@@ -42,7 +42,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 # CLI, errors, logging, time, paths
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
