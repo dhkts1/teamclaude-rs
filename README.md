@@ -1,5 +1,9 @@
 # teamclaude-rs (`tcr`)
 
+[![CI](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+
 A lean, single-user **rotating Anthropic proxy** in Rust. Point your Claude Code (or
 any Anthropic API client) at it and it spreads requests across several Claude
 accounts, refreshes their OAuth tokens automatically, and shows a live TUI with
@@ -7,6 +11,10 @@ per-account quota and request counts.
 
 It's a from-scratch Rust rewrite of the Node proxy [teamclaude](https://github.com/KarpelesLab/teamclaude) — same on-disk config, same certs,
 so it's a drop-in on the same port.
+
+![tcr live TUI](assets/tui-demo.gif)
+
+> The dashboard above is `tcr demo` — the real TUI rendered with fake accounts. Run it yourself with `tcr demo`.
 
 ## What it does
 

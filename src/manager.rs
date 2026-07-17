@@ -311,6 +311,20 @@ impl Manager {
             .iter()
             .map(AccountRuntime::from_config)
             .collect();
+        Self::assemble(config, refresher, prober, warmer, config_path, accounts)
+    }
+
+    /// Assemble the `Arc<Manager>` from an already-built runtime vec. Shared by
+    /// [`Self::new`] (which derives the runtimes from `config`) and
+    /// [`Self::from_runtimes`] (which is handed pre-seeded runtimes for the demo).
+    fn assemble(
+        config: Config,
+        refresher: Arc<dyn TokenRefresher>,
+        prober: Arc<dyn UsageProber>,
+        warmer: Arc<dyn AccountWarmer>,
+        config_path: Option<PathBuf>,
+        accounts: Vec<AccountRuntime>,
+    ) -> Arc<Self> {
         let refresh_locks = accounts
             .iter()
             .map(|_| Arc::new(AsyncMutex::new(())))
@@ -369,6 +383,48 @@ impl Manager {
             Arc::new(LiveWarmer::new()),
             config_path,
         )
+    }
+
+    /// Build a manager from pre-seeded runtime rows, for the `tcr demo` dashboard
+    /// (`src/demo.rs`). The live refresher/prober/warmer are held but NEVER invoked
+    /// — the demo only ever calls [`Self::snapshot`] and [`Self::set_disabled`], so
+    /// no token, probe, or network I/O ever happens. `config_path = None` makes
+    /// every persist a no-op, so nothing can be written to disk.
+    pub fn from_runtimes(accounts: Vec<AccountRuntime>) -> Arc<Self> {
+        let config: Config = serde_json::from_str("{}")
+            .expect("an empty JSON object is always a valid default config");
+        Self::assemble(
+            config,
+            Arc::new(LiveRefresher::new()),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+            accounts,
+        )
+    }
+
+    /// Seed one fake live session into the sessions map, for the `tcr demo`
+    /// dashboard alone — never touched by the real serving path (which upserts
+    /// sessions in [`Self::record_served`]). Lets the demo paint a populated
+    /// sessions pane without routing any real traffic.
+    pub fn seed_session(
+        &self,
+        key: u64,
+        account_idx: usize,
+        requests: u64,
+        last_seen_ms: i64,
+        kind: SessionKind,
+    ) {
+        let mut sessions = self.sessions.lock().expect("sessions lock poisoned");
+        sessions.insert(
+            key,
+            SessionStat {
+                account_idx,
+                requests,
+                last_seen_ms,
+                kind,
+            },
+        );
     }
 
     /// Configured probe cadence in seconds, read from the config's unmodelled
