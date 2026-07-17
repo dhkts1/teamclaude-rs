@@ -148,22 +148,60 @@ fn key_action(key: &KeyEvent) -> Action {
     }
 }
 
+/// Keep the sessions pane usable even when the terminal is short: the accounts
+/// panel never eats so much height that fewer than this many rows remain for the
+/// rest of the frame.
+const SESSIONS_MIN: u16 = 3;
+
+/// Full height (rows) the accounts panel wants: one row per account + a header
+/// row + top/bottom borders.
+const ACCOUNTS_CHROME: u16 = 3;
+
+/// Height (rows) the accounts panel should get. It takes its full height whenever
+/// at least `SESSIONS_MIN` rows remain for the rest of the frame; when the terminal
+/// is too short for that, it yields down to `total_height - SESSIONS_MIN` (so the
+/// recent-log shrinks/vanishes entirely before a single account row is dropped),
+/// but never below a 4-row floor so a tiny terminal still shows the header plus at
+/// least one account.
+fn account_area_height(total_height: u16, n_accounts: u16) -> u16 {
+    let acct_full = n_accounts.saturating_add(ACCOUNTS_CHROME);
+    acct_full
+        .min(total_height.saturating_sub(SESSIONS_MIN))
+        .max(4)
+}
+
+/// The accounts panel title: honest about how many accounts are actually on
+/// screen. `" teamclaude-rs · accounts (7) "` when all fit, or
+/// `" teamclaude-rs · accounts (5/7 ▼) "` when rows are clipped.
+fn accounts_title(shown: u16, total: u16) -> String {
+    if shown >= total {
+        format!(" teamclaude-rs · accounts ({total}) ")
+    } else {
+        format!(" teamclaude-rs · accounts ({shown}/{total} ▼) ")
+    }
+}
+
 /// Paint the whole frame: accounts table on top, sessions pane in the middle,
 /// request log below.
 fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize) {
     let now = OffsetDateTime::now_utc();
-    // Accounts snug to its content (rows + header + top/bottom border) so it never
-    // stretches into dead space; SESSIONS absorbs the vertical slack (`Min`) so every
-    // live session is visible; the recent-request log stays a fixed strip at the bottom.
-    let account_rows = snapshot.accounts.len() as u16;
+    let area = frame.area();
+    // Accounts is the primary data: budget its height first so it is the LAST
+    // thing clipped. SESSIONS absorbs the vertical slack (grows when the terminal
+    // is tall); the recent-log lives in whatever remains, so it shrinks/vanishes
+    // before any account row is dropped.
+    let acct_h = account_area_height(area.height, snapshot.accounts.len() as u16);
+    let rest = area.height.saturating_sub(acct_h);
+    let log_h = rest.saturating_sub(SESSIONS_MIN).min(9);
+    let sessions_h = rest.saturating_sub(log_h);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(account_rows.saturating_add(3)),
-            Constraint::Min(4),
-            Constraint::Length(9),
+            Constraint::Length(acct_h),
+            Constraint::Length(sessions_h),
+            Constraint::Length(log_h),
         ])
-        .split(frame.area());
+        .split(area);
     render_accounts(frame, chunks[0], snapshot, selected, now);
     render_sessions(frame, chunks[1], snapshot, now);
     render_log(frame, chunks[2], snapshot, now);
@@ -236,10 +274,15 @@ fn render_accounts(
         Constraint::Length(6),
     ];
 
+    // Rows that actually fit = panel height minus header + 2 borders, clamped to
+    // the pool size. When `shown < total` the title flags the clip so a hidden
+    // account is never silent.
+    let total = snapshot.accounts.len() as u16;
+    let shown = area.height.saturating_sub(ACCOUNTS_CHROME).min(total);
     let table = Table::new(rows, widths).header(header).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" teamclaude-rs · accounts "),
+            .title(accounts_title(shown, total)),
     );
     frame.render_widget(table, area);
 }
@@ -559,6 +602,37 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_area_height_full_when_tall() {
+        // Plenty of room: accounts gets its full height (7 rows + header + 2 borders).
+        assert_eq!(account_area_height(40, 7), 10);
+    }
+
+    #[test]
+    fn account_area_height_yields_log_before_clipping_accounts() {
+        // Fits accounts (10) + SESSIONS_MIN (3) = 13 but not the full 9-row log:
+        // the log shrank, every account is still shown.
+        assert_eq!(account_area_height(13, 7), 10);
+    }
+
+    #[test]
+    fn account_area_height_clips_only_when_forced() {
+        // Genuinely tiny: accounts yields to total - SESSIONS_MIN, but never below 4.
+        assert_eq!(account_area_height(8, 7), 5);
+        assert!(account_area_height(8, 7) >= 4);
+        assert_eq!(account_area_height(4, 7), 4);
+    }
+
+    #[test]
+    fn accounts_title_shows_total_when_all_visible() {
+        assert_eq!(accounts_title(7, 7), " teamclaude-rs · accounts (7) ");
+    }
+
+    #[test]
+    fn accounts_title_flags_clip() {
+        assert_eq!(accounts_title(5, 7), " teamclaude-rs · accounts (5/7 ▼) ");
+    }
 
     #[test]
     fn bar_fills_proportionally_and_shows_percent() {
