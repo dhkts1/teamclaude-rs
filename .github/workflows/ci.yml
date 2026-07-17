@@ -5,42 +5,61 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: every job here only reads the repo — none comment on PRs,
+# push tags, or publish. Deny everything except contents:read so a compromised
+# action can't escalate. Raise per-job if a future job needs to write.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   ci:
     name: ci
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      # Caches ~/.cargo/{registry,git} + target/. Auto-keys on Cargo.lock +
+      # rustc version + job name, so this cache stays isolated from the tsan/
+      # miri jobs' sanitizer builds. Typically 50-80% faster warm builds.
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Format
         run: cargo fmt --all --check
 
+      # --locked: fail if CI would silently rewrite Cargo.lock. Pins the exact
+      # dependency set that was reviewed — important for an auth-handling proxy.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --all
+        run: cargo test --all --locked
 
       - name: Build (release)
-        run: cargo build --release
+        run: cargo build --release --locked
 
   audit:
     name: audit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      # install-action caches the cargo-audit binary itself, so no target cache
+      # is needed here — audit reads Cargo.lock, it doesn't compile the crate.
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
         with:
@@ -53,8 +72,9 @@ jobs:
   tsan:
     name: tsan
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
@@ -74,11 +94,18 @@ jobs:
     name: miri
     runs-on: ubuntu-latest
     continue-on-error: true
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      # cache-on-failure: this job is continue-on-error, so still persist the
+      # (expensive) miri build cache even when it surfaces UB, or every run
+      # rebuilds std from scratch.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       # cargo test takes ONE filter positional; run each pure module separately.
       # disable-isolation lets miri tolerate time/env access in the pure tests.
       - name: miri (pure tests)
