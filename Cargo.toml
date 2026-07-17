@@ -37,7 +37,7 @@ oauth2 = { version = "5", default-features = false }
 
 # TUI
 ratatui = "0.28"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # CLI, errors, logging, time, paths
 clap = { version = "4", features = ["derive"] }
