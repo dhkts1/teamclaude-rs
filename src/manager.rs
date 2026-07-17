@@ -669,22 +669,56 @@ impl Manager {
                         }
                     };
                     if let Some((target, migrate_names)) = decision {
-                        if let Some((x_name, y_name)) = migrate_names {
-                            tracing::info!(
-                                "affinity: migrate session off {} (n={}) -> {}",
-                                x_name,
-                                count_x,
-                                y_name
-                            );
+                        // (3) UNDER THE AFFINITY LOCK ONLY: commit the pin. Accounts
+                        // lock already dropped — never nest.
+                        //
+                        // TOCTOU close: the `counts` driving the migration decision
+                        // were read in section (1) and the lock was then dropped, so a
+                        // concurrent select on another session stacked on the same X
+                        // could have decided the SAME idle Y in parallel. Committing
+                        // both blindly would OVER-migrate (Y over-stacks, X empties —
+                        // the inverse of the goal, and it can oscillate). So for a
+                        // MIGRATION we RE-VALIDATE against FRESH counts re-tallied from
+                        // the live map under this same lock that mutates it: the pin
+                        // must still be X AND `count(target)+1 < count(X)` must still
+                        // hold. If not, ABORT the move and keep the existing pin. No
+                        // accounts lock is taken here (the re-check needs only the
+                        // affinity-map counts + the already-chosen target; the next
+                        // select re-checks eligibility anyway).
+                        let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                        let mut committed = target;
+                        if target != idx {
+                            let still_pinned_x = pins.get(&key).map(|&(i, _)| i) == Some(idx);
+                            let mut count_x_now = 0usize;
+                            let mut count_t_now = 0usize;
+                            for &(i, _) in pins.values() {
+                                if i == idx {
+                                    count_x_now += 1;
+                                }
+                                if i == target {
+                                    count_t_now += 1;
+                                }
+                            }
+                            // Strictly-improves-balance guard, re-checked on fresh state.
+                            if still_pinned_x && count_t_now + 1 < count_x_now {
+                                if let Some((x_name, y_name)) = migrate_names {
+                                    tracing::info!(
+                                        "affinity: migrate session off {} (n={}) -> {}",
+                                        x_name,
+                                        count_x_now,
+                                        y_name
+                                    );
+                                }
+                            } else {
+                                // The decision went stale between sections (a sibling
+                                // select already rebalanced): keep the current pin.
+                                committed = idx;
+                            }
                         }
-                        // (3) UNDER THE AFFINITY LOCK ONLY: re-pin the session to the
-                        // target (initial-honour or migration) and refresh its
-                        // last-touch. Accounts lock already dropped — never nest.
-                        self.affinity
-                            .lock()
-                            .expect("affinity lock poisoned")
-                            .insert(key, (target, now_ms));
-                        return Some(target);
+                        // Re-pin the session (migration target, or the honoured/kept X)
+                        // and refresh its last-touch for LRU eviction.
+                        pins.insert(key, (committed, now_ms));
+                        return Some(committed);
                     }
                 }
             }
@@ -3902,5 +3936,79 @@ mod tests {
                 account.name, account.in_flight
             );
         }
+    }
+
+    /// TOCTOU regression (concurrency) — the migration feature's OWN target workload.
+    /// Several sessions start STACKED on one account with idle, eligible accounts
+    /// alongside. `N` threads select for those sessions in lockstep: a `Barrier`
+    /// forces every round to fire simultaneously, which is the exact interleaving the
+    /// adversarial review flagged — two concurrent selects both reading `count(Y)=0`
+    /// for the same idle `Y` and BOTH migrating onto it, over-stacking `Y` to 2 while
+    /// `X` empties to 0 (the inverse of the goal) and oscillating 0→1→0.
+    ///
+    /// The fix — re-validating `count(target)+1 < count(X)` against FRESH counts under
+    /// the affinity lock in section 3, aborting the move if it no longer holds — makes
+    /// each committed migration strictly reduce the load's sum-of-squares, so the
+    /// system converges to exactly one session per account and STAYS there. Under the
+    /// pre-fix code the stale-count commit over-migrates and the final distribution is
+    /// NOT balanced. (Asserted on a balanced fleet — no pacing / rate-limit churn — so
+    /// the only force acting on the distribution is the migration logic under test.)
+    #[test]
+    fn concurrent_stacked_sessions_do_not_over_migrate() {
+        const N: usize = 4; // sessions == accounts → balanced fixed point is one-each
+        const ROUNDS: usize = 100;
+
+        let manager = build_manager(
+            config_with(vec![
+                account("a0", 0),
+                account("a1", 0),
+                account("a2", 0),
+                account("a3", 0),
+            ]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        // Pathological start: ALL N sessions pinned to account 0.
+        for key in 0..N as u64 {
+            pin_session(&manager, key, 0);
+        }
+
+        let barrier = Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N as u64)
+            .map(|key| {
+                let manager = Arc::clone(&manager);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let empty: HashSet<usize> = HashSet::new();
+                    for _ in 0..ROUNDS {
+                        // Synchronise so all N selects contend on the same stacked
+                        // account in the same instant — maximising the TOCTOU window.
+                        barrier.wait();
+                        let now = OffsetDateTime::now_utc();
+                        manager.select(&empty, now, None, Some(key));
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("migration stress thread panicked");
+        }
+
+        // Every session is still pinned (none lost), and the distribution converged
+        // to exactly one-per-account. An account holding >=2 while another sits at 0
+        // is the over-migration / oscillation the re-validation exists to prevent.
+        let pins = manager.affinity.lock().expect("affinity lock poisoned");
+        assert_eq!(pins.len(), N, "every session must remain pinned");
+        let mut per_account = [0usize; N];
+        for &(idx, _) in pins.values() {
+            per_account[idx] += 1;
+        }
+        assert_eq!(
+            per_account,
+            [1, 1, 1, 1],
+            "stacked sessions must converge to one-per-account without over-migrating \
+             (got {per_account:?}) — a stale-count commit would over-stack one account"
+        );
     }
 }
