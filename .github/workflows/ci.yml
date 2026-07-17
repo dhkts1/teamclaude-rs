@@ -35,3 +35,17 @@ jobs:
 
       - name: Build (release)
         run: cargo build --release
+
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Reports RustSec advisories. Exits non-zero only on real vulnerabilities;
+      # unmaintained/unsound deps surface as warnings without failing the build.
+      - name: Audit dependencies
+        run: cargo audit
