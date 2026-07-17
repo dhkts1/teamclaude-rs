@@ -8,6 +8,7 @@
 pub mod account_uuid;
 pub mod cli;
 pub mod config;
+pub mod demo;
 pub mod identity;
 pub mod manager;
 pub mod mitm;
