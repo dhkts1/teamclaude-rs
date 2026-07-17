@@ -151,9 +151,7 @@ mod tests {
 
     #[test]
     fn recognizes_js_teamclaude_server() {
-        assert!(is_proxy_server(
-            "node /opt/nvm/bin/teamclaude server"
-        ));
+        assert!(is_proxy_server("node /opt/nvm/bin/teamclaude server"));
         assert!(is_proxy_server("node /path/teamclaude server -r"));
         assert!(is_proxy_server("/path/teamclaude server")); // shebang exec
     }

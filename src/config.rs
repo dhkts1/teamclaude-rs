@@ -314,8 +314,7 @@ mod tests {
     #[test]
     fn empty_pacing_object_disables_pacing() {
         // `"pacing": {}` is the explicit opt-out: both knobs None → inert.
-        let config: Config =
-            serde_json::from_str(r#"{ "accounts": [], "pacing": {} }"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{ "accounts": [], "pacing": {} }"#).unwrap();
         assert_eq!(config.pacing.max_in_flight_per_account, None);
         assert_eq!(config.pacing.min_spacing_ms, None);
         assert!(!config.pacing.is_active());
