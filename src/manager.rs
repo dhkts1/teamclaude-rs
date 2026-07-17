@@ -562,19 +562,36 @@ impl Manager {
         // the pin under the affinity lock, then DROP that lock before taking the
         // accounts lock (never nest the two — that is the documented deadlock).
         if let Some(key) = affinity {
-            let pinned = {
+            // (1) UNDER THE AFFINITY LOCK ONLY: read this session's pin `X` and, in
+            // the same critical section, tally the per-account pinned-session counts
+            // that the load-balancing decision needs. Drop this lock before taking
+            // the accounts lock — the two are NEVER held simultaneously (the
+            // documented deadlock).
+            let (pinned, counts) = {
                 let pins = self.affinity.lock().expect("affinity lock poisoned");
-                pins.get(&key).map(|&(idx, _)| idx)
+                let pinned = pins.get(&key).map(|&(idx, _)| idx);
+                let mut counts: HashMap<usize, usize> = HashMap::new();
+                for &(idx, _) in pins.values() {
+                    *counts.entry(idx).or_insert(0) += 1;
+                }
+                (pinned, counts)
             };
             if let Some(idx) = pinned {
                 if !tried.contains(&idx) {
-                    let usable = {
+                    let count_x = counts.get(&idx).copied().unwrap_or(0);
+                    // (2) UNDER THE ACCOUNTS LOCK ONLY: confirm the pin `X` is still
+                    // usable, then — and only when >=2 sessions stack on `X` — look
+                    // for the least-loaded ELIGIBLE account `Y` that strictly improves
+                    // balance (`count(Y)+1 < count(X)`). Stamp whichever we settle on.
+                    // `None` means `X` is ineligible → fall through to the normal
+                    // pick/re-pin path (which already handles a dead pin).
+                    let decision: Option<(usize, Option<(String, String)>)> = {
                         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
                         // Respect pacing on the pin: a saturated pinned account
                         // temporarily YIELDS here and the LRU pick below (with its
                         // soft fallback) steers to a cooler account, so a session's
                         // concurrent burst spreads instead of all slamming one pin.
-                        let usable = accounts.get(idx).is_some_and(|a| {
+                        let x_usable = accounts.get(idx).is_some_and(|a| {
                             Self::eligible(
                                 a,
                                 self.global_threshold,
@@ -585,24 +602,89 @@ impl Manager {
                                 is_fable,
                             )
                         });
-                        if usable {
-                            // Stamp the pinned account too, so a second session's LRU
-                            // steers away from an account already busy under a pin.
+                        if !x_usable {
+                            None
+                        } else {
+                            // Default: honour the pin. When `count_x < 2` (a LONE
+                            // session) `target` stays `idx` and nothing below runs, so
+                            // this path is byte-identical to the pre-migration
+                            // behaviour — a lone session's warm cache is never moved.
+                            let mut target = idx;
+                            let mut migrate_names: Option<(String, String)> = None;
+                            if count_x >= 2 {
+                                // Least-loaded eligible target, ordered by
+                                // (pinned-session-count asc, in_flight asc,
+                                // last_selected_seq asc / LRU). A candidate qualifies
+                                // ONLY if it strictly improves balance — this guard
+                                // prevents thrash and equal-swaps.
+                                let mut best: Option<usize> = None;
+                                let mut best_key: Option<(usize, u32, u64)> = None;
+                                for (cand, account) in accounts.iter().enumerate() {
+                                    if cand == idx {
+                                        continue;
+                                    }
+                                    let count_y = counts.get(&cand).copied().unwrap_or(0);
+                                    if count_y + 1 >= count_x {
+                                        continue;
+                                    }
+                                    // Only migrate onto an ELIGIBLE account — the same
+                                    // gate the pin honours (disabled/error/rate-limit/
+                                    // quota/pacing), so a throttled `Y` is never chosen.
+                                    if !Self::eligible(
+                                        account,
+                                        self.global_threshold,
+                                        &self.pacing,
+                                        true,
+                                        now,
+                                        now_ms,
+                                        is_fable,
+                                    ) {
+                                        continue;
+                                    }
+                                    let cand_key =
+                                        (count_y, account.in_flight, account.last_selected_seq);
+                                    if best_key.is_none_or(|b| cand_key < b) {
+                                        best = Some(cand);
+                                        best_key = Some(cand_key);
+                                    }
+                                }
+                                if let Some(y) = best {
+                                    let x_name = accounts
+                                        .get(idx)
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_default();
+                                    let y_name =
+                                        accounts.get(y).map(|a| a.name.clone()).unwrap_or_default();
+                                    migrate_names = Some((x_name, y_name));
+                                    target = y;
+                                }
+                            }
+                            // Stamp the chosen account so a second session's LRU steers
+                            // away from an account already busy under a pin.
                             let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                            if let Some(account) = accounts.get_mut(idx) {
+                            if let Some(account) = accounts.get_mut(target) {
                                 account.last_selected_seq = tick;
                             }
+                            Some((target, migrate_names))
                         }
-                        usable
                     };
-                    if usable {
-                        // Refresh the pin's last-touch so LRU eviction keeps live
-                        // sessions. Accounts lock already dropped — never nest the two.
+                    if let Some((target, migrate_names)) = decision {
+                        if let Some((x_name, y_name)) = migrate_names {
+                            tracing::info!(
+                                "affinity: migrate session off {} (n={}) -> {}",
+                                x_name,
+                                count_x,
+                                y_name
+                            );
+                        }
+                        // (3) UNDER THE AFFINITY LOCK ONLY: re-pin the session to the
+                        // target (initial-honour or migration) and refresh its
+                        // last-touch. Accounts lock already dropped — never nest.
                         self.affinity
                             .lock()
                             .expect("affinity lock poisoned")
-                            .insert(key, (idx, now_ms));
-                        return Some(idx);
+                            .insert(key, (target, now_ms));
+                        return Some(target);
                     }
                 }
             }
@@ -3312,6 +3394,174 @@ mod tests {
         assert!(
             pins.contains_key(&((AFFINITY_CAP + 1) as u64)),
             "the just-inserted pin is present"
+        );
+    }
+
+    /// Directly pin `key` to account `idx` in the affinity map (last-touch = now),
+    /// bypassing a select() call — lets a migration test set up an arbitrary stacked
+    /// starting layout without depending on how the initial pins were formed.
+    fn pin_session(manager: &Manager, key: u64, idx: usize) {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .insert(key, (idx, crate::now_ms()));
+    }
+
+    /// Read the account a session key is currently pinned to (None if unpinned).
+    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx)
+    }
+
+    /// Migration #1 — a LONE session is NEVER migrated: its warm cache is preserved
+    /// even when an idle, eligible account sits right next to it. `count(X) < 2` must
+    /// be byte-identical to honouring the pin.
+    #[test]
+    fn lone_session_never_migrates() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        // One session pinned to acct 0; acct 1 is idle and eligible.
+        pin_session(&manager, 100, 0);
+        for _ in 0..6 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(100)),
+                Some(0),
+                "a lone session must stay on its warm account (no migration)"
+            );
+        }
+        assert_eq!(pin_of(&manager, 100), Some(0), "the pin never moved");
+    }
+
+    /// Migration #2 — two sessions stacked on acct 0 with acct 1 idle+eligible:
+    /// selecting for one of them migrates it to acct 1, and the affinity map records
+    /// the new pin.
+    #[test]
+    fn stacked_session_migrates_to_idle() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        pin_session(&manager, 10, 0);
+        pin_session(&manager, 11, 0);
+        // count(0)=2, count(1)=0 → 0+1 < 2, so migrate this session onto acct 1.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(10)),
+            Some(1),
+            "a stacked session migrates to the idle eligible account"
+        );
+        assert_eq!(
+            pin_of(&manager, 10),
+            Some(1),
+            "the affinity map now pins the migrated session to acct 1"
+        );
+    }
+
+    /// Migration #3 — convergence, no thrash: after #2's migration the layout is
+    /// balanced (one session each), so further selects for BOTH sessions are stable —
+    /// neither bounces back.
+    #[test]
+    fn migration_converges_no_thrash() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        pin_session(&manager, 10, 0);
+        pin_session(&manager, 11, 0);
+        // The one migration from #2.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(10)),
+            Some(1)
+        );
+        // Now 1-and-1: every further select is a lone session on its account.
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(10)),
+                Some(1),
+                "the migrated session stays put (no bounce back)"
+            );
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(11)),
+                Some(0),
+                "the remaining session stays put"
+            );
+        }
+    }
+
+    /// Migration #4 — no eligible emptier account, no migration: two sessions stack on
+    /// acct 0 and the only other account is errored, so the stacked session honours
+    /// its pin rather than migrating onto a throttled/dead account.
+    #[test]
+    fn no_migration_when_no_emptier_eligible() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        pin_session(&manager, 20, 0);
+        pin_session(&manager, 21, 0);
+        manager.mark_error(1); // the only alternative is ineligible
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(20)),
+                Some(0),
+                "no eligible emptier account → honour the pin, never migrate onto a dead one"
+            );
+        }
+        assert_eq!(pin_of(&manager, 20), Some(0), "the pin never moved");
+    }
+
+    /// Migration #5 — three sessions stacked on acct 0 with accts 1,2 idle spread to
+    /// one-each after a round of selects (convergence across three accounts).
+    #[test]
+    fn three_sessions_spread_across_three_idle() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            refresher,
+        );
+        let now = OffsetDateTime::now_utc();
+        pin_session(&manager, 1, 0);
+        pin_session(&manager, 2, 0);
+        pin_session(&manager, 3, 0);
+        // A round of selects, one per session.
+        for key in [1u64, 2, 3] {
+            manager.select(&HashSet::new(), now, None, Some(key));
+        }
+        let mut homes = [
+            pin_of(&manager, 1),
+            pin_of(&manager, 2),
+            pin_of(&manager, 3),
+        ]
+        .map(|p| p.expect("each session stays pinned"));
+        homes.sort_unstable();
+        assert_eq!(
+            homes,
+            [0, 1, 2],
+            "three stacked sessions spread to one-per-account after a round of selects"
         );
     }
 
