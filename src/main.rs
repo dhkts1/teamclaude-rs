@@ -15,7 +15,7 @@ use std::sync::Arc;
 use teamclaude_rs::cli::{self, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::manager::Manager;
-use teamclaude_rs::{mitm, oauth, singleton, tui, update};
+use teamclaude_rs::{demo, mitm, oauth, singleton, tui, update};
 
 #[derive(Parser)]
 #[command(
@@ -55,6 +55,8 @@ enum Command {
     Status(StatusArgs),
     /// Self-update: `git pull --ff-only` + `cargo build --release` in the checkout.
     Update(UpdateArgs),
+    /// Render the TUI against fake accounts (for a sanitized README screenshot).
+    Demo,
 }
 
 #[derive(clap::Args)]
@@ -190,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Disable(args)) => run_disable(args),
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Update(args)) => update::run_update(args.force),
+        Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
         None => run_server(cli.server).await,
     }
 }
