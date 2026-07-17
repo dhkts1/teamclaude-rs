@@ -1,0 +1,23 @@
+# gitleaks configuration for teamclaude-rs.
+#
+# The pre-commit hook (.githooks/pre-commit) runs `gitleaks git --staged` with
+# this config, so no secret reaches a commit. It extends gitleaks' built-in
+# ruleset (AWS keys, GitHub/GitLab tokens, private keys, generic high-entropy
+# api-key assignments, etc.).
+#
+# Enable the hook in a fresh clone with:
+#   git config core.hooksPath .githooks
+title = "teamclaude-rs"
+
+[extend]
+useDefault = true
+
+# The repo is intentionally free of real credentials — accounts live in
+# ~/.config/teamclaude.json (never committed). If a unit test ever needs a
+# realistic-looking token, make it obviously fake and allowlist it here rather
+# than weakening the ruleset.
+[allowlist]
+description = "build metadata and lockfile checksums are not secrets"
+paths = [
+  '''Cargo\.lock''',
+]

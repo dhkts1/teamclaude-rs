@@ -1,0 +1,12 @@
+teamclaude-rs
+=============
+
+A Rust rewrite of teamclaude (https://github.com/KarpelesLab/teamclaude),
+ported by reference.
+
+The original teamclaude is Copyright (c) 2026 KarpelesLab and is licensed
+under the MIT License. Its copyright and permission notice are retained in the
+LICENSE file of this project, as the MIT License requires for derivative works.
+
+The Rust implementation in this repository is Copyright (c) 2026 Gil
+(https://github.com/dhkts1) and is likewise released under the MIT License.

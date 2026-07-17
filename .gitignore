@@ -1,0 +1,53 @@
+# ── Rust build ────────────────────────────────────────────────
+/target/
+**/*.rs.bk
+
+# ── Secrets: real account tokens & config (NEVER commit) ──────
+# The live config holds OAuth access/refresh tokens for real accounts.
+# Default path is ~/.config/teamclaude.json (outside the repo); these
+# patterns fail closed against any copy placed inside it.
+teamclaude.json
+teamclaude*.json
+.teamclaude.json
+config.json
+config.local.json
+*.local.json
+config/
+
+# ── Secrets: MITM CA material & any key/cert ─────────────────
+*.pem
+*.key
+*.crt
+*.cer
+*.der
+*.p12
+*.pfx
+ca.*
+
+# ── Secrets: environment files ───────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Logs & runtime captures ──────────────────────────────────
+*.log
+*.jsonl
+tcr-capture*
+/tmp-capture/
+
+# ── Internal dev scaffolding (Henry swarm state, not public) ─
+docs/plans/
+*-swarm-state.md
+*-bridge-*.md
+*-handoff.md
+
+# ── Editor / IDE ─────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── OS cruft ─────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

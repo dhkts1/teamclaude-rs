@@ -1,0 +1,56 @@
+[package]
+name = "teamclaude-rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Lean single-user rotating Anthropic proxy with a live TUI — a Rust replacement for the personal teamclaude proxy"
+
+[[bin]]
+name = "tcr"
+path = "src/main.rs"
+
+[dependencies]
+# async runtime + HTTP
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
+axum = { version = "0.7", features = ["http2"] }
+hyper = { version = "1", features = ["server", "http1"] }
+# TokioIo: the only bridge from tokio AsyncRead/Write to hyper 1.x rt::Read/Write,
+# needed to serve the axum router over a raw/TLS stream in MITM mode. Already in
+# the tree transitively (via axum/reqwest); this just pins the glue we call directly.
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2"] }
+tower = "0.5"
+bytes = "1"
+futures = "0.3"
+
+# SSE parsing that survives chunk-split event boundaries (the JS bug we design out)
+eventsource-stream = "0.2"
+
+# serde config (drop-in on ~/.config/teamclaude.json)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# OAuth PKCE login (browser flow): standard client for PKCE/CSRF/authorize-URL.
+# default-features off — we only use the URL/PKCE builders, not oauth2's own HTTP
+# client (Claude's token endpoint is non-standard JSON, exchanged manually below).
+oauth2 = { version = "5", default-features = false }
+
+# TUI
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# CLI, errors, logging, time, paths
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2.2.0"
+rcgen = "0.14.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

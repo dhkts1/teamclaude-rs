@@ -1,0 +1,293 @@
+//! Account identity helpers, ported 1:1 from `teamclaude/src/identity.js`.
+//!
+//! An OAuth account is identified by its Anthropic account UUID (the *person*)
+//! plus the organization it is scoped to. The same email/person can belong to
+//! multiple organizations — e.g. a corporate Pro org and a personal Max org —
+//! each with its own OAuth token and quota. The org must therefore be part of
+//! the identity; otherwise multi-org logins overwrite each other, removals match
+//! the wrong entry, and token rotation persists onto the wrong account.
+//!
+//! The org discriminator prefers the org UUID but falls back to the org name
+//! (the profile endpoint has always returned a name), so identity still works on
+//! entries created before org UUIDs were stored.
+//!
+//! Backward compatibility: when the identity fields (`account_uuid`, `org_uuid`,
+//! `org_name`) are all absent — the shape of every config written before this
+//! change — every comparison falls back to name equality, so single-org
+//! behaviour is byte-identical.
+
+use crate::config::Account;
+
+/// Stable org discriminator for an account record: org UUID, else org name, else
+/// `None` (an empty string is treated as absent).
+pub fn org_key(a: &Account) -> Option<&str> {
+    a.org_uuid
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| a.org_name.as_deref().filter(|s| !s.is_empty()))
+}
+
+/// Whether two account records refer to the same account+org.
+///
+/// - Both have an `account_uuid`: it must match. If both org keys are known they
+///   must also match; but if either side's org is still unknown we treat them as
+///   the same. This lets a freshly-profiled login backfill a legacy entry (which
+///   has no stored org) instead of creating a duplicate. Once both sides carry
+///   an org key, a *different* org is correctly seen as a distinct account.
+/// - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
+pub fn same_identity(a: &Account, b: &Account) -> bool {
+    match (
+        a.account_uuid.as_deref().filter(|s| !s.is_empty()),
+        b.account_uuid.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        (Some(ua), Some(ub)) => {
+            if ua != ub {
+                return false;
+            }
+            match (org_key(a), org_key(b)) {
+                (Some(ka), Some(kb)) => ka == kb,
+                _ => true,
+            }
+        }
+        _ => a.name == b.name,
+    }
+}
+
+/// The email portion of a display name, stripping a trailing " (org)" suffix.
+pub fn email_of(name: &str) -> &str {
+    if name.ends_with(')') {
+        if let Some(i) = name.rfind(" (") {
+            return &name[..i];
+        }
+    }
+    name
+}
+
+/// Indices of accounts matching `query` (exact name, else email), narrowed by
+/// `org_filter` (org name exact, or org uuid exact/prefix). Caller decides on
+/// 0/1/many.
+pub fn match_accounts(accounts: &[Account], query: &str, org_filter: Option<&str>) -> Vec<usize> {
+    let mut matches: Vec<usize> = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.name == query)
+        .map(|(i, _)| i)
+        .collect();
+    if matches.is_empty() {
+        matches = accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| email_of(&a.name) == query)
+            .map(|(i, _)| i)
+            .collect();
+    }
+    if let Some(f) = org_filter {
+        matches.retain(|&i| {
+            let a = &accounts[i];
+            a.org_name.as_deref().is_some_and(|n| n == f)
+                || a.org_uuid
+                    .as_deref()
+                    .is_some_and(|u| u == f || u.starts_with(f))
+        });
+    }
+    matches
+}
+
+/// Build a lightweight probe [`Account`] carrying only the identity fields, for
+/// [`same_identity`] comparison against stored records (upsert / persist). The
+/// non-identity fields are placeholders and never read by the identity helpers.
+pub fn probe(
+    name: &str,
+    account_uuid: Option<String>,
+    org_uuid: Option<String>,
+    org_name: Option<String>,
+) -> Account {
+    Account {
+        name: name.to_string(),
+        account_type: "oauth".to_string(),
+        account_uuid,
+        org_uuid,
+        org_name,
+        access_token: String::new(),
+        refresh_token: None,
+        expires_at: None,
+        priority: None,
+        switch_threshold: None,
+        disabled: None,
+        extra: serde_json::Map::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acct(
+        name: &str,
+        account_uuid: Option<&str>,
+        org_uuid: Option<&str>,
+        org_name: Option<&str>,
+    ) -> Account {
+        probe(
+            name,
+            account_uuid.map(str::to_string),
+            org_uuid.map(str::to_string),
+            org_name.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn org_key_prefers_uuid_then_name_then_none() {
+        assert_eq!(
+            org_key(&acct("a", None, Some("uuid-1"), Some("Acme"))),
+            Some("uuid-1")
+        );
+        assert_eq!(org_key(&acct("a", None, None, Some("Acme"))), Some("Acme"));
+        assert_eq!(org_key(&acct("a", None, None, None)), None);
+        // Empty strings are treated as absent.
+        assert_eq!(org_key(&acct("a", None, Some(""), Some(""))), None);
+    }
+
+    #[test]
+    fn all_none_falls_back_to_name_equality() {
+        // The current real-config shape: no identity fields. Match must reduce to
+        // name equality so single-org behaviour is byte-identical.
+        let a = acct("me@example.com", None, None, None);
+        let b = acct("me@example.com", None, None, None);
+        let c = acct("other@example.com", None, None, None);
+        assert!(same_identity(&a, &b), "same name → same identity");
+        assert!(!same_identity(&a, &c), "different name → distinct");
+    }
+
+    #[test]
+    fn same_person_different_org_is_distinct_once_both_orgs_known() {
+        let corp = acct(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-corp"),
+            Some("Corp"),
+        );
+        let personal = acct(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-personal"),
+            Some("Personal"),
+        );
+        assert!(
+            !same_identity(&corp, &personal),
+            "same email, same person, different org → two accounts"
+        );
+    }
+
+    #[test]
+    fn same_person_same_org_is_same() {
+        let a = acct(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-corp"),
+            Some("Corp"),
+        );
+        let b = acct(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-corp"),
+            Some("Corp"),
+        );
+        assert!(same_identity(&a, &b));
+    }
+
+    #[test]
+    fn different_person_never_same_even_with_matching_name() {
+        let a = acct(
+            "shared@example.com",
+            Some("uuid-a"),
+            Some("org"),
+            Some("Org"),
+        );
+        let b = acct(
+            "shared@example.com",
+            Some("uuid-b"),
+            Some("org"),
+            Some("Org"),
+        );
+        assert!(!same_identity(&a, &b), "different account_uuid → distinct");
+    }
+
+    #[test]
+    fn legacy_entry_backfills_instead_of_duplicating() {
+        // A freshly-profiled login (full identity) meeting a legacy entry that
+        // has the uuid but no stored org: unknown-org side → treat as same, so
+        // the login backfills the org onto the legacy entry rather than adding a
+        // duplicate.
+        let legacy = acct("me@example.com", Some("uuid-person"), None, None);
+        let fresh = acct(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-corp"),
+            Some("Corp"),
+        );
+        assert!(
+            same_identity(&legacy, &fresh),
+            "unknown org on one side → same"
+        );
+        assert!(same_identity(&fresh, &legacy), "symmetric");
+    }
+
+    #[test]
+    fn email_of_strips_org_suffix() {
+        assert_eq!(email_of("me@example.com (Acme)"), "me@example.com");
+        assert_eq!(email_of("me@example.com"), "me@example.com");
+        // Only a trailing " (…)" is stripped, not a mid-string parenthesis.
+        assert_eq!(email_of("weird (x) name"), "weird (x) name");
+    }
+
+    #[test]
+    fn match_accounts_exact_name_then_email_then_org() {
+        let accounts = vec![
+            acct(
+                "me@example.com (Corp)",
+                Some("u1"),
+                Some("org-corp"),
+                Some("Corp"),
+            ),
+            acct(
+                "me@example.com (Personal)",
+                Some("u1"),
+                Some("org-pers"),
+                Some("Personal"),
+            ),
+            acct("other@example.com", None, None, None),
+        ];
+
+        // Exact display-name wins outright.
+        assert_eq!(
+            match_accounts(&accounts, "me@example.com (Corp)", None),
+            vec![0]
+        );
+
+        // No exact name → email match finds both org variants.
+        assert_eq!(
+            match_accounts(&accounts, "me@example.com", None),
+            vec![0, 1]
+        );
+
+        // Email + org filter narrows to one (by org name).
+        assert_eq!(
+            match_accounts(&accounts, "me@example.com", Some("Personal")),
+            vec![1]
+        );
+        // Org filter by uuid prefix.
+        assert_eq!(
+            match_accounts(&accounts, "me@example.com", Some("org-corp")),
+            vec![0]
+        );
+        assert_eq!(
+            match_accounts(&accounts, "me@example.com", Some("org-")),
+            vec![0, 1],
+            "shared uuid prefix keeps both"
+        );
+
+        // No match at all.
+        assert!(match_accounts(&accounts, "nobody@example.com", None).is_empty());
+    }
+}
