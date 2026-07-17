@@ -1,0 +1,31 @@
+# Keeps the CI actions and Rust dependencies fresh so the cache stays warm on
+# current toolchains and security advisories land as PRs, not surprises.
+#
+# commit-message.prefix is "chore" with NO `include: scope` — this repo's commit
+# gate rejects parenthesized scopes (chore(deps): ...), so the plain `chore:`
+# form is required.
+version: 2
+updates:
+  # GitHub Actions: checkout, rust-cache, install-action, dtolnay/rust-toolchain.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Rust crates. Batch the routine minor/patch bumps into one PR; majors (which
+  # may carry breaking changes) come as separate, individually reviewable PRs.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
