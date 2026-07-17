@@ -3563,4 +3563,94 @@ mod tests {
             "a freshly-warmed account is no longer a target"
         );
     }
+
+    /// Multi-thread stress: RACE `select()` / `enter_in_flight()` / guard-drop
+    /// against the other account-lock writers (`mark_rate_limited` /
+    /// `record_served`) across 8 threads on one shared `Arc<Manager>` with pacing
+    /// ON. This is the race surface ThreadSanitizer watches in CI (the `tsan` job
+    /// filters on this test name); TSan is unrunnable on arm64-macOS, so under
+    /// normal `cargo test` this proves two things TSan does not: the harness runs
+    /// without panicking, and the shared `in_flight` counter is *balanced* — every
+    /// account returns to `in_flight == 0` once all guards drop. A leak, a
+    /// double-decrement, or a lost increment across the check-then-act-across-locks
+    /// path shows up here as a nonzero residual even without instrumentation.
+    #[test]
+    fn concurrent_pacing_stress() {
+        const THREADS: usize = 8;
+        const ITERS: usize = 2000;
+
+        let pacing = PacingConfig {
+            max_in_flight_per_account: Some(2),
+            min_spacing_ms: None,
+        };
+        let manager = build_manager(
+            config_with_pacing(
+                vec![
+                    account("a0", 0),
+                    account("a1", 0),
+                    account("a2", 0),
+                    account("a3", 0),
+                ],
+                pacing,
+            ),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let manager = Arc::clone(&manager);
+                std::thread::spawn(move || {
+                    let empty: HashSet<usize> = HashSet::new();
+                    for i in 0..ITERS {
+                        let now = OffsetDateTime::now_utc();
+                        // Vary the session key per thread AND per iteration so
+                        // affinity pins spread across accounts and the pin map
+                        // churns — maximising concurrent affinity-lock traffic.
+                        let session_key = Some((t as u64) << 32 | (i as u64 % 16));
+                        if let Some(idx) = manager.select(&empty, now, None, session_key) {
+                            // Take the in-flight slot, hold it briefly to widen the
+                            // window where a concurrent select/writer observes a
+                            // nonzero count, then drop the guard (decrement).
+                            let guard = manager.enter_in_flight(idx);
+                            for _ in 0..8 {
+                                std::hint::spin_loop();
+                            }
+                            // Occasionally fire the other account-lock writers so
+                            // TSan sees select/enter racing real mutation, not just
+                            // the in_flight path.
+                            if i % 17 == 0 {
+                                manager.record_served(idx, now, session_key, SessionKind::Fallback);
+                            }
+                            if i % 53 == 0 {
+                                // Short hold so accounts recover and stay selectable
+                                // for the rest of the run.
+                                manager.mark_rate_limited(idx, 1);
+                            }
+                            drop(guard);
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            // A panic in any thread (e.g. a poisoned lock from an unwind under the
+            // write-lock) propagates here and fails the test.
+            h.join().expect("stress thread panicked");
+        }
+
+        // Every guard has dropped, so the counter MUST be balanced back to zero on
+        // every account. A nonzero residual is a real concurrency bug (leaked or
+        // double-counted in_flight) — surface it, never silence it.
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        for (idx, account) in accounts.iter().enumerate() {
+            assert_eq!(
+                account.in_flight, 0,
+                "account {idx} ({}) leaked in_flight={} after all guards dropped",
+                account.name, account.in_flight
+            );
+        }
+    }
 }

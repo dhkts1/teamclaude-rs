@@ -49,3 +49,35 @@ jobs:
       # unmaintained/unsound deps surface as warnings without failing the build.
       - name: Audit dependencies
         run: cargo audit
+
+  tsan:
+    name: tsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: ThreadSanitizer (stress harness)
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          RUSTDOCFLAGS: "-Zsanitizer=thread"
+        run: |
+          cargo +nightly test -Z build-std --target x86_64-unknown-linux-gnu \
+            concurrent_pacing_stress -- --test-threads=1 --nocapture
+
+  # miri (UB detection), best-effort/informational. Scoped to pure leaf modules
+  # (no network/fs) since miri can't execute real I/O. continue-on-error keeps a
+  # miri gap from blocking merges — a signal, not a required gate.
+  miri:
+    name: miri
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: miri (pure tests)
+        run: "cargo +nightly miri test model:: account_uuid:: quota::"
