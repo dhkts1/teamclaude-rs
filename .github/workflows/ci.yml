@@ -79,5 +79,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
+      # cargo test takes ONE filter positional; run each pure module separately.
+      # disable-isolation lets miri tolerate time/env access in the pure tests.
       - name: miri (pure tests)
-        run: "cargo +nightly miri test model:: account_uuid:: quota::"
+        env:
+          MIRIFLAGS: -Zmiri-disable-isolation
+        run: |
+          cargo +nightly miri test model::
+          cargo +nightly miri test account_uuid::
+          cargo +nightly miri test quota::
