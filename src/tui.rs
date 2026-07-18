@@ -207,6 +207,26 @@ fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize) {
     render_log(frame, chunks[2], snapshot, now);
 }
 
+/// The shared skeleton behind the two data panes ([`render_accounts`] and
+/// [`render_sessions`]): a bold header row + caller-mapped rows + column widths,
+/// wrapped in an all-borders block with `title`, rendered into `area`. Each
+/// caller supplies its own column set and per-row cell builder (incl. any
+/// per-row selection/highlight styling); this owns only the identical
+/// `Table::new(...).header(...).block(...)` + `render_widget` tail.
+fn render_table<'a>(
+    frame: &mut Frame,
+    area: Rect,
+    header: Row<'a>,
+    widths: Vec<Constraint>,
+    rows: Vec<Row<'a>>,
+    title: impl Into<Line<'a>>,
+) {
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title.into()));
+    frame.render_widget(table, area);
+}
+
 /// The accounts table.
 fn render_accounts(
     frame: &mut Frame,
@@ -220,46 +240,49 @@ fn render_accounts(
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let rows = snapshot.accounts.iter().enumerate().map(|(i, account)| {
-        let is_current = snapshot.current == Some(i);
-        let marker = if is_current { "▶ " } else { "  " };
-        let (probe_label, probe_style) = probe_cell(account, now);
-        // The weekly bar carries an honest quota label: an account parked out of
-        // rotation on its cap reads as "near"/"full" (yellow/red on the BAR), while
-        // its Status stays "active" — the red "error" is reserved for a dead cred.
-        let (quota_label, quota_style) = quota_cell(account.quota_state);
-        let last_used = account
-            .last_used
-            .map_or_else(|| "—".to_string(), |t| fmt_age(now - t));
+    let rows: Vec<Row> = snapshot
+        .accounts
+        .iter()
+        .enumerate()
+        .map(|(i, account)| {
+            let is_current = snapshot.current == Some(i);
+            let marker = if is_current { "▶ " } else { "  " };
+            let (probe_label, probe_style) = probe_cell(account, now);
+            // The weekly bar carries an honest quota label: an account parked out of
+            // rotation on its cap reads as "near"/"full" (yellow/red on the BAR), while
+            // its Status stays "active" — the red "error" is reserved for a dead cred.
+            let (quota_label, quota_style) = quota_cell(account.quota_state);
+            let last_used = fmt_age_opt(account.last_used, now);
 
-        let cells = vec![
-            Cell::from(format!("{marker}{}", account.name)),
-            Cell::from(account.priority.to_string()),
-            Cell::from(account.status.clone()).style(status_style(&account.status)),
-            Cell::from(probe_label).style(probe_style),
-            Cell::from(bar(account.five_hour)),
-            Cell::from(format!("{}{quota_label}", bar(account.seven_day))).style(quota_style),
-            Cell::from(account.requests.to_string()),
-            Cell::from(fmt_tokens(account.input_tokens)),
-            Cell::from(fmt_tokens(account.output_tokens)),
-            Cell::from(last_used),
-        ];
+            let cells = vec![
+                Cell::from(format!("{marker}{}", account.name)),
+                Cell::from(account.priority.to_string()),
+                Cell::from(account.status.clone()).style(status_style(&account.status)),
+                Cell::from(probe_label).style(probe_style),
+                Cell::from(bar(account.five_hour)),
+                Cell::from(format!("{}{quota_label}", bar(account.seven_day))).style(quota_style),
+                Cell::from(account.requests.to_string()),
+                Cell::from(fmt_tokens(account.input_tokens)),
+                Cell::from(fmt_tokens(account.output_tokens)),
+                Cell::from(last_used),
+            ];
 
-        let mut row = Row::new(cells);
-        if account.disabled {
-            row = row.style(
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::DIM),
-            );
-        }
-        if i == selected {
-            row = row.style(Style::default().add_modifier(Modifier::REVERSED));
-        }
-        row
-    });
+            let mut row = Row::new(cells);
+            if account.disabled {
+                row = row.style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                );
+            }
+            if i == selected {
+                row = row.style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+            row
+        })
+        .collect();
 
-    let widths = [
+    let widths = vec![
         Constraint::Length(18),
         Constraint::Length(3),
         Constraint::Length(9),
@@ -278,12 +301,14 @@ fn render_accounts(
     // account is never silent.
     let total = snapshot.accounts.len() as u16;
     let shown = area.height.saturating_sub(ACCOUNTS_CHROME).min(total);
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(accounts_title(shown, total)),
+    render_table(
+        frame,
+        area,
+        header,
+        widths,
+        rows,
+        accounts_title(shown, total),
     );
-    frame.render_widget(table, area);
 }
 
 /// One row in the sessions pane's account→session tree: either an account
@@ -392,14 +417,13 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
     let header = Row::new(vec!["Session", "Reqs", "Last"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let widths = [
+    let widths = vec![
         Constraint::Length(28),
         Constraint::Length(6),
         Constraint::Length(8),
     ];
 
-    let age =
-        |seen: Option<OffsetDateTime>| seen.map_or_else(|| "—".to_string(), |t| fmt_age(now - t));
+    let age = |seen: Option<OffsetDateTime>| fmt_age_opt(seen, now);
 
     let capacity = area.height.saturating_sub(3) as usize;
     let rows: Vec<Row> = if snapshot.sessions.is_empty() {
@@ -457,10 +481,7 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
             .collect()
     };
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" sessions "));
-    frame.render_widget(table, area);
+    render_table(frame, area, header, widths, rows, " sessions ");
 }
 
 /// The recent-request log pane. Rows are already most-recent-first.
@@ -515,9 +536,7 @@ fn bar(util: Option<f64>) -> String {
 
 /// The probe-health cell: an age since the last probe plus a coloured status.
 fn probe_cell(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
-    let age = account
-        .last_probe
-        .map_or_else(|| "—".to_string(), |t| fmt_age(now - t));
+    let age = fmt_age_opt(account.last_probe, now);
     match account.probe_status {
         ProbeStatus::Ok => (format!("ok {age}"), Style::default().fg(Color::Green)),
         ProbeStatus::Error => (format!("ERR {age}"), Style::default().fg(Color::Red)),
@@ -569,6 +588,12 @@ fn fmt_tokens(count: u64) -> String {
     } else {
         count.to_string()
     }
+}
+
+/// Age of an optional instant relative to `now`, or an em-dash when absent —
+/// the "—"-or-[`fmt_age`] pattern shared by the account, session, and probe cells.
+fn fmt_age_opt(seen: Option<OffsetDateTime>, now: OffsetDateTime) -> String {
+    seen.map_or_else(|| "—".to_string(), |t| fmt_age(now - t))
 }
 
 /// Humanize a duration as a compact age (`45s`, `12m`, `3h`, `2d`).

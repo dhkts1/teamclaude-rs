@@ -109,7 +109,9 @@ impl Quota {
     /// windows that were not reported this time untouched.
     pub fn update_from_headers(&mut self, headers: &impl HeaderView) {
         let now = OffsetDateTime::now_utc();
-        if let Some(util) = get_f64(headers, "anthropic-ratelimit-unified-5h-utilization") {
+        if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-5h-utilization")
+            .filter(|v| v.is_finite())
+        {
             let reported = get_reset(headers, "anthropic-ratelimit-unified-5h-reset");
             let reset = resolve_reset(
                 reported,
@@ -122,7 +124,9 @@ impl Quota {
                 reset,
             });
         }
-        if let Some(util) = get_f64(headers, "anthropic-ratelimit-unified-7d-utilization") {
+        if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-7d-utilization")
+            .filter(|v| v.is_finite())
+        {
             let reported = get_reset(headers, "anthropic-ratelimit-unified-7d-reset");
             let reset = resolve_reset(
                 reported,
@@ -135,7 +139,10 @@ impl Quota {
                 reset,
             });
         }
-        if let Some(util) = get_f64(headers, "anthropic-ratelimit-unified-7d_oi-utilization") {
+        if let Some(util) =
+            get_parsed::<f64>(headers, "anthropic-ratelimit-unified-7d_oi-utilization")
+                .filter(|v| v.is_finite())
+        {
             let reported = get_reset(headers, "anthropic-ratelimit-unified-7d_oi-reset");
             let reset = resolve_reset(
                 reported,
@@ -153,16 +160,16 @@ impl Quota {
             self.status = Some(status.to_string());
         }
 
-        if let Some(v) = get_i64(headers, "anthropic-ratelimit-tokens-limit") {
+        if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-tokens-limit") {
             self.tokens_limit = Some(v);
         }
-        if let Some(v) = get_i64(headers, "anthropic-ratelimit-tokens-remaining") {
+        if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-tokens-remaining") {
             self.tokens_remaining = Some(v);
         }
-        if let Some(v) = get_i64(headers, "anthropic-ratelimit-requests-limit") {
+        if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-requests-limit") {
             self.requests_limit = Some(v);
         }
-        if let Some(v) = get_i64(headers, "anthropic-ratelimit-requests-remaining") {
+        if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-requests-remaining") {
             self.requests_remaining = Some(v);
         }
         if let Some(reset) = get_reset(headers, "anthropic-ratelimit-tokens-reset")
@@ -260,14 +267,10 @@ fn apply_bucket(
     *window = Some(QuotaWindow { utilization, reset });
 }
 
-fn get_f64(headers: &impl HeaderView, name: &str) -> Option<f64> {
-    headers
-        .get_str(name)
-        .and_then(|s| s.trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-}
-
-fn get_i64(headers: &impl HeaderView, name: &str) -> Option<i64> {
+/// Parse a trimmed header value into any `FromStr` target. The `f64` NaN/inf
+/// guard is NOT applied here (the generic can't know `T` is a float) — the f64
+/// call sites append `.filter(|v| v.is_finite())` themselves.
+fn get_parsed<T: std::str::FromStr>(headers: &impl HeaderView, name: &str) -> Option<T> {
     headers.get_str(name).and_then(|s| s.trim().parse().ok())
 }
 
@@ -341,7 +344,8 @@ mod tests {
         for bad in ["nan", "inf", "-inf"] {
             let headers = TestHeaders::new(&[("anthropic-ratelimit-unified-5h-utilization", bad)]);
             assert_eq!(
-                get_f64(&headers, "anthropic-ratelimit-unified-5h-utilization"),
+                get_parsed::<f64>(&headers, "anthropic-ratelimit-unified-5h-utilization")
+                    .filter(|v| v.is_finite()),
                 None,
                 "{bad:?} must parse to None"
             );
@@ -355,7 +359,8 @@ mod tests {
 
         let headers = TestHeaders::new(&[("anthropic-ratelimit-unified-5h-utilization", "0.87")]);
         assert_eq!(
-            get_f64(&headers, "anthropic-ratelimit-unified-5h-utilization"),
+            get_parsed::<f64>(&headers, "anthropic-ratelimit-unified-5h-utilization")
+                .filter(|v| v.is_finite()),
             Some(0.87)
         );
     }
