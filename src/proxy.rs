@@ -391,6 +391,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             builder = builder.body(out_body);
         }
 
+        // Global outbound throttle: pace the AGGREGATE egress so a cold fan-out
+        // cannot burst the shared upstream limiter. Inert unless configured. Placed
+        // after account selection/token so only real sends consume a slot; both the
+        // 401 force-refresh retry and the transient-429 retry loop back here, so
+        // every retry is paced automatically.
+        manager.throttle_send().await;
+
         let resp = match builder.send().await {
             Ok(resp) => resp,
             Err(_) => {
@@ -900,6 +907,7 @@ mod tests {
             upstream: upstream.to_string(),
             switch_threshold: 0.90,
             pacing: crate::config::PacingConfig::default(),
+            throttle: crate::config::ThrottleConfig::default(),
             accounts: vec![Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),
