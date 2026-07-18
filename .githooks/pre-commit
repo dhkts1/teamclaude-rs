@@ -5,6 +5,17 @@
 # Enable in a fresh clone:  git config core.hooksPath .githooks
 set -euo pipefail
 
+# Reminder (non-blocking): this repository is PUBLIC. The gitleaks scan below is
+# the hard gate; this banner is the human nudge that everything committed here is
+# world-readable once pushed.
+printf '%s\n' \
+  "──────────────────────────────────────────────────────────────" \
+  "  ⚠  PUBLIC REPO — github.com/dhkts1/teamclaude-rs" \
+  "  Anything you push is world-readable. Do NOT commit: secrets," \
+  "  tokens, real account emails/UUIDs, ~/ paths, or internal" \
+  "  (Henry) scaffolding — plans, bridges, swarm state." \
+  "──────────────────────────────────────────────────────────────" >&2
+
 if ! command -v gitleaks >/dev/null 2>&1; then
   echo "pre-commit: gitleaks not installed — skipping secret scan." >&2
   echo "            install it to scan for secrets:  brew install gitleaks" >&2
