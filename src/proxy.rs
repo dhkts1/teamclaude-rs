@@ -908,6 +908,7 @@ mod tests {
             switch_threshold: 0.90,
             pacing: crate::config::PacingConfig::default(),
             throttle: crate::config::ThrottleConfig::default(),
+            lock_account: None,
             accounts: vec![Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),

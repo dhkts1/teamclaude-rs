@@ -218,6 +218,10 @@ pub struct Manager {
     /// Global outbound throttle knobs, snapshotted from config at construction
     /// (default all-`None` → inert → byte-identical to the no-throttle build).
     throttle: ThrottleConfig,
+    /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
+    /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
+    /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
+    locked_idx: Option<usize>,
     /// GCRA theoretical-arrival-time (epoch ms) for the global outbound throttle.
     /// Guarded by an async mutex held ONLY for the O(1) slot update, released
     /// before any sleep so concurrent callers stagger and sleep concurrently.
@@ -354,7 +358,21 @@ impl Manager {
         let pacing = config.pacing.clone();
         let throttle = config.throttle.clone();
 
-        Arc::new(Self {
+        let locked_idx = config.lock_account.as_ref().and_then(|name| {
+            let idx = accounts.iter().position(|a| a.name == *name);
+            if idx.is_none() {
+                let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+                tracing::error!(
+                    lock_account = %name, available = ?names,
+                    "lockAccount name did not match any account — running UNLOCKED (normal routing)"
+                );
+            }
+            idx
+        });
+        // Capture the locked account name BEFORE `accounts` is moved into the struct.
+        let locked_name = locked_idx.and_then(|i| accounts.get(i).map(|a| a.name.clone()));
+
+        let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
             refresh_locks,
             refresher,
@@ -385,6 +403,7 @@ impl Manager {
             global_threshold,
             pacing,
             throttle,
+            locked_idx,
             throttle_tat_ms: AsyncMutex::new(0),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
@@ -392,7 +411,16 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             session_seq: AtomicU64::new(1),
-        })
+        });
+
+        if let (Some(i), Some(name)) = (locked_idx, locked_name) {
+            tracing::warn!(
+                account = %name, idx = i,
+                "ACCOUNT LOCK ACTIVE — all traffic pinned to one account; rotation/affinity/migration bypassed, no failover"
+            );
+        }
+
+        manager
     }
 
     /// Convenience constructor for the real binary (live OAuth refresher + live
@@ -655,6 +683,13 @@ impl Manager {
         model: Option<&str>,
         affinity: Option<u64>,
     ) -> Option<usize> {
+        // Hard account lock: pin ALL traffic to the configured account, bypassing
+        // rotation/affinity/migration. `tried` still ends the rotation loop — once the
+        // locked account has failed this request, return None (no failover to the pool).
+        if let Some(li) = self.locked_idx {
+            return if tried.contains(&li) { None } else { Some(li) };
+        }
+
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
@@ -1877,6 +1912,7 @@ mod tests {
             switch_threshold: 0.90,
             pacing: PacingConfig::default(),
             throttle: ThrottleConfig::default(),
+            lock_account: None,
             accounts,
             extra: serde_json::Map::new(),
         }
@@ -2229,6 +2265,87 @@ mod tests {
             serde_json::Value::from(warmup_seconds),
         );
         config
+    }
+
+    // ---- hard account lock (`lockAccount`; no failover) -----------------------
+
+    fn lock_refresher() -> Arc<CountingRefresher> {
+        Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    fn config_with_lock(accounts: Vec<Account>, lock: &str) -> Config {
+        let mut config = config_with(accounts);
+        config.lock_account = Some(lock.to_string());
+        config
+    }
+
+    /// A hard lock pins EVERY select to the locked index, ignoring the LRU
+    /// preference and any session-affinity key that points elsewhere.
+    #[test]
+    fn select_lock_always_returns_locked_idx() {
+        let manager = build_manager(
+            config_with_lock(
+                vec![account("zero", 0), account("one", 0), account("two", 0)],
+                "one",
+            ),
+            lock_refresher(),
+        );
+        assert_eq!(manager.locked_idx, Some(1));
+        let now = OffsetDateTime::now_utc();
+        // No affinity, empty tried → locked account regardless of LRU (index 0
+        // would be the natural first pick here).
+        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(1));
+        // An affinity key returns the SAME locked account (lock ignores affinity).
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(42)),
+            Some(1)
+        );
+        // Bias the LRU toward index 0 by pinning affinity elsewhere first — lock
+        // still wins.
+        assert_eq!(manager.select(&HashSet::new(), now, None, Some(7)), Some(1));
+    }
+
+    /// The lock has NO failover: once the locked account is in `tried`, select
+    /// returns None rather than rotating to the pool.
+    #[test]
+    fn select_lock_returns_none_when_locked_tried() {
+        let manager = build_manager(
+            config_with_lock(vec![account("zero", 0), account("one", 0)], "one"),
+            lock_refresher(),
+        );
+        assert_eq!(manager.locked_idx, Some(1));
+        let now = OffsetDateTime::now_utc();
+        let mut tried = HashSet::new();
+        tried.insert(1usize);
+        assert_eq!(manager.select(&tried, now, None, None), None);
+    }
+
+    /// `assemble` resolves the configured name to its account index; a name that
+    /// matches no account resolves to None (runs unlocked).
+    #[test]
+    fn assemble_resolves_lock_name() {
+        let matched = build_manager(
+            config_with_lock(vec![account("a", 0), account("b", 0), account("c", 0)], "c"),
+            lock_refresher(),
+        );
+        assert_eq!(matched.locked_idx, Some(2));
+
+        let unmatched = build_manager(
+            config_with_lock(vec![account("a", 0), account("b", 0)], "ghost"),
+            lock_refresher(),
+        );
+        assert_eq!(unmatched.locked_idx, None);
+    }
+
+    /// Absent `lockAccount` → `locked_idx == None` → select is unchanged.
+    #[test]
+    fn unlocked_default_leaves_locked_idx_none() {
+        let manager = build_manager(config_with(vec![account("solo", 0)]), lock_refresher());
+        assert_eq!(manager.locked_idx, None);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(0));
     }
 
     #[test]
