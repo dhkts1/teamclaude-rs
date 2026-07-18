@@ -16,16 +16,33 @@ printf '%s\n' \
   "  (Henry) scaffolding — plans, bridges, swarm state." \
   "──────────────────────────────────────────────────────────────" >&2
 
-if ! command -v gitleaks >/dev/null 2>&1; then
-  echo "pre-commit: gitleaks not installed — skipping secret scan." >&2
-  echo "            install it to scan for secrets:  brew install gitleaks" >&2
-  exit 0   # warn only; a missing tool must not block every commit
+# ── Secret scan (gitleaks) ──────────────────────────────────────────────────
+# git runs hooks from the repo root, so cwd already holds .gitleaks.toml.
+if command -v gitleaks >/dev/null 2>&1; then
+  if ! gitleaks git --staged --no-banner --redact; then
+    echo "" >&2
+    echo "pre-commit: BLOCKED — gitleaks found a secret in your staged changes." >&2
+    echo "  Remove it, or (if it's a genuine false positive) allowlist it in .gitleaks.toml." >&2
+    exit 1
+  fi
+else
+  # Warn only — a missing tool must not block every commit. Do NOT exit here,
+  # or the rustfmt gate below becomes dead code on gitleaks-less machines.
+  echo "pre-commit: gitleaks not installed — skipping secret scan (brew install gitleaks)." >&2
 fi
 
-# git runs hooks from the repo root, so cwd already holds .gitleaks.toml.
-if ! gitleaks git --staged --no-banner --redact; then
-  echo "" >&2
-  echo "pre-commit: BLOCKED — gitleaks found a secret in your staged changes." >&2
-  echo "  Remove it, or (if it's a genuine false positive) allowlist it in .gitleaks.toml." >&2
-  exit 1
+# ── Rust format gate ────────────────────────────────────────────────────────
+# Mirror CI's `cargo fmt --check` Format job so a formatting slip is caught here,
+# not after a push goes red. Only fires when the commit stages Rust files.
+if git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
+  if command -v cargo >/dev/null 2>&1; then
+    if ! cargo fmt --check >/dev/null 2>&1; then
+      echo "" >&2
+      echo "pre-commit: BLOCKED — cargo fmt --check failed; CI's Format job would go red." >&2
+      echo "  Fix it:  cargo fmt   then re-stage and commit." >&2
+      exit 1
+    fi
+  else
+    echo "pre-commit: cargo not found — skipping rustfmt check." >&2
+  fi
 fi
