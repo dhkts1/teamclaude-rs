@@ -165,10 +165,10 @@ pub async fn refresh_access_token_at(
             .await
             .map_err(|e| OAuthError::Transient(e.to_string()))?;
 
-        let expires_at_ms = data
-            .expires_at
-            .map(normalize_expires_at)
-            .unwrap_or_else(|| expires_at_from(crate::now_ms(), data.expires_in));
+        let expires_at_ms = data.expires_at.map_or_else(
+            || expires_at_from(crate::now_ms(), data.expires_in),
+            normalize_expires_at,
+        );
 
         return Ok(Tokens {
             access_token: data.access_token,
@@ -240,7 +240,6 @@ impl TokenRefresher for LiveRefresher {
 
 use std::io::Write as _;
 use std::path::Path;
-use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context as _};
 use oauth2::basic::BasicClient;
@@ -571,10 +570,10 @@ fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
         _ => bail!("token exchange returned no refresh_token"),
     };
 
-    let expires_at_ms = data
-        .expires_at
-        .map(normalize_expires_at)
-        .unwrap_or_else(|| expires_at_from(crate::now_ms(), data.expires_in));
+    let expires_at_ms = data.expires_at.map_or_else(
+        || expires_at_from(crate::now_ms(), data.expires_in),
+        normalize_expires_at,
+    );
 
     Ok(Tokens {
         access_token: data.access_token,
@@ -721,8 +720,7 @@ pub fn upsert_account(
         .iter()
         .filter_map(|a| a.priority)
         .max()
-        .map(|max| max + 1)
-        .unwrap_or(0);
+        .map_or(0, |max| max + 1);
 
     config.accounts.push(Account {
         name: name.to_string(),
@@ -743,8 +741,6 @@ pub fn upsert_account(
 /// Run the full browser OAuth login and persist the account to `config_path`.
 /// Returns the account name on success. Never logs or prints the tokens.
 pub async fn login(config_path: &Path) -> anyhow::Result<String> {
-    let started = Instant::now();
-
     // Bind the callback server on a random loopback port (127.0.0.1 only).
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -785,7 +781,6 @@ pub async fn login(config_path: &Path) -> anyhow::Result<String> {
     );
     config::save(config_path, &config).context("save config after login")?;
 
-    let _ = started; // (kept for parity with the timed JS flow)
     println!("Saved account '{name}' to {}", config_path.display());
     Ok(name)
 }

@@ -192,14 +192,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let client_is_loopback = parts
         .extensions
         .get::<ClientAddr>()
-        .map(|a| a.0.ip().is_loopback())
-        .unwrap_or(false);
+        .is_some_and(|a| a.0.ip().is_loopback());
     let method = parts.method;
     let path_and_query = parts
         .uri
         .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
+        .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
     let req_headers = parts.headers;
 
     // 1. Auth: when a proxy key is configured, `x-api-key` must match it — EXCEPT
@@ -255,8 +253,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // matched by name. `rsplit_once` mirrors the crate's CONNECT-target split.
         let is_loopback = host
             .parse::<std::net::IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false)
+            .is_ok_and(|ip| ip.is_loopback())
             || host == "localhost";
         if !is_loopback && !crate::mitm::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
@@ -270,16 +267,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     }
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
-    let body_bytes = match to_bytes(body, MAX_BODY_BYTES).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Failed to read request body.",
-                None,
-            );
-        }
+    let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Failed to read request body.",
+            None,
+        );
     };
 
     // Parse the request's target model ONCE — it is constant across the rotation
@@ -398,15 +392,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // every retry is paced automatically.
         manager.throttle_send().await;
 
-        let resp = match builder.send().await {
-            Ok(resp) => resp,
-            Err(_) => {
-                // Transport failure is not proof of a bad credential — fail this
-                // request over to another account, keep this one eligible.
-                saw_network_error = true;
-                tried.insert(idx);
-                continue;
-            }
+        let Ok(resp) = builder.send().await else {
+            // Transport failure is not proof of a bad credential — fail this
+            // request over to another account, keep this one eligible.
+            saw_network_error = true;
+            tried.insert(idx);
+            continue;
         };
 
         let status = resp.status();
@@ -758,8 +749,7 @@ fn is_quota_rejected(headers: &HeaderMap) -> bool {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.eq_ignore_ascii_case("rejected"))
-            .unwrap_or(false)
+            .is_some_and(|s| s.eq_ignore_ascii_case("rejected"))
     };
     rejected("anthropic-ratelimit-unified-status")
         || rejected("anthropic-ratelimit-unified-5h-status")

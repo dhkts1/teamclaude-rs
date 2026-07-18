@@ -192,7 +192,7 @@ impl Quota {
         // standard window pins the account out of rotation forever (there is no
         // OAuth probe for API-key accounts to re-read it). Only gate while the
         // window is still unexpired.
-        let standard_expired = self.standard_reset.map(|r| now >= r).unwrap_or(false);
+        let standard_expired = self.standard_reset.is_some_and(|r| now >= r);
         if !standard_expired {
             if let (Some(limit), Some(remaining)) = (self.tokens_limit, self.tokens_remaining) {
                 if limit > 0 && 1.0 - (remaining as f64 / limit as f64) >= threshold {
@@ -215,8 +215,7 @@ impl Quota {
     /// [`QuotaWindow::effective`], so a past-reset bucket reads a fresh `0.0`.
     pub fn model_weekly_exhausted(&self, threshold: f64, now: OffsetDateTime) -> bool {
         self.seven_day_oi
-            .map(|w| w.effective(now) >= threshold)
-            .unwrap_or(false)
+            .is_some_and(|w| w.effective(now) >= threshold)
     }
 
     /// Reset of the weekly bucket that governs rotation ordering, but only while
