@@ -56,6 +56,50 @@ const INLINE_WAIT_MAX_SECS: i64 = 15;
 /// How many times one account may be inline-retried on a transient `429` before
 /// we give up on it and rotate — bounds a pathological same-account loop.
 const MAX_SAME_ACCOUNT_429: u32 = 2;
+/// Hold applied to a transient 429 that carries NO retry-after / reset header
+/// (σ5, 2026-07-18 live capture: Anthropic burst 429s carry neither). Short so a
+/// cold-fan-out that trips every account recovers in seconds instead of the ~60s
+/// fleet blackout the old unwrap_or(60) default caused. Rotates rather than
+/// inline-retrying the limited account.
+const NO_GUIDANCE_HOLD_SECS: i64 = 15;
+/// Max random jitter (seconds) added to the no-guidance hold: desync the un-park
+/// of accounts that tripped together, so a synchronized wave can't re-arm a
+/// sliding-window limiter.
+const NO_GUIDANCE_JITTER_MAX_SECS: i64 = 5;
+
+/// How a transient (non-quota-rejected) 429 should be handled.
+#[derive(Debug, PartialEq, Eq)]
+enum Transient429 {
+    /// Wait `secs` inline on the same account, then retry it.
+    InlineWait(i64),
+    /// Park the account for `secs` and rotate to another.
+    Park(i64),
+}
+
+/// Decide how to handle a transient (non-quota-rejected) 429. Pure — unit-tested.
+///
+/// A PRESENT `retry-after` keeps the historical semantics (inline-wait a short
+/// hint, else park+rotate). An ABSENT header no longer fabricates a 60s park
+/// (which blacked out the whole fleet on a cold fan-out); it parks a short
+/// [`NO_GUIDANCE_HOLD_SECS`] and rotates so the next probe can discover the real
+/// window instead of the account inline-retrying into its own limit.
+///
+/// `jitter` (seconds) is added ONLY to the no-guidance hold so accounts that
+/// tripped together un-park at staggered times; the present-`retry-after` path
+/// ignores it and stays byte-identical to the historical behavior.
+fn classify_transient_429(retry_after: Option<i64>, retried: u32, jitter: i64) -> Transient429 {
+    match retry_after {
+        Some(secs) => {
+            let wait = secs.clamp(1, 300);
+            if retried < MAX_SAME_ACCOUNT_429 && wait <= INLINE_WAIT_MAX_SECS {
+                Transient429::InlineWait(wait)
+            } else {
+                Transient429::Park(wait)
+            }
+        }
+        None => Transient429::Park(NO_GUIDANCE_HOLD_SECS + jitter),
+    }
+}
 
 /// The client's socket address, injected into request extensions by the hybrid
 /// server ([`crate::mitm::serve_http`]) so the auth layer can exempt loopback
@@ -436,23 +480,30 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 quota_rejected = is_quota_rejected(&up_headers),
                 "429 diagnostic"
             );
-            let retry_after = parse_retry_after(&up_headers).unwrap_or(60);
+            let retry_after_raw = parse_retry_after(&up_headers);
+            let retry_after = retry_after_raw.unwrap_or(60);
             if is_quota_rejected(&up_headers) {
                 manager.mark_rate_limited(idx, retry_after.clamp(1, 3600));
                 tried.insert(idx);
                 continue;
             }
-            let wait = retry_after.clamp(1, 300);
             let count = retried_429.entry(idx).or_insert(0);
-            if *count < MAX_SAME_ACCOUNT_429 && wait <= INLINE_WAIT_MAX_SECS {
-                *count += 1;
-                tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                retry_same = Some(idx);
-                continue; // retry the same account after the bounded wait
+            // Desync the no-guidance un-park across accounts that tripped together;
+            // derive the jitter from the loop clock so no `rand` dependency is needed.
+            let jitter = (now.nanosecond() as i64) % (NO_GUIDANCE_JITTER_MAX_SECS + 1);
+            match classify_transient_429(retry_after_raw, *count, jitter) {
+                Transient429::InlineWait(wait) => {
+                    *count += 1;
+                    tokio::time::sleep(Duration::from_secs(wait as u64)).await;
+                    retry_same = Some(idx);
+                    continue; // retry the same account after the bounded wait
+                }
+                Transient429::Park(wait) => {
+                    manager.mark_rate_limited(idx, wait);
+                    tried.insert(idx);
+                    continue;
+                }
             }
-            manager.mark_rate_limited(idx, wait);
-            tried.insert(idx);
-            continue;
         }
 
         // Terminal outcome (2xx, or a 3xx/4xx/5xx forwarded verbatim). Count the
@@ -894,6 +945,49 @@ mod tests {
         // Absent header → None.
         let empty = HeaderMap::new();
         assert_eq!(parse_retry_after(&empty), None);
+    }
+
+    #[test]
+    fn classify_transient_429_absent_parks_short() {
+        // THE BITING TEST: an absent retry-after must park the short
+        // NO_GUIDANCE_HOLD_SECS base (15), not the old fabricated 60. The pre-fix
+        // inline logic fabricated a 60s park for an absent retry-after
+        // (unwrap_or(60), 60 > the 15s inline bound → Park(60)); this asserts the
+        // new short base value instead — the oracle for the fleet-blackout fix.
+        assert_eq!(
+            classify_transient_429(None, 0, 0),
+            Transient429::Park(NO_GUIDANCE_HOLD_SECS)
+        );
+        assert_eq!(classify_transient_429(None, 0, 0), Transient429::Park(15));
+        // Jitter adds to the base hold so co-tripping accounts un-park staggered.
+        assert_eq!(classify_transient_429(None, 0, 5), Transient429::Park(20));
+    }
+
+    #[test]
+    fn classify_transient_429_present_retry_after_unchanged() {
+        // A non-zero jitter must be IGNORED on the present-retry-after path — it
+        // only affects the no-guidance (None) hold. Pass jitter=3 throughout and
+        // assert the results are the historical byte-identical values.
+        // Short hint under the inline bound, retry budget available → inline-wait.
+        assert_eq!(
+            classify_transient_429(Some(3), 0, 3),
+            Transient429::InlineWait(3)
+        );
+        // Retry cap reached → park the same short wait, rotate.
+        assert_eq!(
+            classify_transient_429(Some(3), MAX_SAME_ACCOUNT_429, 3),
+            Transient429::Park(3)
+        );
+        // Upper clamp: anything over 300 parks at 300.
+        assert_eq!(
+            classify_transient_429(Some(500), 0, 3),
+            Transient429::Park(300)
+        );
+        // Lower clamp: 0 becomes 1, still within the inline bound → inline-wait.
+        assert_eq!(
+            classify_transient_429(Some(0), 0, 3),
+            Transient429::InlineWait(1)
+        );
     }
 
     #[test]
