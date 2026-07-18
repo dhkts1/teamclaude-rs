@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Lean single-user rotating Anthropic proxy with a live TUI — a Rust replacement for the personal teamclaude proxy"
+repository = "https://github.com/dhkts1/teamclaude-rs"
+homepage = "https://github.com/dhkts1/teamclaude-rs"
 
 [[bin]]
 name = "tcr"
@@ -53,4 +55,9 @@ rcgen = "0.14.8"
 
 [profile.release]
 opt-level = 3
+lto = "thin"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
 lto = "thin"
