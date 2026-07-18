@@ -510,8 +510,7 @@ impl Manager {
             .extra
             .get("quotaProbeSeconds")
             .and_then(|v| v.as_i64())
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(crate::probe::DEFAULT_PROBE_SECONDS)
+            .map_or(crate::probe::DEFAULT_PROBE_SECONDS, |v| v.max(0) as u64)
     }
 
     /// Configured keep-warm cadence in seconds, read from the config's unmodelled
@@ -525,8 +524,7 @@ impl Manager {
             .extra
             .get("warmupSeconds")
             .and_then(|v| v.as_i64())
-            .map(|v| v.max(0) as u64)
-            .unwrap_or(0)
+            .map_or(0, |v| v.max(0) as u64)
     }
 
     /// Whether session affinity is enabled, read from the config's unmodelled
@@ -1025,8 +1023,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map(|r| r.unix_timestamp() as i128)
-                .unwrap_or(i128::MIN);
+                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
             let key = (account.priority, account.last_selected_seq, reset);
             if best_key.is_none_or(|b| key < b) {
                 best = Some(idx);
@@ -1070,8 +1067,7 @@ impl Manager {
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
-                .map(|r| r.unix_timestamp() as i128)
-                .unwrap_or(i128::MIN);
+                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
             let key = (
                 account.in_flight,
                 account.priority,

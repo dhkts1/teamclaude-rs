@@ -165,8 +165,7 @@ impl Patcher {
                 let is_key = self
                     .frames
                     .last()
-                    .map(|t| t.is_obj && t.awaiting_key)
-                    .unwrap_or(false);
+                    .is_some_and(|t| t.is_obj && t.awaiting_key);
                 if is_key {
                     self.reading_key = true;
                     self.key_buf.clear();
@@ -177,15 +176,11 @@ impl Patcher {
                     self.esc = false;
                     self.reading_key = false;
                     let is_target = self.frames.len() == 2
-                        && self
-                            .frames
-                            .last()
-                            .map(|t| {
-                                t.is_obj
-                                    && t.name.as_deref() == Some("metadata")
-                                    && t.key.as_deref() == Some("user_id")
-                            })
-                            .unwrap_or(false);
+                        && self.frames.last().is_some_and(|t| {
+                            t.is_obj
+                                && t.name.as_deref() == Some("metadata")
+                                && t.key.as_deref() == Some("user_id")
+                        });
                     if is_target {
                         self.target = true;
                         self.match_pos = 0;

@@ -230,8 +230,7 @@ fn render_accounts(
         let (quota_label, quota_style) = quota_cell(account.quota_state);
         let last_used = account
             .last_used
-            .map(|t| fmt_age(now - t))
-            .unwrap_or_else(|| "—".to_string());
+            .map_or_else(|| "—".to_string(), |t| fmt_age(now - t));
 
         let cells = vec![
             Cell::from(format!("{marker}{}", account.name)),
@@ -399,10 +398,8 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
         Constraint::Length(8),
     ];
 
-    let age = |seen: Option<OffsetDateTime>| {
-        seen.map(|t| fmt_age(now - t))
-            .unwrap_or_else(|| "—".to_string())
-    };
+    let age =
+        |seen: Option<OffsetDateTime>| seen.map_or_else(|| "—".to_string(), |t| fmt_age(now - t));
 
     let capacity = area.height.saturating_sub(3) as usize;
     let rows: Vec<Row> = if snapshot.sessions.is_empty() {
@@ -520,8 +517,7 @@ fn bar(util: Option<f64>) -> String {
 fn probe_cell(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
     let age = account
         .last_probe
-        .map(|t| fmt_age(now - t))
-        .unwrap_or_else(|| "—".to_string());
+        .map_or_else(|| "—".to_string(), |t| fmt_age(now - t));
     match account.probe_status {
         ProbeStatus::Ok => (format!("ok {age}"), Style::default().fg(Color::Green)),
         ProbeStatus::Error => (format!("ERR {age}"), Style::default().fg(Color::Red)),

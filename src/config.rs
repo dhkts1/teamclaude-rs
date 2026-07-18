@@ -246,9 +246,7 @@ pub struct Config {
 /// `~/Library/Application Support` on macOS) — the JS proxy hard-codes
 /// `~/.config`, and this binary is a drop-in for it.
 pub fn default_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
     home.join(".config").join("teamclaude.json")
 }
 
@@ -274,10 +272,10 @@ pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     // rotated refresh token. Fails loudly on a real perms error (finding #2).
     fs::create_dir_all(dir)?;
 
-    let file_name = path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "teamclaude.json".to_string());
+    let file_name = path.file_name().map_or_else(
+        || "teamclaude.json".to_string(),
+        |f| f.to_string_lossy().into_owned(),
+    );
     // A per-call unique temp name: two concurrent saves (e.g. `probe_all`
     // refreshing several expired accounts at once) must not open and truncate the
     // SAME temp file and interleave into a corrupt write (finding #6).

@@ -133,8 +133,7 @@ pub fn find_scoped_weekly_limit(data: &Value, needle: &str) -> Option<Value> {
                 .and_then(|s| s.get("model"))
                 .and_then(|m| m.get("display_name"))
                 .and_then(Value::as_str)
-                .map(|name| name.to_lowercase().contains(&needle))
-                .unwrap_or(false)
+                .is_some_and(|name| name.to_lowercase().contains(&needle))
     })?;
     Some(serde_json::json!({
         "utilization": entry.get("percent"),
@@ -263,11 +262,6 @@ impl ProbeStatus {
             ProbeStatus::Timeout => "timeout",
             ProbeStatus::RateLimited => "rate-limited",
         }
-    }
-
-    /// Is this a failing state the TUI should flag red?
-    pub fn is_failure(self) -> bool {
-        matches!(self, ProbeStatus::Error | ProbeStatus::Timeout)
     }
 }
 

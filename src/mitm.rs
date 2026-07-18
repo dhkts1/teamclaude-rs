@@ -104,8 +104,7 @@ pub fn parse_connect_target(line: &str) -> Option<(String, u16)> {
 fn config_dir() -> PathBuf {
     crate::config::default_path()
         .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
 /// Ensure a process-wide rustls crypto provider is installed before building a

@@ -5,6 +5,15 @@
 //! their quota fills, refreshes tokens on expiry, streams requests to Anthropic
 //! unchanged, and surfaces a live TUI. See `DESIGN.md` for the full contract.
 
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
+#![warn(
+    clippy::todo,
+    clippy::dbg_macro,
+    clippy::map_unwrap_or,
+    clippy::manual_let_else
+)]
+
 pub mod account_uuid;
 pub mod cli;
 pub mod config;
