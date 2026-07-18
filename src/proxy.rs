@@ -810,7 +810,11 @@ fn error_response(
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
 fn exhausted_response(manager: &Manager, now: OffsetDateTime, account_count: usize) -> Response {
     let retry_after = manager.retry_after_hint(now);
-    tracing::warn!(account_count, retry_after, "returning fleet-exhausted 429 to client");
+    tracing::warn!(
+        account_count,
+        retry_after,
+        "returning fleet-exhausted 429 to client"
+    );
     error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
