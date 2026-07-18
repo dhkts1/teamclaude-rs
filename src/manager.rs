@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use time::OffsetDateTime;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::config::{self, Config, PacingConfig};
+use crate::config::{self, Config, PacingConfig, ThrottleConfig};
 use crate::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
 use crate::probe::{LiveUsageProber, ProbeStatus, Usage, UsageProber};
 use crate::quota::Quota;
@@ -215,6 +215,13 @@ pub struct Manager {
     /// construction. Default (all `None`) → inert → selection is byte-identical to
     /// the no-pacing build. See [`config::PacingConfig`].
     pacing: PacingConfig,
+    /// Global outbound throttle knobs, snapshotted from config at construction
+    /// (default all-`None` → inert → byte-identical to the no-throttle build).
+    throttle: ThrottleConfig,
+    /// GCRA theoretical-arrival-time (epoch ms) for the global outbound throttle.
+    /// Guarded by an async mutex held ONLY for the O(1) slot update, released
+    /// before any sleep so concurrent callers stagger and sleep concurrently.
+    throttle_tat_ms: AsyncMutex<i64>,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
     /// Monotonic counter handed out one tick at a time by [`Manager::select`] to
@@ -286,6 +293,18 @@ fn odt_to_ms(now: OffsetDateTime) -> i64 {
     (now.unix_timestamp_nanos() / 1_000_000) as i64
 }
 
+/// Pure GCRA slot computation for the global outbound throttle. Given the current
+/// theoretical-arrival-time `tat_ms`, the arrival `now_ms`, the emission interval
+/// `spacing_ms` (T) and bucket capacity `burst` (B), returns
+/// `(new_tat_ms, allow_at_ms)`. The caller advances the stored TAT to `new_tat_ms`
+/// and sleeps until `allow_at_ms` if it is in the future. `burst` requests admit
+/// instantly after idle (allow_at <= now), then one per T.
+fn throttle_slot(tat_ms: i64, now_ms: i64, spacing_ms: i64, burst: u32) -> (i64, i64) {
+    let tau = spacing_ms * (burst.max(1) as i64 - 1); // burst tolerance (B-1)*T
+    let base = tat_ms.max(now_ms); // can't schedule in the past
+    (base + spacing_ms, base - tau) // (new TAT, earliest allowed)
+}
+
 fn ms_to_odt(ms: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok()
 }
@@ -333,6 +352,7 @@ impl Manager {
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let pacing = config.pacing.clone();
+        let throttle = config.throttle.clone();
 
         Arc::new(Self {
             accounts: RwLock::new(accounts),
@@ -364,6 +384,8 @@ impl Manager {
             proxy_api_key,
             global_threshold,
             pacing,
+            throttle,
+            throttle_tat_ms: AsyncMutex::new(0),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
             select_seq: AtomicU64::new(1),
@@ -401,6 +423,29 @@ impl Manager {
             None,
             accounts,
         )
+    }
+
+    /// Global outbound-initiation throttle. Inert (returns immediately) unless
+    /// `throttle` is configured. When active, applies a GCRA token bucket across the
+    /// WHOLE fleet at the single send site so a cold fan-out cannot burst the shared
+    /// upstream limiter. Holds NO resource across the sleep — pure initiation delay,
+    /// cannot deadlock, never turns a request into a failure.
+    pub async fn throttle_send(&self) {
+        let Some(spacing_ms) = self.throttle.effective_min_spacing() else {
+            return;
+        };
+        let burst = self.throttle.effective_burst();
+        let now = crate::now_ms();
+        let allow_at = {
+            let mut tat = self.throttle_tat_ms.lock().await;
+            let (new_tat, allow_at) = throttle_slot(*tat, now, spacing_ms as i64, burst);
+            *tat = new_tat;
+            allow_at
+        }; // guard dropped here — never held across the sleep
+        let wait = allow_at - now;
+        if wait > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(wait as u64)).await;
+        }
     }
 
     /// Seed one fake live session into the sessions map, for the `tcr demo`
@@ -1773,6 +1818,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::Duration;
 
+    #[test]
+    fn throttle_slot_burst1_is_strict_spacing() {
+        // B=1 (tau=0): threading the TAT across 3 calls at a fixed `now` yields
+        // allow_at points spaced by exactly `spacing_ms`.
+        let now = 1000;
+        let spacing = 100;
+        let (tat1, allow1) = throttle_slot(0, now, spacing, 1);
+        assert_eq!(allow1, now); // first send: instant (allow_at == now)
+        let (tat2, allow2) = throttle_slot(tat1, now, spacing, 1);
+        assert_eq!(allow2, allow1 + spacing);
+        let (_tat3, allow3) = throttle_slot(tat2, now, spacing, 1);
+        assert_eq!(allow3, allow2 + spacing);
+    }
+
+    #[test]
+    fn throttle_slot_burst3_admits_then_paces() {
+        // B=3, now=1000, T=100 (tau=200): first 3 fire instantly (allow_at <= now),
+        // the 4th is paced to now + spacing_ms.
+        let now = 1000;
+        let spacing = 100;
+        let burst = 3;
+        let (tat1, allow1) = throttle_slot(0, now, spacing, burst);
+        assert_eq!((tat1, allow1), (1100, 800));
+        assert!(allow1 <= now);
+        let (tat2, allow2) = throttle_slot(tat1, now, spacing, burst);
+        assert_eq!((tat2, allow2), (1200, 900));
+        assert!(allow2 <= now);
+        let (tat3, allow3) = throttle_slot(tat2, now, spacing, burst);
+        assert_eq!((tat3, allow3), (1300, 1000));
+        assert!(allow3 <= now);
+        let (tat4, allow4) = throttle_slot(tat3, now, spacing, burst);
+        assert_eq!((tat4, allow4), (1400, 1100));
+        assert_eq!(allow4, now + spacing); // 4th is paced
+    }
+
     fn account(name: &str, priority: i64) -> Account {
         Account {
             name: name.to_string(),
@@ -1796,6 +1876,7 @@ mod tests {
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
             pacing: PacingConfig::default(),
+            throttle: ThrottleConfig::default(),
             accounts,
             extra: serde_json::Map::new(),
         }

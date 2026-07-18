@@ -50,6 +50,14 @@ fn default_pacing() -> PacingConfig {
         min_spacing_ms: None,
     }
 }
+/// Default global outbound throttle: ON. Absent `throttle` key → these
+/// evidence-anchored starting values; `"throttle": {}` → off (escape hatch).
+fn default_throttle() -> ThrottleConfig {
+    ThrottleConfig {
+        min_spacing_ms: Some(350),
+        burst: Some(4),
+    }
+}
 fn default_account_type() -> String {
     "oauth".to_string()
 }
@@ -148,6 +156,56 @@ impl PacingConfig {
     }
 }
 
+/// Global (fleet-wide) outbound request-initiation throttle (opt-in; default OFF).
+///
+/// A GCRA token bucket over the SINGLE upstream send site: `burst` requests admit
+/// instantly after idle, then one per `minSpacingMs`. Unlike [`PacingConfig`] (which
+/// is PER-ACCOUNT and cannot damp a cross-account burst), this paces the AGGREGATE
+/// egress that Anthropic's shared IP/client_id burst limiter actually keys on —
+/// mirroring the probe path's `PROBE_SPACING`. Ships ON by default
+/// ([`default_throttle`]): absent `throttle` key → `minSpacingMs: 350, burst: 4`;
+/// `"throttle": {}` (empty object present) → all `None` → inert (escape hatch).
+///
+/// 350ms mirrors the σ5-proven probe-path aggregate rate (PROBE_SPACING); burst 4
+/// covers a normal within-turn fan-out (main+haiku+quota) untaxed while staying far
+/// below a ~15-20 cold-start fan-out so the throttle engages on the burst. Both are
+/// evidence-anchored STARTING values, tunable live (docs/plans/throttle-live-sweep-runbook.md).
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ThrottleConfig {
+    /// Steady-state emission interval T (ms): after the burst budget is spent,
+    /// at most one upstream send is initiated per this many ms across the WHOLE fleet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_spacing_ms: Option<u64>,
+    /// Bucket capacity B: how many sends may fire instantly after an idle period.
+    /// Absent → treated as 1 (strict spacing). Keep it BELOW the cold fan-out size
+    /// so the burst is actually paced, ABOVE the normal within-turn fan-out (~3) so
+    /// interactive turns are never delayed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+}
+
+impl ThrottleConfig {
+    /// Emission interval, treating `Some(0)` as unset (mirrors
+    /// [`PacingConfig::effective_max_in_flight`]'s footgun normalization).
+    pub fn effective_min_spacing(&self) -> Option<u64> {
+        match self.min_spacing_ms {
+            Some(0) => None,
+            other => other,
+        }
+    }
+    /// Bucket capacity, clamped to >= 1 (B=1 ⇒ strict min-spacing).
+    pub fn effective_burst(&self) -> u32 {
+        self.burst.unwrap_or(1).max(1)
+    }
+    /// Whether the throttle does anything. `min_spacing_ms` is the required knob —
+    /// a burst without a spacing interval is meaningless. When false the throttle is
+    /// fully inert (see [`crate::manager::Manager::throttle_send`]).
+    pub fn is_active(&self) -> bool {
+        self.effective_min_spacing().is_some()
+    }
+}
+
 /// Top-level config document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +221,11 @@ pub struct Config {
     /// (default-ON, soft). Set `"pacing": {}` to disable (all knobs `None`).
     #[serde(default = "default_pacing")]
     pub pacing: PacingConfig,
+    /// Global outbound throttle. Absent → [`default_throttle`] (ON:
+    /// `minSpacingMs: 350, burst: 4`). Set `"throttle": {}` to disable (all knobs
+    /// `None`), or override the knobs to tune the live rate (read at boot).
+    #[serde(default = "default_throttle")]
+    pub throttle: ThrottleConfig,
     #[serde(default)]
     pub accounts: Vec<Account>,
     /// Any top-level keys we do not model, preserved verbatim on save.
@@ -328,5 +391,44 @@ mod tests {
         .unwrap();
         assert_eq!(config.pacing.max_in_flight_per_account, Some(5));
         assert_eq!(config.pacing.min_spacing_ms, Some(200));
+    }
+
+    #[test]
+    fn absent_throttle_defaults_on() {
+        // No `throttle` key → default_throttle → ON with evidence-anchored knobs.
+        let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        assert!(config.throttle.is_active());
+        assert_eq!(config.throttle.effective_min_spacing(), Some(350));
+        assert_eq!(config.throttle.effective_burst(), 4);
+    }
+
+    #[test]
+    fn empty_throttle_object_disables_throttle() {
+        // `"throttle": {}` is the escape hatch: empty object → both knobs None → inert.
+        let config: Config = serde_json::from_str(r#"{ "accounts": [], "throttle": {} }"#).unwrap();
+        assert_eq!(config.throttle.min_spacing_ms, None);
+        assert_eq!(config.throttle.burst, None);
+        assert!(!config.throttle.is_active());
+    }
+
+    #[test]
+    fn explicit_throttle_enables() {
+        let config: Config = serde_json::from_str(
+            r#"{ "accounts": [], "throttle": { "minSpacingMs": 350, "burst": 5 } }"#,
+        )
+        .unwrap();
+        assert!(config.throttle.is_active());
+        assert_eq!(config.throttle.effective_min_spacing(), Some(350));
+        assert_eq!(config.throttle.effective_burst(), 5);
+    }
+
+    #[test]
+    fn throttle_zero_spacing_is_inert() {
+        // `Some(0)` spacing normalizes to unset (footgun parity with pacing).
+        let config: Config =
+            serde_json::from_str(r#"{ "accounts": [], "throttle": { "minSpacingMs": 0 } }"#)
+                .unwrap();
+        assert_eq!(config.throttle.effective_min_spacing(), None);
+        assert!(!config.throttle.is_active());
     }
 }
