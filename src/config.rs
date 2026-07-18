@@ -226,6 +226,13 @@ pub struct Config {
     /// `None`), or override the knobs to tune the live rate (read at boot).
     #[serde(default = "default_throttle")]
     pub throttle: ThrottleConfig,
+    /// Hard account lock: when set to an account `name`, ALL traffic is pinned to
+    /// that one account — LRU rotation, session affinity, and load-balancing
+    /// migration are ALL bypassed. Absent → normal routing (default). Tradeoff:
+    /// a locked account has NO failover; if it is throttled/disabled/down, requests
+    /// fail rather than rotating. Set to the exact `accounts[].name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_account: Option<String>,
     #[serde(default)]
     pub accounts: Vec<Account>,
     /// Any top-level keys we do not model, preserved verbatim on save.
@@ -420,6 +427,19 @@ mod tests {
         assert!(config.throttle.is_active());
         assert_eq!(config.throttle.effective_min_spacing(), Some(350));
         assert_eq!(config.throttle.effective_burst(), 5);
+    }
+
+    #[test]
+    fn lock_account_parses_when_present() {
+        let config: Config =
+            serde_json::from_str(r#"{ "accounts": [], "lockAccount": "acme" }"#).unwrap();
+        assert_eq!(config.lock_account, Some("acme".to_string()));
+    }
+
+    #[test]
+    fn lock_account_absent_defaults_none() {
+        let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        assert_eq!(config.lock_account, None);
     }
 
     #[test]
