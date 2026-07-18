@@ -28,7 +28,7 @@ use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::LiveRefresher;
 use crate::probe::{LiveUsageProber, UsageProber};
-use crate::stats::StatsSnapshot;
+use crate::stats::{AccountSnapshot, StatsSnapshot};
 
 /// How to set an account's priority: an explicit integer, or a relative
 /// `--first` / `--last` that recomputes against the existing fleet.
@@ -115,16 +115,36 @@ pub fn resolve_account(
     }
 }
 
+/// Load → resolve `(query, org)` to one account → hand it to `mutate` → save.
+///
+/// Centralizes the load→resolve→save chain (incl. the nonexistent-account error
+/// path) shared by every mutating verb. Resolution happens BEFORE `mutate`, so a
+/// non-matching query returns an error with the file left byte-identical (no
+/// partial write). `mutate` receives the resolved index and the whole config, so
+/// a command that needs the fleet (e.g. relative priority) or must `remove` the
+/// entry can still do so; it returns whatever the caller wants to report.
+fn edit_account<T>(
+    config_path: &Path,
+    query: &str,
+    org: Option<&str>,
+    mutate: impl FnOnce(&mut Config, usize) -> T,
+) -> anyhow::Result<T> {
+    let mut config = load_for_edit(config_path)?;
+    let idx = resolve_account(&config.accounts, query, org)?;
+    let out = mutate(&mut config, idx);
+    save_after_edit(config_path, &config)?;
+    Ok(out)
+}
+
 /// Remove the account matching `query` from the config and save.
 ///
 /// Resolution happens BEFORE any mutation, so a non-matching query returns an
 /// error with the file left byte-identical (no partial write).
 pub fn remove_account(config_path: &Path, query: &str, org: Option<&str>) -> anyhow::Result<()> {
-    let mut config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query, org)?;
-    let removed = config.accounts.remove(idx);
-    save_after_edit(config_path, &config)?;
-    println!("Removed account '{}'.", removed.name);
+    let removed = edit_account(config_path, query, org, |config, idx| {
+        config.accounts.remove(idx).name
+    })?;
+    println!("Removed account '{removed}'.");
     Ok(())
 }
 
@@ -140,36 +160,33 @@ pub fn set_priority(
     priority: PriorityArg,
     org: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query, org)?;
-
-    let value = match priority {
-        PriorityArg::N(n) => n,
-        PriorityArg::First => {
-            config
-                .accounts
-                .iter()
-                .filter_map(|a| a.priority)
-                .chain(std::iter::once(0))
-                .min()
-                .expect("chained 0 guarantees a min")
-                - 1
-        }
-        PriorityArg::Last => {
-            config
-                .accounts
-                .iter()
-                .filter_map(|a| a.priority)
-                .chain(std::iter::once(0))
-                .max()
-                .expect("chained 0 guarantees a max")
-                + 1
-        }
-    };
-
-    config.accounts[idx].priority = Some(value);
-    let name = config.accounts[idx].name.clone();
-    save_after_edit(config_path, &config)?;
+    let (name, value) = edit_account(config_path, query, org, |config, idx| {
+        let value = match priority {
+            PriorityArg::N(n) => n,
+            PriorityArg::First => {
+                config
+                    .accounts
+                    .iter()
+                    .filter_map(|a| a.priority)
+                    .chain(std::iter::once(0))
+                    .min()
+                    .expect("chained 0 guarantees a min")
+                    - 1
+            }
+            PriorityArg::Last => {
+                config
+                    .accounts
+                    .iter()
+                    .filter_map(|a| a.priority)
+                    .chain(std::iter::once(0))
+                    .max()
+                    .expect("chained 0 guarantees a max")
+                    + 1
+            }
+        };
+        config.accounts[idx].priority = Some(value);
+        (config.accounts[idx].name.clone(), value)
+    })?;
     println!("Set priority of '{name}' to {value}.");
     Ok(())
 }
@@ -185,11 +202,10 @@ pub fn set_enabled(
     org: Option<&str>,
     disabled: bool,
 ) -> anyhow::Result<()> {
-    let mut config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query, org)?;
-    config.accounts[idx].disabled = if disabled { Some(true) } else { None };
-    let name = config.accounts[idx].name.clone();
-    save_after_edit(config_path, &config)?;
+    let name = edit_account(config_path, query, org, |config, idx| {
+        config.accounts[idx].disabled = if disabled { Some(true) } else { None };
+        config.accounts[idx].name.clone()
+    })?;
     println!(
         "{} account '{name}'.",
         if disabled { "Disabled" } else { "Enabled" }
@@ -224,6 +240,21 @@ pub async fn snapshot_offline(
     manager.snapshot(OffsetDateTime::now_utc())
 }
 
+/// Gating quota for one account row: the most-spent of the three known windows
+/// (`5h`, `7d`, `7d_oi`), matching the rotation eligibility gate. `None` when
+/// nothing has been learned yet.
+///
+/// NOTE: this is deliberately 3-window and stays cli-scoped — do NOT unify with
+/// manager.rs's 2-window eligibility gate (`[five_hour, seven_day]`), which
+/// intentionally excludes `7d_oi` to mirror `eligible`'s dims. The display gate
+/// and the routing gate are different by design.
+fn gating_quota(a: &AccountSnapshot) -> Option<f64> {
+    [a.five_hour, a.seven_day, a.seven_day_oi]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max)
+}
+
 /// Render a [`StatsSnapshot`] as plain text — ONE LINE PER ACCOUNT — so the
 /// output is greppable (`account NAME priority=P quota=Q% status=S ...`). The
 /// ratatui TUI renderer is unusable for stdout, and per Gil's greppable-output
@@ -234,12 +265,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot) -> String {
     }
     let mut out = String::new();
     for a in &snapshot.accounts {
-        // Gating quota = the most-spent of the known windows (matches the
-        // rotation eligibility gate). `n/a` when nothing has been learned yet.
-        let quota = [a.five_hour, a.seven_day, a.seven_day_oi]
-            .into_iter()
-            .flatten()
-            .reduce(f64::max);
+        let quota = gating_quota(a);
         let quota_str = match quota {
             Some(u) => format!("{:.0}%", u * 100.0),
             None => "n/a".to_string(),
@@ -263,10 +289,7 @@ fn render_accounts_json(snapshot: &StatsSnapshot) -> String {
         .accounts
         .iter()
         .map(|a| {
-            let quota = [a.five_hour, a.seven_day, a.seven_day_oi]
-                .into_iter()
-                .flatten()
-                .reduce(f64::max);
+            let quota = gating_quota(a);
             serde_json::json!({
                 "name": a.name,
                 "priority": a.priority,
