@@ -419,6 +419,23 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
         // 429 → durable quota rejection rotates; a transient limit waits/rotates.
         if status == StatusCode::TOO_MANY_REQUESTS {
+            let header_str = |name: &str| {
+                up_headers
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<absent>")
+            };
+            tracing::info!(
+                account = account_name.as_deref().unwrap_or("?"),
+                account_index = idx,
+                retry_after_raw = header_str("retry-after"),
+                retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
+                unified_status = header_str("anthropic-ratelimit-unified-status"),
+                unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
+                unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
+                quota_rejected = is_quota_rejected(&up_headers),
+                "429 diagnostic"
+            );
             let retry_after = parse_retry_after(&up_headers).unwrap_or(60);
             if is_quota_rejected(&up_headers) {
                 manager.mark_rate_limited(idx, retry_after.clamp(1, 3600));
@@ -793,6 +810,7 @@ fn error_response(
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
 fn exhausted_response(manager: &Manager, now: OffsetDateTime, account_count: usize) -> Response {
     let retry_after = manager.retry_after_hint(now);
+    tracing::warn!(account_count, retry_after, "returning fleet-exhausted 429 to client");
     error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
@@ -803,6 +821,7 @@ fn exhausted_response(manager: &Manager, now: OffsetDateTime, account_count: usi
 
 /// 502 when every attempt hit a transport failure (upstream unreachable).
 fn bad_gateway() -> Response {
+    tracing::warn!("returning 502 to client — every account transport-failed");
     error_response(
         StatusCode::BAD_GATEWAY,
         "proxy_error",
@@ -849,6 +868,28 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_str(value).unwrap());
         h
+    }
+
+    #[test]
+    fn parse_retry_after_ignores_rfc_date() {
+        // Numeric seconds parse to Some(n).
+        let mut numeric = HeaderMap::new();
+        numeric.insert("retry-after", HeaderValue::from_static("30"));
+        assert_eq!(parse_retry_after(&numeric), Some(30));
+
+        // RFC-date form is NOT parsed — current behavior returns None, so the
+        // caller falls back to its default. (This documents the gap a follow-up
+        // fix will close; do not change parse_retry_after to make this Some.)
+        let mut rfc_date = HeaderMap::new();
+        rfc_date.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 21 Oct 2026 07:28:00 GMT"),
+        );
+        assert_eq!(parse_retry_after(&rfc_date), None);
+
+        // Absent header → None.
+        let empty = HeaderMap::new();
+        assert_eq!(parse_retry_after(&empty), None);
     }
 
     #[test]
