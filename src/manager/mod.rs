@@ -36,6 +36,8 @@ use crate::quota::Quota;
 use crate::stats::{AccountSnapshot, RequestLogEntry, SessionKind, SessionSnapshot, StatsSnapshot};
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
+mod throttle;
+
 const REQUEST_LOG_CAPACITY: usize = 200;
 
 /// Upper bound on a single rate-limit hold. A 429 `retry-after` larger than this
@@ -451,29 +453,6 @@ impl Manager {
             None,
             accounts,
         )
-    }
-
-    /// Global outbound-initiation throttle. Inert (returns immediately) unless
-    /// `throttle` is configured. When active, applies a GCRA token bucket across the
-    /// WHOLE fleet at the single send site so a cold fan-out cannot burst the shared
-    /// upstream limiter. Holds NO resource across the sleep — pure initiation delay,
-    /// cannot deadlock, never turns a request into a failure.
-    pub async fn throttle_send(&self) {
-        let Some(spacing_ms) = self.throttle.effective_min_spacing() else {
-            return;
-        };
-        let burst = self.throttle.effective_burst();
-        let now = crate::now_ms();
-        let allow_at = {
-            let mut tat = self.throttle_tat_ms.lock().await;
-            let (new_tat, allow_at) = throttle_slot(*tat, now, spacing_ms as i64, burst);
-            *tat = new_tat;
-            allow_at
-        }; // guard dropped here — never held across the sleep
-        let wait = allow_at - now;
-        if wait > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(wait as u64)).await;
-        }
     }
 
     /// Seed one fake live session into the sessions map, for the `tcr demo`
