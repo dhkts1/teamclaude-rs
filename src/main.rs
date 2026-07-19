@@ -148,6 +148,11 @@ struct LoginArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Log in even when a proxy server is already running on the configured port.
+    /// Unsafe: the server's next token refresh will overwrite this login — stop the
+    /// server first instead. This is the deliberate escape hatch.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(clap::Args)]
@@ -290,7 +295,7 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
 /// in [`oauth::login`]; this just resolves the config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let name = oauth::login(&config_path)
+    let name = oauth::login(&config_path, args.force)
         .await
         .context("OAuth login failed")?;
     println!("Logged in as '{name}'.");

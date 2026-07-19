@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
-use crate::oauth::LiveRefresher;
+use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, UsageProber};
 use crate::stats::{AccountSnapshot, StatsSnapshot};
 
@@ -214,22 +214,34 @@ pub fn set_enabled(
 }
 
 /// Build an OFFLINE snapshot from `config`: a [`Manager`] with `config_path =
-/// None` (so a probe's token refresh is NEVER written to disk), optionally
+/// None` (so a probe's token refresh is NEVER written to disk) AND a [`NoRefresh`]
+/// refresher (so a probe NEVER performs an OAuth refresh at all), optionally
 /// probing every account's live quota first.
 ///
+/// The no-refresh guarantee is load-bearing and independent of the no-persist one:
+/// refresh tokens are SINGLE-USE, so a refresh from this second process would
+/// revoke the running server's copy and kill the account — even though we would
+/// never write the rotated token back. Accounts with a valid access token probe
+/// normally; expired ones surface a visible probe error instead of refreshing.
+///
 /// Split out from [`list_accounts`] / [`status`] so tests can inject a scripted
-/// [`UsageProber`] and assert the on-disk config is byte-unchanged (the no-race
-/// guarantee).
+/// [`UsageProber`] and a scripted [`TokenRefresher`] — asserting both that the
+/// on-disk config is byte-unchanged (the no-race guarantee) and that an expired
+/// account is handled by the injected refresher, never a hidden [`LiveRefresher`]
+/// (the no-refresh guarantee). Production callers pass [`NoRefresh`].
 pub async fn snapshot_offline(
     config: Config,
+    refresher: Arc<dyn TokenRefresher>,
     prober: Arc<dyn UsageProber>,
     probe: bool,
 ) -> StatsSnapshot {
-    // config_path = None → persist_now / persist_tokens are silent no-ops, so a
-    // probe here can never mutate the user's file.
+    // config_path = None → persist_now / persist_tokens are silent no-ops, and the
+    // caller's refresher (production: NoRefresh) can never reach the OAuth token
+    // endpoint, so a probe here can neither mutate the user's file nor revoke the
+    // live server's tokens.
     let manager = Manager::new(
         config,
-        Arc::new(LiveRefresher::new()),
+        refresher,
         prober,
         Arc::new(crate::warmer::LiveWarmer::new()),
         None,
@@ -255,41 +267,135 @@ fn gating_quota(a: &AccountSnapshot) -> Option<f64> {
         .reduce(f64::max)
 }
 
+/// Per-account gating threshold — the account's `switchThreshold`, else the global
+/// one — collected in config order (which is the snapshot's account order), so the
+/// held-window display gates on exactly the threshold `Manager::eligible` routes on.
+fn resolve_thresholds(config: &Config) -> Vec<f64> {
+    config
+        .accounts
+        .iter()
+        .map(|a| a.switch_threshold.unwrap_or(config.switch_threshold))
+        .collect()
+}
+
+/// A gating window (5h or 7d) currently holding an account out of rotation: its
+/// effective utilization is at/over the account's threshold and it still resets in
+/// the future. Mirrors `Quota::is_near`'s dimensions (5h + 7d; the model-scoped
+/// `7d_oi` never gates shared rotation, so it is not shown as a hold here).
+struct HeldWindow {
+    label: &'static str,
+    reset: OffsetDateTime,
+}
+
+/// The windows holding account `a` out of rotation, evaluated against its own
+/// `threshold`. `a.five_hour`/`a.seven_day` are already the EFFECTIVE utilizations
+/// and `*_reset` the live (future-only) resets — both baked in at snapshot time —
+/// so a held window always carries a future reset to show.
+fn held_windows(a: &AccountSnapshot, threshold: f64) -> Vec<HeldWindow> {
+    let mut held = Vec::new();
+    for (label, util, reset) in [
+        ("5h", a.five_hour, a.five_hour_reset),
+        ("7d", a.seven_day, a.seven_day_reset),
+    ] {
+        if let (Some(u), Some(reset)) = (util, reset) {
+            if u >= threshold {
+                held.push(HeldWindow { label, reset });
+            }
+        }
+    }
+    held
+}
+
+/// A window's reset as a bare `HH:MMZ` wall clock. Rendered in UTC (the `Z` is
+/// explicit): local-time rendering would need the `time` crate's `local-offset`
+/// feature, which is unset and is unsound under the multi-threaded runtime anyway —
+/// the countdown beside it is timezone-independent and carries the actionable "when".
+fn format_reset_clock(reset: OffsetDateTime) -> String {
+    format!("{:02}:{:02}Z", reset.hour(), reset.minute())
+}
+
+/// Countdown from `now` to a future `reset`, one unit: minutes under two hours
+/// (`+92m`), hours under two days (`+5h`), else days (`+3d`). Clamped at `+0m` so a
+/// reset that just elapsed never reads negative.
+fn format_reset_countdown(reset: OffsetDateTime, now: OffsetDateTime) -> String {
+    let mins = (reset - now).whole_minutes().max(0);
+    if mins < 120 {
+        format!("+{mins}m")
+    } else if mins < 60 * 48 {
+        format!("+{}h", mins / 60)
+    } else {
+        format!("+{}d", mins / (60 * 24))
+    }
+}
+
+/// The ` held=<win> resets=<HH:MMZ>(<+countdown>)` segment(s) appended to an
+/// account's status line — one per held window, empty when the account holds none.
+fn held_suffix(a: &AccountSnapshot, threshold: f64, now: OffsetDateTime) -> String {
+    let mut s = String::new();
+    for h in held_windows(a, threshold) {
+        s.push_str(&format!(
+            " held={} resets={}({})",
+            h.label,
+            format_reset_clock(h.reset),
+            format_reset_countdown(h.reset, now),
+        ));
+    }
+    s
+}
+
 /// Render a [`StatsSnapshot`] as plain text — ONE LINE PER ACCOUNT — so the
 /// output is greppable (`account NAME priority=P quota=Q% status=S ...`). The
 /// ratatui TUI renderer is unusable for stdout, and per Gil's greppable-output
 /// rule a naive grep must be able to match any single field.
-pub fn render_accounts(snapshot: &StatsSnapshot) -> String {
+pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
     if snapshot.accounts.is_empty() {
         return "no accounts configured\n".to_string();
     }
+    let now = OffsetDateTime::now_utc();
     let mut out = String::new();
-    for a in &snapshot.accounts {
+    for (i, a) in snapshot.accounts.iter().enumerate() {
         let quota = gating_quota(a);
         let quota_str = match quota {
             Some(u) => format!("{:.0}%", u * 100.0),
             None => "n/a".to_string(),
         };
+        // A missing threshold (slice shorter than accounts) can only fail closed:
+        // 1.0 means "only a fully-exhausted window reads as held", never a false hold.
+        let threshold = thresholds.get(i).copied().unwrap_or(1.0);
         out.push_str(&format!(
-            "account {} priority={} quota={} status={} probe={}{}\n",
+            "account {} priority={} quota={} status={} probe={}{}{}\n",
             a.name,
             a.priority,
             quota_str,
             a.status,
             a.probe_status.as_str(),
             if a.disabled { " disabled" } else { "" },
+            held_suffix(a, threshold, now),
         ));
     }
     out
 }
 
 /// Render a [`StatsSnapshot`] as a JSON array, one object per account.
-fn render_accounts_json(snapshot: &StatsSnapshot) -> String {
+fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
+    let now = OffsetDateTime::now_utc();
     let rows: Vec<serde_json::Value> = snapshot
         .accounts
         .iter()
-        .map(|a| {
+        .enumerate()
+        .map(|(i, a)| {
             let quota = gating_quota(a);
+            let threshold = thresholds.get(i).copied().unwrap_or(1.0);
+            let held: Vec<serde_json::Value> = held_windows(a, threshold)
+                .into_iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "window": h.label,
+                        "resetAtMs": (h.reset.unix_timestamp_nanos() / 1_000_000) as i64,
+                        "minutesUntilReset": (h.reset - now).whole_minutes().max(0),
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "name": a.name,
                 "priority": a.priority,
@@ -304,6 +410,7 @@ fn render_accounts_json(snapshot: &StatsSnapshot) -> String {
                 "outputTokens": a.output_tokens,
                 "probeStatus": a.probe_status.as_str(),
                 "probeError": a.probe_error,
+                "held": held,
             })
         })
         .collect();
@@ -314,8 +421,15 @@ fn render_accounts_json(snapshot: &StatsSnapshot) -> String {
 /// `--probe`, first refresh every account's live quota (never persisted).
 pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    let snapshot = snapshot_offline(config, Arc::new(LiveUsageProber::new()), probe).await;
-    print!("{}", render_accounts(&snapshot));
+    let thresholds = resolve_thresholds(&config);
+    let snapshot = snapshot_offline(
+        config,
+        Arc::new(NoRefresh),
+        Arc::new(LiveUsageProber::new()),
+        probe,
+    )
+    .await;
+    print!("{}", render_accounts(&snapshot, &thresholds));
     Ok(())
 }
 
@@ -323,11 +437,18 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
 /// persisted) and render the fleet as greppable text or a JSON array.
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    let snapshot = snapshot_offline(config, Arc::new(LiveUsageProber::new()), true).await;
+    let thresholds = resolve_thresholds(&config);
+    let snapshot = snapshot_offline(
+        config,
+        Arc::new(NoRefresh),
+        Arc::new(LiveUsageProber::new()),
+        true,
+    )
+    .await;
     if json {
-        println!("{}", render_accounts_json(&snapshot));
+        println!("{}", render_accounts_json(&snapshot, &thresholds));
     } else {
-        print!("{}", render_accounts(&snapshot));
+        print!("{}", render_accounts(&snapshot, &thresholds));
     }
     Ok(())
 }
@@ -335,6 +456,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oauth::{OAuthError, RefreshFuture};
     use crate::probe::{ProbeFuture, Usage, UsageBucket};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -560,8 +682,15 @@ mod tests {
     #[tokio::test]
     async fn render_accounts_emits_one_greppable_line_per_account() {
         let config = load_from(TWO_ACCOUNTS);
-        let snapshot = snapshot_offline(config, Arc::new(FixedProber { util: 0.25 }), true).await;
-        let text = render_accounts(&snapshot);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            true,
+        )
+        .await;
+        let text = render_accounts(&snapshot, &thresholds);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per account");
         // Each line is greppable: name + priority + quota%.
@@ -570,6 +699,11 @@ mod tests {
         assert!(lines[0].contains("quota=25%"));
         assert!(lines[1].contains("bob@example.com"));
         assert!(lines[1].contains("priority=1"));
+        // At 25% util, well under the 0.9 default threshold, no account is held.
+        assert!(
+            !text.contains("held="),
+            "under-threshold accounts show no hold: {text}"
+        );
     }
 
     // --- no-persist guarantee ----------------------------------------------
@@ -582,12 +716,224 @@ mod tests {
         let path = write_config("no-persist", TWO_ACCOUNTS);
         let before = fs::read_to_string(&path).unwrap();
         let config = load(&path);
-        let _snapshot = snapshot_offline(config, Arc::new(FixedProber { util: 0.5 }), true).await;
+        let _snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.5 }),
+            true,
+        )
+        .await;
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(
             before, after,
             "an offline status probe must never persist to the config file"
         );
         fs::remove_file(&path).ok();
+    }
+
+    // --- no-refresh guarantee (Fix 1) --------------------------------------
+
+    /// A prober that always fails as if the usage endpoint rejected the token
+    /// (HTTP 401) — the shape an EXPIRED account's stale access token gets once
+    /// [`NoRefresh`] has declined to refresh it.
+    struct RejectingProber;
+    impl UsageProber for RejectingProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            Box::pin(async {
+                Err(crate::probe::ProbeError {
+                    status: Some(401),
+                    message: "HTTP 401: token expired".to_string(),
+                })
+            })
+        }
+    }
+
+    /// An INSTRUMENTED refresher: records every refresh attempt and, like
+    /// [`NoRefresh`], never contacts the network. Injected into `snapshot_offline`
+    /// to prove the offline snapshot routes an expired account's refresh through the
+    /// caller's refresher — never a hidden [`crate::oauth::LiveRefresher`] that would
+    /// hit the OAuth endpoint and revoke the live server's single-use token.
+    struct RecordingRefresher {
+        calls: Arc<AtomicU64>,
+    }
+    impl TokenRefresher for RecordingRefresher {
+        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(OAuthError::Transient(
+                    "recorded — never networked".to_string(),
+                ))
+            })
+        }
+    }
+
+    /// One OAuth account whose token expired in 1970 — probing it would, before the
+    /// fix, trigger a real OAuth refresh that revokes the running server's copy.
+    const EXPIRED_ACCOUNT: &str = r#"{
+      "proxy": { "port": 3456 },
+      "accounts": [
+        { "name": "stale@example.com", "type": "oauth", "orgName": "Org X",
+          "orgUuid": "uuid-x", "accessToken": "at-stale", "refreshToken": "rt-stale",
+          "expiresAt": 1000, "priority": 0 }
+      ]
+    }"#;
+
+    #[tokio::test]
+    async fn offline_snapshot_over_expired_account_routes_through_injected_refresher() {
+        // Biting test for Fix 1: over an EXPIRED account, the offline snapshot must
+        // hand the refresh to the INJECTED refresher (production wires NoRefresh,
+        // which never networks) rather than a hidden LiveRefresher. A recording
+        // refresher proves the routing — if snapshot_offline ignored its refresher
+        // param and hardcoded LiveRefresher, `calls` would stay 0 and this fails.
+        // The row must still surface a clear, greppable probe=error, and the config
+        // stays byte-identical.
+        let path = write_config("expired", EXPIRED_ACCOUNT);
+        let before = fs::read_to_string(&path).unwrap();
+        let config = load(&path);
+        let thresholds = resolve_thresholds(&config);
+        let calls = Arc::new(AtomicU64::new(0));
+        let refresher = Arc::new(RecordingRefresher {
+            calls: calls.clone(),
+        });
+        let snapshot = snapshot_offline(config, refresher, Arc::new(RejectingProber), true).await;
+        let text = render_accounts(&snapshot, &thresholds);
+        assert!(
+            text.contains("stale@example.com"),
+            "renders the account: {text}"
+        );
+        assert!(
+            text.contains("probe=error"),
+            "surfaces a clear probe status for the expired account: {text}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the expired account's refresh was routed through the injected refresher, \
+             never a hidden LiveRefresher (which would have hit the OAuth endpoint)"
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "an offline probe of an expired account must never persist"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- reset countdowns (3a) ---------------------------------------------
+
+    #[test]
+    fn reset_countdown_tiers_minutes_then_hours_then_days() {
+        let now = OffsetDateTime::now_utc();
+        use time::Duration;
+        // Minutes under two hours (matches the spec example `+92m`).
+        assert_eq!(
+            format_reset_countdown(now + Duration::minutes(5), now),
+            "+5m"
+        );
+        assert_eq!(
+            format_reset_countdown(now + Duration::minutes(92), now),
+            "+92m"
+        );
+        // Hours from two hours up to two days.
+        assert_eq!(format_reset_countdown(now + Duration::hours(5), now), "+5h");
+        // Days beyond two days.
+        assert_eq!(format_reset_countdown(now + Duration::days(3), now), "+3d");
+        assert_eq!(format_reset_countdown(now + Duration::days(7), now), "+7d");
+        // A reset that already elapsed clamps to +0m, never negative.
+        assert_eq!(
+            format_reset_countdown(now - Duration::minutes(5), now),
+            "+0m"
+        );
+    }
+
+    #[test]
+    fn reset_clock_is_bare_hh_mm_utc() {
+        // 18:50:00 UTC → "18:50Z" regardless of seconds.
+        let reset = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap()
+            + time::Duration::seconds(0);
+        let clock = format_reset_clock(reset);
+        assert!(clock.ends_with('Z'), "explicit UTC marker: {clock}");
+        assert_eq!(clock.len(), 6, "HH:MMZ shape: {clock}");
+        assert!(clock.contains(':'), "clock shape: {clock}");
+    }
+
+    /// A prober that drives one account over its 5h threshold and another over its
+    /// 7d threshold, each with a future reset — so both windows read as held.
+    struct WindowProber;
+    impl UsageProber for WindowProber {
+        fn probe(&self, access_token: String) -> ProbeFuture {
+            let now = crate::now_ms();
+            Box::pin(async move {
+                if access_token == "at-a" {
+                    Ok(Usage {
+                        five_hour: Some(UsageBucket {
+                            utilization: Some(0.95),
+                            reset_at_ms: Some(now + 92 * 60 * 1000),
+                        }),
+                        seven_day: None,
+                        seven_day_oi: None,
+                    })
+                } else {
+                    Ok(Usage {
+                        five_hour: None,
+                        seven_day: Some(UsageBucket {
+                            utilization: Some(0.97),
+                            reset_at_ms: Some(now + 3 * 24 * 60 * 60 * 1000),
+                        }),
+                        seven_day_oi: None,
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn render_accounts_shows_held_window_and_reset_for_over_threshold_accounts() {
+        // 3a: a held account's line carries `held=<win> resets=<HH:MMZ>(<+countdown>)`,
+        // gated on the same per-account threshold `eligible` uses (0.9 default here).
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot =
+            snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
+        let text = render_accounts(&snapshot, &thresholds);
+        let alice = text
+            .lines()
+            .find(|l| l.contains("alice@example.com"))
+            .expect("alice line");
+        let bob = text
+            .lines()
+            .find(|l| l.contains("bob@example.com"))
+            .expect("bob line");
+        // alice (at-a) is 5h-held; bob (at-b) is 7d-held. Each shows its own window.
+        assert!(alice.contains("held=5h"), "5h hold labelled: {alice}");
+        assert!(
+            alice.contains("resets=") && alice.contains("(+"),
+            "reset+countdown: {alice}"
+        );
+        assert!(!alice.contains("held=7d"), "alice is not 7d-held: {alice}");
+        assert!(bob.contains("held=7d"), "7d hold labelled: {bob}");
+        assert!(bob.contains("resets="), "reset shown: {bob}");
+        assert!(!bob.contains("held=5h"), "bob is not 5h-held: {bob}");
+        // Greppable one-line-per-account contract survives the new fields.
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "still one line per account: {text}"
+        );
+
+        // JSON mirrors the held fields for machine consumers.
+        let json = render_accounts_json(&snapshot, &thresholds);
+        assert!(json.contains("\"held\""), "json carries held array: {json}");
+        assert!(
+            json.contains("\"window\": \"5h\""),
+            "json names the 5h window: {json}"
+        );
+        assert!(
+            json.contains("\"window\": \"7d\""),
+            "json names the 7d window: {json}"
+        );
+        assert!(
+            json.contains("minutesUntilReset"),
+            "json carries the countdown: {json}"
+        );
     }
 }

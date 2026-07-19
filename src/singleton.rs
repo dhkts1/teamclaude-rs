@@ -97,6 +97,20 @@ pub fn pids_to_replace(
         .collect()
 }
 
+/// Detection-only: the PID of a live teamclaude/tcr *server* currently holding
+/// `port`, if any. Reuses the exact port-scoped, command-verified decision as
+/// [`takeover_port`] ([`pids_to_replace`]) but signals NOTHING — `tcr login` uses
+/// it to REFUSE to run beside a live server (the server reads config only at boot,
+/// and its next `persist_tokens` rewrites the whole file from memory, clobbering the
+/// login's fresh tokens). Returns the first replaceable proxy PID; `None` when the
+/// port is free or held only by a non-proxy process.
+pub fn live_proxy_server(port: u16) -> Option<u32> {
+    let holders = port_listeners(port);
+    pids_to_replace(&holders, std::process::id(), process_command)
+        .into_iter()
+        .next()
+}
+
 /// Is `pid` still alive? (`kill -0`.)
 fn is_alive(pid: u32) -> bool {
     Command::new("kill")
