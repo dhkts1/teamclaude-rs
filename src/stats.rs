@@ -36,6 +36,31 @@ pub enum QuotaState {
     Exhausted,
 }
 
+/// Why an account is currently out of rotation, mirroring the hard gates
+/// [`crate::manager::Manager::eligible`] applies — the single source of truth is
+/// [`crate::manager::Manager::account_gate`], which computes this alongside a
+/// [`AccountSnapshot::free_at`] clear-instant. Soft pacing is deliberately NOT a
+/// reason here: it only ever narrows an already-healthy account, never holds one
+/// out, so a paced account still reads [`GateReason::Ok`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GateReason {
+    /// In rotation — no hard gate is active.
+    Ok,
+    /// A rate-limit hold (429 `retry-after`) that has not yet lifted.
+    Hold,
+    /// The shared 5-hour bucket is at/over threshold.
+    FiveHour,
+    /// The shared weekly bucket is at/over threshold.
+    SevenDay,
+    /// The model-scoped weekly (Fable `7d_oi`) bucket is at/over threshold — only
+    /// ever surfaced for a Fable-scoped evaluation (`is_fable = true`).
+    FableWeekly,
+    /// A dead credential (`AccountStatus::Error`) — needs a re-login, never self-frees.
+    Login,
+    /// Operator-disabled — held out until re-enabled, never self-frees.
+    Disabled,
+}
+
 /// A single account's live-computed view.
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
@@ -67,6 +92,15 @@ pub struct AccountSnapshot {
     /// Live quota state vs this account's switch threshold — for an honest
     /// near-limit/exhausted label that never masquerades as an error.
     pub quota_state: QuotaState,
+    /// Why this account is out of rotation right now (the latest-clearing hard
+    /// gate), computed live via [`crate::manager::Manager::account_gate`] for the
+    /// general (non-Fable) view. [`GateReason::Ok`] when in rotation.
+    pub gate: GateReason,
+    /// When [`Self::gate`] clears — the instant ALL active hard gates have lifted.
+    /// `None` when in rotation (`Ok`), when the gate never self-frees
+    /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
+    /// we cannot promise a time).
+    pub free_at: Option<OffsetDateTime>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

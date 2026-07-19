@@ -71,6 +71,7 @@ impl Manager {
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
     /// at `now` so the display can never show a past-reset window as still full.
     pub fn snapshot(&self, now: OffsetDateTime) -> StatsSnapshot {
+        let now_ms = odt_to_ms(now);
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account_snaps = accounts
             .iter()
@@ -91,6 +92,11 @@ impl Manager {
                     Some(u) if u >= threshold => crate::stats::QuotaState::NearLimit,
                     _ => crate::stats::QuotaState::Normal,
                 };
+                // Why this account is out and when it clears — the GENERAL
+                // (non-Fable) view: `is_fable = false`, so the model-scoped weekly
+                // never gates a general fleet row (an account spent only on its
+                // Fable bucket still serves every other model, so it reads `Ok`).
+                let (gate, free_at) = Self::account_gate(a, threshold, now, now_ms, false);
                 AccountSnapshot {
                     name: a.name.clone(),
                     priority: a.priority,
@@ -130,6 +136,8 @@ impl Manager {
                     last_probe: a.last_probe_ms.and_then(ms_to_odt),
                     probe_error: a.probe_error.clone(),
                     quota_state,
+                    gate,
+                    free_at,
                 }
             })
             .collect();

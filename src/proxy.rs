@@ -279,6 +279,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // Parse the request's target model ONCE — it is constant across the rotation
     // loop, and drives per-model (Fable-aware) account selection below.
     let request_model = crate::model::parse_request_model(&body_bytes);
+    // Whether THIS request targets a Fable model — the same classification
+    // selection uses (`select.rs`). Threaded into every fleet-exhausted 429 so the
+    // `retry-after` hint reflects the Fable-scoped weekly gate for a Fable request
+    // and ignores it otherwise.
+    let request_is_fable = request_model
+        .as_deref()
+        .is_some_and(crate::model::is_fable_model);
 
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
@@ -328,7 +335,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     return if saw_network_error {
                         bad_gateway()
                     } else {
-                        exhausted_response(&manager, now, account_count)
+                        exhausted_response(&manager, now, account_count, request_is_fable)
                     };
                 }
             },
@@ -603,7 +610,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     if saw_network_error {
         bad_gateway()
     } else {
-        exhausted_response(&manager, OffsetDateTime::now_utc(), account_count)
+        exhausted_response(
+            &manager,
+            OffsetDateTime::now_utc(),
+            account_count,
+            request_is_fable,
+        )
     }
 }
 
@@ -856,8 +868,15 @@ fn error_response(
 }
 
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
-fn exhausted_response(manager: &Manager, now: OffsetDateTime, account_count: usize) -> Response {
-    let retry_after = manager.retry_after_hint(now);
+/// `is_fable` scopes the hint to the request's model class so a Fable request is
+/// told the true Fable-weekly recovery instant (see [`Manager::retry_after_hint`]).
+fn exhausted_response(
+    manager: &Manager,
+    now: OffsetDateTime,
+    account_count: usize,
+    is_fable: bool,
+) -> Response {
+    let retry_after = manager.retry_after_hint(now, is_fable);
     tracing::warn!(
         account_count,
         retry_after,
