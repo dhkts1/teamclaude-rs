@@ -28,7 +28,7 @@ use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, UsageProber};
-use crate::stats::{AccountSnapshot, StatsSnapshot};
+use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
 
 /// How to set an account's priority: an explicit integer, or a relative
 /// `--first` / `--last` that recomputes against the existing fleet.
@@ -343,6 +343,18 @@ fn held_suffix(a: &AccountSnapshot, threshold: f64, now: OffsetDateTime) -> Stri
     s
 }
 
+/// A short, grep-matchable token for an account's live [`QuotaState`] — surfaced
+/// on the status line and in the JSON row so a held-but-has-headroom account
+/// (`near`) is never mistaken for a truly spent one (`full`). `normal` is an
+/// in-rotation account comfortably under its threshold.
+fn quota_state_token(state: QuotaState) -> &'static str {
+    match state {
+        QuotaState::Normal => "normal",
+        QuotaState::NearLimit => "near",
+        QuotaState::Exhausted => "full",
+    }
+}
+
 /// Render a [`StatsSnapshot`] as plain text — ONE LINE PER ACCOUNT — so the
 /// output is greppable (`account NAME priority=P quota=Q% status=S ...`). The
 /// ratatui TUI renderer is unusable for stdout, and per Gil's greppable-output
@@ -363,10 +375,11 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
         // 1.0 means "only a fully-exhausted window reads as held", never a false hold.
         let threshold = thresholds.get(i).copied().unwrap_or(1.0);
         out.push_str(&format!(
-            "account {} priority={} quota={} status={} probe={}{}{}\n",
+            "account {} priority={} quota={} quota_state={} status={} probe={}{}{}\n",
             a.name,
             a.priority,
             quota_str,
+            quota_state_token(a.quota_state),
             a.status,
             a.probe_status.as_str(),
             if a.disabled { " disabled" } else { "" },
@@ -402,6 +415,7 @@ fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String 
                 "status": a.status,
                 "disabled": a.disabled,
                 "quota": quota,
+                "quotaState": quota_state_token(a.quota_state),
                 "fiveHour": a.five_hour,
                 "sevenDay": a.seven_day,
                 "sevenDayOi": a.seven_day_oi,

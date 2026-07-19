@@ -2079,6 +2079,65 @@ mod tests {
         assert_eq!(snap.accounts[1].quota_state, QuotaState::Exhausted);
     }
 
+    /// Biting test for the 0.90 → 0.95 default-threshold raise. Keyed off the
+    /// SHIPPED config default (parsed from a minimal config), not a hardcoded
+    /// literal, so it tracks the constant: an account at 0.92 weekly utilization
+    /// has real headroom under the 0.95 default → stays Normal and eligible. On
+    /// the pre-change tree (default 0.90) that same 0.92 tripped the line → held
+    /// NearLimit and select() would refuse it, so this fails before the raise.
+    /// 0.96 → NearLimit (held, credential fine); 1.00 → Exhausted (fully spent).
+    #[test]
+    fn default_threshold_raise_gives_92pct_headroom_normal_near_full() {
+        use crate::stats::QuotaState;
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        // The default the shipped config applies when `switchThreshold` is absent.
+        let default_threshold = serde_json::from_str::<Config>(r#"{ "accounts": [] }"#)
+            .expect("minimal config parses")
+            .switch_threshold;
+        let mut config = config_with(vec![
+            account("headroom", 0),
+            account("near", 0),
+            account("full", 0),
+        ]);
+        config.switch_threshold = default_threshold;
+        let manager = build_manager(config, refresher);
+        let now = OffsetDateTime::now_utc();
+        let reset = (now + Duration::hours(2)).unix_timestamp();
+        let set_7d = |idx: usize, util: &str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                "anthropic-ratelimit-unified-7d-utilization",
+                util.parse().unwrap(),
+            );
+            h.insert(
+                "anthropic-ratelimit-unified-7d-reset",
+                reset.to_string().parse().unwrap(),
+            );
+            manager.update_quota(idx, &h);
+        };
+        set_7d(0, "0.92"); // under the 0.95 default → real headroom, Normal
+        set_7d(1, "0.96"); // over 0.95, under 100% → NearLimit
+        set_7d(2, "1.00"); // at 100% → Exhausted
+
+        let snap = manager.snapshot(now);
+        assert_eq!(
+            snap.accounts[0].quota_state,
+            QuotaState::Normal,
+            "0.92 has headroom under the 0.95 default (pre-change 0.90 held it NearLimit)"
+        );
+        assert_eq!(snap.accounts[1].quota_state, QuotaState::NearLimit);
+        assert_eq!(snap.accounts[2].quota_state, QuotaState::Exhausted);
+        // The headroom account is not merely labelled Normal — it is actually
+        // servable (pre-change it was held out and select() skipped it).
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None),
+            Some(0),
+            "the 0.92 account is eligible under the raised default"
+        );
+    }
+
     /// Best-practices review (Apollo ch7 — no stale shadow of a live value): the
     /// `Throttled` enum is cleared only when the account next serves a non-429, so a
     /// naturally-expired hold would show a STALE "throttled" in the snapshot while
