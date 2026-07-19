@@ -33,7 +33,9 @@ use crate::config::{self, Config, PacingConfig, ThrottleConfig};
 use crate::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
 use crate::probe::{LiveUsageProber, ProbeStatus, Usage, UsageProber};
 use crate::quota::Quota;
-use crate::stats::{AccountSnapshot, RequestLogEntry, SessionKind, SessionSnapshot, StatsSnapshot};
+use crate::stats::{
+    AccountSnapshot, GateReason, RequestLogEntry, SessionKind, SessionSnapshot, StatsSnapshot,
+};
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
 mod probing;
@@ -497,44 +499,37 @@ impl Manager {
     }
 
     /// A `retry-after` hint (seconds) for a synthetic 429 when every account is
-    /// exhausted: the soonest future hold/reset across all accounts, clamped to
-    /// at least 1s, defaulting to 60s when nothing is known.
-    pub fn retry_after_hint(&self, now: OffsetDateTime) -> i64 {
+    /// exhausted: the soonest instant at which SOME account genuinely re-enters
+    /// rotation, clamped to at least 1s, defaulting to 60s when nothing is known.
+    ///
+    /// Honest by construction: it minimises over each account's
+    /// [`Self::account_gate`] `free_at` — the instant ALL of *that* account's
+    /// active gates clear — instead of the raw min over every window's reset. The
+    /// raw-min was bug-shaped: it counted a 5-hour reset of an account that stays
+    /// gated on its weekly bucket, and the reset of an `Error`/disabled account
+    /// that never self-frees at all, so it promised a recovery that would not
+    /// happen. Accounts that contribute nothing here (`Ok`, `Login`, `Disabled`,
+    /// or a gating window with no known reset) are correctly skipped.
+    ///
+    /// `is_fable` scopes the evaluation exactly as selection does: only a Fable
+    /// request is gated by the model-scoped weekly (`7d_oi`) bucket, so an
+    /// all-Fable-exhausted fleet reports that bucket's reset while non-Fable
+    /// traffic ignores it.
+    pub fn retry_after_hint(&self, now: OffsetDateTime, is_fable: bool) -> i64 {
         let now_ms = odt_to_ms(now);
         let accounts = self.accounts.read().expect("accounts lock poisoned");
-        let mut soonest = i64::MAX;
-        for account in accounts.iter() {
-            let candidates = [
-                account.rate_limited_until_ms,
-                account
-                    .quota
-                    .five_hour
-                    .and_then(|w| w.live_reset(now))
-                    .map(odt_to_ms),
-                account
-                    .quota
-                    .seven_day
-                    .and_then(|w| w.live_reset(now))
-                    .map(odt_to_ms),
-                // Fable requests gate on the model-scoped weekly (`7d_oi`) bucket, so
-                // an all-Fable-exhausted fleet has its real reset here — without it the
-                // hint falls through to the 60s default while the true reset is days out.
-                account
-                    .quota
-                    .seven_day_oi
-                    .and_then(|w| w.live_reset(now))
-                    .map(odt_to_ms),
-            ];
-            for candidate in candidates.into_iter().flatten() {
-                if candidate > now_ms {
-                    soonest = soonest.min(candidate);
-                }
-            }
-        }
-        if soonest == i64::MAX {
-            60
-        } else {
-            ((soonest - now_ms + 999) / 1000).max(1)
+        let soonest = accounts
+            .iter()
+            .filter_map(|account| {
+                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+                let (_, free_at) = Self::account_gate(account, threshold, now, now_ms, is_fable);
+                free_at.map(odt_to_ms)
+            })
+            .filter(|&at| at > now_ms)
+            .min();
+        match soonest {
+            Some(at) => ((at - now_ms + 999) / 1000).max(1),
+            None => 60,
         }
     }
 
@@ -2678,7 +2673,10 @@ mod tests {
                 }),
             },
         );
-        let hint = manager.retry_after_hint(now);
+        // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
+        // bucket, so it is what makes that window drive the hint. A non-Fable
+        // request ignores 7d_oi entirely and falls through to the 60s default.
+        let hint = manager.retry_after_hint(now, true);
         assert!(
             hint > 60,
             "the 7d_oi reset must drive the hint past the 60s default, got {hint}"
@@ -2687,6 +2685,154 @@ mod tests {
         assert_eq!(
             hint, expected,
             "hint equals the 7d_oi reset delta in seconds"
+        );
+        // The general (non-Fable) view does NOT see the Fable-only weekly, so with
+        // no other gate the hint falls back to the 60s default — proof the
+        // `is_fable` scoping is honoured, not hard-coded.
+        assert_eq!(
+            manager.retry_after_hint(now, false),
+            60,
+            "a non-Fable request ignores the 7d_oi bucket"
+        );
+    }
+
+    /// A quota window at `util`, resetting at `reset` (`None` = unknown reset).
+    fn window(util: f64, reset: Option<OffsetDateTime>) -> crate::quota::QuotaWindow {
+        crate::quota::QuotaWindow {
+            utilization: util,
+            reset,
+        }
+    }
+
+    /// A fresh active runtime with empty quota, for the [`Manager::account_gate`] tests.
+    fn gate_runtime() -> AccountRuntime {
+        AccountRuntime::from_config(&account("gate", 0))
+    }
+
+    #[test]
+    fn account_gate_ok_when_healthy() {
+        let now = OffsetDateTime::now_utc();
+        let a = gate_runtime();
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Ok, None)
+        );
+    }
+
+    #[test]
+    fn account_gate_disabled_and_error_never_self_free() {
+        let now = OffsetDateTime::now_utc();
+        // Even with a gating window present, the terminal states dominate and carry
+        // NO clear-instant — they never self-free.
+        let mut disabled = gate_runtime();
+        disabled.disabled = true;
+        disabled.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
+        assert_eq!(
+            Manager::account_gate(&disabled, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Disabled, None)
+        );
+
+        let mut errored = gate_runtime();
+        errored.status = AccountStatus::Error;
+        errored.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
+        assert_eq!(
+            Manager::account_gate(&errored, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Login, None)
+        );
+    }
+
+    #[test]
+    fn account_gate_binds_on_latest_clearing_window() {
+        // 5h clears SOON, 7d clears LATER — the account frees only when BOTH clear,
+        // so the reason is the later 7d gate and free_at is its (max) reset. A naive
+        // "soonest reset" would wrongly report the 5h instant.
+        let now = OffsetDateTime::now_utc();
+        let soon = now + Duration::seconds(300);
+        let later = now + Duration::seconds(5_000);
+        let mut a = gate_runtime();
+        a.quota.five_hour = Some(window(0.99, Some(soon)));
+        a.quota.seven_day = Some(window(0.99, Some(later)));
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::SevenDay, Some(later))
+        );
+    }
+
+    #[test]
+    fn account_gate_unknown_reset_sorts_latest_and_hides_time() {
+        // A window over threshold whose reset is unknown (None) is the longest
+        // possible constraint: it becomes the reason and free_at is None (no promise
+        // of a time), even beside a window with a known soon reset.
+        let now = OffsetDateTime::now_utc();
+        let mut a = gate_runtime();
+        a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
+        a.quota.seven_day = Some(window(0.99, None));
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::SevenDay, None)
+        );
+    }
+
+    #[test]
+    fn account_gate_fable_weekly_only_gates_fable() {
+        // The 7d_oi bucket gates a Fable evaluation and is invisible to the general
+        // one — the exact `is_fable` split `eligible` makes.
+        let now = OffsetDateTime::now_utc();
+        let reset = now + Duration::seconds(4_000);
+        let mut a = gate_runtime();
+        a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Ok, None),
+            "the non-Fable view ignores the model-scoped weekly"
+        );
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), true),
+            (GateReason::FableWeekly, Some(reset)),
+            "a Fable evaluation gates on it"
+        );
+    }
+
+    /// The live-incident shape: a fleet-exhausted 429's `retry-after` must name the
+    /// TRUE soonest recovery, never an earlier reset belonging to an account that
+    /// stays gated for another reason or never self-frees at all.
+    #[test]
+    fn retry_after_hint_skips_error_and_still_gated_accounts() {
+        let now = OffsetDateTime::now_utc();
+        let at = |secs: i64| now + Duration::seconds(secs);
+
+        // Account A — weekly-gated: its 5h resets SOON (200s) but its 7d stays over
+        // threshold until 5000s, so A does NOT actually return until 5000s.
+        let mut a = AccountRuntime::from_config(&account("a", 0));
+        a.switch_threshold = Some(0.90);
+        a.quota.five_hour = Some(window(0.99, Some(at(200))));
+        a.quota.seven_day = Some(window(0.99, Some(at(5_000))));
+
+        // Account B — a dead credential (Error) that holds the SOONEST raw reset
+        // (100s). It never self-frees, so it must contribute nothing to the hint.
+        let mut b = AccountRuntime::from_config(&account("b", 0));
+        b.switch_threshold = Some(0.90);
+        b.status = AccountStatus::Error;
+        b.quota.five_hour = Some(window(0.99, Some(at(100))));
+
+        // Account C — the TRUE first recovery: 5h-gated with a later reset (900s)
+        // and a healthy 7d, so it genuinely returns at 900s.
+        let mut c = AccountRuntime::from_config(&account("c", 0));
+        c.switch_threshold = Some(0.90);
+        c.quota.five_hour = Some(window(0.99, Some(at(900))));
+
+        let manager = Manager::from_runtimes(vec![a, b, c]);
+        let hint = manager.retry_after_hint(now, false);
+
+        // Correct = C's 900s reset. The pre-fix raw-min over every window's reset
+        // returned ~100s: it counted B's reset (an Error account that never returns)
+        // and A's 200s 5h reset (A stays gated on its weekly until 5000s). Both are
+        // now skipped, so the min of the real free_at instants is C's 900s.
+        let expected = ((odt_to_ms(at(900)) - odt_to_ms(now) + 999) / 1000).max(1);
+        assert_eq!(hint, expected, "hint must be C's 900s reset, got {hint}");
+        assert!(
+            hint > 800,
+            "must not report B's 100s or A's 200s reset, got {hint}"
         );
     }
 

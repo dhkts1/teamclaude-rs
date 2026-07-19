@@ -324,6 +324,76 @@ impl Manager {
         true
     }
 
+    /// Why this account is out of rotation and when it clears — the display and
+    /// hint-side companion to [`Self::eligible`], mirroring its HARD gates exactly
+    /// (disabled/error → hold → 5-hour → weekly → Fable weekly) while deliberately
+    /// omitting soft pacing, which only ever narrows an already-healthy account and
+    /// never holds one out. Pure and lock-free so both [`Manager::snapshot`] and
+    /// [`Manager::retry_after_hint`] can call it as the single source of truth.
+    ///
+    /// The terminal gates (`Disabled`, `Login`) never self-free, so their instant
+    /// is `None`. Otherwise every ACTIVE gate contributes the instant it clears:
+    /// a future hold its deadline, and a window at/over `threshold` its
+    /// [`crate::quota::QuotaWindow::live_reset`]. An account frees only once ALL of
+    /// its gates clear, so the binding gate is the LATEST-clearing one and
+    /// `free_at` is the MAX of the clear-instants. An active gate with no known
+    /// reset (a window over threshold whose reset is unknown) is the
+    /// longest-possible constraint, so it sorts as "latest": it becomes the reason
+    /// and `free_at` is `None` (we cannot promise a time). No active gate → `Ok`.
+    pub(super) fn account_gate(
+        account: &AccountRuntime,
+        threshold: f64,
+        now: OffsetDateTime,
+        now_ms: i64,
+        is_fable: bool,
+    ) -> (GateReason, Option<OffsetDateTime>) {
+        // Terminal states that never self-free — reported with no clear-instant.
+        if account.disabled {
+            return (GateReason::Disabled, None);
+        }
+        if account.status == AccountStatus::Error {
+            return (GateReason::Login, None);
+        }
+
+        // Every ACTIVE hard gate paired with the instant it clears (`None` = active
+        // but no known reset). Collected in eligibility order; soft pacing is
+        // intentionally excluded (see the doc comment).
+        let mut gates: Vec<(GateReason, Option<OffsetDateTime>)> = Vec::new();
+        if let Some(until) = account.rate_limited_until_ms {
+            if now_ms < until {
+                gates.push((GateReason::Hold, ms_to_odt(until)));
+            }
+        }
+        if let Some(window) = account.quota.five_hour {
+            if window.effective(now) >= threshold {
+                gates.push((GateReason::FiveHour, window.live_reset(now)));
+            }
+        }
+        if let Some(window) = account.quota.seven_day {
+            if window.effective(now) >= threshold {
+                gates.push((GateReason::SevenDay, window.live_reset(now)));
+            }
+        }
+        // The model-scoped weekly gates Fable requests ONLY — mirror `eligible`.
+        if is_fable {
+            if let Some(window) = account.quota.seven_day_oi {
+                if window.effective(now) >= threshold {
+                    gates.push((GateReason::FableWeekly, window.live_reset(now)));
+                }
+            }
+        }
+
+        // The latest-clearing gate binds. `gate_clear_key` sorts an unknown reset
+        // (`None`) after every known instant, so if any active gate has no reset it
+        // wins here and carries its `None` out as `free_at` — exactly the
+        // "cannot promise a time" case. `max_by_key` breaks ties toward the
+        // last-collected gate, a deterministic order.
+        gates
+            .into_iter()
+            .max_by_key(|&(_, at)| gate_clear_key(at))
+            .unwrap_or((GateReason::Ok, None))
+    }
+
     /// The best pacing-respecting eligible account not in `tried`, by ascending
     /// `(priority, last_selected_seq, soonest weekly reset)` — the pre-pacing LRU
     /// order, now additionally skipping any account the soft pacing gate holds out.
@@ -437,5 +507,17 @@ impl Manager {
             }
         }
         best
+    }
+}
+
+/// Sort key for a gate's clear-instant that ranks an unknown reset (`None`) after
+/// every known instant: an active gate with no known reset is the
+/// longest-possible constraint, so it must sort as the LATEST-clearing gate.
+/// Among known instants the natural chronological order applies. Used by
+/// [`Manager::account_gate`] to pick the binding (latest-clearing) gate.
+fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
+    match at {
+        Some(t) => (0, t),
+        None => (1, OffsetDateTime::UNIX_EPOCH),
     }
 }

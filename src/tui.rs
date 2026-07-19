@@ -33,7 +33,9 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 
 use crate::manager::Manager;
 use crate::probe::ProbeStatus;
-use crate::stats::{AccountSnapshot, QuotaState, SessionKind, SessionSnapshot, StatsSnapshot};
+use crate::stats::{
+    AccountSnapshot, GateReason, QuotaState, SessionKind, SessionSnapshot, StatsSnapshot,
+};
 
 /// Restores the terminal to a sane state whenever it is dropped — normal exit,
 /// an early `?`, or a panic unwind. Constructing it enters raw-mode + the
@@ -186,12 +188,22 @@ fn accounts_title(shown: u16, total: u16) -> String {
 fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize) {
     let now = OffsetDateTime::now_utc();
     let area = frame.area();
+    // A single-row fleet banner sits above everything — the fleet aggregate the
+    // per-row table can't show (how many accounts are actually in rotation, and
+    // when the first one returns when none are). The rest of the frame lays out
+    // below it exactly as before.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    render_fleet_banner(frame, outer[0], snapshot, now);
+    let body = outer[1];
     // Accounts is the primary data: budget its height first so it is the LAST
     // thing clipped. SESSIONS absorbs the vertical slack (grows when the terminal
     // is tall); the recent-log lives in whatever remains, so it shrinks/vanishes
     // before any account row is dropped.
-    let acct_h = account_area_height(area.height, snapshot.accounts.len() as u16);
-    let rest = area.height.saturating_sub(acct_h);
+    let acct_h = account_area_height(body.height, snapshot.accounts.len() as u16);
+    let rest = body.height.saturating_sub(acct_h);
     let log_h = rest.saturating_sub(SESSIONS_MIN).min(9);
     let sessions_h = rest.saturating_sub(log_h);
     let chunks = Layout::default()
@@ -201,10 +213,79 @@ fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize) {
             Constraint::Length(sessions_h),
             Constraint::Length(log_h),
         ])
-        .split(area);
+        .split(body);
     render_accounts(frame, chunks[0], snapshot, selected, now);
     render_sessions(frame, chunks[1], snapshot, now);
     render_log(frame, chunks[2], snapshot, now);
+}
+
+/// One row per account is the wrong altitude for "is the whole fleet up?" — the
+/// live incident showed seven individually-busy rows and no aggregate. This
+/// distilled fleet status is exactly that: how many accounts are in rotation, of
+/// how many, and — only when NONE are — which account returns first and when.
+struct FleetStatus {
+    eligible: usize,
+    total: usize,
+    /// The soonest-returning account (name + time-until), computed ONLY when
+    /// `eligible == 0`. `None` there means every gated account has an unknown
+    /// clear-instant, so the banner says "next free unknown" rather than lie.
+    next_free: Option<(String, TimeDuration)>,
+}
+
+/// Distil the account snapshots into a [`FleetStatus`]. An account is eligible
+/// when its gate is [`GateReason::Ok`] and it is not disabled — the same hard
+/// gates selection honours. When none are, the soonest known `free_at` names the
+/// first account to return. Pure and terminal-free so it can be unit-tested.
+fn fleet_status(accounts: &[AccountSnapshot], now: OffsetDateTime) -> FleetStatus {
+    let total = accounts.len();
+    let eligible = accounts
+        .iter()
+        .filter(|a| a.gate == GateReason::Ok && !a.disabled)
+        .count();
+    let next_free = if eligible == 0 {
+        accounts
+            .iter()
+            .filter_map(|a| a.free_at.filter(|&f| f > now).map(|f| (a.name.clone(), f)))
+            .min_by_key(|&(_, f)| f)
+            .map(|(name, f)| (name, f - now))
+    } else {
+        None
+    };
+    FleetStatus {
+        eligible,
+        total,
+        next_free,
+    }
+}
+
+/// The single-row fleet banner: `FLEET n/total eligible`, turning red with a
+/// `· next free <account> in <rel>` (or `· next free unknown`) tail the moment no
+/// account is in rotation — the fleet-exhausted client-facing 429's honest mirror.
+fn render_fleet_banner(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &StatsSnapshot,
+    now: OffsetDateTime,
+) {
+    let status = fleet_status(&snapshot.accounts, now);
+    let mut text = format!("FLEET {}/{} eligible", status.eligible, status.total);
+    if status.eligible == 0 {
+        match status.next_free {
+            Some((name, delta)) => {
+                text.push_str(&format!(" · next free {name} in {}", rel(delta)));
+            }
+            None => text.push_str(" · next free unknown"),
+        }
+    }
+    // Red + bold when the fleet is down (0 eligible); a calm green otherwise.
+    let style = if status.eligible == 0 {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    };
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
 }
 
 /// The shared skeleton behind the two data panes ([`render_accounts`] and
@@ -236,7 +317,7 @@ fn render_accounts(
     now: OffsetDateTime,
 ) {
     let header = Row::new(vec![
-        "Account", "Pri", "Status", "Probe", "5h", "7d", "Reqs", "In", "Out", "Last",
+        "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Reqs", "In", "Out", "Last",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -252,12 +333,16 @@ fn render_accounts(
             // rotation on its cap reads as "near"/"full" (yellow/red on the BAR), while
             // its Status stays "active" — the red "error" is reserved for a dead cred.
             let (quota_label, quota_style) = quota_cell(account.quota_state);
+            // Why this account is out of rotation and when it returns — the
+            // per-row half of the fleet banner (`OK` / `5H 47m` / `LOGIN` / …).
+            let (gate_label, gate_style) = gate_chip(account, now);
             let last_used = fmt_age_opt(account.last_used, now);
 
             let cells = vec![
                 Cell::from(format!("{marker}{}", account.name)),
                 Cell::from(account.priority.to_string()),
                 Cell::from(account.status.clone()).style(status_style(&account.status)),
+                Cell::from(gate_label).style(gate_style),
                 Cell::from(probe_label).style(probe_style),
                 Cell::from(bar(account.five_hour)),
                 Cell::from(format!("{}{quota_label}", bar(account.seven_day))).style(quota_style),
@@ -286,6 +371,8 @@ fn render_accounts(
         Constraint::Length(18),
         Constraint::Length(3),
         Constraint::Length(9),
+        // Gate chip: fits the widest label + back-when (`FABLE-7D 47h30m`).
+        Constraint::Length(15),
         Constraint::Length(11),
         Constraint::Length(14),
         // 7d bar + a "near"/"full" quota label — wider than the 5h column.
@@ -560,6 +647,44 @@ fn quota_cell(state: QuotaState) -> (&'static str, Style) {
     }
 }
 
+/// The per-row gate chip: WHY this account is out of rotation and WHEN it
+/// returns, mirroring the [`GateReason`] the manager computed and formatting the
+/// `free_at` clear-instant as a compact back-when. `OK`/`OFF` are dim (not a
+/// problem); a dead credential's `LOGIN` is red-bold (needs a human); every
+/// quota/hold gate is red. An unknown clear-instant drops the back-when (a bare
+/// `5H`) — the display never invents a time the manager could not promise.
+fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
+    let red = Style::default().fg(Color::Red);
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    // A quota/Fable gate's back-when: the compact `rel`, or just the prefix when
+    // the reset is unknown.
+    let back = |prefix: &str| match account.free_at {
+        Some(f) if f > now => format!("{prefix} {}", rel(f - now)),
+        _ => prefix.to_string(),
+    };
+    match account.gate {
+        GateReason::Ok => ("OK".to_string(), dim),
+        GateReason::Hold => {
+            // A hold is short (<= 1h), so raw seconds read best ("HOLD 12s").
+            let label = match account.free_at {
+                Some(f) if f > now => format!("HOLD {}s", (f - now).whole_seconds().max(1)),
+                _ => "HOLD".to_string(),
+            };
+            (label, red)
+        }
+        GateReason::FiveHour => (back("5H"), red),
+        GateReason::SevenDay => (back("7D"), red),
+        GateReason::FableWeekly => (back("FABLE-7D"), red),
+        GateReason::Login => (
+            "LOGIN".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        GateReason::Disabled => ("OFF".to_string(), dim),
+    }
+}
+
 fn status_style(status: &str) -> Style {
     match status {
         "active" => Style::default().fg(Color::Green),
@@ -605,6 +730,24 @@ fn fmt_age(delta: TimeDuration) -> String {
         format!("{}m", secs / 60)
     } else if secs < 86_400 {
         format!("{}h", secs / 3_600)
+    } else {
+        format!("{}d", secs / 86_400)
+    }
+}
+
+/// A compact "time until" for the fleet banner and gate chips: seconds under a
+/// minute, whole minutes under an hour, `HhMMm` under two days, whole days
+/// beyond. Distinct from [`fmt_age`] (a single-unit ELAPSED age): a gate's
+/// back-when keeps hour+minute detail within a day so `2h05m` is not flattened
+/// to `2h`.
+fn rel(d: TimeDuration) -> String {
+    let secs = d.whole_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 172_800 {
+        format!("{}h{:02}m", secs / 3_600, (secs % 3_600) / 60)
     } else {
         format!("{}d", secs / 86_400)
     }
@@ -869,5 +1012,165 @@ mod tests {
             !rows.iter().any(|r| matches!(r, TreeRow::Unpinned { .. })),
             "all-stable input must yield no unpinned row"
         );
+    }
+
+    /// A minimal account snapshot carrying just the fields the gate chip and fleet
+    /// banner read — everything else defaulted — for those render tests.
+    fn snap_gate(name: &str, gate: GateReason, free_at: Option<OffsetDateTime>) -> AccountSnapshot {
+        AccountSnapshot {
+            name: name.to_string(),
+            priority: 0,
+            status: "active".to_string(),
+            disabled: matches!(gate, GateReason::Disabled),
+            five_hour: None,
+            five_hour_reset: None,
+            seven_day: None,
+            seven_day_reset: None,
+            seven_day_oi: None,
+            requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            last_used: None,
+            rate_limited_until: None,
+            probe_status: ProbeStatus::Never,
+            last_probe: None,
+            probe_error: None,
+            quota_state: QuotaState::Normal,
+            gate,
+            free_at,
+        }
+    }
+
+    /// A stable, far-from-epoch anchor so `now + delta` never underflows.
+    fn anchor() -> OffsetDateTime {
+        OffsetDateTime::UNIX_EPOCH + TimeDuration::days(3650)
+    }
+
+    #[test]
+    fn rel_buckets() {
+        // Under a minute: raw seconds.
+        assert_eq!(rel(TimeDuration::seconds(0)), "0s");
+        assert_eq!(rel(TimeDuration::seconds(45)), "45s");
+        assert_eq!(rel(TimeDuration::seconds(59)), "59s");
+        // Under an hour: whole minutes.
+        assert_eq!(rel(TimeDuration::seconds(60)), "1m");
+        assert_eq!(rel(TimeDuration::minutes(47)), "47m");
+        assert_eq!(rel(TimeDuration::minutes(59)), "59m");
+        // Under 48h: hours + zero-padded minutes.
+        assert_eq!(rel(TimeDuration::hours(1)), "1h00m");
+        assert_eq!(rel(TimeDuration::minutes(125)), "2h05m");
+        assert_eq!(
+            rel(TimeDuration::hours(47) + TimeDuration::minutes(30)),
+            "47h30m"
+        );
+        // 48h and beyond: whole days.
+        assert_eq!(rel(TimeDuration::hours(48)), "2d");
+        assert_eq!(rel(TimeDuration::days(3)), "3d");
+        // Negative (a reset already in the past) clamps to zero.
+        assert_eq!(rel(TimeDuration::seconds(-10)), "0s");
+    }
+
+    #[test]
+    fn gate_chip_labels_each_reason() {
+        let now = anchor();
+        let at = |secs: i64| Some(now + TimeDuration::seconds(secs));
+
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::Ok, None), now).0,
+            "OK"
+        );
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::Login, None), now).0,
+            "LOGIN"
+        );
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::Disabled, None), now).0,
+            "OFF"
+        );
+        // A hold shows raw seconds ("HOLD 12s").
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::Hold, at(12)), now).0,
+            "HOLD 12s"
+        );
+        // Quota/Fable gates carry the compact `rel` back-when.
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::FiveHour, at(47 * 60)), now).0,
+            "5H 47m"
+        );
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::SevenDay, at(2 * 86_400)), now).0,
+            "7D 2d"
+        );
+        assert_eq!(
+            gate_chip(
+                &snap_gate("a", GateReason::FableWeekly, at(3 * 86_400)),
+                now
+            )
+            .0,
+            "FABLE-7D 3d"
+        );
+        // An unknown clear-instant drops the back-when — the display never invents
+        // a time the manager could not promise.
+        assert_eq!(
+            gate_chip(&snap_gate("a", GateReason::FiveHour, None), now).0,
+            "5H"
+        );
+    }
+
+    #[test]
+    fn fleet_status_counts_eligible_and_skips_next_free() {
+        let now = anchor();
+        let accounts = vec![
+            snap_gate("a", GateReason::Ok, None),
+            snap_gate(
+                "b",
+                GateReason::FiveHour,
+                Some(now + TimeDuration::seconds(300)),
+            ),
+            snap_gate("c", GateReason::Ok, None),
+        ];
+        let status = fleet_status(&accounts, now);
+        assert_eq!((status.eligible, status.total), (2, 3));
+        // Some account is in rotation, so no "next free" is computed.
+        assert!(status.next_free.is_none());
+    }
+
+    #[test]
+    fn fleet_status_names_soonest_recovery_when_none_eligible() {
+        let now = anchor();
+        // All gated; b returns first (300s) even though it is listed second, and the
+        // never-self-freeing Login account is skipped.
+        let accounts = vec![
+            snap_gate(
+                "a",
+                GateReason::SevenDay,
+                Some(now + TimeDuration::seconds(5_000)),
+            ),
+            snap_gate(
+                "b",
+                GateReason::FiveHour,
+                Some(now + TimeDuration::seconds(300)),
+            ),
+            snap_gate("login", GateReason::Login, None),
+        ];
+        let status = fleet_status(&accounts, now);
+        assert_eq!(status.eligible, 0);
+        let (name, delta) = status.next_free.expect("some account has a known free_at");
+        assert_eq!(name, "b");
+        assert_eq!(delta, TimeDuration::seconds(300));
+    }
+
+    #[test]
+    fn fleet_status_unknown_when_all_gated_without_reset() {
+        let now = anchor();
+        // Every account is out with NO known clear-instant → next_free is None, so
+        // the banner honestly says "unknown" rather than promising a time.
+        let accounts = vec![
+            snap_gate("a", GateReason::Login, None),
+            snap_gate("b", GateReason::Disabled, None),
+        ];
+        let status = fleet_status(&accounts, now);
+        assert_eq!(status.eligible, 0);
+        assert!(status.next_free.is_none());
     }
 }
