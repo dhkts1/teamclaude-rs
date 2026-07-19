@@ -1228,18 +1228,30 @@ mod tests {
     }
 
     #[test]
-    fn login_guard_refuses_when_a_server_is_live() {
+    fn login_guard_refusal_message_carries_pid_and_stop_login_restart_sequence() {
         let msg = login_guard_refusal(Some(4242), 3456, false)
             .expect("a live server without --force must refuse");
         // Actionable + greppable: names the port, the PID, and the escape hatch.
         assert!(msg.contains("3456"), "names the port: {msg}");
         assert!(msg.contains("4242"), "names the pid: {msg}");
         assert!(msg.contains("--force"), "names the escape hatch: {msg}");
-        assert!(msg.contains("tcr login"), "gives the recovery step: {msg}");
         assert_eq!(
             msg.lines().count(),
             1,
             "the refusal is a single line: {msg}"
+        );
+        // The recovery is the ORDERED stop → login → restart sequence: stop names the
+        // exact PID, then `tcr login`, then restart `tcr server`.
+        let stop = msg.find("kill 4242").expect("stop step names the pid");
+        let login = msg.find("tcr login").expect("login step present");
+        let restart = msg.find("restart").expect("restart step present");
+        assert!(
+            stop < login && login < restart,
+            "stop → login → restart, in order: {msg}"
+        );
+        assert!(
+            msg.contains("tcr server"),
+            "restart targets the server: {msg}"
         );
     }
 
@@ -1249,6 +1261,30 @@ mod tests {
         assert!(login_guard_refusal(Some(4242), 3456, true).is_none());
         // No server on the port → nothing to refuse.
         assert!(login_guard_refusal(None, 3456, false).is_none());
+    }
+
+    #[test]
+    fn login_refuses_over_proxy_command_lines_but_allows_an_unrelated_holder() {
+        use crate::singleton::is_proxy_server;
+        // The real chain: a port holder blocks login IFF its command line is a
+        // recognized tcr/teamclaude *server*. Compose the pure classifier with the
+        // pure guard decision — refuse / refuse / allow.
+        let refuses = |cmd: &str| {
+            let server_pid = is_proxy_server(cmd).then_some(4242u32);
+            login_guard_refusal(server_pid, 3456, false).is_some()
+        };
+        assert!(
+            refuses("/opt/teamclaude-rs/target/release/tcr server"),
+            "a live tcr server must block login"
+        );
+        assert!(
+            refuses("node /opt/nvm/bin/teamclaude server"),
+            "a live JS teamclaude server must block login"
+        );
+        assert!(
+            !refuses("python3 -m http.server 3456"),
+            "an unrelated process on the port must NOT block login"
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
-use crate::oauth::NoRefresh;
+use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, UsageProber};
 use crate::stats::{AccountSnapshot, StatsSnapshot};
 
@@ -225,19 +225,23 @@ pub fn set_enabled(
 /// normally; expired ones surface a visible probe error instead of refreshing.
 ///
 /// Split out from [`list_accounts`] / [`status`] so tests can inject a scripted
-/// [`UsageProber`] and assert the on-disk config is byte-unchanged (the no-race
-/// guarantee).
+/// [`UsageProber`] and a scripted [`TokenRefresher`] — asserting both that the
+/// on-disk config is byte-unchanged (the no-race guarantee) and that an expired
+/// account is handled by the injected refresher, never a hidden [`LiveRefresher`]
+/// (the no-refresh guarantee). Production callers pass [`NoRefresh`].
 pub async fn snapshot_offline(
     config: Config,
+    refresher: Arc<dyn TokenRefresher>,
     prober: Arc<dyn UsageProber>,
     probe: bool,
 ) -> StatsSnapshot {
-    // config_path = None → persist_now / persist_tokens are silent no-ops, and
-    // NoRefresh → the refresher can never reach the OAuth token endpoint, so a probe
-    // here can neither mutate the user's file nor revoke the live server's tokens.
+    // config_path = None → persist_now / persist_tokens are silent no-ops, and the
+    // caller's refresher (production: NoRefresh) can never reach the OAuth token
+    // endpoint, so a probe here can neither mutate the user's file nor revoke the
+    // live server's tokens.
     let manager = Manager::new(
         config,
-        Arc::new(NoRefresh),
+        refresher,
         prober,
         Arc::new(crate::warmer::LiveWarmer::new()),
         None,
@@ -322,7 +326,13 @@ fn render_accounts_json(snapshot: &StatsSnapshot) -> String {
 /// `--probe`, first refresh every account's live quota (never persisted).
 pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    let snapshot = snapshot_offline(config, Arc::new(LiveUsageProber::new()), probe).await;
+    let snapshot = snapshot_offline(
+        config,
+        Arc::new(NoRefresh),
+        Arc::new(LiveUsageProber::new()),
+        probe,
+    )
+    .await;
     print!("{}", render_accounts(&snapshot));
     Ok(())
 }
@@ -331,7 +341,13 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
 /// persisted) and render the fleet as greppable text or a JSON array.
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = load_for_edit(config_path)?;
-    let snapshot = snapshot_offline(config, Arc::new(LiveUsageProber::new()), true).await;
+    let snapshot = snapshot_offline(
+        config,
+        Arc::new(NoRefresh),
+        Arc::new(LiveUsageProber::new()),
+        true,
+    )
+    .await;
     if json {
         println!("{}", render_accounts_json(&snapshot));
     } else {
@@ -343,6 +359,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oauth::{OAuthError, RefreshFuture};
     use crate::probe::{ProbeFuture, Usage, UsageBucket};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -568,7 +585,13 @@ mod tests {
     #[tokio::test]
     async fn render_accounts_emits_one_greppable_line_per_account() {
         let config = load_from(TWO_ACCOUNTS);
-        let snapshot = snapshot_offline(config, Arc::new(FixedProber { util: 0.25 }), true).await;
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            true,
+        )
+        .await;
         let text = render_accounts(&snapshot);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per account");
@@ -590,7 +613,13 @@ mod tests {
         let path = write_config("no-persist", TWO_ACCOUNTS);
         let before = fs::read_to_string(&path).unwrap();
         let config = load(&path);
-        let _snapshot = snapshot_offline(config, Arc::new(FixedProber { util: 0.5 }), true).await;
+        let _snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.5 }),
+            true,
+        )
+        .await;
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(
             before, after,
@@ -616,6 +645,25 @@ mod tests {
         }
     }
 
+    /// An INSTRUMENTED refresher: records every refresh attempt and, like
+    /// [`NoRefresh`], never contacts the network. Injected into `snapshot_offline`
+    /// to prove the offline snapshot routes an expired account's refresh through the
+    /// caller's refresher — never a hidden [`crate::oauth::LiveRefresher`] that would
+    /// hit the OAuth endpoint and revoke the live server's single-use token.
+    struct RecordingRefresher {
+        calls: Arc<AtomicU64>,
+    }
+    impl TokenRefresher for RecordingRefresher {
+        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(OAuthError::Transient(
+                    "recorded — never networked".to_string(),
+                ))
+            })
+        }
+    }
+
     /// One OAuth account whose token expired in 1970 — probing it would, before the
     /// fix, trigger a real OAuth refresh that revokes the running server's copy.
     const EXPIRED_ACCOUNT: &str = r#"{
@@ -628,14 +676,22 @@ mod tests {
     }"#;
 
     #[tokio::test]
-    async fn expired_account_surfaces_probe_error_without_refreshing_or_persisting() {
-        // An expired token beside a live server must NOT trigger an OAuth refresh
-        // (NoRefresh guarantees zero token-endpoint calls); the account instead
-        // surfaces a clear, greppable probe=error, and the config stays byte-identical.
+    async fn offline_snapshot_over_expired_account_routes_through_injected_refresher() {
+        // Biting test for Fix 1: over an EXPIRED account, the offline snapshot must
+        // hand the refresh to the INJECTED refresher (production wires NoRefresh,
+        // which never networks) rather than a hidden LiveRefresher. A recording
+        // refresher proves the routing — if snapshot_offline ignored its refresher
+        // param and hardcoded LiveRefresher, `calls` would stay 0 and this fails.
+        // The row must still surface a clear, greppable probe=error, and the config
+        // stays byte-identical.
         let path = write_config("expired", EXPIRED_ACCOUNT);
         let before = fs::read_to_string(&path).unwrap();
         let config = load(&path);
-        let snapshot = snapshot_offline(config, Arc::new(RejectingProber), true).await;
+        let calls = Arc::new(AtomicU64::new(0));
+        let refresher = Arc::new(RecordingRefresher {
+            calls: calls.clone(),
+        });
+        let snapshot = snapshot_offline(config, refresher, Arc::new(RejectingProber), true).await;
         let text = render_accounts(&snapshot);
         assert!(
             text.contains("stale@example.com"),
@@ -643,7 +699,12 @@ mod tests {
         );
         assert!(
             text.contains("probe=error"),
-            "surfaces a clear probe status: {text}"
+            "surfaces a clear probe status for the expired account: {text}"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the expired account's refresh was routed through the injected refresher, \
+             never a hidden LiveRefresher (which would have hit the OAuth endpoint)"
         );
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(
