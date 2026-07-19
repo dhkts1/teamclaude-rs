@@ -328,8 +328,13 @@ fn format_reset_countdown(reset: OffsetDateTime, now: OffsetDateTime) -> String 
     }
 }
 
-/// The ` held=<win> resets=<HH:MMZ>(<+countdown>)` segment(s) appended to an
-/// account's status line — one per held window, empty when the account holds none.
+/// The ` held=<win> resets=<HH:MMZ>(<+countdown>)` segment(s) for an account's
+/// held windows — one per held window, empty when the account holds none.
+///
+/// Retained deliberately: the text status line now renders per-window inline
+/// `(+countdown)` tokens instead, but `held_windows` still backs the JSON
+/// `held` array and this suffix stays available for that parity / future reuse.
+#[allow(dead_code)]
 fn held_suffix(a: &AccountSnapshot, threshold: f64, now: OffsetDateTime) -> String {
     let mut s = String::new();
     for h in held_windows(a, threshold) {
@@ -345,13 +350,36 @@ fn held_suffix(a: &AccountSnapshot, threshold: f64, now: OffsetDateTime) -> Stri
 
 /// A short, grep-matchable token for an account's live [`QuotaState`] — surfaced
 /// on the status line and in the JSON row so a held-but-has-headroom account
-/// (`near`) is never mistaken for a truly spent one (`full`). `normal` is an
+/// (`near`) is never mistaken for a truly spent one (`spent`). `ok` is an
 /// in-rotation account comfortably under its threshold.
 fn quota_state_token(state: QuotaState) -> &'static str {
     match state {
-        QuotaState::Normal => "normal",
+        QuotaState::Normal => "ok",
         QuotaState::NearLimit => "near",
-        QuotaState::Exhausted => "full",
+        QuotaState::Exhausted => "spent",
+    }
+}
+
+/// Render one quota window as a `key=value` token: `5h=100%(+93m)`, `wk=67%`, or
+/// `5h=n/a`. The inline `(+countdown)` appears ONLY when the window is a binding
+/// hold — util known, at/over its threshold, and a future reset to count down to.
+fn render_window(
+    label: &str,
+    util: Option<f64>,
+    reset: Option<OffsetDateTime>,
+    threshold: f64,
+    now: OffsetDateTime,
+) -> String {
+    match util {
+        None => format!("{label}=n/a"),
+        Some(u) => {
+            let held = u >= threshold && reset.is_some_and(|r| r > now);
+            let hold = match (held, reset) {
+                (true, Some(r)) => format!("({})", format_reset_countdown(r, now)),
+                _ => String::new(),
+            };
+            format!("{label}={:.0}%{hold}", u * 100.0)
+        }
     }
 }
 
@@ -366,24 +394,28 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
     let now = OffsetDateTime::now_utc();
     let mut out = String::new();
     for (i, a) in snapshot.accounts.iter().enumerate() {
-        let quota = gating_quota(a);
-        let quota_str = match quota {
-            Some(u) => format!("{:.0}%", u * 100.0),
-            None => "n/a".to_string(),
-        };
         // A missing threshold (slice shorter than accounts) can only fail closed:
         // 1.0 means "only a fully-exhausted window reads as held", never a false hold.
         let threshold = thresholds.get(i).copied().unwrap_or(1.0);
+        let five_hour = render_window("5h", a.five_hour, a.five_hour_reset, threshold, now);
+        let seven_day = render_window("wk", a.seven_day, a.seven_day_reset, threshold, now);
+        // Fable's model-scoped weekly never gates the general view: no reset field,
+        // no countdown, and the whole token is omitted when it was never learned.
+        let fable = match a.seven_day_oi {
+            Some(u) => format!(" fable={:.0}%", u * 100.0),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "account {} priority={} quota={} quota_state={} status={} probe={}{}{}\n",
+            "account {} priority={} {} {}{} state={} status={} probe={}{}\n",
             a.name,
             a.priority,
-            quota_str,
+            five_hour,
+            seven_day,
+            fable,
             quota_state_token(a.quota_state),
             a.status,
             a.probe_status.as_str(),
             if a.disabled { " disabled" } else { "" },
-            held_suffix(a, threshold, now),
         ));
     }
     out
@@ -434,7 +466,9 @@ fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String 
 /// `tcr accounts [--probe]` — list configured accounts (offline). With
 /// `--probe`, first refresh every account's live quota (never persisted).
 pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()> {
-    let config = load_for_edit(config_path)?;
+    // Read-only verb: plain load, no clobber-warning (we never save).
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
     let thresholds = resolve_thresholds(&config);
     let snapshot = snapshot_offline(
         config,
@@ -450,7 +484,9 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
 /// `tcr status [--json]` — probe every account's live quota (offline, never
 /// persisted) and render the fleet as greppable text or a JSON array.
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
-    let config = load_for_edit(config_path)?;
+    // Read-only verb: plain load, no clobber-warning (we never save).
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
     let thresholds = resolve_thresholds(&config);
     let snapshot = snapshot_offline(
         config,
@@ -707,16 +743,27 @@ mod tests {
         let text = render_accounts(&snapshot, &thresholds);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per account");
-        // Each line is greppable: name + priority + quota%.
+        // Each line is greppable: name + priority + per-window utilization.
         assert!(lines[0].contains("alice@example.com"));
         assert!(lines[0].contains("priority=0"));
-        assert!(lines[0].contains("quota=25%"));
+        // FixedProber sets five_hour=0.25, seven_day/seven_day_oi=None.
+        assert!(lines[0].contains("5h=25%"), "5h window: {}", lines[0]);
+        assert!(lines[0].contains("wk=n/a"), "wk unknown: {}", lines[0]);
+        // seven_day_oi is None → the fable token is omitted entirely.
+        assert!(!lines[0].contains("fable="), "no fable token: {}", lines[0]);
+        // Well under the 0.9 default threshold → an honest `ok` state.
+        assert!(lines[0].contains("state=ok"), "healthy state: {}", lines[0]);
         assert!(lines[1].contains("bob@example.com"));
         assert!(lines[1].contains("priority=1"));
-        // At 25% util, well under the 0.9 default threshold, no account is held.
+        // At 25% util no window is a binding hold → no inline countdown, and the
+        // legacy `held=`/`quota=`/`quota_state=` fields are gone for good.
         assert!(
-            !text.contains("held="),
-            "under-threshold accounts show no hold: {text}"
+            !text.contains("(+"),
+            "under-threshold accounts show no countdown: {text}"
+        );
+        assert!(
+            !text.contains("held=") && !text.contains("quota="),
+            "legacy quota/held fields are gone: {text}"
         );
     }
 
@@ -902,8 +949,8 @@ mod tests {
 
     #[tokio::test]
     async fn render_accounts_shows_held_window_and_reset_for_over_threshold_accounts() {
-        // 3a: a held account's line carries `held=<win> resets=<HH:MMZ>(<+countdown>)`,
-        // gated on the same per-account threshold `eligible` uses (0.9 default here).
+        // 3a: a held account's binding window carries an inline `(+countdown)`,
+        // gated on the same per-account threshold `eligible` uses.
         let config = load_from(TWO_ACCOUNTS);
         let thresholds = resolve_thresholds(&config);
         let snapshot =
@@ -917,16 +964,20 @@ mod tests {
             .lines()
             .find(|l| l.contains("bob@example.com"))
             .expect("bob line");
-        // alice (at-a) is 5h-held; bob (at-b) is 7d-held. Each shows its own window.
-        assert!(alice.contains("held=5h"), "5h hold labelled: {alice}");
-        assert!(
-            alice.contains("resets=") && alice.contains("(+"),
-            "reset+countdown: {alice}"
-        );
-        assert!(!alice.contains("held=7d"), "alice is not 7d-held: {alice}");
-        assert!(bob.contains("held=7d"), "7d hold labelled: {bob}");
-        assert!(bob.contains("resets="), "reset shown: {bob}");
-        assert!(!bob.contains("held=5h"), "bob is not 5h-held: {bob}");
+        // alice (at-a) is 5h-held at 0.95 with a ~+92m reset; her 5h window carries
+        // the inline countdown while her (unlearned) weekly reads n/a. The exact
+        // minute drifts with wall-clock between probe and render, so match the `(+`.
+        assert!(alice.contains("5h=95%(+"), "5h hold + countdown: {alice}");
+        assert!(alice.contains("wk=n/a"), "alice weekly unknown: {alice}");
+        // bob (at-b) is 7d-held at 0.97 with a +3d reset; his weekly carries the
+        // countdown while his (unlearned) 5h reads n/a.
+        assert!(bob.contains("wk=97%(+"), "wk hold + countdown: {bob}");
+        assert!(bob.contains("5h=n/a"), "bob 5h unknown: {bob}");
+        // Neither is over its 1.0 exhaustion line, so both read `near`, not `spent`.
+        assert!(alice.contains("state=near"), "alice near-limit: {alice}");
+        assert!(bob.contains("state=near"), "bob near-limit: {bob}");
+        // The legacy suffix format is gone from the text line.
+        assert!(!text.contains("held="), "no legacy held= suffix: {text}");
         // Greppable one-line-per-account contract survives the new fields.
         assert_eq!(
             text.lines().count(),
@@ -948,6 +999,46 @@ mod tests {
         assert!(
             json.contains("minutesUntilReset"),
             "json carries the countdown: {json}"
+        );
+    }
+
+    /// A prober that drives every account's 5h window fully over the 1.0
+    /// exhaustion line, with a future reset — so the window binds and reads `spent`.
+    struct ExhaustedProber;
+    impl UsageProber for ExhaustedProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            let now = crate::now_ms();
+            Box::pin(async move {
+                Ok(Usage {
+                    five_hour: Some(UsageBucket {
+                        utilization: Some(1.0),
+                        reset_at_ms: Some(now + 45 * 60 * 1000),
+                    }),
+                    seven_day: None,
+                    seven_day_oi: None,
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn render_accounts_marks_fully_exhausted_account_as_spent_with_countdown() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot =
+            snapshot_offline(config, Arc::new(NoRefresh), Arc::new(ExhaustedProber), true).await;
+        let text = render_accounts(&snapshot, &thresholds);
+        let line = text
+            .lines()
+            .find(|l| l.contains("alice@example.com"))
+            .expect("alice line");
+        // At 1.0 util the account is truly spent (never masquerading as `full`),
+        // and its binding 5h window carries an inline `(+…)` countdown. The exact
+        // minute drifts with wall-clock between probe and render, so match the `(+`.
+        assert!(line.contains("state=spent"), "exhausted → spent: {line}");
+        assert!(
+            line.contains("5h=100%(+"),
+            "5h exhausted + countdown: {line}"
         );
     }
 }
