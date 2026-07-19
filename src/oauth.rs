@@ -231,6 +231,26 @@ impl TokenRefresher for LiveRefresher {
     }
 }
 
+/// The error a [`NoRefresh`] attempt fails with, surfaced when an offline snapshot
+/// (`tcr status`, `tcr accounts --probe`) meets an already-expired token.
+pub const NO_REFRESH_MESSAGE: &str = "offline snapshot never refreshes — token expired; check the running server's TUI or re-run after tcr login";
+
+/// A refresher that NEVER contacts the OAuth token endpoint: every attempt fails
+/// with [`NO_REFRESH_MESSAGE`] (a *transient* error, so it never falsely sidelines
+/// the credential as dead). Injected by [`crate::cli::snapshot_offline`] so a
+/// second process (`tcr status`) can never perform a real OAuth refresh — which,
+/// because refresh tokens are SINGLE-USE, would rotate and thereby REVOKE the copy
+/// the running server still holds, killing that account (observed live 2026-07-19).
+/// Accounts with a still-valid access token probe normally (no refresh is
+/// attempted); expired ones surface a visible probe error instead of refreshing.
+pub struct NoRefresh;
+
+impl TokenRefresher for NoRefresh {
+    fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+        Box::pin(async { Err(OAuthError::Transient(NO_REFRESH_MESSAGE.to_string())) })
+    }
+}
+
 // ===========================================================================
 // Browser OAuth login (PKCE), ported from `teamclaude/src/oauth.js`
 // (`loginOAuth` / `startCallbackServer` / `raceWithStdinCode` / `openBrowser` /
@@ -248,6 +268,7 @@ use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, Buf
 use tokio::net::TcpListener;
 
 use crate::config::{self, Account, Config};
+use crate::singleton;
 
 /// Authorize endpoint (from the JS `OAUTH_AUTHORIZE`).
 pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -738,9 +759,47 @@ pub fn upsert_account(
     });
 }
 
+/// The proxy port a login must guard against — the port the running server binds.
+/// Reads `proxy.port` from the config (falling back to the serde default when the
+/// file is missing or unreadable), so the guard checks the SAME port `tcr server`
+/// takes over.
+fn login_target_port(config_path: &Path) -> u16 {
+    config::load(config_path)
+        .unwrap_or_else(|_| {
+            serde_json::from_str("{}").expect("empty object is a valid default config")
+        })
+        .proxy
+        .port
+}
+
+/// The pure login-guard DECISION: given the PID of any live proxy server detected
+/// on the port, the port, and the `--force` flag, return the one-line refusal
+/// message to abort with, or `None` to proceed. Split from the impure lsof-based
+/// detection ([`crate::singleton::live_proxy_server`]) so the refuse/allow logic is
+/// unit-testable, mirroring singleton's pure-decision / impure-executor split.
+fn login_guard_refusal(server_pid: Option<u32>, port: u16, force: bool) -> Option<String> {
+    match server_pid {
+        Some(pid) if !force => Some(format!(
+            "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — stop it (kill {pid}, or Ctrl-C in its terminal), run 'tcr login', then restart 'tcr server'. Re-run with --force to log in anyway."
+        )),
+        _ => None,
+    }
+}
+
 /// Run the full browser OAuth login and persist the account to `config_path`.
 /// Returns the account name on success. Never logs or prints the tokens.
-pub async fn login(config_path: &Path) -> anyhow::Result<String> {
+///
+/// Refuses (unless `force`) when a live proxy server already holds the configured
+/// port: the server reads config only at boot and its next `persist_tokens`
+/// rewrites the WHOLE file from memory, silently clobbering the fresh tokens this
+/// login writes (observed live 2026-07-19 — a server refresh overwrote a re-login
+/// within seconds). Detection is read-only; the server is never signalled.
+pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
+    let port = login_target_port(config_path);
+    if let Some(msg) = login_guard_refusal(singleton::live_proxy_server(port), port, force) {
+        bail!("{}", msg);
+    }
+
     // Bind the callback server on a random loopback port (127.0.0.1 only).
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1149,5 +1208,59 @@ mod tests {
         assert!(url.contains("state="));
         // redirect_uri is percent-encoded by oauth2.
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback"));
+    }
+
+    #[tokio::test]
+    async fn no_refresh_never_hits_the_endpoint_and_fails_transiently() {
+        // The whole point of Fix 1: an offline snapshot's refresher must fail
+        // locally (no OAuth token-endpoint call) so a `tcr status` beside a live
+        // server can never rotate/revoke its single-use refresh token. Transient,
+        // never AuthRejected — it must NOT falsely mark the credential dead.
+        let err = NoRefresh
+            .refresh("rt-should-never-be-sent".to_string())
+            .await
+            .expect_err("NoRefresh must always fail — it never contacts the endpoint");
+        assert!(matches!(err, OAuthError::Transient(_)));
+        assert_eq!(
+            err.to_string(),
+            format!("token refresh failed transiently: {NO_REFRESH_MESSAGE}")
+        );
+    }
+
+    #[test]
+    fn login_guard_refuses_when_a_server_is_live() {
+        let msg = login_guard_refusal(Some(4242), 3456, false)
+            .expect("a live server without --force must refuse");
+        // Actionable + greppable: names the port, the PID, and the escape hatch.
+        assert!(msg.contains("3456"), "names the port: {msg}");
+        assert!(msg.contains("4242"), "names the pid: {msg}");
+        assert!(msg.contains("--force"), "names the escape hatch: {msg}");
+        assert!(msg.contains("tcr login"), "gives the recovery step: {msg}");
+        assert_eq!(
+            msg.lines().count(),
+            1,
+            "the refusal is a single line: {msg}"
+        );
+    }
+
+    #[test]
+    fn login_guard_allows_with_force_or_no_server() {
+        // --force is the deliberate escape hatch even when a server is live.
+        assert!(login_guard_refusal(Some(4242), 3456, true).is_none());
+        // No server on the port → nothing to refuse.
+        assert!(login_guard_refusal(None, 3456, false).is_none());
+    }
+
+    #[test]
+    fn login_target_port_reads_config_and_defaults_when_missing() {
+        // Reads proxy.port so the guard checks the SAME port the server binds.
+        let path =
+            std::env::temp_dir().join(format!("tcr-oauth-login-port-{}.json", std::process::id()));
+        std::fs::write(&path, r#"{ "proxy": { "port": 4999 } }"#).unwrap();
+        assert_eq!(login_target_port(&path), 4999);
+        std::fs::remove_file(&path).ok();
+        // A missing/unreadable config falls back to the serde default (3456).
+        let missing = std::env::temp_dir().join("tcr-oauth-login-port-does-not-exist.json");
+        assert_eq!(login_target_port(&missing), 3456);
     }
 }

@@ -26,7 +26,7 @@ use time::OffsetDateTime;
 use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
-use crate::oauth::LiveRefresher;
+use crate::oauth::NoRefresh;
 use crate::probe::{LiveUsageProber, UsageProber};
 use crate::stats::{AccountSnapshot, StatsSnapshot};
 
@@ -214,8 +214,15 @@ pub fn set_enabled(
 }
 
 /// Build an OFFLINE snapshot from `config`: a [`Manager`] with `config_path =
-/// None` (so a probe's token refresh is NEVER written to disk), optionally
+/// None` (so a probe's token refresh is NEVER written to disk) AND a [`NoRefresh`]
+/// refresher (so a probe NEVER performs an OAuth refresh at all), optionally
 /// probing every account's live quota first.
+///
+/// The no-refresh guarantee is load-bearing and independent of the no-persist one:
+/// refresh tokens are SINGLE-USE, so a refresh from this second process would
+/// revoke the running server's copy and kill the account — even though we would
+/// never write the rotated token back. Accounts with a valid access token probe
+/// normally; expired ones surface a visible probe error instead of refreshing.
 ///
 /// Split out from [`list_accounts`] / [`status`] so tests can inject a scripted
 /// [`UsageProber`] and assert the on-disk config is byte-unchanged (the no-race
@@ -225,11 +232,12 @@ pub async fn snapshot_offline(
     prober: Arc<dyn UsageProber>,
     probe: bool,
 ) -> StatsSnapshot {
-    // config_path = None → persist_now / persist_tokens are silent no-ops, so a
-    // probe here can never mutate the user's file.
+    // config_path = None → persist_now / persist_tokens are silent no-ops, and
+    // NoRefresh → the refresher can never reach the OAuth token endpoint, so a probe
+    // here can neither mutate the user's file nor revoke the live server's tokens.
     let manager = Manager::new(
         config,
-        Arc::new(LiveRefresher::new()),
+        Arc::new(NoRefresh),
         prober,
         Arc::new(crate::warmer::LiveWarmer::new()),
         None,
@@ -587,6 +595,60 @@ mod tests {
         assert_eq!(
             before, after,
             "an offline status probe must never persist to the config file"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- no-refresh guarantee (Fix 1) --------------------------------------
+
+    /// A prober that always fails as if the usage endpoint rejected the token
+    /// (HTTP 401) — the shape an EXPIRED account's stale access token gets once
+    /// [`NoRefresh`] has declined to refresh it.
+    struct RejectingProber;
+    impl UsageProber for RejectingProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            Box::pin(async {
+                Err(crate::probe::ProbeError {
+                    status: Some(401),
+                    message: "HTTP 401: token expired".to_string(),
+                })
+            })
+        }
+    }
+
+    /// One OAuth account whose token expired in 1970 — probing it would, before the
+    /// fix, trigger a real OAuth refresh that revokes the running server's copy.
+    const EXPIRED_ACCOUNT: &str = r#"{
+      "proxy": { "port": 3456 },
+      "accounts": [
+        { "name": "stale@example.com", "type": "oauth", "orgName": "Org X",
+          "orgUuid": "uuid-x", "accessToken": "at-stale", "refreshToken": "rt-stale",
+          "expiresAt": 1000, "priority": 0 }
+      ]
+    }"#;
+
+    #[tokio::test]
+    async fn expired_account_surfaces_probe_error_without_refreshing_or_persisting() {
+        // An expired token beside a live server must NOT trigger an OAuth refresh
+        // (NoRefresh guarantees zero token-endpoint calls); the account instead
+        // surfaces a clear, greppable probe=error, and the config stays byte-identical.
+        let path = write_config("expired", EXPIRED_ACCOUNT);
+        let before = fs::read_to_string(&path).unwrap();
+        let config = load(&path);
+        let snapshot = snapshot_offline(config, Arc::new(RejectingProber), true).await;
+        let text = render_accounts(&snapshot);
+        assert!(
+            text.contains("stale@example.com"),
+            "renders the account: {text}"
+        );
+        assert!(
+            text.contains("probe=error"),
+            "surfaces a clear probe status: {text}"
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "an offline probe of an expired account must never persist"
         );
         fs::remove_file(&path).ok();
     }
