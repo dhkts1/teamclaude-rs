@@ -35,7 +35,7 @@ fn default_upstream() -> String {
     "https://api.anthropic.com".to_string()
 }
 fn default_switch_threshold() -> f64 {
-    0.90
+    0.95
 }
 /// Default pacing when the `pacing` key is absent: cap each account at 3 requests
 /// concurrently in flight, no min-spacing. This makes a concurrent burst (e.g. a
@@ -372,7 +372,7 @@ mod tests {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
         assert_eq!(config.proxy.port, 3456);
         assert_eq!(config.upstream, "https://api.anthropic.com");
-        assert_eq!(config.switch_threshold, 0.90);
+        assert_eq!(config.switch_threshold, 0.95);
         // Absent `pacing` key → good defaults: cap 3 in-flight, no min-spacing.
         assert_eq!(config.pacing.max_in_flight_per_account, Some(3));
         assert_eq!(config.pacing.min_spacing_ms, None);
