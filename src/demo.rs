@@ -54,6 +54,8 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         quota: Quota::default(),
         input_tokens: 0,
         output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_tokens: 0,
         requests: 0,
         last_used_ms: None,
         last_selected_seq: 0,

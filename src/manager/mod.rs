@@ -113,6 +113,12 @@ pub struct AccountRuntime {
     pub quota: Quota,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
+    /// Accumulated so the prompt-cache hit ratio (`cache_read / input_tokens`) is
+    /// visible per account; `> 0` on post-first turns means the cache is warm.
+    pub cache_read_tokens: u64,
+    /// Cache-creation input tokens (also a subset of `input_tokens`).
+    pub cache_creation_tokens: u64,
     pub requests: u64,
     pub last_used_ms: Option<i64>,
     /// Monotonic tick of the last time [`Manager::select`] *chose* this account
@@ -172,6 +178,8 @@ impl AccountRuntime {
             quota: Quota::default(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             requests: 0,
             last_used_ms: None,
             last_selected_seq: 0,
@@ -2249,11 +2257,16 @@ mod tests {
         });
         let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
         // e.g. input_tokens=10 + cache_creation=100 + cache_read=1000 = 1110.
-        manager.update_usage(0, 1110, 42);
-        manager.update_usage(0, 0, 8);
+        // The last two args are the cache-read / cache-creation SUBSETS of that sum.
+        manager.update_usage(0, 1110, 42, 1000, 100);
+        manager.update_usage(0, 0, 8, 0, 0);
         let snap = manager.snapshot(OffsetDateTime::now_utc());
+        // R1: input_tokens is the SUM, byte-identical to the pre-cache behaviour.
         assert_eq!(snap.accounts[0].input_tokens, 1110);
         assert_eq!(snap.accounts[0].output_tokens, 50);
+        // NEW: the cache components accumulate separately (a subset of the sum).
+        assert_eq!(snap.accounts[0].cache_read_tokens, 1000);
+        assert_eq!(snap.accounts[0].cache_creation_tokens, 100);
     }
 
     /// Drive an account's model-scoped weekly (`7d_oi`, Fable) bucket over

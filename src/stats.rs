@@ -79,6 +79,12 @@ pub struct AccountSnapshot {
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache-read input tokens (a subset of `input_tokens`). The prompt-cache
+    /// hit ratio the TUI and `tcr status` surface is `cache_read_tokens /
+    /// input_tokens` (guarded when `input_tokens == 0`).
+    pub cache_read_tokens: u64,
+    /// Cache-creation input tokens (also a subset of `input_tokens`).
+    pub cache_creation_tokens: u64,
     pub last_used: Option<OffsetDateTime>,
     /// If throttled, when the hold lifts (only while still in the future).
     pub rate_limited_until: Option<OffsetDateTime>,

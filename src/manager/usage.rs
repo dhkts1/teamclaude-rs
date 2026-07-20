@@ -17,12 +17,25 @@ impl Manager {
 
     /// Add token usage to account `idx` (the true serving account — bug #3).
     /// `input_tokens` already includes `cache_creation_input_tokens` +
-    /// `cache_read_input_tokens` (summed by the caller — bug #4).
-    pub fn update_usage(&self, idx: usize, input_tokens: u64, output_tokens: u64) {
+    /// `cache_read_input_tokens` (summed by the caller — bug #4), and remains the
+    /// quota counter. The `cache_read` / `cache_creation` components are ALSO
+    /// tracked separately (they are a SUBSET of `input_tokens`, not additional
+    /// quota) so the prompt-cache hit ratio is visible per account without
+    /// changing what counts against quota.
+    pub fn update_usage(
+        &self,
+        idx: usize,
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_read: u64,
+        cache_creation: u64,
+    ) {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         if let Some(account) = accounts.get_mut(idx) {
             account.input_tokens += input_tokens;
             account.output_tokens += output_tokens;
+            account.cache_read_tokens += cache_read;
+            account.cache_creation_tokens += cache_creation;
         }
     }
 

@@ -127,6 +127,8 @@ impl Manager {
                     requests: a.requests,
                     input_tokens: a.input_tokens,
                     output_tokens: a.output_tokens,
+                    cache_read_tokens: a.cache_read_tokens,
+                    cache_creation_tokens: a.cache_creation_tokens,
                     last_used: a.last_used_ms.and_then(ms_to_odt),
                     rate_limited_until: a
                         .rate_limited_until_ms
