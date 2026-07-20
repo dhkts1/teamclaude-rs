@@ -685,6 +685,7 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         GateReason::FiveHour => (back("5H"), red),
         GateReason::SevenDay => (back("7D"), red),
         GateReason::FableWeekly => (back("FABLE-7D"), red),
+        GateReason::Standard => (back("STD"), red),
         GateReason::Login => (
             "LOGIN".to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
