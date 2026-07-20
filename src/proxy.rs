@@ -66,6 +66,21 @@ const NO_GUIDANCE_HOLD_SECS: i64 = 15;
 /// of accounts that tripped together, so a synchronized wave can't re-arm a
 /// sliding-window limiter.
 const NO_GUIDANCE_JITTER_MAX_SECS: i64 = 5;
+/// Ceiling for soft-waiting out a *transient* all-parked fleet at the exhausted
+/// branch instead of firing the hard 429. Set to the maximum no-guidance park
+/// (`NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS` = 20s): a burst park
+/// falls at/under it, while a real quota rejection (mark_rate_limited clamped up
+/// to 3600s) or a quota window (hours) sits far above it — so real exhaustion is
+/// NEVER soft-waited and still hard-fails immediately.
+const EXHAUSTION_SOFT_WAIT_MAX_SECS: i64 = NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS;
+// Correctness of the soft-wait path depends on this cap staying BELOW
+// `Manager::retry_after_hint`'s `None => 60` sentinel (mod.rs): a soonest-free of
+// exactly 60 there means "no account has a known reset", NOT "60s away", so a cap
+// >= 60 would make an unknown-reset fleet spuriously soft-wait. Enforced at compile time.
+const _: () = assert!(
+    EXHAUSTION_SOFT_WAIT_MAX_SECS < 60,
+    "soft-wait cap must stay below retry_after_hint's None=>60 sentinel"
+);
 
 /// How a transient (non-quota-rejected) 429 should be handled.
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +113,20 @@ fn classify_transient_429(retry_after: Option<i64>, retried: u32, jitter: i64) -
             }
         }
         None => Transient429::Park(NO_GUIDANCE_HOLD_SECS + jitter),
+    }
+}
+
+/// Decide whether an all-accounts-unavailable state is a *transient* fleet-park
+/// worth soft-waiting (Some(secs) to sleep) vs genuine exhaustion (None → hard 429).
+/// `soonest_free_secs` is `Manager::retry_after_hint`; `already_waited` caps us to
+/// ONE soft-wait per client request. Real exhaustion has soonest_free far above the
+/// transient ceiling → None. Kept pure so it is unit-tested without timing.
+fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
+    if already_waited || soonest_free_secs <= 0 || soonest_free_secs > EXHAUSTION_SOFT_WAIT_MAX_SECS
+    {
+        None
+    } else {
+        Some(soonest_free_secs as u64)
     }
 }
 
@@ -324,6 +353,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // its idx here so the next iteration reuses it and bypasses select(), which
     // would otherwise rotate AWAY from the account the retry meant to keep.
     let mut retry_same: Option<usize> = None;
+    // One-shot guard: at most one transient-fleet-park soft-wait per client request.
+    let mut soft_waited_exhaustion = false;
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
@@ -332,11 +363,48 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             None => match manager.select(&tried, now, request_model.as_deref(), session_key) {
                 Some(idx) => idx,
                 None => {
-                    return if saw_network_error {
-                        bad_gateway()
-                    } else {
-                        exhausted_response(&manager, now, account_count, request_is_fable)
-                    };
+                    if saw_network_error {
+                        return bad_gateway();
+                    }
+                    // A cold shared-limiter burst parks the whole fleet for ~15-20s.
+                    // Rather than telling the client "all exhausted" for a transient
+                    // blip, wait out the soonest un-park ONCE and retry select — the
+                    // JS original's inline-wait-retry (L3). Real exhaustion (quota
+                    // windows / long holds) has soonest_free >> the ceiling →
+                    // soft_wait_secs returns None → fall through to the honest 429.
+                    match soft_wait_secs(
+                        manager.retry_after_hint(now, request_is_fable),
+                        soft_waited_exhaustion,
+                    ) {
+                        Some(secs) => {
+                            soft_waited_exhaustion = true;
+                            // Desync concurrent waiters: without this, every request
+                            // sleeping the same integer-ceil `secs` wakes on the SAME
+                            // second and races for the single earliest-freeing account,
+                            // re-synchronizing the herd NO_GUIDANCE_JITTER (:555) spreads
+                            // and re-bursting that account. Waking `jitter` seconds later
+                            // still serves (the account already freed at `secs`); worst
+                            // case adds NO_GUIDANCE_JITTER_MAX_SECS (5s) → total ≤ 25s.
+                            let jitter = (now.nanosecond() as i64
+                                % (NO_GUIDANCE_JITTER_MAX_SECS + 1))
+                                as u64;
+                            let wait = secs + jitter;
+                            tracing::info!(
+                                wait_secs = wait,
+                                "fleet transiently parked — soft-waiting once before exhausted"
+                            );
+                            tokio::time::sleep(Duration::from_secs(wait)).await;
+                            continue; // re-run select(); the just-freed account is now eligible
+                        }
+                        None => {
+                            return exhausted_response(
+                                &manager,
+                                now,
+                                account_count,
+                                request_is_fable,
+                            );
+                        }
+                    }
                 }
             },
         };
@@ -1051,6 +1119,29 @@ mod tests {
             classify_transient_429(Some(0), 0, 3),
             Transient429::InlineWait(1)
         );
+    }
+
+    #[test]
+    fn soft_wait_secs_separates_transient_from_real_exhaustion() {
+        // Transient burst-park (≤ ceiling), not yet soft-waited → wait that long.
+        assert_eq!(soft_wait_secs(16, false), Some(16));
+        // Exactly at the 20s ceiling → still a transient park, soft-wait.
+        assert_eq!(
+            soft_wait_secs(EXHAUSTION_SOFT_WAIT_MAX_SECS, false),
+            Some(EXHAUSTION_SOFT_WAIT_MAX_SECS as u64)
+        );
+        // Just over the ceiling → real exhaustion, hard-fail (no wait).
+        assert_eq!(
+            soft_wait_secs(EXHAUSTION_SOFT_WAIT_MAX_SECS + 1, false),
+            None
+        );
+        // A real quota window (hours) → far above ceiling → hard-fail.
+        assert_eq!(soft_wait_secs(6000, false), None);
+        // One-shot: already soft-waited this request → never wait again.
+        assert_eq!(soft_wait_secs(16, true), None);
+        // No promise of an imminent un-park (0 / negative hint) → hard-fail.
+        assert_eq!(soft_wait_secs(0, false), None);
+        assert_eq!(soft_wait_secs(-1, false), None);
     }
 
     #[test]
