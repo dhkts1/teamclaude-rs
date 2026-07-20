@@ -544,9 +544,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         .await
                         .map(|bytes| (Ok::<Bytes, Infallible>(bytes), rx))
                 });
-                let (input, output) = parse_sse_usage(byte_stream).await;
-                if input > 0 || output > 0 {
-                    manager_side.update_usage(idx, input, output);
+                let parsed = parse_sse_usage(byte_stream).await;
+                if parsed.input_total > 0 || parsed.output > 0 {
+                    manager_side.update_usage(
+                        idx,
+                        parsed.input_total,
+                        parsed.output,
+                        parsed.cache_read,
+                        parsed.cache_creation,
+                    );
                 }
             });
             let passthrough = resp.bytes_stream().map(move |chunk| {
@@ -597,9 +603,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             }
         };
         if status.is_success() {
-            let (input, output) = usage_from_json(&bytes);
-            if input > 0 || output > 0 {
-                manager.update_usage(idx, input, output);
+            let parsed = usage_from_json(&bytes);
+            if parsed.input_total > 0 || parsed.output > 0 {
+                manager.update_usage(
+                    idx,
+                    parsed.input_total,
+                    parsed.output,
+                    parsed.cache_read,
+                    parsed.cache_creation,
+                );
             }
         }
         return build_response(status, &up_headers, Body::from(bytes));
@@ -771,35 +783,68 @@ fn is_quota_rejected(headers: &HeaderMap) -> bool {
 
 /// Sum the input side of a `usage` object: base input plus cache-creation and
 /// cache-read tokens (the JS proxy missed the cache tokens — behaviour fixed).
+/// This is the QUOTA counter — `input_total` folds all three into one u64.
 fn sum_input_tokens(usage: &Value) -> u64 {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     field("input_tokens") + field("cache_creation_input_tokens") + field("cache_read_input_tokens")
 }
 
-/// Parse `(input, output)` token counts from a non-streamed JSON messages body.
-fn usage_from_json(bytes: &[u8]) -> (u64, u64) {
+/// The parsed token breakdown of a response. `input_total` keeps
+/// [`sum_input_tokens`] semantics byte-for-byte (the quota counter — bug #4),
+/// while `cache_read` / `cache_creation` are ALSO surfaced separately so an
+/// operator can see prompt-cache warmth (`cache_read > 0` on post-first turns).
+/// A single struct — rather than a 4-tuple — keeps the call sites legible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ParsedUsage {
+    input_total: u64,
+    output: u64,
+    cache_read: u64,
+    cache_creation: u64,
+}
+
+/// Extract the cache-read + cache-creation components of a `usage` object.
+/// R2: both parse paths (JSON and SSE) call THIS, so the two cache fields are
+/// extracted identically and cache% can never depend on stream-mode.
+fn cache_breakdown(usage: &Value) -> (u64, u64) {
+    let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    (
+        field("cache_read_input_tokens"),
+        field("cache_creation_input_tokens"),
+    )
+}
+
+/// Parse the token breakdown from a non-streamed JSON messages body.
+fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return (0, 0);
+        return ParsedUsage::default();
     };
     let Some(usage) = value.get("usage") else {
-        return (0, 0);
+        return ParsedUsage::default();
     };
     let output = usage
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    (sum_input_tokens(usage), output)
+    let (cache_read, cache_creation) = cache_breakdown(usage);
+    ParsedUsage {
+        input_total: sum_input_tokens(usage),
+        output,
+        cache_read,
+        cache_creation,
+    }
 }
 
-/// Parse total `(input, output)` usage from an SSE messages stream.
+/// Parse the total usage breakdown from an SSE messages stream.
 ///
-/// `input` is taken from `message_start` (base + cache tokens); `output` is the
-/// latest cumulative count from `message_delta` (or `message_start` if no delta
-/// arrives). Returning the totals — rather than incrementing per event — is what
-/// makes the count applied exactly once, never doubled. eventsource-stream
-/// reassembles events split across network chunks, so a boundary-split
-/// `message_start` is still parsed whole (bug #1 designed out).
-async fn parse_sse_usage<S, B, E>(stream: S) -> (u64, u64)
+/// `input_total` is taken from `message_start` (base + cache tokens); `output`
+/// is the latest cumulative count from `message_delta` (or `message_start` if
+/// no delta arrives). Returning the totals — rather than incrementing per event
+/// — is what makes the count applied exactly once, never doubled.
+/// eventsource-stream reassembles events split across network chunks, so a
+/// boundary-split `message_start` is still parsed whole (bug #1 designed out).
+/// The cache components come from the same `message_start` usage via the shared
+/// [`cache_breakdown`] (R2: identical extraction to the JSON path).
+async fn parse_sse_usage<S, B, E>(stream: S) -> ParsedUsage
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -807,8 +852,7 @@ where
     let events = stream.eventsource();
     futures::pin_mut!(events);
 
-    let mut input: u64 = 0;
-    let mut output: u64 = 0;
+    let mut parsed = ParsedUsage::default();
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
             break; // malformed/utf8/transport error — stop parsing, keep totals
@@ -822,9 +866,10 @@ where
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
                 if let Some(usage) = value.get("message").and_then(|m| m.get("usage")) {
-                    input = sum_input_tokens(usage);
+                    parsed.input_total = sum_input_tokens(usage);
+                    (parsed.cache_read, parsed.cache_creation) = cache_breakdown(usage);
                     if let Some(out) = usage.get("output_tokens").and_then(Value::as_u64) {
-                        output = out;
+                        parsed.output = out;
                     }
                 }
             }
@@ -834,13 +879,13 @@ where
                     .and_then(|u| u.get("output_tokens"))
                     .and_then(Value::as_u64)
                 {
-                    output = out;
+                    parsed.output = out;
                 }
             }
             _ => {}
         }
     }
-    (input, output)
+    parsed
 }
 
 /// A JSON error response in Anthropic's error envelope.
@@ -1119,9 +1164,19 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[..split])),
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[split..])),
         ];
-        let (input, output) = parse_sse_usage(futures::stream::iter(chunks)).await;
-        assert_eq!(input, 1110, "10 + 100 (cache-creation) + 1000 (cache-read)");
-        assert_eq!(output, 42);
+        let parsed = parse_sse_usage(futures::stream::iter(chunks)).await;
+        // R1: the quota sum is byte-identical to before.
+        assert_eq!(
+            parsed.input_total, 1110,
+            "10 + 100 (cache-creation) + 1000 (cache-read)"
+        );
+        assert_eq!(parsed.output, 42);
+        // NEW: the cache components are now surfaced SEPARATELY (not summed away).
+        assert_eq!(
+            parsed.cache_read, 1000,
+            "cache-read retained on the SSE path"
+        );
+        assert_eq!(parsed.cache_creation, 100, "cache-creation retained");
     }
 
     /// No double-count: multiple `message_delta`s yield the FINAL cumulative
@@ -1135,18 +1190,28 @@ mod tests {
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":37}}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (input, output) = parse_sse_usage(stream).await;
-        assert_eq!(input, 5);
-        assert_eq!(output, 37, "final cumulative output, not 20 + 37");
+        let parsed = parse_sse_usage(stream).await;
+        assert_eq!(parsed.input_total, 5);
+        assert_eq!(parsed.output, 37, "final cumulative output, not 20 + 37");
+        // No cache tokens in this fixture → both stay zero.
+        assert_eq!(parsed.cache_read, 0);
+        assert_eq!(parsed.cache_creation, 0);
     }
 
     /// Non-stream JSON path also sums the cache tokens into `input`.
     #[test]
     fn json_usage_sums_cache_tokens() {
         let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
-        let (input, output) = usage_from_json(body);
-        assert_eq!(input, 100);
-        assert_eq!(output, 11);
+        let parsed = usage_from_json(body);
+        // R1: 7 + 3 + 90 = 100, the quota sum, unchanged.
+        assert_eq!(parsed.input_total, 100);
+        assert_eq!(parsed.output, 11);
+        // R2: the JSON path surfaces the SAME cache fields the SSE path does.
+        assert_eq!(
+            parsed.cache_read, 90,
+            "cache-read retained on the JSON path"
+        );
+        assert_eq!(parsed.cache_creation, 3, "cache-creation retained");
     }
 
     #[test]
@@ -1625,6 +1690,133 @@ mod tests {
             up_body.len(),
             sent_len,
             "the same-length patch must preserve the body length so Content-Length stays valid"
+        );
+    }
+
+    /// End-to-end affinity + cache surfacing over a REAL 2-account fleet: two
+    /// requests carrying the SAME `metadata.user_id` must pin to ONE account
+    /// (requests 2 / 0 — the seam no unit test spans), and that account's snapshot
+    /// must expose the upstream's `cache_read_input_tokens` separately (not summed
+    /// away into the quota total). The `SessionKey` extension is injected by a
+    /// layer here exactly as the hybrid CONNECT server (`mitm.rs`) does per
+    /// connection — `app()` alone injects none, so without it affinity is inert.
+    #[tokio::test]
+    async fn same_user_id_pins_one_account_and_surfaces_cache_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+
+        // Fake upstream: every connection gets a 200 whose JSON `usage` carries a
+        // non-zero `cache_read_input_tokens` (a warm-cache turn). Loops so BOTH
+        // forwarded requests are answered.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let body = br#"{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":500,"output_tokens":20}}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                });
+            }
+        });
+
+        // A 2-account fleet pointed at the one fake upstream.
+        let mut config = dummy_config(None, &format!("http://{up_addr}"));
+        let mut second = config.accounts[0].clone();
+        second.name = "dummy2".to_string();
+        config.accounts.push(second);
+        let manager = Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+
+        // Inject a DISTINCT per-request SessionKey the way mitm.rs does (its
+        // `next_session_key()` = `session_seq.fetch_add(1)` hands every connection
+        // a unique key). Distinct fallback keys are load-bearing to the proof: if
+        // `metadata.user_id` extraction were dead, key resolution would fall back
+        // to these distinct per-connection keys and the two requests would SPREAD
+        // to 2 accounts (test fails). Only the SHARED `user_id` "cache-affinity-user"
+        // resolving to one stable key can pin them 2/0 — so a green test proves the
+        // body's user_id is what pins, not merely affinity-on.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let served = manager.clone();
+        let seq = Arc::new(AtomicU64::new(1));
+        let affinity_app = app(served).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let seq = seq.clone();
+                async move {
+                    req.extensions_mut()
+                        .insert(SessionKey(seq.fetch_add(1, Ordering::Relaxed)));
+                    next.run(req).await
+                }
+            },
+        ));
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, affinity_app).await;
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "claude-x",
+            "metadata": { "user_id": "cache-affinity-user" },
+            "messages": [],
+        }))
+        .unwrap();
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for _ in 0..2 {
+            let _ = client
+                .post(format!("http://{proxy_addr}/v1/messages"))
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let reqs: Vec<u64> = snap.accounts.iter().map(|a| a.requests).collect();
+        // Affinity end-to-end: one account served BOTH, the other served NONE.
+        assert!(
+            reqs.contains(&2),
+            "one account must serve both same-user_id requests, got {reqs:?}"
+        );
+        assert!(
+            reqs.contains(&0),
+            "the other account must serve none (affinity pinned the session), got {reqs:?}"
+        );
+        // Cache surfacing: the serving account exposes the retained cache-read
+        // tokens (500 per request x2), NOT summed away into the quota total.
+        let serving = snap
+            .accounts
+            .iter()
+            .find(|a| a.requests == 2)
+            .expect("a serving account exists");
+        assert!(
+            serving.cache_read_tokens > 0,
+            "cache-read must be surfaced on the serving account"
+        );
+        assert_eq!(
+            serving.cache_read_tokens, 1000,
+            "500 cache-read per request, twice"
         );
     }
 

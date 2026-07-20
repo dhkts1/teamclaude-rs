@@ -317,7 +317,8 @@ fn render_accounts(
     now: OffsetDateTime,
 ) {
     let header = Row::new(vec![
-        "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Reqs", "In", "Out", "Last",
+        "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Reqs", "In", "Cache", "Out",
+        "Last",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -348,6 +349,10 @@ fn render_accounts(
                 Cell::from(format!("{}{quota_label}", bar(account.seven_day))).style(quota_style),
                 Cell::from(account.requests.to_string()),
                 Cell::from(fmt_tokens(account.input_tokens)),
+                Cell::from(fmt_cache_ratio(
+                    account.cache_read_tokens,
+                    account.input_tokens,
+                )),
                 Cell::from(fmt_tokens(account.output_tokens)),
                 Cell::from(last_used),
             ];
@@ -379,6 +384,9 @@ fn render_accounts(
         Constraint::Length(20),
         Constraint::Length(6),
         Constraint::Length(8),
+        // Cache hit ratio (`cache_read / input`) as a percentage, or "-" when
+        // no input has been counted yet.
+        Constraint::Length(7),
         Constraint::Length(8),
         Constraint::Length(6),
     ];
@@ -715,6 +723,17 @@ fn fmt_tokens(count: u64) -> String {
     }
 }
 
+/// Format the prompt-cache hit ratio (`cache_read / input_total`) as a whole
+/// percentage. R3 GATE: `input_total == 0` renders "-" (never NaN / no divide),
+/// so a never-served account shows a dash rather than a bogus 0%.
+fn fmt_cache_ratio(cache_read: u64, input_total: u64) -> String {
+    if input_total == 0 {
+        "-".to_string()
+    } else {
+        format!("{:.0}%", cache_read as f64 / input_total as f64 * 100.0)
+    }
+}
+
 /// Age of an optional instant relative to `now`, or an em-dash when absent —
 /// the "—"-or-[`fmt_age`] pattern shared by the account, session, and probe cells.
 fn fmt_age_opt(seen: Option<OffsetDateTime>, now: OffsetDateTime) -> String {
@@ -1030,6 +1049,8 @@ mod tests {
             requests: 0,
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             last_used: None,
             rate_limited_until: None,
             probe_status: ProbeStatus::Never,

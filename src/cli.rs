@@ -405,13 +405,24 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
             Some(u) => format!(" fable={:.0}%", u * 100.0),
             None => String::new(),
         };
+        // Prompt-cache hit ratio, omitted until there is input to divide by (R3:
+        // no NaN). Greppable `cache=NN%` token for parity with the JSON field.
+        let cache = if a.input_tokens == 0 {
+            String::new()
+        } else {
+            format!(
+                " cache={:.0}%",
+                a.cache_read_tokens as f64 / a.input_tokens as f64 * 100.0
+            )
+        };
         out.push_str(&format!(
-            "account {} priority={} {} {}{} state={} status={} probe={}{}\n",
+            "account {} priority={} {} {}{}{} state={} status={} probe={}{}\n",
             a.name,
             a.priority,
             five_hour,
             seven_day,
             fable,
+            cache,
             quota_state_token(a.quota_state),
             a.status,
             a.probe_status.as_str(),
@@ -454,6 +465,14 @@ fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String 
                 "requests": a.requests,
                 "inputTokens": a.input_tokens,
                 "outputTokens": a.output_tokens,
+                "cacheReadTokens": a.cache_read_tokens,
+                // Prompt-cache hit ratio (0.0–1.0): cache_read / input_total.
+                // 0.0 when nothing has been counted yet (no NaN — R3).
+                "cacheHitRatio": if a.input_tokens == 0 {
+                    0.0
+                } else {
+                    a.cache_read_tokens as f64 / a.input_tokens as f64
+                },
                 "probeStatus": a.probe_status.as_str(),
                 "probeError": a.probe_error,
                 "held": held,
