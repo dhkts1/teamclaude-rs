@@ -2865,6 +2865,84 @@ mod tests {
         );
     }
 
+    /// A near standard (API-key) token limit with a future `standard_reset` and no
+    /// other gate is reported as `(Standard, Some(reset))` — account_gate now sees
+    /// the same dimension `eligible`/`is_near` enforces.
+    #[test]
+    fn account_gate_gates_a_near_standard_limit() {
+        let now = OffsetDateTime::now_utc();
+        let reset = now + Duration::seconds(600);
+        let mut a = gate_runtime();
+        a.quota.tokens_limit = Some(1_000);
+        a.quota.tokens_remaining = Some(50); // 95% spent, over the 0.90 threshold
+        a.quota.standard_reset = Some(reset);
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Standard, Some(reset))
+        );
+    }
+
+    /// The exact G2 scenario: an account with BOTH a short transient Hold (+8s) AND
+    /// a near standard limit (reset +600s) must bind on the later-clearing Standard
+    /// gate, so `retry_after_hint` reports the true 600s recovery — not the 8s Hold
+    /// that would trigger a soft-wait then hard-fail anyway.
+    #[test]
+    fn account_gate_standard_reset_outlasts_a_short_hold() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let reset = now + Duration::seconds(600);
+        let mut a = AccountRuntime::from_config(&account("std-hold", 0));
+        a.switch_threshold = Some(0.90);
+        a.rate_limited_until_ms = Some(now_ms + 8_000); // short Hold, +8s
+        a.quota.requests_limit = Some(200);
+        a.quota.requests_remaining = Some(5); // 97.5% spent
+        a.quota.standard_reset = Some(reset);
+
+        // The Standard gate (later reset) wins max_by_key over the +8s Hold.
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            (GateReason::Standard, Some(reset)),
+            "the standard reset outlasts the short hold"
+        );
+
+        // retry_after_hint must now reflect the real 600s, not the 8s Hold.
+        let manager = Manager::from_runtimes(vec![a]);
+        let hint = manager.retry_after_hint(now, false);
+        let expected = ((odt_to_ms(reset) - now_ms + 999) / 1000).max(1);
+        assert_eq!(hint, expected, "hint must be the 600s reset, got {hint}");
+        assert!(hint > 500, "must not report the 8s hold, got {hint}");
+    }
+
+    /// G-a: an OAuth account (all standard fields `None`) produces NO Standard gate,
+    /// so account_gate is byte-identical to its pre-fix behavior for OAuth.
+    #[test]
+    fn account_gate_ignores_standard_for_oauth() {
+        let now = OffsetDateTime::now_utc();
+        let a = gate_runtime(); // all standard fields None by default
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Ok, None),
+            "OAuth accounts never gate on the standard dimension"
+        );
+    }
+
+    /// An expired `standard_reset` (in the PAST) means the upstream limit has
+    /// refreshed, so a spent count must NOT keep gating — mirrors is_near's expiry
+    /// rule so a spent standard window never pins an API-key account out forever.
+    #[test]
+    fn account_gate_ignores_expired_standard() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = gate_runtime();
+        a.quota.tokens_limit = Some(1_000);
+        a.quota.tokens_remaining = Some(10); // 99% spent, over threshold
+        a.quota.standard_reset = Some(now - Duration::seconds(1)); // already refreshed
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            (GateReason::Ok, None),
+            "an expired standard window no longer gates"
+        );
+    }
+
     /// The live-incident shape: a fleet-exhausted 429's `retry-after` must name the
     /// TRUE soonest recovery, never an earlier reset belonging to an account that
     /// stays gated for another reason or never self-frees at all.

@@ -55,6 +55,11 @@ pub enum GateReason {
     /// The model-scoped weekly (Fable `7d_oi`) bucket is at/over threshold — only
     /// ever surfaced for a Fable-scoped evaluation (`is_fable = true`).
     FableWeekly,
+    /// A standard (API-key) token/request limit is at/over threshold — mirrors the
+    /// standard branch of [`crate::quota::Quota::is_near`], so `account_gate`
+    /// agrees with `eligible` on API-key accounts. Never fires for OAuth accounts
+    /// (all standard fields `None`).
+    Standard,
     /// A dead credential (`AccountStatus::Error`) — needs a re-login, never self-frees.
     Login,
     /// Operator-disabled — held out until re-enabled, never self-frees.

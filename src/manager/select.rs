@@ -382,6 +382,30 @@ impl Manager {
                 }
             }
         }
+        // Standard (API-key) token/request limits — mirror `Quota::is_near`
+        // (quota.rs) so account_gate agrees with eligible(): a standard-limited
+        // account is gated, not "soon-servable". free_at = standard_reset (the
+        // upstream refresh instant); None when unknown ("cannot promise a time").
+        // OAuth accounts have all standard fields None → this never fires →
+        // account_gate byte-identical for them. Once standard_reset has passed the
+        // upstream limit has refreshed, so a spent count must NOT keep gating.
+        let standard_expired = account.quota.standard_reset.is_some_and(|r| now >= r);
+        if !standard_expired {
+            let near = |limit: Option<i64>, remaining: Option<i64>| {
+                matches!(
+                    (limit, remaining),
+                    (Some(l), Some(r)) if l > 0 && 1.0 - (r as f64 / l as f64) >= threshold
+                )
+            };
+            if near(account.quota.tokens_limit, account.quota.tokens_remaining)
+                || near(
+                    account.quota.requests_limit,
+                    account.quota.requests_remaining,
+                )
+            {
+                gates.push((GateReason::Standard, account.quota.standard_reset));
+            }
+        }
 
         // The latest-clearing gate binds. `gate_clear_key` sorts an unknown reset
         // (`None`) after every known instant, so if any active gate has no reset it
