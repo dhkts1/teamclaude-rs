@@ -317,8 +317,8 @@ fn render_accounts(
     now: OffsetDateTime,
 ) {
     let header = Row::new(vec![
-        "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Reqs", "In", "Cache", "Out",
-        "Last",
+        "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Fable", "Reqs", "In", "Cache",
+        "Out", "Last",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
@@ -347,6 +347,11 @@ fn render_accounts(
                 Cell::from(probe_label).style(probe_style),
                 Cell::from(bar(account.five_hour)),
                 Cell::from(format!("{}{quota_label}", bar(account.seven_day))).style(quota_style),
+                // Model-scoped weekly (the Fable `7d_oi` bucket). Visibility only:
+                // it never gates shared rotation (`eligible` ignores it), so no
+                // quota label — the gate chip already reads `FABLE-7D` when it
+                // parks Fable routing. `—` until the bucket is first learned.
+                Cell::from(bar(account.seven_day_oi)),
                 Cell::from(account.requests.to_string()),
                 Cell::from(fmt_tokens(account.input_tokens)),
                 Cell::from(fmt_cache_ratio(
@@ -379,9 +384,12 @@ fn render_accounts(
         // Gate chip: fits the widest label + back-when (`FABLE-7D 47h30m`).
         Constraint::Length(15),
         Constraint::Length(11),
-        Constraint::Length(14),
+        // A learned bar is 15 chars (`[########] 100%`) — 14 clipped the `%`.
+        Constraint::Length(15),
         // 7d bar + a "near"/"full" quota label — wider than the 5h column.
         Constraint::Length(20),
+        // Fable weekly bar, same shape as 5h (no quota label).
+        Constraint::Length(15),
         Constraint::Length(6),
         Constraint::Length(8),
         // Cache hit ratio (`cache_read / input`) as a percentage, or "-" when
