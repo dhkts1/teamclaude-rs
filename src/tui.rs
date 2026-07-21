@@ -308,7 +308,53 @@ fn render_table<'a>(
     frame.render_widget(table, area);
 }
 
-/// The accounts table.
+/// Which of the two accounts-table layouts a given pane width gets. The choice
+/// is a *deterministic breakpoint*, not the constraint solver's squeeze: ratatui
+/// silently shrinks over-wide `Length` columns to make a too-wide table fit, and
+/// the first casualty is the trailing `%` of each utilization bar — the exact
+/// number Gil needs most on a small screen. An honest display degrades by
+/// *choosing* what to drop (here the Probe/Cache columns, and the bars in favour
+/// of bare percentages) rather than letting the solver clip a number silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountsLayout {
+    /// The full 13-column table, unchanged. Chosen at or above
+    /// [`FULL_LAYOUT_MIN_WIDTH`].
+    Full,
+    /// The reduced 11-column table: Probe/Cache dropped, the three quota buckets
+    /// rendered as bar-less right-aligned percentages — the number IS the cell,
+    /// so it survives any further squeeze. Chosen below [`FULL_LAYOUT_MIN_WIDTH`].
+    Compact,
+}
+
+/// The narrowest terminal width that still fits the full 13-column table without
+/// the constraint solver clipping a column. Kept a literal with the arithmetic
+/// shown so a future column edit must update it *consciously* rather than
+/// silently re-introducing the squeeze it exists to prevent:
+///
+/// ```text
+///   141  Σ the 13 column widths: 18+3+9+15+11+15+20+15+6+8+7+8+6
+/// +  12  column_spacing (1 cell × 12 inter-column gaps)
+/// +   2  the block's left + right borders
+/// = 155
+/// ```
+const FULL_LAYOUT_MIN_WIDTH: u16 = 155;
+
+/// Pick the accounts-table layout for a pane `width` — the pure, rendering-free
+/// core of the responsive table, so the breakpoint is unit-testable without a
+/// terminal. See [`AccountsLayout`] for *why* the breakpoint is deterministic.
+fn accounts_layout(width: u16) -> AccountsLayout {
+    if width >= FULL_LAYOUT_MIN_WIDTH {
+        AccountsLayout::Full
+    } else {
+        AccountsLayout::Compact
+    }
+}
+
+/// The accounts table. Responsive: [`AccountsLayout::Full`] renders all 13
+/// columns; [`AccountsLayout::Compact`] (below [`FULL_LAYOUT_MIN_WIDTH`]) drops
+/// Probe/Cache and renders the quota buckets as bar-less percentages so the
+/// utilization numbers stay visible on a narrow pane instead of being silently
+/// clipped by the constraint solver.
 fn render_accounts(
     frame: &mut Frame,
     area: Rect,
@@ -316,10 +362,17 @@ fn render_accounts(
     selected: usize,
     now: OffsetDateTime,
 ) {
-    let header = Row::new(vec![
-        "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Fable", "Reqs", "In", "Cache",
-        "Out", "Last",
-    ])
+    let layout = accounts_layout(area.width);
+
+    let header = match layout {
+        AccountsLayout::Full => Row::new(vec![
+            "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Fable", "Reqs", "In",
+            "Cache", "Out", "Last",
+        ]),
+        AccountsLayout::Compact => Row::new(vec![
+            "Account", "Pri", "Status", "Gate", "5h", "7d", "Fable", "Reqs", "In", "Out", "Last",
+        ]),
+    }
     .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = snapshot
@@ -329,38 +382,74 @@ fn render_accounts(
         .map(|(i, account)| {
             let is_current = snapshot.current == Some(i);
             let marker = if is_current { "▶ " } else { "  " };
-            let (probe_label, probe_style) = probe_cell(account, now);
-            // The weekly bar carries an honest quota label: an account parked out of
-            // rotation on its cap reads as "near"/"full" (yellow/red on the BAR), while
-            // its Status stays "active" — the red "error" is reserved for a dead cred.
+            // The weekly quota annotation: an account parked out of rotation on its
+            // cap reads as "near"/"full" (yellow/red), while its Status stays
+            // "active" — the red "error" is reserved for a dead cred. Same pairing
+            // in both layouts (compact keeps the label on the bar-less percentage).
             let (quota_label, quota_style) = quota_cell(account.quota_state);
             // Why this account is out of rotation and when it returns — the
             // per-row half of the fleet banner (`OK` / `5H 47m` / `LOGIN` / …).
             let (gate_label, gate_style) = gate_chip(account, now);
             let last_used = fmt_age_opt(account.last_used, now);
 
-            let cells = vec![
-                Cell::from(format!("{marker}{}", account.name)),
-                Cell::from(account.priority.to_string()),
-                Cell::from(account.status.clone()).style(status_style(&account.status)),
-                Cell::from(gate_label).style(gate_style),
-                Cell::from(probe_label).style(probe_style),
-                Cell::from(bar(account.five_hour)),
-                Cell::from(format!("{}{quota_label}", bar(account.seven_day))).style(quota_style),
-                // Model-scoped weekly (the Fable `7d_oi` bucket). Visibility only:
-                // it never gates shared rotation (`eligible` ignores it), so no
-                // quota label — the gate chip already reads `FABLE-7D` when it
-                // parks Fable routing. `—` until the bucket is first learned.
-                Cell::from(bar(account.seven_day_oi)),
-                Cell::from(account.requests.to_string()),
-                Cell::from(fmt_tokens(account.input_tokens)),
-                Cell::from(fmt_cache_ratio(
-                    account.cache_read_tokens,
-                    account.input_tokens,
-                )),
-                Cell::from(fmt_tokens(account.output_tokens)),
-                Cell::from(last_used),
-            ];
+            // Columns shared by both layouts, in their shared order.
+            let name = Cell::from(format!("{marker}{}", account.name));
+            let priority = Cell::from(account.priority.to_string());
+            let status = Cell::from(account.status.clone()).style(status_style(&account.status));
+            let gate = Cell::from(gate_label).style(gate_style);
+            let reqs = Cell::from(account.requests.to_string());
+            let input = Cell::from(fmt_tokens(account.input_tokens));
+            let output = Cell::from(fmt_tokens(account.output_tokens));
+            let last = Cell::from(last_used);
+
+            let cells = match layout {
+                // Full mode: the probe cell, the three 8-cell bars, and the cache
+                // ratio — exactly the pre-responsive column set.
+                AccountsLayout::Full => {
+                    let (probe_label, probe_style) = probe_cell(account, now);
+                    vec![
+                        name,
+                        priority,
+                        status,
+                        gate,
+                        Cell::from(probe_label).style(probe_style),
+                        Cell::from(bar(account.five_hour)),
+                        Cell::from(format!("{}{quota_label}", bar(account.seven_day)))
+                            .style(quota_style),
+                        // Model-scoped weekly (the Fable `7d_oi` bucket). Visibility
+                        // only: it never gates shared rotation (`eligible` ignores
+                        // it), so no quota label — the gate chip already reads
+                        // `FABLE-7D` when it parks Fable. `—` until first learned.
+                        Cell::from(bar(account.seven_day_oi)),
+                        reqs,
+                        input,
+                        Cell::from(fmt_cache_ratio(
+                            account.cache_read_tokens,
+                            account.input_tokens,
+                        )),
+                        output,
+                        last,
+                    ]
+                }
+                // Compact mode: Probe and Cache dropped; each quota bucket becomes a
+                // bare percentage (`pct`) so the number itself is the cell and
+                // survives further squeeze. The 7d bucket keeps its "near"/"full"
+                // label + style, exactly as in full mode.
+                AccountsLayout::Compact => vec![
+                    name,
+                    priority,
+                    status,
+                    gate,
+                    Cell::from(pct(account.five_hour)),
+                    Cell::from(format!("{}{quota_label}", pct(account.seven_day)))
+                        .style(quota_style),
+                    Cell::from(pct(account.seven_day_oi)),
+                    reqs,
+                    input,
+                    output,
+                    last,
+                ],
+            };
 
             let mut row = Row::new(cells);
             if account.disabled {
@@ -377,27 +466,47 @@ fn render_accounts(
         })
         .collect();
 
-    let widths = vec![
-        Constraint::Length(18),
-        Constraint::Length(3),
-        Constraint::Length(9),
-        // Gate chip: fits the widest label + back-when (`FABLE-7D 47h30m`).
-        Constraint::Length(15),
-        Constraint::Length(11),
-        // A learned bar is 15 chars (`[########] 100%`) — 14 clipped the `%`.
-        Constraint::Length(15),
-        // 7d bar + a "near"/"full" quota label — wider than the 5h column.
-        Constraint::Length(20),
-        // Fable weekly bar, same shape as 5h (no quota label).
-        Constraint::Length(15),
-        Constraint::Length(6),
-        Constraint::Length(8),
-        // Cache hit ratio (`cache_read / input`) as a percentage, or "-" when
-        // no input has been counted yet.
-        Constraint::Length(7),
-        Constraint::Length(8),
-        Constraint::Length(6),
-    ];
+    let widths = match layout {
+        AccountsLayout::Full => vec![
+            Constraint::Length(18),
+            Constraint::Length(3),
+            Constraint::Length(9),
+            // Gate chip: fits the widest label + back-when (`FABLE-7D 47h30m`).
+            Constraint::Length(15),
+            Constraint::Length(11),
+            // A learned bar is 15 chars (`[########] 100%`) — 14 clipped the `%`.
+            Constraint::Length(15),
+            // 7d bar + a "near"/"full" quota label — wider than the 5h column.
+            Constraint::Length(20),
+            // Fable weekly bar, same shape as 5h (no quota label).
+            Constraint::Length(15),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            // Cache hit ratio (`cache_read / input`) as a percentage, or "-" when
+            // no input has been counted yet.
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(6),
+        ],
+        // 91 widths + 10 spacing + 2 borders ≈ 103 cols. The three bar columns
+        // collapse to bare percentages and Probe/Cache are gone.
+        AccountsLayout::Compact => vec![
+            Constraint::Length(18),
+            Constraint::Length(3),
+            Constraint::Length(9),
+            Constraint::Length(15),
+            // 5h as a bare right-aligned percentage (` 47%`).
+            Constraint::Length(4),
+            // 7d percentage + its "near"/"full" label (fits `100% full`).
+            Constraint::Length(9),
+            // Fable percentage; the header word sets the width, not the value.
+            Constraint::Length(5),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(6),
+        ],
+    };
 
     // Rows that actually fit = panel height minus header + 2 borders, clamped to
     // the pool size. When `shown < total` the title flags the clip so a hidden
@@ -637,6 +746,19 @@ fn bar(util: Option<f64>) -> String {
     }
 }
 
+/// The bar-less quota cell used in [`AccountsLayout::Compact`]: the SAME
+/// percentage [`bar`] prints, with the 8-cell bar dropped so the number itself
+/// is the whole cell. A plain right-aligned `%` cannot lose its digits to the
+/// constraint solver the way a bar's trailing `%` does — which is the entire
+/// point of compact mode. `—` mirrors [`bar`]'s never-learned dash so an
+/// un-probed bucket reads identically in both layouts.
+fn pct(util: Option<f64>) -> String {
+    match util {
+        None => "—".to_string(),
+        Some(util) => format!("{:>3}%", (util * 100.0).round() as i64),
+    }
+}
+
 /// The probe-health cell: an age since the last probe plus a coloured status.
 fn probe_cell(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
     let age = fmt_age_opt(account.last_probe, now);
@@ -793,6 +915,9 @@ fn truncate(text: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
     use super::*;
 
     #[test]
@@ -1202,5 +1327,92 @@ mod tests {
         let status = fleet_status(&accounts, now);
         assert_eq!(status.eligible, 0);
         assert!(status.next_free.is_none());
+    }
+
+    /// Flatten a rendered buffer into one string per row so a render test can
+    /// assert on the visible text without caring about cell geometry.
+    fn buffer_rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A one-account snapshot with learned quota buckets (5h 47%, 7d 90% at
+    /// `state`, Fable 62%) for the render tests — adapts [`snap_gate`], whose
+    /// buckets are all `None`.
+    fn util_snapshot(state: QuotaState) -> StatsSnapshot {
+        let mut account = snap_gate("acct", GateReason::Ok, None);
+        account.five_hour = Some(0.47);
+        account.seven_day = Some(0.9);
+        account.seven_day_oi = Some(0.62);
+        account.quota_state = state;
+        StatsSnapshot {
+            accounts: vec![account],
+            current: Some(0),
+            recent: vec![],
+            sessions: vec![],
+        }
+    }
+
+    #[test]
+    fn accounts_layout_picks_mode_at_threshold() {
+        // The breakpoint is exact: FULL_LAYOUT_MIN_WIDTH still fits the full
+        // table; one column narrower drops to compact.
+        assert_eq!(accounts_layout(FULL_LAYOUT_MIN_WIDTH), AccountsLayout::Full);
+        assert_eq!(
+            accounts_layout(FULL_LAYOUT_MIN_WIDTH - 1),
+            AccountsLayout::Compact
+        );
+    }
+
+    #[test]
+    fn pct_renders_percentage_or_dash() {
+        // The same number `bar` prints, minus the bar; `—` when never learned.
+        assert_eq!(pct(Some(0.47)), " 47%");
+        assert_eq!(pct(Some(1.0)), "100%");
+        assert_eq!(pct(None), "—");
+    }
+
+    #[test]
+    fn render_wide_keeps_full_columns_and_bars() {
+        // A pane at/above the threshold gets every column and the 8-cell bars.
+        let snapshot = util_snapshot(QuotaState::Normal);
+        let backend = TestBackend::new(170, 12);
+        let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
+            .expect("render succeeds");
+        let text = buffer_rows(terminal.backend().buffer()).join("\n");
+
+        assert!(text.contains("Probe"), "full mode shows the Probe header");
+        assert!(text.contains("Cache"), "full mode shows the Cache header");
+        assert!(text.contains('['), "full mode draws at least one bar cell");
+    }
+
+    #[test]
+    fn render_narrow_shows_percentages_and_drops_probe_cache() {
+        // Below the threshold: bar-less percentages, the 7d quota label, and NO
+        // Probe/Cache columns — the numbers survive the squeeze by construction.
+        let snapshot = util_snapshot(QuotaState::Exhausted);
+        let backend = TestBackend::new(104, 12);
+        let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
+            .expect("render succeeds");
+        let text = buffer_rows(terminal.backend().buffer()).join("\n");
+
+        assert!(
+            text.contains("Fable"),
+            "compact mode keeps the Fable header"
+        );
+        assert!(text.contains(" 47%"), "compact shows the 5h percentage");
+        assert!(text.contains("62%"), "compact shows the Fable percentage");
+        assert!(text.contains("full"), "compact keeps the 7d quota label");
+        assert!(!text.contains("Probe"), "compact drops the Probe column");
+        assert!(!text.contains("Cache"), "compact drops the Cache column");
     }
 }
