@@ -225,6 +225,30 @@ impl Quota {
             .is_some_and(|w| w.effective(now) >= threshold)
     }
 
+    /// Highest utilization across the dimensions that govern this request at `now`
+    /// (shared 5-hour + weekly; the Fable weekly `7d_oi` too when `is_fable`), read
+    /// live via [`QuotaWindow::effective`] so a past-reset window contributes a
+    /// fresh `0.0`. A missing window contributes `0.0`. Used by
+    /// [`crate::manager::Manager::select_revalidation`] to pick the least-utilized
+    /// revalidation target — the account most likely to have stale headroom.
+    /// Deliberately excludes the standard (API-key) token/request limits: OAuth
+    /// accounts carry them `None`, and they are not trivially a single fraction.
+    pub fn max_utilization(&self, now: OffsetDateTime, is_fable: bool) -> f64 {
+        let mut max = 0.0f64;
+        if let Some(w) = self.five_hour {
+            max = max.max(w.effective(now));
+        }
+        if let Some(w) = self.seven_day {
+            max = max.max(w.effective(now));
+        }
+        if is_fable {
+            if let Some(w) = self.seven_day_oi {
+                max = max.max(w.effective(now));
+            }
+        }
+        max
+    }
+
     /// Reset of the weekly bucket that governs rotation ordering, but only while
     /// it is still in the future at `now`. Used to spend the soonest-resetting
     /// quota first; `None` sorts an account first (unknown quota → probe it).

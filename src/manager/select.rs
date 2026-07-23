@@ -277,6 +277,163 @@ impl Manager {
         best
     }
 
+    /// LAST-RESORT serve when normal [`Self::select`] found nothing (the whole
+    /// fleet reads over the SOFT switch threshold). Serves an account that Anthropic
+    /// still allows, ignoring the soft utilization/pacing gates but honoring the
+    /// HARD blocks:
+    ///   - `disabled` / [`AccountStatus::Error`] → skip;
+    ///   - a live rate-limit hold (`rate_limited_until_ms` in the future) → skip;
+    ///   - `quota.status == Some("rejected")` → skip (genuinely blocked; would 429);
+    ///   - a Fable request whose model-scoped weekly (`7d_oi`) is a hard reject → skip
+    ///     (that same account still serves every non-Fable model).
+    ///
+    /// TWO paths, mirroring [`Self::select`]'s never-nested lock discipline (read the
+    /// pin under the affinity lock, DROP it before taking the accounts lock):
+    ///  - **(A) PIN-HONOR** (cache-warm, the common case): when `affinity` is
+    ///    `Some(key)` and the session's pinned account is not in `tried` and passes
+    ///    the HARD gates, serve THAT pin — even over the soft threshold — to keep the
+    ///    operator's prompt cache warm. NO revalidation throttle here (the global
+    ///    egress throttle already paces); the pin is left as-is.
+    ///  - **(B) FALLBACK** (no pin, or the pin is rejected/held/tried): the
+    ///    least-utilized surviving account wins (lowest
+    ///    [`crate::quota::Quota::max_utilization`]; ties: LRU `last_selected_seq`).
+    ///    The anti-storm throttle applies HERE ONLY — at most one NEW-account
+    ///    revalidation per [`REVALIDATION_MIN_SPACING_MS`]; inside that window return
+    ///    `None` (the caller emits the honest 429). The window is spent only once a
+    ///    servable candidate exists. On success the session is RE-PINNED to the
+    ///    chosen account, mirroring `select()`'s re-pin.
+    ///
+    /// The winner's `last_selected_seq` is stamped and ONE `tracing::info!` names the
+    /// path (pin-honor vs fallback), the account, and its utilization.
+    pub fn select_revalidation(
+        &self,
+        tried: &HashSet<usize>,
+        now: OffsetDateTime,
+        model: Option<&str>,
+        affinity: Option<u64>,
+    ) -> Option<usize> {
+        // Anti-storm spacing on the FALLBACK path only: the upstream 429→hold and the
+        // global egress throttle are the real backstops; this just stops a
+        // synchronized burst from slamming one over-threshold account when the fleet
+        // saturates. The pin-honor path is never throttled here.
+        const REVALIDATION_MIN_SPACING_MS: i64 = 2000;
+
+        let now_ms = odt_to_ms(now);
+        let is_fable = model.is_some_and(crate::model::is_fable_model);
+
+        // HARD-gate predicate shared by both paths: the blocks that even a
+        // revalidation serve must honor (soft utilization/pacing deliberately absent).
+        let hard_ok = |account: &AccountRuntime| -> bool {
+            if account.disabled || account.status == AccountStatus::Error {
+                return false;
+            }
+            if let Some(until) = account.rate_limited_until_ms {
+                if now_ms < until {
+                    return false;
+                }
+            }
+            if account.quota.status.as_deref() == Some("rejected") {
+                return false;
+            }
+            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+            if is_fable && account.quota.model_weekly_exhausted(threshold, now) {
+                return false;
+            }
+            true
+        };
+
+        // (A) PIN-HONOR — read the pin under the affinity lock, DROP it, then check
+        // the pin's HARD gates under the accounts lock (never nested). No throttle.
+        if let Some(key) = affinity {
+            let pinned = {
+                let pins = self.affinity.lock().expect("affinity lock poisoned");
+                pins.get(&key).map(|&(idx, _)| idx)
+            };
+            if let Some(idx) = pinned {
+                if !tried.contains(&idx) {
+                    let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+                    if accounts.get(idx).is_some_and(&hard_ok) {
+                        let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                        let util = accounts
+                            .get(idx)
+                            .map(|a| a.quota.max_utilization(now, is_fable))
+                            .unwrap_or_default();
+                        if let Some(account) = accounts.get_mut(idx) {
+                            account.last_selected_seq = tick;
+                            tracing::info!(
+                                account = %account.name,
+                                utilization = util,
+                                is_fable,
+                                "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                            );
+                        }
+                        return Some(idx);
+                    }
+                    // Pin is HARD-blocked → fall through to the fallback path (lock
+                    // drops at the end of this scope, before the affinity lock below).
+                }
+            }
+        }
+
+        // (B) FALLBACK — least-utilized surviving account, throttled, then re-pinned.
+        let idx = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+
+            let mut best: Option<usize> = None;
+            // (util as ordered bits, last_selected_seq) — utilizations are finite and
+            // non-negative here (NaN/inf headers filtered at parse), so the raw bit
+            // pattern orders correctly for ascending "least utilized first".
+            let mut best_key: Option<(u64, u64)> = None;
+            for (i, account) in accounts.iter().enumerate() {
+                if tried.contains(&i) || !hard_ok(account) {
+                    continue;
+                }
+                let util = account.quota.max_utilization(now, is_fable);
+                let key = (util.to_bits(), account.last_selected_seq);
+                if best_key.is_none_or(|b| key < b) {
+                    best = Some(i);
+                    best_key = Some(key);
+                }
+            }
+
+            let idx = best?;
+
+            // A servable candidate exists — spend the anti-storm window now (after
+            // selection, so a fleet with nothing to serve never burns the valve).
+            let next_at = self.next_revalidation_at_ms.load(Ordering::Relaxed);
+            if now_ms < next_at {
+                return None;
+            }
+            self.next_revalidation_at_ms
+                .store(now_ms + REVALIDATION_MIN_SPACING_MS, Ordering::Relaxed);
+
+            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+            let util = accounts
+                .get(idx)
+                .map(|a| a.quota.max_utilization(now, is_fable))
+                .unwrap_or_default();
+            if let Some(account) = accounts.get_mut(idx) {
+                account.last_selected_seq = tick;
+                tracing::info!(
+                    account = %account.name,
+                    utilization = util,
+                    is_fable,
+                    "revalidation-serve (fallback): whole fleet over soft threshold — serving least-utilized allowed account"
+                );
+            }
+            idx
+        };
+
+        // Re-pin the session to the served account (accounts lock already dropped —
+        // never nest the two). Mirrors `select()`'s re-pin; no size-cap eviction here
+        // because a revalidation serve only ever re-keys an EXISTING session.
+        if let Some(key) = affinity {
+            let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (idx, now_ms));
+        }
+        Some(idx)
+    }
+
     pub(super) fn eligible(
         account: &AccountRuntime,
         global_threshold: f64,

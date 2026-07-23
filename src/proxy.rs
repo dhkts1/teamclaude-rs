@@ -397,12 +397,38 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             continue; // re-run select(); the just-freed account is now eligible
                         }
                         None => {
-                            return exhausted_response(
-                                &manager,
-                                now,
-                                account_count,
-                                request_is_fable,
-                            );
+                            // Not a transient park — the whole fleet reads over the
+                            // SOFT switch threshold. Before synthesizing a 429, try a
+                            // last-resort revalidation serve on the least-utilized
+                            // account Anthropic still allows (default ON; disable via
+                            // top-level `revalidationServe: false`). An upstream 200
+                            // refreshes stale quota; a 429 arms a real hold via the
+                            // existing inline-429 handling. `None` (throttled, or
+                            // nothing servable) keeps the honest exhausted 429.
+                            if manager.revalidation_serve_enabled() {
+                                if let Some(idx) = manager.select_revalidation(
+                                    &tried,
+                                    now,
+                                    request_model.as_deref(),
+                                    session_key,
+                                ) {
+                                    idx
+                                } else {
+                                    return exhausted_response(
+                                        &manager,
+                                        now,
+                                        account_count,
+                                        request_is_fable,
+                                    );
+                                }
+                            } else {
+                                return exhausted_response(
+                                    &manager,
+                                    now,
+                                    account_count,
+                                    request_is_fable,
+                                );
+                            }
                         }
                     }
                 }

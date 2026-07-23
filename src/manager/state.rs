@@ -45,6 +45,21 @@ impl Manager {
             .unwrap_or(false)
     }
 
+    /// Over-threshold revalidation-serve is ON by default; set top-level
+    /// `"revalidationServe": false` in the config to disable it (pure fall-through
+    /// to a synthesized 429 when the whole fleet reads over the soft threshold).
+    /// Same read pattern as [`Self::session_affinity_enabled`]. See
+    /// [`Manager::select_revalidation`].
+    pub fn revalidation_serve_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .extra
+            .get("revalidationServe")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    }
+
     /// Mint the next session key: a strictly-increasing, unique `u64` starting at
     /// 1. Called once per connection by the hybrid server when affinity is on.
     pub fn next_session_key(&self) -> u64 {

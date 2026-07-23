@@ -268,6 +268,9 @@ pub struct Manager {
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
+    /// Anti-storm valve for over-threshold revalidation-serve: epoch-ms before which
+    /// no new revalidation serve is issued. See [`Manager::select_revalidation`].
+    next_revalidation_at_ms: std::sync::atomic::AtomicI64,
 }
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
@@ -430,6 +433,7 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             session_seq: AtomicU64::new(1),
+            next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
         });
 
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
@@ -3360,6 +3364,253 @@ mod tests {
             [1, 1, 1, 1],
             "stacked sessions must converge to one-per-account without over-migrating \
              (got {per_account:?}) — a stale-count commit would over-stack one account"
+        );
+    }
+
+    // ---- over-threshold revalidation-serve (last-resort; default ON) ----------
+
+    /// Drive account `idx` OVER the soft switch threshold on its shared weekly
+    /// (`7d`) window (future reset) and stamp `unifiedStatus`, so normal `select`
+    /// benches it but `select_revalidation` can still consider it. `util` is the
+    /// weekly utilization; `status` the reported unified status.
+    fn set_over_threshold(manager: &Manager, idx: usize, util: f64, status: &str) {
+        let now = OffsetDateTime::now_utc();
+        let mut a = manager.accounts.write().expect("accounts lock poisoned");
+        let account = &mut a[idx];
+        account.quota.seven_day = Some(crate::quota::QuotaWindow {
+            utilization: util,
+            reset: Some(now + Duration::hours(48)),
+        });
+        account.quota.status = Some(status.to_string());
+    }
+
+    /// #1 Whole fleet over the soft threshold, all `allowed_warning`: normal
+    /// `select` is `None` but `select_revalidation` serves the LOWEST-utilization
+    /// account.
+    #[test]
+    fn revalidation_serves_least_utilized_when_all_over_threshold() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.995, "allowed_warning");
+        set_over_threshold(&manager, 1, 0.970, "allowed_warning"); // least utilized
+        set_over_threshold(&manager, 2, 0.999, "allowed_warning");
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None),
+            None,
+            "every account is over the soft threshold → normal select benches all"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(1),
+            "revalidation serves the least-utilized allowed account"
+        );
+    }
+
+    /// #1b THE cache-warmth test: a session pinned (affinity) to an over-threshold
+    /// but `allowed_warning` account X — with OTHER accounts LESS utilized — must be
+    /// served X (its warm pin), NOT the least-utilized other, and must NOT consume
+    /// the fallback anti-storm window. If X becomes `rejected`, it falls back to the
+    /// least-utilized survivor and RE-PINS the session there.
+    #[test]
+    fn revalidation_honors_pin_through_threshold() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        // The pinned account (idx 2) is the MOST utilized; the others are cooler.
+        set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&manager, 1, 0.970, "allowed_warning");
+        set_over_threshold(&manager, 2, 0.999, "allowed_warning"); // the warm pin
+        let key = 424_242u64;
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (2, odt_to_ms(now)));
+        }
+
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            Some(2),
+            "pin-honor serves the session's warm pinned account, NOT the least-utilized other"
+        );
+        // The pin-honor path must NOT have burned the fallback throttle window: an
+        // unaffiliated (no-pin) fallback serve still succeeds immediately.
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(0),
+            "pin-honor does not consume the fallback anti-storm window"
+        );
+
+        // When the pin becomes HARD-blocked (rejected), fall back to least-utilized
+        // and RE-PIN the session there. Use a fresh manager (throttle valve reset).
+        let manager2 = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager2, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&manager2, 1, 0.970, "allowed_warning");
+        set_over_threshold(&manager2, 2, 0.999, "rejected"); // pin now blocked
+        {
+            let mut pins = manager2.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (2, odt_to_ms(now)));
+        }
+        assert_eq!(
+            manager2.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            Some(0),
+            "a rejected pin falls back to the least-utilized survivor"
+        );
+        let repinned = manager2
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            repinned,
+            Some(0),
+            "the fallback serve re-pins the session to the account it chose"
+        );
+    }
+
+    /// #2 A `rejected` account is skipped even when least-utilized; a higher-util
+    /// `allowed` one is served. If ALL are `rejected` → `None`.
+    #[test]
+    fn revalidation_skips_rejected_accounts() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.960, "rejected"); // least util but blocked
+        set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(1),
+            "the least-utilized account is rejected → skip it, serve the allowed one"
+        );
+
+        // Now reject BOTH → nothing servable → None.
+        set_over_threshold(&manager, 1, 0.990, "rejected");
+        // A fresh manager to reset the anti-storm valve (previous serve armed it).
+        let manager2 = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager2, 0, 0.960, "rejected");
+        set_over_threshold(&manager2, 1, 0.990, "rejected");
+        assert_eq!(
+            manager2.select_revalidation(&HashSet::new(), now, None, None),
+            None,
+            "all accounts rejected → no revalidation target, honest 429"
+        );
+    }
+
+    /// #3 An account under a live rate-limit hold is skipped even if least-utilized.
+    #[test]
+    fn revalidation_skips_hard_held_account() {
+        let manager = build_manager(
+            config_with(vec![account("held", 0), account("free", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least util …
+        set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[0].rate_limited_until_ms = Some(crate::now_ms() + 60_000); // … but held.
+        }
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(1),
+            "a live-held account is a HARD block — skipped even as least-utilized"
+        );
+    }
+
+    /// #4 Anti-storm: two back-to-back calls — the first serves, the second (inside
+    /// `REVALIDATION_MIN_SPACING_MS`) returns `None`.
+    #[test]
+    fn revalidation_throttle_spacing_respected() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.970, "allowed_warning");
+        set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(0),
+            "first call serves"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            None,
+            "a second call within the spacing window is throttled to None"
+        );
+    }
+
+    /// #5 When one account is UNDER threshold, normal `select` returns it and the
+    /// revalidation path is never consulted — the normal path stays unchanged.
+    #[test]
+    fn revalidation_not_consulted_when_an_account_is_eligible() {
+        let manager = build_manager(
+            config_with(vec![account("hot", 0), account("cool", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.999, "allowed_warning");
+        // account 1 stays healthy (no quota set) → under threshold → eligible.
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None),
+            Some(1),
+            "an under-threshold account is served by the normal path; revalidation \
+             is only consulted after select() returns None"
+        );
+    }
+
+    /// #6 A Fable request skips an account whose Fable weekly (`7d_oi`) is a hard
+    /// reject, but a non-Fable request serves that same account.
+    #[test]
+    fn revalidation_fable_skips_fable_exhausted() {
+        let build = || {
+            let manager = build_manager(
+                config_with(vec![account("fable-full", 0), account("other", 0)]),
+                pacing_refresher(),
+            );
+            let now = OffsetDateTime::now_utc();
+            // account 0: least-utilized on shared dims but Fable weekly exhausted.
+            set_over_threshold(&manager, 0, 0.950, "allowed_warning");
+            set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+            {
+                let mut a = manager.accounts.write().expect("accounts lock poisoned");
+                a[0].quota.seven_day_oi = Some(crate::quota::QuotaWindow {
+                    utilization: 0.999,
+                    reset: Some(now + Duration::hours(48)),
+                });
+            }
+            (manager, now)
+        };
+
+        // Fable request: account 0's Fable weekly is a hard reject → skip → serve 1.
+        let (manager, now) = build();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), None),
+            Some(1),
+            "a Fable request skips the Fable-exhausted account even when least-utilized"
+        );
+
+        // Non-Fable request on a fresh manager: account 0 IS served (Fable weekly
+        // gates Fable traffic only; on shared dims account 0 is least-utilized).
+        let (manager, now) = build();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, Some("claude-opus-4-6"), None),
+            Some(0),
+            "a non-Fable request still serves the Fable-exhausted account"
         );
     }
 }
