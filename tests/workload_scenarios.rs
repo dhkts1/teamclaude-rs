@@ -58,9 +58,12 @@ use time::{Duration, OffsetDateTime};
 // Part A — the harness
 // ---------------------------------------------------------------------------
 
-/// The production default (`config::default_pacing`): three requests may be in
-/// flight on one account before it yields. The scenarios that model a burst are
-/// calibrated against this number, so it is named once here.
+/// The in-flight cap these scenarios exercise: three requests may be in flight on
+/// one account before it yields. This is the harness's own choice, NOT the
+/// production default — `config::default_pacing` ships pacing OFF (no cap). The
+/// scenarios build their `pacing(CAP)` explicitly so the capped path stays covered
+/// on purpose; the burst scenarios are calibrated against this number, so it is
+/// named once here.
 const CAP: u32 = 3;
 
 /// The default soft switch threshold (`config::default_switch_threshold`).
