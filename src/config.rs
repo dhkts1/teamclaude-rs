@@ -274,7 +274,12 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 /// Same-directory temp + rename keeps the swap atomic (rename is atomic within a
 /// filesystem); a crash mid-write leaves the original intact.
 pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
-    let json = serde_json::to_string_pretty(config)?;
+    write_atomic(path, &serde_json::to_string_pretty(config)?)
+}
+
+/// The atomic 0600 write itself, shared by [`save`] and [`save_tokens`] so both
+/// paths get the same durability and permission guarantees.
+fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
 
@@ -310,9 +315,151 @@ pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Persist ONLY the per-account credential state from `memory` into the file at
+/// `path`, leaving every user-owned setting on disk exactly as the user left it.
+///
+/// The running server's `Config` is a BOOT-TIME snapshot: it goes stale the
+/// moment the user edits the file, and only the credential fields
+/// (`access_token` / `refresh_token` / `expires_at`) are ever mutated in memory
+/// afterwards. Writing that whole snapshot back — which is what a plain [`save`]
+/// does — therefore reverts every edit made while the proxy runs (observed live
+/// 2026-07-25: a deleted `pacing` key was restored by the shutdown flush and read
+/// back by the next boot, three restarts running). So persisting is a
+/// read-modify-write: the FILE is the authority for everything except tokens.
+///
+/// Accounts are matched by identity ([`crate::identity::same_identity`], which
+/// reduces to name equality for the current config shape) and never by index —
+/// indices shift when the user adds or removes an account. Iterating the on-disk
+/// list and pulling tokens IN gives the two removal semantics for free: an
+/// account the user deleted from the file is not resurrected, and an account on
+/// disk that the server never loaded is left untouched.
+///
+/// An unreadable or malformed file falls back to writing the in-memory config:
+/// a just-rotated refresh token is single-use, so dropping it strands that
+/// account on `invalid_grant` forever, which is strictly worse than overwriting
+/// a file we cannot parse anyway. Both fallbacks log a warning naming the cause.
+///
+/// The merge runs on the file's raw JSON document, NOT on a `Config` round-trip:
+/// deserializing would materialize every serde default back into the file, so a
+/// key the user just DELETED would reappear as its default (`"pacing": {}`) and a
+/// key they never wrote would appear for the first time. Editing the parsed
+/// document leaves the file byte-identical apart from the credential fields.
+pub fn save_tokens(path: &Path, memory: &Config) -> Result<(), ConfigError> {
+    let merged = match read_document(path) {
+        Ok(mut doc) => {
+            merge_tokens(&mut doc, memory);
+            doc
+        }
+        Err(ConfigError::Io(err)) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "config unreadable at persist time; falling back to writing the in-memory config"
+            );
+            return save(path, memory);
+        }
+        Err(ConfigError::Parse(err)) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "config on disk is malformed JSON at persist time; falling back to writing the in-memory config"
+            );
+            return save(path, memory);
+        }
+    };
+    write_atomic(path, &serde_json::to_string_pretty(&merged)?)
+}
+
+/// Read the config file as a raw JSON object. Parsing as a MAP (not a bare
+/// `Value`) is deliberate: a file that is valid JSON but not an object — `[]`,
+/// `null`, a half-written fragment — must take the malformed fallback rather
+/// than be written back verbatim with the fresh tokens silently dropped.
+fn read_document(path: &Path) -> Result<Map<String, Value>, ConfigError> {
+    Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+}
+
+/// The identity fields of an on-disk account entry — the only part of a stored
+/// account this layer needs to read. Deliberately narrower than [`Account`]: an
+/// entry the user is mid-edit on (no `accessToken` yet) still gets matched
+/// rather than skipped.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiskIdentity {
+    name: String,
+    #[serde(default)]
+    account_uuid: Option<String>,
+    #[serde(default)]
+    org_uuid: Option<String>,
+    #[serde(default)]
+    org_name: Option<String>,
+}
+
+/// The mutable credential triple, carrying the SAME serde renames as
+/// [`Account`] so the merged keys are spelled exactly as the account struct
+/// spells them — one source of truth for the wire names.
+///
+/// The `Option`s skip rather than clear: memory holds `None` only when the file
+/// had no such field at boot, so an absent value means "nothing to say about
+/// this key", never "delete what the user has since written there".
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Credentials<'a> {
+    access_token: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
+}
+
+/// Overwrite the credential fields of every account present in BOTH `memory` and
+/// the on-disk `doc`, matched by identity and never by position. Nothing else in
+/// the document is touched.
+///
+/// Iterating the ON-DISK list and pulling tokens in gives both removal semantics
+/// for free: an account the user deleted from the file is never resurrected (it
+/// has no entry to write into), and an account on disk the server never loaded
+/// is left alone (no memory match).
+fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) {
+    let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in accounts.iter_mut() {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
+        else {
+            continue;
+        };
+        let probe = crate::identity::probe(
+            &stored.name,
+            stored.account_uuid,
+            stored.org_uuid,
+            stored.org_name,
+        );
+        let Some(fresh) = memory
+            .accounts
+            .iter()
+            .find(|a| crate::identity::same_identity(a, &probe))
+        else {
+            continue;
+        };
+        let credentials = Credentials {
+            access_token: &fresh.access_token,
+            refresh_token: fresh.refresh_token.as_deref(),
+            expires_at: fresh.expires_at,
+        };
+        let Ok(Value::Object(fields)) = serde_json::to_value(&credentials) else {
+            continue;
+        };
+        object.extend(fields);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const SAMPLE: &str = r#"{
       "proxy": { "port": 3456, "apiKey": "sk-proxy-secret", "customFlag": true },
@@ -462,6 +609,233 @@ mod tests {
     fn lock_account_absent_defaults_none() {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
         assert_eq!(config.lock_account, None);
+    }
+
+    /// A unique temp path per test — the suite runs tests in parallel threads of
+    /// ONE process, so a pid-only name collides.
+    fn tmp_path(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("tcr-{tag}-{}-{seq}.json", std::process::id()))
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).expect("read persisted config"))
+            .expect("persisted config is valid JSON")
+    }
+
+    /// One account, tokens as given, written as the file the server booted from.
+    fn one_account_file(access: &str, refresh: &str, expires: i64) -> String {
+        format!(
+            r#"{{ "accounts": [ {{ "name": "acct-a", "accessToken": "{access}", "refreshToken": "{refresh}", "expiresAt": {expires} }} ] }}"#
+        )
+    }
+
+    /// THE regression guard. Reproduces what happened live on 2026-07-25: the
+    /// server booted with `pacing.maxInFlightPerAccount = 3`, the user deleted
+    /// the key while it ran, and the next persist stamped the boot-time snapshot
+    /// back over the file — so the deleted setting returned and the next boot
+    /// read it. Persisting must write the rotated tokens and NOTHING else.
+    #[test]
+    fn persist_does_not_clobber_a_user_edit() {
+        let path = tmp_path("persist-user-edit");
+        fs::write(
+            &path,
+            r#"{ "pacing": { "maxInFlightPerAccount": 3 },
+                 "accounts": [ { "name": "acct-a", "accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1 } ] }"#,
+        )
+        .unwrap();
+
+        // The server's boot-time snapshot still carries the setting…
+        let mut memory = load(&path).unwrap();
+        assert_eq!(memory.pacing.max_in_flight_per_account, Some(3));
+        // …the user deletes it while the proxy runs…
+        fs::write(&path, one_account_file("at-old", "rt-old", 1)).unwrap();
+        // …and a token rotates, triggering a persist.
+        memory.accounts[0].access_token = "at-new".to_string();
+        memory.accounts[0].refresh_token = Some("rt-new".to_string());
+        memory.accounts[0].expires_at = Some(2);
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert!(
+            value.get("pacing").is_none(),
+            "the server restored a key the user deleted: {value}"
+        );
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-new"));
+        assert_eq!(value["accounts"][0]["refreshToken"], json!("rt-new"));
+        assert_eq!(value["accounts"][0]["expiresAt"], json!(2));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_preserves_unknown_top_level_keys() {
+        let path = tmp_path("persist-unknown");
+        fs::write(&path, one_account_file("at-old", "rt-old", 1)).unwrap();
+        let mut memory = load(&path).unwrap();
+
+        // The user adds keys the server does not model — including one it has
+        // never seen — then a token rotates.
+        fs::write(
+            &path,
+            r#"{ "quotaProbeSeconds": 120,
+                 "routes": [{ "name": "r1", "match": "*fable*" }],
+                 "accounts": [ { "name": "acct-a", "accessToken": "at-old", "refreshToken": "rt-old", "expiresAt": 1, "models": ["claude-fable-5"] } ] }"#,
+        )
+        .unwrap();
+        memory.accounts[0].access_token = "at-new".to_string();
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(value["quotaProbeSeconds"], json!(120));
+        assert!(value["routes"].is_array());
+        assert_eq!(value["accounts"][0]["models"], json!(["claude-fable-5"]));
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-new"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_falls_back_when_file_is_unreadable() {
+        let path = tmp_path("persist-missing");
+        let memory: Config =
+            serde_json::from_str(&one_account_file("at-new", "rt-new", 7)).unwrap();
+        // No file at all (deleted under the running server, or a first-boot path
+        // that has yet to create it): the rotated tokens must still land.
+        assert!(!path.exists());
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-new"));
+        assert_eq!(value["accounts"][0]["refreshToken"], json!("rt-new"));
+        assert_eq!(value["accounts"][0]["expiresAt"], json!(7));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_falls_back_when_file_is_malformed() {
+        let path = tmp_path("persist-malformed");
+        let memory: Config =
+            serde_json::from_str(&one_account_file("at-new", "rt-new", 7)).unwrap();
+        // A single-use refresh token is worth more than an unparseable file.
+        fs::write(&path, "{ this is not json").unwrap();
+        save_tokens(&path, &memory).unwrap();
+        assert_eq!(
+            read_json(&path)["accounts"][0]["refreshToken"],
+            json!("rt-new")
+        );
+
+        // Valid JSON that is not an object takes the same path.
+        fs::write(&path, "[]").unwrap();
+        save_tokens(&path, &memory).unwrap();
+        assert_eq!(
+            read_json(&path)["accounts"][0]["refreshToken"],
+            json!("rt-new")
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_matches_accounts_by_name_not_index() {
+        let path = tmp_path("persist-by-name");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a-new", "refreshToken": "rt-a-new", "expiresAt": 11 },
+                   { "name": "acct-b", "accessToken": "at-b-new", "refreshToken": "rt-b-new", "expiresAt": 22 } ] }"#,
+        )
+        .unwrap();
+        // The user reorders the accounts on disk while the proxy runs. Index 0 in
+        // memory is acct-a; index 0 on disk is now acct-b.
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "acct-b", "accessToken": "at-b-old" },
+                   { "name": "acct-a", "accessToken": "at-a-old" } ] }"#,
+        )
+        .unwrap();
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(value["accounts"][0]["name"], json!("acct-b"));
+        assert_eq!(
+            value["accounts"][0]["accessToken"],
+            json!("at-b-new"),
+            "tokens landed by position, not identity"
+        );
+        assert_eq!(value["accounts"][0]["refreshToken"], json!("rt-b-new"));
+        assert_eq!(value["accounts"][1]["name"], json!("acct-a"));
+        assert_eq!(value["accounts"][1]["accessToken"], json!("at-a-new"));
+        assert_eq!(value["accounts"][1]["expiresAt"], json!(11));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_does_not_resurrect_an_account_the_user_removed() {
+        let path = tmp_path("persist-removed");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a" },
+                   { "name": "acct-gone", "accessToken": "at-gone" } ] }"#,
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            r#"{ "accounts": [ { "name": "acct-a", "accessToken": "at-a-old" } ] }"#,
+        )
+        .unwrap();
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        let accounts = value["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 1, "a removed account came back: {value}");
+        assert_eq!(accounts[0]["name"], json!("acct-a"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn persist_leaves_an_account_the_server_never_loaded_untouched() {
+        let path = tmp_path("persist-added");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [ { "name": "acct-a", "accessToken": "at-a-new" } ] }"#,
+        )
+        .unwrap();
+        // The user added a second account by hand after boot.
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a-old" },
+                   { "name": "acct-new", "accessToken": "at-new", "refreshToken": "rt-new" } ] }"#,
+        )
+        .unwrap();
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-a-new"));
+        assert_eq!(value["accounts"][1]["accessToken"], json!("at-new"));
+        assert_eq!(value["accounts"][1]["refreshToken"], json!("rt-new"));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn save_tokens_writes_owner_only_permissions() {
+        let path = tmp_path("persist-perm");
+        let memory: Config =
+            serde_json::from_str(&one_account_file("at-new", "rt-new", 7)).unwrap();
+        // Both paths through save_tokens must land 0600: the merge…
+        fs::write(&path, one_account_file("at-old", "rt-old", 1)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save_tokens(&path, &memory).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // …and the fallback.
+        fs::remove_file(&path).unwrap();
+        save_tokens(&path, &memory).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(&path).ok();
     }
 
     #[test]
