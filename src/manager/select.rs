@@ -32,17 +32,17 @@ impl Manager {
     /// pick.
     ///
     /// **The invariant, and the whole point of a pin: a session's pin is re-keyed
-    /// ONLY when the pinned account fails a HARD gate** ([`Self::hard_ok`] is the
-    /// sole authority). Anthropic's prompt cache is per-account, so a re-key
+    /// ONLY when the pinned ACCOUNT fails a HARD gate** ([`Self::account_hard_ok`] is
+    /// the sole authority). Anthropic's prompt cache is per-account, so a re-key
     /// re-creates the entire conversation prefix on a cold account. Only disabled /
-    /// [`AccountStatus::Error`] / a live hold / `rejected` / Fable-weekly-exhausted
-    /// re-key durably. This is self-healing: a durable failure arms a hold or sets
-    /// `rejected` on the very next attempt, and those fail `hard_ok`.
+    /// [`AccountStatus::Error`] / a live hold / `rejected` re-key durably. This is
+    /// self-healing: a durable failure arms a hold or sets `rejected` on the very
+    /// next attempt, and those fail `account_hard_ok`.
     ///
-    /// A SOFT failure never re-keys, and — the second half of the same argument —
-    /// mostly does not even DIVERT, because a divert costs that request the same cold
-    /// prefix a re-key would. The three soft failures split by how much they actually
-    /// know:
+    /// Everything else is a fact about ONE REQUEST, not about the account. Such a
+    /// fact never re-keys, and — the second half of the same argument — mostly does
+    /// not even DIVERT, because a divert costs that request the same cold prefix a
+    /// re-key would. The four split by how much they actually know:
     ///  - **over the utilization threshold** → **SERVE the pin anyway.** That
     ///    threshold is our own arithmetic over headers that go stale by minutes, and
     ///    Anthropic keeps answering 200s for accounts it benches. Upstream is the
@@ -51,11 +51,16 @@ impl Manager {
     ///    [`Self::paced_out`]) → divert this ONE request, keep the pin. Our own
     ///    concurrency is measured exactly and never stale, and spreading a session's
     ///    burst is precisely what the cap exists to do.
+    ///  - **model-class blocked** (a Fable request whose pin has an exhausted Fable
+    ///    weekly, see [`Self::model_blocked`]) → divert this ONE request, keep the
+    ///    pin. The account cannot answer THIS request and answers every other model
+    ///    class perfectly, so treating it as death let a one-line title call drag a
+    ///    200k-token Opus conversation onto a cold account.
     ///  - **already in `tried`** → divert this ONE request, keep the pin. It has
     ///    failed THIS request upstream, so re-serving it would spin — but one blip is
     ///    not proof the account is gone.
     ///
-    /// Both diverts route to the fall-through pick while the pin stays put (see
+    /// Every divert routes to the fall-through pick while the pin stays put (see
     /// `keep_pin`); the utilization case returns from the fast-path.
     ///
     /// The one remaining voluntary mover — the load-balancing migration that
@@ -82,14 +87,15 @@ impl Manager {
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
 
-        // Set (to the OLD pin index) for the two soft failures that DIVERT — the pin
-        // is paced out, or it is already in `tried` — while still clearing every HARD
-        // gate (`Self::hard_ok`). A soft gate may divert a request; it may never
-        // RE-KEY a session: Anthropic's prompt cache is per-account, so a re-pin
+        // Set (to the OLD pin index) for the three per-REQUEST failures that DIVERT —
+        // the pin is paced out, it cannot serve this request's model class, or it is
+        // already in `tried` — while still clearing every ACCOUNT-level HARD gate
+        // (`Self::account_hard_ok`). A per-request fact may divert a request; it may
+        // never RE-KEY a session: Anthropic's prompt cache is per-account, so a re-pin
         // re-creates the whole conversation prefix on the next request. The
         // fall-through re-pin at the bottom honours this and keeps the old index.
-        // The third soft failure — over the utilization threshold — does not divert
-        // at all; the fast-path below serves the pin and returns.
+        // The fourth — over the utilization threshold — does not divert at all; the
+        // fast-path below serves the pin and returns.
         let mut keep_pin: Option<usize> = None;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
@@ -114,14 +120,19 @@ impl Manager {
                 if tried.contains(&idx) {
                     // The pin already failed THIS request upstream. That is NOT proof
                     // the account is gone — a transient blip (a dropped connection, a
-                    // 5xx) leaves every HARD gate clear. So divert this request and
-                    // keep the pin. Self-healing: a DURABLE failure arms a hold or
-                    // sets `rejected`, both of which fail `hard_ok`, so the re-key
-                    // still happens — one request later, on evidence.
+                    // 5xx) leaves every ACCOUNT-level gate clear. So divert this
+                    // request and keep the pin. Self-healing: a DURABLE failure arms a
+                    // hold or sets `rejected`, both of which fail `account_hard_ok`, so
+                    // the re-key still happens — one request later, on evidence.
+                    //
+                    // `account_hard_ok`, not `hard_ok`: the model-class gate is about
+                    // THIS request, so a Fable-exhausted pin that a Fable request
+                    // already tried still keeps its pin for the session's Opus turns.
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
-                    if accounts.get(idx).is_some_and(|a| {
-                        Self::hard_ok(a, self.global_threshold, now, now_ms, is_fable)
-                    }) {
+                    if accounts
+                        .get(idx)
+                        .is_some_and(|a| Self::account_hard_ok(a, now_ms))
+                    {
                         keep_pin = Some(idx);
                     }
                 } else {
@@ -159,23 +170,30 @@ impl Manager {
                             )
                         });
                         if !x_usable {
-                            // Re-test the SAME account against the HARD gates ALONE to
-                            // separate a SOFT yield from a real block. Passing here
-                            // means the pin cleared disabled/error/hold/rejected/
-                            // Fable-weekly and only tripped a soft gate — the
-                            // utilization threshold (`quota.is_near`) or the
-                            // concurrency-cap / min-spacing pacing gate. Both are
-                            // rotation hints, never proof this account cannot serve.
-                            // Failing here is a genuine HARD block → fall through to
-                            // the normal pick, which durably re-keys (the session's
-                            // account really is gone).
+                            // Re-test the SAME account against the ACCOUNT-level HARD
+                            // gates ALONE to separate a per-REQUEST yield from a real
+                            // block. Passing there means the pin cleared
+                            // disabled/error/hold/rejected and only tripped a gate that
+                            // describes this one request — the utilization threshold
+                            // (`quota.is_near`), the concurrency-cap / min-spacing
+                            // pacing gate, or the model-class gate. None of those is
+                            // proof this account is gone. Failing it IS a genuine HARD
+                            // block → fall through to the normal pick, which durably
+                            // re-keys (the session's account really is gone).
                             //
-                            // The two soft gates then part ways, because they are not
-                            // the same kind of claim (see `Self::paced_out`):
+                            // The three then part ways, because they are not the same
+                            // kind of claim (see `Self::paced_out`, `Self::model_blocked`):
                             //
                             //  - PACED OUT → yield THIS request and keep the pin, as
                             //    before. Our own concurrency is a fact we measure
                             //    exactly, and spreading a burst is what the cap is for.
+                            //
+                            //  - MODEL-CLASS BLOCKED (a Fable request, Fable weekly
+                            //    exhausted) → same shape: this account cannot answer
+                            //    THIS request, and answers every other model class
+                            //    fine. Divert the one request, keep the pin — otherwise
+                            //    a one-line title call re-keys a 200k-token Opus
+                            //    conversation onto a cold account.
                             //
                             //  - OVER THE UTILIZATION THRESHOLD → SERVE THE PIN. That
                             //    threshold is our own arithmetic over headers stale by
@@ -189,16 +207,19 @@ impl Manager {
                             //    behaviour `select_revalidation`'s PIN-HONOR path
                             //    already had, hoisted to where it is reachable; both
                             //    log the identical line so they grep together.
-                            let hard_ok = accounts.get(idx).is_some_and(|a| {
-                                Self::hard_ok(a, self.global_threshold, now, now_ms, is_fable)
+                            let account_alive = accounts
+                                .get(idx)
+                                .is_some_and(|a| Self::account_hard_ok(a, now_ms));
+                            let model_blocked = accounts.get(idx).is_some_and(|a| {
+                                Self::model_blocked(a, self.global_threshold, now, is_fable)
                             });
                             let paced_out = accounts
                                 .get(idx)
                                 .is_some_and(|a| Self::paced_out(a, &self.pacing, now_ms));
-                            if !hard_ok {
+                            if !account_alive {
                                 // Genuinely gone: fall through and durably re-key.
                                 None
-                            } else if paced_out {
+                            } else if model_blocked || paced_out {
                                 // Yield this ONE request to the fall-through pick; the
                                 // re-pin at the bottom re-inserts the OLD index.
                                 keep_pin = Some(idx);
@@ -387,8 +408,8 @@ impl Manager {
         // migration). Skipped entirely when affinity is off, so the map stays
         // empty on the disabled path.
         if let (Some(key), Some(idx)) = (affinity, best) {
-            // A SOFT-gated pin (over the utilization threshold, paced, or transiently
-            // in `tried`) diverted THIS request only: re-insert the OLD index, not the
+            // A per-REQUEST-gated pin (paced, model-class blocked, or transiently in
+            // `tried`) diverted THIS request only: re-insert the OLD index, not the
             // account we are about to serve. The insert still has to happen — this
             // `now_ms` is one of only two writers of the last-touch stamp that the
             // AFFINITY_CAP eviction below sorts on, so skipping it would make a
@@ -416,8 +437,8 @@ impl Manager {
             };
             // The only durable re-key that happens here, and until now it logged
             // nothing — which is why a 39.4% live account-switch rate went unnoticed.
-            // Reaching this line now means the pin failed a HARD gate, so the line
-            // doubles as the audit trail for the invariant.
+            // Reaching this line now means the pin failed an ACCOUNT-level HARD gate,
+            // so the line doubles as the audit trail for the invariant.
             // The accounts lock is taken ONLY after the affinity lock has dropped
             // above; the two are never held simultaneously.
             if let Some(previous) = moved_off {
@@ -425,7 +446,7 @@ impl Manager {
                 let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
                 let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
                 tracing::info!(
-                    "affinity: re-pin session {} off {} -> {} (pin failed a HARD gate)",
+                    "affinity: re-pin session {} off {} -> {} (pin failed an ACCOUNT HARD gate)",
                     short_session_id(key),
                     old_name,
                     new_name
@@ -455,14 +476,17 @@ impl Manager {
     ///    serve-the-pin rule in its own affinity fast-path (identical log line), so a
     ///    servable pin is honoured there and this path is the belt-and-braces copy for
     ///    any caller that reaches revalidation directly.
-    ///  - **(B) FALLBACK** (no pin, or the pin is rejected/held/tried): the
-    ///    least-utilized surviving account wins (lowest
+    ///  - **(B) FALLBACK** (no pin, or the pin is rejected/held/tried/model-blocked):
+    ///    the least-utilized surviving account wins (lowest
     ///    [`crate::quota::Quota::max_utilization`]; ties: LRU `last_selected_seq`).
     ///    The anti-storm throttle applies HERE ONLY — at most one NEW-account
     ///    revalidation per [`REVALIDATION_MIN_SPACING_MS`]; inside that window return
     ///    `None` (the caller emits the honest 429). The window is spent only once a
     ///    servable candidate exists. On success the session is RE-PINNED to the
-    ///    chosen account, mirroring `select()`'s re-pin.
+    ///    chosen account, mirroring `select()`'s re-pin — EXCEPT when the pin was
+    ///    passed over merely because it cannot serve this request's MODEL CLASS
+    ///    ([`Self::model_blocked`]), which is a per-request fact and so re-writes the
+    ///    OLD index instead (`keep_pin`, exactly as `select()` does).
     ///
     /// The winner's `last_selected_seq` is stamped and ONE `tracing::info!` names the
     /// path (pin-honor vs fallback), the account, and its utilization.
@@ -487,6 +511,13 @@ impl Manager {
         let hard_ok = |account: &AccountRuntime| -> bool {
             Self::hard_ok(account, self.global_threshold, now, now_ms, is_fable)
         };
+
+        // Mirrors `select()`'s `keep_pin`: set to the OLD pin index when the pin
+        // cannot serve THIS request but the ACCOUNT is alive, so the fallback below
+        // serves elsewhere while re-writing the OLD index. Without it a Fable request
+        // that reaches this path re-keys the session and the next Opus turn pays a
+        // cold prefix — the same defect this file fixed in `select()`, one path over.
+        let mut keep_pin: Option<usize> = None;
 
         // (A) PIN-HONOR — read the pin under the affinity lock, DROP it, then check
         // the pin's HARD gates under the accounts lock (never nested). No throttle.
@@ -515,8 +546,18 @@ impl Manager {
                         }
                         return Some(idx);
                     }
-                    // Pin is HARD-blocked → fall through to the fallback path (lock
-                    // drops at the end of this scope, before the affinity lock below).
+                    // The pin cannot serve THIS request → fall through to the fallback
+                    // path (lock drops at the end of this scope, before the affinity
+                    // lock below). Whether that fall-through also MOVES the pin depends
+                    // on WHY: a model-class block leaves the account alive for every
+                    // other class, so the pin stays; only an ACCOUNT-level block is a
+                    // durable re-key.
+                    if accounts
+                        .get(idx)
+                        .is_some_and(|a| Self::account_hard_ok(a, now_ms))
+                    {
+                        keep_pin = Some(idx);
+                    }
                 }
             }
         }
@@ -570,29 +611,32 @@ impl Manager {
             idx
         };
 
-        // Re-pin the session to the served account (accounts lock already dropped —
-        // never nest the two). Mirrors `select()`'s re-pin; no size-cap eviction here
-        // because a revalidation serve only ever re-keys an EXISTING session.
+        // Re-pin the session (accounts lock already dropped — never nest the two).
+        // Mirrors `select()`'s re-pin, `keep_pin` included: a model-class divert
+        // re-writes the OLD index with a fresh `now_ms`, so the session comes home on
+        // its next request of another class. No size-cap eviction here because a
+        // revalidation serve only ever touches an EXISTING session's pin.
         if let Some(key) = affinity {
             let mut pins = self.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (idx, now_ms));
+            pins.insert(key, (keep_pin.unwrap_or(idx), now_ms));
         }
         Some(idx)
     }
 
-    /// The HARD gates alone — the blocks that mean *this account cannot serve at
-    /// all*, with every SOFT gate deliberately absent:
+    /// The ACCOUNT-level HARD gates alone — the blocks that mean *this account is
+    /// gone for every model class*, with every SOFT gate deliberately absent:
     ///   - `disabled` / [`AccountStatus::Error`] → hard fail;
     ///   - a live rate-limit hold (`rate_limited_until_ms` still in the future);
-    ///   - `quota.status == Some("rejected")` — Anthropic's own verdict;
-    ///   - for a Fable request, an exhausted model-scoped weekly (`7d_oi`) bucket.
+    ///   - `quota.status == Some("rejected")` — Anthropic's own verdict.
     ///
-    /// Deliberately NOT here: the soft utilization threshold ([`crate::quota::Quota::is_near`])
-    /// and pacing. Both are rotation HINTS — reasons to prefer another account for
-    /// one request — never proof this one is gone. That distinction is the whole
-    /// ballgame for the per-account prompt cache: [`Self::select`] uses this
-    /// predicate as the SOLE authority on whether a session's pin may be re-keyed,
-    /// because a re-key re-creates the conversation prefix on a cold account.
+    /// **This — not [`Self::hard_ok`] — is the SOLE authority on whether a session's
+    /// pin may be re-keyed**, because a re-key re-creates the conversation prefix on
+    /// a cold account. Everything absent from it is a fact about ONE REQUEST rather
+    /// than about the account, and a per-request fact may divert a request but must
+    /// never move a pin. That covers the soft utilization threshold
+    /// ([`crate::quota::Quota::is_near`]), pacing, an entry in `tried`, and — the
+    /// one that used to live here — model-scoped exhaustion
+    /// ([`Self::model_blocked`]).
     ///
     /// Known staleness caveat: `quota.status` is written ONLY from live response
     /// headers ([`crate::quota`]), never by the background probe, so for a benched
@@ -602,13 +646,7 @@ impl Manager {
     /// possibly-stale arithmetic.
     ///
     /// Pure and lock-free; the caller holds whichever accounts lock it needs.
-    pub(super) fn hard_ok(
-        account: &AccountRuntime,
-        global_threshold: f64,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-    ) -> bool {
+    pub(super) fn account_hard_ok(account: &AccountRuntime, now_ms: i64) -> bool {
         if account.disabled || account.status == AccountStatus::Error {
             return false;
         }
@@ -620,11 +658,58 @@ impl Manager {
         if account.quota.status.as_deref() == Some("rejected") {
             return false;
         }
-        let threshold = account.switch_threshold.unwrap_or(global_threshold);
-        if is_fable && account.quota.model_weekly_exhausted(threshold, now) {
-            return false;
-        }
         true
+    }
+
+    /// Whether this account cannot serve **this request's model class** while still
+    /// serving every other one: a Fable request against an exhausted model-scoped
+    /// weekly (`7d_oi`) bucket.
+    ///
+    /// Model-scoped exhaustion is a property of the REQUEST CLASS, never of the
+    /// account — an account out of its Fable weekly answers Opus perfectly — so it is
+    /// deliberately NOT part of [`Self::account_hard_ok`]. At a pin it belongs with
+    /// the soft-divert family: divert THAT ONE request and keep the pin, so the
+    /// session's next Opus turn still lands on the account holding its warm prefix.
+    /// It remains a hard skip for every SERVE decision ([`Self::hard_ok`],
+    /// [`Self::eligible`]) — serving a Fable request from an exhausted bucket only
+    /// buys a 429.
+    ///
+    /// The live shape that makes the distinction load-bearing: every Claude Code
+    /// session mixes classes — Opus for the conversation plus a one-line Fable call
+    /// for titles and summaries — while a real fleet reads 95-99% on the Fable weekly
+    /// across nearly every account. Counted as account death, one cheap title request
+    /// re-keyed the session and dragged a 200k-token conversation onto a cold
+    /// account.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn model_blocked(
+        account: &AccountRuntime,
+        global_threshold: f64,
+        now: OffsetDateTime,
+        is_fable: bool,
+    ) -> bool {
+        let threshold = account.switch_threshold.unwrap_or(global_threshold);
+        is_fable && account.quota.model_weekly_exhausted(threshold, now)
+    }
+
+    /// Can this account SERVE this request at all, soft gates aside: the
+    /// account-level blocks ([`Self::account_hard_ok`]) AND this request's own
+    /// model-class block ([`Self::model_blocked`]).
+    ///
+    /// The right predicate for a serve decision (may this account answer *this*
+    /// request?) and the wrong one for a pin decision (is this session's account
+    /// gone?) — see [`Self::account_hard_ok`], which owns the latter.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hard_ok(
+        account: &AccountRuntime,
+        global_threshold: f64,
+        now: OffsetDateTime,
+        now_ms: i64,
+        is_fable: bool,
+    ) -> bool {
+        Self::account_hard_ok(account, now_ms)
+            && !Self::model_blocked(account, global_threshold, now, is_fable)
     }
 
     pub(super) fn eligible(
@@ -652,7 +737,11 @@ impl Manager {
         }
         // Per-model routing: only a Fable request gates on the model-scoped weekly
         // (`7d_oi`) bucket — every non-Fable model still serves from this account.
-        if is_fable && account.quota.model_weekly_exhausted(threshold, now) {
+        // Kept here on purpose: for an UNPINNED pick a Fable-exhausted account
+        // genuinely cannot serve this request, so it must be skipped. What changed
+        // is only that it is no longer grounds to MOVE AN EXISTING PIN — that
+        // decision reads [`Self::account_hard_ok`], which excludes this gate.
+        if Self::model_blocked(account, global_threshold, now, is_fable) {
             return false;
         }
         // SOFT pacing gate, evaluated LAST so it only ever narrows an already-healthy

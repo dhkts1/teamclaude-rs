@@ -49,6 +49,7 @@ use std::sync::Arc;
 
 use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, ThrottleConfig};
 use teamclaude_rs::manager::{InFlightGuard, Manager};
+use teamclaude_rs::model::is_fable_model;
 use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use teamclaude_rs::probe::{ProbeError, ProbeFuture, Usage, UsageBucket, UsageProber};
 use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
@@ -73,6 +74,12 @@ const SWITCH_THRESHOLD: f64 = 0.95;
 /// passed to `select` as an affinity — those calls pass `None`, which is the
 /// whole point of scenario 6.
 const ANON_KEY: u64 = 0;
+
+/// The two model classes one Claude Code session interleaves: the conversation
+/// turns, and the one-line title/summary calls that ride the same identity.
+/// `is_fable_model` is a substring test, so these are the ids the proxy sees.
+const OPUS: &str = "claude-opus-4-6";
+const FABLE: &str = "claude-fable-5";
 
 /// A fixed simulation epoch (2026-01-01T00:00:00Z). Every scenario advances
 /// `now` from here by hand, so a run is identical on every machine and clock.
@@ -162,13 +169,25 @@ struct Lineage {
     name: &'static str,
 }
 
+/// One recorded serve: the lineage that issued it, the account that answered it,
+/// and whether it was a Fable-class request. The class is recorded because a real
+/// session mixes classes, and only the NON-Fable subsequence carries the expensive
+/// prompt cache — a diverted one-line title call costs nothing, while a diverted
+/// conversation turn re-creates a 200k-token prefix.
+#[derive(Clone, Copy)]
+struct Serve {
+    key: u64,
+    account: usize,
+    is_fable: bool,
+}
+
 /// A fleet of accounts plus the recorded serve history that the metric is
 /// computed from.
 struct Fleet {
     manager: Arc<Manager>,
     account_names: Vec<String>,
-    /// Every `(lineage key, account index)` serve, in issue order.
-    serves: Vec<(u64, usize)>,
+    /// Every serve, in issue order.
+    serves: Vec<Serve>,
     /// Lineage display names in first-registration order (report ordering).
     lineages: Vec<(u64, &'static str)>,
     next_key: u64,
@@ -242,10 +261,31 @@ impl Fleet {
         tried: &HashSet<usize>,
         now: OffsetDateTime,
     ) -> usize {
-        match self.manager.select(tried, now, None, Some(lineage.key)) {
-            Some(idx) => {
-                self.serves.push((lineage.key, idx));
-                idx
+        self.serve_inner(lineage, tried, None, now)
+    }
+
+    /// One request on `lineage` targeting `model` — the shape a mixed-class
+    /// session issues, where the conversation turns and the title/summary calls
+    /// share one identity but not one quota bucket.
+    fn serve_model(&mut self, lineage: Lineage, model: &str, now: OffsetDateTime) -> usize {
+        self.serve_inner(lineage, &HashSet::new(), Some(model), now)
+    }
+
+    fn serve_inner(
+        &mut self,
+        lineage: Lineage,
+        tried: &HashSet<usize>,
+        model: Option<&str>,
+        now: OffsetDateTime,
+    ) -> usize {
+        match self.manager.select(tried, now, model, Some(lineage.key)) {
+            Some(account) => {
+                self.serves.push(Serve {
+                    key: lineage.key,
+                    account,
+                    is_fable: model.is_some_and(is_fable_model),
+                });
+                account
             }
             None => panic!(
                 "fleet refused to serve lineage {}\n{}",
@@ -259,9 +299,13 @@ impl Fleet {
     /// without creating or touching a pin.
     fn serve_anon(&mut self, now: OffsetDateTime) -> usize {
         match self.manager.select(&HashSet::new(), now, None, None) {
-            Some(idx) => {
-                self.serves.push((ANON_KEY, idx));
-                idx
+            Some(account) => {
+                self.serves.push(Serve {
+                    key: ANON_KEY,
+                    account,
+                    is_fable: false,
+                });
+                account
             }
             None => panic!("fleet refused an identity-less request\n{}", self.report()),
         }
@@ -300,6 +344,24 @@ impl Fleet {
         );
     }
 
+    /// Drive account `idx` over the soft switch threshold on its MODEL-SCOPED
+    /// weekly (`7d_oi`, the Fable bucket), through the same public path a
+    /// background quota probe uses. Every shared dimension is left healthy, which
+    /// is the real shape: the account is out of Fable and answers every other
+    /// model class perfectly.
+    fn set_fable_exhausted(&self, idx: usize, util: f64, now: OffsetDateTime) {
+        self.manager.apply_usage(
+            idx,
+            &Usage {
+                seven_day_oi: Some(UsageBucket {
+                    utilization: Some(util),
+                    reset_at_ms: Some(to_ms(now + Duration::hours(48))),
+                }),
+                ..Usage::default()
+            },
+        );
+    }
+
     fn account_name(&self, idx: usize) -> &str {
         self.account_names
             .get(idx)
@@ -310,8 +372,19 @@ impl Fleet {
     fn serves_of(&self, key: u64) -> Vec<usize> {
         self.serves
             .iter()
-            .filter(|(k, _)| *k == key)
-            .map(|(_, idx)| *idx)
+            .filter(|s| s.key == key)
+            .map(|s| s.account)
+            .collect()
+    }
+
+    /// The accounts that served `key` with a request of one model class, in order.
+    /// The NON-Fable subsequence is the conversation itself — the only one whose
+    /// continuity costs real prompt-cache creation.
+    fn serves_of_class(&self, key: u64, is_fable: bool) -> Vec<usize> {
+        self.serves
+            .iter()
+            .filter(|s| s.key == key && s.is_fable == is_fable)
+            .map(|s| s.account)
             .collect()
     }
 
@@ -324,14 +397,19 @@ impl Fleet {
             .count()
     }
 
-    /// `1.0 - switches / pairs`; `1.0` for a lineage with fewer than 2 requests.
-    fn continuity(&self, key: u64) -> f64 {
-        let serves = self.serves_of(key);
-        if serves.len() < 2 {
+    /// `1.0 - switches / pairs` over any serve path; `1.0` for fewer than 2
+    /// serves. Split out so a single model class can be measured on its own.
+    fn continuity_of(path: &[usize]) -> f64 {
+        if path.len() < 2 {
             return 1.0;
         }
-        let pairs = serves.len() - 1;
-        1.0 - (self.switches(key) as f64 / pairs as f64)
+        let switches = path.windows(2).filter(|w| w[0] != w[1]).count();
+        1.0 - (switches as f64 / (path.len() - 1) as f64)
+    }
+
+    /// `1.0 - switches / pairs`; `1.0` for a lineage with fewer than 2 requests.
+    fn continuity(&self, key: u64) -> f64 {
+        Self::continuity_of(&self.serves_of(key))
     }
 
     /// The account a lineage started on — the one holding its warm prefix.
@@ -380,11 +458,13 @@ impl Fleet {
     }
 
     /// One greppable line per lineage that issued anything:
-    /// `lineage=<name> requests=<n> switches=<n> continuity=<0.00-1.00> home=<account> path=<a>b>a>`
+    /// `lineage=<name> requests=<n> switches=<n> continuity=<0.00-1.00> home=<account> path=<a>b(fable)>a>`
+    /// — a Fable-class serve is marked in the path, so a mixed-model run shows at a
+    /// glance which hops were cheap title calls and which were conversation turns.
     fn report(&self) -> String {
         let mut counts: HashMap<u64, usize> = HashMap::new();
-        for (key, _) in &self.serves {
-            *counts.entry(*key).or_insert(0) += 1;
+        for serve in &self.serves {
+            *counts.entry(serve.key).or_insert(0) += 1;
         }
         let mut out = String::new();
         for (key, name) in &self.lineages {
@@ -392,7 +472,19 @@ impl Fleet {
             if serves.is_empty() {
                 continue;
             }
-            let path: Vec<&str> = serves.iter().map(|&idx| self.account_name(idx)).collect();
+            let path: Vec<String> = self
+                .serves
+                .iter()
+                .filter(|s| s.key == *key)
+                .map(|s| {
+                    let name = self.account_name(s.account);
+                    if s.is_fable {
+                        format!("{name}(fable)")
+                    } else {
+                        name.to_string()
+                    }
+                })
+                .collect();
             out.push_str(&format!(
                 "lineage={} requests={} switches={} continuity={:.2} home={} path={}\n",
                 name,
@@ -875,7 +967,8 @@ fn busy_neighbour_does_not_rekey_a_quiet_session() {
 }
 
 // ---------------------------------------------------------------------------
-// Part C — scenarios that fail today: the executable spec for the next fix
+// Part C — one invariant per cache-losing path, in the order the fixes landed.
+// Each was written as an executable spec while the scenario still failed.
 // ---------------------------------------------------------------------------
 
 /// **8. A transient upstream failure must divert, never re-key.** When a 429 or
@@ -962,4 +1055,66 @@ fn migration_never_moves_a_session_to_a_lower_priority_tier() {
             fleet.report()
         );
     }
+}
+
+/// **10. A mixed-model session keeps ONE home.** A Claude Code conversation is not
+/// one model class: the turns are Opus, and riding on the same identity are
+/// one-line Fable calls for titles and summaries. A live fleet reads 95-99% on the
+/// Fable weekly across nearly every account, so a session's pinned account is
+/// routinely out of Fable while answering Opus perfectly.
+///
+/// Model-scoped exhaustion is therefore a property of the REQUEST CLASS, not of the
+/// account. Counted as account death it re-keyed the whole session — one cheap
+/// title request dragging a 200k-token conversation onto a cold account, which is
+/// the most expensive possible trade. The Fable calls may land wherever they can be
+/// served; every Opus turn must land on ONE account.
+#[test]
+fn mixed_model_session_keeps_one_home() {
+    let mut fleet = Fleet::new(&[("alpha", 0), ("bravo", 0)], pacing(CAP));
+    let session = fleet.lineage("mixed");
+    let mut now = t0();
+
+    // The first turn establishes the pin (and the warm prefix).
+    let home = fleet.serve_model(session, OPUS, now);
+    now += Duration::seconds(1);
+    // That account is now out of its Fable weekly. Every shared dimension stays
+    // healthy: it answers Opus exactly as before.
+    fleet.set_fable_exhausted(home, 0.99, now);
+
+    // Ten conversation turns, each followed by the title/summary call the client
+    // fires on the same session.
+    for _ in 0..10 {
+        fleet.serve_model(session, OPUS, now);
+        now += Duration::seconds(1);
+        fleet.serve_model(session, FABLE, now);
+        now += Duration::seconds(1);
+    }
+
+    let opus_path = fleet.serves_of_class(session.key, false);
+    assert!(
+        opus_path.iter().all(|&idx| idx == home),
+        "every Opus turn must be served by the session's home account — a Fable \
+         gate may divert a Fable request, it may never move the pin\n{}",
+        fleet.report()
+    );
+    assert!(
+        (Fleet::continuity_of(&opus_path) - 1.0).abs() < f64::EPSILON,
+        "continuity over the conversation turns must be 1.0, got {:.3}\n{}",
+        Fleet::continuity_of(&opus_path),
+        fleet.report()
+    );
+
+    let fable_path = fleet.serves_of_class(session.key, true);
+    assert_eq!(
+        fable_path.len(),
+        10,
+        "every Fable call must be served\n{}",
+        fleet.report()
+    );
+    assert!(
+        fable_path.iter().all(|&idx| idx != home),
+        "a Fable call must be routed off the Fable-exhausted account — serving it \
+         there only buys a 429\n{}",
+        fleet.report()
+    );
 }

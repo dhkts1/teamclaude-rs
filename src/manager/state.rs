@@ -68,8 +68,8 @@ impl Manager {
     /// cooler account purely to even out pinned-session counts, and Anthropic's
     /// prompt cache is per-account: every such move costs a full prompt-cache
     /// re-creation of the whole conversation prefix on the target. A session's
-    /// account is chosen at START, or when its pin fails a HARD gate
-    /// ([`Manager::hard_ok`]) — never merely to balance load. Set
+    /// account is chosen at START, or when its pin fails an ACCOUNT-level HARD gate
+    /// ([`Manager::account_hard_ok`]) — never merely to balance load. Set
     /// `"loadBalanceMigration": true` to restore the balancing behaviour.
     pub fn load_balance_migration_enabled(&self) -> bool {
         self.config
