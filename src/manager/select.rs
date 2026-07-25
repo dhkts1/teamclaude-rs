@@ -28,14 +28,20 @@ impl Manager {
     /// `tried` and still passes [`Self::eligible`], that pinned account is
     /// returned — still stamped with a fresh select tick so *other* sessions' LRU
     /// steers away from a busy pinned account. Otherwise a normal LRU/priority
-    /// pick runs and its winner is recorded as the session's pin (the initial pin
-    /// or a re-pin when the old pin was HARD-ineligible / already tried).
-    /// Affinity never overrides priority — the pin is always a normal pick.
+    /// pick runs. Affinity never overrides priority — the pin is always a normal
+    /// pick.
     ///
-    /// One exception, and it is the whole point of a pin: when the old pin failed
-    /// only the SOFT pacing gate it is still healthy, so the fall-through pick
-    /// serves this ONE request while the pin stays where it is (see `keep_pin`) —
-    /// a soft gate may divert a request, it may never re-key a session.
+    /// **The invariant, and the whole point of a pin: a session's pin is re-keyed
+    /// ONLY when the pinned account fails a HARD gate** ([`Self::hard_ok`] is the
+    /// sole authority). Anthropic's prompt cache is per-account, so a re-key
+    /// re-creates the entire conversation prefix on a cold account. Every SOFT
+    /// failure — the utilization threshold, pacing, or a transient upstream blip
+    /// that merely landed the pin in `tried` — DIVERTS this ONE request to the
+    /// fall-through pick while the pin stays where it is (see `keep_pin`). Only
+    /// disabled / [`AccountStatus::Error`] / a live hold / `rejected` /
+    /// Fable-weekly-exhausted re-key durably. This is self-healing: a durable
+    /// failure arms a hold or sets `rejected` on the very next attempt, and those
+    /// fail `hard_ok`.
     pub fn select(
         &self,
         tried: &HashSet<usize>,
@@ -54,11 +60,12 @@ impl Manager {
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
 
-        // Set (to the OLD pin index) when the pin failed the SOFT pacing gate ONLY,
-        // i.e. it still clears every HARD gate. A soft gate may DIVERT a request; it
-        // may never RE-KEY a session — Anthropic's prompt cache is per-account, so a
-        // re-pin re-creates the whole conversation prefix on the next request. The
-        // fall-through re-pin at the bottom honours this and keeps the old index.
+        // Set (to the OLD pin index) whenever the pin failed only SOFT gates, i.e. it
+        // still clears every HARD gate (`Self::hard_ok`). A soft gate may DIVERT a
+        // request; it may never RE-KEY a session — Anthropic's prompt cache is
+        // per-account, so a re-pin re-creates the whole conversation prefix on the
+        // next request. The fall-through re-pin at the bottom honours this and keeps
+        // the old index.
         let mut keep_pin: Option<usize> = None;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
@@ -80,7 +87,20 @@ impl Manager {
                 (pinned, counts)
             };
             if let Some(idx) = pinned {
-                if !tried.contains(&idx) {
+                if tried.contains(&idx) {
+                    // The pin already failed THIS request upstream. That is NOT proof
+                    // the account is gone — a transient blip (a dropped connection, a
+                    // 5xx) leaves every HARD gate clear. So divert this request and
+                    // keep the pin. Self-healing: a DURABLE failure arms a hold or
+                    // sets `rejected`, both of which fail `hard_ok`, so the re-key
+                    // still happens — one request later, on evidence.
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    if accounts.get(idx).is_some_and(|a| {
+                        Self::hard_ok(a, self.global_threshold, now, now_ms, is_fable)
+                    }) {
+                        keep_pin = Some(idx);
+                    }
+                } else {
                     let count_x = counts.get(&idx).copied().unwrap_or(0);
                     // (2) UNDER THE ACCOUNTS LOCK ONLY: confirm the pin `X` is still
                     // usable, then — and only when >=2 sessions stack on `X` — look
@@ -109,23 +129,22 @@ impl Manager {
                             )
                         });
                         if !x_usable {
-                            // Re-test the SAME account with pacing OFF to separate a
-                            // SOFT yield from a HARD block. Passing here means the pin
-                            // cleared disabled/error/hold/quota/Fable-weekly and only
-                            // tripped the concurrency-cap / min-spacing gate: divert
-                            // THIS request to the fall-through pick but keep the pin.
-                            // Failing here is a genuine HARD block, which keeps today's
-                            // durable re-pin (the session's account really is gone).
+                            // Re-test the SAME account against the HARD gates ALONE to
+                            // separate a SOFT yield from a real block. Passing here
+                            // means the pin cleared disabled/error/hold/rejected/
+                            // Fable-weekly and only tripped a soft gate — the
+                            // utilization threshold (`quota.is_near`) or the
+                            // concurrency-cap / min-spacing pacing gate. Both are
+                            // rotation hints: divert THIS request to the fall-through
+                            // pick but keep the pin. Failing here is a genuine HARD
+                            // block, which keeps today's durable re-pin (the session's
+                            // account really is gone).
+                            //
+                            // The utilization case is the load-bearing one: an account
+                            // crossing the soft threshold used to dump EVERY session
+                            // pinned to it, simultaneously, cold-starting all of them.
                             if accounts.get(idx).is_some_and(|a| {
-                                Self::eligible(
-                                    a,
-                                    self.global_threshold,
-                                    &self.pacing,
-                                    false,
-                                    now,
-                                    now_ms,
-                                    is_fable,
-                                )
+                                Self::hard_ok(a, self.global_threshold, now, now_ms, is_fable)
                             }) {
                                 keep_pin = Some(idx);
                             }
@@ -294,10 +313,11 @@ impl Manager {
         // migration). Skipped entirely when affinity is off, so the map stays
         // empty on the disabled path.
         if let (Some(key), Some(idx)) = (affinity, best) {
-            // A SOFT-paced pin diverted THIS request only: re-insert the OLD index,
-            // not the account we are about to serve. The insert still has to happen —
-            // this `now_ms` is one of only two writers of the last-touch stamp that
-            // the AFFINITY_CAP eviction below sorts on, so skipping it would make a
+            // A SOFT-gated pin (over the utilization threshold, paced, or transiently
+            // in `tried`) diverted THIS request only: re-insert the OLD index, not the
+            // account we are about to serve. The insert still has to happen — this
+            // `now_ms` is one of only two writers of the last-touch stamp that the
+            // AFFINITY_CAP eviction below sorts on, so skipping it would make a
             // heavily-diverted session the eviction victim.
             let pin_idx = keep_pin.unwrap_or(idx);
             let moved_off = {
@@ -322,6 +342,8 @@ impl Manager {
             };
             // The only durable re-key that happens here, and until now it logged
             // nothing — which is why a 39.4% live account-switch rate went unnoticed.
+            // Reaching this line now means the pin failed a HARD gate, so the line
+            // doubles as the audit trail for the invariant.
             // The accounts lock is taken ONLY after the affinity lock has dropped
             // above; the two are never held simultaneously.
             if let Some(previous) = moved_off {
@@ -329,7 +351,7 @@ impl Manager {
                 let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
                 let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
                 tracing::info!(
-                    "affinity: re-pin session {} off {} -> {} (pin hard-gated or already tried)",
+                    "affinity: re-pin session {} off {} -> {} (pin failed a HARD gate)",
                     short_session_id(key),
                     old_name,
                     new_name
@@ -386,22 +408,7 @@ impl Manager {
         // HARD-gate predicate shared by both paths: the blocks that even a
         // revalidation serve must honor (soft utilization/pacing deliberately absent).
         let hard_ok = |account: &AccountRuntime| -> bool {
-            if account.disabled || account.status == AccountStatus::Error {
-                return false;
-            }
-            if let Some(until) = account.rate_limited_until_ms {
-                if now_ms < until {
-                    return false;
-                }
-            }
-            if account.quota.status.as_deref() == Some("rejected") {
-                return false;
-            }
-            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-            if is_fable && account.quota.model_weekly_exhausted(threshold, now) {
-                return false;
-            }
-            true
+            Self::hard_ok(account, self.global_threshold, now, now_ms, is_fable)
         };
 
         // (A) PIN-HONOR — read the pin under the affinity lock, DROP it, then check
@@ -494,6 +501,53 @@ impl Manager {
             pins.insert(key, (idx, now_ms));
         }
         Some(idx)
+    }
+
+    /// The HARD gates alone — the blocks that mean *this account cannot serve at
+    /// all*, with every SOFT gate deliberately absent:
+    ///   - `disabled` / [`AccountStatus::Error`] → hard fail;
+    ///   - a live rate-limit hold (`rate_limited_until_ms` still in the future);
+    ///   - `quota.status == Some("rejected")` — Anthropic's own verdict;
+    ///   - for a Fable request, an exhausted model-scoped weekly (`7d_oi`) bucket.
+    ///
+    /// Deliberately NOT here: the soft utilization threshold ([`crate::quota::Quota::is_near`])
+    /// and pacing. Both are rotation HINTS — reasons to prefer another account for
+    /// one request — never proof this one is gone. That distinction is the whole
+    /// ballgame for the per-account prompt cache: [`Self::select`] uses this
+    /// predicate as the SOLE authority on whether a session's pin may be re-keyed,
+    /// because a re-key re-creates the conversation prefix on a cold account.
+    ///
+    /// Known staleness caveat: `quota.status` is written ONLY from live response
+    /// headers ([`crate::quota`]), never by the background probe, so for a benched
+    /// account it is stale-or-`None` and `None` passes here. That is acceptable
+    /// precisely because a genuine rejection answers the next attempt with a 429,
+    /// which arms a real hold — upstream stays the oracle instead of our own
+    /// possibly-stale arithmetic.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hard_ok(
+        account: &AccountRuntime,
+        global_threshold: f64,
+        now: OffsetDateTime,
+        now_ms: i64,
+        is_fable: bool,
+    ) -> bool {
+        if account.disabled || account.status == AccountStatus::Error {
+            return false;
+        }
+        if let Some(until) = account.rate_limited_until_ms {
+            if now_ms < until {
+                return false;
+            }
+        }
+        if account.quota.status.as_deref() == Some("rejected") {
+            return false;
+        }
+        let threshold = account.switch_threshold.unwrap_or(global_threshold);
+        if is_fable && account.quota.model_weekly_exhausted(threshold, now) {
+            return false;
+        }
+        true
     }
 
     pub(super) fn eligible(
