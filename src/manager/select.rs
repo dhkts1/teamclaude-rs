@@ -42,6 +42,13 @@ impl Manager {
     /// Fable-weekly-exhausted re-key durably. This is self-healing: a durable
     /// failure arms a hold or sets `rejected` on the very next attempt, and those
     /// fail `hard_ok`.
+    ///
+    /// The one remaining voluntary mover — the load-balancing migration that
+    /// re-pins a stacked session onto a less-loaded account — is therefore
+    /// OPT-IN and ships OFF (top-level `loadBalanceMigration`, see
+    /// [`Self::load_balance_migration_enabled`]). Disabled, the scan is skipped
+    /// entirely and the pin is honoured; set to `true`, the balancing behaviour
+    /// below is unchanged.
     pub fn select(
         &self,
         tried: &HashSet<usize>,
@@ -102,10 +109,20 @@ impl Manager {
                     }
                 } else {
                     let count_x = counts.get(&idx).copied().unwrap_or(0);
+                    // Load-balancing migration ships OFF (see
+                    // [`Self::load_balance_migration_enabled`]): a session that HAS a
+                    // pin is by definition already warm, so moving it to even out
+                    // counts is a guaranteed prompt-cache loss. Read the flag HERE,
+                    // while NO other lock is held — the affinity lock dropped above
+                    // and the accounts lock is taken below, so the config lock is
+                    // never nested under either. Short-circuited on `count_x`, so the
+                    // common lone-session path does not touch the config lock at all.
+                    let migration_ok = count_x >= 2 && self.load_balance_migration_enabled();
                     // (2) UNDER THE ACCOUNTS LOCK ONLY: confirm the pin `X` is still
-                    // usable, then — and only when >=2 sessions stack on `X` — look
-                    // for the least-loaded ELIGIBLE account `Y` that strictly improves
-                    // balance (`count(Y)+1 < count(X)`). Stamp whichever we settle on.
+                    // usable, then — and only when migration is ENABLED and >=2
+                    // sessions stack on `X` — look for the least-loaded ELIGIBLE
+                    // account `Y` that strictly improves balance
+                    // (`count(Y)+1 < count(X)`). Stamp whichever we settle on.
                     // `None` means `X` is ineligible → fall through to the normal
                     // pick/re-pin path (which already handles a dead pin).
                     let decision: Option<(usize, Option<(String, String)>)> = {
@@ -150,13 +167,14 @@ impl Manager {
                             }
                             None
                         } else {
-                            // Default: honour the pin. When `count_x < 2` (a LONE
-                            // session) `target` stays `idx` and nothing below runs, so
-                            // this path is byte-identical to the pre-migration
-                            // behaviour — a lone session's warm cache is never moved.
+                            // Default: honour the pin. With migration disabled (the
+                            // default), or when `count_x < 2` (a LONE session),
+                            // `target` stays `idx` and nothing below runs, so this
+                            // path is byte-identical to the pre-migration behaviour —
+                            // a warm session's cache is never moved.
                             let mut target = idx;
                             let mut migrate_names: Option<(String, String)> = None;
-                            if count_x >= 2 {
+                            if migration_ok {
                                 // Least-loaded eligible target, ordered by
                                 // (pinned-session-count asc, in_flight asc,
                                 // last_selected_seq asc / LRU). A candidate qualifies
