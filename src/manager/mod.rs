@@ -203,8 +203,8 @@ struct SessionStat {
     requests: u64,
     last_seen_ms: i64,
     /// [`SessionKind::Stable`] when this session was keyed on a stable client identity
-    /// (x-api-key / `metadata.user_id`); [`SessionKind::Fallback`] when it fell back to
-    /// the per-connection key. DISPLAY provenance only — the routing pin is unaffected.
+    /// (x-api-key / `metadata.user_id`); [`SessionKind::Fallback`] when there was none
+    /// and the request served unpinned. DISPLAY provenance only — never routing.
     kind: SessionKind,
 }
 
@@ -2431,6 +2431,98 @@ mod tests {
                 "the re-pin must be durable"
             );
         }
+    }
+
+    /// SOFT gates DIVERT, they never RE-KEY: a pinned account that is merely paced
+    /// (at the in-flight cap, every hard gate clear) yields THIS request to another
+    /// account while the pin stays put, and the session returns to it the moment the
+    /// guards drop. Before the fix the fall-through re-pin at the bottom of `select`
+    /// rewrote the pin to the diverted account, permanently cold-starting that
+    /// session's per-account prompt cache.
+    #[test]
+    fn soft_paced_pin_diverts_without_repinning() {
+        let pacing = PacingConfig {
+            max_in_flight_per_account: Some(1),
+            min_spacing_ms: None,
+        };
+        let manager = build_manager(
+            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(77))
+            .expect("an account is eligible");
+        // Saturate ONLY the pinned account: at cap=1 it is soft-paced while every
+        // hard gate (disabled/error/hold/quota) stays clear.
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].in_flight = 1;
+        }
+        let diverted = manager
+            .select(&HashSet::new(), now, None, Some(77))
+            .expect("the un-paced account serves this request");
+        assert_ne!(
+            diverted, pinned,
+            "a soft-paced pin must yield THIS request to the cooler account"
+        );
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&77)
+                .map(|&(idx, _)| idx),
+            Some(pinned),
+            "a SOFT divert must not move the pin"
+        );
+        // The pacing guard clears → the session snaps back to its warm account.
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].in_flight = 0;
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(77)),
+                Some(pinned),
+                "once un-paced the session must return to its original account"
+            );
+        }
+    }
+
+    /// The last-touch stamp is still refreshed on a soft divert, so a heavily
+    /// diverted session can never become the `AFFINITY_CAP` eviction victim (the
+    /// eviction sorts on exactly this field).
+    #[test]
+    fn soft_paced_divert_refreshes_pin_last_touch() {
+        let pacing = PacingConfig {
+            max_in_flight_per_account: Some(1),
+            min_spacing_ms: None,
+        };
+        let manager = build_manager(
+            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(88))
+            .expect("an account is eligible");
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].in_flight = 1;
+        }
+        // A later `now` is what the divert must stamp onto the surviving pin.
+        let later = now + time::Duration::seconds(30);
+        let later_ms = odt_to_ms(later);
+        manager
+            .select(&HashSet::new(), later, None, Some(88))
+            .expect("the un-paced account serves this request");
+        let pins = manager.affinity.lock().expect("affinity lock poisoned");
+        assert_eq!(
+            pins.get(&88).copied(),
+            Some((pinned, later_ms)),
+            "the divert must re-insert the OLD index with a FRESH last-touch"
+        );
     }
 
     /// If the pinned account is in `tried` (this request already failed over it),

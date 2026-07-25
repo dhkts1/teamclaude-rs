@@ -29,8 +29,13 @@ impl Manager {
     /// returned — still stamped with a fresh select tick so *other* sessions' LRU
     /// steers away from a busy pinned account. Otherwise a normal LRU/priority
     /// pick runs and its winner is recorded as the session's pin (the initial pin
-    /// or a re-pin when the old pin became ineligible / was already tried).
+    /// or a re-pin when the old pin was HARD-ineligible / already tried).
     /// Affinity never overrides priority — the pin is always a normal pick.
+    ///
+    /// One exception, and it is the whole point of a pin: when the old pin failed
+    /// only the SOFT pacing gate it is still healthy, so the fall-through pick
+    /// serves this ONE request while the pin stays where it is (see `keep_pin`) —
+    /// a soft gate may divert a request, it may never re-key a session.
     pub fn select(
         &self,
         tried: &HashSet<usize>,
@@ -48,6 +53,13 @@ impl Manager {
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
+
+        // Set (to the OLD pin index) when the pin failed the SOFT pacing gate ONLY,
+        // i.e. it still clears every HARD gate. A soft gate may DIVERT a request; it
+        // may never RE-KEY a session — Anthropic's prompt cache is per-account, so a
+        // re-pin re-creates the whole conversation prefix on the next request. The
+        // fall-through re-pin at the bottom honours this and keeps the old index.
+        let mut keep_pin: Option<usize> = None;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
         // the pin under the affinity lock, then DROP that lock before taking the
@@ -82,6 +94,9 @@ impl Manager {
                         // temporarily YIELDS here and the LRU pick below (with its
                         // soft fallback) steers to a cooler account, so a session's
                         // concurrent burst spreads instead of all slamming one pin.
+                        // The yield is per-REQUEST only — `keep_pin` below holds the
+                        // session on this account so the burst spreads without ever
+                        // moving the pin.
                         let x_usable = accounts.get(idx).is_some_and(|a| {
                             Self::eligible(
                                 a,
@@ -94,6 +109,26 @@ impl Manager {
                             )
                         });
                         if !x_usable {
+                            // Re-test the SAME account with pacing OFF to separate a
+                            // SOFT yield from a HARD block. Passing here means the pin
+                            // cleared disabled/error/hold/quota/Fable-weekly and only
+                            // tripped the concurrency-cap / min-spacing gate: divert
+                            // THIS request to the fall-through pick but keep the pin.
+                            // Failing here is a genuine HARD block, which keeps today's
+                            // durable re-pin (the session's account really is gone).
+                            if accounts.get(idx).is_some_and(|a| {
+                                Self::eligible(
+                                    a,
+                                    self.global_threshold,
+                                    &self.pacing,
+                                    false,
+                                    now,
+                                    now_ms,
+                                    is_fable,
+                                )
+                            }) {
+                                keep_pin = Some(idx);
+                            }
                             None
                         } else {
                             // Default: honour the pin. When `count_x < 2` (a LONE
@@ -259,19 +294,46 @@ impl Manager {
         // migration). Skipped entirely when affinity is off, so the map stays
         // empty on the disabled path.
         if let (Some(key), Some(idx)) = (affinity, best) {
-            let mut pins = self.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (idx, now_ms));
-            // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
-            // the single oldest-last-touch entry (not the one we just inserted). Stable
-            // pins survive reconnects, so this size cap — not a disconnect hook — is
-            // what keeps a long-lived proxy from growing the map without limit.
-            const AFFINITY_CAP: usize = 1024;
-            if pins.len() > AFFINITY_CAP {
-                if let Some((&oldest, _)) = pins.iter().min_by_key(|(_, &(_, touch))| touch) {
-                    if oldest != key {
-                        pins.remove(&oldest);
+            // A SOFT-paced pin diverted THIS request only: re-insert the OLD index,
+            // not the account we are about to serve. The insert still has to happen —
+            // this `now_ms` is one of only two writers of the last-touch stamp that
+            // the AFFINITY_CAP eviction below sorts on, so skipping it would make a
+            // heavily-diverted session the eviction victim.
+            let pin_idx = keep_pin.unwrap_or(idx);
+            let moved_off = {
+                let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                let previous = pins.get(&key).map(|&(i, _)| i);
+                pins.insert(key, (pin_idx, now_ms));
+                // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
+                // the single oldest-last-touch entry (not the one we just inserted). Stable
+                // pins survive reconnects, so this size cap — not a disconnect hook — is
+                // what keeps a long-lived proxy from growing the map without limit.
+                const AFFINITY_CAP: usize = 1024;
+                if pins.len() > AFFINITY_CAP {
+                    if let Some((&oldest, _)) = pins.iter().min_by_key(|(_, &(_, touch))| touch) {
+                        if oldest != key {
+                            pins.remove(&oldest);
+                        }
                     }
                 }
+                // Only a real change is worth a line: `None` on an initial pin, and on
+                // a soft divert (where `pin_idx` is the unchanged old index).
+                previous.filter(|&p| p != pin_idx)
+            };
+            // The only durable re-key that happens here, and until now it logged
+            // nothing — which is why a 39.4% live account-switch rate went unnoticed.
+            // The accounts lock is taken ONLY after the affinity lock has dropped
+            // above; the two are never held simultaneously.
+            if let Some(previous) = moved_off {
+                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
+                let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
+                tracing::info!(
+                    "affinity: re-pin session {} off {} -> {} (pin hard-gated or already tried)",
+                    short_session_id(key),
+                    old_name,
+                    new_name
+                );
             }
         }
         best
