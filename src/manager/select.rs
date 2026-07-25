@@ -34,14 +34,29 @@ impl Manager {
     /// **The invariant, and the whole point of a pin: a session's pin is re-keyed
     /// ONLY when the pinned account fails a HARD gate** ([`Self::hard_ok`] is the
     /// sole authority). Anthropic's prompt cache is per-account, so a re-key
-    /// re-creates the entire conversation prefix on a cold account. Every SOFT
-    /// failure — the utilization threshold, pacing, or a transient upstream blip
-    /// that merely landed the pin in `tried` — DIVERTS this ONE request to the
-    /// fall-through pick while the pin stays where it is (see `keep_pin`). Only
-    /// disabled / [`AccountStatus::Error`] / a live hold / `rejected` /
-    /// Fable-weekly-exhausted re-key durably. This is self-healing: a durable
-    /// failure arms a hold or sets `rejected` on the very next attempt, and those
-    /// fail `hard_ok`.
+    /// re-creates the entire conversation prefix on a cold account. Only disabled /
+    /// [`AccountStatus::Error`] / a live hold / `rejected` / Fable-weekly-exhausted
+    /// re-key durably. This is self-healing: a durable failure arms a hold or sets
+    /// `rejected` on the very next attempt, and those fail `hard_ok`.
+    ///
+    /// A SOFT failure never re-keys, and — the second half of the same argument —
+    /// mostly does not even DIVERT, because a divert costs that request the same cold
+    /// prefix a re-key would. The three soft failures split by how much they actually
+    /// know:
+    ///  - **over the utilization threshold** → **SERVE the pin anyway.** That
+    ///    threshold is our own arithmetic over headers that go stale by minutes, and
+    ///    Anthropic keeps answering 200s for accounts it benches. Upstream is the
+    ///    oracle: serve, and let a real 429 arm a real (HARD) hold.
+    ///  - **paced out** (at the in-flight cap / inside min-spacing, see
+    ///    [`Self::paced_out`]) → divert this ONE request, keep the pin. Our own
+    ///    concurrency is measured exactly and never stale, and spreading a session's
+    ///    burst is precisely what the cap exists to do.
+    ///  - **already in `tried`** → divert this ONE request, keep the pin. It has
+    ///    failed THIS request upstream, so re-serving it would spin — but one blip is
+    ///    not proof the account is gone.
+    ///
+    /// Both diverts route to the fall-through pick while the pin stays put (see
+    /// `keep_pin`); the utilization case returns from the fast-path.
     ///
     /// The one remaining voluntary mover — the load-balancing migration that
     /// re-pins a stacked session onto a less-loaded account — is therefore
@@ -67,12 +82,14 @@ impl Manager {
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
 
-        // Set (to the OLD pin index) whenever the pin failed only SOFT gates, i.e. it
-        // still clears every HARD gate (`Self::hard_ok`). A soft gate may DIVERT a
-        // request; it may never RE-KEY a session — Anthropic's prompt cache is
-        // per-account, so a re-pin re-creates the whole conversation prefix on the
-        // next request. The fall-through re-pin at the bottom honours this and keeps
-        // the old index.
+        // Set (to the OLD pin index) for the two soft failures that DIVERT — the pin
+        // is paced out, or it is already in `tried` — while still clearing every HARD
+        // gate (`Self::hard_ok`). A soft gate may divert a request; it may never
+        // RE-KEY a session: Anthropic's prompt cache is per-account, so a re-pin
+        // re-creates the whole conversation prefix on the next request. The
+        // fall-through re-pin at the bottom honours this and keeps the old index.
+        // The third soft failure — over the utilization threshold — does not divert
+        // at all; the fast-path below serves the pin and returns.
         let mut keep_pin: Option<usize> = None;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
@@ -127,13 +144,9 @@ impl Manager {
                     // pick/re-pin path (which already handles a dead pin).
                     let decision: Option<(usize, Option<(String, String)>)> = {
                         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-                        // Respect pacing on the pin: a saturated pinned account
-                        // temporarily YIELDS here and the LRU pick below (with its
-                        // soft fallback) steers to a cooler account, so a session's
-                        // concurrent burst spreads instead of all slamming one pin.
-                        // The yield is per-REQUEST only — `keep_pin` below holds the
-                        // session on this account so the burst spreads without ever
-                        // moving the pin.
+                        // The full (soft-inclusive) gate. Failing it does NOT bench the
+                        // pin — it only means we drop into the hard-gate re-test below,
+                        // which decides serve-anyway vs durable re-key.
                         let x_usable = accounts.get(idx).is_some_and(|a| {
                             Self::eligible(
                                 a,
@@ -152,20 +165,63 @@ impl Manager {
                             // Fable-weekly and only tripped a soft gate — the
                             // utilization threshold (`quota.is_near`) or the
                             // concurrency-cap / min-spacing pacing gate. Both are
-                            // rotation hints: divert THIS request to the fall-through
-                            // pick but keep the pin. Failing here is a genuine HARD
-                            // block, which keeps today's durable re-pin (the session's
+                            // rotation hints, never proof this account cannot serve.
+                            // Failing here is a genuine HARD block → fall through to
+                            // the normal pick, which durably re-keys (the session's
                             // account really is gone).
                             //
-                            // The utilization case is the load-bearing one: an account
-                            // crossing the soft threshold used to dump EVERY session
-                            // pinned to it, simultaneously, cold-starting all of them.
-                            if accounts.get(idx).is_some_and(|a| {
+                            // The two soft gates then part ways, because they are not
+                            // the same kind of claim (see `Self::paced_out`):
+                            //
+                            //  - PACED OUT → yield THIS request and keep the pin, as
+                            //    before. Our own concurrency is a fact we measure
+                            //    exactly, and spreading a burst is what the cap is for.
+                            //
+                            //  - OVER THE UTILIZATION THRESHOLD → SERVE THE PIN. That
+                            //    threshold is our own arithmetic over headers stale by
+                            //    minutes, and Anthropic keeps answering 200s for
+                            //    accounts it benches. Keeping the pin while still
+                            //    diverting the request — the earlier half-fix — bought
+                            //    nothing: the pin survived and the request paid the
+                            //    cold prefix anyway (measured live: a 44.4%
+                            //    account-switch rate on SUCCESSFUL serves, with zero
+                            //    pacing events and zero hard failures). This is the
+                            //    behaviour `select_revalidation`'s PIN-HONOR path
+                            //    already had, hoisted to where it is reachable; both
+                            //    log the identical line so they grep together.
+                            let hard_ok = accounts.get(idx).is_some_and(|a| {
                                 Self::hard_ok(a, self.global_threshold, now, now_ms, is_fable)
-                            }) {
+                            });
+                            let paced_out = accounts
+                                .get(idx)
+                                .is_some_and(|a| Self::paced_out(a, &self.pacing, now_ms));
+                            if !hard_ok {
+                                // Genuinely gone: fall through and durably re-key.
+                                None
+                            } else if paced_out {
+                                // Yield this ONE request to the fall-through pick; the
+                                // re-pin at the bottom re-inserts the OLD index.
                                 keep_pin = Some(idx);
+                                None
+                            } else {
+                                let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                                let util = accounts
+                                    .get(idx)
+                                    .map(|a| a.quota.max_utilization(now, is_fable))
+                                    .unwrap_or_default();
+                                if let Some(account) = accounts.get_mut(idx) {
+                                    account.last_selected_seq = tick;
+                                    tracing::info!(
+                                        account = %account.name,
+                                        utilization = util,
+                                        is_fable,
+                                        "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                                    );
+                                }
+                                // `target == idx`, so the commit section below is a
+                                // plain pin refresh: OLD index, fresh `now_ms`.
+                                Some((idx, None))
                             }
-                            None
                         } else {
                             // Default: honour the pin. With migration disabled (the
                             // default), or when `count_x < 2` (a LONE session),
@@ -391,11 +447,14 @@ impl Manager {
     ///
     /// TWO paths, mirroring [`Self::select`]'s never-nested lock discipline (read the
     /// pin under the affinity lock, DROP it before taking the accounts lock):
-    ///  - **(A) PIN-HONOR** (cache-warm, the common case): when `affinity` is
-    ///    `Some(key)` and the session's pinned account is not in `tried` and passes
-    ///    the HARD gates, serve THAT pin — even over the soft threshold — to keep the
-    ///    operator's prompt cache warm. NO revalidation throttle here (the global
-    ///    egress throttle already paces); the pin is left as-is.
+    ///  - **(A) PIN-HONOR** (cache-warm): when `affinity` is `Some(key)` and the
+    ///    session's pinned account is not in `tried` and passes the HARD gates, serve
+    ///    THAT pin — even over the soft threshold — to keep the operator's prompt
+    ///    cache warm. NO revalidation throttle here (the global egress throttle
+    ///    already paces); the pin is left as-is. [`Self::select`] now runs this same
+    ///    serve-the-pin rule in its own affinity fast-path (identical log line), so a
+    ///    servable pin is honoured there and this path is the belt-and-braces copy for
+    ///    any caller that reaches revalidation directly.
     ///  - **(B) FALLBACK** (no pin, or the pin is rejected/held/tried): the
     ///    least-utilized surviving account wins (lowest
     ///    [`crate::quota::Quota::max_utilization`]; ties: LRU `last_selected_seq`).
@@ -600,19 +659,40 @@ impl Manager {
         // account. When `respect_pacing` is false (the fallback pass) or pacing is
         // unconfigured, this is inert — so a default-OFF build is byte-identical here
         // and the fallback pass can always still find a servable account.
-        if respect_pacing && pacing.is_active() {
-            if let Some(cap) = pacing.effective_max_in_flight() {
-                if account.in_flight >= cap {
-                    return false;
-                }
-            }
-            if let Some(gap) = pacing.min_spacing_ms {
-                if now_ms.saturating_sub(account.last_served_ms) < gap as i64 {
-                    return false;
-                }
-            }
+        if respect_pacing && Self::paced_out(account, pacing, now_ms) {
+            return false;
         }
         true
+    }
+
+    /// Whether the SOFT pacing gate ALONE holds this account out: it is at the
+    /// per-account in-flight cap, or inside the min-spacing window since its last
+    /// serve. Inert (always `false`) when pacing is unconfigured, which is how it
+    /// ships.
+    ///
+    /// Split out of [`Self::eligible`] because [`Self::select`] needs to tell the two
+    /// soft gates apart. They are not the same kind of signal:
+    ///   - the **utilization threshold** is OUR arithmetic over headers that go stale
+    ///     by minutes, and it routinely benches an account Anthropic is still
+    ///     answering 200s for — so it may not bench a warm pin;
+    ///   - **pacing** is a fact we measure exactly and continuously about our OWN
+    ///     concurrency, and spreading a session's burst is the entire reason the cap
+    ///     exists. It stays a per-REQUEST yield: divert this one, keep the pin.
+    pub(super) fn paced_out(account: &AccountRuntime, pacing: &PacingConfig, now_ms: i64) -> bool {
+        if !pacing.is_active() {
+            return false;
+        }
+        if let Some(cap) = pacing.effective_max_in_flight() {
+            if account.in_flight >= cap {
+                return true;
+            }
+        }
+        if let Some(gap) = pacing.min_spacing_ms {
+            if now_ms.saturating_sub(account.last_served_ms) < gap as i64 {
+                return true;
+            }
+        }
+        false
     }
 
     /// Why this account is out of rotation and when it clears — the display and
