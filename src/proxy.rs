@@ -141,10 +141,12 @@ pub struct ClientAddr(pub SocketAddr);
 
 /// The per-connection session key, injected into request extensions by the hybrid
 /// server ([`crate::mitm::serve_http`]) **only when session affinity is enabled**.
-/// Its presence pins every request on this connection to one account via
-/// [`Manager::select`]'s `affinity` arg; its absence (the default) leaves
-/// selection at the per-request LRU rotation. One connection = one `claude`
-/// session, so a connection-scoped key is a session-scoped key.
+/// Its PRESENCE is the feature flag: it lets a request derive a pin via
+/// [`stable_session_key`] and pass it as [`Manager::select`]'s `affinity` arg; its
+/// absence (the default) leaves selection at the per-request LRU rotation. The
+/// wrapped value is deliberately NOT used as a routing key — one connection is one
+/// `claude` process, but a pin keyed on it dies with the connection and leaves a
+/// ghost entry behind, so a request with no stable identity routes unpinned.
 #[derive(Clone, Copy)]
 pub struct SessionKey(pub u64);
 
@@ -188,9 +190,11 @@ struct UserIdMeta {
 ///      subagents to one account (warm prompt cache). Do NOT key on the
 ///      `x-claude-code-session-id` HEADER instead: it forks on resume and varies
 ///      across sidechain requests, which would cold-start the cache. Else
-///   3. `None` — the caller falls back to the per-connection `SessionKey`.
+///   3. `None` — the request has no stable identity and routes UNPINNED (plain
+///      LRU). It deliberately does NOT fall back to the per-connection
+///      [`SessionKey`]: that mints a pin no reconnect can ever reuse or reclaim.
 ///
-/// Returns `None` on absence/parse failure so the caller keeps current behaviour.
+/// Returns `None` on absence/parse failure, which routes the request unpinned.
 fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>) -> Option<u64> {
     if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         // The shared proxy secret is not a client identity — skip it so remote
@@ -321,18 +325,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // rotation) by default. When on, key on the most STABLE client identity —
     // x-api-key, then body `metadata.user_id` — so a client that drops and
     // reconnects (new connection key) still maps to the SAME account and keeps
-    // its per-account prompt cache warm; fall back to the per-connection key only
-    // when no stable identity is available. `session_kind` records WHICH branch
-    // produced the key (stable identity vs per-connection fallback) — DISPLAY
-    // provenance only, threaded into `record_served`; routing keys on
-    // `session_key` byte-for-byte as before.
+    // its per-account prompt cache warm. With NO stable identity the request routes
+    // UNPINNED (plain LRU): a per-connection key is not a session key — it mints a
+    // fresh pin per connection that nothing ever removes, and those ghosts (93% of
+    // the live pin map) both bloat it and inflate the pinned-session counts that
+    // drive the migration decision in `select`. `session_kind` records WHICH branch
+    // produced the key (stable identity vs unpinned fallback) — DISPLAY provenance
+    // only, threaded into `record_served`.
     let (session_key, session_kind) = match parts.extensions.get::<SessionKey>() {
-        Some(conn) => {
-            match stable_session_key(&req_headers, &body_bytes, manager.proxy_api_key()) {
-                Some(key) => (Some(key), SessionKind::Stable),
-                None => (Some(conn.0), SessionKind::Fallback),
-            }
-        }
+        Some(_) => match stable_session_key(&req_headers, &body_bytes, manager.proxy_api_key()) {
+            Some(key) => (Some(key), SessionKind::Stable),
+            None => (None, SessionKind::Fallback),
+        },
         None => (None, SessionKind::Fallback),
     };
 

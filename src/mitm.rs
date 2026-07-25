@@ -465,12 +465,13 @@ where
 {
     // Session affinity (opt-in): when enabled, mint ONE session key for this whole
     // connection (= one `claude` session, since the server is HTTP/1.1: one CONNECT
-    // tunnel is one process). This per-connection key is the fallback the proxy uses
-    // when no stable identity (device_id + account_uuid) is present. The affinity map
-    // itself is bounded by a size cap + LRU eviction in `Manager::select` — stable
-    // pins intentionally survive reconnects — so there is no disconnect-release. When
-    // disabled, no key is minted and nothing is injected, so `select` receives
-    // `affinity = None` and the disabled path stays inert.
+    // tunnel is one process). The key's PRESENCE is what switches affinity on for
+    // this connection's requests; the routing key itself is always derived from a
+    // stable client identity in `proxy::stable_session_key` (no stable identity →
+    // the request routes unpinned). The affinity map is bounded by a size cap + LRU
+    // eviction in `Manager::select` — stable pins intentionally survive reconnects —
+    // so there is no disconnect-release. When disabled, no key is minted and nothing
+    // is injected, so `select` receives `affinity = None` and the path stays inert.
     let session_key = manager
         .session_affinity_enabled()
         .then(|| manager.next_session_key());

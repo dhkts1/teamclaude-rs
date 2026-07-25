@@ -115,8 +115,8 @@ pub struct AccountSnapshot {
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /
-/// metadata.user_id) or fell back to a per-connection key. DISPLAY-only —
-/// never a routing input.
+/// metadata.user_id) or had none and served unpinned. DISPLAY-only — never a
+/// routing input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionKind {
     Stable,
@@ -132,9 +132,9 @@ pub struct SessionSnapshot {
     pub requests: u64,
     pub last_seen: Option<OffsetDateTime>,
     /// [`SessionKind::Stable`] when keyed on a stable client identity (x-api-key /
-    /// `metadata.user_id`); [`SessionKind::Fallback`] for a per-connection key.
-    /// Display provenance only — the TUI folds all fallback sessions into one dim
-    /// aggregate row; routing is unchanged.
+    /// `metadata.user_id`); [`SessionKind::Fallback`] when there was none and the
+    /// request served unpinned. Display provenance only — the TUI folds all
+    /// fallback serves into one dim aggregate row; routing is unchanged.
     pub kind: SessionKind,
 }
 

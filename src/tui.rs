@@ -540,10 +540,10 @@ enum TreeRow {
         requests: u64,
         last_seen: Option<OffsetDateTime>,
     },
-    /// The single collapsed aggregate for ALL per-connection (fallback) sessions —
-    /// those with no stable client identity. Rendered LAST, dim, with no children,
-    /// so unpinned traffic stays visible as one honest row instead of flooding the
-    /// pane. Absent entirely when there are no fallback sessions.
+    /// The single collapsed aggregate for ALL fallback sessions — those with no
+    /// stable client identity. Rendered LAST, dim, with no children, so unpinned
+    /// traffic stays visible as one honest row instead of flooding the pane.
+    /// Absent entirely when there are no fallback sessions.
     Unpinned {
         count: usize,
         requests: u64,
@@ -557,7 +557,7 @@ enum TreeRow {
 /// the group's session count, its summed requests, and the group's YOUNGEST
 /// `last_seen`, followed by that account's sessions in input order. ALL fallback
 /// (non-`stable`) sessions instead fold into one trailing [`TreeRow::Unpinned`]
-/// aggregate, rendered LAST and only when non-empty — so per-connection telemetry
+/// aggregate, rendered LAST and only when non-empty — so identity-less telemetry
 /// traffic collapses to one dim row rather than flooding the pane. Pure and
 /// terminal-free so it can be unit-tested directly.
 fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
