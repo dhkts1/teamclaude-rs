@@ -2525,10 +2525,13 @@ mod tests {
         );
     }
 
-    /// If the pinned account is in `tried` (this request already failed over it),
-    /// affinity falls through to a normal pick and re-pins to the new account.
+    /// If the pinned account is in `tried` AND fails a HARD gate, affinity falls
+    /// through to a normal pick and re-pins to the new account. Being in `tried`
+    /// is on its own only a SOFT signal (see
+    /// `transient_tried_failure_keeps_the_pin`) — it takes a hard gate, here a live
+    /// rate-limit hold, to make the fall-through durable.
     #[test]
-    fn affinity_falls_through_when_pinned_in_tried() {
+    fn affinity_falls_through_when_pinned_in_tried_and_hard_gated() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -2540,6 +2543,8 @@ mod tests {
         let a = manager
             .select(&HashSet::new(), now, None, Some(9))
             .expect("an account is eligible");
+        // The failover that put A in `tried` was durable: it armed a hold.
+        manager.mark_rate_limited(a, 60);
         let tried: HashSet<usize> = [a].into_iter().collect();
         let b = manager
             .select(&tried, now, None, Some(9))
@@ -2550,6 +2555,178 @@ mod tests {
             manager.select(&HashSet::new(), now, None, Some(9)),
             Some(b),
             "the pin must have migrated to the fallen-through account"
+        );
+    }
+
+    // ---- only a HARD gate may re-key a session ---------------------------------
+
+    /// THE cache-loss fix: an account crossing the SOFT utilization threshold used
+    /// to dump every session pinned to it at once, because `eligible()` folds
+    /// `quota.is_near` into the same bool as the hard gates. The threshold is a
+    /// rotation HINT — this request diverts to a cooler account, but the pin must
+    /// not move, and the session must snap back the moment the quota window
+    /// refreshes. With eleven of thirteen live accounts sitting at 98-100%, this
+    /// was the single largest remaining cause of per-account prompt-cache loss.
+    #[test]
+    fn pin_over_soft_threshold_is_honoured_not_evicted() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(1234))
+            .expect("an account is eligible");
+        // Over the soft threshold, but Anthropic still says `allowed_warning`:
+        // every HARD gate is clear.
+        set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
+
+        let diverted = manager
+            .select(&HashSet::new(), now, None, Some(1234))
+            .expect("the under-threshold account serves this request");
+        assert_ne!(
+            diverted, pinned,
+            "an over-threshold pin yields THIS request to the cooler account"
+        );
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&1234)
+                .map(|&(idx, _)| idx),
+            Some(pinned),
+            "crossing the SOFT utilization threshold must not re-key the session"
+        );
+
+        // The weekly window refreshes → the session returns to its warm account.
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].quota.seven_day = None;
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(1234)),
+                Some(pinned),
+                "once back under threshold the session must return to its original account"
+            );
+        }
+    }
+
+    /// The guard against over-correcting: a HARD gate still re-keys durably. A live
+    /// rate-limit hold means the account genuinely cannot serve, so the session
+    /// moves and STAYS moved.
+    #[test]
+    fn pin_with_live_hold_is_rekeyed() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(2345))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(pinned, 60);
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(2345))
+            .expect("the un-held account serves this request");
+        assert_ne!(served, pinned, "a held pin cannot serve");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&2345)
+                .map(|&(idx, _)| idx),
+            Some(served),
+            "a live rate-limit hold is a HARD gate — it must re-key the session"
+        );
+    }
+
+    /// `quota.status == "rejected"` is Anthropic's own verdict, so it is HARD even
+    /// though the account looks identical to the `allowed_warning` case above in
+    /// every other field. This pair is the whole soft/hard distinction in two tests.
+    #[test]
+    fn pin_rejected_by_upstream_is_rekeyed() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(3456))
+            .expect("an account is eligible");
+        set_over_threshold(&manager, pinned, 0.995, "rejected");
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(3456))
+            .expect("the allowed account serves this request");
+        assert_ne!(served, pinned, "a rejected pin cannot serve");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&3456)
+                .map(|&(idx, _)| idx),
+            Some(served),
+            "an upstream `rejected` is a HARD gate — it must re-key the session"
+        );
+    }
+
+    /// A pin landing in `tried` means this ONE request failed over it — a dropped
+    /// connection or a 5xx, not proof the account is gone. Divert, keep the pin.
+    /// Self-healing: when the failure is durable it arms a hold, and the very next
+    /// select re-keys on that evidence instead of on a single blip.
+    #[test]
+    fn transient_tried_failure_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(4567))
+            .expect("an account is eligible");
+        let tried: HashSet<usize> = [pinned].into_iter().collect();
+
+        let served = manager
+            .select(&tried, now, None, Some(4567))
+            .expect("the untried account serves this request");
+        assert_ne!(served, pinned, "the tried pin cannot serve THIS request");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&4567)
+                .map(|&(idx, _)| idx),
+            Some(pinned),
+            "a transient failover must not re-key the session"
+        );
+        // Nothing tried → straight back to the warm pin.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(4567)),
+            Some(pinned),
+            "the session must return to its original account"
+        );
+
+        // Now the failure proves durable (a 429 armed a hold) — that IS hard, so the
+        // same tried-pin select re-keys.
+        manager.mark_rate_limited(pinned, 60);
+        let moved = manager
+            .select(&tried, now, None, Some(4567))
+            .expect("the un-held account serves this request");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&4567)
+                .map(|&(idx, _)| idx),
+            Some(moved),
+            "a durable failure still re-keys — the divert-and-keep is self-healing"
         );
     }
 
