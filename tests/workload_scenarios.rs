@@ -38,11 +38,18 @@
 //! ## Determinism
 //!
 //! Every scenario passes an explicit `now` built from a fixed epoch and advances
-//! it by hand. No sleeps, no randomness, no wall-clock reads on any asserted
-//! path. `PacingConfig::min_spacing_ms` is deliberately left unset everywhere
-//! because it is evaluated against `last_served_ms`, which `enter_in_flight`
-//! stamps from the real clock — the one place simulated time and wall time would
-//! meet.
+//! it by hand. No sleeps, no randomness. `PacingConfig::min_spacing_ms` is
+//! deliberately left unset everywhere because it is evaluated against
+//! `last_served_ms`, which `enter_in_flight` stamps from the real clock — the one
+//! place simulated time and wall time would meet.
+//!
+//! One scenario is a stated exception: `transient_hold_returns_the_session_home`
+//! reads the wall clock ONCE, for its epoch. Its subject is a rate-limit hold, and
+//! the only public way to arm one (`Manager::mark_rate_limited`) anchors the
+//! deadline to the process clock, so the harness clock has to start from the same
+//! source for "15 seconds of hold remaining" to mean anything. Every offset from
+//! that epoch is still written out explicitly, so its routing decisions are as
+//! reproducible as every other scenario's.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1115,6 +1122,98 @@ fn mixed_model_session_keeps_one_home() {
         fable_path.iter().all(|&idx| idx != home),
         "a Fable call must be routed off the Fable-exhausted account — serving it \
          there only buys a 429\n{}",
+        fleet.report()
+    );
+}
+
+/// **11. A short hold is a DETOUR, not a move.** A 429 park is a TIMER on an
+/// account, and the timers this proxy arms are mostly short: a transient 429 with
+/// no `retry-after` parks 15s + jitter, and one with a hint is clamped to 300s
+/// (`src/proxy.rs`). Anthropic's default ephemeral prompt cache lives 5 minutes.
+///
+/// Counting any live hold as account death therefore threw away a prefix that
+/// would still have been warm 15 seconds later — and permanently, because a re-key
+/// is durable, so the session never went back. Nothing about the account had
+/// changed by the time it un-parked; the conversation simply never returned to it.
+///
+/// The shape here is the live one: a conversation runs warm, its account trips a
+/// burst 429 mid-run, the parked turns go elsewhere because the account genuinely
+/// cannot answer them, and the moment the timer expires the conversation comes
+/// home to its warm prefix. Two switches over the whole run — out and back — and
+/// nothing that survives the detour.
+#[test]
+fn transient_hold_returns_the_session_home() {
+    /// The hold the fleet arms most: `proxy::NO_GUIDANCE_HOLD_SECS`, the park a
+    /// transient 429 with no `retry-after` gets. Well under the 5-minute cache TTL.
+    const HOLD_SECS: i64 = 15;
+    /// Turns before the 429 and after the hold clears. Sized so the two-switch
+    /// detour cannot by itself drag continuity under the 0.9 floor.
+    const WARM_TURNS: i64 = 12;
+    /// Turns issued while the account is parked. Each is spaced 2s apart and the
+    /// first is at +1s, so all of them land inside the hold.
+    const HELD_TURNS: i64 = 5;
+
+    // See the module header: this is the one scenario whose epoch is the wall
+    // clock, because `mark_rate_limited` anchors its deadline there. Every offset
+    // below is explicit, so the decisions stay reproducible.
+    let start = OffsetDateTime::now_utc();
+
+    let mut fleet = Fleet::new(&[("alpha", 0), ("bravo", 0)], pacing(CAP));
+    let session = fleet.lineage("held-mid-run");
+
+    // Phase 1 — a healthy conversation. Kept inside the first second so the hold
+    // armed just below still has its full duration ahead of the simulated clock.
+    let home = fleet.serve_model(session, OPUS, start);
+    for turn in 1..WARM_TURNS {
+        fleet.serve_model(session, OPUS, start + Duration::milliseconds(turn * 50));
+    }
+    assert_eq!(
+        fleet.switches(session.key),
+        0,
+        "the warm phase must not move the session\n{}",
+        fleet.report()
+    );
+
+    // Phase 2 — a burst 429 with no guidance parks the home account for 15s.
+    fleet.manager.mark_rate_limited(home, HOLD_SECS);
+
+    for turn in 0..HELD_TURNS {
+        let at = start + Duration::seconds(1 + turn * 2);
+        assert_ne!(
+            fleet.serve_model(session, OPUS, at),
+            home,
+            "a parked account cannot answer this turn — serving it buys another \
+             429\n{}",
+            fleet.report()
+        );
+    }
+
+    // Phase 3 — the timer runs out. The prefix on `home` was never 5 minutes old,
+    // so the conversation must come back to it and stay.
+    for turn in 0..WARM_TURNS {
+        let at = start + Duration::seconds(HOLD_SECS + 5 + turn);
+        assert_eq!(
+            fleet.serve_model(session, OPUS, at),
+            home,
+            "once the hold cleared the session must come home to its warm \
+             prefix — the hold was a timer, not a death\n{}",
+            fleet.report()
+        );
+    }
+
+    assert_eq!(
+        fleet.switches(session.key),
+        2,
+        "a detour is exactly two switches: off the parked account and back \
+         again\n{}",
+        fleet.report()
+    );
+    let conversation = fleet.serves_of_class(session.key, false);
+    let continuity = Fleet::continuity_of(&conversation);
+    assert!(
+        continuity >= 0.9,
+        "continuity over the conversation turns must survive a short park, got \
+         {continuity:.3}\n{}",
         fleet.report()
     );
 }

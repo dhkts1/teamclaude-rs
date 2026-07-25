@@ -35,14 +35,15 @@ impl Manager {
     /// ONLY when the pinned ACCOUNT fails a HARD gate** ([`Self::account_hard_ok`] is
     /// the sole authority). Anthropic's prompt cache is per-account, so a re-key
     /// re-creates the entire conversation prefix on a cold account. Only disabled /
-    /// [`AccountStatus::Error`] / a live hold / `rejected` re-key durably. This is
-    /// self-healing: a durable failure arms a hold or sets `rejected` on the very
-    /// next attempt, and those fail `account_hard_ok`.
+    /// [`AccountStatus::Error`] / `rejected` / a hold that OUTLIVES the prompt cache
+    /// ([`CACHE_WARM_HOLD_SECS`]) re-key durably. This is self-healing: a durable
+    /// failure arms a long hold or sets `rejected` on the very next attempt, and
+    /// those fail `account_hard_ok`.
     ///
     /// Everything else is a fact about ONE REQUEST, not about the account. Such a
     /// fact never re-keys, and — the second half of the same argument — mostly does
     /// not even DIVERT, because a divert costs that request the same cold prefix a
-    /// re-key would. The four split by how much they actually know:
+    /// re-key would. The five split by how much they actually know:
     ///  - **over the utilization threshold** → **SERVE the pin anyway.** That
     ///    threshold is our own arithmetic over headers that go stale by minutes, and
     ///    Anthropic keeps answering 200s for accounts it benches. Upstream is the
@@ -59,6 +60,13 @@ impl Manager {
     ///  - **already in `tried`** → divert this ONE request, keep the pin. It has
     ///    failed THIS request upstream, so re-serving it would spin — but one blip is
     ///    not proof the account is gone.
+    ///  - **held by a rate-limit timer that clears while the cache is still warm**
+    ///    (see [`Self::hold_clears_while_warm`]) → divert this ONE request, keep the
+    ///    pin. A hold is a timer, not a death, and the ones we arm are mostly short:
+    ///    a no-guidance park is 15s + jitter, and a `retry-after` park is clamped to
+    ///    300s. Re-keying on one would discard a prefix that is still warm when the
+    ///    account frees. Past [`CACHE_WARM_HOLD_SECS`] the trade inverts and the hold
+    ///    goes back to being an ACCOUNT-level hard gate.
     ///
     /// Every divert routes to the fall-through pick while the pin stays put (see
     /// `keep_pin`); the utilization case returns from the fast-path.
@@ -87,9 +95,10 @@ impl Manager {
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
 
-        // Set (to the OLD pin index) for the three per-REQUEST failures that DIVERT —
-        // the pin is paced out, it cannot serve this request's model class, or it is
-        // already in `tried` — while still clearing every ACCOUNT-level HARD gate
+        // Set (to the OLD pin index) for the four per-REQUEST failures that DIVERT —
+        // the pin is paced out, it cannot serve this request's model class, it is
+        // already in `tried`, or it is parked on a hold that clears while its prompt
+        // cache is still warm — while still clearing every ACCOUNT-level HARD gate
         // (`Self::account_hard_ok`). A per-request fact may divert a request; it may
         // never RE-KEY a session: Anthropic's prompt cache is per-account, so a re-pin
         // re-creates the whole conversation prefix on the next request. The
@@ -181,12 +190,23 @@ impl Manager {
                             // block → fall through to the normal pick, which durably
                             // re-keys (the session's account really is gone).
                             //
-                            // The three then part ways, because they are not the same
-                            // kind of claim (see `Self::paced_out`, `Self::model_blocked`):
+                            // The four then part ways, because they are not the same
+                            // kind of claim (see `Self::paced_out`, `Self::model_blocked`,
+                            // `Self::hold_clears_while_warm`):
                             //
                             //  - PACED OUT → yield THIS request and keep the pin, as
                             //    before. Our own concurrency is a fact we measure
                             //    exactly, and spreading a burst is what the cap is for.
+                            //
+                            //  - HELD, BUT THE HOLD CLEARS WHILE THE CACHE IS WARM →
+                            //    same shape. A hold is a TIMER, not a death, and the
+                            //    timers we arm are mostly short (a no-guidance park is
+                            //    15s + jitter). Diverting the one request costs one cold
+                            //    prefix; re-keying throws away a cache that would still
+                            //    have been warm when the account came back, and the
+                            //    session never returns to it. A hold that OUTLIVES the
+                            //    cache is a different claim and fails `account_alive`
+                            //    above — see `CACHE_WARM_HOLD_SECS`.
                             //
                             //  - MODEL-CLASS BLOCKED (a Fable request, Fable weekly
                             //    exhausted) → same shape: this account cannot answer
@@ -216,10 +236,16 @@ impl Manager {
                             let paced_out = accounts
                                 .get(idx)
                                 .is_some_and(|a| Self::paced_out(a, &self.pacing, now_ms));
+                            // Reached only when `account_alive` holds, so any live hold
+                            // left here is by construction a short one — named anyway so
+                            // the branch does not depend on the ordering above.
+                            let held_briefly = accounts
+                                .get(idx)
+                                .is_some_and(|a| Self::hold_clears_while_warm(a, now_ms));
                             if !account_alive {
                                 // Genuinely gone: fall through and durably re-key.
                                 None
-                            } else if model_blocked || paced_out {
+                            } else if held_briefly || model_blocked || paced_out {
                                 // Yield this ONE request to the fall-through pick; the
                                 // re-pin at the bottom re-inserts the OLD index.
                                 keep_pin = Some(idx);
@@ -461,7 +487,9 @@ impl Manager {
     /// still allows, ignoring the soft utilization/pacing gates but honoring the
     /// HARD blocks:
     ///   - `disabled` / [`AccountStatus::Error`] → skip;
-    ///   - a live rate-limit hold (`rate_limited_until_ms` in the future) → skip;
+    ///   - ANY live rate-limit hold (`rate_limited_until_ms` in the future) → skip.
+    ///     A SERVE decision honours the whole hold; only the PIN decision softens the
+    ///     short ones (see [`Self::hard_ok`] and [`CACHE_WARM_HOLD_SECS`]);
     ///   - `quota.status == Some("rejected")` → skip (genuinely blocked; would 429);
     ///   - a Fable request whose model-scoped weekly (`7d_oi`) is a hard reject → skip
     ///     (that same account still serves every non-Fable model).
@@ -484,9 +512,11 @@ impl Manager {
     ///    `None` (the caller emits the honest 429). The window is spent only once a
     ///    servable candidate exists. On success the session is RE-PINNED to the
     ///    chosen account, mirroring `select()`'s re-pin — EXCEPT when the pin was
-    ///    passed over merely because it cannot serve this request's MODEL CLASS
-    ///    ([`Self::model_blocked`]), which is a per-request fact and so re-writes the
-    ///    OLD index instead (`keep_pin`, exactly as `select()` does).
+    ///    passed over merely because it cannot serve THIS request: its MODEL CLASS
+    ///    ([`Self::model_blocked`]) or a hold that clears while its cache is still
+    ///    warm ([`Self::hold_clears_while_warm`]). Both are per-request facts, so
+    ///    they re-write the OLD index instead (`keep_pin`, exactly as `select()`
+    ///    does).
     ///
     /// The winner's `last_selected_seq` is stamped and ONE `tracing::info!` names the
     /// path (pin-honor vs fallback), the account, and its utilization.
@@ -550,8 +580,9 @@ impl Manager {
                     // path (lock drops at the end of this scope, before the affinity
                     // lock below). Whether that fall-through also MOVES the pin depends
                     // on WHY: a model-class block leaves the account alive for every
-                    // other class, so the pin stays; only an ACCOUNT-level block is a
-                    // durable re-key.
+                    // other class, and a short hold leaves it alive for every LATER
+                    // request, so in both cases the pin stays; only an ACCOUNT-level
+                    // block is a durable re-key.
                     if accounts
                         .get(idx)
                         .is_some_and(|a| Self::account_hard_ok(a, now_ms))
@@ -623,10 +654,52 @@ impl Manager {
         Some(idx)
     }
 
+    /// Milliseconds still to run on a LIVE rate-limit hold, or `None` when the
+    /// account is not held right now — either no hold is armed, or its deadline has
+    /// already passed (a past hold reads as expired live, no mutation needed).
+    ///
+    /// The single place `rate_limited_until_ms` is turned into a duration, so the
+    /// three hold questions — held at all? clears warm? outlives the cache? — can
+    /// never drift apart. Pure and lock-free.
+    pub(super) fn hold_remaining_ms(account: &AccountRuntime, now_ms: i64) -> Option<i64> {
+        account
+            .rate_limited_until_ms
+            .map(|until| until - now_ms)
+            .filter(|&remaining_ms| remaining_ms > 0)
+    }
+
+    /// Whether a live hold is still running when this account's prompt cache dies
+    /// ([`CACHE_WARM_HOLD_SECS`] or more remaining) — the only hold long enough to
+    /// be worth re-keying a session for, and so the only one
+    /// [`Self::account_hard_ok`] counts as account death.
+    ///
+    /// The boundary is `>=`: a hold that clears at exactly the cache TTL is treated
+    /// as LONG, because the prefix is gone at the same instant the account frees.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hold_outlives_cache(account: &AccountRuntime, now_ms: i64) -> bool {
+        Self::hold_remaining_ms(account, now_ms)
+            .is_some_and(|remaining_ms| remaining_ms >= CACHE_WARM_HOLD_SECS * 1000)
+    }
+
+    /// Whether a live hold clears while this account's prompt cache is still warm
+    /// (under [`CACHE_WARM_HOLD_SECS`] remaining). The exact complement of
+    /// [`Self::hold_outlives_cache`] over live holds, and the SOFT case: this
+    /// account cannot answer THIS request, but it is a timer and not a death, so
+    /// divert the one request and leave the pin where it is.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hold_clears_while_warm(account: &AccountRuntime, now_ms: i64) -> bool {
+        Self::hold_remaining_ms(account, now_ms)
+            .is_some_and(|remaining_ms| remaining_ms < CACHE_WARM_HOLD_SECS * 1000)
+    }
+
     /// The ACCOUNT-level HARD gates alone — the blocks that mean *this account is
     /// gone for every model class*, with every SOFT gate deliberately absent:
     ///   - `disabled` / [`AccountStatus::Error`] → hard fail;
-    ///   - a live rate-limit hold (`rate_limited_until_ms` still in the future);
+    ///   - a rate-limit hold that OUTLIVES the prompt cache
+    ///     ([`Self::hold_outlives_cache`]) — a SHORTER hold is a timer, not a death,
+    ///     and deliberately passes here;
     ///   - `quota.status == Some("rejected")` — Anthropic's own verdict.
     ///
     /// **This — not [`Self::hard_ok`] — is the SOLE authority on whether a session's
@@ -634,9 +707,14 @@ impl Manager {
     /// a cold account. Everything absent from it is a fact about ONE REQUEST rather
     /// than about the account, and a per-request fact may divert a request but must
     /// never move a pin. That covers the soft utilization threshold
-    /// ([`crate::quota::Quota::is_near`]), pacing, an entry in `tried`, and — the
-    /// one that used to live here — model-scoped exhaustion
-    /// ([`Self::model_blocked`]).
+    /// ([`crate::quota::Quota::is_near`]), pacing, an entry in `tried`, model-scoped
+    /// exhaustion ([`Self::model_blocked`]), and — the newest — a rate-limit hold
+    /// that clears while the cache is still warm ([`Self::hold_clears_while_warm`]).
+    ///
+    /// The hold split is why this predicate is NOT the right one for a SERVE
+    /// decision: a short-held account passes here (its pin survives) while it still
+    /// cannot answer a request until the timer runs out. [`Self::hard_ok`] adds that
+    /// back.
     ///
     /// Known staleness caveat: `quota.status` is written ONLY from live response
     /// headers ([`crate::quota`]), never by the background probe, so for a benched
@@ -650,10 +728,8 @@ impl Manager {
         if account.disabled || account.status == AccountStatus::Error {
             return false;
         }
-        if let Some(until) = account.rate_limited_until_ms {
-            if now_ms < until {
-                return false;
-            }
+        if Self::hold_outlives_cache(account, now_ms) {
+            return false;
         }
         if account.quota.status.as_deref() == Some("rejected") {
             return false;
@@ -693,8 +769,15 @@ impl Manager {
     }
 
     /// Can this account SERVE this request at all, soft gates aside: the
-    /// account-level blocks ([`Self::account_hard_ok`]) AND this request's own
-    /// model-class block ([`Self::model_blocked`]).
+    /// account-level blocks ([`Self::account_hard_ok`]), **any** live rate-limit
+    /// hold, and this request's own model-class block ([`Self::model_blocked`]).
+    ///
+    /// The short-hold term is the one that is not implied by `account_hard_ok`, and
+    /// it is load-bearing in exactly one direction. A hold under
+    /// [`CACHE_WARM_HOLD_SECS`] deliberately passes `account_hard_ok` so the session
+    /// keeps its pin — but the account is still parked, so serving it only buys
+    /// another 429. Every SERVE decision therefore re-adds the full hold here; only
+    /// the PIN decision gets the softened one.
     ///
     /// The right predicate for a serve decision (may this account answer *this*
     /// request?) and the wrong one for a pin decision (is this session's account
@@ -709,6 +792,7 @@ impl Manager {
         is_fable: bool,
     ) -> bool {
         Self::account_hard_ok(account, now_ms)
+            && !Self::hold_clears_while_warm(account, now_ms)
             && !Self::model_blocked(account, global_threshold, now, is_fable)
     }
 

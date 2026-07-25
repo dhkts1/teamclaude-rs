@@ -87,7 +87,18 @@ const _: () = assert!(
 enum Transient429 {
     /// Wait `secs` inline on the same account, then retry it.
     InlineWait(i64),
-    /// Park the account for `secs` and rotate to another.
+    /// Park the account for `secs` and route THIS request elsewhere.
+    ///
+    /// "Rotate" is only half the story for a pinned session. The park arms
+    /// `rate_limited_until_ms`, and selection reads its REMAINING duration against
+    /// `CACHE_WARM_HOLD_SECS` (`src/manager/mod.rs`): a park that clears while the
+    /// prompt cache is still warm diverts this one request and LEAVES THE PIN, so
+    /// the session comes home to its warm prefix when the timer runs out; only a
+    /// park that outlives the cache re-keys the session durably. Every park this
+    /// function produces is short — `NO_GUIDANCE_HOLD_SECS` + jitter, or a
+    /// `retry-after` clamped to 300s — so the pin-keeping branch is the common one
+    /// here. The long parks come from the quota-rejected path instead, which calls
+    /// `mark_rate_limited` with a `retry-after` clamped up to 3600s.
     Park(i64),
 }
 
