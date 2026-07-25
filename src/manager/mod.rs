@@ -2441,12 +2441,18 @@ mod tests {
         }
     }
 
-    /// SOFT gates DIVERT, they never RE-KEY: a pinned account that is merely paced
+    /// PACING gates DIVERT, they never RE-KEY: a pinned account that is merely paced
     /// (at the in-flight cap, every hard gate clear) yields THIS request to another
     /// account while the pin stays put, and the session returns to it the moment the
     /// guards drop. Before the fix the fall-through re-pin at the bottom of `select`
     /// rewrote the pin to the diverted account, permanently cold-starting that
     /// session's per-account prompt cache.
+    ///
+    /// Contrast `soft_gated_pin_is_served_not_diverted`, where the OTHER soft gate —
+    /// our own utilization threshold — does not even divert. The difference is what
+    /// each gate knows: `in_flight` is a fact we measure exactly and continuously
+    /// about our own concurrency, and spreading a burst is the whole reason the cap
+    /// exists; utilization is arithmetic over headers that go stale by minutes.
     #[test]
     fn soft_paced_pin_diverts_without_repinning() {
         let pacing = PacingConfig {
@@ -2475,14 +2481,9 @@ mod tests {
             "a soft-paced pin must yield THIS request to the cooler account"
         );
         assert_eq!(
-            manager
-                .affinity
-                .lock()
-                .expect("affinity lock poisoned")
-                .get(&77)
-                .map(|&(idx, _)| idx),
+            pin_of(&manager, 77),
             Some(pinned),
-            "a SOFT divert must not move the pin"
+            "a PACING divert must not move the pin"
         );
         // The pacing guard clears → the session snaps back to its warm account.
         {
@@ -2498,7 +2499,7 @@ mod tests {
         }
     }
 
-    /// The last-touch stamp is still refreshed on a soft divert, so a heavily
+    /// The last-touch stamp is still refreshed on a pacing divert, so a heavily
     /// diverted session can never become the `AFFINITY_CAP` eviction victim (the
     /// eviction sorts on exactly this field).
     #[test]
@@ -2568,15 +2569,18 @@ mod tests {
 
     // ---- only a HARD gate may re-key a session ---------------------------------
 
-    /// THE cache-loss fix: an account crossing the SOFT utilization threshold used
-    /// to dump every session pinned to it at once, because `eligible()` folds
-    /// `quota.is_near` into the same bool as the hard gates. The threshold is a
-    /// rotation HINT — this request diverts to a cooler account, but the pin must
-    /// not move, and the session must snap back the moment the quota window
-    /// refreshes. With eleven of thirteen live accounts sitting at 98-100%, this
-    /// was the single largest remaining cause of per-account prompt-cache loss.
+    /// THE cache-loss fix: an account crossing the SOFT utilization threshold used to
+    /// dump every session pinned to it at once, because `eligible()` folds
+    /// `quota.is_near` into the same bool as the hard gates. Keeping the pin while
+    /// still diverting the request — the first half of the fix — bought nothing: the
+    /// diverted request paid the cold prefix anyway (measured live: a 44.4%
+    /// account-switch rate on SUCCESSFUL serves, with zero hard failures). The
+    /// threshold is our own arithmetic, and it routinely benches an account Anthropic
+    /// is answering 200s for, so it may not bench a warm pin at all: the pinned
+    /// account SERVES. With eleven of thirteen live accounts sitting at 98-100%, this
+    /// is the single largest remaining cause of per-account prompt-cache loss.
     #[test]
-    fn pin_over_soft_threshold_is_honoured_not_evicted() {
+    fn soft_gated_pin_is_served_not_diverted() {
         let manager = build_manager(
             config_with(vec![account("a", 0), account("b", 0)]),
             pacing_refresher(),
@@ -2589,36 +2593,29 @@ mod tests {
         // every HARD gate is clear.
         set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
 
-        let diverted = manager
-            .select(&HashSet::new(), now, None, Some(1234))
-            .expect("the under-threshold account serves this request");
-        assert_ne!(
-            diverted, pinned,
-            "an over-threshold pin yields THIS request to the cooler account"
-        );
-        assert_eq!(
-            manager
-                .affinity
-                .lock()
-                .expect("affinity lock poisoned")
-                .get(&1234)
-                .map(|&(idx, _)| idx),
-            Some(pinned),
-            "crossing the SOFT utilization threshold must not re-key the session"
-        );
-
-        // The weekly window refreshes → the session returns to its warm account.
-        {
-            let mut a = manager.accounts.write().expect("accounts lock poisoned");
-            a[pinned].quota.seven_day = None;
-        }
         for _ in 0..3 {
             assert_eq!(
                 manager.select(&HashSet::new(), now, None, Some(1234)),
                 Some(pinned),
-                "once back under threshold the session must return to its original account"
+                "an over-threshold pin that clears every HARD gate still serves its \
+                 own session — upstream, not our utilization arithmetic, is the oracle"
             );
         }
+        assert_eq!(
+            pin_of(&manager, 1234),
+            Some(pinned),
+            "crossing the SOFT utilization threshold must not re-key the session"
+        );
+
+        // The threshold is not dead — it still steers selection with no pin to
+        // protect, so a session arriving cold lands on the cooler account.
+        let unpinned = manager
+            .select(&HashSet::new(), now, None, None)
+            .expect("the under-threshold account is eligible");
+        assert_ne!(
+            unpinned, pinned,
+            "the soft threshold still gates UNPINNED selection"
+        );
     }
 
     /// The guard against over-correcting: a HARD gate still re-keys durably. A live
@@ -2649,6 +2646,48 @@ mod tests {
                 .map(|&(idx, _)| idx),
             Some(served),
             "a live rate-limit hold is a HARD gate — it must re-key the session"
+        );
+    }
+
+    /// THE guard against over-correcting serve-the-pin into serve-anything: an
+    /// account that is over the soft threshold AND holds a live 429 must still
+    /// rotate. This is the exact combination the serve-the-pin path could swallow —
+    /// the soft gate that now serves, stacked on the hard gate that must still win —
+    /// and it is also the self-healing loop that makes serving over the threshold
+    /// safe: a genuinely rejected account answers with a 429, that 429 arms
+    /// `rate_limited_until_ms`, and this select is the one that moves the session off
+    /// it. `hard_ok` stays the sole authority in both directions.
+    #[test]
+    fn pin_that_fails_a_hard_gate_still_rotates() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(5678))
+            .expect("an account is eligible");
+        set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
+        // The serve-over-threshold hit a real 429, which armed a real hold.
+        manager.mark_rate_limited(pinned, 60);
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(5678))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            served, pinned,
+            "a live hold is HARD — it outranks the serve-the-pin path"
+        );
+        assert_eq!(
+            pin_of(&manager, 5678),
+            Some(served),
+            "and it re-keys the session DURABLY, not just for this request"
+        );
+        // Durable: a fresh select with nothing tried stays on the new account.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(5678)),
+            Some(served),
+            "the session must not snap back to the held account"
         );
     }
 

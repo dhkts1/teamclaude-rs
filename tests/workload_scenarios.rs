@@ -597,10 +597,19 @@ fn two_sessions_on_one_account_do_not_pingpong() {
     // `migration_is_off_by_default_and_pin_is_honoured` in src/manager/mod.rs.
 }
 
-/// **5. An account crosses its quota threshold mid-run.** The sessions pinned to
-/// it MUST re-pin — the account is genuinely gone, and moving is the correct
-/// call. The session on the healthy account MUST NOT move: a quota event on a
-/// neighbour is not a reason to throw away a warm cache.
+/// **5. An account crosses its quota threshold mid-run.** Two crossings, and only
+/// one of them is a reason to move:
+///
+/// * **the SOFT switch threshold** is our own utilization arithmetic, computed from
+///   headers that can be stale by minutes. Anthropic keeps answering 200s for
+///   accounts it benches (`gil@token.security` read 100% weekly while serving), so
+///   it is a rotation hint for UNPINNED picks — the pinned sessions keep serving
+///   from it and keep their prompt caches warm: `continuity == 1.0`.
+/// * **a live 429 hold** is upstream's own verdict. That is HARD: the pinned
+///   sessions move, exactly once, and stay moved.
+///
+/// The session on the healthy account must not be perturbed by either — a quota
+/// event on a neighbour is never a reason to throw away a warm cache.
 #[test]
 fn quota_crossing_moves_only_the_affected_sessions() {
     let mut fleet = Fleet::new(&[("alpha", 0), ("bravo", 0)], pacing(CAP));
@@ -632,8 +641,46 @@ fn quota_crossing_moves_only_the_affected_sessions() {
         );
     }
 
-    // alpha crosses the soft switch threshold.
+    // Phase A — alpha crosses the SOFT switch threshold. Nobody moves: the pinned
+    // sessions are served by alpha anyway, and upstream gets to be the oracle.
     fleet.set_over_threshold(0, 0.99, now);
+
+    for _ in 0..5 {
+        for session in [doomed_a, healthy, doomed_b] {
+            fleet.serve(session, now);
+            now += Duration::seconds(1);
+        }
+    }
+
+    for session in [doomed_a, doomed_b] {
+        assert_eq!(
+            fleet.serves_of(session.key).last(),
+            Some(&0),
+            "{} must still be served by its over-threshold pin — the SOFT \
+             threshold is a rotation hint, not proof the account is gone\n{}",
+            session.name,
+            fleet.report()
+        );
+        assert!(
+            (fleet.continuity(session.key) - 1.0).abs() < f64::EPSILON,
+            "{} lost cache continuity to a SOFT gate\n{}",
+            session.name,
+            fleet.report()
+        );
+    }
+    // A session arriving cold still avoids the over-threshold account: the
+    // threshold keeps steering the picks that have no warm cache to lose.
+    assert_eq!(
+        fleet.serve_anon(now),
+        1,
+        "unpinned traffic must still route away from the over-threshold \
+         account\n{}",
+        fleet.report()
+    );
+    now += Duration::seconds(1);
+
+    // Phase B — alpha 429s for real, which arms a live hold. THAT is hard.
+    fleet.manager.mark_rate_limited(0, 60);
 
     for _ in 0..5 {
         for session in [doomed_a, healthy, doomed_b] {
@@ -646,7 +693,8 @@ fn quota_crossing_moves_only_the_affected_sessions() {
         assert_eq!(
             fleet.switches(session.key),
             1,
-            "{} must re-pin exactly once off the exhausted account\n{}",
+            "{} must re-pin exactly once off the held account — and only on the \
+             HARD gate, never on the soft crossing before it\n{}",
             session.name,
             fleet.report()
         );
@@ -740,6 +788,9 @@ fn identityless_requests_never_take_a_pin() {
 ///   diverted (pacing working), and then the very next turn must come home.
 ///   Before the soft-divert fix the divert re-keyed the session durably: it
 ///   never came home, and every later turn paid a cold cache.
+///
+/// Pacing is the soft gate that still diverts. The other one — our own utilization
+/// threshold — does not: scenario 5 covers a pin served straight through it.
 #[test]
 fn busy_neighbour_does_not_rekey_a_quiet_session() {
     // `hot` sorts first on priority, so both the quiet session and the
