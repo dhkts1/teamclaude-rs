@@ -60,6 +60,27 @@ impl Manager {
             .unwrap_or(true)
     }
 
+    /// Whether load-balancing migration is enabled, read from the config's
+    /// unmodelled top-level `loadBalanceMigration` (**default `false` — OFF**).
+    /// Same read pattern as [`Self::session_affinity_enabled`].
+    ///
+    /// It ships OFF because that migration moves an ALREADY-WARM session to a
+    /// cooler account purely to even out pinned-session counts, and Anthropic's
+    /// prompt cache is per-account: every such move costs a full prompt-cache
+    /// re-creation of the whole conversation prefix on the target. A session's
+    /// account is chosen at START, or when its pin fails a HARD gate
+    /// ([`Manager::hard_ok`]) — never merely to balance load. Set
+    /// `"loadBalanceMigration": true` to restore the balancing behaviour.
+    pub fn load_balance_migration_enabled(&self) -> bool {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .extra
+            .get("loadBalanceMigration")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// Mint the next session key: a strictly-increasing, unique `u64` starting at
     /// 1. Called once per connection by the hybrid server when affinity is on.
     pub fn next_session_key(&self) -> u64 {

@@ -2837,6 +2837,18 @@ mod tests {
             .insert(key, (idx, crate::now_ms()));
     }
 
+    /// Like [`config_with`] but with the (default-OFF) load-balancing migration
+    /// explicitly enabled — every test that exercises the migration scan itself
+    /// must opt in, exactly as an operator would via `~/.config/teamclaude.json`.
+    fn config_with_migration(accounts: Vec<Account>) -> Config {
+        let mut config = config_with(accounts);
+        config.extra.insert(
+            "loadBalanceMigration".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        config
+    }
+
     /// Read the account a session key is currently pinned to (None if unpinned).
     fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
         manager
@@ -2872,16 +2884,16 @@ mod tests {
         assert_eq!(pin_of(&manager, 100), Some(0), "the pin never moved");
     }
 
-    /// Migration #2 — two sessions stacked on acct 0 with acct 1 idle+eligible:
-    /// selecting for one of them migrates it to acct 1, and the affinity map records
-    /// the new pin.
+    /// Migration #2 — two sessions stacked on acct 0 with acct 1 idle+eligible and
+    /// `loadBalanceMigration` ENABLED: selecting for one of them migrates it to
+    /// acct 1, and the affinity map records the new pin.
     #[test]
     fn stacked_session_migrates_to_idle() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
+            config_with_migration(vec![account("a", 0), account("b", 0)]),
             refresher,
         );
         let now = OffsetDateTime::now_utc();
@@ -2900,16 +2912,16 @@ mod tests {
         );
     }
 
-    /// Migration #3 — convergence, no thrash: after #2's migration the layout is
-    /// balanced (one session each), so further selects for BOTH sessions are stable —
-    /// neither bounces back.
+    /// Migration #3 — convergence, no thrash (with `loadBalanceMigration` ENABLED):
+    /// after #2's migration the layout is balanced (one session each), so further
+    /// selects for BOTH sessions are stable — neither bounces back.
     #[test]
     fn migration_converges_no_thrash() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
+            config_with_migration(vec![account("a", 0), account("b", 0)]),
             refresher,
         );
         let now = OffsetDateTime::now_utc();
@@ -2961,15 +2973,16 @@ mod tests {
         assert_eq!(pin_of(&manager, 20), Some(0), "the pin never moved");
     }
 
-    /// Migration #5 — three sessions stacked on acct 0 with accts 1,2 idle spread to
-    /// one-each after a round of selects (convergence across three accounts).
+    /// Migration #5 — with `loadBalanceMigration` ENABLED, three sessions stacked on
+    /// acct 0 with accts 1,2 idle spread to one-each after a round of selects
+    /// (convergence across three accounts).
     #[test]
     fn three_sessions_spread_across_three_idle() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            config_with_migration(vec![account("a", 0), account("b", 0), account("c", 0)]),
             refresher,
         );
         let now = OffsetDateTime::now_utc();
@@ -2991,6 +3004,71 @@ mod tests {
             homes,
             [0, 1, 2],
             "three stacked sessions spread to one-per-account after a round of selects"
+        );
+    }
+
+    /// Migration #6 — the DEFAULT is no migration at all. Identical stacked layout to
+    /// #2 (two sessions on acct 0, acct 1 idle and eligible): with a plain config
+    /// NEITHER session moves, because a session that already has a pin is by
+    /// definition warm and Anthropic's prompt cache is per-account, so re-pinning it
+    /// merely to even out counts throws that cache away. The SAME layout under
+    /// `"loadBalanceMigration": true` still migrates — proof the behaviour is gated,
+    /// not deleted.
+    #[test]
+    fn migration_is_off_by_default_and_pin_is_honoured() {
+        let now = OffsetDateTime::now_utc();
+
+        // --- default config: the migration scan never runs ---
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert!(
+            !manager.load_balance_migration_enabled(),
+            "loadBalanceMigration must default to OFF"
+        );
+        pin_session(&manager, 30, 0);
+        pin_session(&manager, 31, 0);
+        // count(0)=2, count(1)=0 — exactly the condition that used to migrate.
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(30)),
+                Some(0),
+                "a stacked session keeps its warm account when migration is off"
+            );
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(31)),
+                Some(0),
+                "its stack-mate keeps the same account too"
+            );
+        }
+        assert_eq!(pin_of(&manager, 30), Some(0), "pin 30 never moved");
+        assert_eq!(pin_of(&manager, 31), Some(0), "pin 31 never moved");
+
+        // --- same layout, key explicitly true: the old behaviour is intact ---
+        let enabled = build_manager(
+            config_with_migration(vec![account("a", 0), account("b", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert!(
+            enabled.load_balance_migration_enabled(),
+            "the explicit key must read back as ON"
+        );
+        pin_session(&enabled, 30, 0);
+        pin_session(&enabled, 31, 0);
+        assert_eq!(
+            enabled.select(&HashSet::new(), now, None, Some(30)),
+            Some(1),
+            "with loadBalanceMigration=true the stacked session still migrates"
+        );
+        assert_eq!(
+            pin_of(&enabled, 30),
+            Some(1),
+            "and the affinity map records the migrated pin"
         );
     }
 
@@ -3562,7 +3640,8 @@ mod tests {
         }
     }
 
-    /// TOCTOU regression (concurrency) — the migration feature's OWN target workload.
+    /// TOCTOU regression (concurrency) — the migration feature's OWN target workload,
+    /// with `loadBalanceMigration` explicitly ENABLED (it ships OFF).
     /// Several sessions start STACKED on one account with idle, eligible accounts
     /// alongside. `N` threads select for those sessions in lockstep: a `Barrier`
     /// forces every round to fire simultaneously, which is the exact interleaving the
@@ -3583,7 +3662,7 @@ mod tests {
         const ROUNDS: usize = 100;
 
         let manager = build_manager(
-            config_with(vec![
+            config_with_migration(vec![
                 account("a0", 0),
                 account("a1", 0),
                 account("a2", 0),

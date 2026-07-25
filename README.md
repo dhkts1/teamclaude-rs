@@ -86,7 +86,7 @@ Then either export `ANTHROPIC_BASE_URL` / `HTTPS_PROXY` as above, or use `tcr ru
 Everything the Node original did (and a couple it didn't) is implemented: OAuth
 `login`, per-model (Fable-aware) routing, the account CLI (`accounts` / `remove` /
 `priority` / `enable` / `disable` / `status`), `update`, keep-warm, and session
-affinity. Two are opt-in via `~/.config/teamclaude.json`, off by default:
+affinity. Three are opt-in via `~/.config/teamclaude.json`, off by default:
 
 - `"sessionAffinity": true` — pin a client session to one account for its
   lifetime. **Anthropic's prompt cache is per-account**, so per-request rotation
@@ -94,6 +94,12 @@ affinity. Two are opt-in via `~/.config/teamclaude.json`, off by default:
   account while different sessions still spread across accounts.
 - `"warmupSeconds": <n>` — periodically warm idle accounts so their 5-hour window
   stays active. This one *spends real quota*, so enable it deliberately.
+- `"loadBalanceMigration": true` — re-pin a session off an account that several
+  sessions stack on, onto a less-loaded one. Off by default for the same
+  per-account-cache reason: a session that has a pin is already warm, so every
+  such move re-creates its whole conversation prefix on the target. A session's
+  account is chosen at start, or when its pin fails a hard gate — not to even
+  out counts.
 
 ## Security
 
