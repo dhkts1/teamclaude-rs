@@ -37,16 +37,24 @@ fn default_upstream() -> String {
 fn default_switch_threshold() -> f64 {
     0.95
 }
-/// Default pacing when the `pacing` key is absent: cap each account at 3 requests
-/// concurrently in flight, no min-spacing. This makes a concurrent burst (e.g. a
-/// subagent fan-out) SPREAD across the pool instead of saturating one
-/// affinity-pinned account. It is safe to default on because pacing is soft — the
-/// select() fallback still serves the least-loaded account when all are at the
-/// cap, so it can only ever spread load, never drop a request. Set
-/// `"pacing": {}` in the config to disable (all knobs `None`).
+/// Default pacing when the `pacing` key is absent: OFF — no in-flight cap, no
+/// min-spacing, so an unconfigured proxy runs the no-pacing selection path.
+///
+/// A per-account concurrency cap trades prompt-cache locality for load spread:
+/// every request it diverts lands on an account whose prefix is cold. On a
+/// single-user proxy the cache is the scarce resource and the accounts are not,
+/// so the trade is the wrong way round and the cap ships off. It stays a
+/// supported knob — set `"pacing": {"maxInFlightPerAccount": N}` (and/or
+/// `"minSpacingMs"`) to turn it back on, with exactly the behaviour it has today.
+///
+/// This is NOT covered by the global egress throttle ([`default_throttle`],
+/// `src/manager/throttle.rs`): that is a RATE limiter (min-spacing + burst over
+/// the aggregate send site), not a concurrency bound, and it is deliberately not
+/// a substitute for one. Turning the cap off leaves per-account concurrency
+/// genuinely unbounded.
 fn default_pacing() -> PacingConfig {
     PacingConfig {
-        max_in_flight_per_account: Some(3),
+        max_in_flight_per_account: None,
         min_spacing_ms: None,
     }
 }
@@ -216,9 +224,12 @@ pub struct Config {
     pub upstream: String,
     #[serde(default = "default_switch_threshold")]
     pub switch_threshold: f64,
-    /// Per-account request pacing. Absent in JSON → [`default_pacing`] →
-    /// `maxInFlightPerAccount: 3` so a concurrent burst spreads across the pool
-    /// (default-ON, soft). Set `"pacing": {}` to disable (all knobs `None`).
+    /// Per-account request pacing. Absent in JSON → [`default_pacing`] → all knobs
+    /// `None`, i.e. OFF: a per-account concurrency cap trades prompt-cache locality
+    /// for load spread, and on a single-user proxy the cache is the scarce resource.
+    /// Set `"pacing": {"maxInFlightPerAccount": N}` to opt back in. The global
+    /// [`ThrottleConfig`] is a RATE limiter and is deliberately not a substitute for
+    /// a concurrency bound.
     #[serde(default = "default_pacing")]
     pub pacing: PacingConfig,
     /// Global outbound throttle. Absent → [`default_throttle`] (ON:
@@ -373,15 +384,28 @@ mod tests {
         assert_eq!(config.proxy.port, 3456);
         assert_eq!(config.upstream, "https://api.anthropic.com");
         assert_eq!(config.switch_threshold, 0.95);
-        // Absent `pacing` key → good defaults: cap 3 in-flight, no min-spacing.
-        assert_eq!(config.pacing.max_in_flight_per_account, Some(3));
+        // Absent `pacing` key → pacing OFF: no in-flight cap, no min-spacing.
+        assert_eq!(config.pacing.max_in_flight_per_account, None);
         assert_eq!(config.pacing.min_spacing_ms, None);
-        assert!(config.pacing.is_active());
+        assert!(!config.pacing.is_active());
+    }
+
+    #[test]
+    fn default_pacing_ships_off() {
+        // Guards the DEFAULT itself, not just deserialization: a per-account
+        // concurrency cap costs prompt-cache locality, so it must stay opt-in.
+        // If this flips, pacing was silently turned back on for every user.
+        let pacing = default_pacing();
+        assert_eq!(pacing.max_in_flight_per_account, None);
+        assert_eq!(pacing.min_spacing_ms, None);
+        assert_eq!(pacing.effective_max_in_flight(), None);
+        assert!(!pacing.is_active());
     }
 
     #[test]
     fn empty_pacing_object_disables_pacing() {
-        // `"pacing": {}` is the explicit opt-out: both knobs None → inert.
+        // `"pacing": {}` spells out what the default already is: both knobs
+        // None → inert. Kept so a config that writes the key stays supported.
         let config: Config = serde_json::from_str(r#"{ "accounts": [], "pacing": {} }"#).unwrap();
         assert_eq!(config.pacing.max_in_flight_per_account, None);
         assert_eq!(config.pacing.min_spacing_ms, None);
