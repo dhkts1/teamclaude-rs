@@ -602,7 +602,7 @@ fn two_sessions_on_one_account_do_not_pingpong() {
 ///
 /// * **the SOFT switch threshold** is our own utilization arithmetic, computed from
 ///   headers that can be stale by minutes. Anthropic keeps answering 200s for
-///   accounts it benches (`gil@token.security` read 100% weekly while serving), so
+///   accounts it benches (one observed reading 100% weekly while still serving), so
 ///   it is a rotation hint for UNPINNED picks — the pinned sessions keep serving
 ///   from it and keep their prompt caches warm: `continuity == 1.0`.
 /// * **a live 429 hold** is upstream's own verdict. That is HARD: the pinned
