@@ -54,6 +54,31 @@ const REQUEST_LOG_CAPACITY: usize = 200;
 /// pinned out for hours with no live request to clear the hold (finding #5).
 const MAX_RATE_LIMIT_HOLD_SECONDS: i64 = 3600;
 
+/// The dividing line between a rate-limit hold a session should WAIT OUT on its
+/// pinned account and one long enough that re-keying is the cheaper trade:
+/// **Anthropic's default ephemeral prompt-cache TTL, 5 minutes.**
+///
+/// A hold is a TIMER, not a death, and the timers we arm are mostly short — a
+/// no-guidance transient 429 parks `NO_GUIDANCE_HOLD_SECS` (15s) plus jitter, and
+/// a `retry-after` park is clamped to 300s ([`crate::proxy`]). Discarding a
+/// per-account prompt cache that will still be warm 15 seconds later, and never
+/// returning to it, is the same cache-loss defect the soft gates already fixed,
+/// reached through a different signal.
+///
+/// So a hold with LESS than this remaining is SOFT — divert this ONE request and
+/// keep the pin, and the session comes home warm. A hold with this much or MORE
+/// remaining stays HARD: the old cache is dead by the time the account frees, and
+/// re-keying settles the session on one account that then warms up, whereas
+/// holding a long-dead pin would divert through the LRU pick on every turn and
+/// scatter the conversation cold across the fleet.
+///
+/// 300 is the CONSERVATIVE choice. Anthropic's 1-hour extended cache would justify
+/// a much larger value (up to `MAX_RATE_LIMIT_HOLD_SECONDS`), but we cannot tell
+/// from a hold which TTL a given session's prefix was written under. Erring low
+/// costs at most one extra diverted request on a hold that would in fact have come
+/// home warm; erring high costs a whole conversation prefix.
+const CACHE_WARM_HOLD_SECS: i64 = 300;
+
 /// How long a *transient* refresh failure holds off further refreshes of the
 /// same account. A transient failure leaves the token unchanged, so the
 /// access-token coalescing guard can't stop a follower queued on the lock from
@@ -668,6 +693,17 @@ mod tests {
     use crate::warmer::{AccountWarmer, WarmError, WarmFuture};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::Duration;
+
+    /// A rate-limit hold that clears while the pinned account's prompt cache is
+    /// still warm — the SOFT case. The live value of a no-guidance transient park
+    /// (`proxy::NO_GUIDANCE_HOLD_SECS`), which is the hold this fleet arms most.
+    const SHORT_HOLD_SECS: i64 = 15;
+
+    /// A hold that OUTLIVES the prompt cache — the only kind that is ACCOUNT-level
+    /// death and may re-key a session. Derived from the threshold rather than
+    /// written as a literal so that raising [`CACHE_WARM_HOLD_SECS`] can never
+    /// silently turn a re-key test into a divert test.
+    const LONG_HOLD_SECS: i64 = CACHE_WARM_HOLD_SECS + 60;
 
     #[test]
     fn throttle_slot_burst1_is_strict_spacing() {
@@ -2411,8 +2447,8 @@ mod tests {
     }
 
     /// Migration: when a session's pinned account becomes ineligible (rate
-    /// limited), the next same-key select re-pins to a DIFFERENT eligible account
-    /// and then sticks to that one.
+    /// limited long enough to outlive its prompt cache), the next same-key select
+    /// re-pins to a DIFFERENT eligible account and then sticks to that one.
     #[test]
     fn affinity_repins_when_pinned_account_ineligible() {
         let refresher = Arc::new(CountingRefresher {
@@ -2426,7 +2462,7 @@ mod tests {
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(42))
             .expect("an account is eligible");
-        manager.mark_rate_limited(pinned, 300);
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
         let repinned = manager
             .select(&HashSet::new(), now, None, Some(42))
             .expect("the other account is eligible");
@@ -2537,8 +2573,11 @@ mod tests {
     /// If the pinned account is in `tried` AND fails a HARD gate, affinity falls
     /// through to a normal pick and re-pins to the new account. Being in `tried`
     /// is on its own only a SOFT signal (see
-    /// `transient_tried_failure_keeps_the_pin`) — it takes a hard gate, here a live
-    /// rate-limit hold, to make the fall-through durable.
+    /// `transient_tried_failure_keeps_the_pin`) — it takes a hard gate, here a hold
+    /// that outlives the prompt cache, to make the fall-through durable. A SHORT
+    /// hold would not: it diverts and keeps the pin (see
+    /// `short_hold_diverts_but_keeps_the_pin`), so the fall-through would serve the
+    /// other account while leaving the session pinned where it was.
     #[test]
     fn affinity_falls_through_when_pinned_in_tried_and_hard_gated() {
         let refresher = Arc::new(CountingRefresher {
@@ -2552,8 +2591,9 @@ mod tests {
         let a = manager
             .select(&HashSet::new(), now, None, Some(9))
             .expect("an account is eligible");
-        // The failover that put A in `tried` was durable: it armed a hold.
-        manager.mark_rate_limited(a, 60);
+        // The failover that put A in `tried` was durable: it armed a hold that
+        // outlives A's prompt cache, so there is nothing left to come home to.
+        manager.mark_rate_limited(a, LONG_HOLD_SECS);
         let tried: HashSet<usize> = [a].into_iter().collect();
         let b = manager
             .select(&tried, now, None, Some(9))
@@ -2618,9 +2658,11 @@ mod tests {
         );
     }
 
-    /// The guard against over-correcting: a HARD gate still re-keys durably. A live
-    /// rate-limit hold means the account genuinely cannot serve, so the session
-    /// moves and STAYS moved.
+    /// The guard against over-correcting: a HARD gate still re-keys durably. A
+    /// rate-limit hold that outlives the prompt cache means the account is gone for
+    /// longer than the session's prefix survives, so the session moves and STAYS
+    /// moved. (A SHORTER hold is the SOFT case — see
+    /// `short_hold_diverts_but_keeps_the_pin`.)
     #[test]
     fn pin_with_live_hold_is_rekeyed() {
         let manager = build_manager(
@@ -2631,7 +2673,7 @@ mod tests {
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(2345))
             .expect("an account is eligible");
-        manager.mark_rate_limited(pinned, 60);
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
 
         let served = manager
             .select(&HashSet::new(), now, None, Some(2345))
@@ -2645,7 +2687,8 @@ mod tests {
                 .get(&2345)
                 .map(|&(idx, _)| idx),
             Some(served),
-            "a live rate-limit hold is a HARD gate — it must re-key the session"
+            "a hold outliving the prompt cache is a HARD gate — it must re-key the \
+             session"
         );
     }
 
@@ -2668,8 +2711,9 @@ mod tests {
             .select(&HashSet::new(), now, None, Some(5678))
             .expect("an account is eligible");
         set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
-        // The serve-over-threshold hit a real 429, which armed a real hold.
-        manager.mark_rate_limited(pinned, 60);
+        // The serve-over-threshold hit a real 429, which armed a real hold — and a
+        // long one, past the point where waiting it out could still hit a warm cache.
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
 
         let served = manager
             .select(&HashSet::new(), now, None, Some(5678))
@@ -2759,9 +2803,10 @@ mod tests {
             "the session must return to its original account"
         );
 
-        // Now the failure proves durable (a 429 armed a hold) — that IS hard, so the
-        // same tried-pin select re-keys.
-        manager.mark_rate_limited(pinned, 60);
+        // Now the failure proves durable (a 429 armed a hold long enough to outlive
+        // the account's prompt cache) — that IS hard, so the same tried-pin select
+        // re-keys.
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
         let moved = manager
             .select(&tried, now, None, Some(4567))
             .expect("the un-held account serves this request");
@@ -2837,7 +2882,8 @@ mod tests {
 
     /// THE over-correction guard for the test above: the model gate softened, and
     /// nothing else did. Same Fable-exhausted pin, but now the account is also under a
-    /// live 429 hold — ACCOUNT-level death, which must still re-key durably.
+    /// 429 hold that outlives its prompt cache — ACCOUNT-level death, which must still
+    /// re-key durably.
     #[test]
     fn account_death_still_rekeys_a_fable_session() {
         let manager = build_manager(
@@ -2850,8 +2896,9 @@ mod tests {
             .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
             .expect("an account is eligible");
         set_fable_exhausted(&manager, home, 0.999);
-        // The account is not merely out of Fable — it is gone for every model class.
-        manager.mark_rate_limited(home, 60);
+        // The account is not merely out of Fable — it is gone for every model class,
+        // and for longer than its prompt cache survives.
+        manager.mark_rate_limited(home, LONG_HOLD_SECS);
 
         let served = manager
             .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
@@ -2860,7 +2907,8 @@ mod tests {
         assert_eq!(
             pin_of(&manager, key),
             Some(served),
-            "a live hold is ACCOUNT-level death — it must still re-key the session"
+            "a hold outliving the prompt cache is ACCOUNT-level death — it must \
+             still re-key the session"
         );
         assert_eq!(
             manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
@@ -2920,16 +2968,162 @@ mod tests {
         );
     }
 
-    /// DOCUMENTING test — asserts today's behaviour, fixes nothing. Once a hard 429
-    /// hold has re-keyed a session onto a failover account, the expiry of that hold
-    /// does NOT bring the session home: the pin is simply the failover from then on.
+    /// A rate-limit hold is a TIMER, not a death — and the timers this proxy arms
+    /// are mostly SHORT: a no-guidance transient 429 parks 15s + jitter, and a
+    /// `retry-after` park is clamped to 300s (`src/proxy.rs`). Anthropic's default
+    /// ephemeral prompt cache lives 5 minutes, so re-keying on a 15-second park
+    /// throws away a prefix that would still be warm 15 seconds later — and the
+    /// session never returns to it, because a re-key is durable.
     ///
-    /// That is deliberate for now. A hold runs up to `MAX_RATE_LIMIT_HOLD_SECONDS`
-    /// (3600s), which outlives Anthropic's prompt-cache TTL (5 minutes, 1 hour with
-    /// extended caching), so by the time the original account frees, the prefix it was
-    /// holding is gone. Coming home would buy a cold start on the way back and no
-    /// cache hit at the other end — strictly worse than staying put. Should the hold
-    /// ever be shortened below the cache TTL, this test is the one that has to change.
+    /// So a hold that clears inside [`CACHE_WARM_HOLD_SECS`] is SOFT: it diverts
+    /// THIS one request (the account really is parked and would only answer another
+    /// 429) and leaves the pin alone, and the session comes home warm when the timer
+    /// runs out. The over-correction guard is `long_hold_rekeys_the_session`, which
+    /// is this same fixture with only the hold duration changed.
+    #[test]
+    fn short_hold_diverts_but_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 515_151u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, SHORT_HOLD_SECS);
+
+        let diverted = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            diverted, home,
+            "a parked pin cannot serve THIS request — serving it only buys a 429"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "a hold that clears while the cache is still warm may divert a request, \
+             it may never re-key the session"
+        );
+
+        // The timer runs out. A past hold reads as expired live, no mutation needed.
+        let after = now + Duration::seconds(SHORT_HOLD_SECS + 5);
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(&HashSet::new(), after, None, Some(key)),
+                Some(home),
+                "once the hold clears the session must come home to the account \
+                 still holding its warm prefix"
+            );
+        }
+    }
+
+    /// THE over-correction guard for the test above: only the SHORT holds softened.
+    /// The same fixture with a hold that outlives the prompt cache must still re-key
+    /// durably — by the time that account frees, the prefix it was holding is gone,
+    /// so keeping the pin would divert through the LRU pick on every turn and
+    /// scatter the conversation cold across the fleet instead of settling it on one
+    /// account that can warm up.
+    #[test]
+    fn long_hold_rekeys_the_session() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 525_252u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, LONG_HOLD_SECS);
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(served, home, "a parked pin cannot serve");
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(served),
+            "a hold that outlives the prompt cache is ACCOUNT-level death — it must \
+             re-key the session"
+        );
+        // Durable: a fresh select with nothing tried stays on the new account.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(served),
+            "the session must not snap back to the held account"
+        );
+    }
+
+    /// Pin a session, park its account with EXACTLY `remaining_ms` left to run, and
+    /// report whether the next select RE-KEYED the session (`true`) or merely
+    /// diverted the request while keeping the pin (`false`).
+    ///
+    /// Writes `rate_limited_until_ms` directly instead of going through
+    /// `mark_rate_limited`, which anchors the deadline to the process wall clock and
+    /// therefore cannot express an exact remaining duration relative to the `now`
+    /// the select is given — the whole point of a boundary test.
+    fn rekeys_with_hold_remaining(remaining_ms: i64) -> bool {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let key = 424_242u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[home].status = AccountStatus::Throttled;
+            accounts[home].rate_limited_until_ms = Some(now_ms + remaining_ms);
+        }
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            served, home,
+            "a parked pin cannot serve, at any hold length"
+        );
+        pin_of(&manager, key) != Some(home)
+    }
+
+    /// Pins the dividing line itself, from BOTH sides, so a refactor cannot drift it
+    /// silently: a hold with exactly [`CACHE_WARM_HOLD_SECS`] left is LONG (the cache
+    /// dies at the same instant the account frees, so there is nothing to come home
+    /// to), and one millisecond less is SHORT.
+    ///
+    /// Asserted through `select`, not against the predicate, so it is the ROUTING
+    /// decision that is nailed down rather than an implementation detail.
+    #[test]
+    fn hold_exactly_at_the_boundary_is_treated_as_long() {
+        let boundary_ms = CACHE_WARM_HOLD_SECS * 1000;
+        assert!(
+            rekeys_with_hold_remaining(boundary_ms),
+            "a hold with exactly CACHE_WARM_HOLD_SECS left must re-key — the prefix \
+             is gone at the same instant the account frees"
+        );
+        assert!(
+            !rekeys_with_hold_remaining(boundary_ms - 1),
+            "one millisecond under the line must keep the pin — the boundary is \
+             `>=`, and this is the assertion that stops it drifting"
+        );
+    }
+
+    /// Once a hold LONG enough to have re-keyed a session has moved it onto a
+    /// failover account, the expiry of that hold does NOT bring the session home:
+    /// the pin is simply the failover from then on.
+    ///
+    /// That is the whole justification for re-keying on a long hold at all. By the
+    /// time the original account frees, the prefix it was holding is gone
+    /// ([`CACHE_WARM_HOLD_SECS`]), so coming home would buy a cold start on the way
+    /// back and no cache hit at the other end — strictly worse than staying put.
+    ///
+    /// The complement is `short_hold_diverts_but_keeps_the_pin`: a hold that clears
+    /// while the cache is still warm never re-keys in the first place, so there is
+    /// nothing to come home FROM. The two together are the whole rule.
     #[test]
     fn hold_expiry_leaves_the_session_on_its_failover() {
         let manager = build_manager(
@@ -2941,12 +3135,15 @@ mod tests {
         let home = manager
             .select(&HashSet::new(), now, None, Some(key))
             .expect("an account is eligible");
-        manager.mark_rate_limited(home, 60);
+        manager.mark_rate_limited(home, LONG_HOLD_SECS);
 
         let failover = manager
             .select(&HashSet::new(), now, None, Some(key))
             .expect("the un-held account serves this request");
-        assert_ne!(failover, home, "a live hold re-keys the session");
+        assert_ne!(
+            failover, home,
+            "a hold outliving the prompt cache re-keys the session"
+        );
         assert_eq!(pin_of(&manager, key), Some(failover));
 
         // The hold expires. A past hold reads as expired live, no mutation needed.
