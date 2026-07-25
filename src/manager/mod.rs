@@ -2777,6 +2777,194 @@ mod tests {
         );
     }
 
+    /// Drive account `idx` over the soft threshold on its MODEL-SCOPED weekly
+    /// (`7d_oi`, the Fable bucket) with a reset 48h out, leaving every shared
+    /// dimension healthy: the account is out of Fable and serves everything else
+    /// perfectly. The companion to [`set_over_threshold`], which moves the SHARED
+    /// weekly instead.
+    fn set_fable_exhausted(manager: &Manager, idx: usize, util: f64) {
+        let now = OffsetDateTime::now_utc();
+        let mut a = manager.accounts.write().expect("accounts lock poisoned");
+        a[idx].quota.seven_day_oi = Some(crate::quota::QuotaWindow {
+            utilization: util,
+            reset: Some(now + Duration::hours(48)),
+        });
+    }
+
+    /// Model-scoped exhaustion is a property of the REQUEST CLASS, not of the
+    /// account: an account out of its Fable weekly still answers Opus perfectly. So a
+    /// Fable request whose pin is Fable-exhausted diverts THAT ONE request and keeps
+    /// the pin — the session's next Opus turn must still land on the account holding
+    /// its warm prefix.
+    ///
+    /// This is the live shape, not a corner case: every Claude Code session mixes
+    /// classes (Opus for the conversation, a one-line Fable call for titles and
+    /// summaries) while a real fleet reads 95-99% on the Fable weekly across nearly
+    /// every account. Counted as account death, one cheap title request re-keyed a
+    /// 200k-token conversation onto a cold account.
+    #[test]
+    fn fable_exhaustion_diverts_the_request_but_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 909_090u64;
+        let home = manager
+            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .expect("an account is eligible");
+        set_fable_exhausted(&manager, home, 0.999);
+
+        let served = manager
+            .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
+            .expect("the other account can still serve Fable");
+        assert_ne!(
+            served, home,
+            "a Fable request must not be served from an exhausted Fable weekly"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "model-scoped exhaustion is a per-REQUEST fact — it may divert a \
+             request, it may never re-key the session"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            Some(home),
+            "the next non-Fable request must come home to the warm prefix"
+        );
+    }
+
+    /// THE over-correction guard for the test above: the model gate softened, and
+    /// nothing else did. Same Fable-exhausted pin, but now the account is also under a
+    /// live 429 hold — ACCOUNT-level death, which must still re-key durably.
+    #[test]
+    fn account_death_still_rekeys_a_fable_session() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 808_080u64;
+        let home = manager
+            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .expect("an account is eligible");
+        set_fable_exhausted(&manager, home, 0.999);
+        // The account is not merely out of Fable — it is gone for every model class.
+        manager.mark_rate_limited(home, 60);
+
+        let served = manager
+            .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(served, home, "a held pin cannot serve");
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(served),
+            "a live hold is ACCOUNT-level death — it must still re-key the session"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            Some(served),
+            "and durably: the Opus turn stays on the failover, it does not snap back"
+        );
+    }
+
+    /// The same invariant one path over. When the whole fleet reads over the SOFT
+    /// threshold, `select` returns `None` and the request lands in
+    /// `select_revalidation` — which also re-pins. A Fable request whose pin is
+    /// Fable-exhausted must be SERVED elsewhere there too while the pin stays put.
+    ///
+    /// Live-reachable, not theoretical: a fleet at 95-99% Fable has no Fable-eligible
+    /// account for `select` to pick, so this is the path a title request actually
+    /// takes.
+    #[test]
+    fn revalidation_fable_divert_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 707_070u64;
+        let home = manager
+            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .expect("an account is eligible");
+        let other = 1 - home;
+        // The whole fleet crosses the SOFT threshold, and the pin is out of Fable.
+        set_over_threshold(&manager, home, 0.99, "allowed_warning");
+        set_over_threshold(&manager, other, 0.96, "allowed_warning");
+        set_fable_exhausted(&manager, home, 0.999);
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            None,
+            "every account is over the soft threshold → normal select benches all"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            Some(other),
+            "the revalidation serve routes the Fable request to an account that can \
+             answer it"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "and it must NOT have re-keyed the session — the pin is model-blocked \
+             for this request only"
+        );
+        // A non-Fable request comes straight home: `select`'s pin-honor path serves
+        // the over-threshold pin rather than diverting it.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            Some(home),
+            "the Opus turn is served by the warm pin"
+        );
+    }
+
+    /// DOCUMENTING test — asserts today's behaviour, fixes nothing. Once a hard 429
+    /// hold has re-keyed a session onto a failover account, the expiry of that hold
+    /// does NOT bring the session home: the pin is simply the failover from then on.
+    ///
+    /// That is deliberate for now. A hold runs up to `MAX_RATE_LIMIT_HOLD_SECONDS`
+    /// (3600s), which outlives Anthropic's prompt-cache TTL (5 minutes, 1 hour with
+    /// extended caching), so by the time the original account frees, the prefix it was
+    /// holding is gone. Coming home would buy a cold start on the way back and no
+    /// cache hit at the other end — strictly worse than staying put. Should the hold
+    /// ever be shortened below the cache TTL, this test is the one that has to change.
+    #[test]
+    fn hold_expiry_leaves_the_session_on_its_failover() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 606_060u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, 60);
+
+        let failover = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(failover, home, "a live hold re-keys the session");
+        assert_eq!(pin_of(&manager, key), Some(failover));
+
+        // The hold expires. A past hold reads as expired live, no mutation needed.
+        let after = now + Duration::hours(1);
+        assert_eq!(
+            manager.select(&HashSet::new(), after, None, Some(key)),
+            Some(failover),
+            "the session stays on its failover once the hold clears — the original \
+             account's prompt cache is long gone, so coming home would only buy a \
+             second cold start"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(failover),
+            "and the pin is not walked back either"
+        );
+    }
+
     /// Distinct session keys fan out to different accounts (each initial pin is a
     /// normal LRU pick) and then each key stays on its own account.
     #[test]
@@ -3981,13 +4169,7 @@ mod tests {
             // account 0: least-utilized on shared dims but Fable weekly exhausted.
             set_over_threshold(&manager, 0, 0.950, "allowed_warning");
             set_over_threshold(&manager, 1, 0.990, "allowed_warning");
-            {
-                let mut a = manager.accounts.write().expect("accounts lock poisoned");
-                a[0].quota.seven_day_oi = Some(crate::quota::QuotaWindow {
-                    utilization: 0.999,
-                    reset: Some(now + Duration::hours(48)),
-                });
-            }
+            set_fable_exhausted(&manager, 0, 0.999);
             (manager, now)
         };
 
