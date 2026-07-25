@@ -568,19 +568,24 @@ impl Manager {
         }
     }
 
-    /// Flush the current in-memory config (with any refreshed tokens) to disk.
-    /// Token refreshes already persist incrementally via [`Self::persist_tokens`],
-    /// so this is the belt-and-suspenders final flush on shutdown (DESIGN §main).
-    /// A missing `config_path` (tests, corrupt-source boot) is a silent no-op so
-    /// a corrupt user file is never clobbered with defaults.
+    /// Flush the refreshed TOKENS to disk. Token refreshes already persist
+    /// incrementally via [`Self::persist_tokens`], so this is the
+    /// belt-and-suspenders final flush on shutdown (DESIGN §main). A missing
+    /// `config_path` (tests, corrupt-source boot) is a silent no-op so a corrupt
+    /// user file is never clobbered with defaults.
+    ///
+    /// Writes via [`config::save_tokens`], NOT [`config::save`]: the in-memory
+    /// `Config` is a boot-time snapshot, so flushing it whole would revert every
+    /// setting the user edited while the proxy was running.
     pub fn persist_now(&self) {
         let Some(path) = &self.config_path else {
             return;
         };
         // Save UNDER the lock (not clone-then-save-unlocked) so a shutdown flush
         // can't race a concurrent persist_tokens and clobber a just-rotated token.
+        // The lock also serializes save_tokens' read-modify-write of the file.
         let config = self.config.lock().expect("config lock poisoned");
-        if let Err(err) = config::save(path, &config) {
+        if let Err(err) = config::save_tokens(path, &config) {
             tracing::error!(error = %err, "failed to flush config on shutdown");
         }
     }
@@ -605,7 +610,8 @@ impl Manager {
         // then saving unlocked lets two concurrent refreshes race on the file: a
         // stale save clobbers the other account's just-rotated refresh token,
         // which then 400s ("invalid_grant") on its next refresh. Holding the lock
-        // through the save serializes writes so every rotation lands on disk.
+        // through the save serializes writes — including save_tokens' whole
+        // read-modify-write of the file — so every rotation lands on disk.
         let mut config = self.config.lock().expect("config lock poisoned");
         if let Some(account) = config
             .accounts
@@ -616,7 +622,9 @@ impl Manager {
             account.refresh_token = Some(tokens.refresh_token.clone());
             account.expires_at = Some(tokens.expires_at_ms);
         }
-        if let Err(err) = config::save(path, &config) {
+        // Tokens only: the in-memory config is a boot-time snapshot, so writing
+        // it whole would stamp stale settings over the user's live file.
+        if let Err(err) = config::save_tokens(path, &config) {
             tracing::error!(error = %err, "failed to persist refreshed token to config");
         }
     }

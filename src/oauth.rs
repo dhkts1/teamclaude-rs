@@ -791,9 +791,12 @@ fn login_guard_refusal(server_pid: Option<u32>, port: u16, force: bool) -> Optio
 ///
 /// Refuses (unless `force`) when a live proxy server already holds the configured
 /// port: the server reads config only at boot and its next `persist_tokens`
-/// rewrites the WHOLE file from memory, silently clobbering the fresh tokens this
-/// login writes (observed live 2026-07-19 — a server refresh overwrote a re-login
-/// within seconds). Detection is read-only; the server is never signalled.
+/// writes its boot-time TOKENS back over the file, silently clobbering the fresh
+/// ones this login writes (observed live 2026-07-19 — a server refresh overwrote
+/// a re-login within seconds). Persisting is otherwise tokens-only
+/// ([`config::save_tokens`]), so a live server no longer reverts the user's
+/// SETTINGS — but credentials are exactly what a login writes, so the guard
+/// stands. Detection is read-only; the server is never signalled.
 pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
     let port = login_target_port(config_path);
     if let Some(msg) = login_guard_refusal(singleton::live_proxy_server(port), port, force) {
