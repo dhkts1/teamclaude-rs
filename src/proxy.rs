@@ -663,6 +663,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 retry_after_raw = header_str("retry-after"),
                 retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
                 unified_status = header_str("anthropic-ratelimit-unified-status"),
+                // The MODEL-SCOPED twin of `unified_status`. Logged to make one
+                // specific class observable: a Fable-weekly-only rejection that
+                // `is_quota_rejected` reads as account-wide, arming a 3600s hold that
+                // then re-keys the session. If this ever reads `rejected` while
+                // `unified_status` does not, that is the case — diagnostic only, no
+                // routing reads this.
+                unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
                 unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
                 unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
                 quota_rejected = is_quota_rejected(&up_headers),

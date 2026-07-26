@@ -820,8 +820,9 @@ fn quota_cell(state: QuotaState) -> (&'static str, Style) {
 /// The per-row gate chip: WHY this account is out of rotation and WHEN it
 /// returns, mirroring the [`GateReason`] the manager computed and formatting the
 /// `free_at` clear-instant as a compact back-when. `OK`/`OFF` are dim (not a
-/// problem); a dead credential's `LOGIN` is red-bold (needs a human); every
-/// quota/hold gate is red. An unknown clear-instant drops the back-when (a bare
+/// problem); the gates only a human clears — a dead credential's `LOGIN` and an
+/// upstream-`REJECTED` account — are red-bold; every quota/hold gate is red. An
+/// unknown clear-instant drops the back-when (a bare
 /// `5H`) — the display never invents a time the manager could not promise.
 fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
     let red = Style::default().fg(Color::Red);
@@ -850,6 +851,12 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         GateReason::Standard => (back("STD"), red),
         GateReason::Login => (
             "LOGIN".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        // Upstream's own verdict, with no reset to wait on — red-bold like LOGIN
+        // because only a human clears it, never a timer.
+        GateReason::Rejected => (
+            "REJECTED".to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         GateReason::Disabled => ("OFF".to_string(), dim),

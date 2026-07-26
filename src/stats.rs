@@ -62,6 +62,12 @@ pub enum GateReason {
     Standard,
     /// A dead credential (`AccountStatus::Error`) — needs a re-login, never self-frees.
     Login,
+    /// Anthropic answered `anthropic-ratelimit-unified-status: rejected` for this
+    /// account. Unlike a window it carries no reset to wait on, so it never
+    /// self-frees. Long held out of rotation by
+    /// [`crate::manager::Manager::account_hard_ok`], it had no reason of its own
+    /// here and so rendered as [`GateReason::Ok`].
+    Rejected,
     /// Operator-disabled — held out until re-enabled, never self-frees.
     Disabled,
 }

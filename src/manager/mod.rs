@@ -432,6 +432,18 @@ impl Manager {
             // request dies as "upstream unreachable". Always reach Anthropic directly.
             http: reqwest::Client::builder()
                 .no_proxy()
+                // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
+                // otherwise stalls the attempt until the OS TCP timeout, and with a
+                // retry budget of `account_count * 2 + 4` that is many minutes of a
+                // hung request. `oauth.rs` and `probe.rs` both already set one.
+                //
+                // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
+                // responses are long-lived SSE streams that legitimately run longer
+                // than any bound worth setting, and a total timeout would truncate
+                // them mid-stream. `connect_timeout` cannot — it applies only before
+                // the response headers arrive, so once a stream is flowing it is out
+                // of the picture.
+                .connect_timeout(std::time::Duration::from_secs(10))
                 // Keep the single HTTP/2 connection to Anthropic warm across
                 // interactive think-time pauses. reqwest reaps idle connections
                 // after 90s by default, but a coding session routinely pauses
@@ -3865,6 +3877,184 @@ mod tests {
             Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
             (GateReason::Ok, None),
             "an expired standard window no longer gates"
+        );
+    }
+
+    #[test]
+    fn rejected_account_reports_a_rejected_gate() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let mut a = gate_runtime();
+        a.quota.status = Some("rejected".to_string());
+
+        // Was `Ok`: `account_hard_ok` held the account out on `rejected` while
+        // `account_gate` had no arm for it, so the TUI showed a rejected account as
+        // healthy and in rotation.
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            (GateReason::Rejected, None)
+        );
+        assert!(
+            !Manager::account_hard_ok(&a, now_ms),
+            "and it stays hard-gated, exactly as before"
+        );
+
+        // Terminal, so it dominates a live window and carries NO clear-instant —
+        // `retry_after_hint` reads `free_at`, and a rejected account was never going
+        // to come back at its 5h reset.
+        a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            (GateReason::Rejected, None),
+            "a rejected account must not advertise a window reset as its recovery"
+        );
+    }
+
+    /// The drift guard, and the reason R7 exists. [`Manager::account_gate`] (what
+    /// the TUI and `retry_after_hint` read) and [`Manager::account_hard_ok`] (whether
+    /// a session may lose its pin) once kept two hand-maintained gate lists, and they
+    /// drifted: `rejected` was on one and missing from the other.
+    ///
+    /// The two are deliberately NOT equal — a quota window or a short hold gates the
+    /// display while leaving the pin alone — so this pins the RELATIONSHIP per
+    /// variant instead. The classification below is exhaustive over [`GateReason`],
+    /// so adding a variant stops compiling until someone decides which side of the
+    /// account/request line it falls on.
+    #[test]
+    fn gate_and_hard_ok_agree_on_every_variant() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let reset = now + Duration::seconds(5_000);
+
+        const ALL: [GateReason; 9] = [
+            GateReason::Ok,
+            GateReason::Hold,
+            GateReason::FiveHour,
+            GateReason::SevenDay,
+            GateReason::FableWeekly,
+            GateReason::Standard,
+            GateReason::Login,
+            GateReason::Disabled,
+            GateReason::Rejected,
+        ];
+
+        for reason in ALL {
+            // Only a Fable-scoped evaluation can ever surface the model-scoped gate.
+            let is_fable = reason == GateReason::FableWeekly;
+
+            // Per case: a label, a runtime that actually exhibits `reason`, and
+            // whether that block is ACCOUNT-level (`account_hard_ok == false`) or
+            // request-scoped (`account_hard_ok` stays true, the pin survives).
+            let cases: Vec<(&str, AccountRuntime, bool)> = match reason {
+                GateReason::Ok => vec![("healthy", gate_runtime(), true)],
+
+                // Terminal: a fact about the credential, for every model class.
+                GateReason::Disabled => {
+                    let mut a = gate_runtime();
+                    a.disabled = true;
+                    vec![("operator-disabled", a, false)]
+                }
+                GateReason::Login => {
+                    let mut a = gate_runtime();
+                    a.status = AccountStatus::Error;
+                    vec![("dead credential", a, false)]
+                }
+                GateReason::Rejected => {
+                    let mut a = gate_runtime();
+                    a.quota.status = Some("rejected".to_string());
+                    vec![("upstream rejected", a, false)]
+                }
+
+                // The one reason that splits on DURATION: past the cache TTL a hold
+                // is account death, under it a timer worth keeping the pin for.
+                GateReason::Hold => {
+                    let mut long = gate_runtime();
+                    long.rate_limited_until_ms = Some(now_ms + (CACHE_WARM_HOLD_SECS + 60) * 1_000);
+                    let mut short = gate_runtime();
+                    short.rate_limited_until_ms = Some(now_ms + 30_000);
+                    vec![
+                        ("hold outliving the cache", long, false),
+                        ("hold clearing while warm", short, true),
+                    ]
+                }
+
+                // Windows are per-request facts: they gate the display and every
+                // serve decision, but must never move a session's pin.
+                GateReason::FiveHour => {
+                    let mut a = gate_runtime();
+                    a.quota.five_hour = Some(window(0.99, Some(reset)));
+                    vec![("5h over threshold", a, true)]
+                }
+                GateReason::SevenDay => {
+                    let mut a = gate_runtime();
+                    a.quota.seven_day = Some(window(0.99, Some(reset)));
+                    vec![("7d over threshold", a, true)]
+                }
+                GateReason::FableWeekly => {
+                    let mut a = gate_runtime();
+                    a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
+                    vec![("7d_oi over threshold", a, true)]
+                }
+                GateReason::Standard => {
+                    let mut a = gate_runtime();
+                    a.quota.tokens_limit = Some(1_000);
+                    a.quota.tokens_remaining = Some(10); // 99% spent
+                    a.quota.standard_reset = Some(reset);
+                    vec![("standard limit spent", a, true)]
+                }
+            };
+
+            for (label, runtime, account_level) in cases {
+                let (gate, _) = Manager::account_gate(&runtime, 0.90, now, now_ms, is_fable);
+                assert_eq!(gate, reason, "fixture `{label}` must exhibit {reason:?}");
+
+                let hard_ok = Manager::account_hard_ok(&runtime, now_ms);
+                assert_eq!(
+                    hard_ok, account_level,
+                    "`{label}`: account_hard_ok disagrees with {reason:?}'s classification"
+                );
+
+                // The invariant that actually broke: whatever `account_hard_ok` holds
+                // out MUST have a reason to show for it. `rejected` violated this.
+                if !hard_ok {
+                    assert_ne!(
+                        gate,
+                        GateReason::Ok,
+                        "`{label}` is hard-gated but renders Ok — the gate lists have drifted"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The serving client must never carry a TOTAL request timeout: these responses
+    /// are long-lived SSE streams, and a total timeout truncates them mid-stream.
+    /// (The `connect_timeout` it does set is not observable here — `reqwest::Client`
+    /// exposes no getters and its `Debug` omits it, since the value lives inside the
+    /// connector. Only the total timeout is surfaced.)
+    #[test]
+    fn serving_client_has_no_total_timeout() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+
+        // reqwest prints the total timeout as a `TotalTimeout` field, and only when
+        // one is set. Prove the marker on a control client first, so a future reqwest
+        // that renames it fails HERE loudly instead of making the guard below pass
+        // vacuously.
+        let control = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build control client");
+        assert!(
+            format!("{control:?}").contains("TotalTimeout"),
+            "reqwest no longer reports a total timeout in Debug — this guard needs rewriting"
+        );
+
+        assert!(
+            !format!("{:?}", manager.http).contains("TotalTimeout"),
+            "the serving client grew a total timeout; it will truncate SSE streams"
         );
     }
 
