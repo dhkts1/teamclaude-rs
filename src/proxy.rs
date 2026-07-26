@@ -423,6 +423,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let mut retry_same: Option<usize> = None;
     // One-shot guard: at most one transient-fleet-park soft-wait per client request.
     let mut soft_waited_exhaustion = false;
+    // The subset of `tried` that is held out by a TRANSIENT 429 park and nothing
+    // else — the only entries the soft-wait below is allowed to re-admit.
+    //
+    // `tried` alone cannot answer that question: it also carries accounts benched
+    // by a 401, a transport blip, a dead token, and a durable quota rejection.
+    // Only the transient park is a TIMER, so only it un-does itself when the clock
+    // runs out; re-admitting any of the others would re-send this request to an
+    // account that already failed it, in a loop. An account leaves this set the
+    // moment it is re-admitted, so membership always means "currently parked".
+    let mut parked_transient: HashSet<usize> = HashSet::new();
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
@@ -462,7 +472,39 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                 "fleet transiently parked — soft-waiting once before exhausted"
                             );
                             tokio::time::sleep(Duration::from_secs(wait)).await;
-                            continue; // re-run select(); the just-freed account is now eligible
+                            // Re-admit exactly what the sleep was timed for.
+                            // `Transient429::Park` benches an account TWICE — a
+                            // hold via `mark_rate_limited` AND an entry in
+                            // `tried` — and both `pick_eligible` and
+                            // `pick_least_loaded` test `tried` BEFORE they ever
+                            // evaluate eligibility. So clearing only the hold
+                            // leaves the account this sleep was timed for still
+                            // skipped: select() returns `None` a second time, the
+                            // one-shot guard blocks another wait, and the wait
+                            // buys nothing. Dropping the now-expired parks from
+                            // `tried` is what makes the recovery path actually
+                            // reach the account it was built to preserve.
+                            //
+                            // Precision matters more than reach here: an account
+                            // whose hold is still running stays parked, and one
+                            // benched for any NON-hold reason was never in
+                            // `parked_transient` to begin with.
+                            let now_ms = crate::now_ms();
+                            let freed: Vec<usize> = parked_transient
+                                .iter()
+                                .copied()
+                                .filter(|&i| manager.hold_expired(i, now_ms))
+                                .collect();
+                            for i in &freed {
+                                tried.remove(i);
+                                parked_transient.remove(i);
+                            }
+                            tracing::info!(
+                                readmitted = freed.len(),
+                                still_parked = parked_transient.len(),
+                                "soft-wait over — re-admitted the accounts whose hold expired"
+                            );
+                            continue; // re-run select(); the re-admitted accounts are eligible again
                         }
                         None => {
                             // Not a transient park — the whole fleet reads over the
@@ -696,6 +738,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 Transient429::Park(wait) => {
                     manager.mark_rate_limited(idx, wait);
                     tried.insert(idx);
+                    // Record WHY this entry is in `tried`: a timer that expires on
+                    // its own, so the soft-wait above may take it back. Every other
+                    // `tried.insert` in this loop deliberately omits this.
+                    parked_transient.insert(idx);
                     continue;
                 }
             }
@@ -2235,6 +2281,26 @@ mod tests {
         )
     }
 
+    /// A `429` with NO `unified-status`, i.e. a TRANSIENT rate limit: the arm that
+    /// inline-waits `retry_after` seconds on the same account and, once
+    /// [`MAX_SAME_ACCOUNT_429`] inline retries are spent, PARKS it for that long and
+    /// rotates — the `Transient429::Park` that puts an account into BOTH
+    /// `mark_rate_limited` and `tried`. `retry_after: 1` is what keeps a test that
+    /// must reach the park down to two one-second inline waits.
+    fn raw_429_transient(retry_after: u32) -> String {
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\
+             retry-after: {retry_after}\r\n\r\n"
+        )
+    }
+
+    /// A bare `401`. With the `fleet` refresher (every refresh a transient error)
+    /// the force-refresh yields no new token, so the account is benched in `tried`
+    /// and the request rotates — an entry no timer ever clears.
+    fn raw_401() -> String {
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+    }
+
     /// A `529 Overloaded` shaped like Anthropic's — the status the retry ladder
     /// exists for. Carries NO `retry-after` (the live captures do not), so the
     /// backoff comes from the ladder alone and the test's timing is deterministic.
@@ -2557,6 +2623,148 @@ mod tests {
             "a 529 is upstream overload, not a quota rejection: it must never arm a \
              rate-limit hold that would bench the account for later requests"
         );
+    }
+
+    /// THE BITING TEST for the soft-wait: the account the sleep was TIMED FOR must
+    /// actually be selectable when the sleep ends.
+    ///
+    /// `Transient429::Park` benches an account twice — a hold via
+    /// `mark_rate_limited` AND an entry in `tried` — and `pick_eligible` /
+    /// `pick_least_loaded` both test `tried` BEFORE they evaluate eligibility. So
+    /// waiting out the hold alone changed nothing: `select()` returned `None` a
+    /// second time, the one-soft-wait guard blocked another wait, and the request
+    /// fell through to a revalidation-serve that skips `tried` too — an honest-looking
+    /// 429 handed to the client after a sleep that bought nothing.
+    ///
+    /// One account, so "some account served" and "the account we waited for served"
+    /// are the same claim. Three transient 429s spend the two inline retries and then
+    /// park it for 1s; the fourth connection is the 200 that only exists if the
+    /// re-admission works. Pre-fix this test reads 429.
+    #[tokio::test]
+    async fn soft_wait_readmits_the_unparked_account() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_429_transient(1)), // attempt 1 — inline-wait 1s, same account
+            Some(raw_429_transient(1)), // attempt 2 — inline budget spent
+            Some(raw_429_transient(1)), // attempt 3 — park 1s + `tried`, fleet empty
+            Some(raw_200()),            // attempt 4 — only reachable after re-admission
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 200,
+            "the soft-wait slept for THIS account's un-park — it must be back in \
+             rotation when the sleep ends, not still excluded by `tried`"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "three 429s then one serve — no extra attempt, so the re-admission did \
+             not turn the rotation loop into a retry spin"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(
+            a.requests, 1,
+            "the re-admitted account is the one that served"
+        );
+        assert!(
+            a.rate_limited_until.is_none(),
+            "the 200 proves the hold no longer binds, so it is cleared"
+        );
+    }
+
+    /// The precision guard on the re-admission: ONLY a transient park is a timer.
+    ///
+    /// `tried` carries accounts benched for reasons a clock never undoes — a 401
+    /// whose force-refresh produced no token, a transport blip, a dead token, a
+    /// durable quota rejection. Re-admitting those after the sleep would re-send this
+    /// request to an account that already failed it, which is how a recovery path
+    /// becomes a retry loop. So the sweep is keyed on WHY the entry is in `tried`,
+    /// not merely on "has no live hold" — `a` and `b` have no hold at all and must
+    /// still stay out.
+    ///
+    /// LRU makes the failure loud rather than silent: `a` was stamped first, so a
+    /// sweep that cleared every hold-free entry would re-admit `a` and serve the 200
+    /// from it. The assertion is on WHICH account served.
+    #[tokio::test]
+    async fn soft_wait_does_not_readmit_a_401_or_transport_failure() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_401()),            // attempt 1 — `a`: refresh fails, benched in `tried`
+            None,                       // attempt 2 — `b`: transport blip, benched in `tried`
+            Some(raw_429_transient(1)), // attempt 3 — `c`: inline-wait
+            Some(raw_429_transient(1)), // attempt 4 — `c`: inline budget spent
+            Some(raw_429_transient(1)), // attempt 5 — `c`: park 1s + `tried`, fleet empty
+            Some(raw_200()),            // attempt 6 — must be `c`, never `a` or `b`
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b", "c"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(status, 200, "the transiently parked `c` still recovers");
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            6,
+            "one attempt each on `a` and `b`, three on `c`, then `c`'s serve — a \
+             re-admitted `a` or `b` would add attempts here"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let served: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|x| x.requests > 0)
+            .map(|x| x.name.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            ["c"],
+            "only the account parked by a HOLD may come back; the 401 and the \
+             transport failure are not timers and stay benched for this request"
+        );
+    }
+
+    /// Termination: re-admitting accounts must not turn the rotation loop into an
+    /// unbounded retry. Two things bound it and this asserts both.
+    ///
+    /// The one-soft-wait-per-request guard means the sweep can run AT MOST ONCE, and
+    /// every iteration — the soft-waiting one included — still spends one unit of the
+    /// `max_attempts` budget. So when the re-admitted account immediately re-parks,
+    /// the second `select()` miss cannot wait again and control reaches the existing
+    /// exhausted-429 path.
+    ///
+    /// `a` is durably quota-rejected (a 3600s hold, and never in the transient set);
+    /// `b` parks transiently, is re-admitted, and 429s straight back. Five upstream
+    /// attempts, then a 429 — the connection count is what proves it did not spin.
+    #[tokio::test]
+    async fn soft_wait_still_terminates_when_nothing_recovers() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_429_rejected(3600)), // attempt 1 — `a`: durable, no re-admission
+            Some(raw_429_transient(1)),   // attempt 2 — `b`: inline-wait
+            Some(raw_429_transient(1)),   // attempt 3 — `b`: inline budget spent
+            Some(raw_429_transient(1)),   // attempt 4 — `b`: park 1s + `tried`
+            Some(raw_429_transient(1)),   // attempt 5 — `b` re-admitted, 429s again
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 429,
+            "nothing recovered, so the honest exhausted-429 is still the verdict"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the second select() miss cannot soft-wait again, so the re-admission \
+             buys exactly ONE extra attempt and the loop ends"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let total: u64 = snap.accounts.iter().map(|x| x.requests).sum();
+        assert_eq!(total, 0, "no account ever served this request");
     }
 
     /// The 502 predicate itself, over the four states the two counters can be in.

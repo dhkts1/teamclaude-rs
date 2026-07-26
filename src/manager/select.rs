@@ -741,6 +741,23 @@ impl Manager {
             .filter(|&remaining_ms| remaining_ms > 0)
     }
 
+    /// Whether account `idx` has NO live rate-limit hold at `now_ms` — either none
+    /// was ever armed, or the one that was has already run out.
+    ///
+    /// The locking wrapper around [`Self::hold_remaining_ms`] for callers OUTSIDE
+    /// the manager (the proxy's rotation loop), so `rate_limited_until_ms` stays
+    /// private and the "is it still held?" question keeps exactly one answer.
+    ///
+    /// An index that names no account answers `false` (treated as still held) —
+    /// the safe direction, since the only caller uses a `true` to re-admit an
+    /// account into a request's rotation.
+    pub fn hold_expired(&self, idx: usize, now_ms: i64) -> bool {
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        accounts
+            .get(idx)
+            .is_some_and(|account| Self::hold_remaining_ms(account, now_ms).is_none())
+    }
+
     /// Whether a live hold is still running when this account's prompt cache dies
     /// ([`CACHE_WARM_HOLD_SECS`] or more remaining) — the only hold long enough to
     /// be worth re-keying a session for, and so the only one
