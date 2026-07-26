@@ -150,6 +150,11 @@ pub fn takeover_port(port: u16, no_replace: bool) {
         eprintln!(
             "[tcr] replacing existing proxy on :{port} (pid {pid}) — one proxy per port, or the two mutually invalidate each other's single-use refresh tokens (token war)."
         );
+        // The other half of the boot marker: in TUI mode this eprintln lands on a
+        // terminal that the alternate screen is about to cover, so the durable log
+        // is the only place a takeover is recoverable. Pairs with "server started"
+        // to turn "the server bounced" into "pid N was killed by pid M".
+        tracing::info!(port, replaced_pid = pid, "replacing incumbent proxy");
         let _ = Command::new("kill").arg(pid.to_string()).status();
         sleep(Duration::from_millis(800));
         if is_alive(pid) {

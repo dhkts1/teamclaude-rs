@@ -374,6 +374,22 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
     let bound = listener.local_addr()?;
+
+    // The boot marker. `$TMPDIR/teamclaude-rs.log` is appended forever and never
+    // rotated, so without this line a restart is invisible: request lines run
+    // unbroken across a bounce and the log cannot be sliced "since this boot".
+    // Emitted here deliberately — after `init_tracing` (else it goes nowhere) and
+    // after the bind SUCCEEDED — so one line means "this pid is live on this port",
+    // not "this pid tried". A restart also wipes the in-memory session→account pin
+    // map, the most expensive cache event in this system; counting these lines is
+    // how that cost becomes measurable:  rg 'server started' "$TMPDIR/teamclaude-rs.log"
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        pid = std::process::id(),
+        port = bound.port(),
+        "server started"
+    );
+
     let serve_manager = manager.clone();
     let mut server = tokio::spawn(async move {
         mitm::serve(listener, serve_manager, tls).await;
