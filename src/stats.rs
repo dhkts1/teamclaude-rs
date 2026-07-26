@@ -123,12 +123,30 @@ pub enum SessionKind {
     Fallback,
 }
 
-/// One live session's view: a short display id, the account it's pinned to,
-/// how many requests it has served, and when it was last seen.
+/// One live session's view: a short display id, the account it is PINNED to, the
+/// account that actually served its most recent request, how many requests it has
+/// served, and when it was last seen.
+///
+/// The two account fields are deliberately separate because they genuinely differ:
+/// a session's pin is HELD while a single request is diverted elsewhere (a Fable
+/// title call whose model-scoped weekly is spent, one request during a hold that
+/// clears while the cache is still warm — see
+/// [`crate::manager::Manager::select`]). Collapsing them made every such divert
+/// look like the session had moved account, which is how a fleet measured at a
+/// 1.70% switch rate read as "sessions keep jumping" in the TUI.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
-    pub id: String,      // short hex derived from the u64 session key (display only)
-    pub account: String, // account name it is currently pinned to
+    pub id: String, // short hex derived from the u64 session key (display only)
+    /// Account name this session is currently PINNED to, read from the manager's
+    /// affinity map — the sole authority on the pin. A session with no pin (an
+    /// identity-less fallback serve, a seeded demo row) has no home, so this falls
+    /// back to [`Self::last_served_account`].
+    pub account: String,
+    /// Account name that served this session's most recent request. Equal to
+    /// [`Self::account`] on a normal serve; DIFFERENT exactly when that one request
+    /// was diverted while the pin stayed put — so the divert stays observable
+    /// instead of being hidden.
+    pub last_served_account: String,
     pub requests: u64,
     pub last_seen: Option<OffsetDateTime>,
     /// [`SessionKind::Stable`] when keyed on a stable client identity (x-api-key /
@@ -146,6 +164,8 @@ pub struct StatsSnapshot {
     pub current: Option<usize>,
     /// Most-recent-first request log.
     pub recent: Vec<RequestLogEntry>,
-    /// Live per-session serving stats, most-recent-first.
+    /// Live per-session serving stats in a STABLE order (pinned account, then
+    /// session id) — deliberately NOT recency, so a row holds its place instead of
+    /// jumping to the top of the pane on every request.
     pub sessions: Vec<SessionSnapshot>,
 }
