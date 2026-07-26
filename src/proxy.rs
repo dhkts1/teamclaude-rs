@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HOST, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use axum::Router;
@@ -269,6 +269,71 @@ fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>)
 /// ever answers locally belongs under this prefix.
 pub const STATUS_PATH: &str = "/_tcr/status";
 
+/// The prefix [`STATUS_PATH`] lives under. Every path beneath it belongs to the
+/// PROXY, never to Anthropic, so anything under it that is not a registered route
+/// is answered with a LOCAL 404 (see the guard in [`handle`]) instead of being
+/// forwarded. That is not hygiene: before the guard existed a typo'd status probe
+/// fell through the catch-all and was sent to `api.anthropic.com/_tcr/status`
+/// carrying a pooled OAuth Bearer, which burned an account on a request no
+/// upstream route could ever answer.
+const LOCAL_PREFIX: &str = "/_tcr/";
+
+/// Paths whose upstream call must carry the **client's own** credential and which
+/// therefore bypass account selection entirely. Matched as prefixes of the request
+/// path, mirroring the JS proxy's `CLIENT_CREDENTIAL_PATHS` (`teamclaude/src/server.js`).
+///
+/// Do NOT "simplify" any of these back into the catch-all. They are bound to the
+/// identity that authenticated the CLIENT, so a rotated pooled token is the wrong
+/// credential by construction:
+/// - `/v1/code/…` is the Remote Control channel, bound to the session's paired
+///   claude.ai identity; a pooled token 403s its worker event stream.
+/// - `/api/oauth/files/…` and `/api/oauth/file_upload` are attachment transfers. A
+///   file uploaded from claude.ai belongs to the paired identity, so fetching it
+///   with a pooled token 403s and **Claude Code silently drops the image from the
+///   message** — nothing surfaces the failure, the turn just loses its attachment.
+///
+/// Measured on the live log while every one of these still went through rotation:
+/// 13 of 57 sessionless requests came back 404 (22.8%), against 0 of 1556 pinned ones.
+const CLIENT_CREDENTIAL_PREFIXES: [&str; 3] =
+    ["/v1/code/", "/api/oauth/files/", "/api/oauth/file_upload"];
+
+/// The CLIENT's own OAuth token refresh. Relayed raw — no auth header at all,
+/// because a refresh carries its credentials in the BODY. The proxy manages its own
+/// tokens via [`Manager::ensure_fresh`]; rewriting a client's refresh would inject
+/// the wrong identity into an exchange that is not ours.
+const CLIENT_TOKEN_REFRESH_PATH: &str = "/v1/oauth/token";
+
+/// `user-agent` sent by [`RelayMode::Raw`] when the client sent none. The JS proxy
+/// defaults to `'node'` here; naming ourselves is more honest about who is calling.
+const RELAY_USER_AGENT: &str = concat!("tcr/", env!("CARGO_PKG_VERSION"));
+
+/// How a request that must NOT go through account rotation reaches upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelayMode {
+    /// Forward the client's own headers — including its `authorization` — and
+    /// stream the response back. See [`CLIENT_CREDENTIAL_PREFIXES`].
+    ClientCredential,
+    /// Send `content-type` / `accept` / `user-agent` and nothing else, no auth in
+    /// any form. See [`CLIENT_TOKEN_REFRESH_PATH`].
+    Raw,
+}
+
+/// Classify a request as one of the rotation-bypassing relays, or `None` for the
+/// normal pooled-credential forwarding path. Takes the path WITHOUT its query, so
+/// a `?…` can never smuggle a path past the match. Pure — unit-tested.
+fn relay_mode(method: &Method, path: &str) -> Option<RelayMode> {
+    if *method == Method::POST && path == CLIENT_TOKEN_REFRESH_PATH {
+        return Some(RelayMode::Raw);
+    }
+    if CLIENT_CREDENTIAL_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p))
+    {
+        return Some(RelayMode::ClientCredential);
+    }
+    None
+}
+
 /// Build the proxy router. Every method and path funnels through the single
 /// catch-all [`handle`] — EXCEPT [`STATUS_PATH`], which the proxy answers itself.
 /// The [`Manager`] is shared state.
@@ -396,6 +461,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         .uri
         .path_and_query()
         .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
+    // The path WITHOUT its query — what the local-route and relay classifiers match
+    // on. Matching them against `path_and_query` would let a query string decide
+    // routing, and a path is what these rules are actually about.
+    let path = parts.uri.path().to_string();
     let req_headers = parts.headers;
 
     // 1. Auth: when a proxy key is configured, `x-api-key` must match it — EXCEPT
@@ -417,6 +486,26 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 );
             }
         }
+    }
+
+    // 1a. Everything under `/_tcr/` is OURS. The router matches the registered
+    //     routes (today: [`STATUS_PATH`]) BEFORE this catch-all, so any request that
+    //     reaches `handle` under the prefix is one we do not serve — and the honest
+    //     answer to that is a LOCAL 404, not a forward. Forwarding it would rewrite
+    //     a proxy-private path onto api.anthropic.com WITH A POOLED OAUTH BEARER
+    //     attached: that is how a typo'd status probe once put Gil's bearer on
+    //     `api.anthropic.com/_tcr/status` and burned an account. The bare `/_tcr`
+    //     (no trailing slash) is included so the prefix has no unguarded edge.
+    //
+    //     Placed AFTER the api-key gate: a request that cannot authenticate learns
+    //     nothing here that it would not learn from any other path.
+    if path.starts_with(LOCAL_PREFIX) || path == LOCAL_PREFIX.trim_end_matches('/') {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            "Unknown tcr endpoint.",
+            None,
+        );
     }
 
     // 1b. Host guard: tcr is a credential-injecting reverse proxy for
@@ -462,6 +551,21 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 None,
             );
         }
+    }
+
+    // 1c. Rotation-bypassing relays. A request bound to the CLIENT's identity
+    //     ([`CLIENT_CREDENTIAL_PREFIXES`]) or to a credential exchange that is not
+    //     ours ([`CLIENT_TOKEN_REFRESH_PATH`]) must not be re-credentialled, and it
+    //     must not spend anything the rotation owns: no `select`, no in-flight slot,
+    //     no throttle token, no `record_served`, no pin read or write. Every one of
+    //     these used to burn a rotation slot and pollute the LRU key for a request
+    //     the pooled account could never have answered.
+    //
+    //     Deliberately placed AFTER the api-key gate (1) and the host guard (1b):
+    //     relaying for an unauthenticated caller, or to a host we just refused to
+    //     forward to, would each be a new hole. Gate first, then relay.
+    if let Some(mode) = relay_mode(&method, &path) {
+        return relay_upstream(&manager, mode, method, &path_and_query, &req_headers, body).await;
     }
 
     // 2. Buffer the body once so it can be re-sent verbatim on every rotation.
@@ -754,11 +858,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
         let status = resp.status();
         // One greppable line per upstream response, tagged with the true serving
-        // account and outcome status. "serving request" logs BEFORE the outcome, so
-        // without this the logs are status-blind — the gap that hid the 401 storm.
+        // account, the PATH and the outcome status. "serving request" logs BEFORE the
+        // outcome, so without this the logs are status-blind — the gap that hid the
+        // 401 storm. The path is here because without it a status is undiagnosable:
+        // the only other record of which path produced a 404 is the in-memory TUI
+        // ring (`push_log` below), which is lost on every restart.
         tracing::info!(
             account_index = idx,
             account = account_name.as_deref().unwrap_or("?"),
+            path = %path_and_query,
             status = status.as_u16(),
             "upstream response"
         );
@@ -1106,6 +1214,190 @@ fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
         out.insert(AUTHORIZATION, value);
     }
     out
+}
+
+/// Clone the client's request headers for a [`RelayMode::ClientCredential`] call:
+/// drop pseudo-headers, hop-by-hop and `accept-encoding`, KEEP everything else —
+/// crucially the client's own `authorization`, which is the entire point of this
+/// path. Contrast [`build_upstream_headers`], which strips exactly that header to
+/// make room for the pooled Bearer.
+///
+/// The one header removed beyond that set is an `x-api-key` whose value equals the
+/// configured proxy key: that is OUR gate credential, not the client's upstream
+/// credential, and forwarding it hands the operator's secret to a third party. A
+/// client `x-api-key` that is NOT our key is the client's own and passes through.
+fn build_passthrough_headers(req_headers: &HeaderMap, proxy_key: Option<&str>) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in req_headers.iter() {
+        let lower = name.as_str();
+        if lower.starts_with(':') || is_request_hop_by_hop(lower) || lower == "accept-encoding" {
+            continue;
+        }
+        if lower == "x-api-key"
+            && proxy_key.is_some_and(|expected| key_matches(value.to_str().ok(), expected))
+        {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    out
+}
+
+/// The three headers a [`RelayMode::Raw`] relay carries — `content-type`, `accept`,
+/// `user-agent` — and nothing else. No `authorization` and no `x-api-key`: a token
+/// refresh authenticates with the credentials in its BODY, so a header credential
+/// would be at best redundant and, for a pooled Bearer, the wrong identity's
+/// entirely. Mirrors the JS proxy's `relayRaw`.
+fn build_raw_relay_headers(req_headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, default) in [
+        (CONTENT_TYPE, "application/json"),
+        (ACCEPT, "application/json"),
+        (USER_AGENT, RELAY_USER_AGENT),
+    ] {
+        let value = req_headers
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| HeaderValue::from_static(default));
+        out.insert(name, value);
+    }
+    out
+}
+
+/// The HTTP client [`relay_upstream`] uses, built once and reused.
+///
+/// Deliberately NOT [`Manager::http_client`]: the pooled client follows up to 10
+/// redirects, and a relay must hand a 3xx BACK to the client rather than chase it
+/// (the JS proxy passes `redirect: 'manual'` for this reason). Following one here
+/// would resolve a location the client never sees, while carrying a credential we
+/// are only forwarding on its behalf. The rest mirrors the pooled client: `no_proxy`
+/// (we ARE the proxy — an ambient `HTTP_PROXY` would loop us through ourselves) and
+/// a CONNECT-phase-only timeout, never a total one, because a `/v1/code/` response
+/// is a long-lived event stream that any total timeout would truncate mid-stream.
+///
+/// `None` only if the TLS backend fails to initialise, which the caller answers with
+/// a 502 — a proxy never panics on a client request.
+fn relay_client() -> Option<&'static reqwest::Client> {
+    static RELAY_CLIENT: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    RELAY_CLIENT
+        .get_or_init(|| {
+            match reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    tracing::error!(error = %err, "could not build the relay HTTP client");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+/// Forward a request upstream WITHOUT touching account rotation — see the `1c`
+/// block in [`handle`] for which requests land here and why.
+///
+/// `mode` picks the header policy ([`build_passthrough_headers`] vs
+/// [`build_raw_relay_headers`]) and the body policy: a client-credential response is
+/// STREAMED (`/v1/code/` is an event stream that must not be buffered before the
+/// client sees it), a raw response is buffered under the same cap as every other
+/// body this file reads. Response headers go through the shared [`build_response`],
+/// which drops the framing headers a relayed body would mis-frame with.
+async fn relay_upstream(
+    manager: &Manager,
+    mode: RelayMode,
+    method: Method,
+    path_and_query: &str,
+    req_headers: &HeaderMap,
+    body: Body,
+) -> Response {
+    let Some(client) = relay_client() else {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "proxy_error",
+            "Could not build the relay HTTP client.",
+            None,
+        );
+    };
+    let Ok(body_bytes) = to_bytes(body, MAX_BODY_BYTES).await else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Failed to read request body.",
+            None,
+        );
+    };
+
+    let headers = match mode {
+        RelayMode::ClientCredential => {
+            build_passthrough_headers(req_headers, manager.proxy_api_key())
+        }
+        RelayMode::Raw => build_raw_relay_headers(req_headers),
+    };
+    let url = format!("{}{}", manager.upstream(), path_and_query);
+    let mut builder = client.request(method.clone(), &url).headers(headers);
+    // A GET/HEAD carries no body, and an empty body is sent as no body at all —
+    // both mirror the JS relays, and the latter keeps a bodyless POST from
+    // acquiring a `content-length: 0` it did not arrive with.
+    if method != Method::GET && method != Method::HEAD && !body_bytes.is_empty() {
+        builder = builder.body(body_bytes);
+    }
+
+    let resp = match builder.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::warn!(
+                path = %path_and_query,
+                mode = ?mode,
+                is_connect = err.is_connect(),
+                is_timeout = err.is_timeout(),
+                error = %err,
+                "relay transport failure"
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_error",
+                "Upstream unreachable.",
+                None,
+            );
+        }
+    };
+
+    let status = resp.status();
+    let up_headers = resp.headers().clone();
+    // The relay's twin of the "upstream response" line. These requests are invisible
+    // to the per-account log by construction (they serve no account), so this line is
+    // the ONLY record that one happened and what it answered.
+    tracing::info!(
+        path = %path_and_query,
+        mode = ?mode,
+        status = status.as_u16(),
+        "relayed response"
+    );
+
+    match mode {
+        RelayMode::ClientCredential => {
+            build_response(status, &up_headers, Body::from_stream(resp.bytes_stream()))
+        }
+        RelayMode::Raw => match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
+            Ok(bytes) => build_response(status, &up_headers, Body::from(bytes)),
+            Err(BodyReadError::Transport) => error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_error",
+                "Failed to read upstream response body.",
+                None,
+            ),
+            Err(BodyReadError::TooLarge) => error_response(
+                StatusCode::BAD_GATEWAY,
+                "proxy_error",
+                "Upstream response body exceeded the size cap.",
+                None,
+            ),
+        },
+    }
 }
 
 /// Hop-by-hop request headers that must not be forwarded. Header names from a
@@ -2112,6 +2404,433 @@ mod tests {
             );
             assert_eq!(after.current, before.current, "{method} moved no cursor");
         }
+    }
+
+    // --- rotation-bypassing relays -----------------------------------------
+
+    /// What a fake upstream saw — one of these per request it received.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Echo {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl Echo {
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.as_str())
+        }
+    }
+
+    /// Spawn a fake upstream that echoes every request back as JSON and counts hits.
+    ///
+    /// A real upstream is what makes these tests measure the thing that matters:
+    /// what the proxy PUT ON THE WIRE. Asserting on the header-building helpers
+    /// alone would prove only that the helpers work, not that the relay path calls
+    /// them — the exact gap the bug lived in. The hit counter is the second half:
+    /// it proves a locally-answered path reached NO upstream at all.
+    async fn spawn_echo_upstream() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let upstream = Router::new().fallback(move |req: Request| {
+            let counter = Arc::clone(&counter);
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (parts, body) = req.into_parts();
+                let bytes = to_bytes(body, MAX_BODY_BYTES).await.unwrap_or_default();
+                axum::Json(Echo {
+                    method: parts.method.to_string(),
+                    path: parts
+                        .uri
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_default(),
+                    headers: parts
+                        .headers
+                        .iter()
+                        .map(|(n, v)| {
+                            (n.as_str().to_string(), v.to_str().unwrap_or("").to_string())
+                        })
+                        .collect(),
+                    body: String::from_utf8_lossy(&bytes).to_string(),
+                })
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind echo upstream");
+        let addr = listener.local_addr().expect("echo upstream addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, upstream).await;
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Drive the proxy router with a peer we control, as `mitm::serve_http` would.
+    async fn drive(
+        manager: Arc<Manager>,
+        method: Method,
+        uri: &str,
+        peer: Option<SocketAddr>,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, bytes)
+    }
+
+    fn parse_echo(bytes: &Bytes) -> Echo {
+        serde_json::from_slice(bytes).unwrap_or_else(|err| {
+            panic!(
+                "an echo payload ({err}): {}",
+                String::from_utf8_lossy(bytes)
+            )
+        })
+    }
+
+    /// The classifier, in isolation. The negatives matter as much as the positives:
+    /// `/v1/code/` is a prefix WITH its slash so `/v1/codex` is not a Remote Control
+    /// path, and the token refresh is POST-only so a GET on it is ordinary traffic.
+    #[test]
+    fn relay_mode_classifies_only_the_bypass_paths() {
+        for path in [
+            "/v1/code/",
+            "/v1/code/session/abc",
+            "/api/oauth/files/file_0123",
+            "/api/oauth/file_upload",
+        ] {
+            assert_eq!(
+                relay_mode(&Method::POST, path),
+                Some(RelayMode::ClientCredential),
+                "{path} is client-credential"
+            );
+            assert_eq!(
+                relay_mode(&Method::GET, path),
+                Some(RelayMode::ClientCredential),
+                "{path} is client-credential on GET too"
+            );
+        }
+        assert_eq!(
+            relay_mode(&Method::POST, CLIENT_TOKEN_REFRESH_PATH),
+            Some(RelayMode::Raw)
+        );
+        for (method, path) in [
+            (Method::GET, "/v1/oauth/token"), // refresh is POST-only
+            (Method::POST, "/v1/messages"),
+            (Method::GET, "/v1/models"),
+            (Method::GET, "/v1/codex"), // NOT under /v1/code/
+            (Method::GET, "/"),
+        ] {
+            assert_eq!(
+                relay_mode(&method, path),
+                None,
+                "{method} {path} must take the normal rotation path"
+            );
+        }
+    }
+
+    /// Every client-credential prefix reaches upstream carrying the CLIENT's own
+    /// `authorization` — and never the pooled account Bearer, which is what 403'd
+    /// the Remote Control stream and silently dropped claude.ai attachments.
+    #[tokio::test]
+    async fn client_credential_paths_forward_the_clients_own_credential() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        for path in [
+            "/v1/code/session/abc",
+            "/api/oauth/files/file_0123",
+            "/api/oauth/file_upload",
+        ] {
+            let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+            let (status, body) = drive(
+                manager,
+                Method::POST,
+                path,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own-token"),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path} was relayed");
+            let echo = parse_echo(&body);
+            assert_eq!(echo.path, path, "the path is forwarded verbatim");
+            assert_eq!(
+                echo.header("authorization"),
+                Some("Bearer client-own-token"),
+                "{path} must carry the client's OWN credential"
+            );
+            assert_ne!(
+                echo.header("authorization"),
+                Some("Bearer at-dummy"),
+                "{path} must never carry the pooled account token"
+            );
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// The proxy's own gate credential never leaves this process. An `x-api-key`
+    /// equal to the configured proxy key is OUR secret and is stripped; a different
+    /// one is the client's own and passes through untouched.
+    #[tokio::test]
+    async fn client_credential_strips_only_our_own_proxy_key() {
+        let (upstream, _hits) = spawn_echo_upstream().await;
+        let config = || dummy_config(Some("sk-proxy-secret"), &upstream);
+
+        let manager = Manager::with_live_refresher(config(), None);
+        let (status, body) = drive(
+            manager,
+            Method::GET,
+            "/api/oauth/files/file_0123",
+            Some(loopback_peer()),
+            &[("x-api-key", "sk-proxy-secret")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let echo = parse_echo(&body);
+        assert_eq!(
+            echo.header("x-api-key"),
+            None,
+            "our own proxy key must never reach Anthropic"
+        );
+
+        let manager = Manager::with_live_refresher(config(), None);
+        let (status, body) = drive(
+            manager,
+            Method::GET,
+            "/api/oauth/files/file_0123",
+            Some(loopback_peer()),
+            &[("x-api-key", "sk-the-clients-own")],
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let echo = parse_echo(&body);
+        assert_eq!(
+            echo.header("x-api-key"),
+            Some("sk-the-clients-own"),
+            "a key that is not ours is the client's credential and passes through"
+        );
+    }
+
+    /// `POST /v1/oauth/token` is a credential exchange that is not ours: it goes up
+    /// with NO auth header in any form (its credentials are in the body, which is
+    /// forwarded byte-for-byte) and no header we did not explicitly choose.
+    #[tokio::test]
+    async fn token_refresh_relays_raw_with_no_auth_header() {
+        let (upstream, _hits) = spawn_echo_upstream().await;
+        let manager =
+            Manager::with_live_refresher(dummy_config(Some("sk-proxy-secret"), &upstream), None);
+        let payload = r#"{"grant_type":"refresh_token","refresh_token":"rt-client"}"#;
+        let (status, body) = drive(
+            manager,
+            Method::POST,
+            "/v1/oauth/token",
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own-token"),
+                ("x-api-key", "sk-proxy-secret"),
+                ("content-type", "application/json"),
+                ("x-stainless-lang", "js"),
+            ],
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let echo = parse_echo(&body);
+        assert_eq!(echo.method, "POST");
+        assert_eq!(echo.body, payload, "the refresh body is forwarded verbatim");
+        assert_eq!(
+            echo.header("authorization"),
+            None,
+            "a raw relay sends no auth header at all"
+        );
+        assert_eq!(echo.header("x-api-key"), None, "nor our gate credential");
+        assert_eq!(echo.header("x-stainless-lang"), None, "nor anything else");
+        assert_eq!(echo.header("content-type"), Some("application/json"));
+    }
+
+    /// THE BITING TEST: a relayed request spends none of the rotation's state, and
+    /// the `/v1/messages` control in the same test proves the assertion can fail —
+    /// the identical counters DO move when a request goes the pooled-credential way,
+    /// which is also the regression guard that this change left that path alone.
+    #[tokio::test]
+    async fn rotation_state_moves_for_messages_and_never_for_a_relay() {
+        let (upstream, _hits) = spawn_echo_upstream().await;
+
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        for (method, path) in [
+            (Method::POST, "/v1/code/session/abc"),
+            (Method::GET, "/api/oauth/files/file_0123"),
+            (Method::POST, "/api/oauth/file_upload"),
+            (Method::POST, "/v1/oauth/token"),
+        ] {
+            let (status, _body) = drive(
+                Arc::clone(&manager),
+                method.clone(),
+                path,
+                Some(loopback_peer()),
+                &[("authorization", "Bearer client-own-token")],
+                "{}",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{method} {path} was relayed");
+        }
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            after.accounts[0].requests, before.accounts[0].requests,
+            "a relayed request must not be counted against any account"
+        );
+        assert_eq!(
+            after.accounts[0].last_used, before.accounts[0].last_used,
+            "nor touch its LRU key"
+        );
+        assert_eq!(after.current, before.current, "nor move the cursor");
+        assert_eq!(
+            after.sessions.len(),
+            before.sessions.len(),
+            "nor write a pin"
+        );
+
+        // The control: the same counters on the same manager, for a request that
+        // DOES go through rotation. It also re-asserts the pooled-credential
+        // contract on `/v1/messages` — the client's authorization is replaced, not
+        // forwarded.
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own-token"),
+                ("content-type", "application/json"),
+            ],
+            r#"{"model":"claude-sonnet-5"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let echo = parse_echo(&body);
+        assert_eq!(
+            echo.header("authorization"),
+            Some("Bearer at-dummy"),
+            "/v1/messages still carries the POOLED token"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+            1,
+            "…and is counted against the serving account"
+        );
+    }
+
+    /// Anything under the proxy's own prefix that is not a registered route is
+    /// answered LOCALLY. The hit counter is the assertion that matters: a fall-through
+    /// would have sent a proxy-private path to Anthropic with a pooled Bearer on it.
+    #[tokio::test]
+    async fn unknown_local_paths_are_answered_locally() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        for (method, uri) in [
+            (Method::GET, "/_tcr/status-typo"),
+            (Method::GET, "/_tcr/status/extra"),
+            (Method::POST, "/_tcr/anything-else"),
+            (Method::GET, "/_tcr/"),
+            (Method::GET, "/_tcr"),
+            (Method::GET, "/_tcr/status?x=1&y=2/../nope"),
+        ] {
+            let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+            let (status, body) = drive(
+                Arc::clone(&manager),
+                method.clone(),
+                uri,
+                Some(loopback_peer()),
+                &[],
+                "",
+            )
+            .await;
+            let text = String::from_utf8_lossy(&body);
+            // `/_tcr/status?…` IS a registered route (the query does not change the
+            // path), so it is served; every other shape is a local 404. Neither is
+            // ever forwarded, which is the single claim this test makes.
+            if uri.starts_with("/_tcr/status?") {
+                assert_eq!(status, StatusCode::OK, "{uri} is the real status route");
+            } else {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri} → local 404");
+                assert!(
+                    text.contains("not_found_error"),
+                    "in the standard error envelope: {text}"
+                );
+            }
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+                0,
+                "{uri} spent no account"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no `/_tcr/…` request may ever reach an upstream"
+        );
+    }
+
+    /// The relays bypass ROTATION, not the api-key gate. A non-loopback caller with
+    /// no key is refused before anything is forwarded — relaying for an
+    /// unauthenticated caller would be a new hole, not a fix.
+    #[tokio::test]
+    async fn relay_paths_stay_behind_the_api_key_gate() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        for (method, path) in [
+            (Method::POST, "/v1/code/session/abc"),
+            (Method::GET, "/api/oauth/files/file_0123"),
+            (Method::POST, "/v1/oauth/token"),
+        ] {
+            let manager = Manager::with_live_refresher(
+                dummy_config(Some("sk-proxy-secret"), &upstream),
+                None,
+            );
+            let (status, _body) = drive(
+                manager,
+                method.clone(),
+                path,
+                Some(remote_peer()),
+                &[("authorization", "Bearer client-own-token")],
+                "{}",
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "keyless remote {method} {path} must be refused"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a refused caller's request never reached upstream"
+        );
     }
 
     /// key_matches behaviour is preserved after the length side-channel fix:
