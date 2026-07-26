@@ -82,6 +82,44 @@ const _: () = assert!(
     "soft-wait cap must stay below retry_after_hint's None=>60 sentinel"
 );
 
+/// Anthropic's non-standard `529 Overloaded`. Not in [`StatusCode`]'s constants
+/// (it is outside the IANA registry), so it is compared as a raw `u16`.
+const STATUS_OVERLOADED: u16 = 529;
+/// How many times one account may be retried IN PLACE on a `529 Overloaded`
+/// before the status is forwarded to the client. Counts RETRIES, not attempts —
+/// same semantics as [`MAX_SAME_ACCOUNT_429`] — so the budget is `1 + this`
+/// upstream sends on that account.
+const MAX_SAME_ACCOUNT_529_RETRIES: u32 = 2;
+/// Base of the escalating 529 backoff: retry `n` waits `BASE << n` seconds
+/// (1s, 2s), so the no-`retry-after` ladder adds 3s to a request at worst.
+const RETRY_529_BASE_BACKOFF_SECS: i64 = 1;
+/// Ceiling on ANY single 529 backoff, including a server-supplied `retry-after`.
+/// With [`MAX_SAME_ACCOUNT_529_RETRIES`] this bounds the total added latency at
+/// 8s — deliberately single-digit, because the in-flight guard is held across
+/// the wait (see the 529 arm in [`handle`]).
+const RETRY_529_MAX_BACKOFF_SECS: i64 = 4;
+
+/// Backoff (seconds) before the `retried`-th in-place retry of a `529 Overloaded`.
+///
+/// The ladder is exponential from [`RETRY_529_BASE_BACKOFF_SECS`] — 1s, 2s — so a
+/// briefly-overloaded upstream is retried almost immediately while a persistently
+/// overloaded one is not hammered. A `retry-after` is HONOURED as a FLOOR (the
+/// server knows how long it needs better than the ladder does) but CLAMPED to
+/// [`RETRY_529_MAX_BACKOFF_SECS`]: an overloaded upstream asking for 300s must
+/// never park a client connection — and the per-account in-flight slot it holds —
+/// for minutes. Past the clamp the honest answer is to forward the 529 and let
+/// the client decide. Pure — unit-tested.
+fn backoff_529_secs(retried: u32, retry_after: Option<i64>) -> u64 {
+    // `min(16)` keeps the shift defined for any counter; the clamp below makes
+    // every value past the first couple of rungs collapse to the ceiling anyway.
+    let ladder = RETRY_529_BASE_BACKOFF_SECS.saturating_mul(1i64 << retried.min(16));
+    let secs = match retry_after {
+        Some(hint) => hint.max(ladder),
+        None => ladder,
+    };
+    secs.clamp(1, RETRY_529_MAX_BACKOFF_SECS) as u64
+}
+
 /// How a transient (non-quota-rejected) 429 should be handled.
 #[derive(Debug, PartialEq, Eq)]
 enum Transient429 {
@@ -359,6 +397,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let mut forced_401: HashSet<usize> = HashSet::new();
     // Per-account inline-429 retry counters.
     let mut retried_429: HashMap<usize, u32> = HashMap::new();
+    // Per-account in-place 529 retry counters. Separate from `retried_429`: a 429
+    // is "this account is over quota" and may rotate, a 529 is "the upstream is
+    // busy" and must not — sharing one counter would let one status spend the
+    // other's budget.
+    let mut retried_529: HashMap<usize, u32> = HashMap::new();
     // Distinguishes "no account available" (429) from "every attempt hit a
     // transport failure" (502) once the loop can no longer make progress.
     //
@@ -649,6 +692,55 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     continue;
                 }
             }
+        }
+
+        // 529 Overloaded → the UPSTREAM is busy, not this account. Retry the SAME
+        // account after a short escalating backoff rather than handing the error to
+        // the client. Measured live 2026-07-26: 256 of the last 4,963 upstream
+        // responses were 529 (5.2%), every one of them surfaced in Claude Code as a
+        // failed request the user re-sent by hand.
+        //
+        // Deliberately NOT a rotation. `tried` is untouched, `mark_rate_limited` is
+        // never called, and the pin does not move: a 529 says the SERVER is
+        // saturated, not that this account is over quota, so failing over cannot
+        // help — it would only abandon this account's warm prompt cache and pay a
+        // cold one elsewhere for nothing. (`clear_rate_limited` above already ran,
+        // since 529 != 429, so eligibility is unchanged either way.)
+        //
+        // Latency: the in-flight guard taken at the top of this iteration is HELD
+        // across the backoff, so a retrying request keeps its per-account
+        // concurrency slot. That is why the ladder is bounded hard —
+        // MAX_SAME_ACCOUNT_529_RETRIES waits, each clamped to
+        // RETRY_529_MAX_BACKOFF_SECS — for at most 8s of added latency per request
+        // (3s when the upstream sends no `retry-after`). Single-digit by
+        // construction: a slot must never be parked for minutes on a server hint.
+        //
+        // On budget exhaustion this does NOT return. Control falls through to the
+        // terminal-outcome arm below, so the client sees the 529 forwarded verbatim
+        // — byte-identical to the behaviour before this arm existed.
+        if status.as_u16() == STATUS_OVERLOADED {
+            let retried = retried_529.entry(idx).or_insert(0);
+            if *retried < MAX_SAME_ACCOUNT_529_RETRIES {
+                let backoff = backoff_529_secs(*retried, parse_retry_after(&up_headers));
+                *retried += 1;
+                tracing::warn!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    retry = *retried,
+                    max_retries = MAX_SAME_ACCOUNT_529_RETRIES,
+                    backoff_secs = backoff,
+                    "upstream 529 Overloaded — backing off and retrying the SAME account"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                retry_same = Some(idx);
+                continue; // retry the same account after the bounded backoff
+            }
+            tracing::warn!(
+                account = account_name.as_deref().unwrap_or("?"),
+                account_index = idx,
+                attempts = *retried + 1,
+                "upstream 529 Overloaded — retry budget spent, forwarding 529 to the client"
+            );
         }
 
         // Terminal outcome (2xx, or a 3xx/4xx/5xx forwarded verbatim). Count the
@@ -1211,6 +1303,66 @@ mod tests {
         assert_eq!(
             classify_transient_429(Some(0), 0, 3),
             Transient429::InlineWait(1)
+        );
+    }
+
+    #[test]
+    fn backoff_529_ladder_escalates_then_clamps() {
+        assert_eq!(
+            backoff_529_secs(0, None),
+            1,
+            "first retry is near-immediate"
+        );
+        assert_eq!(backoff_529_secs(1, None), 2, "the ladder doubles");
+        assert_eq!(
+            backoff_529_secs(2, None),
+            4,
+            "third rung reaches the ceiling"
+        );
+        assert_eq!(
+            backoff_529_secs(9, None),
+            RETRY_529_MAX_BACKOFF_SECS as u64,
+            "a rung past the ceiling clamps rather than overflowing the shift"
+        );
+    }
+
+    #[test]
+    fn backoff_529_honours_retry_after_as_a_floor_but_clamps_it() {
+        assert_eq!(
+            backoff_529_secs(0, Some(3)),
+            3,
+            "a server hint longer than the rung wins — the upstream knows its own load"
+        );
+        assert_eq!(
+            backoff_529_secs(1, Some(1)),
+            2,
+            "a hint SHORTER than the rung must not defeat the escalation"
+        );
+        assert_eq!(
+            backoff_529_secs(0, Some(300)),
+            RETRY_529_MAX_BACKOFF_SECS as u64,
+            "an arbitrary server-supplied wait is clamped — it holds an in-flight slot"
+        );
+        assert_eq!(
+            backoff_529_secs(0, Some(0)),
+            1,
+            "a zero/absurd hint still waits the rung, never busy-loops"
+        );
+        assert_eq!(backoff_529_secs(0, Some(-5)), 1, "negative hints too");
+    }
+
+    /// The in-flight guard is held across every 529 backoff, so the ladder's TOTAL
+    /// is a latency budget, not just a per-step one. This is the assertion that
+    /// fails if someone raises the retry count or the per-step ceiling without
+    /// re-reading the comment on the 529 arm.
+    #[test]
+    fn backoff_529_worst_case_total_stays_single_digit() {
+        let worst: u64 = (0..MAX_SAME_ACCOUNT_529_RETRIES)
+            .map(|n| backoff_529_secs(n, Some(i64::MAX)))
+            .sum();
+        assert!(
+            worst < 10,
+            "529 retries hold an in-flight slot; worst-case added latency was {worst}s"
         );
     }
 
@@ -2012,9 +2164,21 @@ mod tests {
     /// reply must send `connection: close` so the client pool cannot reuse a socket
     /// and attempt N is always connection N.
     async fn spawn_scripted_upstream(script: Vec<Option<String>>) -> SocketAddr {
+        spawn_counted_upstream(script).await.0
+    }
+
+    /// [`spawn_scripted_upstream`] plus a live count of accepted connections —
+    /// i.e. of upstream ATTEMPTS. Retries are invisible in the account stats (only
+    /// the terminal outcome is recorded), so a test that must pin the exact number
+    /// of sends reads it here instead of inferring it from the client's status.
+    async fn spawn_counted_upstream(
+        script: Vec<Option<String>>,
+    ) -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
         tokio::spawn(async move {
             let mut n = 0usize;
             loop {
@@ -2025,6 +2189,7 @@ mod tests {
                 // is spawned, so it cannot race with a concurrent handler.
                 let reply = script.get(n).or_else(|| script.last()).cloned().flatten();
                 n += 1;
+                counter.store(n, std::sync::atomic::Ordering::SeqCst);
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let _ = sock.read(&mut buf).await;
@@ -2039,7 +2204,7 @@ mod tests {
                 });
             }
         });
-        addr
+        (addr, attempts)
     }
 
     /// A `200 OK` with a minimal JSON usage body.
@@ -2060,6 +2225,19 @@ mod tests {
         format!(
             "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\
              retry-after: {retry_after}\r\nanthropic-ratelimit-unified-status: rejected\r\n\r\n"
+        )
+    }
+
+    /// A `529 Overloaded` shaped like Anthropic's — the status the retry ladder
+    /// exists for. Carries NO `retry-after` (the live captures do not), so the
+    /// backoff comes from the ladder alone and the test's timing is deterministic.
+    fn raw_529() -> String {
+        let body =
+            br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#;
+        format!(
+            "HTTP/1.1 529 \r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
         )
     }
 
@@ -2085,6 +2263,27 @@ mod tests {
             Arc::new(crate::warmer::LiveWarmer::new()),
             None,
         )
+    }
+
+    /// [`post_one`] plus the client-visible BODY — for asserting that a status the
+    /// proxy gives up on is forwarded verbatim, not replaced by a synthesized one.
+    async fn post_one_with_body(manager: Arc<Manager>) -> (u16, String) {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(manager)).await;
+        });
+        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        (status, resp.text().await.unwrap())
     }
 
     /// Serve `manager` on a fresh loopback listener and POST one `/v1/messages`,
@@ -2195,6 +2394,161 @@ mod tests {
         assert_eq!(
             total, 0,
             "a transport failure serves nothing, so nothing counts"
+        );
+    }
+
+    /// A 529 is transient upstream overload, so it is retried IN PLACE — the client
+    /// sees the eventual 200 instead of an error it has to re-send by hand.
+    ///
+    /// The fleet has two accounts and selection is LRU, so a fresh fleet picks `a`
+    /// first and would pick `b` on any rotation. Scripting `529` then `200` makes
+    /// the two behaviours distinguishable in the stats: retry-in-place credits `a`
+    /// with the 200, a rotation credits `b`. Before this arm existed the client got
+    /// the 529 straight through and neither account served anything.
+    #[tokio::test]
+    async fn overloaded_529_retries_the_same_account() {
+        let up_addr = spawn_scripted_upstream(vec![
+            Some(raw_529()), // attempt 1 — upstream reports itself overloaded
+            Some(raw_200()), // attempt 2 — the SAME account, after the backoff
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 200,
+            "a 529 is transient — the retry must serve the client the 200 rather \
+             than surfacing an error it has to re-send by hand"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let served: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.requests > 0)
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            ["a"],
+            "the retry must reuse the account that 529'd — landing on `b` means the \
+             529 rotated and threw away a warm prompt cache for nothing"
+        );
+        let a = snap.accounts.iter().find(|a| a.name == "a").unwrap();
+        assert_eq!(
+            a.requests, 1,
+            "only the terminal outcome counts: a retried 529 is not a served request"
+        );
+    }
+
+    /// The ladder is bounded, and on exhaustion the 529 is forwarded VERBATIM —
+    /// the pre-fix behaviour, just later. Both halves run concurrently because each
+    /// pays the real 1s + 2s backoff.
+    ///
+    /// Two scripts pin the attempt count from both sides: with the budget exactly
+    /// spent the third send lands on a scripted 200 (proving both retries ran), and
+    /// with one 529 too many the fourth send never happens, so the 200 behind it is
+    /// unreachable and the client gets the 529.
+    #[tokio::test]
+    async fn overloaded_529_gives_up_after_the_budget() {
+        let exact = async {
+            let up_addr = spawn_scripted_upstream(vec![
+                Some(raw_529()),
+                Some(raw_529()),
+                Some(raw_200()), // reachable only if BOTH retries fire
+            ])
+            .await;
+            post_one(fleet(up_addr, &["a"])).await
+        };
+        let over = async {
+            let (up_addr, attempts) = spawn_counted_upstream(vec![
+                Some(raw_529()),
+                Some(raw_529()),
+                Some(raw_529()),
+                Some(raw_200()), // must stay unreachable — the budget is spent
+            ])
+            .await;
+            let (status, body) = post_one_with_body(fleet(up_addr, &["a"])).await;
+            (
+                status,
+                body,
+                attempts.load(std::sync::atomic::Ordering::SeqCst),
+            )
+        };
+        let (exact_status, (over_status, over_body, over_attempts)) = tokio::join!(exact, over);
+
+        assert_eq!(
+            exact_status, 200,
+            "the budget is {MAX_SAME_ACCOUNT_529_RETRIES} retries — the third send \
+             must still happen and serve the client"
+        );
+        assert_eq!(
+            over_status, 529,
+            "one 529 past the budget must terminate, not retry forever — the \
+             scripted 200 behind it proves the send never happened"
+        );
+        assert_eq!(
+            over_attempts,
+            MAX_SAME_ACCOUNT_529_RETRIES as usize + 1,
+            "the ladder is exactly one send plus {MAX_SAME_ACCOUNT_529_RETRIES} retries"
+        );
+        assert!(
+            over_body.contains("overloaded_error"),
+            "give-up forwards the upstream 529 verbatim, exactly as before this arm \
+             existed; a synthesized body would break clients that parse it. Got: {over_body}"
+        );
+    }
+
+    /// The constraint that makes this a retry and not a failover: a 529 must not
+    /// rotate, must not consume the account's eligibility, and must not arm a
+    /// rate-limit hold. It means "the server is busy", never "this account is over
+    /// quota" — and rotating on it would pay a cold prompt cache to reach an
+    /// upstream that is equally overloaded.
+    ///
+    /// `a` 529s through its whole budget while a 200 sits in the very next script
+    /// slot. Any rotation would hand that 200 to `b` and the client would see 200,
+    /// so the 529 here is the proof that `b` was never reached.
+    #[tokio::test]
+    async fn overloaded_529_does_not_rotate_or_hold() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_529()),
+            Some(raw_529()),
+            Some(raw_529()),
+            Some(raw_200()), // a rotation to `b` would serve this
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 529,
+            "the 529 budget is per-account and never rotates, so the client gets \
+             `a`'s forwarded 529 even though `b` was idle"
+        );
+        // Without this the test passes vacuously on a proxy that never retries at
+        // all: one 529 forwarded straight through leaves `b` idle and unheld too.
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_SAME_ACCOUNT_529_RETRIES as usize + 1,
+            "exactly one initial send plus {MAX_SAME_ACCOUNT_529_RETRIES} retries, \
+             all of them on `a`"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        let b = snap.accounts.iter().find(|x| x.name == "b").unwrap();
+        assert_eq!(
+            b.requests, 0,
+            "no rotation: a 529 must never mark the account tried and fail over"
+        );
+        assert_eq!(
+            a.requests, 1,
+            "the forwarded 529 counts once — the retries must not each count as served"
+        );
+        assert!(
+            a.rate_limited_until.is_none(),
+            "a 529 is upstream overload, not a quota rejection: it must never arm a \
+             rate-limit hold that would bench the account for later requests"
         );
     }
 
