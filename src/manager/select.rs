@@ -106,6 +106,11 @@ impl Manager {
         // The fourth — over the utilization threshold — does not divert at all; the
         // fast-path below serves the pin and returns.
         let mut keep_pin: Option<usize> = None;
+        // WHY the pin was kept while another account serves, carried down to the
+        // re-pin at the bottom because only there are BOTH the kept pin and the
+        // account actually serving known. `None` means no divert happened. Purely
+        // for the log line — nothing branches on it.
+        let mut divert_reason: Option<&'static str> = None;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
         // the pin under the affinity lock, then DROP that lock before taking the
@@ -143,6 +148,7 @@ impl Manager {
                         .is_some_and(|a| Self::account_hard_ok(a, now_ms))
                     {
                         keep_pin = Some(idx);
+                        divert_reason = Some("pin-tried");
                     }
                 } else {
                     let count_x = counts.get(&idx).copied().unwrap_or(0);
@@ -247,8 +253,16 @@ impl Manager {
                                 None
                             } else if held_briefly || model_blocked || paced_out {
                                 // Yield this ONE request to the fall-through pick; the
-                                // re-pin at the bottom re-inserts the OLD index.
+                                // re-pin at the bottom re-inserts the OLD index and now
+                                // logs WHICH of the three per-request gates diverted it.
                                 keep_pin = Some(idx);
+                                divert_reason = Some(if held_briefly {
+                                    "short-hold"
+                                } else if model_blocked {
+                                    "model-class"
+                                } else {
+                                    "paced"
+                                });
                                 None
                             } else {
                                 let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
@@ -478,6 +492,26 @@ impl Manager {
                     new_name
                 );
             }
+            // The SOFT counterpart, and until now it emitted nothing at all: the pin
+            // survived, a DIFFERENT account served, and no line said so — which is why
+            // off-pin serves were unattributable in the live logs. Normally exclusive
+            // with `moved_off` (a divert re-inserts the OLD index, so `previous ==
+            // pin_idx` and `moved_off` is `None`); a concurrent select that re-pinned
+            // this session between the two reads can make both fire, which is two
+            // honest lines about one request, not a defect. The accounts lock is taken
+            // only after the affinity lock dropped above — never nested.
+            if let Some(reason) = divert_reason {
+                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
+                let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+                tracing::info!(
+                    "affinity: divert session {} pin {} -> serving {} (reason={}, pin kept)",
+                    short_session_id(key),
+                    pin_name,
+                    serve_name,
+                    reason
+                );
+            }
         }
         best
     }
@@ -557,38 +591,49 @@ impl Manager {
                 pins.get(&key).map(|&(idx, _)| idx)
             };
             if let Some(idx) = pinned {
-                if !tried.contains(&idx) {
-                    let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-                    if accounts.get(idx).is_some_and(&hard_ok) {
-                        let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                        let util = accounts
-                            .get(idx)
-                            .map(|a| a.quota.max_utilization(now, is_fable))
-                            .unwrap_or_default();
-                        if let Some(account) = accounts.get_mut(idx) {
-                            account.last_selected_seq = tick;
-                            tracing::info!(
-                                account = %account.name,
-                                utilization = util,
-                                is_fable,
-                                "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
-                            );
-                        }
-                        return Some(idx);
-                    }
-                    // The pin cannot serve THIS request → fall through to the fallback
-                    // path (lock drops at the end of this scope, before the affinity
-                    // lock below). Whether that fall-through also MOVES the pin depends
-                    // on WHY: a model-class block leaves the account alive for every
-                    // other class, and a short hold leaves it alive for every LATER
-                    // request, so in both cases the pin stays; only an ACCOUNT-level
-                    // block is a durable re-key.
-                    if accounts
+                let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+                // `tried` gates SERVING and nothing else: the pin already failed THIS
+                // request upstream, so it cannot answer it. Whether the PIN MOVES is
+                // decided below, on ACCOUNT-level evidence alone — see the comment
+                // there.
+                if !tried.contains(&idx) && accounts.get(idx).is_some_and(&hard_ok) {
+                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                    let util = accounts
                         .get(idx)
-                        .is_some_and(|a| Self::account_hard_ok(a, now_ms))
-                    {
-                        keep_pin = Some(idx);
+                        .map(|a| a.quota.max_utilization(now, is_fable))
+                        .unwrap_or_default();
+                    if let Some(account) = accounts.get_mut(idx) {
+                        account.last_selected_seq = tick;
+                        tracing::info!(
+                            account = %account.name,
+                            utilization = util,
+                            is_fable,
+                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                        );
                     }
+                    return Some(idx);
+                }
+                // The pin cannot serve THIS request → fall through to the fallback
+                // path (lock drops at the end of this scope, before the affinity
+                // lock below). Whether that fall-through also MOVES the pin depends
+                // on WHY: a model-class block leaves the account alive for every
+                // other class, a short hold leaves it alive for every LATER request,
+                // and membership in `tried` says only that ONE request failed on it
+                // — none of the three is evidence the account is gone, so in all of
+                // them the pin stays. Only an ACCOUNT-level HARD block is a durable
+                // re-key.
+                //
+                // This test used to sit INSIDE `if !tried.contains(&idx)`, so a pin
+                // that merely failed this one request left `keep_pin` at `None` and
+                // the fallback's `pins.insert` re-keyed the session for good — a
+                // transient blip throwing away a warm prompt cache. `select()` takes
+                // the opposite decision on the identical fact and documents why
+                // (see its affinity fast-path); the two now agree.
+                if accounts
+                    .get(idx)
+                    .is_some_and(|a| Self::account_hard_ok(a, now_ms))
+                {
+                    keep_pin = Some(idx);
                 }
             }
         }
@@ -648,8 +693,36 @@ impl Manager {
         // its next request of another class. No size-cap eviction here because a
         // revalidation serve only ever touches an EXISTING session's pin.
         if let Some(key) = affinity {
-            let mut pins = self.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (keep_pin.unwrap_or(idx), now_ms));
+            let pin_idx = keep_pin.unwrap_or(idx);
+            let previous = {
+                let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                let previous = pins.get(&key).map(|&(i, _)| i);
+                pins.insert(key, (pin_idx, now_ms));
+                previous
+            };
+            // Until now this arm emitted nothing, so a request served off-pin by the
+            // fallback was unattributable: the logs showed a serve on an account the
+            // session was not pinned to and no line explaining it. One greppable line
+            // carrying the same `reason=` field as `select()`'s divert log, so all
+            // four reasons grep together. It says KEPT or RE-KEYED rather than
+            // assuming a divert, because this arm does both: `keep_pin` set means the
+            // pin stayed and another account served; `keep_pin` unset means the
+            // fallback account became the new pin. The accounts lock is taken only
+            // after the affinity lock has dropped above — never simultaneously.
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
+            let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+            tracing::info!(
+                "affinity: revalidation session {} pin {} -> serving {} (reason=revalidation-fallback, pin {})",
+                short_session_id(key),
+                pin_name,
+                serve_name,
+                if previous.is_some_and(|p| p != pin_idx) {
+                    "re-keyed"
+                } else {
+                    "kept"
+                }
+            );
         }
         Some(idx)
     }

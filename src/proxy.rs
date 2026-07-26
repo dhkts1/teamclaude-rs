@@ -361,7 +361,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let mut retried_429: HashMap<usize, u32> = HashMap::new();
     // Distinguishes "no account available" (429) from "every attempt hit a
     // transport failure" (502) once the loop can no longer make progress.
-    let mut saw_network_error = false;
+    //
+    // These were ONE BOOL, and that was the bug: any single `send()` failure
+    // latched it for the rest of the request, and the check sits BEFORE both the
+    // soft-wait and the revalidation-serve — so one transport blip on one account
+    // disabled the entire recovery ladder and returned a 502 whose message ("every
+    // account transport-failed") was simply false. Observed live 09:16:46: the 502
+    // fired while two accounts had already answered with honest 429s and a third
+    // served a 200 1.6s later. Counting BOTH outcomes keeps the 502 for the only
+    // case it actually describes — nothing ever reached an upstream at all.
+    let mut transport_failures = 0usize;
+    let mut upstream_responses = 0usize;
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = account_count.saturating_mul(2).saturating_add(4).max(1);
     // A genuine same-account retry (401 force-refresh, transient-429 wait) parks
@@ -378,8 +388,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             None => match manager.select(&tried, now, request_model.as_deref(), session_key) {
                 Some(idx) => idx,
                 None => {
-                    if saw_network_error {
-                        return bad_gateway();
+                    if every_attempt_transport_failed(transport_failures, upstream_responses) {
+                        return bad_gateway(transport_failures);
                     }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
                     // Rather than telling the client "all exhausted" for a transient
@@ -501,6 +511,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             builder = builder.body(out_body);
         }
 
+        // Fetch the serving account's name once per iteration — reused by the
+        // transport-failure warning, the upstream-response line, and, on the
+        // terminal path, by push_log (was two read-locks + clones back-to-back).
+        // Hoisted ABOVE the send so the transport-failure arm can name the account
+        // it failed on — that arm used to log nothing at any level.
+        let account_name = manager.account_name(idx);
+
         // Global outbound throttle: pace the AGGREGATE egress so a cold fan-out
         // cannot burst the shared upstream limiter. Inert unless configured. Placed
         // after account selection/token so only real sends consume a slot; both the
@@ -508,19 +525,33 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // every retry is paced automatically.
         manager.throttle_send().await;
 
-        let Ok(resp) = builder.send().await else {
-            // Transport failure is not proof of a bad credential — fail this
-            // request over to another account, keep this one eligible.
-            saw_network_error = true;
-            tried.insert(idx);
-            continue;
+        let resp = match builder.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                // Transport failure is not proof of a bad credential — fail this
+                // request over to another account, keep this one eligible. The
+                // `reqwest::Error` used to be discarded by a `let Ok(..) else`,
+                // so a 502 assembled out of these failures had no line anywhere to
+                // attribute it to; `is_connect` / `is_timeout` separate "never
+                // reached the host" from "the host went quiet mid-request".
+                transport_failures += 1;
+                tracing::warn!(
+                    account_index = idx,
+                    account = account_name.as_deref().unwrap_or("?"),
+                    is_connect = err.is_connect(),
+                    is_timeout = err.is_timeout(),
+                    error = %err,
+                    "upstream transport failure — rotating to another account"
+                );
+                tried.insert(idx);
+                continue;
+            }
         };
+        // This attempt reached an upstream and got an HTTP status back, whatever it
+        // was. That fact alone disproves "every account transport-failed".
+        upstream_responses += 1;
 
         let status = resp.status();
-        // Fetch the serving account's name once per iteration — reused by the log
-        // line below and, on the terminal path, by push_log (was two read-locks +
-        // clones back-to-back).
-        let account_name = manager.account_name(idx);
         // One greppable line per upstream response, tagged with the true serving
         // account and outcome status. "serving request" logs BEFORE the outcome, so
         // without this the logs are status-blind — the gap that hid the 401 storm.
@@ -726,10 +757,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         return build_response(status, &up_headers, Body::from(bytes));
     }
 
-    // Ran out of attempts while still rotating — treat repeated transport
-    // failures as a bad gateway, otherwise as exhausted quota.
-    if saw_network_error {
-        bad_gateway()
+    // Ran out of attempts while still rotating — a bad gateway only if transport
+    // failure was the WHOLE story (same rule as the mid-loop check above);
+    // otherwise an upstream did answer us and the honest verdict is exhausted quota.
+    if every_attempt_transport_failed(transport_failures, upstream_responses) {
+        bad_gateway(transport_failures)
     } else {
         exhausted_response(
             &manager,
@@ -1044,13 +1076,33 @@ fn exhausted_response(
     )
 }
 
-/// 502 when every attempt hit a transport failure (upstream unreachable).
-fn bad_gateway() -> Response {
-    tracing::warn!("returning 502 to client — every account transport-failed");
+/// Whether a 502 is the honest verdict: at least one attempt failed in transport
+/// AND no attempt ever came back with an upstream HTTP status. Every attempt that
+/// gets as far as the send either fails in transport or yields a response, so
+/// `upstream_responses == 0` is exactly "transport failure accounts for all of
+/// them" — the only state `bad_gateway`'s message describes truthfully.
+///
+/// A 429, a 5xx, even a 401 is an upstream ANSWER: it proves the network path
+/// works and that the right verdict for this request is quota exhaustion (or a
+/// forwarded status), never "upstream unreachable". Keeping the two counts apart
+/// is what lets one blip rotate away instead of collapsing the recovery ladder.
+fn every_attempt_transport_failed(transport_failures: usize, upstream_responses: usize) -> bool {
+    transport_failures > 0 && upstream_responses == 0
+}
+
+/// 502 when every attempt hit a transport failure (upstream unreachable). Gated
+/// by [`every_attempt_transport_failed`], and the count is in the message so the
+/// line states what was actually observed rather than asserting a fleet-wide
+/// claim it cannot support.
+fn bad_gateway(transport_failures: usize) -> Response {
+    tracing::warn!(
+        transport_failures,
+        "returning 502 to client — every attempt failed in transport, none reached an upstream"
+    );
     error_response(
         StatusCode::BAD_GATEWAY,
         "proxy_error",
-        "Upstream unreachable after trying every account.",
+        &format!("Upstream unreachable: all {transport_failures} attempt(s) failed in transport."),
         None,
     )
 }
@@ -1949,6 +2001,222 @@ mod tests {
         assert_eq!(
             serving.cache_read_tokens, 1000,
             "500 cache-read per request, twice"
+        );
+    }
+
+    /// A fake upstream that answers by CONNECTION ORDINAL, so one test can script the
+    /// exact per-attempt sequence the rotation loop sees. `None` = read the request
+    /// and hang up without replying, which the client surfaces as a TRANSPORT failure
+    /// (the shape the 502 decision turns on); `Some(raw)` = write `raw` verbatim.
+    /// Connections past the end of the script reuse the last entry. Every scripted
+    /// reply must send `connection: close` so the client pool cannot reuse a socket
+    /// and attempt N is always connection N.
+    async fn spawn_scripted_upstream(script: Vec<Option<String>>) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut n = 0usize;
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                // Ordinal is assigned in ACCEPT order, before the per-connection task
+                // is spawned, so it cannot race with a concurrent handler.
+                let reply = script.get(n).or_else(|| script.last()).cloned().flatten();
+                n += 1;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    match reply {
+                        Some(raw) => {
+                            let _ = sock.write_all(raw.as_bytes()).await;
+                        }
+                        // Drop with no reply: "connection closed before message
+                        // completed" on the client side — a transport error.
+                        None => drop(sock),
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// A `200 OK` with a minimal JSON usage body.
+    fn raw_200() -> String {
+        let body = br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+    }
+
+    /// A `429` reporting DURABLE quota rejection. `is_quota_rejected` matches on
+    /// `unified-status: rejected`, which is the ONE 429 arm that parks the account
+    /// and rotates with no inline sleep — so a test using it stays fast and has no
+    /// timing dependency.
+    fn raw_429_rejected(retry_after: u32) -> String {
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\
+             retry-after: {retry_after}\r\nanthropic-ratelimit-unified-status: rejected\r\n\r\n"
+        )
+    }
+
+    /// Boot an N-account fleet (all cloned from `dummy`) pointed at `upstream`.
+    fn fleet(upstream: SocketAddr, names: &[&str]) -> Arc<Manager> {
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+        let mut config = dummy_config(None, &format!("http://{upstream}"));
+        for name in names {
+            let mut extra = config.accounts[0].clone();
+            extra.name = (*name).to_string();
+            config.accounts.push(extra);
+        }
+        config.accounts.remove(0); // keep exactly `names`, in order
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// Serve `manager` on a fresh loopback listener and POST one `/v1/messages`,
+    /// returning the client-visible status.
+    async fn post_one(manager: Arc<Manager>) -> u16 {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(manager)).await;
+        });
+        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    /// R2 — ONE transport blip must not disable the whole recovery ladder.
+    ///
+    /// The counter this asserts on used to be a BOOL (`saw_network_error`) set by any
+    /// `send()` failure and never cleared, checked BEFORE both the soft-wait and the
+    /// revalidation-serve. So a single blip on a single account short-circuited every
+    /// recovery path for the rest of the request and returned a 502 claiming "every
+    /// account transport-failed" — false, and observed live at 09:16:46 while two
+    /// accounts had already answered with honest 429s and a third served a 200 1.6s
+    /// later.
+    ///
+    /// The scripted sequence is exactly that shape: `a` blips, `b` answers with a
+    /// durable 429 (an upstream ANSWER — proof the network path works), and `c` is
+    /// over the SOFT threshold so normal `select` benches it while the
+    /// revalidation-serve may still use it. Reaching `c` at all requires surviving
+    /// the check the bool used to fail. Old code: 502. New code: `c` serves a 200.
+    #[tokio::test]
+    async fn transport_blip_does_not_disable_recovery() {
+        let up_addr = spawn_scripted_upstream(vec![
+            None,                        // attempt 1 — `a` fails in transport
+            Some(raw_429_rejected(120)), // attempt 2 — `b` answers, durably 429
+            Some(raw_200()),             // attempt 3 — `c` serves via revalidation
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b", "c"]);
+
+        // Drive `c` OVER the soft switch threshold (0.90 in `dummy_config`) on the
+        // shared weekly window with a reset 48h out, via the same public path a real
+        // upstream response takes. `select` now benches it — so attempts 1 and 2 must
+        // land on `a`/`b` — while `select_revalidation` still allows it, since an
+        // over-threshold `allowed_warning` account is a SOFT block, not a hard one.
+        let mut over = HeaderMap::new();
+        over.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            HeaderValue::from_static("0.99"),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            HeaderValue::from_str(&(crate::now_ms() / 1000 + 172_800).to_string()).unwrap(),
+        );
+        over.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed_warning"),
+        );
+        manager.update_quota(2, &over);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 200,
+            "one transport blip alongside a real upstream 429 must not synthesize a \
+             502 — the recovery ladder still had a servable account"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let served: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.requests > 0)
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            ["c"],
+            "the revalidation-serve account must be the one that served, exactly once"
+        );
+    }
+
+    /// R2 over-correction guard — when transport failure really IS the whole story,
+    /// the 502 stays. Every account hangs up without replying, so no attempt ever
+    /// reaches an upstream HTTP status and `every_attempt_transport_failed` holds.
+    /// This is what stops the fix above from turning a genuinely unreachable upstream
+    /// into a misleading 429.
+    #[tokio::test]
+    async fn all_transport_failures_still_502() {
+        let up_addr = spawn_scripted_upstream(vec![None]).await; // every connection blips
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 502,
+            "no attempt reached an upstream at all — 502 is the honest verdict"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let total: u64 = snap.accounts.iter().map(|a| a.requests).sum();
+        assert_eq!(
+            total, 0,
+            "a transport failure serves nothing, so nothing counts"
+        );
+    }
+
+    /// The 502 predicate itself, over the four states the two counters can be in.
+    /// The bug was that the second row returned `true`.
+    #[test]
+    fn bad_gateway_only_when_nothing_reached_an_upstream() {
+        assert!(
+            every_attempt_transport_failed(2, 0),
+            "blips only, nothing answered → 502"
+        );
+        assert!(
+            !every_attempt_transport_failed(1, 1),
+            "an upstream answered → the blip is not the whole story (the live bug)"
+        );
+        assert!(
+            !every_attempt_transport_failed(0, 3),
+            "no transport failure at all → never a 502"
+        );
+        assert!(
+            !every_attempt_transport_failed(0, 0),
+            "no attempt made → exhausted, not unreachable"
         );
     }
 
