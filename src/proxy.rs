@@ -1086,7 +1086,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 }
                 chunk
             });
-            return build_response(status, &up_headers, Body::from_stream(passthrough));
+            return build_response(
+                status,
+                &up_headers,
+                Body::from_stream(passthrough),
+                ServedBy::PooledAccount,
+            );
         }
 
         // Non-stream body: buffer it (capped like the request path — an unbounded
@@ -1123,7 +1128,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 );
             }
         }
-        return build_response(status, &up_headers, Body::from(bytes));
+        return build_response(
+            status,
+            &up_headers,
+            Body::from(bytes),
+            ServedBy::PooledAccount,
+        );
     }
 
     // Ran out of attempts while still rotating — a bad gateway only if transport
@@ -1379,11 +1389,17 @@ async fn relay_upstream(
     );
 
     match mode {
-        RelayMode::ClientCredential => {
-            build_response(status, &up_headers, Body::from_stream(resp.bytes_stream()))
-        }
+        // Both arms are served with the CALLER's own credential (or none at all),
+        // so their rate-limit and org headers describe the caller — coherent, and
+        // theirs to see. Only the rotated path lies; see [`ServedBy`].
+        RelayMode::ClientCredential => build_response(
+            status,
+            &up_headers,
+            Body::from_stream(resp.bytes_stream()),
+            ServedBy::Caller,
+        ),
         RelayMode::Raw => match read_capped_body(resp.bytes_stream(), MAX_BODY_BYTES).await {
-            Ok(bytes) => build_response(status, &up_headers, Body::from(bytes)),
+            Ok(bytes) => build_response(status, &up_headers, Body::from(bytes), ServedBy::Caller),
             Err(BodyReadError::Transport) => error_response(
                 StatusCode::BAD_GATEWAY,
                 "proxy_error",
@@ -1437,14 +1453,68 @@ fn is_response_skip(name: &str) -> bool {
     )
 }
 
+/// Upstream headers that describe the ACCOUNT that served a request rather than
+/// the request itself, and so are only meaningful to a client that owns that
+/// account.
+///
+/// Matched by PREFIX, deliberately: the `anthropic-ratelimit-` family has more
+/// members than the `unified-*` set this proxy reads (`requests-*`, `tokens-*`,
+/// `input-tokens-*`, `output-tokens-*`, …), and an enumeration would leak
+/// whichever one Anthropic adds next. Header names from a [`HeaderMap`] are
+/// already lowercased.
+///
+/// `request-id` is deliberately absent: it identifies a REQUEST, not an account,
+/// and it is the one id that makes a single failed call debuggable end-to-end.
+fn is_account_scoped(name: &str) -> bool {
+    name.starts_with("anthropic-ratelimit-") || name == "anthropic-organization-id"
+}
+
+/// Whose account produced the response being assembled — the one thing that
+/// decides whether its per-account headers mean anything to the caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServedBy {
+    /// A pooled account picked by rotation. Its quota headers describe an account
+    /// the caller has never heard of and that CHANGES per request, so
+    /// [`is_account_scoped`] strips them on the way out — see [`build_response`].
+    PooledAccount,
+    /// The caller's own credential ([`RelayMode`] paths, which bypass rotation
+    /// entirely). Those headers describe the caller's own account, so they are
+    /// coherent and pass through untouched.
+    Caller,
+}
+
 /// Assemble the client response: the upstream status + body, carrying every
-/// upstream header except the connection-specific / framing ones.
-fn build_response(status: StatusCode, up_headers: &HeaderMap, body: Body) -> Response {
+/// upstream header except the connection-specific / framing ones — and, on the
+/// rotated path, except the ones that belong to the serving ACCOUNT.
+///
+/// The account strip exists because Claude Code renders its usage UI straight
+/// from `anthropic-ratelimit-unified-*`. Rotation means consecutive requests are
+/// answered by different accounts, so forwarding those headers hands the client a
+/// different quota picture every time: a request that lands on an account at 1.00
+/// weekly renders a usage-limit banner, the next one lands elsewhere and
+/// contradicts it. None of those numbers describe the pool the client is actually
+/// talking to. `anthropic-organization-id` is stripped with them — it leaks a
+/// distinct org identity per pooled account.
+///
+/// This is the CLIENT boundary, and the strip belongs here and nowhere earlier:
+/// the proxy's own quota model is built from these same headers upstream of this
+/// call — `manager.update_quota` and the `is_quota_rejected` gate both read the
+/// untouched `up_headers`. Stripping at ingest would blind the rotation logic
+/// while looking like it fixed something.
+fn build_response(
+    status: StatusCode,
+    up_headers: &HeaderMap,
+    body: Body,
+    served_by: ServedBy,
+) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     let headers = response.headers_mut();
     for (name, value) in up_headers.iter() {
         if is_response_skip(name.as_str()) {
+            continue;
+        }
+        if served_by == ServedBy::PooledAccount && is_account_scoped(name.as_str()) {
             continue;
         }
         headers.append(name.clone(), value.clone());
@@ -2471,15 +2541,20 @@ mod tests {
         (format!("http://{addr}"), hits)
     }
 
-    /// Drive the proxy router with a peer we control, as `mitm::serve_http` would.
-    async fn drive(
+    /// Drive the proxy router with a peer we control, as `mitm::serve_http` would,
+    /// returning the WHOLE client-visible response.
+    ///
+    /// Response headers are the surface the account strip acts on, so a helper
+    /// that folds them away cannot test it — [`drive`] is the status+body view
+    /// layered on top of this one.
+    async fn drive_full(
         manager: Arc<Manager>,
         method: Method,
         uri: &str,
         peer: Option<SocketAddr>,
         headers: &[(&str, &str)],
         body: &str,
-    ) -> (StatusCode, Bytes) {
+    ) -> Response {
         use tower::ServiceExt as _;
         let mut builder = Request::builder().method(method).uri(uri);
         for (name, value) in headers {
@@ -2491,7 +2566,19 @@ mod tests {
         if let Some(addr) = peer {
             req.extensions_mut().insert(ClientAddr(addr));
         }
-        let response = app(manager).oneshot(req).await.expect("router response");
+        app(manager).oneshot(req).await.expect("router response")
+    }
+
+    /// [`drive_full`] reduced to the status and body most tests assert on.
+    async fn drive(
+        manager: Arc<Manager>,
+        method: Method,
+        uri: &str,
+        peer: Option<SocketAddr>,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, Bytes) {
+        let response = drive_full(manager, method, uri, peer, headers, body).await;
         let status = response.status();
         let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
             .await
@@ -3386,6 +3473,50 @@ mod tests {
         )
     }
 
+    /// The per-account header block a real Anthropic response carries, as raw
+    /// header lines. Includes `requests-remaining` and `tokens-limit` alongside the
+    /// `unified-*` family precisely because the proxy itself only reads `unified-*`:
+    /// a strip that enumerated the names it knows would forward these two.
+    const ACCOUNT_HEADER_LINES: &str = "anthropic-ratelimit-unified-status: allowed\r\n\
+         anthropic-ratelimit-unified-5h-utilization: 0.42\r\n\
+         anthropic-ratelimit-unified-7d-utilization: 1.0\r\n\
+         anthropic-ratelimit-unified-7d-reset: 1800000000\r\n\
+         anthropic-ratelimit-requests-remaining: 7\r\n\
+         anthropic-ratelimit-tokens-limit: 40000\r\n\
+         anthropic-organization-id: org-01234567\r\n";
+
+    /// A `200 OK` carrying the full per-account header set, plus the two headers
+    /// that must SURVIVE: `request-id` (a request id, not an account id) and an
+    /// ordinary `anthropic-version` standing in for every unrelated header.
+    fn raw_200_with_account_headers() -> String {
+        let body = br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n{ACCOUNT_HEADER_LINES}\
+             request-id: req_011CabcdEFGH\r\nanthropic-version: 2023-06-01\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+    }
+
+    /// [`raw_429_rejected`] carrying the per-account headers a live rejection does.
+    /// The quota model is built from exactly these, so this is the reply that shows
+    /// whether the client-boundary strip blinded it. `unified-status` is `rejected`
+    /// here, so it cannot share [`ACCOUNT_HEADER_LINES`]'s `allowed`.
+    fn raw_429_rejected_with_account_headers(retry_after: u32) -> String {
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\
+             retry-after: {retry_after}\r\n\
+             anthropic-ratelimit-unified-status: rejected\r\n\
+             anthropic-ratelimit-unified-5h-utilization: 0.42\r\n\
+             anthropic-ratelimit-unified-7d-utilization: 1.0\r\n\
+             anthropic-ratelimit-unified-7d-reset: 1800000000\r\n\
+             anthropic-ratelimit-requests-remaining: 7\r\n\
+             anthropic-ratelimit-tokens-limit: 40000\r\n\
+             anthropic-organization-id: org-01234567\r\n\r\n"
+        )
+    }
+
     /// A `429` with NO `unified-status`, i.e. a TRANSIENT rate limit: the arm that
     /// inline-waits `retry_after` seconds on the same account and, once
     /// [`MAX_SAME_ACCOUNT_429`] inline retries are spent, PARKS it for that long and
@@ -3483,6 +3614,198 @@ mod tests {
             .unwrap()
             .status()
             .as_u16()
+    }
+
+    /// The every-account-scoped header block the upstream in these tests sends, by
+    /// name. Spelled out here — rather than derived from [`is_account_scoped`] — so
+    /// the assertions describe the WIRE, not the predicate under test.
+    const LEAKED_HEADER_NAMES: &[&str] = &[
+        "anthropic-ratelimit-unified-status",
+        "anthropic-ratelimit-unified-5h-utilization",
+        "anthropic-ratelimit-unified-7d-utilization",
+        "anthropic-ratelimit-unified-7d-reset",
+        "anthropic-ratelimit-requests-remaining",
+        "anthropic-ratelimit-tokens-limit",
+        "anthropic-organization-id",
+    ];
+
+    /// The classifier alone. The `request-id` and `anthropic-version` negatives are
+    /// the point: a prefix loose enough to swallow either would strip the one id
+    /// that makes a failed call traceable.
+    #[test]
+    fn is_account_scoped_matches_the_family_and_nothing_else() {
+        for name in LEAKED_HEADER_NAMES {
+            assert!(is_account_scoped(name), "{name} belongs to the account");
+        }
+        // Not yet invented, but the prefix must already cover it.
+        assert!(is_account_scoped("anthropic-ratelimit-something-new"));
+        for name in [
+            "request-id",
+            "anthropic-version",
+            "content-type",
+            "retry-after",
+            "anthropic-organization",  // not the id
+            "x-anthropic-ratelimit-a", // the family is not a substring match
+        ] {
+            assert!(!is_account_scoped(name), "{name} must survive");
+        }
+    }
+
+    /// THE REPORTED BUG: a rotated response must reach the client carrying NONE of
+    /// the serving account's quota or org headers.
+    ///
+    /// Claude Code renders its usage banner from `anthropic-ratelimit-unified-*`,
+    /// and with 13 accounts in rotation those headers describe a different account
+    /// on every request — the upstream here reports `7d-utilization: 1.0`, i.e. the
+    /// exact shape that made a freshly-opened session show a usage-limit banner.
+    #[tokio::test]
+    async fn rotated_response_strips_every_account_header() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200_with_account_headers())]).await;
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        let response = drive_messages(manager).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        for name in LEAKED_HEADER_NAMES {
+            assert!(
+                response.headers().get(*name).is_none(),
+                "{name} describes the serving account, not the caller"
+            );
+        }
+        let leaked: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(|k| k.as_str())
+            .filter(|k| k.starts_with("anthropic-ratelimit"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "no rate-limit header may survive, by prefix: {leaked:?}"
+        );
+    }
+
+    /// The over-stripping guard. `request-id` identifies a REQUEST — it is what
+    /// makes one failed call traceable to Anthropic — and every unrelated upstream
+    /// header is still the client's to see. Their presence is also what proves the
+    /// test above can fail: these arrived over the same wire.
+    #[tokio::test]
+    async fn rotated_response_keeps_request_id_and_unrelated_headers() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200_with_account_headers())]).await;
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        let response = drive_messages(manager).await;
+
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        assert_eq!(
+            header("request-id").as_deref(),
+            Some("req_011CabcdEFGH"),
+            "request-id identifies a request, not an account"
+        );
+        assert_eq!(
+            header("anthropic-version").as_deref(),
+            Some("2023-06-01"),
+            "an unrelated upstream header is untouched"
+        );
+        assert_eq!(header("content-type").as_deref(), Some("application/json"));
+    }
+
+    /// THE REGRESSION GUARD THAT MATTERS: the strip is at the CLIENT boundary, so
+    /// everything upstream of it still sees the untouched headers.
+    ///
+    /// A durable `429` must still (a) set the account's quota status to `rejected`,
+    /// which is the red REJECTED state in the TUI and the hard gate that re-keys a
+    /// session pin, (b) arm the rate-limit hold, and (c) fold the reported weekly
+    /// utilization into the quota model. Strip at ingest instead and all three go
+    /// silently dark while the client-facing bug still looks fixed.
+    #[tokio::test]
+    async fn durable_429_still_rejects_the_account_after_the_strip() {
+        let up_addr =
+            spawn_scripted_upstream(vec![Some(raw_429_rejected_with_account_headers(120))]).await;
+        let manager = fleet(up_addr, &["a"]);
+        let response = drive_messages(Arc::clone(&manager)).await;
+
+        // The only account is held out, so the client gets the synthesized
+        // fleet-exhausted 429 — which carries no upstream headers by construction.
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        for name in LEAKED_HEADER_NAMES {
+            assert!(
+                response.headers().get(*name).is_none(),
+                "{name} is stripped"
+            );
+        }
+
+        let account = &manager.snapshot(OffsetDateTime::now_utc()).accounts[0];
+        assert_eq!(
+            account.gate,
+            crate::stats::GateReason::Rejected,
+            "`update_quota` must still have seen `unified-status: rejected`"
+        );
+        assert!(
+            account.rate_limited_until.is_some(),
+            "the durable-rejection hold must still be armed"
+        );
+        assert_eq!(
+            account.seven_day,
+            Some(1.0),
+            "the reported weekly utilization must still reach the quota model"
+        );
+    }
+
+    /// The relay paths are served with the CALLER's own credential, so their
+    /// rate-limit and org headers describe the caller and are coherent. Stripping
+    /// them would hide the caller's real quota from them — the inverse of the bug.
+    #[tokio::test]
+    async fn relay_response_keeps_its_account_headers() {
+        for path in [
+            "/v1/code/session/abc",
+            "/api/oauth/files/file_0123",
+            "/api/oauth/file_upload",
+        ] {
+            let up_addr = spawn_scripted_upstream(vec![Some(raw_200_with_account_headers())]).await;
+            let manager = Manager::with_live_refresher(
+                dummy_config(None, &format!("http://{up_addr}")),
+                None,
+            );
+            let response = drive_full(
+                manager,
+                Method::POST,
+                path,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own-token"),
+                    ("content-type", "application/json"),
+                ],
+                "{}",
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::OK, "{path} was relayed");
+            for name in LEAKED_HEADER_NAMES {
+                assert!(
+                    response.headers().get(*name).is_some(),
+                    "{name} is the CALLER's own on {path} and must pass through"
+                );
+            }
+        }
+    }
+
+    /// One rotated `/v1/messages` through the router, returning the whole response.
+    async fn drive_messages(manager: Arc<Manager>) -> Response {
+        drive_full(
+            manager,
+            Method::POST,
+            "/v1/messages",
+            Some(loopback_peer()),
+            &[("content-type", "application/json")],
+            r#"{"model":"claude-sonnet-5","messages":[]}"#,
+        )
+        .await
     }
 
     /// R2 — ONE transport blip must not disable the whole recovery ladder.
