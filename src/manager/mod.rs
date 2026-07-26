@@ -4398,6 +4398,127 @@ mod tests {
         );
     }
 
+    /// #1c `tried` governs whether an account may SERVE this request; it must never
+    /// decide whether that session's PIN may MOVE. A pin that merely failed THIS
+    /// request — a transport blip, a 5xx — while still clearing every ACCOUNT-level
+    /// HARD gate stays put: the fallback serves elsewhere for this one request and
+    /// the session comes home on the next.
+    ///
+    /// Before the fix the `account_hard_ok → keep_pin` test sat INSIDE
+    /// `if !tried.contains(&idx)`, so a tried pin left `keep_pin` at `None` and the
+    /// fallback's `pins.insert` durably re-keyed the session — a warm prompt cache
+    /// discarded on the strength of one failed request. `select()` takes the opposite
+    /// decision on the identical fact and documents why; this is the two agreeing.
+    ///
+    /// Also the first coverage of a NON-EMPTY `tried` on this path at all — every
+    /// other `select_revalidation` test passes `&HashSet::new()`.
+    #[test]
+    fn revalidation_keeps_the_pin_when_it_is_merely_tried() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&manager, 1, 0.970, "allowed_warning");
+        set_over_threshold(&manager, 2, 0.999, "allowed_warning"); // the warm pin
+        let key = 515_151u64;
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (2, odt_to_ms(now)));
+        }
+
+        // The pin failed THIS request and nothing more: not disabled, not errored,
+        // not rejected, no hold. It clears every ACCOUNT-level hard gate.
+        let tried = HashSet::from([2usize]);
+        assert_eq!(
+            manager.select_revalidation(&tried, now, None, Some(key)),
+            Some(0),
+            "a tried pin cannot serve THIS request → the least-utilized survivor does"
+        );
+        let pin_after = manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            pin_after,
+            Some(2),
+            "the pin must NOT move: membership in `tried` is a per-request fact, not \
+             evidence the account is gone"
+        );
+    }
+
+    /// #1d The over-correction guard for #1c. Hoisting the `keep_pin` test out of the
+    /// `!tried` guard must not make a pin STICKY: a pin that fails an ACCOUNT-level
+    /// HARD gate still re-keys, and being in `tried` as well changes nothing. Both
+    /// hard shapes are exercised — `quota.status == "rejected"`, and a hold that
+    /// outlives the prompt cache (>= `CACHE_WARM_HOLD_SECS`).
+    #[test]
+    fn revalidation_rekeys_when_the_pin_fails_a_hard_gate() {
+        let key = 626_262u64;
+        let now = OffsetDateTime::now_utc();
+        let tried = HashSet::from([2usize]);
+        let pin_session = |manager: &Manager, idx: usize| {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (idx, odt_to_ms(now)));
+        };
+        let pin_of = |manager: &Manager| {
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&key)
+                .map(|&(idx, _)| idx)
+        };
+
+        // (a) REJECTED and tried — a durable block, so the session must move off it.
+        let rejected = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&rejected, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&rejected, 1, 0.970, "allowed_warning");
+        set_over_threshold(&rejected, 2, 0.999, "rejected");
+        pin_session(&rejected, 2);
+        assert_eq!(
+            rejected.select_revalidation(&tried, now, None, Some(key)),
+            Some(0),
+            "a rejected pin is skipped; the least-utilized survivor serves"
+        );
+        assert_eq!(
+            pin_of(&rejected),
+            Some(0),
+            "a rejected pin RE-KEYS — `tried` must not shield it from the hard gate"
+        );
+
+        // (b) HELD PAST THE CACHE and tried — also durable (a fresh manager, so the
+        // anti-storm valve the serve above armed does not swallow this call).
+        let held = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&held, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&held, 1, 0.970, "allowed_warning");
+        set_over_threshold(&held, 2, 0.999, "allowed_warning");
+        {
+            let mut a = held.accounts.write().expect("accounts lock poisoned");
+            a[2].rate_limited_until_ms = Some(crate::now_ms() + 3_600_000);
+        }
+        pin_session(&held, 2);
+        assert_eq!(
+            held.select_revalidation(&tried, now, None, Some(key)),
+            Some(0),
+            "a pin held past its cache lifetime is skipped; the survivor serves"
+        );
+        assert_eq!(
+            pin_of(&held),
+            Some(0),
+            "a hold that outlives the cache RE-KEYS — `tried` must not shield it"
+        );
+    }
+
     /// #2 A `rejected` account is skipped even when least-utilized; a higher-util
     /// `allowed` one is served. If ALL are `rejected` → `None`.
     #[test]
