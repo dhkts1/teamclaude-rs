@@ -269,14 +269,17 @@ fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>)
 /// ever answers locally belongs under this prefix.
 pub const STATUS_PATH: &str = "/_tcr/status";
 
-/// The prefix [`STATUS_PATH`] lives under. Every path beneath it belongs to the
-/// PROXY, never to Anthropic, so anything under it that is not a registered route
-/// is answered with a LOCAL 404 (see the guard in [`handle`]) instead of being
-/// forwarded. That is not hygiene: before the guard existed a typo'd status probe
-/// fell through the catch-all and was sent to `api.anthropic.com/_tcr/status`
+/// The path segment [`STATUS_PATH`] lives under. Every path beneath it belongs to
+/// the PROXY, never to Anthropic, so anything under it that is not a registered
+/// route is answered with a LOCAL 404 (see the guard in [`handle`]) instead of
+/// being forwarded. That is not hygiene: before the guard existed a typo'd status
+/// probe fell through the catch-all and was sent to `api.anthropic.com/_tcr/status`
 /// carrying a pooled OAuth Bearer, which burned an account on a request no
 /// upstream route could ever answer.
-const LOCAL_PREFIX: &str = "/_tcr/";
+///
+/// Stored WITHOUT a trailing slash and matched by [`path_is_under`], so the bare
+/// `/_tcr` has no unguarded edge.
+const LOCAL_PREFIX: &str = "/_tcr";
 
 /// Paths whose upstream call must carry the **client's own** credential and which
 /// therefore bypass account selection entirely. Matched as prefixes of the request
@@ -294,13 +297,25 @@ const LOCAL_PREFIX: &str = "/_tcr/";
 ///
 /// Measured on the live log while every one of these still went through rotation:
 /// 13 of 57 sessionless requests came back 404 (22.8%), against 0 of 1556 pinned ones.
+///
+/// Written WITHOUT trailing slashes and matched by [`path_is_under`] — an entry
+/// matches the exact path or that path followed by `/`, never a longer identifier.
+/// Both edges of a raw `starts_with` were live defects: `"/api/oauth/file_upload"`
+/// (no terminator) also relayed `/api/oauth/file_upload_v2`, and `"/v1/code/"`
+/// (with one) missed the bare `/v1/code`.
 const CLIENT_CREDENTIAL_PREFIXES: [&str; 3] =
-    ["/v1/code/", "/api/oauth/files/", "/api/oauth/file_upload"];
+    ["/v1/code", "/api/oauth/files", "/api/oauth/file_upload"];
 
 /// The CLIENT's own OAuth token refresh. Relayed raw — no auth header at all,
 /// because a refresh carries its credentials in the BODY. The proxy manages its own
 /// tokens via [`Manager::ensure_fresh`]; rewriting a client's refresh would inject
 /// the wrong identity into an exchange that is not ours.
+///
+/// Matched by [`path_is_under`], like the prefixes above. It used to be an EXACT
+/// compare, which let the trailing-slash spelling `/v1/oauth/token/` fall through to
+/// the POOLED path — putting our Bearer on a client's token exchange, precisely what
+/// the paragraph above says must never happen. Relaying a hypothetical sub-path with
+/// no auth is the safe direction to be wrong in; a pooled Bearer is not.
 const CLIENT_TOKEN_REFRESH_PATH: &str = "/v1/oauth/token";
 
 /// `user-agent` sent by [`RelayMode::Raw`] when the client sent none. The JS proxy
@@ -318,16 +333,90 @@ enum RelayMode {
     Raw,
 }
 
+/// Does `path` name `base` itself, or something beneath it?
+///
+/// The ONE rule every path-prefix decision in this module goes through, so that a
+/// route's boundary is its segment boundary and nothing else. A bare `starts_with`
+/// is wrong in both directions: without a terminator `/api/oauth/file_upload` also
+/// swallows `/api/oauth/file_upload_v2`, and with one `/v1/code/` misses the bare
+/// `/v1/code`. Callers must pass a `base` with NO trailing slash. Pure — unit-tested.
+fn path_is_under(path: &str, base: &str) -> bool {
+    path.strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Is `segment` a WHATWG dot segment — `.` or `..`, in any percent-encoded spelling?
+///
+/// The URL parser folds `%2e`/`%2E` to `.` BEFORE it classifies a segment, so `%2e%2e`
+/// and `.%2e` are `..` to it. It does NOT decode `%2f`, so `..%2f` stays one opaque
+/// segment and is not traversal — decoding it here would reject a legitimate path.
+/// Only 1 or 2 dots are special: `...` is an ordinary name.
+fn is_dot_segment(segment: &str) -> bool {
+    let mut rest = segment;
+    let mut dots = 0usize;
+    while !rest.is_empty() {
+        if let Some(tail) = rest.strip_prefix('.') {
+            rest = tail;
+        } else if rest.len() >= 3
+            && rest.as_bytes()[0] == b'%'
+            && rest.as_bytes()[1] == b'2'
+            && rest.as_bytes()[2].eq_ignore_ascii_case(&b'e')
+        {
+            rest = &rest[3..];
+        } else {
+            return false;
+        }
+        dots += 1;
+        if dots > 2 {
+            return false;
+        }
+    }
+    dots == 1 || dots == 2
+}
+
+/// Would this raw request path mean something DIFFERENT to the upstream URL parser
+/// than it means to the classifiers here? If so it must never be routed at all.
+///
+/// The path this module makes every decision on is `uri.path()` — the raw request
+/// target, verbatim. The path that goes ON THE WIRE is whatever `Url::parse` makes
+/// of `upstream + path_and_query`, and that parser normalizes per WHATWG. Where the
+/// two disagree, every routing decision is made about a path the upstream never sees.
+/// Measured against this crate's own reqwest, `/v1/code/../../v1/messages` classified
+/// as a client-credential RELAY and arrived at the upstream as `/v1/messages` — a real
+/// inference bypassing `select`, the in-flight slot, the throttle, `record_served`,
+/// session pinning and the whole retry ladder, carrying the CLIENT's token. `/x/../_tcr/status`
+/// slipped the `/_tcr/` guard and reached the upstream WITH A POOLED BEARER on it,
+/// which is the exact shape that once burned an account.
+///
+/// Reconciling the two representations is the fragile fix — it re-derives the
+/// upstream's parser here and stays correct only while both agree forever. Instead
+/// REJECT the disagreement: no legitimate Anthropic client emits a dot segment or a
+/// backslash, so the ambiguous shapes cost nothing to refuse.
+///
+/// Two disagreements exist, both measured, not theorized:
+/// - a **dot segment** (see [`is_dot_segment`]) — the parser collapses it away.
+/// - a literal **backslash**, which is not a valid request-target character at all
+///   (RFC 3986 `pchar`) and which WHATWG treats as a path SEPARATOR for http(s).
+///   `/v1/code\foo` classified as pooled here and landed on the upstream as the
+///   Remote Control path `/v1/code/foo` wearing a pooled Bearer — the under-inclusive
+///   half of the same defect. `%5c` is NOT decoded by the parser, so it is left alone.
+fn path_is_ambiguous(path: &str) -> bool {
+    path.contains('\\') || path.split('/').any(is_dot_segment)
+}
+
 /// Classify a request as one of the rotation-bypassing relays, or `None` for the
 /// normal pooled-credential forwarding path. Takes the path WITHOUT its query, so
 /// a `?…` can never smuggle a path past the match. Pure — unit-tested.
+///
+/// Sound only on a path [`path_is_ambiguous`] has already rejected: on a path that
+/// still contains a dot segment, what this classifies is not what goes on the wire.
 fn relay_mode(method: &Method, path: &str) -> Option<RelayMode> {
-    if *method == Method::POST && path == CLIENT_TOKEN_REFRESH_PATH {
+    if *method == Method::POST && path_is_under(path, CLIENT_TOKEN_REFRESH_PATH) {
         return Some(RelayMode::Raw);
     }
     if CLIENT_CREDENTIAL_PREFIXES
         .iter()
-        .any(|p| path.starts_with(p))
+        .any(|base| path_is_under(path, base))
     {
         return Some(RelayMode::ClientCredential);
     }
@@ -488,18 +577,37 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         }
     }
 
-    // 1a. Everything under `/_tcr/` is OURS. The router matches the registered
+    // 1a. Path shape. FIRST of the routing guards, because every one below it — the
+    //     `/_tcr/` guard, the host guard, the relay classifier — decides on `path`,
+    //     and this is the check that `path` still means upstream what it means here.
+    //     `path` is the RAW request target; the upstream URL is parsed from it by
+    //     reqwest, which collapses dot segments (and treats `\` as a separator) per
+    //     WHATWG. A path where the two disagree is one where every decision below is
+    //     made about a URL that never goes on the wire — see [`path_is_ambiguous`]
+    //     for the two measured bypasses. Reject rather than reconcile: keeping two
+    //     path representations in agreement is correct only while both parsers agree
+    //     forever, and no legitimate Anthropic client emits either shape.
+    //
+    //     Placed AFTER the api-key gate, like the guards below it: a request that
+    //     cannot authenticate learns nothing here it would not learn anywhere else.
+    if path_is_ambiguous(&path) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Request path must not contain a dot segment or a backslash.",
+            None,
+        );
+    }
+
+    // 1b. Everything under `/_tcr/` is OURS. The router matches the registered
     //     routes (today: [`STATUS_PATH`]) BEFORE this catch-all, so any request that
     //     reaches `handle` under the prefix is one we do not serve — and the honest
     //     answer to that is a LOCAL 404, not a forward. Forwarding it would rewrite
     //     a proxy-private path onto api.anthropic.com WITH A POOLED OAUTH BEARER
     //     attached: that is how a typo'd status probe once put Gil's bearer on
-    //     `api.anthropic.com/_tcr/status` and burned an account. The bare `/_tcr`
-    //     (no trailing slash) is included so the prefix has no unguarded edge.
-    //
-    //     Placed AFTER the api-key gate: a request that cannot authenticate learns
-    //     nothing here that it would not learn from any other path.
-    if path.starts_with(LOCAL_PREFIX) || path == LOCAL_PREFIX.trim_end_matches('/') {
+    //     `api.anthropic.com/_tcr/status` and burned an account. [`path_is_under`]
+    //     covers the bare `/_tcr` too, so the prefix has no unguarded edge.
+    if path_is_under(&path, LOCAL_PREFIX) {
         return error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -508,7 +616,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         );
     }
 
-    // 1b. Host guard: tcr is a credential-injecting reverse proxy for
+    // 1c. Host guard: tcr is a credential-injecting reverse proxy for
     //     api.anthropic.com, NOT an open forward proxy. Every request is rewritten
     //     to `manager.upstream()` with the pooled OAuth Bearer, DISCARDING its
     //     target host. A plain-HTTP forward-proxy request aimed at a DIFFERENT host
@@ -553,7 +661,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         }
     }
 
-    // 1c. Rotation-bypassing relays. A request bound to the CLIENT's identity
+    // 1d. Rotation-bypassing relays. A request bound to the CLIENT's identity
     //     ([`CLIENT_CREDENTIAL_PREFIXES`]) or to a credential exchange that is not
     //     ours ([`CLIENT_TOKEN_REFRESH_PATH`]) must not be re-credentialled, and it
     //     must not spend anything the rotation owns: no `select`, no in-flight slot,
@@ -561,9 +669,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     these used to burn a rotation slot and pollute the LRU key for a request
     //     the pooled account could never have answered.
     //
-    //     Deliberately placed AFTER the api-key gate (1) and the host guard (1b):
-    //     relaying for an unauthenticated caller, or to a host we just refused to
-    //     forward to, would each be a new hole. Gate first, then relay.
+    //     Deliberately placed AFTER the api-key gate (1), the path-shape guard (1a)
+    //     and the host guard (1c): relaying for an unauthenticated caller, on a path
+    //     that means something else upstream, or to a host we just refused to forward
+    //     to, would each be a new hole. Gate first, then relay.
     if let Some(mode) = relay_mode(&method, &path) {
         return relay_upstream(&manager, mode, method, &path_and_query, &req_headers, body).await;
     }
@@ -2549,6 +2658,128 @@ mod tests {
         }
     }
 
+    /// The segment-boundary rule, at both edges. Every entry that reads as a prefix
+    /// in this module is really "this path, or something under it" — a longer
+    /// IDENTIFIER sharing the same leading characters is a different route.
+    #[test]
+    fn relay_mode_matches_whole_segments_at_both_edges() {
+        // Bare, with no trailing slash: a real route, previously missed by `/v1/code/`.
+        for path in ["/v1/code", "/api/oauth/files", "/api/oauth/file_upload"] {
+            assert_eq!(
+                relay_mode(&Method::POST, path),
+                Some(RelayMode::ClientCredential),
+                "the bare {path} is the same route as {path}/"
+            );
+        }
+        // Longer identifiers: NOT the route, previously swallowed by the entry that
+        // carried no terminator.
+        for path in [
+            "/v1/codex",
+            "/api/oauth/file_upload_v2",
+            "/api/oauth/file_uploadX",
+            "/api/oauth/filesystem",
+        ] {
+            assert_eq!(
+                relay_mode(&Method::POST, path),
+                None,
+                "{path} only shares a prefix — it is not the route"
+            );
+        }
+        // The token refresh takes the same rule. `/v1/oauth/token/` used to miss the
+        // exact compare and fall through to the POOLED path, which is the one outcome
+        // a client's own credential exchange must never have.
+        for path in ["/v1/oauth/token", "/v1/oauth/token/"] {
+            assert_eq!(
+                relay_mode(&Method::POST, path),
+                Some(RelayMode::Raw),
+                "{path} is the client's own token exchange"
+            );
+        }
+        assert_eq!(
+            relay_mode(&Method::POST, "/v1/oauth/tokens"),
+            None,
+            "a longer identifier is not the token endpoint"
+        );
+    }
+
+    /// `path_is_under` in isolation — the single rule every prefix decision uses.
+    #[test]
+    fn path_is_under_matches_only_whole_segments() {
+        for (path, base, want) in [
+            ("/_tcr", "/_tcr", true),
+            ("/_tcr/", "/_tcr", true),
+            ("/_tcr/status", "/_tcr", true),
+            ("/_tcrx", "/_tcr", false),
+            ("/_tc", "/_tcr", false),
+            ("/v1/code/session/abc", "/v1/code", true),
+            ("", "/_tcr", false),
+        ] {
+            assert_eq!(
+                path_is_under(path, base),
+                want,
+                "path_is_under({path:?}, {base:?})"
+            );
+        }
+    }
+
+    /// Dot-segment recognition, in every spelling the upstream URL parser folds —
+    /// and, as importantly, NOT in the spellings it leaves alone. Over-rejecting a
+    /// legitimate path is a real failure mode, not a safe default.
+    #[test]
+    fn dot_segments_are_recognised_in_every_spelling() {
+        // Single-dot (`.`, `%2e`) and double-dot (`..` and its three mixed
+        // spellings) segments — the parser folds `%2e`/`%2E` before classifying.
+        for segment in [".", "%2e", "%2E", "..", "%2e%2e", "%2E%2E", ".%2e", "%2e."] {
+            assert!(is_dot_segment(segment), "{segment} is a dot segment");
+        }
+        for segment in [
+            "",
+            "...",       // three dots is an ordinary name
+            "%2e%2e%2e", // …in any spelling
+            "a.json",    // a literal dot INSIDE a name
+            "..a",
+            "a..",
+            "..%2f..", // `%2f` is not decoded, so this is one opaque segment
+            "%2f",
+            "%25 2e",
+            "file_upload",
+        ] {
+            assert!(!is_dot_segment(segment), "{segment} is NOT a dot segment");
+        }
+    }
+
+    /// The whole-path guard: which request targets disagree with what reqwest will
+    /// put on the wire. The negatives are the half that keeps the guard honest.
+    #[test]
+    fn path_is_ambiguous_flags_traversal_and_leaves_ordinary_paths_alone() {
+        for path in [
+            "/v1/code/../../v1/messages",
+            "/v1/code/%2e%2e/%2e%2e/v1/messages",
+            "/v1/code/../../_tcr/status",
+            "/x/../_tcr/status",
+            "/v1/./messages",
+            "/v1/code/.%2e/../v1/messages",
+            "/..",
+            "/v1/code/..\\../v1/messages", // `\` is a WHATWG path separator
+            "/v1/code\\foo",               // …so this lands on /v1/code/foo upstream
+        ] {
+            assert!(path_is_ambiguous(path), "{path} must be refused");
+        }
+        for path in [
+            "/",
+            "/v1/messages",
+            "/v1/models",
+            "/api/oauth/files/a.json",       // a literal dot in a filename
+            "/api/oauth/files/...",          // three dots
+            "/api/oauth/files/..%2f..",      // `%2f` is not decoded by the parser
+            "/api/oauth/files/%5c..",        // nor is `%5c`
+            "/v1/organizations/x.y.z/usage", // dots inside segments
+            "/_tcr/status",
+        ] {
+            assert!(!path_is_ambiguous(path), "{path} is legitimate");
+        }
+    }
+
     /// Every client-credential prefix reaches upstream carrying the CLIENT's own
     /// `authorization` — and never the pooled account Bearer, which is what 403'd
     /// the Remote Control stream and silently dropped claude.ai attachments.
@@ -2794,6 +3025,208 @@ mod tests {
             0,
             "no `/_tcr/…` request may ever reach an upstream"
         );
+    }
+
+    /// The traversal table, end to end, against the fake upstream that reports what
+    /// it actually RECEIVED. Every row here was measured reaching an upstream before
+    /// the guard existed, and the received path is the proof that the classification
+    /// and the wire disagreed:
+    ///
+    /// | raw request target                  | classified as | upstream received |
+    /// |-------------------------------------|---------------|-------------------|
+    /// | `/v1/code/../../v1/messages`        | RELAY         | `/v1/messages`    |
+    /// | `/v1/code/%2e%2e/%2e%2e/v1/messages`| RELAY         | `/v1/messages`    |
+    /// | `/v1/code/../../_tcr/status`        | RELAY         | `/_tcr/status`    |
+    /// | `/x/../_tcr/status`                 | pooled        | `/_tcr/status`    |
+    /// | `/v1/code\..\../v1/messages`        | RELAY         | `/v1/messages`    |
+    /// | `/v1/code\foo`                      | pooled        | `/v1/code/foo`    |
+    ///
+    /// Rows 1-2 and 5 are a real `/v1/messages` routed as a relay: no `select`, no
+    /// in-flight slot, no throttle, no `record_served`, no pin, no retry ladder, and
+    /// the CLIENT's credential instead of a pooled one. Rows 3-4 defeat the `/_tcr/`
+    /// guard, row 4 putting a POOLED BEARER on `/_tcr/status` — the shape that burned
+    /// an account. Row 6 is the inverse: a Remote Control path routed as pooled.
+    ///
+    /// The hit counter is the assertion that matters — 400, and nothing on the wire.
+    #[tokio::test]
+    async fn traversal_paths_are_refused_before_any_routing_decision() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        for uri in [
+            "/v1/code/../../v1/messages",
+            "/v1/code/%2e%2e/%2e%2e/v1/messages",
+            "/v1/code/%2E%2E/%2E%2E/v1/messages",
+            "/v1/code/../../_tcr/status",
+            "/x/../_tcr/status",
+            "/v1/code/.%2e/../v1/messages",
+            "/v1/messages/./",
+            "/v1/code/..\\../v1/messages",
+            "/v1/code\\foo",
+        ] {
+            let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+            let (status, body) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                uri,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own-token"),
+                    ("content-type", "application/json"),
+                ],
+                r#"{"model":"claude-sonnet-5"}"#,
+            )
+            .await;
+            let text = String::from_utf8_lossy(&body);
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} → 400, got {text}");
+            assert!(
+                text.contains("invalid_request_error"),
+                "in the standard error envelope: {text}"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+                0,
+                "{uri} spent no account"
+            );
+        }
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "not one ambiguous path may reach an upstream, by either route"
+        );
+    }
+
+    /// The other half of the guard: a dot that is not a dot SEGMENT is ordinary path
+    /// text and must still be forwarded. A guard that rejected `a.json` would break
+    /// attachment fetches to fix a traversal — trading one silent failure for another.
+    #[tokio::test]
+    async fn legitimate_paths_containing_dots_are_still_forwarded() {
+        let (upstream, hits) = spawn_echo_upstream().await;
+        for uri in [
+            "/api/oauth/files/a.json",
+            "/api/oauth/files/....",
+            "/api/oauth/files/..%2f..",
+            "/api/oauth/files/%5c..",
+            "/v1/messages",
+        ] {
+            let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+            let (status, body) = drive(
+                manager,
+                Method::POST,
+                uri,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own-token"),
+                    ("content-type", "application/json"),
+                ],
+                r#"{"model":"claude-sonnet-5"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{uri} must not be rejected");
+            assert_eq!(
+                parse_echo(&body).path,
+                uri,
+                "{uri} reaches the upstream verbatim"
+            );
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    /// The segment-boundary fix on the wire, in both directions. The bare `/v1/code`
+    /// is the Remote Control route and must carry the CLIENT's token; the longer
+    /// identifier `/api/oauth/file_upload_v2` is NOT that route and takes rotation.
+    #[tokio::test]
+    async fn segment_boundaries_decide_which_credential_goes_on_the_wire() {
+        let (upstream, _hits) = spawn_echo_upstream().await;
+
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            "/v1/code",
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own-token"),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            parse_echo(&body).header("authorization"),
+            Some("Bearer client-own-token"),
+            "the bare /v1/code is Remote Control and keeps the client's credential"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+            0,
+            "…and spends no account"
+        );
+
+        let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+        let (status, body) = drive(
+            Arc::clone(&manager),
+            Method::POST,
+            "/api/oauth/file_upload_v2",
+            Some(loopback_peer()),
+            &[
+                ("authorization", "Bearer client-own-token"),
+                ("content-type", "application/json"),
+            ],
+            r#"{"model":"claude-sonnet-5"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            parse_echo(&body).header("authorization"),
+            Some("Bearer at-dummy"),
+            "a longer identifier is not the upload route — it takes the pooled token"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+            1,
+            "…and is counted against the serving account"
+        );
+    }
+
+    /// `POST /v1/oauth/token/` — the trailing-slash spelling of the client's own
+    /// credential exchange. It used to miss the exact compare and take the POOLED
+    /// path, attaching our Bearer to an exchange that is not ours. A raw relay sends
+    /// NO authorization at all, which is the whole point of [`RelayMode::Raw`].
+    #[tokio::test]
+    async fn token_refresh_never_takes_a_pooled_bearer_on_any_spelling() {
+        let (upstream, _hits) = spawn_echo_upstream().await;
+        for uri in ["/v1/oauth/token", "/v1/oauth/token/"] {
+            let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
+            let (status, body) = drive(
+                Arc::clone(&manager),
+                Method::POST,
+                uri,
+                Some(loopback_peer()),
+                &[
+                    ("authorization", "Bearer client-own-token"),
+                    ("content-type", "application/json"),
+                ],
+                r#"{"grant_type":"refresh_token"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let echo = parse_echo(&body);
+            assert_ne!(
+                echo.header("authorization"),
+                Some("Bearer at-dummy"),
+                "{uri} must NEVER carry the pooled account token"
+            );
+            assert_eq!(
+                echo.header("authorization"),
+                None,
+                "{uri} is a raw relay — it carries no authorization in any form"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+                0,
+                "{uri} spends no account"
+            );
+        }
     }
 
     /// The relays bypass ROTATION, not the api-key gate. A non-loopback caller with
@@ -4018,6 +4451,53 @@ mod tests {
         assert_eq!(
             status, 502,
             "an api.anthropic.com request must pass the guard (dead upstream → 502), never 421"
+        );
+    }
+
+    /// Test 5 — the path-shape guard over a REAL socket, with the request target
+    /// written byte for byte. The `drive` harness builds its URI through `http::Uri`
+    /// in-process; this proves the same shapes survive hyper's own request-line
+    /// parser and are refused there too, so the guard is not an artifact of the test
+    /// harness. 400 — not the 502 a forwarded request to the dead upstream gives —
+    /// is what proves it fired BEFORE any egress.
+    #[tokio::test]
+    async fn traversal_targets_refused_over_a_raw_socket_400() {
+        let addr = spawn_dead_upstream_proxy().await;
+        for target in [
+            "/v1/code/../../v1/messages",
+            "/v1/code/%2e%2e/%2e%2e/v1/messages",
+            "/x/../_tcr/status",
+            "/v1/code/..\\../v1/messages",
+            "/v1/code\\foo",
+        ] {
+            let status = raw_request_status(
+                addr,
+                &format!(
+                    "POST {target} HTTP/1.1\r\n\
+                     Host: api.anthropic.com\r\n\
+                     Content-Length: 2\r\n\
+                     Connection: close\r\n\r\n{{}}"
+                ),
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "{target} must be refused locally, never forwarded (502)"
+            );
+        }
+        // The control: the same socket, the same dead upstream, an ordinary path.
+        // 502 proves the guard rejects the ambiguous shape and nothing else.
+        let status = raw_request_status(
+            addr,
+            "POST /v1/messages HTTP/1.1\r\n\
+             Host: api.anthropic.com\r\n\
+             Content-Length: 2\r\n\
+             Connection: close\r\n\r\n{}",
+        )
+        .await;
+        assert_eq!(
+            status, 502,
+            "an ordinary path still reaches the rotation loop (dead upstream → 502)"
         );
     }
 }
