@@ -15,6 +15,7 @@
 )]
 
 pub mod account_uuid;
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod demo;

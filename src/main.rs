@@ -15,7 +15,7 @@ use std::sync::Arc;
 use teamclaude_rs::cli::{self, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::manager::Manager;
-use teamclaude_rs::{demo, mitm, oauth, singleton, tui, update};
+use teamclaude_rs::{build_info, demo, mitm, oauth, singleton, tui, update};
 
 #[derive(Parser)]
 #[command(
@@ -383,8 +383,17 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // not "this pid tried". A restart also wipes the in-memory session→account pin
     // map, the most expensive cache event in this system; counting these lines is
     // how that cost becomes measurable:  rg 'server started' "$TMPDIR/teamclaude-rs.log"
+    //
+    // `version` alone could not tell two boots apart: it is `CARGO_PKG_VERSION`,
+    // the literal 0.1.0 from Cargo.toml, identical across every build ever made.
+    // The build stamp beside it is the field that actually identifies the code
+    // this pid is executing — the thing that used to need an `lsof -p <pid>`
+    // inode comparison to establish. See `build_info`.
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
+        sha = build_info::SHA,
+        dirty = build_info::DIRTY,
+        built_at = build_info::BUILT_AT,
         pid = std::process::id(),
         port = bound.port(),
         "server started"
