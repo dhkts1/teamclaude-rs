@@ -18,10 +18,20 @@ set -euo pipefail
 git_dir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
 
 # ── Do not build mid-operation ──────────────────────────────────────────────
-# A rebase/cherry-pick/unfinished-merge tree is a snapshot of someone's
-# in-flight work, not a commit anyone asked to build. `git merge` only runs this
-# hook on success, so MERGE_HEAD here means an unusual state, not the normal path.
-for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+# A rebase/cherry-pick tree is a snapshot of someone's in-flight work, not a
+# commit anyone asked to build. These markers can genuinely be set while this
+# hook runs — a rebase replaying a merge commit, a cherry-picked merge.
+#
+# MERGE_HEAD is deliberately NOT in this list, and must not be added back.
+# Measured: git clears MERGE_HEAD *after* post-merge returns, not before, so on
+# a plain `git merge --no-ff` the marker is present for the entire hook run and
+# is gone the moment the merge completes. Testing for it here tests for the
+# normal path, which skipped every rebuild the hook exists to do; only a
+# fast-forward `git pull` ever got through — the case that needs it least.
+# Nothing is lost by dropping it: `git merge` runs this hook only on success, so
+# an unfinished or conflicted merge never reaches this code at all, and the
+# unresolved-conflict check below covers the index either way.
+for marker in CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
   if [ -e "$git_dir/$marker" ]; then
     echo "post-merge: $marker present — skipping the rebuild until the tree settles." >&2
     exit 0
