@@ -534,11 +534,16 @@ enum TreeRow {
         requests: u64,
         last_seen: Option<OffsetDateTime>,
     },
-    /// A single session under the account above it.
+    /// A single session under the account it is PINNED to.
     Session {
         id: String,
         requests: u64,
         last_seen: Option<OffsetDateTime>,
+        /// The account that served this session's most recent request, when that
+        /// is NOT its pinned account — i.e. the request was diverted while the pin
+        /// was held. `None` on the normal case. The session still lives under its
+        /// pinned account's header; this only annotates the row.
+        diverted_to: Option<String>,
     },
     /// The single collapsed aggregate for ALL fallback sessions — those with no
     /// stable client identity. Rendered LAST, dim, with no children, so unpinned
@@ -551,11 +556,14 @@ enum TreeRow {
     },
 }
 
-/// Group most-recent-first sessions into an account→sessions tree. STABLE sessions
-/// build the tree: for each account — in order of its FIRST appearance, so the
-/// most-recently-active account leads — emit an [`TreeRow::Account`] header carrying
-/// the group's session count, its summed requests, and the group's YOUNGEST
-/// `last_seen`, followed by that account's sessions in input order. ALL fallback
+/// Group sessions into a PINNED-account→sessions tree. STABLE sessions build the
+/// tree: for each account — in order of its FIRST appearance in the (stably
+/// ordered) input — emit an [`TreeRow::Account`] header carrying the group's
+/// session count, its summed requests, and the group's YOUNGEST `last_seen`,
+/// followed by that account's sessions in input order. Grouping keys on
+/// [`SessionSnapshot::account`], the PIN, so a session whose last request was
+/// merely diverted keeps its row under its own account and is annotated with
+/// `diverted_to` instead of jumping to another group. ALL fallback
 /// (non-`stable`) sessions instead fold into one trailing [`TreeRow::Unpinned`]
 /// aggregate, rendered LAST and only when non-empty — so identity-less telemetry
 /// traffic collapses to one dim row rather than flooding the pane. Pure and
@@ -605,6 +613,10 @@ fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
                 id: session.id.clone(),
                 requests: session.requests,
                 last_seen: session.last_seen,
+                // Only a genuine divert annotates the row: the account that served
+                // last differs from the one the session is pinned to.
+                diverted_to: (session.last_served_account != session.account)
+                    .then(|| session.last_served_account.clone()),
             });
         }
     }
@@ -619,12 +631,17 @@ fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
     rows
 }
 
-/// The live sessions pane, drawn as an account→sessions tree: each account being
-/// served becomes a Cyan+bold header `▾ <name> · <count>` carrying the group's
-/// summed requests and youngest age, with its sessions indented beneath as short
-/// ids — so load balance across accounts and each session's affinity read at a
-/// glance. Rows arrive most-recent-first; [`session_tree`] preserves that recency
-/// both across account groups and within each group.
+/// The live sessions pane, drawn as a PINNED-account→sessions tree: each account
+/// holding pins becomes a Cyan+bold header `▾ <name> · <count>` carrying the
+/// group's summed requests and youngest age, with its sessions indented beneath as
+/// short ids — so load balance across accounts and each session's affinity read at
+/// a glance. Rows arrive in a stable (account, id) order and [`session_tree`]
+/// preserves it, so a row never moves because a request was served.
+///
+/// A session whose LAST request was diverted off its pin (a Fable title call, one
+/// request during a short hold) keeps its row under its own account and gets a dim
+/// `→<account>` suffix naming where that one request actually went. That is the
+/// honest reading: the pin did not move, so neither does the row.
 fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now: OffsetDateTime) {
     let header = Row::new(vec!["Session", "Reqs", "Last"])
         .style(Style::default().add_modifier(Modifier::BOLD));
@@ -668,12 +685,27 @@ fn render_sessions(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now:
                     id,
                     requests,
                     last_seen,
-                } => Row::new(vec![
-                    // Four-space indent nests the session under its account.
-                    Cell::from(format!("    {}", truncate(&id, 10))),
-                    Cell::from(requests.to_string()),
-                    Cell::from(age(last_seen)),
-                ]),
+                    diverted_to,
+                } => {
+                    // Four-space indent nests the session under its PINNED account.
+                    let mut spans = vec![Span::raw(format!("    {}", truncate(&id, 10)))];
+                    if let Some(account) = diverted_to {
+                        // Dim so the row still reads as belonging to its pin: the
+                        // session did not move, one request went elsewhere. Widths:
+                        // 4 + 10 + 2 + 10 = 26, inside the 28-cell column.
+                        spans.push(Span::styled(
+                            format!(" →{}", truncate(&account, 10)),
+                            Style::default()
+                                .fg(Color::DarkGray)
+                                .add_modifier(Modifier::DIM),
+                        ));
+                    }
+                    Row::new(vec![
+                        Cell::from(Line::from(spans)),
+                        Cell::from(requests.to_string()),
+                        Cell::from(age(last_seen)),
+                    ])
+                }
                 TreeRow::Unpinned {
                     count,
                     requests,
@@ -989,13 +1021,30 @@ mod tests {
         OffsetDateTime::UNIX_EPOCH + TimeDuration::seconds(secs)
     }
 
+    /// A session sitting on its pin — pinned to and last served by `account`.
     fn snap(id: &str, account: &str, requests: u64, last_seen: Option<i64>) -> SessionSnapshot {
         SessionSnapshot {
             id: id.to_string(),
             account: account.to_string(),
+            last_served_account: account.to_string(),
             requests,
             last_seen: last_seen.map(at),
             kind: SessionKind::Stable,
+        }
+    }
+
+    /// A session PINNED to `account` whose most recent request was DIVERTED to
+    /// `served_by` — the pin never moved.
+    fn diverted(
+        id: &str,
+        account: &str,
+        served_by: &str,
+        requests: u64,
+        last_seen: Option<i64>,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            last_served_account: served_by.to_string(),
+            ..snap(id, account, requests, last_seen)
         }
     }
 
@@ -1097,6 +1146,42 @@ mod tests {
     #[test]
     fn session_tree_empty_input_is_empty() {
         assert!(session_tree(&[]).is_empty());
+    }
+
+    #[test]
+    fn session_tree_groups_a_diverted_session_under_its_pin() {
+        // `d1` is pinned to acct-a; its last request was diverted to acct-b. It
+        // must stay in acct-a's group — the pin never moved — and carry the
+        // divert as an annotation rather than a change of home.
+        let sessions = vec![
+            snap("a1", "acct-a", 4, Some(100)),
+            diverted("d1", "acct-a", "acct-b", 7, Some(90)),
+        ];
+        let rows = session_tree(&sessions);
+
+        assert_eq!(rows.len(), 3, "one header, two sessions — NO acct-b group");
+        assert_eq!(header(&rows[0]), ("acct-a", 2));
+        match (&rows[1], &rows[2]) {
+            (
+                TreeRow::Session {
+                    diverted_to: home, ..
+                },
+                TreeRow::Session {
+                    id,
+                    diverted_to: away,
+                    ..
+                },
+            ) => {
+                assert_eq!(id, "d1");
+                assert_eq!(*home, None, "a session sitting on its pin is not annotated");
+                assert_eq!(
+                    away.as_deref(),
+                    Some("acct-b"),
+                    "the diverted session names where its one request actually went"
+                );
+            }
+            _ => panic!("rows 1 and 2 should both be sessions"),
+        }
     }
 
     #[test]
@@ -1414,5 +1499,50 @@ mod tests {
         assert!(text.contains("full"), "compact keeps the 7d quota label");
         assert!(!text.contains("Probe"), "compact drops the Probe column");
         assert!(!text.contains("Cache"), "compact drops the Cache column");
+    }
+
+    #[test]
+    fn render_sessions_keeps_a_diverted_session_under_its_pin() {
+        // One session pinned to `alice` whose most recent request was diverted to
+        // `bob`. The pane must show it as alice's — with the divert marked — and
+        // must NOT open a bob group, because no pin moved.
+        let snapshot = StatsSnapshot {
+            accounts: vec![],
+            current: None,
+            recent: vec![],
+            sessions: vec![diverted("a1f3", "alice", "bob", 24, Some(100))],
+        };
+        let backend = TestBackend::new(48, 8);
+        let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_sessions(frame, frame.area(), &snapshot, at(160)))
+            .expect("render succeeds");
+        let rows = buffer_rows(terminal.backend().buffer());
+        let text = rows.join("\n");
+
+        assert!(
+            text.contains("▾ alice · 1"),
+            "the session is grouped under its PINNED account\n{text}"
+        );
+        assert!(
+            !text.contains("▾ bob"),
+            "an account that merely served one diverted request gets NO group\n{text}"
+        );
+        let pin_row = rows
+            .iter()
+            .position(|row| row.contains("▾ alice"))
+            .expect("the alice header is drawn");
+        let session_row = rows
+            .iter()
+            .position(|row| row.contains("a1f3"))
+            .expect("the session row is drawn");
+        assert!(
+            session_row > pin_row,
+            "the session nests beneath its pin's header\n{text}"
+        );
+        assert!(
+            rows[session_row].contains("→bob"),
+            "the divert stays visible as a marker on the row\n{text}"
+        );
     }
 }

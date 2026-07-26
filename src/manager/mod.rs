@@ -2296,6 +2296,148 @@ mod tests {
         );
     }
 
+    /// The sessions pane must report the PIN, never whoever happened to serve the
+    /// last request. A hold that clears while the pinned account's prompt cache is
+    /// still warm DIVERTS one request and deliberately keeps the pin (see
+    /// [`CACHE_WARM_HOLD_SECS`]) — but the snapshot used to take its account from the
+    /// SERVING index, so every divert made the session visibly jump accounts in the
+    /// TUI although the pin never moved. A display that misreports state is worse
+    /// than no display: it made a fleet measured at a 1.70% switch rate read as
+    /// "sessions keep jumping".
+    #[test]
+    fn snapshot_reports_the_pin_not_the_last_serve() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 0xFEEDu64;
+
+        // Pin the session to `a`, and serve one request there.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(0),
+            "precondition: the first select pins the session to `a`"
+        );
+        manager.record_served(0, now, Some(key), SessionKind::Stable);
+
+        // `a` picks up a SHORT hold — one that clears while its cache is still warm.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].rate_limited_until_ms = Some(odt_to_ms(now) + SHORT_HOLD_SECS * 1000);
+        }
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(1),
+            "precondition: the short hold DIVERTS this one request to `b`"
+        );
+        manager.record_served(1, now, Some(key), SessionKind::Stable);
+
+        let snap = manager.snapshot(now);
+        let session = snap
+            .sessions
+            .iter()
+            .find(|s| s.id == short_session_id(key))
+            .expect("the session is present in the snapshot");
+        assert_eq!(
+            session.account, "a",
+            "the snapshot must report the PIN, which a divert never moves"
+        );
+        assert_eq!(
+            session.last_served_account, "b",
+            "the divert must stay OBSERVABLE in its own field — the goal is honesty, \
+             not concealment"
+        );
+    }
+
+    /// The other half of the same contract, so the fix cannot swing too far and start
+    /// hiding genuine re-keys behind a stale pin: when the pin DURABLY moves, the
+    /// snapshot follows it. Only an ACCOUNT-level hard gate re-keys, so sideline `a`
+    /// and let the next select re-pin the session to `b`.
+    #[test]
+    fn snapshot_account_follows_a_real_rekey() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 0xBEEFu64;
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(0),
+            "precondition: the session starts pinned to `a`"
+        );
+        manager.record_served(0, now, Some(key), SessionKind::Stable);
+
+        // A dead credential is ACCOUNT-level death → the pin is durably re-keyed.
+        manager.mark_error(0);
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(1),
+            "precondition: an errored pin re-keys the session to `b`"
+        );
+        manager.record_served(1, now, Some(key), SessionKind::Stable);
+
+        let snap = manager.snapshot(now);
+        let session = snap
+            .sessions
+            .iter()
+            .find(|s| s.id == short_session_id(key))
+            .expect("the session is present in the snapshot");
+        assert_eq!(
+            session.account, "b",
+            "a REAL re-key must move the reported account — the pin is the authority \
+             in both directions"
+        );
+        assert_eq!(session.last_served_account, "b");
+    }
+
+    /// Serving a request must not re-order the sessions pane. Rows used to sort
+    /// most-recent-first, so every single request threw its session to the top and
+    /// the pane churned under the operator's eyes — the other half of why a stable
+    /// fleet looked like it was thrashing.
+    #[test]
+    fn session_rows_do_not_reorder_on_a_serve() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), lock_refresher());
+        let now = OffsetDateTime::now_utc();
+        let keys = [0x11u64, 0x22, 0x33];
+
+        // Three sessions pinned to the one account, last seen 3s/2s/1s ago — so a
+        // recency order and a stable order are genuinely different orders here.
+        for key in keys {
+            manager.select(&HashSet::new(), now, None, Some(key));
+        }
+        for (offset, key) in [3i64, 2, 1].into_iter().zip(keys) {
+            manager.record_served(
+                0,
+                now - Duration::seconds(offset),
+                Some(key),
+                SessionKind::Stable,
+            );
+        }
+
+        let ids = |snap: StatsSnapshot| -> Vec<String> {
+            snap.sessions.iter().map(|s| s.id.clone()).collect()
+        };
+        let before = ids(manager.snapshot(now));
+        assert_eq!(
+            before.len(),
+            3,
+            "precondition: all three sessions are shown"
+        );
+
+        // The OLDEST session — not the first row — serves one request.
+        manager.record_served(0, now, Some(keys[0]), SessionKind::Stable);
+        let after = ids(manager.snapshot(now));
+
+        assert_eq!(
+            before, after,
+            "a serve must never move a session's row; the age belongs in the `Last` \
+             column, not in the row order"
+        );
+    }
+
     /// Cache tokens count: `update_usage` accumulates whatever the caller sums,
     /// which for the proxy includes cache-creation + cache-read input tokens.
     #[test]
