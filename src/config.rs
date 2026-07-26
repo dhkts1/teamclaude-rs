@@ -334,10 +334,18 @@ fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
 /// account the user deleted from the file is not resurrected, and an account on
 /// disk that the server never loaded is left untouched.
 ///
-/// An unreadable or malformed file falls back to writing the in-memory config:
-/// a just-rotated refresh token is single-use, so dropping it strands that
-/// account on `invalid_grant` forever, which is strictly worse than overwriting
-/// a file we cannot parse anyway. Both fallbacks log a warning naming the cause.
+/// An unreadable file, a malformed one, or one carrying no usable `accounts`
+/// list falls back to writing the in-memory config: a just-rotated refresh token
+/// is single-use, so dropping it strands that account on `invalid_grant`
+/// forever, which is strictly worse than overwriting a file whose account list
+/// we cannot find anyway. Every fallback logs a warning naming the cause.
+///
+/// A credential that cannot be placed on a SPECIFIC entry — the entry is
+/// malformed, or its identity matches nothing the server loaded — is never a
+/// reason to fail the whole write: every other account's token still lands, and
+/// [`merge_tokens`] hands back what it could not place so each miss is warned
+/// about by name here. Silence was the old defect: the merge skipped, the write
+/// succeeded, `Ok(())` came back, and the caller's error branch never ran.
 ///
 /// The merge runs on the file's raw JSON document, NOT on a `Config` round-trip:
 /// deserializing would materialize every serde default back into the file, so a
@@ -345,11 +353,8 @@ fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
 /// key they never wrote would appear for the first time. Editing the parsed
 /// document leaves the file byte-identical apart from the credential fields.
 pub fn save_tokens(path: &Path, memory: &Config) -> Result<(), ConfigError> {
-    let merged = match read_document(path) {
-        Ok(mut doc) => {
-            merge_tokens(&mut doc, memory);
-            doc
-        }
+    let mut doc = match read_document(path) {
+        Ok(doc) => doc,
         Err(ConfigError::Io(err)) => {
             tracing::warn!(
                 error = %err,
@@ -367,7 +372,19 @@ pub fn save_tokens(path: &Path, memory: &Config) -> Result<(), ConfigError> {
             return save(path, memory);
         }
     };
-    write_atomic(path, &serde_json::to_string_pretty(&merged)?)
+    let report = match merge_tokens(&mut doc, memory) {
+        Ok(report) => report,
+        Err(reason) => {
+            tracing::warn!(
+                reason = %reason,
+                path = %path.display(),
+                "config on disk has no usable accounts list at persist time; falling back to writing the in-memory config so the rotated tokens are not lost"
+            );
+            return save(path, memory);
+        }
+    };
+    report.warn_unpersisted(path);
+    write_atomic(path, &serde_json::to_string_pretty(&doc)?)
 }
 
 /// Read the config file as a raw JSON object. Parsing as a MAP (not a bare
@@ -411,6 +428,134 @@ struct Credentials<'a> {
     expires_at: Option<i64>,
 }
 
+/// Why the on-disk `accounts` list could not be merged into AT ALL. Not one
+/// account's problem but the whole document's, so [`save_tokens`] answers it with
+/// the same whole-config fallback an unparseable file takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unmergeable {
+    /// No `accounts` key in the document.
+    Missing,
+    /// `accounts` is present but is not a JSON array.
+    NotAnArray,
+}
+
+impl std::fmt::Display for Unmergeable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Missing => "the document has no accounts key",
+            Self::NotAnArray => "the accounts key is not an array",
+        })
+    }
+}
+
+/// Why ONE on-disk account entry did not receive its rotated credentials. The
+/// other entries in the same document are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// The array element is not a JSON object (a string, a number, `null`).
+    NotAnObject,
+    /// The element is an object but carries no readable identity — no string
+    /// `name`, which every match needs.
+    NoIdentity,
+    /// The entry is well-formed but no loaded account shares its identity. The
+    /// signature of an account renamed on disk while the proxy was running,
+    /// which is exactly the live-edit workflow [`save_tokens`] exists to support.
+    NoMemoryMatch,
+    /// The credential triple would not serialize. Structurally unreachable —
+    /// reported rather than swallowed precisely because reaching it would mean an
+    /// assumption this module rests on has broken.
+    CredentialEncoding,
+}
+
+impl std::fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotAnObject => "the entry is not a JSON object",
+            Self::NoIdentity => "the entry has no readable account name",
+            Self::NoMemoryMatch => "no loaded account has that identity (renamed on disk?)",
+            Self::CredentialEncoding => "the credentials would not serialize",
+        })
+    }
+}
+
+/// One on-disk entry the merge could not write into. It keeps whatever
+/// credential it already held — which, after a rotation, is a consumed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkippedEntry {
+    /// Position in the on-disk `accounts` array — the only handle the user has on
+    /// an entry too malformed to carry a name.
+    index: usize,
+    /// The entry's `name` when one is readable, which it is for the common
+    /// [`SkipReason::NoMemoryMatch`] case.
+    name: Option<String>,
+    reason: SkipReason,
+}
+
+impl SkippedEntry {
+    /// How the entry is named in a log line: its `name`, else its position.
+    fn label(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| format!("accounts[{}]", self.index))
+    }
+}
+
+/// What a merge could not persist. Both lists are REPORTS, not failures: the
+/// merge places every credential it can and hands the rest back, so
+/// [`save_tokens`] logs each miss with the config path attached instead of the
+/// helper logging blind.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct MergeReport {
+    /// On-disk entries left holding whatever credential they already had.
+    skipped: Vec<SkippedEntry>,
+    /// Names of loaded accounts with no on-disk entry to write into. Benign when
+    /// the user deleted the account; a token loss when they renamed it.
+    absent_from_disk: Vec<String>,
+}
+
+impl MergeReport {
+    /// Emit one line per credential that did NOT reach the file. A rotated
+    /// refresh token is single-use, so a skip means that token is now consumed
+    /// and unrecoverable — the account has to be re-authed. Nothing else in the
+    /// stack can say this: the write itself succeeds and returns `Ok(())`.
+    fn warn_unpersisted(&self, path: &Path) {
+        for entry in &self.skipped {
+            tracing::warn!(
+                account = %entry.label(),
+                index = entry.index,
+                reason = %entry.reason,
+                path = %path.display(),
+                "rotated credential not persisted for this account; it may need `tcr login`"
+            );
+        }
+        // A loaded account with no on-disk entry is USUALLY the user deleting it
+        // from the file — correct, expected, and not worth a warning on every
+        // persist for the rest of the process's life. Paired with an unmatched
+        // on-disk entry in the same write it is instead the signature of a
+        // RENAME, where a rotated credential really was dropped. The pairing is
+        // what makes the two cases distinguishable, so only it escalates.
+        let renamed = self
+            .skipped
+            .iter()
+            .any(|s| s.reason == SkipReason::NoMemoryMatch);
+        for name in &self.absent_from_disk {
+            if renamed {
+                tracing::warn!(
+                    account = %name,
+                    path = %path.display(),
+                    "loaded account has no entry on disk while another entry matched nothing; a rename would drop its rotated credential, and it may need `tcr login`"
+                );
+            } else {
+                tracing::debug!(
+                    account = %name,
+                    path = %path.display(),
+                    "loaded account has no entry on disk; nothing persisted for it (removed from the file?)"
+                );
+            }
+        }
+    }
+}
+
 /// Overwrite the credential fields of every account present in BOTH `memory` and
 /// the on-disk `doc`, matched by identity and never by position. Nothing else in
 /// the document is touched.
@@ -419,16 +564,48 @@ struct Credentials<'a> {
 /// for free: an account the user deleted from the file is never resurrected (it
 /// has no entry to write into), and an account on disk the server never loaded
 /// is left alone (no memory match).
-fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) {
-    let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
-        return;
+///
+/// Every path that declines to write a credential is REPORTED, never silent: the
+/// per-entry misses come back in the [`MergeReport`], and a document with no
+/// usable `accounts` list comes back as [`Unmergeable`] so the caller can fall
+/// back to writing the config whole rather than lose every rotated token in the
+/// one write. A skipped entry is not an error for the others — the merge runs to
+/// the end of the list either way.
+fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeReport, Unmergeable> {
+    let Some(accounts) = doc.get_mut("accounts") else {
+        return Err(Unmergeable::Missing);
     };
-    for entry in accounts.iter_mut() {
+    let Some(accounts) = accounts.as_array_mut() else {
+        return Err(Unmergeable::NotAnArray);
+    };
+
+    let mut report = MergeReport::default();
+    // Which loaded accounts found a home, so the ones that did not can be named
+    // afterwards — a rename shows up here as well as in `skipped`.
+    let mut placed = vec![false; memory.accounts.len()];
+
+    for (index, entry) in accounts.iter_mut().enumerate() {
         let Some(object) = entry.as_object_mut() else {
+            report.skipped.push(SkippedEntry {
+                index,
+                name: None,
+                reason: SkipReason::NotAnObject,
+            });
             continue;
         };
+        // Read the name BEFORE the identity parse, so a half-edited entry that
+        // fails to deserialize can still be named in the warning.
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
         else {
+            report.skipped.push(SkippedEntry {
+                index,
+                name,
+                reason: SkipReason::NoIdentity,
+            });
             continue;
         };
         let probe = crate::identity::probe(
@@ -437,11 +614,17 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) {
             stored.org_uuid,
             stored.org_name,
         );
-        let Some(fresh) = memory
+        let Some((position, fresh)) = memory
             .accounts
             .iter()
-            .find(|a| crate::identity::same_identity(a, &probe))
+            .enumerate()
+            .find(|(_, a)| crate::identity::same_identity(a, &probe))
         else {
+            report.skipped.push(SkippedEntry {
+                index,
+                name,
+                reason: SkipReason::NoMemoryMatch,
+            });
             continue;
         };
         let credentials = Credentials {
@@ -450,10 +633,27 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) {
             expires_at: fresh.expires_at,
         };
         let Ok(Value::Object(fields)) = serde_json::to_value(&credentials) else {
+            report.skipped.push(SkippedEntry {
+                index,
+                name,
+                reason: SkipReason::CredentialEncoding,
+            });
             continue;
         };
         object.extend(fields);
+        if let Some(seen) = placed.get_mut(position) {
+            *seen = true;
+        }
     }
+
+    report.absent_from_disk = memory
+        .accounts
+        .iter()
+        .zip(&placed)
+        .filter(|(_, seen)| !**seen)
+        .map(|(account, _)| account.name.clone())
+        .collect();
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -812,6 +1012,212 @@ mod tests {
         assert_eq!(value["accounts"][0]["accessToken"], json!("at-a-new"));
         assert_eq!(value["accounts"][1]["accessToken"], json!("at-new"));
         assert_eq!(value["accounts"][1]["refreshToken"], json!("rt-new"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// A document that parses but carries no `accounts` list at all — a
+    /// truncated hand-edit, or a file another tool rewrote. The merge used to
+    /// return before writing ANYTHING while `save_tokens` still reported `Ok`, so
+    /// one write consumed and dropped the freshly rotated refresh token of every
+    /// account at once. It is a malformed document, and takes the same
+    /// whole-config fallback an unparseable one does.
+    #[test]
+    fn merge_with_missing_accounts_array_falls_back_and_warns() {
+        let path = tmp_path("persist-no-accounts-key");
+        let memory: Config =
+            serde_json::from_str(&one_account_file("at-new", "rt-new", 7)).unwrap();
+        let malformed = r#"{ "proxy": { "port": 3456 } }"#;
+        fs::write(&path, malformed).unwrap();
+
+        let mut doc: Map<String, Value> = serde_json::from_str(malformed).unwrap();
+        assert_eq!(
+            merge_tokens(&mut doc, &memory),
+            Err(Unmergeable::Missing),
+            "the caller must be told, not handed a silently untouched document"
+        );
+
+        save_tokens(&path, &memory).unwrap();
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["refreshToken"],
+            json!("rt-new"),
+            "a single-use rotated token was dropped: {value}"
+        );
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-new"));
+        assert_eq!(value["accounts"][0]["expiresAt"], json!(7));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the fallback must not loosen permissions on a token file"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn merge_with_non_array_accounts_falls_back() {
+        let path = tmp_path("persist-accounts-not-array");
+        let memory: Config =
+            serde_json::from_str(&one_account_file("at-new", "rt-new", 7)).unwrap();
+        // `accounts` present but the wrong JSON type: nothing to merge into, and
+        // writing the document back verbatim would drop the rotated token.
+        let malformed = r#"{ "accounts": {} }"#;
+        fs::write(&path, malformed).unwrap();
+
+        let mut doc: Map<String, Value> = serde_json::from_str(malformed).unwrap();
+        assert_eq!(
+            merge_tokens(&mut doc, &memory),
+            Err(Unmergeable::NotAnArray)
+        );
+
+        save_tokens(&path, &memory).unwrap();
+        let value = read_json(&path);
+        assert_eq!(value["accounts"][0]["refreshToken"], json!("rt-new"));
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-new"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// The live-edit workflow `save_tokens` exists to support, in its one losing
+    /// shape: renaming an account leaves its on-disk entry matching nothing, so
+    /// its rotated credential cannot be placed. That is unavoidable — being
+    /// silent about it is not. Both halves of the rename must be reported, and
+    /// the OTHER account's token must still land.
+    #[test]
+    fn renamed_account_is_reported_not_silently_skipped() {
+        let path = tmp_path("persist-renamed");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a-new", "refreshToken": "rt-a-new", "expiresAt": 11 },
+                   { "name": "acct-b", "accessToken": "at-b-new", "refreshToken": "rt-b-new", "expiresAt": 22 } ] }"#,
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "acct-a-renamed", "accessToken": "at-a-old", "refreshToken": "rt-a-old" },
+                   { "name": "acct-b", "accessToken": "at-b-old", "refreshToken": "rt-b-old" } ] }"#,
+        )
+        .unwrap();
+
+        let mut doc = read_document(&path).unwrap();
+        let report = merge_tokens(&mut doc, &memory).expect("the document has an accounts array");
+        assert_eq!(
+            report.skipped,
+            vec![SkippedEntry {
+                index: 0,
+                name: Some("acct-a-renamed".to_string()),
+                reason: SkipReason::NoMemoryMatch,
+            }],
+            "the unmatched on-disk entry must come back named"
+        );
+        assert_eq!(
+            report.absent_from_disk,
+            vec!["acct-a".to_string()],
+            "the memory side of the rename must be visible too — that is what makes it a rename and not a deletion"
+        );
+
+        save_tokens(&path, &memory).unwrap();
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["refreshToken"],
+            json!("rt-a-old"),
+            "a token landed on an entry that is not its own: {value}"
+        );
+        assert_eq!(value["accounts"][1]["accessToken"], json!("at-b-new"));
+        assert_eq!(
+            value["accounts"][1]["refreshToken"],
+            json!("rt-b-new"),
+            "one skipped entry must not cost the other accounts their tokens"
+        );
+        assert_eq!(value["accounts"][1]["expiresAt"], json!(22));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn undeserializable_entry_does_not_block_its_siblings() {
+        let path = tmp_path("persist-junk-entry");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [ { "name": "acct-a", "accessToken": "at-a-new", "refreshToken": "rt-a-new", "expiresAt": 33 } ] }"#,
+        )
+        .unwrap();
+        // Two entries a mid-edit file can hold — a bare string and an object with
+        // no name — ahead of the real account.
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   "acct-a",
+                   { "accessToken": "at-orphan" },
+                   { "name": "acct-a", "accessToken": "at-a-old", "refreshToken": "rt-a-old" } ] }"#,
+        )
+        .unwrap();
+
+        let mut doc = read_document(&path).unwrap();
+        let report = merge_tokens(&mut doc, &memory).expect("the document has an accounts array");
+        assert_eq!(
+            report.skipped,
+            vec![
+                SkippedEntry {
+                    index: 0,
+                    name: None,
+                    reason: SkipReason::NotAnObject,
+                },
+                SkippedEntry {
+                    index: 1,
+                    name: None,
+                    reason: SkipReason::NoIdentity,
+                },
+            ]
+        );
+        assert!(
+            report.absent_from_disk.is_empty(),
+            "the loaded account did find its entry"
+        );
+        // A nameless entry is still addressable by the user: they can count rows.
+        assert_eq!(report.skipped[0].label(), "accounts[0]");
+
+        save_tokens(&path, &memory).unwrap();
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0],
+            json!("acct-a"),
+            "a malformed entry was rewritten instead of left alone"
+        );
+        assert_eq!(value["accounts"][1], json!({ "accessToken": "at-orphan" }));
+        assert_eq!(value["accounts"][2]["accessToken"], json!("at-a-new"));
+        assert_eq!(
+            value["accounts"][2]["refreshToken"],
+            json!("rt-a-new"),
+            "junk ahead of a good entry blocked its rotated token: {value}"
+        );
+        assert_eq!(value["accounts"][2]["expiresAt"], json!(33));
+        fs::remove_file(&path).ok();
+    }
+
+    /// The benign twin of the rename: an account deleted from the file is
+    /// reported as absent, with NO unmatched on-disk entry beside it. That
+    /// pairing is the only thing distinguishing a correct deletion from a
+    /// rename that just cost an account its refresh token.
+    #[test]
+    fn account_removed_from_disk_is_reported_without_a_skip() {
+        let path = tmp_path("persist-removed-report");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a-new" },
+                   { "name": "acct-gone", "accessToken": "at-gone-new" } ] }"#,
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            r#"{ "accounts": [ { "name": "acct-a", "accessToken": "at-a-old" } ] }"#,
+        )
+        .unwrap();
+
+        let mut doc = read_document(&path).unwrap();
+        let report = merge_tokens(&mut doc, &memory).expect("the document has an accounts array");
+        assert!(
+            report.skipped.is_empty(),
+            "a deletion leaves no unmatched on-disk entry: {report:?}"
+        );
+        assert_eq!(report.absent_from_disk, vec!["acct-gone".to_string()]);
         fs::remove_file(&path).ok();
     }
 
