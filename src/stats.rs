@@ -24,7 +24,10 @@ pub struct RequestLogEntry {
 /// an honest "near limit" / "exhausted" label: an account parked out of rotation
 /// because it is near/over its weekly (or 5-hour) cap is still operationally
 /// **active** — never the red `error` reserved for a dead credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serde-derived so it crosses the status endpoint's wire ([`crate::status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum QuotaState {
     /// Comfortably under the switch threshold — in normal rotation.
     #[default]
@@ -42,7 +45,10 @@ pub enum QuotaState {
 /// [`AccountSnapshot::free_at`] clear-instant. Soft pacing is deliberately NOT a
 /// reason here: it only ever narrows an already-healthy account, never holds one
 /// out, so a paced account still reads [`GateReason::Ok`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Serde-derived so it crosses the status endpoint's wire ([`crate::status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GateReason {
     /// In rotation — no hard gate is active.
     Ok,

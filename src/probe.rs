@@ -235,7 +235,10 @@ impl UsageProber for LiveUsageProber {
 /// Health of an account's most recent probe, surfaced to the TUI. A failing
 /// probe becomes a visible [`ProbeStatus::Error`]/[`ProbeStatus::Timeout`],
 /// never a silently-frozen bar.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Serialized kebab-case so it crosses the status endpoint's wire
+/// ([`crate::status`]) as the same token [`ProbeStatus::as_str`] already prints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ProbeStatus {
     /// Never probed yet (or a non-OAuth account).
     #[default]
