@@ -638,6 +638,13 @@ async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusE
 /// answers we fall back to the historical offline path — a fresh `Manager` plus a
 /// live quota probe, never persisted — and every rendering says which of the two
 /// it is, so a zero counter can never again pass for a measurement.
+///
+/// The live path deliberately does NOT probe. Quota there comes from the server's
+/// own probe loop (every `quotaProbeSeconds`, 75s by default), which is both
+/// fresher in practice than a cold one-shot probe and one fewer caller hitting the
+/// usage endpoint — that endpoint rate-limits, and a second prober racing the
+/// server's is what makes a whole fleet read `probe=rate-limited`. Only the
+/// offline fallback, which has no server to inherit quota from, probes.
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = config::load(config_path)
@@ -1024,6 +1031,73 @@ mod tests {
             render_accounts(&counted, &thresholds).contains("cache=75%"),
             "a measured ratio still renders as a percentage"
         );
+    }
+
+    /// END-TO-END through the PRODUCTION path, which is the claim that actually
+    /// matters: a real hybrid listener (the thing that injects `ClientAddr`), a
+    /// real HTTP round trip on a real socket, and the real client parser.
+    ///
+    /// The counters below exist ONLY in the served manager's process — exactly the
+    /// situation that made `tcr status` lie, since the offline path builds a fresh
+    /// `Manager` that can never see them. Binds port 0 (a free ephemeral port) and
+    /// overrides the config's 3456, so this never touches a real running proxy.
+    #[tokio::test]
+    async fn live_status_reads_the_running_servers_counters() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = port;
+
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        // 750 of 1000 input tokens were prompt-cache reads: a real 75% hit ratio,
+        // held in this process only.
+        manager.update_usage(0, 1_000, 200, 750, 50);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let payload = match fetch_live_status(&config).await {
+            Ok(p) => p,
+            Err(LiveStatusError::NoServer) => panic!("the spawned server did not answer"),
+            Err(LiveStatusError::Unusable(why)) => panic!("live status unusable: {why}"),
+        };
+        let (snapshot, thresholds) = payload.into_snapshot();
+
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Live);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(
+            rows[0]["cacheHitRatio"],
+            serde_json::json!(0.75),
+            "the ratio is the SERVER's real measurement, not a structural zero: {}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["inputTokens"], 1_000);
+        assert_eq!(rows[0]["cacheReadTokens"], 750);
+        assert_eq!(rows[0]["source"], "live");
+        // The account that served nothing still reports an honest null, not a 0.0.
+        assert!(rows[1]["cacheHitRatio"].is_null(), "{}", rows[1]);
+        // Thresholds came from the SERVER, not from re-reading the config file.
+        assert_eq!(thresholds.len(), 2);
+    }
+
+    /// The fallback half of the same contract: with nothing listening, the live
+    /// read reports `NoServer` (the ordinary case, which warns about nothing) and
+    /// `tcr status` keeps working exactly as before — just labelled `offline`.
+    #[tokio::test]
+    async fn live_status_falls_back_when_no_server_answers() {
+        // Bind and immediately drop, so the port is free and reliably refuses.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = port;
+
+        match fetch_live_status(&config).await {
+            Err(LiveStatusError::NoServer) => {}
+            Err(LiveStatusError::Unusable(why)) => {
+                panic!("a dead port is the ordinary no-server case, not a warning: {why}")
+            }
+            Ok(_) => panic!("nothing is listening on {port}"),
+        }
     }
 
     // --- no-persist guarantee ----------------------------------------------

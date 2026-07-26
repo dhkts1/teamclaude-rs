@@ -279,10 +279,12 @@ pub fn app(manager: Arc<Manager>) -> Router {
         // Anthropic with a pooled OAuth Bearer attached.
         //
         // `.fallback` on the METHOD router pins the wrong-method answer to a local
-        // 405 as well. Without it, a `MethodRouter` still carrying its default
-        // fallback inherits the Router's catch-all — which would mean a POST to
-        // this path silently became an upstream-forwarded request. Method-scoping
-        // is load-bearing here, not decoration.
+        // 405. Measured on axum 0.8: a bare `get(...)` ALREADY answers 405 rather
+        // than inheriting the Router's catch-all, so this is belt-and-braces, not
+        // a fix for a live bug — it buys a consistent JSON error body and, more to
+        // the point, pins the behaviour explicitly so a future axum whose method
+        // routers inherit the outer fallback cannot silently turn a POST on this
+        // path into an upstream-forwarded request carrying a pooled OAuth Bearer.
         .route(
             STATUS_PATH,
             axum::routing::get(status_handler).fallback(status_method_not_allowed),
@@ -2059,9 +2061,15 @@ mod tests {
     /// The 405 is what proves the no-fall-through: `handle` would rewrite the
     /// request to the configured upstream — a dead port here — and return 502. So
     /// 405 (and not 502) is the assertion that a POST to this path was never sent
-    /// to Anthropic with a pooled OAuth Bearer attached. Without the explicit
-    /// `.fallback` on the method router, a `MethodRouter` still carrying its
-    /// default fallback inherits the Router's catch-all, which is exactly that bug.
+    /// to Anthropic with a pooled OAuth Bearer attached.
+    ///
+    /// Sensitivity, measured rather than assumed: this test still passes with the
+    /// method router's explicit `.fallback` removed, because axum 0.8 already
+    /// answers 405 instead of inheriting the outer catch-all. So it is a
+    /// REGRESSION guard on the routing contract — it would catch the path being
+    /// re-registered under `any(...)`, moved behind the fallback, or an axum
+    /// upgrade that starts propagating the outer fallback — not proof that the
+    /// explicit `.fallback` is currently load-bearing.
     #[tokio::test]
     async fn status_endpoint_is_get_only() {
         for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
