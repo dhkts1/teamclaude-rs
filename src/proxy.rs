@@ -259,10 +259,124 @@ fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>)
     Some(stable_hash("uid:", &user_id))
 }
 
+/// Path of the read-only live-status endpoint [`status_handler`] serves.
+///
+/// The `_tcr/` prefix is what makes the route safe to add to a transparent
+/// forwarder: every path a client legitimately means for Anthropic lives under
+/// `/v1/…` (`/v1/messages`, `/v1/models`, `/v1/organizations/…`), so a segment
+/// starting with an underscore can neither collide with a request we must forward
+/// today nor be shadowed by an Anthropic route added tomorrow. Anything the proxy
+/// ever answers locally belongs under this prefix.
+pub const STATUS_PATH: &str = "/_tcr/status";
+
 /// Build the proxy router. Every method and path funnels through the single
-/// catch-all [`handle`]; the [`Manager`] is shared state.
+/// catch-all [`handle`] — EXCEPT [`STATUS_PATH`], which the proxy answers itself.
+/// The [`Manager`] is shared state.
 pub fn app(manager: Arc<Manager>) -> Router {
-    Router::new().fallback(handle).with_state(manager)
+    Router::new()
+        // Registered as a real route so it is matched BEFORE the catch-all: a
+        // status request must never reach `handle`, which would rewrite it to
+        // Anthropic with a pooled OAuth Bearer attached.
+        //
+        // `.fallback` on the METHOD router pins the wrong-method answer to a local
+        // 405 as well. Without it, a `MethodRouter` still carrying its default
+        // fallback inherits the Router's catch-all — which would mean a POST to
+        // this path silently became an upstream-forwarded request. Method-scoping
+        // is load-bearing here, not decoration.
+        .route(
+            STATUS_PATH,
+            axum::routing::get(status_handler).fallback(status_method_not_allowed),
+        )
+        .fallback(handle)
+        .with_state(manager)
+}
+
+/// A non-`GET` on [`STATUS_PATH`]. Answered locally with 405 so the request is
+/// neither forwarded upstream nor able to mutate anything — the endpoint is a
+/// pure read, and there is no verb on it that is not.
+async fn status_method_not_allowed() -> Response {
+    error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr status endpoint is read-only: GET.",
+        None,
+    )
+}
+
+/// `GET /_tcr/status` — the live fleet snapshot, for `tcr status`.
+///
+/// This is a **new attack surface on a process holding every account's OAuth
+/// access and refresh token**, so it is gated twice and reads nothing but state
+/// that is already on screen in the TUI:
+///
+/// 1. **Origin.** The peer must be loopback, proven by the [`ClientAddr`]
+///    extension the hybrid listener injects from the real socket address (the
+///    same extension the auth gate in [`handle`] uses). It is not a header, so a
+///    client cannot forge it. Absent — a request that did not arrive through the
+///    listener — we fail CLOSED. Bind scope is not authorization: `127.0.0.1` is
+///    reachable by every process and every container on this host, so "we only
+///    bind loopback" is not a claim about who is calling.
+/// 2. **Key.** When a proxy api-key is configured it is REQUIRED here, with no
+///    loopback exemption — deliberately stricter than [`handle`], which exempts
+///    loopback because `claude` authenticates with its own OAuth and never sends
+///    the proxy key. Nothing on this host needs to read the fleet's state without
+///    the operator's secret, so reading it costs the same secret that using the
+///    proxy does. The compare is [`key_matches`] (constant-time, length-safe).
+///
+/// It takes only [`Parts`](axum::http::request::Parts), so the request body is
+/// never read; it touches no `&mut` state, triggers no probe, no token refresh
+/// and no config write; and it returns the [`crate::status`] projection, which
+/// carries no token, no key and no `Authorization` echo (see that module's
+/// no-secret invariant).
+async fn status_handler(
+    State(manager): State<Arc<Manager>>,
+    parts: axum::http::request::Parts,
+) -> Response {
+    let client_is_loopback = parts
+        .extensions
+        .get::<ClientAddr>()
+        .is_some_and(|a| a.0.ip().is_loopback());
+    if !client_is_loopback {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "The tcr status endpoint is loopback-only.",
+            None,
+        );
+    }
+
+    if let Some(expected) = manager.proxy_api_key() {
+        let provided = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        if !key_matches(provided, expected) {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Missing or invalid x-api-key.",
+                None,
+            );
+        }
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let payload =
+        crate::status::StatusPayload::from_snapshot(&manager.snapshot(now), &manager.thresholds());
+    let Ok(body) = serde_json::to_string(&payload) else {
+        // Serializing plain numbers and strings cannot realistically fail, but a
+        // proxy never panics on a client request — surface it as a 500 instead.
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "Could not serialize the status snapshot.",
+            None,
+        );
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    // Operational state that is stale the instant it is read, from a
+    // credential-holding process — never store it anywhere.
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    response
 }
 
 /// The catch-all proxy handler.
@@ -1726,6 +1840,270 @@ mod tests {
             502,
             "the exempt request proceeds upstream (dead port → 502)"
         );
+    }
+
+    // --- GET /_tcr/status ---------------------------------------------------
+
+    /// Drive the router directly with a `ClientAddr` extension we control.
+    ///
+    /// This is the same extension `mitm::serve_http` injects from the real peer
+    /// socket, and driving the router by hand is the only way to present a
+    /// NON-loopback peer without binding a routable address on the test machine.
+    /// `peer = None` models a request that never went through the listener at all.
+    async fn status_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(STATUS_PATH);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder.body(Body::empty()).expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, body)
+    }
+
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 54_321))
+    }
+
+    /// A routable, definitely-not-loopback peer (TEST-NET-3, RFC 5737).
+    fn remote_peer() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 7], 44_444))
+    }
+
+    /// THE BITING TEST for the whole change: the endpoint reports the counters of
+    /// the process that actually served, so a cache hit ratio computed from them
+    /// is a real measurement.
+    ///
+    /// Pre-fix there was no route at all — `tcr status` built a FRESH `Manager`
+    /// whose `input_tokens` is structurally 0, so its ratio was the literal `0.0`
+    /// fallback for every account, always. Here 750 of 1000 input tokens were
+    /// cache reads and the payload must carry exactly that, giving 0.75.
+    #[tokio::test]
+    async fn status_endpoint_returns_live_counters() {
+        let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+        // Serve a request through the manager so the counters are non-zero, the
+        // same two calls `handle` makes at a terminal outcome.
+        manager.update_usage(0, 1_000, 200, 750, 50);
+        manager.record_served(0, OffsetDateTime::now_utc(), None, SessionKind::Fallback);
+
+        let (status, headers, body) =
+            status_request(manager, Method::GET, Some(loopback_peer()), None).await;
+        assert_eq!(status, StatusCode::OK, "loopback GET is served");
+        assert_eq!(
+            headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "live state from a credential-holding process is never stored"
+        );
+
+        let payload: crate::status::StatusPayload =
+            serde_json::from_slice(&body).expect("a tcr status payload");
+        assert_eq!(payload.kind, crate::status::STATUS_KIND);
+        let account = &payload.accounts[0];
+        assert_eq!(account.name, "dummy");
+        assert_eq!(account.requests, 1, "the serve was counted");
+        assert_eq!(account.input_tokens, 1_000);
+        assert_eq!(account.cache_read_tokens, 750);
+        assert_eq!(account.cache_creation_tokens, 50);
+        assert_eq!(account.output_tokens, 200);
+        // The number `tcr status` derives from this row — a real 0.75, never the
+        // structural 0.0 an offline snapshot could only ever produce.
+        let ratio = account.cache_read_tokens as f64 / account.input_tokens as f64;
+        assert!(
+            (ratio - 0.75).abs() < f64::EPSILON,
+            "hit ratio reflects the real numbers: {ratio}"
+        );
+    }
+
+    /// SECURITY GUARD 1 — origin. Binding loopback is not authorization, so the
+    /// endpoint proves the peer instead: a non-loopback `ClientAddr` is refused,
+    /// and so is an ABSENT one (a request that did not arrive through the hybrid
+    /// listener has no provable origin, so it fails CLOSED). Neither answer may
+    /// carry any fleet state.
+    #[tokio::test]
+    async fn status_endpoint_rejects_a_non_loopback_client() {
+        let config = || dummy_config(None, "http://127.0.0.1:1");
+
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let manager = Manager::with_live_refresher(config(), None);
+            let (status, _headers, body) = status_request(manager, Method::GET, peer, None).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} must be refused, got {status}"
+            );
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("dummy") && !text.contains("accounts"),
+                "a refused caller learns nothing about the fleet: {text}"
+            );
+        }
+    }
+
+    /// SECURITY GUARD 2 — the key. When a proxy api-key is configured this
+    /// endpoint requires it with NO loopback exemption, deliberately stricter than
+    /// the forwarding path (which exempts loopback because `claude` sends its own
+    /// OAuth and never the proxy key). Every case below is a LOOPBACK peer, so
+    /// what is being asserted is precisely that loopback alone is not enough.
+    #[tokio::test]
+    async fn status_endpoint_rejects_a_bad_api_key() {
+        let config = || dummy_config(Some("sk-proxy-secret"), "http://127.0.0.1:1");
+
+        for (label, key) in [
+            ("no key", None),
+            ("wrong key", Some("sk-wrong-secret!")),
+            ("prefix of the key", Some("sk-proxy")),
+            ("key with a suffix", Some("sk-proxy-secret-extra")),
+        ] {
+            let manager = Manager::with_live_refresher(config(), None);
+            let (status, _headers, body) =
+                status_request(manager, Method::GET, Some(loopback_peer()), key).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{label} must be 401 even from loopback, got {status}"
+            );
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("dummy"),
+                "a rejected caller learns nothing about the fleet: {text}"
+            );
+        }
+
+        // ...and the correct key from loopback is served.
+        let manager = Manager::with_live_refresher(config(), None);
+        let (status, _headers, _body) = status_request(
+            manager,
+            Method::GET,
+            Some(loopback_peer()),
+            Some("sk-proxy-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "loopback + correct key is served");
+    }
+
+    /// SECURITY GUARD 3 — no secrets on the wire. Asserted on the RESPONSE BYTES,
+    /// not on a struct: a struct assertion only proves the fields you thought to
+    /// name are clean, while the bytes are what actually leaves the process. The
+    /// proxy holds every account's OAuth access and refresh token plus the proxy
+    /// key; none of the three may appear, in any field, under any name.
+    #[tokio::test]
+    async fn status_endpoint_leaks_no_secrets() {
+        let manager = Manager::with_live_refresher(
+            dummy_config(Some("sk-proxy-secret"), "http://127.0.0.1:1"),
+            None,
+        );
+        manager.update_usage(0, 1_000, 200, 750, 50);
+        let (status, headers, body) = status_request(
+            manager,
+            Method::GET,
+            Some(loopback_peer()),
+            Some("sk-proxy-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let text = String::from_utf8_lossy(&body);
+        for secret in [
+            "at-dummy",        // the account's OAuth ACCESS token
+            "rt-dummy",        // the account's OAuth REFRESH token
+            "sk-proxy-secret", // the proxy api-key (must not be echoed back)
+            "Bearer",          // no upstream Authorization header, in any form
+        ] {
+            assert!(
+                !text.contains(secret),
+                "the response body leaked {secret:?}: {text}"
+            );
+        }
+        // Sanity: the assertion above is meaningful only if a real payload WAS
+        // rendered — an empty body would pass it vacuously.
+        assert!(
+            text.contains("\"name\":\"dummy\"") && text.contains("\"cacheReadTokens\":750"),
+            "the body really is a populated status payload: {text}"
+        );
+        // Headers are part of the response too — nothing credential-shaped there.
+        for (name, value) in headers.iter() {
+            let rendered = format!("{name}: {}", value.to_str().unwrap_or_default());
+            assert!(
+                !rendered.contains("at-dummy")
+                    && !rendered.contains("rt-dummy")
+                    && !rendered.contains("sk-proxy-secret"),
+                "a response header leaked a secret: {rendered}"
+            );
+        }
+    }
+
+    /// SECURITY GUARD 4 — GET only, and never a fall-through. A non-GET on the
+    /// status path is answered LOCALLY with 405; it must not mutate anything and
+    /// must not reach `handle`.
+    ///
+    /// The 405 is what proves the no-fall-through: `handle` would rewrite the
+    /// request to the configured upstream — a dead port here — and return 502. So
+    /// 405 (and not 502) is the assertion that a POST to this path was never sent
+    /// to Anthropic with a pooled OAuth Bearer attached. Without the explicit
+    /// `.fallback` on the method router, a `MethodRouter` still carrying its
+    /// default fallback inherits the Router's catch-all, which is exactly that bug.
+    #[tokio::test]
+    async fn status_endpoint_is_get_only() {
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            let manager =
+                Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
+            let before = manager.snapshot(OffsetDateTime::now_utc());
+            let (status, _headers, body) = status_request(
+                Arc::clone(&manager),
+                method.clone(),
+                Some(loopback_peer()),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on the status path is refused locally, got {status}"
+            );
+            assert_ne!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{method} must never fall through to the upstream forwarder"
+            );
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("cacheReadTokens"),
+                "a refused method returns no snapshot: {text}"
+            );
+
+            // Nothing moved: no serve counted, no token usage, no probe.
+            let after = manager.snapshot(OffsetDateTime::now_utc());
+            assert_eq!(after.accounts[0].requests, before.accounts[0].requests);
+            assert_eq!(
+                after.accounts[0].input_tokens,
+                before.accounts[0].input_tokens
+            );
+            assert_eq!(
+                after.accounts[0].probe_status, before.accounts[0].probe_status,
+                "{method} triggered no probe"
+            );
+            assert_eq!(after.current, before.current, "{method} moved no cursor");
+        }
     }
 
     /// key_matches behaviour is preserved after the length side-channel fix:

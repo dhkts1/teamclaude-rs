@@ -68,6 +68,24 @@ impl Manager {
         log.push_back(entry);
     }
 
+    /// Each account's effective gating threshold — its own `switchThreshold`, else
+    /// the global one — in account order, resolved exactly as [`Self::snapshot`]
+    /// resolves it internally.
+    ///
+    /// Exposed for the status endpoint (`crate::proxy`), which ships the SERVER's
+    /// thresholds alongside its snapshot. A client must not re-derive them from
+    /// `~/.config/teamclaude.json`: that file may have been edited since the server
+    /// booted, and a client-ordered threshold list zipped against a server-ordered
+    /// account list would mislabel which windows are holding which account.
+    pub fn thresholds(&self) -> Vec<f64> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .map(|a| a.switch_threshold.unwrap_or(self.global_threshold))
+            .collect()
+    }
+
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
     /// at `now` so the display can never show a past-reset window as still full.
     pub fn snapshot(&self, now: OffsetDateTime) -> StatsSnapshot {

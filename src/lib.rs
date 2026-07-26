@@ -28,6 +28,7 @@ pub mod proxy;
 pub mod quota;
 pub mod singleton;
 pub mod stats;
+pub mod status;
 pub mod tui;
 pub mod update;
 pub mod warmer;
