@@ -767,13 +767,43 @@ impl Manager {
             .is_some_and(|remaining_ms| remaining_ms < CACHE_WARM_HOLD_SECS * 1000)
     }
 
+    /// The TERMINAL account-level gates — the blocks that are a fact about the
+    /// CREDENTIAL rather than about one request or one window, and that never
+    /// self-free (so they carry no clear-instant): `disabled`,
+    /// [`AccountStatus::Error`], and `quota.status == Some("rejected")` —
+    /// Anthropic's own verdict, which unlike a window has no reset to wait on.
+    /// `None` when no terminal gate is active.
+    ///
+    /// **This is the one list both [`Self::account_hard_ok`] and
+    /// [`Self::account_gate`] read**, and it exists because they used to keep two
+    /// hand-maintained copies of it that drifted: `account_hard_ok` blocked on
+    /// `rejected` while `account_gate` had no `Rejected` arm at all, so an account
+    /// Anthropic had explicitly rejected was held out of rotation while rendering
+    /// `OK` in the TUI and feeding [`Manager::retry_after_hint`] as though it were
+    /// healthy. A terminal gate added HERE reaches both callers at once; one added
+    /// to either caller alone is exactly the bug this prevents.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn account_terminal_gate(account: &AccountRuntime) -> Option<GateReason> {
+        if account.disabled {
+            return Some(GateReason::Disabled);
+        }
+        if account.status == AccountStatus::Error {
+            return Some(GateReason::Login);
+        }
+        if account.quota.status.as_deref() == Some("rejected") {
+            return Some(GateReason::Rejected);
+        }
+        None
+    }
+
     /// The ACCOUNT-level HARD gates alone — the blocks that mean *this account is
     /// gone for every model class*, with every SOFT gate deliberately absent:
-    ///   - `disabled` / [`AccountStatus::Error`] → hard fail;
+    ///   - every terminal gate ([`Self::account_terminal_gate`]: `disabled`,
+    ///     [`AccountStatus::Error`], `rejected`) → hard fail;
     ///   - a rate-limit hold that OUTLIVES the prompt cache
     ///     ([`Self::hold_outlives_cache`]) — a SHORTER hold is a timer, not a death,
-    ///     and deliberately passes here;
-    ///   - `quota.status == Some("rejected")` — Anthropic's own verdict.
+    ///     and deliberately passes here.
     ///
     /// **This — not [`Self::hard_ok`] — is the SOLE authority on whether a session's
     /// pin may be re-keyed**, because a re-key re-creates the conversation prefix on
@@ -798,13 +828,10 @@ impl Manager {
     ///
     /// Pure and lock-free; the caller holds whichever accounts lock it needs.
     pub(super) fn account_hard_ok(account: &AccountRuntime, now_ms: i64) -> bool {
-        if account.disabled || account.status == AccountStatus::Error {
+        if Self::account_terminal_gate(account).is_some() {
             return false;
         }
         if Self::hold_outlives_cache(account, now_ms) {
-            return false;
-        }
-        if account.quota.status.as_deref() == Some("rejected") {
             return false;
         }
         true
@@ -943,13 +970,15 @@ impl Manager {
 
     /// Why this account is out of rotation and when it clears — the display and
     /// hint-side companion to [`Self::eligible`], mirroring its HARD gates exactly
-    /// (disabled/error → hold → 5-hour → weekly → Fable weekly) while deliberately
+    /// (disabled/error/rejected → hold → 5-hour → weekly → Fable weekly) while deliberately
     /// omitting soft pacing, which only ever narrows an already-healthy account and
     /// never holds one out. Pure and lock-free so both [`Manager::snapshot`] and
     /// [`Manager::retry_after_hint`] can call it as the single source of truth.
     ///
-    /// The terminal gates (`Disabled`, `Login`) never self-free, so their instant
-    /// is `None`. Otherwise every ACTIVE gate contributes the instant it clears:
+    /// The terminal gates ([`Self::account_terminal_gate`]: `Disabled`, `Login`,
+    /// `Rejected`) never self-free, so their instant is `None` — a rejected account
+    /// therefore stops feeding [`Manager::retry_after_hint`] a clear-instant it was
+    /// never going to honour. Otherwise every ACTIVE gate contributes the instant it clears:
     /// a future hold its deadline, and a window at/over `threshold` its
     /// [`crate::quota::QuotaWindow::live_reset`]. An account frees only once ALL of
     /// its gates clear, so the binding gate is the LATEST-clearing one and
@@ -965,11 +994,10 @@ impl Manager {
         is_fable: bool,
     ) -> (GateReason, Option<OffsetDateTime>) {
         // Terminal states that never self-free — reported with no clear-instant.
-        if account.disabled {
-            return (GateReason::Disabled, None);
-        }
-        if account.status == AccountStatus::Error {
-            return (GateReason::Login, None);
+        // Shared with `account_hard_ok` so the two can no longer disagree about
+        // which blocks are account-level (see `account_terminal_gate`).
+        if let Some(reason) = Self::account_terminal_gate(account) {
+            return (reason, None);
         }
 
         // Every ACTIVE hard gate paired with the instant it clears (`None` = active
