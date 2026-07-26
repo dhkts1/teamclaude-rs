@@ -24,6 +24,7 @@ use std::time::Duration;
 use anyhow::{bail, Context as _};
 use time::OffsetDateTime;
 
+use crate::build_info::{self, BuildInfo};
 use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
@@ -466,13 +467,20 @@ impl StatusSource {
 
 /// Render a [`StatsSnapshot`] as a JSON array, one object per account.
 ///
-/// `source` is stamped on EVERY row rather than wrapped around the array: the
-/// output has always been a bare array, and a `jq '.[].name'` that works today
-/// must keep working. One row is one account is one line to grep.
+/// `source` and `serverSha` are stamped on EVERY row rather than wrapped around
+/// the array: the output has always been a bare array, and a `jq '.[].name'`
+/// that works today must keep working. One row is one account is one line to
+/// grep.
+///
+/// `server` is `None` on the offline path, where there is no serving process
+/// whose build could be reported — `serverSha` is then `null`, the same
+/// "not measured" idiom `cacheHitRatio` uses, never a placeholder that reads
+/// like a real sha.
 fn render_accounts_json(
     snapshot: &StatsSnapshot,
     thresholds: &[f64],
     source: StatusSource,
+    server: Option<&BuildInfo>,
 ) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<serde_json::Value> = snapshot
@@ -494,6 +502,12 @@ fn render_accounts_json(
                 .collect();
             serde_json::json!({
                 "source": source.as_str(),
+                // Which build produced these numbers. A script watching this
+                // output can diff it against `git rev-parse --short HEAD` and
+                // know, without an `lsof`, whether the server predates the fix
+                // it is verifying.
+                "serverSha": server.map(|b| b.sha.as_str()),
+                "serverDirty": server.and_then(|b| b.dirty),
                 "name": a.name,
                 "priority": a.priority,
                 "status": a.status,
@@ -650,10 +664,11 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
 
-    let (source, snapshot, thresholds) = match fetch_live_status(&config).await {
+    let (source, server_build, snapshot, thresholds) = match fetch_live_status(&config).await {
         Ok(payload) => {
+            let build = payload.build.clone();
             let (snapshot, thresholds) = payload.into_snapshot();
-            (StatusSource::Live, snapshot, thresholds)
+            (StatusSource::Live, Some(build), snapshot, thresholds)
         }
         Err(reason) => {
             if let LiveStatusError::Unusable(why) = reason {
@@ -670,27 +685,75 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 true,
             )
             .await;
-            (StatusSource::Offline, snapshot, thresholds)
+            (StatusSource::Offline, None, snapshot, thresholds)
         }
     };
 
+    // Build skew goes to STDERR in both modes: `--json` output is a bare array
+    // that scripts pipe into jq, and a diagnostic on stdout would corrupt it.
+    // One channel for the warning also means one place to look for it.
+    if let Some(line) = skew_report(server_build.as_ref()) {
+        eprintln!("{line}");
+    }
+
     if json {
-        println!("{}", render_accounts_json(&snapshot, &thresholds, source));
+        println!(
+            "{}",
+            render_accounts_json(&snapshot, &thresholds, source, server_build.as_ref())
+        );
     } else {
         // One greppable `source=` line above the account lines, in the same
         // key=value idiom, so the provenance is visible without --json.
         println!(
-            "status source={}{}",
+            "status source={}{}{}",
             source.as_str(),
             match source {
                 StatusSource::Live => String::new(),
                 StatusSource::Offline =>
                     " note=serving-counters-unavailable-no-server-answered".to_string(),
-            }
+            },
+            build_fields(server_build.as_ref()),
         );
         print!("{}", render_accounts(&snapshot, &thresholds));
     }
     Ok(())
+}
+
+/// The build `key=value` tail of the `status source=` line.
+///
+/// `client_sha` is always present, and is not redundant with `server_sha`: the
+/// two are the same binary only until someone rebuilds without restarting, which
+/// is the normal state of affairs here (`tcr update` rebuilds on purpose without
+/// restarting). When they differ, the CLI you just ran is newer than the server
+/// answering it — worth seeing before trusting either.
+fn build_fields(server: Option<&BuildInfo>) -> String {
+    let client = BuildInfo::current();
+    match server {
+        Some(server) => format!(
+            " server_sha={} server_dirty={} server_built_at={} client_sha={}",
+            server.sha,
+            server.dirty_str(),
+            server.built_at,
+            client.sha,
+        ),
+        None => format!(" client_sha={}", client.sha),
+    }
+}
+
+/// Compare the RUNNING server's build against the checkout we are standing in,
+/// and return the line to print — `None` when there is nothing to say.
+///
+/// Two silences are deliberate. With no live server there is no running code to
+/// be stale (the offline path's numbers come from this very process). Outside
+/// tcr's own checkout there is no HEAD that means anything here — see
+/// [`build_info::find_tcr_checkout`], which refuses to compare against an
+/// unrelated repository's HEAD.
+fn skew_report(server: Option<&BuildInfo>) -> Option<String> {
+    let server = server?;
+    let cwd = std::env::current_dir().ok()?;
+    let root = build_info::find_tcr_checkout(&cwd)?;
+    let checkout = build_info::read_checkout_state(&root, &server.sha);
+    build_info::compare(server, &checkout).report_line()
 }
 
 #[cfg(test)]
@@ -980,7 +1043,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
         for row in &rows {
@@ -1008,7 +1071,7 @@ mod tests {
         let mut counted = snapshot.clone();
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
-        let live = render_accounts_json(&counted, &thresholds, StatusSource::Live);
+        let live = render_accounts_json(&counted, &thresholds, StatusSource::Live, None);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
         assert_eq!(rows[0]["source"], "live");
@@ -1059,9 +1122,10 @@ mod tests {
             Err(LiveStatusError::NoServer) => panic!("the spawned server did not answer"),
             Err(LiveStatusError::Unusable(why)) => panic!("live status unusable: {why}"),
         };
+        let build = payload.build.clone();
         let (snapshot, thresholds) = payload.into_snapshot();
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Live);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, Some(&build));
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(
             rows[0]["cacheHitRatio"],
@@ -1076,6 +1140,87 @@ mod tests {
         assert!(rows[1]["cacheHitRatio"].is_null(), "{}", rows[1]);
         // Thresholds came from the SERVER, not from re-reading the config file.
         assert_eq!(thresholds.len(), 2);
+
+        // END-TO-END on the build stamp too: the sha crossed a real socket from
+        // the serving process, and reaches every rendered row.
+        assert_eq!(
+            build,
+            BuildInfo::current(),
+            "the served payload names the build that served it"
+        );
+        for row in &rows {
+            assert_eq!(row["serverSha"], serde_json::json!(build_info::SHA));
+        }
+    }
+
+    /// The offline path has no serving process, so `serverSha` is `null` — the
+    /// same "not measured" idiom as `cacheHitRatio`, and never this CLI's own sha
+    /// standing in for a server's.
+    #[tokio::test]
+    async fn offline_rows_report_a_null_server_sha() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            false,
+        )
+        .await;
+
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        for row in &rows {
+            assert!(
+                row["serverSha"].is_null(),
+                "no server answered, so no server sha: {row}"
+            );
+            assert!(row["serverDirty"].is_null(), "{row}");
+        }
+    }
+
+    /// The text line's provenance tail. With a server it names both builds; with
+    /// none it still names the CLI's own, so "which binary am I running" is
+    /// always answerable from the first line of output.
+    #[test]
+    fn build_fields_name_the_server_and_the_client() {
+        let server = BuildInfo {
+            sha: "cd146ce".to_string(),
+            dirty: Some(false),
+            built_at: "2026-07-26T00:00:00Z".to_string(),
+        };
+        let live = build_fields(Some(&server));
+        assert!(live.contains("server_sha=cd146ce"), "{live}");
+        assert!(live.contains("server_dirty=false"), "{live}");
+        assert!(
+            live.contains("server_built_at=2026-07-26T00:00:00Z"),
+            "{live}"
+        );
+        assert!(
+            live.contains(&format!("client_sha={}", build_info::SHA)),
+            "{live}"
+        );
+
+        let offline = build_fields(None);
+        assert!(
+            !offline.contains("server_sha="),
+            "no server, no server fields: {offline}"
+        );
+        assert!(
+            offline.contains(&format!("client_sha={}", build_info::SHA)),
+            "{offline}"
+        );
+
+        // An unknown dirty flag reads as `unknown`, never as `false`.
+        let murky = build_fields(Some(&BuildInfo::default()));
+        assert!(murky.contains("server_dirty=unknown"), "{murky}");
+    }
+
+    /// With no live server there is nothing whose code could be stale, so the
+    /// skew check stays silent regardless of what the checkout looks like.
+    #[test]
+    fn skew_report_is_silent_without_a_server() {
+        assert_eq!(skew_report(None), None);
     }
 
     /// The fallback half of the same contract: with nothing listening, the live
@@ -1319,7 +1464,7 @@ mod tests {
         );
 
         // JSON mirrors the held fields for machine consumers.
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
             json.contains("\"window\": \"5h\""),

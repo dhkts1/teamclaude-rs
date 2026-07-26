@@ -35,6 +35,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::build_info::BuildInfo;
 use crate::probe::ProbeStatus;
 use crate::stats::{AccountSnapshot, GateReason, QuotaState, StatsSnapshot};
 
@@ -51,12 +52,39 @@ use crate::stats::{AccountSnapshot, GateReason, QuotaState, StatsSnapshot};
 pub const STATUS_KIND: &str = "tcr.status.v1";
 
 /// A live fleet view as served by the proxy: one row per configured account, in
-/// the server's account order.
+/// the server's account order, plus the build the server is running.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusPayload {
     /// Always [`STATUS_KIND`]. See its docs for why the client demands it.
     pub kind: String,
     pub accounts: Vec<AccountStatus>,
+    /// Which commit the SERVING process was built from — the one fact no client
+    /// can derive, since the server may have been running for days while the
+    /// checkout moved on ([`crate::build_info`]).
+    ///
+    /// # Why this did NOT bump [`STATUS_KIND`]
+    ///
+    /// The client demands an EXACT `kind` match and falls back to the offline
+    /// snapshot — whose serving counters are structurally zero — on any
+    /// mismatch. So a bump is not a neutral version marker here: it would make
+    /// every not-yet-rebuilt client reject a new server's payload and silently
+    /// render zeros, which is precisely the false-zero failure this endpoint was
+    /// built to end. A bump has to be reserved for a change that would otherwise
+    /// be MISREAD, and this one cannot be, in either direction:
+    ///
+    /// * OLD client ← NEW server: serde ignores unknown fields by default, so
+    ///   the extra `build` object is skipped and every field the old client
+    ///   reads is unchanged. (`status_payload_tolerates_an_unknown_field` pins
+    ///   that behaviour, since a later `deny_unknown_fields` would break it.)
+    /// * NEW client ← OLD server: `#[serde(default)]` fills in
+    ///   [`BuildInfo::default`] — every field `unknown` — and the client renders
+    ///   "cannot tell whether the server is current", which is the truth.
+    ///
+    /// The rule this encodes: `kind` gates INCOMPATIBLE shape changes (a field
+    /// removed, retyped, or given new meaning), never additive ones that both
+    /// directions degrade through honestly.
+    #[serde(default)]
+    pub build: BuildInfo,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -149,6 +177,9 @@ impl StatusPayload {
         Self {
             kind: STATUS_KIND.to_string(),
             accounts,
+            // Compile-time constants of the SERVING binary — not passed in,
+            // because the only honest answer is the one baked into this process.
+            build: BuildInfo::current(),
         }
     }
 
@@ -270,6 +301,64 @@ mod tests {
         assert_eq!(after.probe_status, before.probe_status);
         assert_eq!(after.quota_state, before.quota_state);
         assert_eq!(after.gate, before.gate);
+    }
+
+    /// The server's build stamp rides along and survives the wire.
+    #[test]
+    fn payload_carries_the_servers_build() {
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+        ))
+        .expect("serialize");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(
+            back.build,
+            BuildInfo::current(),
+            "the payload reports the SERVING binary's build"
+        );
+        assert!(
+            wire.contains("\"builtAt\""),
+            "the build object is camelCase on the wire like every other field: {wire}"
+        );
+    }
+
+    /// BACK-COMPAT, direction 1 — a NEW client reading an OLD server, whose
+    /// payload predates the `build` field entirely.
+    ///
+    /// It must parse (a hard error would drop the client to the offline snapshot
+    /// and its structurally-zero counters, the exact regression this endpoint
+    /// exists to prevent) and it must report `unknown` — never a default that
+    /// reads as a real sha, and never anything a comparison could call in-sync.
+    #[test]
+    fn payload_without_a_build_field_parses_as_unknown() {
+        let legacy = r#"{"kind":"tcr.status.v1","accounts":[]}"#;
+        let payload: StatusPayload =
+            serde_json::from_str(legacy).expect("an older server's payload still parses");
+        assert_eq!(payload.kind, STATUS_KIND);
+        assert_eq!(payload.build, BuildInfo::default());
+        assert_eq!(payload.build.sha, crate::build_info::UNKNOWN);
+
+        // A partial build object degrades per-field rather than failing the parse.
+        let partial = r#"{"kind":"tcr.status.v1","accounts":[],"build":{"sha":"cd146ce"}}"#;
+        let payload: StatusPayload = serde_json::from_str(partial).expect("partial build parses");
+        assert_eq!(payload.build.sha, "cd146ce");
+        assert_eq!(payload.build.dirty, None);
+        assert_eq!(payload.build.built_at, crate::build_info::UNKNOWN);
+    }
+
+    /// BACK-COMPAT, direction 2 — an OLD client reading a NEW server. The old
+    /// binary's `StatusPayload` has no `build` field, so what keeps it working is
+    /// serde's default of IGNORING unknown fields. This test stands in for that
+    /// old struct: it would fail the day someone adds `deny_unknown_fields`,
+    /// which is what would silently break every un-rebuilt client.
+    #[test]
+    fn status_payload_tolerates_an_unknown_field() {
+        let future = r#"{"kind":"tcr.status.v1","accounts":[],"build":{"sha":"cd146ce","dirty":false,"builtAt":"2026-07-26T00:00:00Z"},"somethingAddedLater":{"n":1}}"#;
+        let payload: StatusPayload =
+            serde_json::from_str(future).expect("an unknown field is skipped, not fatal");
+        assert_eq!(payload.kind, STATUS_KIND, "and the kind never had to move");
+        assert_eq!(payload.build.sha, "cd146ce");
     }
 
     /// The `kind` discriminator is what stops an older server's upstream-forwarded

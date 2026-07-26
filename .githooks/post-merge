@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Post-merge rebuild: keep the on-disk release binary tracking the checkout.
+#
+# Enable in a fresh clone:  git config core.hooksPath .githooks
+#
+# Why: the binary carries its commit sha (build.rs → TCR_BUILD_SHA), and a merge
+# moves HEAD, so without this the artifact on disk claims a sha the checkout has
+# already left behind. Rebuilding here means only ONE thing can be stale
+# afterwards — the running process — which is exactly what `tcr status` reports.
+#
+# What this hook must NEVER do: restart, kill or signal a running tcr. A restart
+# wipes the in-memory session→account pin map and cold-starts every live Claude
+# Code session's prompt prefix — the most expensive event in this system, and a
+# human's explicit choice at a quiet moment. This hook only replaces bytes on
+# disk and says so.
+set -euo pipefail
+
+git_dir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+
+# ── Do not build mid-operation ──────────────────────────────────────────────
+# A rebase/cherry-pick/unfinished-merge tree is a snapshot of someone's
+# in-flight work, not a commit anyone asked to build. `git merge` only runs this
+# hook on success, so MERGE_HEAD here means an unusual state, not the normal path.
+for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+  if [ -e "$git_dir/$marker" ]; then
+    echo "post-merge: $marker present — skipping the rebuild until the tree settles." >&2
+    exit 0
+  fi
+done
+
+# Unresolved conflict markers in the index. Belt and braces alongside the above.
+if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+  echo "post-merge: unresolved conflicts — skipping the rebuild." >&2
+  exit 0
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  # Warn only. A missing toolchain must never make a merge look like it failed.
+  echo "post-merge: cargo not found — skipping the release rebuild." >&2
+  exit 0
+fi
+
+# No filter on which paths the merge touched: HEAD moved, so TCR_BUILD_SHA
+# changed, so the binary is stale even for a docs-only merge. Gating on *.rs
+# would leave an artifact stamped with the wrong commit.
+sha=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+echo "post-merge: rebuilding tcr (release) at $sha — this takes a moment." >&2
+
+# Quiet on success, loud on failure: cargo's output is captured and only replayed
+# when the build fails.
+log=$(mktemp -t tcr-post-merge)
+if cargo build --release >"$log" 2>&1; then
+  rm -f "$log"
+  # Replacing target/release/tcr does NOT disturb a running server: on Unix the
+  # live process holds its own open inode, and cargo writes a NEW file over the
+  # path. The old process keeps executing the old bytes until someone restarts
+  # it — deliberately, per the note above. Do not "fix" this by signalling it.
+  echo "post-merge: built $sha — a RUNNING tcr still serves the old binary; restart it when convenient." >&2
+else
+  echo "" >&2
+  echo "post-merge: BUILD FAILED at $sha — target/release/tcr is now STALE or missing." >&2
+  echo "  The merge itself completed; only the rebuild failed. Full output:" >&2
+  cat "$log" >&2
+  rm -f "$log"
+fi
+
+# Always succeed: git ignores this hook's exit status, and a non-zero here would
+# only mislead anyone reading it.
+exit 0
