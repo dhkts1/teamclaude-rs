@@ -70,8 +70,11 @@ const RESP_UNAVAILABLE: &[u8] =
 /// Loaded TLS material plus the CA path to advertise via `NODE_EXTRA_CA_CERTS`.
 pub struct TlsAssets {
     pub acceptor: TlsAcceptor,
-    /// The CA cert clients should trust. `None` when we reused the pre-existing
-    /// leaf whose CA the client is already configured to trust.
+    /// The CA cert clients should trust to accept [`Self::acceptor`]'s leaf.
+    /// `None` only when we cannot name one — a reused leaf with no companion CA
+    /// beside it. Callers that must *tell* a client what to trust (see-through
+    /// mode in `tcr run`) treat `None` as "cannot do that", not as "no CA needed":
+    /// an unnameable CA may still be trusted ambiently, but we cannot prove it.
     pub ca_path: Option<PathBuf>,
 }
 
@@ -156,11 +159,20 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
     if leaf_cert.is_file() && leaf_key.is_file() {
         match build_acceptor(&leaf_cert, &leaf_key) {
             Ok(acceptor) => {
-                tracing::info!(cert = %leaf_cert.display(), "MITM: reusing existing leaf certificate");
-                return Ok(TlsAssets {
-                    acceptor,
-                    ca_path: None,
-                });
+                // The JS proxy writes its CA next to the leaf it signs. Report it
+                // when it is there: a caller that has to TELL a client what to
+                // trust (see-through mode passes it as NODE_EXTRA_CA_CERTS) cannot
+                // derive the path itself, and reporting `None` here used to strand
+                // it — on the very path Gil is actually on — with the answer
+                // sitting one `join` away. Absent → `None`, same as before.
+                let companion_ca = dir.join("teamclaude-ca.pem");
+                let ca_path = companion_ca.is_file().then_some(companion_ca);
+                tracing::info!(
+                    cert = %leaf_cert.display(),
+                    ca = ca_path.as_ref().map_or_else(String::new, |p| p.display().to_string()),
+                    "MITM: reusing existing leaf certificate"
+                );
+                return Ok(TlsAssets { acceptor, ca_path });
             }
             Err(err) => {
                 tracing::warn!(error = %err, "MITM: reusing leaf failed — trying our own minted chain");
@@ -531,8 +543,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The pre-existing JS leaf still wins over our own minted chain, and reports
-    /// no CA to trust because its own CA is already trusted by the client.
+    /// The pre-existing JS leaf still wins over our own minted chain, and with no
+    /// companion CA beside it there is no CA we can name.
     #[test]
     fn load_tls_prefers_the_preexisting_js_leaf() {
         let dir = std::env::temp_dir().join(format!("tcr-mitm-jsleaf-{}", std::process::id()));
@@ -546,11 +558,36 @@ mod tests {
         let assets = load_tls_in(&dir).expect("load");
         assert!(
             assets.ca_path.is_none(),
-            "reusing the JS leaf must not advertise a CA"
+            "with no companion CA on disk there is none to advertise"
         );
         assert!(
             !dir.join("tcr-leaf.pem").exists(),
             "the JS leaf path must not mint a competing chain"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reusing the JS leaf must advertise the CA sitting beside it. This is the
+    /// path Gil's install is on, and see-through mode (`tcr run` handing claude a
+    /// first-party base URL + `NODE_EXTRA_CA_CERTS`) is unavailable without it —
+    /// the CA the client needs is the one that signed the leaf we present.
+    #[test]
+    fn load_tls_advertises_the_companion_ca_next_to_a_reused_leaf() {
+        let dir = std::env::temp_dir().join(format!("tcr-mitm-jsca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let (ca, leaf, key) = generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS chain");
+        write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
+        write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
+        write_file(&dir.join("teamclaude-ca.pem"), ca.as_bytes(), 0o644).expect("write ca");
+
+        let assets = load_tls_in(&dir).expect("load");
+        assert_eq!(
+            assets.ca_path.as_deref(),
+            Some(dir.join("teamclaude-ca.pem").as_path()),
+            "the CA beside the reused leaf must be advertised"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

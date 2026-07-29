@@ -261,54 +261,17 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
     cmd.args(&args.args);
 
     if cli::proxy_is_up(port) {
-        cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"));
         if let Some(key) = config.proxy.api_key.as_deref() {
             cmd.env("ANTHROPIC_API_KEY", key);
         }
-        // We are the proxy, we speak plain HTTP on loopback, and we have NO MITM.
-        // An ambient HTTPS_PROXY (e.g. the JS teamclaude on :3456) would hijack
-        // claude's traffic away from us, and its NODE_EXTRA_CA_CERTS would be
-        // verifying a leaf we never present. Strip both so `tcr run` is
-        // self-contained and can't be captured by a stale env.
-        for var in [
-            "HTTPS_PROXY",
-            "https_proxy",
-            "HTTP_PROXY",
-            "http_proxy",
-            "NODE_EXTRA_CA_CERTS",
-        ] {
-            cmd.env_remove(var);
+        // Two ways to route claude at ourselves, and they are NOT equivalent to
+        // Claude Code — see `apply_see_through_env` for why we prefer the first.
+        // Anything missing from the MITM material lands us in base-URL mode, which
+        // always works; there is no half-applied third state.
+        match see_through_ca() {
+            Some(ca) => apply_see_through_env(&mut cmd, port, &ca),
+            None => apply_base_url_env(&mut cmd, port),
         }
-
-        // Setting ANTHROPIC_BASE_URL above makes Claude Code classify this session as a
-        // NON-first-party host, which SILENTLY disables every capability gated on
-        // `xn()==="firstParty" && Yd()` -- no error, at most a [DEBUG] line. We caused that,
-        // so we carry the compensation. Scoped to this branch on purpose: with the proxy
-        // down we launch claude untouched and genuinely are first-party.
-        //
-        // Measured 2026-07-29 against Claude Code 2.1.220 (gate at bundled-JS abs offset
-        // 230310702): 1 of 4 same-day sessions lost tool search outright -- the one that
-        // reached the gate ~30ms sooner, before settings.json's env block was applied to
-        // process.env. Setting these here puts them in the child env at EXEC time, so that
-        // ordering race cannot occur at all.
-        //
-        // Only set what the user has not already chosen; an explicit value always wins.
-        for (var, val) in [
-            // Without this ~130 tool schemas load eagerly every request. Requires that we
-            // forward `tool_reference` blocks upstream untouched -- we do, since
-            // build_upstream_headers uses a denylist rather than an allowlist.
-            ("ENABLE_TOOL_SEARCH", "true"),
-            // Stall detection on the response stream; without it a hung response is never
-            // proactively aborted.
-            ("CLAUDE_ENABLE_BYTE_WATCHDOG", "1"),
-            // Incremental tool-input streaming rather than batched delivery.
-            ("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING", "true"),
-        ] {
-            if std::env::var_os(var).is_none() {
-                cmd.env(var, val);
-            }
-        }
-        eprintln!("[tcr] routing claude through http://127.0.0.1:{port}");
     } else {
         eprintln!("[tcr] proxy not listening on :{port} — launching claude directly");
     }
@@ -317,6 +280,130 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The CA to advertise for see-through mode, or `None` when we must fall back to
+/// base-URL mode. Prints the reason on every `None` — a silent downgrade would
+/// look exactly like a working see-through session while the capabilities it
+/// exists to preserve stay off.
+///
+/// See-through needs BOTH halves of the MITM contract: the proxy must be able to
+/// present a leaf for `api.anthropic.com` (so `mitm::load_tls` has to succeed)
+/// AND we must be able to name the CA that signed it (so `claude` can be told to
+/// trust it). `load_tls` is the same loader the server ran at boot against the
+/// same dir, so it resolves to the same material rather than a second opinion.
+fn see_through_ca() -> Option<PathBuf> {
+    match mitm::load_tls() {
+        Ok(assets) => match assets.ca_path {
+            Some(ca) if ca.is_file() => Some(ca),
+            // A path we cannot read is not a CA we can hand to claude.
+            Some(ca) => {
+                eprintln!(
+                    "[tcr] see-through off: CA {} is not a readable file",
+                    ca.display()
+                );
+                None
+            }
+            None => {
+                eprintln!("[tcr] see-through off: no CA on disk for the MITM leaf we present");
+                None
+            }
+        },
+        Err(err) => {
+            eprintln!("[tcr] see-through off: MITM TLS material unavailable ({err})");
+            None
+        }
+    }
+}
+
+/// SEE-THROUGH mode — the preferred route. `claude` keeps the REAL first-party
+/// base URL and reaches us as a CONNECT proxy instead, so we still see (and
+/// rotate) every request while Claude Code's first-party check keeps passing.
+///
+/// That check is a pure string compare on `ANTHROPIC_BASE_URL` — no DNS, no
+/// socket, no certificate inspection, just `new URL(e).host === "api.anthropic.com"`.
+/// So the fix is to stop lying to it: leave the base URL alone and move the
+/// interception down a layer to `HTTPS_PROXY`, where tcr's CONNECT handler
+/// MITM-terminates `api.anthropic.com` with a leaf `NODE_EXTRA_CA_CERTS` makes
+/// node trust.
+///
+/// The proxy vars are set in BOTH cases deliberately: clients disagree about
+/// which spelling they read, and one that reads only the one we skipped would go
+/// direct — bypassing rotation entirely, silently.
+fn apply_see_through_env(cmd: &mut std::process::Command, port: u16, ca: &Path) {
+    let proxy = format!("http://127.0.0.1:{port}");
+    cmd.env("ANTHROPIC_BASE_URL", "https://api.anthropic.com");
+    cmd.env("HTTPS_PROXY", &proxy);
+    cmd.env("https_proxy", &proxy);
+    cmd.env("NODE_EXTRA_CA_CERTS", ca);
+    // Unnecessary here — we ARE first-party in this mode, so nothing gates them
+    // off — but harmless, and they keep the session whole if it ever falls back.
+    apply_capability_defaults(cmd);
+    eprintln!(
+        "[tcr] see-through mode: claude keeps https://api.anthropic.com, tunnelling via {proxy}"
+    );
+    eprintln!(
+        "[tcr] trusting our MITM leaf via NODE_EXTRA_CA_CERTS={}",
+        ca.display()
+    );
+}
+
+/// BASE-URL mode — the fallback, used when see-through material is unavailable.
+/// `claude` talks plain HTTP to us on loopback, which costs first-party status
+/// and everything gated on it (hence [`apply_capability_defaults`]).
+fn apply_base_url_env(cmd: &mut std::process::Command, port: u16) {
+    cmd.env("ANTHROPIC_BASE_URL", format!("http://127.0.0.1:{port}"));
+    // Here we speak plain HTTP on loopback and present NO leaf. An ambient
+    // HTTPS_PROXY (e.g. the JS teamclaude on :3456) would hijack claude's traffic
+    // away from us, and its NODE_EXTRA_CA_CERTS would be verifying a cert we never
+    // send. Strip both so `tcr run` is self-contained and can't be captured by a
+    // stale env. See-through mode does the opposite — it SETS these two, which is
+    // precisely why the strip cannot live at the branch above.
+    for var in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "NODE_EXTRA_CA_CERTS",
+    ] {
+        cmd.env_remove(var);
+    }
+    apply_capability_defaults(cmd);
+    eprintln!("[tcr] base-URL mode: routing claude through http://127.0.0.1:{port}");
+}
+
+/// Re-enable the capabilities a non-first-party `ANTHROPIC_BASE_URL` silently
+/// switches off.
+///
+/// Claude Code gates tool search, the stall watchdog, and fine-grained tool
+/// streaming on `xn()==="firstParty" && Yd()`, and base-URL mode fails that check
+/// -- no error, at most a [DEBUG] line. We caused it, so we carry the
+/// compensation. Never applied with the proxy down: we launch claude untouched
+/// there and genuinely are first-party.
+///
+/// Measured 2026-07-29 against Claude Code 2.1.220 (gate at bundled-JS abs offset
+/// 230310702): 1 of 4 same-day sessions lost tool search outright -- the one that
+/// reached the gate ~30ms sooner, before settings.json's env block was applied to
+/// process.env. Setting these here puts them in the child env at EXEC time, so
+/// that ordering race cannot occur at all.
+///
+/// Only set what the user has not already chosen; an explicit value always wins.
+fn apply_capability_defaults(cmd: &mut std::process::Command) {
+    for (var, val) in [
+        // Without this ~130 tool schemas load eagerly every request. Requires that we
+        // forward `tool_reference` blocks upstream untouched -- we do, since
+        // build_upstream_headers uses a denylist rather than an allowlist.
+        ("ENABLE_TOOL_SEARCH", "true"),
+        // Stall detection on the response stream; without it a hung response is never
+        // proactively aborted.
+        ("CLAUDE_ENABLE_BYTE_WATCHDOG", "1"),
+        // Incremental tool-input streaming rather than batched delivery.
+        ("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING", "true"),
+    ] {
+        if std::env::var_os(var).is_none() {
+            cmd.env(var, val);
+        }
+    }
 }
 
 /// `tcr login` — browser OAuth PKCE flow that authenticates a Claude account
