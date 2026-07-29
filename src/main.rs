@@ -279,6 +279,35 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         ] {
             cmd.env_remove(var);
         }
+
+        // Setting ANTHROPIC_BASE_URL above makes Claude Code classify this session as a
+        // NON-first-party host, which SILENTLY disables every capability gated on
+        // `xn()==="firstParty" && Yd()` -- no error, at most a [DEBUG] line. We caused that,
+        // so we carry the compensation. Scoped to this branch on purpose: with the proxy
+        // down we launch claude untouched and genuinely are first-party.
+        //
+        // Measured 2026-07-29 against Claude Code 2.1.220 (gate at bundled-JS abs offset
+        // 230310702): 1 of 4 same-day sessions lost tool search outright -- the one that
+        // reached the gate ~30ms sooner, before settings.json's env block was applied to
+        // process.env. Setting these here puts them in the child env at EXEC time, so that
+        // ordering race cannot occur at all.
+        //
+        // Only set what the user has not already chosen; an explicit value always wins.
+        for (var, val) in [
+            // Without this ~130 tool schemas load eagerly every request. Requires that we
+            // forward `tool_reference` blocks upstream untouched -- we do, since
+            // build_upstream_headers uses a denylist rather than an allowlist.
+            ("ENABLE_TOOL_SEARCH", "true"),
+            // Stall detection on the response stream; without it a hung response is never
+            // proactively aborted.
+            ("CLAUDE_ENABLE_BYTE_WATCHDOG", "1"),
+            // Incremental tool-input streaming rather than batched delivery.
+            ("CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING", "true"),
+        ] {
+            if std::env::var_os(var).is_none() {
+                cmd.env(var, val);
+            }
+        }
         eprintln!("[tcr] routing claude through http://127.0.0.1:{port}");
     } else {
         eprintln!("[tcr] proxy not listening on :{port} — launching claude directly");
