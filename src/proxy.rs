@@ -94,10 +94,30 @@ const MAX_SAME_ACCOUNT_529_RETRIES: u32 = 2;
 /// (1s, 2s), so the no-`retry-after` ladder adds 3s to a request at worst.
 const RETRY_529_BASE_BACKOFF_SECS: i64 = 1;
 /// Ceiling on ANY single 529 backoff, including a server-supplied `retry-after`.
-/// With [`MAX_SAME_ACCOUNT_529_RETRIES`] this bounds the total added latency at
-/// 8s — deliberately single-digit, because the in-flight guard is held across
-/// the wait (see the 529 arm in [`handle`]).
+/// With [`MAX_SAME_ACCOUNT_529_RETRIES`] this bounds the added latency at 8s PER
+/// ACCOUNT — deliberately single-digit, because the in-flight guard is held across
+/// the wait (see the 529 arm in [`handle`]). A request may spend that ladder on up
+/// to `1 + `[`MAX_529_FAILOVERS_PER_REQUEST`] accounts, so the REQUEST-level ceiling
+/// is a multiple of it (`overloaded_529_failover_worst_case_latency_is_bounded`).
 const RETRY_529_MAX_BACKOFF_SECS: i64 = 4;
+/// How many DIFFERENT accounts one request may fail over to after a
+/// `529 Overloaded` has spent its IN-PLACE retries on an account.
+///
+/// The 529 arm shipped deliberately rotation-free, on the premise that a 529 means
+/// the SERVER is saturated — so another account would be equally overloaded and the
+/// failover would only pay a cold prompt cache. The live log falsifies that: over
+/// one 8-minute window a single account answered 136 529s while its siblings served
+/// 200s, and a session diverted off it (by an unrelated transport timeout) got a 200
+/// from a sibling two seconds later. The overload is ACCOUNT-scoped and
+/// time-varying, so one cold prefix is worth trading for a served request.
+///
+/// Bounded at 2 (at most 3 accounts per request) because the cost is paid in full
+/// on every hop: each new account re-runs its own in-place ladder before yielding,
+/// so the REQUEST's worst-case added sleep is `1 + this` times the per-account total
+/// (asserted in `overloaded_529_failover_worst_case_latency_is_bounded`). Unbounded,
+/// one request would walk an overloaded fleet end to end and every concurrent
+/// request would do it too.
+const MAX_529_FAILOVERS_PER_REQUEST: u32 = 2;
 
 /// Backoff (seconds) before the `retried`-th in-place retry of a `529 Overloaded`.
 ///
@@ -177,6 +197,18 @@ fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
     } else {
         Some(soonest_free_secs as u64)
     }
+}
+
+/// The rotation loop's TOTAL attempt budget for a fleet of `account_count` — two
+/// sends per account plus a small constant, so the per-account retry ladders (401
+/// force-refresh, transient-429 inline wait, the 529 backoff ladder and its
+/// failovers) can never spin [`handle`]'s loop.
+///
+/// Extracted from the loop so the headroom assertion in
+/// `overloaded_529_failover_worst_case_latency_is_bounded` binds THIS formula
+/// instead of a copy of it that could silently drift from it.
+fn max_attempts_for(account_count: usize) -> usize {
+    account_count.saturating_mul(2).saturating_add(4).max(1)
 }
 
 /// The client's socket address, injected into request extensions by the hybrid
@@ -731,6 +763,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // busy" and must not — sharing one counter would let one status spend the
     // other's budget.
     let mut retried_529: HashMap<usize, u32> = HashMap::new();
+    // How many times THIS request has failed over to a DIFFERENT account on a 529.
+    // Per-REQUEST, deliberately not per-account like the counter above: what needs
+    // bounding is how much of the fleet one client request may walk, so it must not
+    // reset when the account changes.
+    let mut failovers_529 = 0u32;
     // Distinguishes "no account available" (429) from "every attempt hit a
     // transport failure" (502) once the loop can no longer make progress.
     //
@@ -745,11 +782,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let mut transport_failures = 0usize;
     let mut upstream_responses = 0usize;
     // Bound the total attempts so per-account 401/429 retries can never loop.
-    let max_attempts = account_count.saturating_mul(2).saturating_add(4).max(1);
-    // A genuine same-account retry (401 force-refresh, transient-429 wait) parks
-    // its idx here so the next iteration reuses it and bypasses select(), which
-    // would otherwise rotate AWAY from the account the retry meant to keep.
-    let mut retry_same: Option<usize> = None;
+    let max_attempts = max_attempts_for(account_count);
+    // The account the NEXT iteration must use, bypassing select(). Two producers:
+    //
+    //  - A genuine SAME-account retry (401 force-refresh, transient-429 inline wait,
+    //    529 in-place backoff), which select() would otherwise rotate AWAY from the
+    //    very account the retry means to keep.
+    //  - The 529 FAILOVER below, which parks the DIFFERENT account its availability
+    //    probe already chose. That probe IS this iteration's selection: re-running
+    //    select() next iteration would double its side effects (LRU stamp, divert
+    //    log) and could race to a `None` after we already benched the 529'd account
+    //    in `tried` — turning a forwardable 529 into a synthesized 429.
+    let mut next_idx: Option<usize> = None;
     // One-shot guard: at most one transient-fleet-park soft-wait per client request.
     let mut soft_waited_exhaustion = false;
     // The subset of `tried` that is held out by a TRANSIENT 429 park and nothing
@@ -765,7 +809,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
-        let idx = match retry_same.take() {
+        let idx = match next_idx.take() {
             Some(i) => i,
             None => match manager.select(&tried, now, request_model.as_deref(), session_key) {
                 Some(idx) => idx,
@@ -991,7 +1035,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         if status == StatusCode::UNAUTHORIZED {
             if forced_401.insert(idx) {
                 if manager.ensure_fresh_force(idx).await {
-                    retry_same = Some(idx);
+                    next_idx = Some(idx);
                     continue; // retry the same account with the fresh token
                 }
                 // The forced refresh produced no new token — it was coalesced /
@@ -1065,7 +1109,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 Transient429::InlineWait(wait) => {
                     *count += 1;
                     tokio::time::sleep(Duration::from_secs(wait as u64)).await;
-                    retry_same = Some(idx);
+                    next_idx = Some(idx);
                     continue; // retry the same account after the bounded wait
                 }
                 Transient429::Park(wait) => {
@@ -1080,30 +1124,54 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             }
         }
 
-        // 529 Overloaded → the UPSTREAM is busy, not this account. Retry the SAME
-        // account after a short escalating backoff rather than handing the error to
-        // the client. Measured live 2026-07-26: 256 of the last 4,963 upstream
-        // responses were 529 (5.2%), every one of them surfaced in Claude Code as a
-        // failed request the user re-sent by hand.
+        // 529 Overloaded → this SEND was refused, and the ladder below spends two
+        // budgets before the client ever sees it. Measured live 2026-07-26: 256 of
+        // the last 4,963 upstream responses were 529 (5.2%), every one of them
+        // surfaced in Claude Code as a failed request the user re-sent by hand.
         //
-        // Deliberately NOT a rotation. `tried` is untouched, `mark_rate_limited` is
-        // never called, and the pin does not move: a 529 says the SERVER is
-        // saturated, not that this account is over quota, so failing over cannot
-        // help — it would only abandon this account's warm prompt cache and pay a
-        // cold one elsewhere for nothing. (`clear_rate_limited` above already ran,
-        // since 529 != 429, so eligibility is unchanged either way.)
+        // FIRST the SAME account, after a short escalating backoff: its prompt cache
+        // is warm and a brief overload usually clears within a second or two.
+        //
+        // THEN — and this is what the arm originally refused to do — a bounded
+        // FAILOVER to a different account. The original premise was that a 529 means
+        // the SERVER is saturated, so a sibling would be equally overloaded and the
+        // rotation would buy a cold prompt cache for nothing. The live log falsifies
+        // it: the overload is ACCOUNT-scoped and time-varying (one account answered
+        // 136 529s over 8 minutes while its siblings served 200s; a session diverted
+        // off it got a 200 from a sibling 2s later). See
+        // [`MAX_529_FAILOVERS_PER_REQUEST`].
+        //
+        // The failover mechanism is exactly one line — `tried.insert(idx)` — because
+        // `select` already has the branch for it: a PINNED session whose pin is in
+        // `tried` takes the documented "pin-tried" path, which diverts THIS REQUEST
+        // and KEEPS THE PIN (`src/manager/select.rs`). So the session comes home to
+        // its warm account on its next request; nothing re-keys, and `tried` is
+        // per-request so the 529'd account is fully eligible again immediately.
+        // `mark_rate_limited` is still NEVER called here — an overloaded account is
+        // not over quota, and arming a hold would bench it for OTHER requests.
+        //
+        // The failover is gated on `select` actually offering another account, and
+        // that gate is load-bearing rather than defensive: benching the account
+        // FIRST and discovering the fleet is empty AFTERWARDS would drop this
+        // request into the exhausted path and answer a synthesized 429 — replacing
+        // the upstream's own 529 with a status that means something else entirely.
+        // With no account to move to, the arm degrades exactly into its pre-failover
+        // self. (Under a hard account lock `select` returns `None` for a tried
+        // account by construction, so the lock's "no failover to the pool" contract
+        // holds here for free.)
         //
         // Latency: the in-flight guard taken at the top of this iteration is HELD
-        // across the backoff, so a retrying request keeps its per-account
-        // concurrency slot. That is why the ladder is bounded hard —
-        // MAX_SAME_ACCOUNT_529_RETRIES waits, each clamped to
-        // RETRY_529_MAX_BACKOFF_SECS — for at most 8s of added latency per request
-        // (3s when the upstream sends no `retry-after`). Single-digit by
-        // construction: a slot must never be parked for minutes on a server hint.
+        // across every backoff, so a retrying request keeps its per-account
+        // concurrency slot. Per account that is MAX_SAME_ACCOUNT_529_RETRIES waits
+        // each clamped to RETRY_529_MAX_BACKOFF_SECS (3s on the no-`retry-after`
+        // ladder the live captures actually carry, 8s if the upstream asks for
+        // more); per REQUEST it is that times `1 + MAX_529_FAILOVERS_PER_REQUEST`,
+        // i.e. 9s and 24s. Both are asserted, not assumed —
+        // `overloaded_529_failover_worst_case_latency_is_bounded`.
         //
-        // On budget exhaustion this does NOT return. Control falls through to the
-        // terminal-outcome arm below, so the client sees the 529 forwarded verbatim
-        // — byte-identical to the behaviour before this arm existed.
+        // On BOTH budgets being spent this does NOT return. Control falls through to
+        // the terminal-outcome arm below, so the client sees the 529 forwarded
+        // verbatim — byte-identical to the behaviour before this arm existed.
         if status.as_u16() == STATUS_OVERLOADED {
             let retried = retried_529.entry(idx).or_insert(0);
             if *retried < MAX_SAME_ACCOUNT_529_RETRIES {
@@ -1118,14 +1186,58 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     "upstream 529 Overloaded — backing off and retrying the SAME account"
                 );
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
-                retry_same = Some(idx);
+                next_idx = Some(idx);
                 continue; // retry the same account after the bounded backoff
+            }
+            // This account's in-place budget is spent. Fail the request over while
+            // the per-request failover budget lasts AND another account is free.
+            let attempts = *retried + 1;
+            if failovers_529 < MAX_529_FAILOVERS_PER_REQUEST {
+                // Ask for the replacement BEFORE benching this account, and pass the
+                // `tried` set the next iteration WOULD have passed. A fresh clock,
+                // not the loop's `now`: the backoffs above have made that value up to
+                // several seconds stale, and an account whose hold expired during
+                // them is a legitimate target.
+                let mut with_this_one = tried.clone();
+                with_this_one.insert(idx);
+                let failover_now = OffsetDateTime::now_utc();
+                if let Some(other) = manager.select(
+                    &with_this_one,
+                    failover_now,
+                    request_model.as_deref(),
+                    session_key,
+                ) {
+                    debug_assert_ne!(
+                        other, idx,
+                        "select must honour `tried`, or the failover re-sends to the overloaded account"
+                    );
+                    tried.insert(idx);
+                    failovers_529 += 1;
+                    tracing::warn!(
+                        account = account_name.as_deref().unwrap_or("?"),
+                        account_index = idx,
+                        attempts,
+                        failover = failovers_529,
+                        max_failovers = MAX_529_FAILOVERS_PER_REQUEST,
+                        next_account = manager.account_name(other).as_deref().unwrap_or("?"),
+                        next_account_index = other,
+                        "upstream 529 Overloaded — in-place budget spent, failing this request over to another account"
+                    );
+                    // The probe above IS this failover's selection; consume it rather
+                    // than re-selecting (see `next_idx`).
+                    next_idx = Some(other);
+                    continue;
+                }
             }
             tracing::warn!(
                 account = account_name.as_deref().unwrap_or("?"),
                 account_index = idx,
-                attempts = *retried + 1,
-                "upstream 529 Overloaded — retry budget spent, forwarding 529 to the client"
+                attempts,
+                // Distinguishes the two give-up shapes in the log: 0 means nothing
+                // else was eligible to fail over to, `MAX_529_FAILOVERS_PER_REQUEST`
+                // means the fleet was walked and every account was overloaded too.
+                failovers = failovers_529,
+                "upstream 529 Overloaded — retry and failover budgets spent, forwarding 529 to the client"
             );
         }
 
@@ -1995,6 +2107,11 @@ mod tests {
     /// is a latency budget, not just a per-step one. This is the assertion that
     /// fails if someone raises the retry count or the per-step ceiling without
     /// re-reading the comment on the 529 arm.
+    ///
+    /// Scope: this is the PER-ACCOUNT ladder. A request may now spend it on up to
+    /// `1 + MAX_529_FAILOVERS_PER_REQUEST` accounts, so the number a client actually
+    /// waits is a multiple of this one — see
+    /// `overloaded_529_failover_worst_case_latency_is_bounded`.
     #[test]
     fn backoff_529_worst_case_total_stays_single_digit() {
         let worst: u64 = (0..MAX_SAME_ACCOUNT_529_RETRIES)
@@ -2003,6 +2120,57 @@ mod tests {
         assert!(
             worst < 10,
             "529 retries hold an in-flight slot; worst-case added latency was {worst}s"
+        );
+    }
+
+    /// The REQUEST-level 529 latency budget, and the loop headroom the failover needs.
+    /// Pure arithmetic over the constants, so it is the assertion that fails when
+    /// someone widens the failover budget without re-reading what it costs.
+    ///
+    /// Two ladders, because they are two different promises. On the no-`retry-after`
+    /// ladder — the only shape the live captures actually carry — the whole request
+    /// stays single-digit at 9s. With a hostile server hint every rung clamps to
+    /// `RETRY_529_MAX_BACKOFF_SECS` and the ceiling is 24s: NOT single-digit, and
+    /// stated here honestly rather than assumed away, because the in-flight guard is
+    /// held across all of it. That ceiling is what bounds `MAX_529_FAILOVERS_PER_REQUEST`
+    /// at 2.
+    ///
+    /// The headroom half is the one that would fail silently: the rotation loop stops
+    /// after `max_attempts_for(account_count)` iterations, so a failover ladder longer
+    /// than that budget would be truncated mid-walk — the request would stop early for
+    /// a reason nothing logs. The binding case is the SMALLEST fleet that can host the
+    /// full walk (`accounts_walked` accounts); bigger fleets only add headroom, and
+    /// smaller ones cannot reach the last hop at all because the failover is gated on
+    /// `select` offering another account.
+    #[test]
+    fn overloaded_529_failover_worst_case_latency_is_bounded() {
+        let accounts_walked = 1 + MAX_529_FAILOVERS_PER_REQUEST as u64;
+        let ladder = |hint: Option<i64>| -> u64 {
+            (0..MAX_SAME_ACCOUNT_529_RETRIES)
+                .map(|n| backoff_529_secs(n, hint))
+                .sum()
+        };
+
+        let no_hint = ladder(None) * accounts_walked;
+        assert!(
+            no_hint < 10,
+            "on the ladder the live upstream actually produces (no `retry-after`) the \
+             whole request must stay single-digit; was {no_hint}s"
+        );
+        let hostile_hint = ladder(Some(i64::MAX)) * accounts_walked;
+        assert!(
+            hostile_hint <= 24,
+            "even when every 529 asks for the maximum wait, a client connection and \
+             the in-flight slots behind it are parked for at most 24s; was {hostile_hint}s"
+        );
+
+        let sends = accounts_walked as usize * (MAX_SAME_ACCOUNT_529_RETRIES as usize + 1);
+        let budget = max_attempts_for(accounts_walked as usize);
+        assert!(
+            sends <= budget,
+            "the full failover walk is {sends} sends but the rotation loop only allows \
+             {budget} attempts on a {accounts_walked}-account fleet — the walk would be \
+             silently truncated"
         );
     }
 
@@ -4049,6 +4217,48 @@ mod tests {
             .as_u16()
     }
 
+    /// [`post_one`] with session affinity LIVE, so a test can assert what happened to
+    /// the session's PIN and not just to the client's status.
+    ///
+    /// Two things have to be true for a request to be pinned, and `app()` alone
+    /// provides neither: the [`SessionKey`] extension must be present (injected here
+    /// by a layer, exactly as the hybrid CONNECT server does per connection) and the
+    /// request must carry a stable identity for [`stable_session_key`] to hash —
+    /// hence `metadata.user_id` in the body. The pin lives in the MANAGER, so two
+    /// calls with the same `user_id` are two requests of ONE session even though each
+    /// call serves the app on a fresh listener.
+    async fn post_one_pinned(manager: Arc<Manager>, user_id: &str) -> u16 {
+        let affinity_app = app(manager).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                // The value is a per-connection ordinal upstream and is deliberately
+                // NOT the routing key (`stable_session_key` never falls back to it),
+                // so a constant is as faithful here as a counter.
+                req.extensions_mut().insert(SessionKey(1));
+                next.run(req).await
+            },
+        ));
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, affinity_app).await;
+        });
+        let body = serde_json::to_vec(&serde_json::json!({
+            "model": "claude-x",
+            "metadata": { "user_id": user_id },
+            "messages": [],
+        }))
+        .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
     /// The every-account-scoped header block the upstream in these tests sends, by
     /// name. Spelled out here — rather than derived from [`is_account_scoped`] — so
     /// the assertions describe the WIRE, not the predicate under test.
@@ -4383,6 +4593,12 @@ mod tests {
     /// spent the third send lands on a scripted 200 (proving both retries ran), and
     /// with one 529 too many the fourth send never happens, so the 200 behind it is
     /// unreachable and the client gets the 529.
+    ///
+    /// The SINGLE-account fleet is load-bearing, not incidental: it is what keeps this
+    /// the IN-PLACE budget's test after the failover stage was added. With a second
+    /// account the spent budget would fail over instead of giving up, and this would
+    /// silently become a (worse) copy of `overloaded_529_fails_over_to_another_account`.
+    /// The failover's own bound is `overloaded_529_failover_is_bounded`.
     #[tokio::test]
     async fn overloaded_529_gives_up_after_the_budget() {
         let exact = async {
@@ -4433,56 +4649,260 @@ mod tests {
         );
     }
 
-    /// The constraint that makes this a retry and not a failover: a 529 must not
-    /// rotate, must not consume the account's eligibility, and must not arm a
-    /// rate-limit hold. It means "the server is busy", never "this account is over
-    /// quota" — and rotating on it would pay a cold prompt cache to reach an
-    /// upstream that is equally overloaded.
+    /// The constraint that survives the failover stage, and the one no client ever
+    /// sees: a 529 must not cost the account its ELIGIBILITY. It means "this send was
+    /// refused", never "this account is over quota", so `mark_rate_limited` is the one
+    /// call this arm may never make — a hold would bench a healthy account for every
+    /// OTHER request in flight, and only a later request can observe that.
     ///
-    /// `a` 529s through its whole budget while a 200 sits in the very next script
-    /// slot. Any rotation would hand that 200 to `b` and the client would see 200,
-    /// so the 529 here is the proof that `b` was never reached.
+    /// A single-account fleet, so the failover has nowhere to go and the give-up path
+    /// runs: request 1 spends the in-place budget and gets the 529 forwarded. The bite
+    /// is request 2 on the SAME manager — it must be served a 200 by the SAME account,
+    /// which is only possible if the 529 left behind neither a hold nor a durable
+    /// bench (`tried` is per-request and dies with the request).
+    ///
+    /// This was `overloaded_529_does_not_rotate_or_hold` and asserted a no-rotation
+    /// half too. That half is now false BY DESIGN; what bounds the rotation instead is
+    /// `overloaded_529_failover_is_bounded`.
     #[tokio::test]
-    async fn overloaded_529_does_not_rotate_or_hold() {
+    async fn overloaded_529_never_arms_a_hold_or_benches_the_account() {
         let (up_addr, attempts) = spawn_counted_upstream(vec![
             Some(raw_529()),
             Some(raw_529()),
             Some(raw_529()),
-            Some(raw_200()), // a rotation to `b` would serve this
+            Some(raw_200()), // request 2 — reachable only if `a` is still eligible
         ])
         .await;
-        let manager = fleet(up_addr, &["a", "b"]);
+        let manager = fleet(up_addr, &["a"]);
 
-        let status = post_one(manager.clone()).await;
         assert_eq!(
-            status, 529,
-            "the 529 budget is per-account and never rotates, so the client gets \
-             `a`'s forwarded 529 even though `b` was idle"
+            post_one(manager.clone()).await,
+            529,
+            "one account means nothing to fail over to, so the in-place ladder is the \
+             whole budget and the upstream's 529 is forwarded"
         );
         // Without this the test passes vacuously on a proxy that never retries at
-        // all: one 529 forwarded straight through leaves `b` idle and unheld too.
+        // all: one 529 forwarded straight through leaves the account unheld too.
         assert_eq!(
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             MAX_SAME_ACCOUNT_529_RETRIES as usize + 1,
-            "exactly one initial send plus {MAX_SAME_ACCOUNT_529_RETRIES} retries, \
-             all of them on `a`"
+            "exactly one initial send plus {MAX_SAME_ACCOUNT_529_RETRIES} retries"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert!(
+            a.rate_limited_until.is_none(),
+            "a 529 is upstream overload, not a quota rejection: it must never arm a \
+             rate-limit hold that would bench the account for later requests"
+        );
+        assert_eq!(
+            a.gate,
+            crate::stats::GateReason::Ok,
+            "no hard gate of any kind may be left behind — the account stays in rotation"
+        );
+        assert_eq!(
+            a.requests, 1,
+            "the forwarded 529 counts once — the retries must not each count as served"
+        );
+
+        // The durable half of the claim, which only a second request can make.
+        assert_eq!(
+            post_one(manager.clone()).await,
+            200,
+            "the 529'd account must be fully eligible for the NEXT request"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(a.requests, 2, "both requests were served by `a`");
+    }
+
+    /// The failover, end to end, together with the pin invariant that makes it safe.
+    ///
+    /// `a` is overloaded for its whole in-place budget while `b` is healthy, so the
+    /// client must see `b`'s 200 — before this stage existed it saw `a`'s 529 and
+    /// re-sent by hand. The SESSION, meanwhile, must still be pinned to `a`: a 529 is
+    /// a fact about one request, not about the account. `tried.insert` buys both at
+    /// once, because it sends `select` down its "pin-tried" branch, which diverts THIS
+    /// REQUEST and keeps the pin.
+    ///
+    /// `sessions[0].account` is read from the affinity map (the sole authority on the
+    /// pin) and `last_served_account` from the serve, so the two DIFFERING is the
+    /// assertion: one request moved, the session did not. The fifth scripted reply
+    /// proves it behaviourally — the session's next request comes home to `a`.
+    #[tokio::test]
+    async fn overloaded_529_fails_over_to_another_account() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_529()), // `a` — send 1
+            Some(raw_529()), // `a` — in-place retry 1
+            Some(raw_529()), // `a` — in-place retry 2, budget now spent
+            Some(raw_200()), // the failover target serves the client
+            Some(raw_200()), // the session's NEXT request, back home on `a`
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+        const SESSION: &str = "529-failover-session";
+
+        assert_eq!(
+            post_one_pinned(manager.clone(), SESSION).await,
+            200,
+            "the overload is account-scoped, so a sibling can serve: the client must \
+             get the 200 rather than a 529 it has to re-send by hand"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            MAX_SAME_ACCOUNT_529_RETRIES as usize + 2,
+            "the in-place ladder still runs in FULL on `a` first — the failover is the \
+             send AFTER it, not a replacement for it"
         );
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
         let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
         let b = snap.accounts.iter().find(|x| x.name == "b").unwrap();
         assert_eq!(
-            b.requests, 0,
-            "no rotation: a 529 must never mark the account tried and fail over"
-        );
-        assert_eq!(
-            a.requests, 1,
-            "the forwarded 529 counts once — the retries must not each count as served"
+            (a.requests, b.requests),
+            (0, 1),
+            "only the terminal outcome counts, and it happened on `b`"
         );
         assert!(
             a.rate_limited_until.is_none(),
-            "a 529 is upstream overload, not a quota rejection: it must never arm a \
-             rate-limit hold that would bench the account for later requests"
+            "the failover benches `a` for THIS REQUEST only — no hold may be armed"
+        );
+        let session = snap
+            .sessions
+            .first()
+            .expect("the pinned session is visible in the snapshot");
+        assert_eq!(
+            session.account, "a",
+            "the pin must NOT move: a 529 diverts one request, and re-keying the \
+             session would cold-start its whole prompt-cache prefix on `b`"
+        );
+        assert_eq!(
+            session.last_served_account, "b",
+            "…while the account that actually served it is the failover target"
+        );
+
+        assert_eq!(
+            post_one_pinned(manager.clone(), SESSION).await,
+            200,
+            "the session's next request must be servable"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let a = snap.accounts.iter().find(|x| x.name == "a").unwrap();
+        assert_eq!(
+            a.requests, 1,
+            "and it comes HOME to the pinned account — the divert really was for one \
+             request only"
+        );
+    }
+
+    /// The bound. Every account in a five-account fleet is overloaded, so the request
+    /// walks accounts until its failover budget runs out — and then STOPS, instead of
+    /// cascading across the fleet and paying every account's in-place ladder on the
+    /// way (which, with every concurrent request doing the same, is how a partial
+    /// overload becomes a total one).
+    ///
+    /// The fleet is deliberately LARGER than the budget allows, so the attempt count
+    /// separates a bounded walk (`1 + MAX_529_FAILOVERS_PER_REQUEST` accounts, each
+    /// getting exactly its in-place ladder) from a cascade over all five. The client
+    /// still receives the upstream's own 529 verbatim: the give-up SHAPE is unchanged,
+    /// it just arrives later.
+    #[tokio::test]
+    async fn overloaded_529_failover_is_bounded() {
+        // One script entry, reused for every connection: nothing but 529s, anywhere.
+        let (up_addr, attempts) = spawn_counted_upstream(vec![Some(raw_529())]).await;
+        let manager = fleet(up_addr, &["a", "b", "c", "d", "e"]);
+
+        let (status, body) = post_one_with_body(manager.clone()).await;
+        assert_eq!(
+            status, 529,
+            "with the whole fleet overloaded the failover cannot help, so the client \
+             gets the 529"
+        );
+        assert!(
+            body.contains("overloaded_error"),
+            "give-up still forwards the upstream 529 VERBATIM, exactly as it did \
+             before failover existed; a synthesized body would break clients that \
+             parse it. Got: {body}"
+        );
+
+        let accounts_walked = 1 + MAX_529_FAILOVERS_PER_REQUEST as usize;
+        let sends_per_account = MAX_SAME_ACCOUNT_529_RETRIES as usize + 1;
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            accounts_walked * sends_per_account,
+            "{accounts_walked} accounts at {sends_per_account} sends each — two idle \
+             accounts must be left untouched, or one overloaded request walks the fleet"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let held: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.rate_limited_until.is_some())
+            .map(|a| a.name.as_str())
+            .collect();
+        assert!(
+            held.is_empty(),
+            "however many accounts a 529 walks, it arms a hold on none of them: {held:?}"
+        );
+        assert_eq!(
+            snap.accounts.iter().map(|a| a.requests).sum::<u64>(),
+            1,
+            "one client request is one terminal outcome, no matter how many accounts \
+             it was sent to"
+        );
+    }
+
+    /// Invariant 1 on the FAILOVER path specifically: benching an account in the
+    /// per-request `tried` set must not shade into benching it for everyone else.
+    /// After a completed failover, no account carries a rate-limit hold and none is
+    /// held out of rotation for any other reason either (an upstream `rejected` mark
+    /// included) — [`crate::stats::GateReason::Ok`] is exactly that claim, read from
+    /// the same `account_gate` the selector's hard gates come from.
+    ///
+    /// The sibling of `overloaded_529_never_arms_a_hold_or_benches_the_account`, which
+    /// asserts the same thing on the give-up path where no failover happens at all.
+    #[tokio::test]
+    async fn overloaded_529_failover_arms_no_hold() {
+        use crate::stats::GateReason;
+        let up_addr = spawn_scripted_upstream(vec![
+            Some(raw_529()),
+            Some(raw_529()),
+            Some(raw_529()),
+            Some(raw_200()), // the failover target serves
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b", "c"]);
+
+        assert_eq!(
+            post_one(manager.clone()).await,
+            200,
+            "precondition: the failover happened and served the client"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let held: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.rate_limited_until.is_some())
+            .map(|a| a.name.as_str())
+            .collect();
+        assert!(
+            held.is_empty(),
+            "a 529 is not a quota rejection — `mark_rate_limited` must never be \
+             reached from this arm. Held: {held:?}"
+        );
+        let gated: Vec<(&str, GateReason)> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.gate != GateReason::Ok)
+            .map(|a| (a.name.as_str(), a.gate))
+            .collect();
+        assert!(
+            gated.is_empty(),
+            "every account, the overloaded one included, must still be in rotation \
+             for the next request. Gated: {gated:?}"
         );
     }
 
