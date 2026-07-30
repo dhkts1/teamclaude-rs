@@ -270,6 +270,21 @@ impl Quota {
 /// A probed utilization that carries no reset gets a bounded synthesized reset
 /// (`window` ahead of now) via [`resolve_reset`], so it can never pin the account
 /// out of rotation forever (bug #4/#5).
+///
+/// **Exception — a ZERO utilization never synthesizes a reset.** The synthesis
+/// above exists to bound a *high* utilization reported without a reset; a bucket
+/// at `0.0` gates nothing, so inventing a reset for it protects nothing and
+/// actively asserts a window that no real usage ever started. That fabrication
+/// was not cosmetic: the zero-spend probe runs every `quotaProbeSeconds`, so it
+/// stamped every idle account with a future 5h reset, and
+/// [`crate::manager::Manager::warm_targets`] reads exactly that signal
+/// (`five_hour.live_reset(now).is_some()`) as "already warm — skip". Measured on
+/// the live fleet 2026-07-31: 7 of 13 accounts carried a future 5h reset at
+/// `0.00` utilization, and keep-warm had **0 eligible targets** as a result.
+/// Leaving the reset `None` here is the truthful state — we have no evidence of
+/// a live window — and it is invisible to routing, because
+/// [`QuotaWindow::effective`] returns `0.0` for a zero bucket under both the
+/// `Some(reset)` and `None` arms.
 fn apply_bucket(
     window: &mut Option<QuotaWindow>,
     bucket: Option<crate::probe::UsageBucket>,
@@ -287,7 +302,12 @@ fn apply_bucket(
     let reported = bucket
         .reset_at_ms
         .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok());
-    let reset = resolve_reset(reported, prior.and_then(|w| w.reset), now, win);
+    let reset = if reported.is_none() && utilization == 0.0 {
+        // Nothing to gate — do not invent a window. See the exception above.
+        None
+    } else {
+        resolve_reset(reported, prior.and_then(|w| w.reset), now, win)
+    };
     *window = Some(QuotaWindow { utilization, reset });
 }
 
@@ -468,6 +488,64 @@ mod tests {
         assert!(
             !quota.is_near(0.90, after_window),
             "resetless window must clear after its bounded lifetime, never pin forever"
+        );
+    }
+
+    /// The zero-spend probe must NOT fabricate a 5h window on an idle account.
+    ///
+    /// Measured live 2026-07-31: every probe sweep stamped idle accounts with a
+    /// reset exactly `now + 5h`, and `warm_targets` reads a live 5h reset as
+    /// "already warm", so keep-warm had 0 eligible targets of 13 while 7
+    /// accounts carried a future reset at 0.00 utilization. The probe starts no
+    /// window — only a served request does — so a zero bucket must leave the
+    /// reset `None`.
+    #[test]
+    fn probed_zero_bucket_does_not_fabricate_a_window() {
+        let mut quota = Quota::default();
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: Some(0.0),
+                reset_at_ms: None,
+            }),
+            ..Default::default()
+        });
+
+        let now = OffsetDateTime::now_utc();
+        let window = quota.five_hour.expect("the bucket was applied");
+        assert_eq!(
+            window.reset, None,
+            "a zero-utilization probe must not synthesize a reset"
+        );
+        assert_eq!(
+            window.live_reset(now),
+            None,
+            "and must therefore not read as a live window to warm_targets"
+        );
+    }
+
+    /// The guard above must not weaken bug #4/#5 on the path it was written for:
+    /// a NON-zero probed utilization with no reset still gets a bounded window,
+    /// so it gates now and clears later rather than pinning the account forever.
+    #[test]
+    fn probed_nonzero_bucket_without_reset_still_gets_a_bounded_window() {
+        let mut quota = Quota::default();
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: Some(0.95),
+                reset_at_ms: None,
+            }),
+            ..Default::default()
+        });
+
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            quota.five_hour.expect("applied").reset.is_some(),
+            "a resetless HIGH utilization still needs its bounded reset"
+        );
+        assert!(quota.is_near(0.90, now), "and gates immediately");
+        assert!(
+            !quota.is_near(0.90, now + Duration::hours(6)),
+            "clearing after one bounded window, never pinning forever"
         );
     }
 
