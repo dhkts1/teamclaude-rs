@@ -15,6 +15,7 @@
 )]
 
 pub mod account_uuid;
+pub mod build_info;
 pub mod cli;
 pub mod config;
 pub mod demo;
@@ -28,6 +29,7 @@ pub mod proxy;
 pub mod quota;
 pub mod singleton;
 pub mod stats;
+pub mod status;
 pub mod tui;
 pub mod update;
 pub mod warmer;

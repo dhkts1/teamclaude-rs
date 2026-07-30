@@ -101,8 +101,9 @@ pub fn pids_to_replace(
 /// `port`, if any. Reuses the exact port-scoped, command-verified decision as
 /// [`takeover_port`] ([`pids_to_replace`]) but signals NOTHING — `tcr login` uses
 /// it to REFUSE to run beside a live server (the server reads config only at boot,
-/// and its next `persist_tokens` rewrites the whole file from memory, clobbering the
-/// login's fresh tokens). Returns the first replaceable proxy PID; `None` when the
+/// and its next `persist_tokens` writes its boot-time TOKENS back over the file,
+/// clobbering the login's fresh ones). Returns the first replaceable proxy PID;
+/// `None` when the
 /// port is free or held only by a non-proxy process.
 pub fn live_proxy_server(port: u16) -> Option<u32> {
     let holders = port_listeners(port);
@@ -149,6 +150,11 @@ pub fn takeover_port(port: u16, no_replace: bool) {
         eprintln!(
             "[tcr] replacing existing proxy on :{port} (pid {pid}) — one proxy per port, or the two mutually invalidate each other's single-use refresh tokens (token war)."
         );
+        // The other half of the boot marker: in TUI mode this eprintln lands on a
+        // terminal that the alternate screen is about to cover, so the durable log
+        // is the only place a takeover is recoverable. Pairs with "server started"
+        // to turn "the server bounced" into "pid N was killed by pid M".
+        tracing::info!(port, replaced_pid = pid, "replacing incumbent proxy");
         let _ = Command::new("kill").arg(pid.to_string()).status();
         sleep(Duration::from_millis(800));
         if is_alive(pid) {

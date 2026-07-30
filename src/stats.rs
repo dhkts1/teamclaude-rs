@@ -24,7 +24,10 @@ pub struct RequestLogEntry {
 /// an honest "near limit" / "exhausted" label: an account parked out of rotation
 /// because it is near/over its weekly (or 5-hour) cap is still operationally
 /// **active** — never the red `error` reserved for a dead credential.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// Serde-derived so it crosses the status endpoint's wire ([`crate::status`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum QuotaState {
     /// Comfortably under the switch threshold — in normal rotation.
     #[default]
@@ -42,7 +45,10 @@ pub enum QuotaState {
 /// [`AccountSnapshot::free_at`] clear-instant. Soft pacing is deliberately NOT a
 /// reason here: it only ever narrows an already-healthy account, never holds one
 /// out, so a paced account still reads [`GateReason::Ok`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Serde-derived so it crosses the status endpoint's wire ([`crate::status`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GateReason {
     /// In rotation — no hard gate is active.
     Ok,
@@ -62,6 +68,12 @@ pub enum GateReason {
     Standard,
     /// A dead credential (`AccountStatus::Error`) — needs a re-login, never self-frees.
     Login,
+    /// Anthropic answered `anthropic-ratelimit-unified-status: rejected` for this
+    /// account. Unlike a window it carries no reset to wait on, so it never
+    /// self-frees. Long held out of rotation by
+    /// [`crate::manager::Manager::account_hard_ok`], it had no reason of its own
+    /// here and so rendered as [`GateReason::Ok`].
+    Rejected,
     /// Operator-disabled — held out until re-enabled, never self-frees.
     Disabled,
 }
@@ -115,26 +127,44 @@ pub struct AccountSnapshot {
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /
-/// metadata.user_id) or fell back to a per-connection key. DISPLAY-only —
-/// never a routing input.
+/// metadata.user_id) or had none and served unpinned. DISPLAY-only — never a
+/// routing input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionKind {
     Stable,
     Fallback,
 }
 
-/// One live session's view: a short display id, the account it's pinned to,
-/// how many requests it has served, and when it was last seen.
+/// One live session's view: a short display id, the account it is PINNED to, the
+/// account that actually served its most recent request, how many requests it has
+/// served, and when it was last seen.
+///
+/// The two account fields are deliberately separate because they genuinely differ:
+/// a session's pin is HELD while a single request is diverted elsewhere (a Fable
+/// title call whose model-scoped weekly is spent, one request during a hold that
+/// clears while the cache is still warm — see
+/// [`crate::manager::Manager::select`]). Collapsing them made every such divert
+/// look like the session had moved account, which is how a fleet measured at a
+/// 1.70% switch rate read as "sessions keep jumping" in the TUI.
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
-    pub id: String,      // short hex derived from the u64 session key (display only)
-    pub account: String, // account name it is currently pinned to
+    pub id: String, // short hex derived from the u64 session key (display only)
+    /// Account name this session is currently PINNED to, read from the manager's
+    /// affinity map — the sole authority on the pin. A session with no pin (an
+    /// identity-less fallback serve, a seeded demo row) has no home, so this falls
+    /// back to [`Self::last_served_account`].
+    pub account: String,
+    /// Account name that served this session's most recent request. Equal to
+    /// [`Self::account`] on a normal serve; DIFFERENT exactly when that one request
+    /// was diverted while the pin stayed put — so the divert stays observable
+    /// instead of being hidden.
+    pub last_served_account: String,
     pub requests: u64,
     pub last_seen: Option<OffsetDateTime>,
     /// [`SessionKind::Stable`] when keyed on a stable client identity (x-api-key /
-    /// `metadata.user_id`); [`SessionKind::Fallback`] for a per-connection key.
-    /// Display provenance only — the TUI folds all fallback sessions into one dim
-    /// aggregate row; routing is unchanged.
+    /// `metadata.user_id`); [`SessionKind::Fallback`] when there was none and the
+    /// request served unpinned. Display provenance only — the TUI folds all
+    /// fallback serves into one dim aggregate row; routing is unchanged.
     pub kind: SessionKind,
 }
 
@@ -146,6 +176,8 @@ pub struct StatsSnapshot {
     pub current: Option<usize>,
     /// Most-recent-first request log.
     pub recent: Vec<RequestLogEntry>,
-    /// Live per-session serving stats, most-recent-first.
+    /// Live per-session serving stats in a STABLE order (pinned account, then
+    /// session id) — deliberately NOT recency, so a row holds its place instead of
+    /// jumping to the top of the pane on every request.
     pub sessions: Vec<SessionSnapshot>,
 }

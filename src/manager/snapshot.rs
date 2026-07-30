@@ -68,10 +68,43 @@ impl Manager {
         log.push_back(entry);
     }
 
+    /// Each account's effective gating threshold — its own `switchThreshold`, else
+    /// the global one — in account order, resolved exactly as [`Self::snapshot`]
+    /// resolves it internally.
+    ///
+    /// Exposed for the status endpoint (`crate::proxy`), which ships the SERVER's
+    /// thresholds alongside its snapshot. A client must not re-derive them from
+    /// `~/.config/teamclaude.json`: that file may have been edited since the server
+    /// booted, and a client-ordered threshold list zipped against a server-ordered
+    /// account list would mislabel which windows are holding which account.
+    pub fn thresholds(&self) -> Vec<f64> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .map(|a| a.switch_threshold.unwrap_or(self.global_threshold))
+            .collect()
+    }
+
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
     /// at `now` so the display can never show a past-reset window as still full.
     pub fn snapshot(&self, now: OffsetDateTime) -> StatsSnapshot {
         let now_ms = odt_to_ms(now);
+        // (1) UNDER THE AFFINITY LOCK ONLY: copy every session's PIN out into a
+        // local, then DROP the lock before the accounts lock below is taken — the
+        // two are NEVER held simultaneously (the documented deadlock), the same
+        // three-section shape [`Manager::select`] uses. The affinity map is the sole
+        // authority on where a session is pinned; `SessionStat.account_idx` records
+        // only who SERVED last, which a divert deliberately moves while the pin
+        // stays put.
+        let pins: HashMap<u64, usize> = {
+            let affinity = self.affinity.lock().expect("affinity lock poisoned");
+            affinity
+                .iter()
+                .map(|(&key, &(idx, _))| (key, idx))
+                .collect()
+        };
+        // (2) UNDER THE ACCOUNTS LOCK: everything below resolves indices to names.
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account_snaps = accounts
             .iter()
@@ -153,24 +186,41 @@ impl Manager {
             .cloned()
             .collect();
 
-        // Resolve each session's account_idx → name from the accounts guard we
-        // already hold, sorted most-recent-first for the TUI sessions pane.
+        // Resolve each session's PIN (from `pins`, read above) and its LAST SERVER
+        // (`SessionStat.account_idx`) to names from the accounts guard we already
+        // hold. A session with no pin has no home, so it shows where it last served.
         let sessions = {
             let map = self.sessions.lock().expect("sessions lock poisoned");
+            let name_of = |idx: usize| {
+                accounts
+                    .get(idx)
+                    .map(|a| a.name.clone())
+                    .unwrap_or_default()
+            };
             let mut v: Vec<SessionSnapshot> = map
                 .iter()
-                .map(|(k, s)| SessionSnapshot {
-                    id: short_session_id(*k),
-                    account: accounts
-                        .get(s.account_idx)
-                        .map(|a| a.name.clone())
-                        .unwrap_or_default(),
-                    requests: s.requests,
-                    last_seen: ms_to_odt(s.last_seen_ms),
-                    kind: s.kind,
+                .map(|(k, s)| {
+                    let last_served_account = name_of(s.account_idx);
+                    let account = pins
+                        .get(k)
+                        .map_or_else(|| last_served_account.clone(), |&idx| name_of(idx));
+                    SessionSnapshot {
+                        id: short_session_id(*k),
+                        account,
+                        last_served_account,
+                        requests: s.requests,
+                        last_seen: ms_to_odt(s.last_seen_ms),
+                        kind: s.kind,
+                    }
                 })
                 .collect();
-            v.sort_by_key(|s| std::cmp::Reverse(s.last_seen));
+            // STABLE order — (pinned account, session id) — not recency. Sorting
+            // most-recent-first re-ordered the pane on every single request, so rows
+            // churned under the operator's eyes and a session appeared to move even
+            // when its pin never did. Both keys change only when the pin actually
+            // moves or a session appears/disappears; the age stays visible as data in
+            // the `Last` column rather than being encoded in the row order.
+            v.sort_by(|a, b| a.account.cmp(&b.account).then_with(|| a.id.cmp(&b.id)));
             v
         };
 

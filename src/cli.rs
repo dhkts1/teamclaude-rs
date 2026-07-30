@@ -19,16 +19,19 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context as _};
 use time::OffsetDateTime;
 
+use crate::build_info::{self, BuildInfo};
 use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
 use crate::probe::{LiveUsageProber, UsageProber};
 use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
+use crate::status::{StatusPayload, STATUS_KIND};
 
 /// How to set an account's priority: an explicit integer, or a relative
 /// `--first` / `--last` that recomputes against the existing fleet.
@@ -405,10 +408,14 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
             Some(u) => format!(" fable={:.0}%", u * 100.0),
             None => String::new(),
         };
-        // Prompt-cache hit ratio, omitted until there is input to divide by (R3:
-        // no NaN). Greppable `cache=NN%` token for parity with the JSON field.
+        // Prompt-cache hit ratio. `n/a` — never `0%` — when there is no input to
+        // divide by (R3: no NaN), matching the `5h=n/a` / `wk=n/a` idiom: an
+        // OFFLINE snapshot's counters live in the server's process and are
+        // structurally zero here, and rendering that as a measured 0% is exactly
+        // the lie that hid a real prompt-cache catastrophe. Greppable `cache=NN%`
+        // token for parity with the JSON field.
         let cache = if a.input_tokens == 0 {
-            String::new()
+            " cache=n/a".to_string()
         } else {
             format!(
                 " cache={:.0}%",
@@ -432,8 +439,49 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
     out
 }
 
+/// Where a rendered fleet view's numbers came from.
+///
+/// The distinction is not cosmetic. Only [`StatusSource::Live`] carries real
+/// serving counters (requests, tokens, cache hit ratio) — those live in the
+/// running proxy's process. [`StatusSource::Offline`] is a fresh process's view:
+/// its quota bars are real (they come from a live probe) but every counter is
+/// structurally zero because nothing has served through it. Labelling the two
+/// apart is the whole point: a structurally-zero counter must never again be
+/// mistaken for a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusSource {
+    /// Read from the running proxy's `/_tcr/status` endpoint.
+    Live,
+    /// Computed in this process from the config, with no server to ask.
+    Offline,
+}
+
+impl StatusSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            StatusSource::Live => "live",
+            StatusSource::Offline => "offline",
+        }
+    }
+}
+
 /// Render a [`StatsSnapshot`] as a JSON array, one object per account.
-fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
+///
+/// `source` and `serverSha` are stamped on EVERY row rather than wrapped around
+/// the array: the output has always been a bare array, and a `jq '.[].name'`
+/// that works today must keep working. One row is one account is one line to
+/// grep.
+///
+/// `server` is `None` on the offline path, where there is no serving process
+/// whose build could be reported — `serverSha` is then `null`, the same
+/// "not measured" idiom `cacheHitRatio` uses, never a placeholder that reads
+/// like a real sha.
+fn render_accounts_json(
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+    server: Option<&BuildInfo>,
+) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<serde_json::Value> = snapshot
         .accounts
@@ -453,6 +501,13 @@ fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String 
                 })
                 .collect();
             serde_json::json!({
+                "source": source.as_str(),
+                // Which build produced these numbers. A script watching this
+                // output can diff it against `git rev-parse --short HEAD` and
+                // know, without an `lsof`, whether the server predates the fix
+                // it is verifying.
+                "serverSha": server.map(|b| b.sha.as_str()),
+                "serverDirty": server.and_then(|b| b.dirty),
                 "name": a.name,
                 "priority": a.priority,
                 "status": a.status,
@@ -466,12 +521,21 @@ fn render_accounts_json(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String 
                 "inputTokens": a.input_tokens,
                 "outputTokens": a.output_tokens,
                 "cacheReadTokens": a.cache_read_tokens,
-                // Prompt-cache hit ratio (0.0–1.0): cache_read / input_total.
-                // 0.0 when nothing has been counted yet (no NaN — R3).
+                // Prompt-cache hit ratio (0.0–1.0): cache_read / input_total, and
+                // `null` — NEVER a literal 0.0 — when `inputTokens` is 0 and there
+                // is nothing to divide by (also keeps NaN out — R3).
+                //
+                // The null is the honesty fix. `source: "offline"` means these
+                // counters come from a fresh process, not the serving one, so they
+                // are structurally zero; emitting `0.0` there published an
+                // unmeasured number as a measured "0% cache hits" for every account
+                // forever, and that false zero is precisely why a real prompt-cache
+                // catastrophe went unseen. `null` says "not measured"; `source`
+                // says which process would have measured it.
                 "cacheHitRatio": if a.input_tokens == 0 {
-                    0.0
+                    serde_json::Value::Null
                 } else {
-                    a.cache_read_tokens as f64 / a.input_tokens as f64
+                    serde_json::json!(a.cache_read_tokens as f64 / a.input_tokens as f64)
                 },
                 "probeStatus": a.probe_status.as_str(),
                 "probeError": a.probe_error,
@@ -500,26 +564,196 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
     Ok(())
 }
 
-/// `tcr status [--json]` — probe every account's live quota (offline, never
-/// persisted) and render the fleet as greppable text or a JSON array.
+/// Why a live status read did not produce a payload.
+enum LiveStatusError {
+    /// Nothing is listening on the configured port — the ORDINARY case (`tcr
+    /// status` with no server running). Falling back is expected, so it is
+    /// reported by the `offline` label alone rather than by a warning.
+    NoServer,
+    /// A server answered but the read was not usable. Always warned about: a
+    /// silently-swallowed rejection here would look exactly like "no server",
+    /// which is how an api-key typo becomes a mysterious all-zero status.
+    Unusable(String),
+}
+
+/// Read the live fleet snapshot from the running proxy's [`crate::proxy::STATUS_PATH`].
+///
+/// Sends the configured proxy api-key: unlike the forwarding path, the status
+/// endpoint has no loopback exemption. Only a body that deserializes AND names
+/// the exact [`STATUS_KIND`] is accepted — a tcr built before the endpoint
+/// existed has no such route, so it forwards this path UPSTREAM and hands back
+/// Anthropic's own error JSON, which must never be rendered as a fleet status.
+async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusError> {
+    let client = reqwest::Client::builder()
+        // Never route our own loopback read through a system proxy: `HTTP_PROXY`
+        // very commonly points AT tcr, so honouring it would send this query
+        // through the endpoint it is asking about.
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveStatusError::Unusable(format!("http client: {e}")))?;
+
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::STATUS_PATH
+    );
+    let mut request = client.get(&url);
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return Err(LiveStatusError::NoServer),
+        Err(e) if e.is_timeout() => {
+            return Err(LiveStatusError::Unusable(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) => return Err(LiveStatusError::Unusable(e.to_string())),
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        let hint = if status.as_u16() == 401 {
+            " — the proxy api-key in the config was rejected"
+        } else {
+            ""
+        };
+        return Err(LiveStatusError::Unusable(format!("HTTP {status}{hint}")));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| LiveStatusError::Unusable(format!("reading the response body: {e}")))?;
+    let payload: StatusPayload = serde_json::from_str(&body).map_err(|e| {
+        LiveStatusError::Unusable(format!(
+            "the response was not a tcr status payload ({e}) — an older tcr forwards this path upstream"
+        ))
+    })?;
+    if payload.kind != STATUS_KIND {
+        return Err(LiveStatusError::Unusable(format!(
+            "unexpected payload kind '{}' (expected '{STATUS_KIND}')",
+            payload.kind
+        )));
+    }
+    Ok(payload)
+}
+
+/// `tcr status [--json]` — render the fleet as greppable text or a JSON array,
+/// preferring the RUNNING proxy's own numbers.
+///
+/// The live endpoint is tried first because it is the only place the serving
+/// counters exist: requests, tokens and the prompt-cache hit ratio are per-process
+/// state, and an offline snapshot's copies are structurally zero. When no server
+/// answers we fall back to the historical offline path — a fresh `Manager` plus a
+/// live quota probe, never persisted — and every rendering says which of the two
+/// it is, so a zero counter can never again pass for a measurement.
+///
+/// The live path deliberately does NOT probe. Quota there comes from the server's
+/// own probe loop (every `quotaProbeSeconds`, 75s by default), which is both
+/// fresher in practice than a cold one-shot probe and one fewer caller hitting the
+/// usage endpoint — that endpoint rate-limits, and a second prober racing the
+/// server's is what makes a whole fleet read `probe=rate-limited`. Only the
+/// offline fallback, which has no server to inherit quota from, probes.
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
-    let thresholds = resolve_thresholds(&config);
-    let snapshot = snapshot_offline(
-        config,
-        Arc::new(NoRefresh),
-        Arc::new(LiveUsageProber::new()),
-        true,
-    )
-    .await;
+
+    let (source, server_build, snapshot, thresholds) = match fetch_live_status(&config).await {
+        Ok(payload) => {
+            let build = payload.build.clone();
+            let (snapshot, thresholds) = payload.into_snapshot();
+            (StatusSource::Live, Some(build), snapshot, thresholds)
+        }
+        Err(reason) => {
+            if let LiveStatusError::Unusable(why) = reason {
+                eprintln!(
+                    "[tcr] warning: could not read live status from the proxy on :{} ({why}) — falling back to an offline snapshot, whose serving counters are all zero.",
+                    config.proxy.port
+                );
+            }
+            let thresholds = resolve_thresholds(&config);
+            let snapshot = snapshot_offline(
+                config,
+                Arc::new(NoRefresh),
+                Arc::new(LiveUsageProber::new()),
+                true,
+            )
+            .await;
+            (StatusSource::Offline, None, snapshot, thresholds)
+        }
+    };
+
+    // Build skew goes to STDERR in both modes: `--json` output is a bare array
+    // that scripts pipe into jq, and a diagnostic on stdout would corrupt it.
+    // One channel for the warning also means one place to look for it.
+    if let Some(line) = skew_report(server_build.as_ref()) {
+        eprintln!("{line}");
+    }
+
     if json {
-        println!("{}", render_accounts_json(&snapshot, &thresholds));
+        println!(
+            "{}",
+            render_accounts_json(&snapshot, &thresholds, source, server_build.as_ref())
+        );
     } else {
+        // One greppable `source=` line above the account lines, in the same
+        // key=value idiom, so the provenance is visible without --json.
+        println!(
+            "status source={}{}{}",
+            source.as_str(),
+            match source {
+                StatusSource::Live => String::new(),
+                StatusSource::Offline =>
+                    " note=serving-counters-unavailable-no-server-answered".to_string(),
+            },
+            build_fields(server_build.as_ref()),
+        );
         print!("{}", render_accounts(&snapshot, &thresholds));
     }
     Ok(())
+}
+
+/// The build `key=value` tail of the `status source=` line.
+///
+/// `client_sha` is always present, and is not redundant with `server_sha`: the
+/// two are the same binary only until someone rebuilds without restarting, which
+/// is the normal state of affairs here (`tcr update` rebuilds on purpose without
+/// restarting). When they differ, the CLI you just ran is newer than the server
+/// answering it — worth seeing before trusting either.
+fn build_fields(server: Option<&BuildInfo>) -> String {
+    let client = BuildInfo::current();
+    match server {
+        Some(server) => format!(
+            " server_sha={} server_dirty={} server_built_at={} client_sha={}",
+            server.sha,
+            server.dirty_str(),
+            server.built_at,
+            client.sha,
+        ),
+        None => format!(" client_sha={}", client.sha),
+    }
+}
+
+/// Compare the RUNNING server's build against the checkout we are standing in,
+/// and return the line to print — `None` when there is nothing to say.
+///
+/// Two silences are deliberate. With no live server there is no running code to
+/// be stale (the offline path's numbers come from this very process). Outside
+/// tcr's own checkout there is no HEAD that means anything here — see
+/// [`build_info::find_tcr_checkout`], which refuses to compare against an
+/// unrelated repository's HEAD.
+fn skew_report(server: Option<&BuildInfo>) -> Option<String> {
+    let server = server?;
+    let cwd = std::env::current_dir().ok()?;
+    let root = build_info::find_tcr_checkout(&cwd)?;
+    let checkout = build_info::read_checkout_state(&root, &server.sha);
+    build_info::compare(server, &checkout).report_line()
 }
 
 #[cfg(test)]
@@ -786,6 +1020,231 @@ mod tests {
         );
     }
 
+    /// THE HONESTY TEST. An offline snapshot's serving counters live in the
+    /// SERVER's process, so `input_tokens` here is structurally zero — there is
+    /// nothing to divide by and no measurement was taken. It must therefore emit
+    /// `null` (JSON) / `n/a` (human), never a `0.0` that reads as a measured "0%
+    /// cache hits".
+    ///
+    /// That false zero is the entire reason this bug hid: `tcr status --json`
+    /// reported `"cacheHitRatio": 0.0` for every account forever, so the one
+    /// surface that should have shown a prompt-cache catastrophe reported
+    /// "cache fine" straight through it. The `source` field is the other half —
+    /// it names the process the counters would have come from.
+    #[tokio::test]
+    async fn offline_status_reports_null_not_zero_hit_ratio() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            true,
+        )
+        .await;
+
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(rows.len(), 2, "one row per account");
+        for row in &rows {
+            assert_eq!(
+                row["inputTokens"], 0,
+                "the premise: an offline snapshot has counted nothing"
+            );
+            assert!(
+                row["cacheHitRatio"].is_null(),
+                "an uncounted ratio is null, not a number: {row}"
+            );
+            assert_ne!(
+                row["cacheHitRatio"],
+                serde_json::json!(0.0),
+                "the literal 0.0 that masqueraded as a measurement is gone: {row}"
+            );
+            assert_eq!(
+                row["source"], "offline",
+                "every row names the process its counters came from: {row}"
+            );
+        }
+
+        // A ratio that IS measured still renders as a number — the null is about
+        // absence of data, not a blanket suppression.
+        let mut counted = snapshot.clone();
+        counted.accounts[0].input_tokens = 1_000;
+        counted.accounts[0].cache_read_tokens = 750;
+        let live = render_accounts_json(&counted, &thresholds, StatusSource::Live, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
+        assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
+        assert_eq!(rows[0]["source"], "live");
+        assert!(
+            rows[1]["cacheHitRatio"].is_null(),
+            "the still-uncounted account stays null: {}",
+            rows[1]
+        );
+
+        // The human view uses the same `n/a` idiom the unknown quota windows use.
+        let text = render_accounts(&snapshot, &thresholds);
+        for line in text.lines() {
+            assert!(
+                line.contains("cache=n/a"),
+                "uncounted cache reads as n/a, never 0%: {line}"
+            );
+            assert!(!line.contains("cache=0%"), "no false measured zero: {line}");
+        }
+        assert!(
+            render_accounts(&counted, &thresholds).contains("cache=75%"),
+            "a measured ratio still renders as a percentage"
+        );
+    }
+
+    /// END-TO-END through the PRODUCTION path, which is the claim that actually
+    /// matters: a real hybrid listener (the thing that injects `ClientAddr`), a
+    /// real HTTP round trip on a real socket, and the real client parser.
+    ///
+    /// The counters below exist ONLY in the served manager's process — exactly the
+    /// situation that made `tcr status` lie, since the offline path builds a fresh
+    /// `Manager` that can never see them. Binds port 0 (a free ephemeral port) and
+    /// overrides the config's 3456, so this never touches a real running proxy.
+    #[tokio::test]
+    async fn live_status_reads_the_running_servers_counters() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = port;
+
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        // 750 of 1000 input tokens were prompt-cache reads: a real 75% hit ratio,
+        // held in this process only.
+        manager.update_usage(0, 1_000, 200, 750, 50);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let payload = match fetch_live_status(&config).await {
+            Ok(p) => p,
+            Err(LiveStatusError::NoServer) => panic!("the spawned server did not answer"),
+            Err(LiveStatusError::Unusable(why)) => panic!("live status unusable: {why}"),
+        };
+        let build = payload.build.clone();
+        let (snapshot, thresholds) = payload.into_snapshot();
+
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, Some(&build));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(
+            rows[0]["cacheHitRatio"],
+            serde_json::json!(0.75),
+            "the ratio is the SERVER's real measurement, not a structural zero: {}",
+            rows[0]
+        );
+        assert_eq!(rows[0]["inputTokens"], 1_000);
+        assert_eq!(rows[0]["cacheReadTokens"], 750);
+        assert_eq!(rows[0]["source"], "live");
+        // The account that served nothing still reports an honest null, not a 0.0.
+        assert!(rows[1]["cacheHitRatio"].is_null(), "{}", rows[1]);
+        // Thresholds came from the SERVER, not from re-reading the config file.
+        assert_eq!(thresholds.len(), 2);
+
+        // END-TO-END on the build stamp too: the sha crossed a real socket from
+        // the serving process, and reaches every rendered row.
+        assert_eq!(
+            build,
+            BuildInfo::current(),
+            "the served payload names the build that served it"
+        );
+        for row in &rows {
+            assert_eq!(row["serverSha"], serde_json::json!(build_info::SHA));
+        }
+    }
+
+    /// The offline path has no serving process, so `serverSha` is `null` — the
+    /// same "not measured" idiom as `cacheHitRatio`, and never this CLI's own sha
+    /// standing in for a server's.
+    #[tokio::test]
+    async fn offline_rows_report_a_null_server_sha() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            false,
+        )
+        .await;
+
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        for row in &rows {
+            assert!(
+                row["serverSha"].is_null(),
+                "no server answered, so no server sha: {row}"
+            );
+            assert!(row["serverDirty"].is_null(), "{row}");
+        }
+    }
+
+    /// The text line's provenance tail. With a server it names both builds; with
+    /// none it still names the CLI's own, so "which binary am I running" is
+    /// always answerable from the first line of output.
+    #[test]
+    fn build_fields_name_the_server_and_the_client() {
+        let server = BuildInfo {
+            sha: "cd146ce".to_string(),
+            dirty: Some(false),
+            built_at: "2026-07-26T00:00:00Z".to_string(),
+        };
+        let live = build_fields(Some(&server));
+        assert!(live.contains("server_sha=cd146ce"), "{live}");
+        assert!(live.contains("server_dirty=false"), "{live}");
+        assert!(
+            live.contains("server_built_at=2026-07-26T00:00:00Z"),
+            "{live}"
+        );
+        assert!(
+            live.contains(&format!("client_sha={}", build_info::SHA)),
+            "{live}"
+        );
+
+        let offline = build_fields(None);
+        assert!(
+            !offline.contains("server_sha="),
+            "no server, no server fields: {offline}"
+        );
+        assert!(
+            offline.contains(&format!("client_sha={}", build_info::SHA)),
+            "{offline}"
+        );
+
+        // An unknown dirty flag reads as `unknown`, never as `false`.
+        let murky = build_fields(Some(&BuildInfo::default()));
+        assert!(murky.contains("server_dirty=unknown"), "{murky}");
+    }
+
+    /// With no live server there is nothing whose code could be stale, so the
+    /// skew check stays silent regardless of what the checkout looks like.
+    #[test]
+    fn skew_report_is_silent_without_a_server() {
+        assert_eq!(skew_report(None), None);
+    }
+
+    /// The fallback half of the same contract: with nothing listening, the live
+    /// read reports `NoServer` (the ordinary case, which warns about nothing) and
+    /// `tcr status` keeps working exactly as before — just labelled `offline`.
+    #[tokio::test]
+    async fn live_status_falls_back_when_no_server_answers() {
+        // Bind and immediately drop, so the port is free and reliably refuses.
+        let port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = port;
+
+        match fetch_live_status(&config).await {
+            Err(LiveStatusError::NoServer) => {}
+            Err(LiveStatusError::Unusable(why)) => {
+                panic!("a dead port is the ordinary no-server case, not a warning: {why}")
+            }
+            Ok(_) => panic!("nothing is listening on {port}"),
+        }
+    }
+
     // --- no-persist guarantee ----------------------------------------------
 
     #[tokio::test]
@@ -1005,7 +1464,7 @@ mod tests {
         );
 
         // JSON mirrors the held fields for machine consumers.
-        let json = render_accounts_json(&snapshot, &thresholds);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
             json.contains("\"window\": \"5h\""),

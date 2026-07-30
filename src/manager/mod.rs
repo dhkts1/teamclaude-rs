@@ -54,6 +54,31 @@ const REQUEST_LOG_CAPACITY: usize = 200;
 /// pinned out for hours with no live request to clear the hold (finding #5).
 const MAX_RATE_LIMIT_HOLD_SECONDS: i64 = 3600;
 
+/// The dividing line between a rate-limit hold a session should WAIT OUT on its
+/// pinned account and one long enough that re-keying is the cheaper trade:
+/// **Anthropic's default ephemeral prompt-cache TTL, 5 minutes.**
+///
+/// A hold is a TIMER, not a death, and the timers we arm are mostly short — a
+/// no-guidance transient 429 parks `NO_GUIDANCE_HOLD_SECS` (15s) plus jitter, and
+/// a `retry-after` park is clamped to 300s ([`crate::proxy`]). Discarding a
+/// per-account prompt cache that will still be warm 15 seconds later, and never
+/// returning to it, is the same cache-loss defect the soft gates already fixed,
+/// reached through a different signal.
+///
+/// So a hold with LESS than this remaining is SOFT — divert this ONE request and
+/// keep the pin, and the session comes home warm. A hold with this much or MORE
+/// remaining stays HARD: the old cache is dead by the time the account frees, and
+/// re-keying settles the session on one account that then warms up, whereas
+/// holding a long-dead pin would divert through the LRU pick on every turn and
+/// scatter the conversation cold across the fleet.
+///
+/// 300 is the CONSERVATIVE choice. Anthropic's 1-hour extended cache would justify
+/// a much larger value (up to `MAX_RATE_LIMIT_HOLD_SECONDS`), but we cannot tell
+/// from a hold which TTL a given session's prefix was written under. Erring low
+/// costs at most one extra diverted request on a hold that would in fact have come
+/// home warm; erring high costs a whole conversation prefix.
+const CACHE_WARM_HOLD_SECS: i64 = 300;
+
 /// How long a *transient* refresh failure holds off further refreshes of the
 /// same account. A transient failure leaves the token unchanged, so the
 /// access-token coalescing guard can't stop a follower queued on the lock from
@@ -203,8 +228,8 @@ struct SessionStat {
     requests: u64,
     last_seen_ms: i64,
     /// [`SessionKind::Stable`] when this session was keyed on a stable client identity
-    /// (x-api-key / `metadata.user_id`); [`SessionKind::Fallback`] when it fell back to
-    /// the per-connection key. DISPLAY provenance only — the routing pin is unaffected.
+    /// (x-api-key / `metadata.user_id`); [`SessionKind::Fallback`] when there was none
+    /// and the request served unpinned. DISPLAY provenance only — never routing.
     kind: SessionKind,
 }
 
@@ -268,6 +293,9 @@ pub struct Manager {
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
+    /// Anti-storm valve for over-threshold revalidation-serve: epoch-ms before which
+    /// no new revalidation serve is issued. See [`Manager::select_revalidation`].
+    next_revalidation_at_ms: std::sync::atomic::AtomicI64,
 }
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
@@ -404,6 +432,18 @@ impl Manager {
             // request dies as "upstream unreachable". Always reach Anthropic directly.
             http: reqwest::Client::builder()
                 .no_proxy()
+                // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
+                // otherwise stalls the attempt until the OS TCP timeout, and with a
+                // retry budget of `account_count * 2 + 4` that is many minutes of a
+                // hung request. `oauth.rs` and `probe.rs` both already set one.
+                //
+                // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
+                // responses are long-lived SSE streams that legitimately run longer
+                // than any bound worth setting, and a total timeout would truncate
+                // them mid-stream. `connect_timeout` cannot — it applies only before
+                // the response headers arrive, so once a stream is flowing it is out
+                // of the picture.
+                .connect_timeout(std::time::Duration::from_secs(10))
                 // Keep the single HTTP/2 connection to Anthropic warm across
                 // interactive think-time pauses. reqwest reaps idle connections
                 // after 90s by default, but a coding session routinely pauses
@@ -430,6 +470,7 @@ impl Manager {
             affinity: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             session_seq: AtomicU64::new(1),
+            next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
         });
 
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
@@ -564,19 +605,24 @@ impl Manager {
         }
     }
 
-    /// Flush the current in-memory config (with any refreshed tokens) to disk.
-    /// Token refreshes already persist incrementally via [`Self::persist_tokens`],
-    /// so this is the belt-and-suspenders final flush on shutdown (DESIGN §main).
-    /// A missing `config_path` (tests, corrupt-source boot) is a silent no-op so
-    /// a corrupt user file is never clobbered with defaults.
+    /// Flush the refreshed TOKENS to disk. Token refreshes already persist
+    /// incrementally via [`Self::persist_tokens`], so this is the
+    /// belt-and-suspenders final flush on shutdown (DESIGN §main). A missing
+    /// `config_path` (tests, corrupt-source boot) is a silent no-op so a corrupt
+    /// user file is never clobbered with defaults.
+    ///
+    /// Writes via [`config::save_tokens`], NOT [`config::save`]: the in-memory
+    /// `Config` is a boot-time snapshot, so flushing it whole would revert every
+    /// setting the user edited while the proxy was running.
     pub fn persist_now(&self) {
         let Some(path) = &self.config_path else {
             return;
         };
         // Save UNDER the lock (not clone-then-save-unlocked) so a shutdown flush
         // can't race a concurrent persist_tokens and clobber a just-rotated token.
+        // The lock also serializes save_tokens' read-modify-write of the file.
         let config = self.config.lock().expect("config lock poisoned");
-        if let Err(err) = config::save(path, &config) {
+        if let Err(err) = config::save_tokens(path, &config) {
             tracing::error!(error = %err, "failed to flush config on shutdown");
         }
     }
@@ -601,7 +647,8 @@ impl Manager {
         // then saving unlocked lets two concurrent refreshes race on the file: a
         // stale save clobbers the other account's just-rotated refresh token,
         // which then 400s ("invalid_grant") on its next refresh. Holding the lock
-        // through the save serializes writes so every rotation lands on disk.
+        // through the save serializes writes — including save_tokens' whole
+        // read-modify-write of the file — so every rotation lands on disk.
         let mut config = self.config.lock().expect("config lock poisoned");
         if let Some(account) = config
             .accounts
@@ -612,7 +659,9 @@ impl Manager {
             account.refresh_token = Some(tokens.refresh_token.clone());
             account.expires_at = Some(tokens.expires_at_ms);
         }
-        if let Err(err) = config::save(path, &config) {
+        // Tokens only: the in-memory config is a boot-time snapshot, so writing
+        // it whole would stamp stale settings over the user's live file.
+        if let Err(err) = config::save_tokens(path, &config) {
             tracing::error!(error = %err, "failed to persist refreshed token to config");
         }
     }
@@ -656,6 +705,17 @@ mod tests {
     use crate::warmer::{AccountWarmer, WarmError, WarmFuture};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use time::Duration;
+
+    /// A rate-limit hold that clears while the pinned account's prompt cache is
+    /// still warm — the SOFT case. The live value of a no-guidance transient park
+    /// (`proxy::NO_GUIDANCE_HOLD_SECS`), which is the hold this fleet arms most.
+    const SHORT_HOLD_SECS: i64 = 15;
+
+    /// A hold that OUTLIVES the prompt cache — the only kind that is ACCOUNT-level
+    /// death and may re-key a session. Derived from the threshold rather than
+    /// written as a literal so that raising [`CACHE_WARM_HOLD_SECS`] can never
+    /// silently turn a re-key test into a divert test.
+    const LONG_HOLD_SECS: i64 = CACHE_WARM_HOLD_SECS + 60;
 
     #[test]
     fn throttle_slot_burst1_is_strict_spacing() {
@@ -2248,6 +2308,148 @@ mod tests {
         );
     }
 
+    /// The sessions pane must report the PIN, never whoever happened to serve the
+    /// last request. A hold that clears while the pinned account's prompt cache is
+    /// still warm DIVERTS one request and deliberately keeps the pin (see
+    /// [`CACHE_WARM_HOLD_SECS`]) — but the snapshot used to take its account from the
+    /// SERVING index, so every divert made the session visibly jump accounts in the
+    /// TUI although the pin never moved. A display that misreports state is worse
+    /// than no display: it made a fleet measured at a 1.70% switch rate read as
+    /// "sessions keep jumping".
+    #[test]
+    fn snapshot_reports_the_pin_not_the_last_serve() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 0xFEEDu64;
+
+        // Pin the session to `a`, and serve one request there.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(0),
+            "precondition: the first select pins the session to `a`"
+        );
+        manager.record_served(0, now, Some(key), SessionKind::Stable);
+
+        // `a` picks up a SHORT hold — one that clears while its cache is still warm.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].rate_limited_until_ms = Some(odt_to_ms(now) + SHORT_HOLD_SECS * 1000);
+        }
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(1),
+            "precondition: the short hold DIVERTS this one request to `b`"
+        );
+        manager.record_served(1, now, Some(key), SessionKind::Stable);
+
+        let snap = manager.snapshot(now);
+        let session = snap
+            .sessions
+            .iter()
+            .find(|s| s.id == short_session_id(key))
+            .expect("the session is present in the snapshot");
+        assert_eq!(
+            session.account, "a",
+            "the snapshot must report the PIN, which a divert never moves"
+        );
+        assert_eq!(
+            session.last_served_account, "b",
+            "the divert must stay OBSERVABLE in its own field — the goal is honesty, \
+             not concealment"
+        );
+    }
+
+    /// The other half of the same contract, so the fix cannot swing too far and start
+    /// hiding genuine re-keys behind a stale pin: when the pin DURABLY moves, the
+    /// snapshot follows it. Only an ACCOUNT-level hard gate re-keys, so sideline `a`
+    /// and let the next select re-pin the session to `b`.
+    #[test]
+    fn snapshot_account_follows_a_real_rekey() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 0xBEEFu64;
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(0),
+            "precondition: the session starts pinned to `a`"
+        );
+        manager.record_served(0, now, Some(key), SessionKind::Stable);
+
+        // A dead credential is ACCOUNT-level death → the pin is durably re-keyed.
+        manager.mark_error(0);
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(1),
+            "precondition: an errored pin re-keys the session to `b`"
+        );
+        manager.record_served(1, now, Some(key), SessionKind::Stable);
+
+        let snap = manager.snapshot(now);
+        let session = snap
+            .sessions
+            .iter()
+            .find(|s| s.id == short_session_id(key))
+            .expect("the session is present in the snapshot");
+        assert_eq!(
+            session.account, "b",
+            "a REAL re-key must move the reported account — the pin is the authority \
+             in both directions"
+        );
+        assert_eq!(session.last_served_account, "b");
+    }
+
+    /// Serving a request must not re-order the sessions pane. Rows used to sort
+    /// most-recent-first, so every single request threw its session to the top and
+    /// the pane churned under the operator's eyes — the other half of why a stable
+    /// fleet looked like it was thrashing.
+    #[test]
+    fn session_rows_do_not_reorder_on_a_serve() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), lock_refresher());
+        let now = OffsetDateTime::now_utc();
+        let keys = [0x11u64, 0x22, 0x33];
+
+        // Three sessions pinned to the one account, last seen 3s/2s/1s ago — so a
+        // recency order and a stable order are genuinely different orders here.
+        for key in keys {
+            manager.select(&HashSet::new(), now, None, Some(key));
+        }
+        for (offset, key) in [3i64, 2, 1].into_iter().zip(keys) {
+            manager.record_served(
+                0,
+                now - Duration::seconds(offset),
+                Some(key),
+                SessionKind::Stable,
+            );
+        }
+
+        let ids = |snap: StatsSnapshot| -> Vec<String> {
+            snap.sessions.iter().map(|s| s.id.clone()).collect()
+        };
+        let before = ids(manager.snapshot(now));
+        assert_eq!(
+            before.len(),
+            3,
+            "precondition: all three sessions are shown"
+        );
+
+        // The OLDEST session — not the first row — serves one request.
+        manager.record_served(0, now, Some(keys[0]), SessionKind::Stable);
+        let after = ids(manager.snapshot(now));
+
+        assert_eq!(
+            before, after,
+            "a serve must never move a session's row; the age belongs in the `Last` \
+             column, not in the row order"
+        );
+    }
+
     /// Cache tokens count: `update_usage` accumulates whatever the caller sums,
     /// which for the proxy includes cache-creation + cache-read input tokens.
     #[test]
@@ -2399,8 +2601,8 @@ mod tests {
     }
 
     /// Migration: when a session's pinned account becomes ineligible (rate
-    /// limited), the next same-key select re-pins to a DIFFERENT eligible account
-    /// and then sticks to that one.
+    /// limited long enough to outlive its prompt cache), the next same-key select
+    /// re-pins to a DIFFERENT eligible account and then sticks to that one.
     #[test]
     fn affinity_repins_when_pinned_account_ineligible() {
         let refresher = Arc::new(CountingRefresher {
@@ -2414,7 +2616,7 @@ mod tests {
         let pinned = manager
             .select(&HashSet::new(), now, None, Some(42))
             .expect("an account is eligible");
-        manager.mark_rate_limited(pinned, 300);
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
         let repinned = manager
             .select(&HashSet::new(), now, None, Some(42))
             .expect("the other account is eligible");
@@ -2429,10 +2631,109 @@ mod tests {
         }
     }
 
-    /// If the pinned account is in `tried` (this request already failed over it),
-    /// affinity falls through to a normal pick and re-pins to the new account.
+    /// PACING gates DIVERT, they never RE-KEY: a pinned account that is merely paced
+    /// (at the in-flight cap, every hard gate clear) yields THIS request to another
+    /// account while the pin stays put, and the session returns to it the moment the
+    /// guards drop. Before the fix the fall-through re-pin at the bottom of `select`
+    /// rewrote the pin to the diverted account, permanently cold-starting that
+    /// session's per-account prompt cache.
+    ///
+    /// Contrast `soft_gated_pin_is_served_not_diverted`, where the OTHER soft gate —
+    /// our own utilization threshold — does not even divert. The difference is what
+    /// each gate knows: `in_flight` is a fact we measure exactly and continuously
+    /// about our own concurrency, and spreading a burst is the whole reason the cap
+    /// exists; utilization is arithmetic over headers that go stale by minutes.
     #[test]
-    fn affinity_falls_through_when_pinned_in_tried() {
+    fn soft_paced_pin_diverts_without_repinning() {
+        let pacing = PacingConfig {
+            max_in_flight_per_account: Some(1),
+            min_spacing_ms: None,
+        };
+        let manager = build_manager(
+            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(77))
+            .expect("an account is eligible");
+        // Saturate ONLY the pinned account: at cap=1 it is soft-paced while every
+        // hard gate (disabled/error/hold/quota) stays clear.
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].in_flight = 1;
+        }
+        let diverted = manager
+            .select(&HashSet::new(), now, None, Some(77))
+            .expect("the un-paced account serves this request");
+        assert_ne!(
+            diverted, pinned,
+            "a soft-paced pin must yield THIS request to the cooler account"
+        );
+        assert_eq!(
+            pin_of(&manager, 77),
+            Some(pinned),
+            "a PACING divert must not move the pin"
+        );
+        // The pacing guard clears → the session snaps back to its warm account.
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].in_flight = 0;
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(77)),
+                Some(pinned),
+                "once un-paced the session must return to its original account"
+            );
+        }
+    }
+
+    /// The last-touch stamp is still refreshed on a pacing divert, so a heavily
+    /// diverted session can never become the `AFFINITY_CAP` eviction victim (the
+    /// eviction sorts on exactly this field).
+    #[test]
+    fn soft_paced_divert_refreshes_pin_last_touch() {
+        let pacing = PacingConfig {
+            max_in_flight_per_account: Some(1),
+            min_spacing_ms: None,
+        };
+        let manager = build_manager(
+            config_with_pacing(vec![account("a", 0), account("b", 0)], pacing),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(88))
+            .expect("an account is eligible");
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[pinned].in_flight = 1;
+        }
+        // A later `now` is what the divert must stamp onto the surviving pin.
+        let later = now + time::Duration::seconds(30);
+        let later_ms = odt_to_ms(later);
+        manager
+            .select(&HashSet::new(), later, None, Some(88))
+            .expect("the un-paced account serves this request");
+        let pins = manager.affinity.lock().expect("affinity lock poisoned");
+        assert_eq!(
+            pins.get(&88).copied(),
+            Some((pinned, later_ms)),
+            "the divert must re-insert the OLD index with a FRESH last-touch"
+        );
+    }
+
+    /// If the pinned account is in `tried` AND fails a HARD gate, affinity falls
+    /// through to a normal pick and re-pins to the new account. Being in `tried`
+    /// is on its own only a SOFT signal (see
+    /// `transient_tried_failure_keeps_the_pin`) — it takes a hard gate, here a hold
+    /// that outlives the prompt cache, to make the fall-through durable. A SHORT
+    /// hold would not: it diverts and keeps the pin (see
+    /// `short_hold_diverts_but_keeps_the_pin`), so the fall-through would serve the
+    /// other account while leaving the session pinned where it was.
+    #[test]
+    fn affinity_falls_through_when_pinned_in_tried_and_hard_gated() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -2444,6 +2745,9 @@ mod tests {
         let a = manager
             .select(&HashSet::new(), now, None, Some(9))
             .expect("an account is eligible");
+        // The failover that put A in `tried` was durable: it armed a hold that
+        // outlives A's prompt cache, so there is nothing left to come home to.
+        manager.mark_rate_limited(a, LONG_HOLD_SECS);
         let tried: HashSet<usize> = [a].into_iter().collect();
         let b = manager
             .select(&tried, now, None, Some(9))
@@ -2454,6 +2758,561 @@ mod tests {
             manager.select(&HashSet::new(), now, None, Some(9)),
             Some(b),
             "the pin must have migrated to the fallen-through account"
+        );
+    }
+
+    // ---- only a HARD gate may re-key a session ---------------------------------
+
+    /// THE cache-loss fix: an account crossing the SOFT utilization threshold used to
+    /// dump every session pinned to it at once, because `eligible()` folds
+    /// `quota.is_near` into the same bool as the hard gates. Keeping the pin while
+    /// still diverting the request — the first half of the fix — bought nothing: the
+    /// diverted request paid the cold prefix anyway (measured live: a 44.4%
+    /// account-switch rate on SUCCESSFUL serves, with zero hard failures). The
+    /// threshold is our own arithmetic, and it routinely benches an account Anthropic
+    /// is answering 200s for, so it may not bench a warm pin at all: the pinned
+    /// account SERVES. With eleven of thirteen live accounts sitting at 98-100%, this
+    /// is the single largest remaining cause of per-account prompt-cache loss.
+    #[test]
+    fn soft_gated_pin_is_served_not_diverted() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(1234))
+            .expect("an account is eligible");
+        // Over the soft threshold, but Anthropic still says `allowed_warning`:
+        // every HARD gate is clear.
+        set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
+
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(1234)),
+                Some(pinned),
+                "an over-threshold pin that clears every HARD gate still serves its \
+                 own session — upstream, not our utilization arithmetic, is the oracle"
+            );
+        }
+        assert_eq!(
+            pin_of(&manager, 1234),
+            Some(pinned),
+            "crossing the SOFT utilization threshold must not re-key the session"
+        );
+
+        // The threshold is not dead — it still steers selection with no pin to
+        // protect, so a session arriving cold lands on the cooler account.
+        let unpinned = manager
+            .select(&HashSet::new(), now, None, None)
+            .expect("the under-threshold account is eligible");
+        assert_ne!(
+            unpinned, pinned,
+            "the soft threshold still gates UNPINNED selection"
+        );
+    }
+
+    /// The guard against over-correcting: a HARD gate still re-keys durably. A
+    /// rate-limit hold that outlives the prompt cache means the account is gone for
+    /// longer than the session's prefix survives, so the session moves and STAYS
+    /// moved. (A SHORTER hold is the SOFT case — see
+    /// `short_hold_diverts_but_keeps_the_pin`.)
+    #[test]
+    fn pin_with_live_hold_is_rekeyed() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(2345))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(2345))
+            .expect("the un-held account serves this request");
+        assert_ne!(served, pinned, "a held pin cannot serve");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&2345)
+                .map(|&(idx, _)| idx),
+            Some(served),
+            "a hold outliving the prompt cache is a HARD gate — it must re-key the \
+             session"
+        );
+    }
+
+    /// THE guard against over-correcting serve-the-pin into serve-anything: an
+    /// account that is over the soft threshold AND holds a live 429 must still
+    /// rotate. This is the exact combination the serve-the-pin path could swallow —
+    /// the soft gate that now serves, stacked on the hard gate that must still win —
+    /// and it is also the self-healing loop that makes serving over the threshold
+    /// safe: a genuinely rejected account answers with a 429, that 429 arms
+    /// `rate_limited_until_ms`, and this select is the one that moves the session off
+    /// it. `hard_ok` stays the sole authority in both directions.
+    #[test]
+    fn pin_that_fails_a_hard_gate_still_rotates() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(5678))
+            .expect("an account is eligible");
+        set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
+        // The serve-over-threshold hit a real 429, which armed a real hold — and a
+        // long one, past the point where waiting it out could still hit a warm cache.
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(5678))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            served, pinned,
+            "a live hold is HARD — it outranks the serve-the-pin path"
+        );
+        assert_eq!(
+            pin_of(&manager, 5678),
+            Some(served),
+            "and it re-keys the session DURABLY, not just for this request"
+        );
+        // Durable: a fresh select with nothing tried stays on the new account.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(5678)),
+            Some(served),
+            "the session must not snap back to the held account"
+        );
+    }
+
+    /// `quota.status == "rejected"` is Anthropic's own verdict, so it is HARD even
+    /// though the account looks identical to the `allowed_warning` case above in
+    /// every other field. This pair is the whole soft/hard distinction in two tests.
+    #[test]
+    fn pin_rejected_by_upstream_is_rekeyed() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(3456))
+            .expect("an account is eligible");
+        set_over_threshold(&manager, pinned, 0.995, "rejected");
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(3456))
+            .expect("the allowed account serves this request");
+        assert_ne!(served, pinned, "a rejected pin cannot serve");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&3456)
+                .map(|&(idx, _)| idx),
+            Some(served),
+            "an upstream `rejected` is a HARD gate — it must re-key the session"
+        );
+    }
+
+    /// A pin landing in `tried` means this ONE request failed over it — a dropped
+    /// connection or a 5xx, not proof the account is gone. Divert, keep the pin.
+    /// Self-healing: when the failure is durable it arms a hold, and the very next
+    /// select re-keys on that evidence instead of on a single blip.
+    #[test]
+    fn transient_tried_failure_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let pinned = manager
+            .select(&HashSet::new(), now, None, Some(4567))
+            .expect("an account is eligible");
+        let tried: HashSet<usize> = [pinned].into_iter().collect();
+
+        let served = manager
+            .select(&tried, now, None, Some(4567))
+            .expect("the untried account serves this request");
+        assert_ne!(served, pinned, "the tried pin cannot serve THIS request");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&4567)
+                .map(|&(idx, _)| idx),
+            Some(pinned),
+            "a transient failover must not re-key the session"
+        );
+        // Nothing tried → straight back to the warm pin.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(4567)),
+            Some(pinned),
+            "the session must return to its original account"
+        );
+
+        // Now the failure proves durable (a 429 armed a hold long enough to outlive
+        // the account's prompt cache) — that IS hard, so the same tried-pin select
+        // re-keys.
+        manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
+        let moved = manager
+            .select(&tried, now, None, Some(4567))
+            .expect("the un-held account serves this request");
+        assert_eq!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&4567)
+                .map(|&(idx, _)| idx),
+            Some(moved),
+            "a durable failure still re-keys — the divert-and-keep is self-healing"
+        );
+    }
+
+    /// Drive account `idx` over the soft threshold on its MODEL-SCOPED weekly
+    /// (`7d_oi`, the Fable bucket) with a reset 48h out, leaving every shared
+    /// dimension healthy: the account is out of Fable and serves everything else
+    /// perfectly. The companion to [`set_over_threshold`], which moves the SHARED
+    /// weekly instead.
+    fn set_fable_exhausted(manager: &Manager, idx: usize, util: f64) {
+        let now = OffsetDateTime::now_utc();
+        let mut a = manager.accounts.write().expect("accounts lock poisoned");
+        a[idx].quota.seven_day_oi = Some(crate::quota::QuotaWindow {
+            utilization: util,
+            reset: Some(now + Duration::hours(48)),
+        });
+    }
+
+    /// Model-scoped exhaustion is a property of the REQUEST CLASS, not of the
+    /// account: an account out of its Fable weekly still answers Opus perfectly. So a
+    /// Fable request whose pin is Fable-exhausted diverts THAT ONE request and keeps
+    /// the pin — the session's next Opus turn must still land on the account holding
+    /// its warm prefix.
+    ///
+    /// This is the live shape, not a corner case: every Claude Code session mixes
+    /// classes (Opus for the conversation, a one-line Fable call for titles and
+    /// summaries) while a real fleet reads 95-99% on the Fable weekly across nearly
+    /// every account. Counted as account death, one cheap title request re-keyed a
+    /// 200k-token conversation onto a cold account.
+    #[test]
+    fn fable_exhaustion_diverts_the_request_but_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 909_090u64;
+        let home = manager
+            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .expect("an account is eligible");
+        set_fable_exhausted(&manager, home, 0.999);
+
+        let served = manager
+            .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
+            .expect("the other account can still serve Fable");
+        assert_ne!(
+            served, home,
+            "a Fable request must not be served from an exhausted Fable weekly"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "model-scoped exhaustion is a per-REQUEST fact — it may divert a \
+             request, it may never re-key the session"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            Some(home),
+            "the next non-Fable request must come home to the warm prefix"
+        );
+    }
+
+    /// THE over-correction guard for the test above: the model gate softened, and
+    /// nothing else did. Same Fable-exhausted pin, but now the account is also under a
+    /// 429 hold that outlives its prompt cache — ACCOUNT-level death, which must still
+    /// re-key durably.
+    #[test]
+    fn account_death_still_rekeys_a_fable_session() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 808_080u64;
+        let home = manager
+            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .expect("an account is eligible");
+        set_fable_exhausted(&manager, home, 0.999);
+        // The account is not merely out of Fable — it is gone for every model class,
+        // and for longer than its prompt cache survives.
+        manager.mark_rate_limited(home, LONG_HOLD_SECS);
+
+        let served = manager
+            .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(served, home, "a held pin cannot serve");
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(served),
+            "a hold outliving the prompt cache is ACCOUNT-level death — it must \
+             still re-key the session"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            Some(served),
+            "and durably: the Opus turn stays on the failover, it does not snap back"
+        );
+    }
+
+    /// The same invariant one path over. When the whole fleet reads over the SOFT
+    /// threshold, `select` returns `None` and the request lands in
+    /// `select_revalidation` — which also re-pins. A Fable request whose pin is
+    /// Fable-exhausted must be SERVED elsewhere there too while the pin stays put.
+    ///
+    /// Live-reachable, not theoretical: a fleet at 95-99% Fable has no Fable-eligible
+    /// account for `select` to pick, so this is the path a title request actually
+    /// takes.
+    #[test]
+    fn revalidation_fable_divert_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 707_070u64;
+        let home = manager
+            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .expect("an account is eligible");
+        let other = 1 - home;
+        // The whole fleet crosses the SOFT threshold, and the pin is out of Fable.
+        set_over_threshold(&manager, home, 0.99, "allowed_warning");
+        set_over_threshold(&manager, other, 0.96, "allowed_warning");
+        set_fable_exhausted(&manager, home, 0.999);
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            None,
+            "every account is over the soft threshold → normal select benches all"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            Some(other),
+            "the revalidation serve routes the Fable request to an account that can \
+             answer it"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "and it must NOT have re-keyed the session — the pin is model-blocked \
+             for this request only"
+        );
+        // A non-Fable request comes straight home: `select`'s pin-honor path serves
+        // the over-threshold pin rather than diverting it.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            Some(home),
+            "the Opus turn is served by the warm pin"
+        );
+    }
+
+    /// A rate-limit hold is a TIMER, not a death — and the timers this proxy arms
+    /// are mostly SHORT: a no-guidance transient 429 parks 15s + jitter, and a
+    /// `retry-after` park is clamped to 300s (`src/proxy.rs`). Anthropic's default
+    /// ephemeral prompt cache lives 5 minutes, so re-keying on a 15-second park
+    /// throws away a prefix that would still be warm 15 seconds later — and the
+    /// session never returns to it, because a re-key is durable.
+    ///
+    /// So a hold that clears inside [`CACHE_WARM_HOLD_SECS`] is SOFT: it diverts
+    /// THIS one request (the account really is parked and would only answer another
+    /// 429) and leaves the pin alone, and the session comes home warm when the timer
+    /// runs out. The over-correction guard is `long_hold_rekeys_the_session`, which
+    /// is this same fixture with only the hold duration changed.
+    #[test]
+    fn short_hold_diverts_but_keeps_the_pin() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 515_151u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, SHORT_HOLD_SECS);
+
+        let diverted = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            diverted, home,
+            "a parked pin cannot serve THIS request — serving it only buys a 429"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "a hold that clears while the cache is still warm may divert a request, \
+             it may never re-key the session"
+        );
+
+        // The timer runs out. A past hold reads as expired live, no mutation needed.
+        let after = now + Duration::seconds(SHORT_HOLD_SECS + 5);
+        for _ in 0..3 {
+            assert_eq!(
+                manager.select(&HashSet::new(), after, None, Some(key)),
+                Some(home),
+                "once the hold clears the session must come home to the account \
+                 still holding its warm prefix"
+            );
+        }
+    }
+
+    /// THE over-correction guard for the test above: only the SHORT holds softened.
+    /// The same fixture with a hold that outlives the prompt cache must still re-key
+    /// durably — by the time that account frees, the prefix it was holding is gone,
+    /// so keeping the pin would divert through the LRU pick on every turn and
+    /// scatter the conversation cold across the fleet instead of settling it on one
+    /// account that can warm up.
+    #[test]
+    fn long_hold_rekeys_the_session() {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 525_252u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, LONG_HOLD_SECS);
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(served, home, "a parked pin cannot serve");
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(served),
+            "a hold that outlives the prompt cache is ACCOUNT-level death — it must \
+             re-key the session"
+        );
+        // Durable: a fresh select with nothing tried stays on the new account.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(key)),
+            Some(served),
+            "the session must not snap back to the held account"
+        );
+    }
+
+    /// Pin a session, park its account with EXACTLY `remaining_ms` left to run, and
+    /// report whether the next select RE-KEYED the session (`true`) or merely
+    /// diverted the request while keeping the pin (`false`).
+    ///
+    /// Writes `rate_limited_until_ms` directly instead of going through
+    /// `mark_rate_limited`, which anchors the deadline to the process wall clock and
+    /// therefore cannot express an exact remaining duration relative to the `now`
+    /// the select is given — the whole point of a boundary test.
+    fn rekeys_with_hold_remaining(remaining_ms: i64) -> bool {
+        let manager = build_manager(
+            config_with(vec![account("home", 0), account("other", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let key = 424_242u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[home].status = AccountStatus::Throttled;
+            accounts[home].rate_limited_until_ms = Some(now_ms + remaining_ms);
+        }
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            served, home,
+            "a parked pin cannot serve, at any hold length"
+        );
+        pin_of(&manager, key) != Some(home)
+    }
+
+    /// Pins the dividing line itself, from BOTH sides, so a refactor cannot drift it
+    /// silently: a hold with exactly [`CACHE_WARM_HOLD_SECS`] left is LONG (the cache
+    /// dies at the same instant the account frees, so there is nothing to come home
+    /// to), and one millisecond less is SHORT.
+    ///
+    /// Asserted through `select`, not against the predicate, so it is the ROUTING
+    /// decision that is nailed down rather than an implementation detail.
+    #[test]
+    fn hold_exactly_at_the_boundary_is_treated_as_long() {
+        let boundary_ms = CACHE_WARM_HOLD_SECS * 1000;
+        assert!(
+            rekeys_with_hold_remaining(boundary_ms),
+            "a hold with exactly CACHE_WARM_HOLD_SECS left must re-key — the prefix \
+             is gone at the same instant the account frees"
+        );
+        assert!(
+            !rekeys_with_hold_remaining(boundary_ms - 1),
+            "one millisecond under the line must keep the pin — the boundary is \
+             `>=`, and this is the assertion that stops it drifting"
+        );
+    }
+
+    /// Once a hold LONG enough to have re-keyed a session has moved it onto a
+    /// failover account, the expiry of that hold does NOT bring the session home:
+    /// the pin is simply the failover from then on.
+    ///
+    /// That is the whole justification for re-keying on a long hold at all. By the
+    /// time the original account frees, the prefix it was holding is gone
+    /// ([`CACHE_WARM_HOLD_SECS`]), so coming home would buy a cold start on the way
+    /// back and no cache hit at the other end — strictly worse than staying put.
+    ///
+    /// The complement is `short_hold_diverts_but_keeps_the_pin`: a hold that clears
+    /// while the cache is still warm never re-keys in the first place, so there is
+    /// nothing to come home FROM. The two together are the whole rule.
+    #[test]
+    fn hold_expiry_leaves_the_session_on_its_failover() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 606_060u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, LONG_HOLD_SECS);
+
+        let failover = manager
+            .select(&HashSet::new(), now, None, Some(key))
+            .expect("the un-held account serves this request");
+        assert_ne!(
+            failover, home,
+            "a hold outliving the prompt cache re-keys the session"
+        );
+        assert_eq!(pin_of(&manager, key), Some(failover));
+
+        // The hold expires. A past hold reads as expired live, no mutation needed.
+        let after = now + Duration::hours(1);
+        assert_eq!(
+            manager.select(&HashSet::new(), after, None, Some(key)),
+            Some(failover),
+            "the session stays on its failover once the hold clears — the original \
+             account's prompt cache is long gone, so coming home would only buy a \
+             second cold start"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(failover),
+            "and the pin is not walked back either"
         );
     }
 
@@ -2564,6 +3423,18 @@ mod tests {
             .insert(key, (idx, crate::now_ms()));
     }
 
+    /// Like [`config_with`] but with the (default-OFF) load-balancing migration
+    /// explicitly enabled — every test that exercises the migration scan itself
+    /// must opt in, exactly as an operator would via `~/.config/teamclaude.json`.
+    fn config_with_migration(accounts: Vec<Account>) -> Config {
+        let mut config = config_with(accounts);
+        config.extra.insert(
+            "loadBalanceMigration".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        config
+    }
+
     /// Read the account a session key is currently pinned to (None if unpinned).
     fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
         manager
@@ -2599,16 +3470,16 @@ mod tests {
         assert_eq!(pin_of(&manager, 100), Some(0), "the pin never moved");
     }
 
-    /// Migration #2 — two sessions stacked on acct 0 with acct 1 idle+eligible:
-    /// selecting for one of them migrates it to acct 1, and the affinity map records
-    /// the new pin.
+    /// Migration #2 — two sessions stacked on acct 0 with acct 1 idle+eligible and
+    /// `loadBalanceMigration` ENABLED: selecting for one of them migrates it to
+    /// acct 1, and the affinity map records the new pin.
     #[test]
     fn stacked_session_migrates_to_idle() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
+            config_with_migration(vec![account("a", 0), account("b", 0)]),
             refresher,
         );
         let now = OffsetDateTime::now_utc();
@@ -2627,16 +3498,16 @@ mod tests {
         );
     }
 
-    /// Migration #3 — convergence, no thrash: after #2's migration the layout is
-    /// balanced (one session each), so further selects for BOTH sessions are stable —
-    /// neither bounces back.
+    /// Migration #3 — convergence, no thrash (with `loadBalanceMigration` ENABLED):
+    /// after #2's migration the layout is balanced (one session each), so further
+    /// selects for BOTH sessions are stable — neither bounces back.
     #[test]
     fn migration_converges_no_thrash() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0)]),
+            config_with_migration(vec![account("a", 0), account("b", 0)]),
             refresher,
         );
         let now = OffsetDateTime::now_utc();
@@ -2688,15 +3559,16 @@ mod tests {
         assert_eq!(pin_of(&manager, 20), Some(0), "the pin never moved");
     }
 
-    /// Migration #5 — three sessions stacked on acct 0 with accts 1,2 idle spread to
-    /// one-each after a round of selects (convergence across three accounts).
+    /// Migration #5 — with `loadBalanceMigration` ENABLED, three sessions stacked on
+    /// acct 0 with accts 1,2 idle spread to one-each after a round of selects
+    /// (convergence across three accounts).
     #[test]
     fn three_sessions_spread_across_three_idle() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
         let manager = build_manager(
-            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            config_with_migration(vec![account("a", 0), account("b", 0), account("c", 0)]),
             refresher,
         );
         let now = OffsetDateTime::now_utc();
@@ -2718,6 +3590,71 @@ mod tests {
             homes,
             [0, 1, 2],
             "three stacked sessions spread to one-per-account after a round of selects"
+        );
+    }
+
+    /// Migration #6 — the DEFAULT is no migration at all. Identical stacked layout to
+    /// #2 (two sessions on acct 0, acct 1 idle and eligible): with a plain config
+    /// NEITHER session moves, because a session that already has a pin is by
+    /// definition warm and Anthropic's prompt cache is per-account, so re-pinning it
+    /// merely to even out counts throws that cache away. The SAME layout under
+    /// `"loadBalanceMigration": true` still migrates — proof the behaviour is gated,
+    /// not deleted.
+    #[test]
+    fn migration_is_off_by_default_and_pin_is_honoured() {
+        let now = OffsetDateTime::now_utc();
+
+        // --- default config: the migration scan never runs ---
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert!(
+            !manager.load_balance_migration_enabled(),
+            "loadBalanceMigration must default to OFF"
+        );
+        pin_session(&manager, 30, 0);
+        pin_session(&manager, 31, 0);
+        // count(0)=2, count(1)=0 — exactly the condition that used to migrate.
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(30)),
+                Some(0),
+                "a stacked session keeps its warm account when migration is off"
+            );
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(31)),
+                Some(0),
+                "its stack-mate keeps the same account too"
+            );
+        }
+        assert_eq!(pin_of(&manager, 30), Some(0), "pin 30 never moved");
+        assert_eq!(pin_of(&manager, 31), Some(0), "pin 31 never moved");
+
+        // --- same layout, key explicitly true: the old behaviour is intact ---
+        let enabled = build_manager(
+            config_with_migration(vec![account("a", 0), account("b", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert!(
+            enabled.load_balance_migration_enabled(),
+            "the explicit key must read back as ON"
+        );
+        pin_session(&enabled, 30, 0);
+        pin_session(&enabled, 31, 0);
+        assert_eq!(
+            enabled.select(&HashSet::new(), now, None, Some(30)),
+            Some(1),
+            "with loadBalanceMigration=true the stacked session still migrates"
+        );
+        assert_eq!(
+            pin_of(&enabled, 30),
+            Some(1),
+            "and the affinity map records the migrated pin"
         );
     }
 
@@ -2940,6 +3877,184 @@ mod tests {
             Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
             (GateReason::Ok, None),
             "an expired standard window no longer gates"
+        );
+    }
+
+    #[test]
+    fn rejected_account_reports_a_rejected_gate() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let mut a = gate_runtime();
+        a.quota.status = Some("rejected".to_string());
+
+        // Was `Ok`: `account_hard_ok` held the account out on `rejected` while
+        // `account_gate` had no arm for it, so the TUI showed a rejected account as
+        // healthy and in rotation.
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            (GateReason::Rejected, None)
+        );
+        assert!(
+            !Manager::account_hard_ok(&a, now_ms),
+            "and it stays hard-gated, exactly as before"
+        );
+
+        // Terminal, so it dominates a live window and carries NO clear-instant —
+        // `retry_after_hint` reads `free_at`, and a rejected account was never going
+        // to come back at its 5h reset.
+        a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
+        assert_eq!(
+            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            (GateReason::Rejected, None),
+            "a rejected account must not advertise a window reset as its recovery"
+        );
+    }
+
+    /// The drift guard, and the reason R7 exists. [`Manager::account_gate`] (what
+    /// the TUI and `retry_after_hint` read) and [`Manager::account_hard_ok`] (whether
+    /// a session may lose its pin) once kept two hand-maintained gate lists, and they
+    /// drifted: `rejected` was on one and missing from the other.
+    ///
+    /// The two are deliberately NOT equal — a quota window or a short hold gates the
+    /// display while leaving the pin alone — so this pins the RELATIONSHIP per
+    /// variant instead. The classification below is exhaustive over [`GateReason`],
+    /// so adding a variant stops compiling until someone decides which side of the
+    /// account/request line it falls on.
+    #[test]
+    fn gate_and_hard_ok_agree_on_every_variant() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let reset = now + Duration::seconds(5_000);
+
+        const ALL: [GateReason; 9] = [
+            GateReason::Ok,
+            GateReason::Hold,
+            GateReason::FiveHour,
+            GateReason::SevenDay,
+            GateReason::FableWeekly,
+            GateReason::Standard,
+            GateReason::Login,
+            GateReason::Disabled,
+            GateReason::Rejected,
+        ];
+
+        for reason in ALL {
+            // Only a Fable-scoped evaluation can ever surface the model-scoped gate.
+            let is_fable = reason == GateReason::FableWeekly;
+
+            // Per case: a label, a runtime that actually exhibits `reason`, and
+            // whether that block is ACCOUNT-level (`account_hard_ok == false`) or
+            // request-scoped (`account_hard_ok` stays true, the pin survives).
+            let cases: Vec<(&str, AccountRuntime, bool)> = match reason {
+                GateReason::Ok => vec![("healthy", gate_runtime(), true)],
+
+                // Terminal: a fact about the credential, for every model class.
+                GateReason::Disabled => {
+                    let mut a = gate_runtime();
+                    a.disabled = true;
+                    vec![("operator-disabled", a, false)]
+                }
+                GateReason::Login => {
+                    let mut a = gate_runtime();
+                    a.status = AccountStatus::Error;
+                    vec![("dead credential", a, false)]
+                }
+                GateReason::Rejected => {
+                    let mut a = gate_runtime();
+                    a.quota.status = Some("rejected".to_string());
+                    vec![("upstream rejected", a, false)]
+                }
+
+                // The one reason that splits on DURATION: past the cache TTL a hold
+                // is account death, under it a timer worth keeping the pin for.
+                GateReason::Hold => {
+                    let mut long = gate_runtime();
+                    long.rate_limited_until_ms = Some(now_ms + (CACHE_WARM_HOLD_SECS + 60) * 1_000);
+                    let mut short = gate_runtime();
+                    short.rate_limited_until_ms = Some(now_ms + 30_000);
+                    vec![
+                        ("hold outliving the cache", long, false),
+                        ("hold clearing while warm", short, true),
+                    ]
+                }
+
+                // Windows are per-request facts: they gate the display and every
+                // serve decision, but must never move a session's pin.
+                GateReason::FiveHour => {
+                    let mut a = gate_runtime();
+                    a.quota.five_hour = Some(window(0.99, Some(reset)));
+                    vec![("5h over threshold", a, true)]
+                }
+                GateReason::SevenDay => {
+                    let mut a = gate_runtime();
+                    a.quota.seven_day = Some(window(0.99, Some(reset)));
+                    vec![("7d over threshold", a, true)]
+                }
+                GateReason::FableWeekly => {
+                    let mut a = gate_runtime();
+                    a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
+                    vec![("7d_oi over threshold", a, true)]
+                }
+                GateReason::Standard => {
+                    let mut a = gate_runtime();
+                    a.quota.tokens_limit = Some(1_000);
+                    a.quota.tokens_remaining = Some(10); // 99% spent
+                    a.quota.standard_reset = Some(reset);
+                    vec![("standard limit spent", a, true)]
+                }
+            };
+
+            for (label, runtime, account_level) in cases {
+                let (gate, _) = Manager::account_gate(&runtime, 0.90, now, now_ms, is_fable);
+                assert_eq!(gate, reason, "fixture `{label}` must exhibit {reason:?}");
+
+                let hard_ok = Manager::account_hard_ok(&runtime, now_ms);
+                assert_eq!(
+                    hard_ok, account_level,
+                    "`{label}`: account_hard_ok disagrees with {reason:?}'s classification"
+                );
+
+                // The invariant that actually broke: whatever `account_hard_ok` holds
+                // out MUST have a reason to show for it. `rejected` violated this.
+                if !hard_ok {
+                    assert_ne!(
+                        gate,
+                        GateReason::Ok,
+                        "`{label}` is hard-gated but renders Ok — the gate lists have drifted"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The serving client must never carry a TOTAL request timeout: these responses
+    /// are long-lived SSE streams, and a total timeout truncates them mid-stream.
+    /// (The `connect_timeout` it does set is not observable here — `reqwest::Client`
+    /// exposes no getters and its `Debug` omits it, since the value lives inside the
+    /// connector. Only the total timeout is surfaced.)
+    #[test]
+    fn serving_client_has_no_total_timeout() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+
+        // reqwest prints the total timeout as a `TotalTimeout` field, and only when
+        // one is set. Prove the marker on a control client first, so a future reqwest
+        // that renames it fails HERE loudly instead of making the guard below pass
+        // vacuously.
+        let control = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("build control client");
+        assert!(
+            format!("{control:?}").contains("TotalTimeout"),
+            "reqwest no longer reports a total timeout in Debug — this guard needs rewriting"
+        );
+
+        assert!(
+            !format!("{:?}", manager.http).contains("TotalTimeout"),
+            "the serving client grew a total timeout; it will truncate SSE streams"
         );
     }
 
@@ -3289,7 +4404,8 @@ mod tests {
         }
     }
 
-    /// TOCTOU regression (concurrency) — the migration feature's OWN target workload.
+    /// TOCTOU regression (concurrency) — the migration feature's OWN target workload,
+    /// with `loadBalanceMigration` explicitly ENABLED (it ships OFF).
     /// Several sessions start STACKED on one account with idle, eligible accounts
     /// alongside. `N` threads select for those sessions in lockstep: a `Barrier`
     /// forces every round to fire simultaneously, which is the exact interleaving the
@@ -3310,7 +4426,7 @@ mod tests {
         const ROUNDS: usize = 100;
 
         let manager = build_manager(
-            config_with(vec![
+            config_with_migration(vec![
                 account("a0", 0),
                 account("a1", 0),
                 account("a2", 0),
@@ -3360,6 +4476,368 @@ mod tests {
             [1, 1, 1, 1],
             "stacked sessions must converge to one-per-account without over-migrating \
              (got {per_account:?}) — a stale-count commit would over-stack one account"
+        );
+    }
+
+    // ---- over-threshold revalidation-serve (last-resort; default ON) ----------
+
+    /// Drive account `idx` OVER the soft switch threshold on its shared weekly
+    /// (`7d`) window (future reset) and stamp `unifiedStatus`, so normal `select`
+    /// benches it but `select_revalidation` can still consider it. `util` is the
+    /// weekly utilization; `status` the reported unified status.
+    fn set_over_threshold(manager: &Manager, idx: usize, util: f64, status: &str) {
+        let now = OffsetDateTime::now_utc();
+        let mut a = manager.accounts.write().expect("accounts lock poisoned");
+        let account = &mut a[idx];
+        account.quota.seven_day = Some(crate::quota::QuotaWindow {
+            utilization: util,
+            reset: Some(now + Duration::hours(48)),
+        });
+        account.quota.status = Some(status.to_string());
+    }
+
+    /// #1 Whole fleet over the soft threshold, all `allowed_warning`: normal
+    /// `select` is `None` but `select_revalidation` serves the LOWEST-utilization
+    /// account.
+    #[test]
+    fn revalidation_serves_least_utilized_when_all_over_threshold() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.995, "allowed_warning");
+        set_over_threshold(&manager, 1, 0.970, "allowed_warning"); // least utilized
+        set_over_threshold(&manager, 2, 0.999, "allowed_warning");
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None),
+            None,
+            "every account is over the soft threshold → normal select benches all"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(1),
+            "revalidation serves the least-utilized allowed account"
+        );
+    }
+
+    /// #1b THE cache-warmth test: a session pinned (affinity) to an over-threshold
+    /// but `allowed_warning` account X — with OTHER accounts LESS utilized — must be
+    /// served X (its warm pin), NOT the least-utilized other, and must NOT consume
+    /// the fallback anti-storm window. If X becomes `rejected`, it falls back to the
+    /// least-utilized survivor and RE-PINS the session there.
+    #[test]
+    fn revalidation_honors_pin_through_threshold() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        // The pinned account (idx 2) is the MOST utilized; the others are cooler.
+        set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&manager, 1, 0.970, "allowed_warning");
+        set_over_threshold(&manager, 2, 0.999, "allowed_warning"); // the warm pin
+        let key = 424_242u64;
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (2, odt_to_ms(now)));
+        }
+
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            Some(2),
+            "pin-honor serves the session's warm pinned account, NOT the least-utilized other"
+        );
+        // The pin-honor path must NOT have burned the fallback throttle window: an
+        // unaffiliated (no-pin) fallback serve still succeeds immediately.
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(0),
+            "pin-honor does not consume the fallback anti-storm window"
+        );
+
+        // When the pin becomes HARD-blocked (rejected), fall back to least-utilized
+        // and RE-PIN the session there. Use a fresh manager (throttle valve reset).
+        let manager2 = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager2, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&manager2, 1, 0.970, "allowed_warning");
+        set_over_threshold(&manager2, 2, 0.999, "rejected"); // pin now blocked
+        {
+            let mut pins = manager2.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (2, odt_to_ms(now)));
+        }
+        assert_eq!(
+            manager2.select_revalidation(&HashSet::new(), now, None, Some(key)),
+            Some(0),
+            "a rejected pin falls back to the least-utilized survivor"
+        );
+        let repinned = manager2
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            repinned,
+            Some(0),
+            "the fallback serve re-pins the session to the account it chose"
+        );
+    }
+
+    /// #1c `tried` governs whether an account may SERVE this request; it must never
+    /// decide whether that session's PIN may MOVE. A pin that merely failed THIS
+    /// request — a transport blip, a 5xx — while still clearing every ACCOUNT-level
+    /// HARD gate stays put: the fallback serves elsewhere for this one request and
+    /// the session comes home on the next.
+    ///
+    /// Before the fix the `account_hard_ok → keep_pin` test sat INSIDE
+    /// `if !tried.contains(&idx)`, so a tried pin left `keep_pin` at `None` and the
+    /// fallback's `pins.insert` durably re-keyed the session — a warm prompt cache
+    /// discarded on the strength of one failed request. `select()` takes the opposite
+    /// decision on the identical fact and documents why; this is the two agreeing.
+    ///
+    /// Also the first coverage of a NON-EMPTY `tried` on this path at all — every
+    /// other `select_revalidation` test passes `&HashSet::new()`.
+    #[test]
+    fn revalidation_keeps_the_pin_when_it_is_merely_tried() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&manager, 1, 0.970, "allowed_warning");
+        set_over_threshold(&manager, 2, 0.999, "allowed_warning"); // the warm pin
+        let key = 515_151u64;
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (2, odt_to_ms(now)));
+        }
+
+        // The pin failed THIS request and nothing more: not disabled, not errored,
+        // not rejected, no hold. It clears every ACCOUNT-level hard gate.
+        let tried = HashSet::from([2usize]);
+        assert_eq!(
+            manager.select_revalidation(&tried, now, None, Some(key)),
+            Some(0),
+            "a tried pin cannot serve THIS request → the least-utilized survivor does"
+        );
+        let pin_after = manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            pin_after,
+            Some(2),
+            "the pin must NOT move: membership in `tried` is a per-request fact, not \
+             evidence the account is gone"
+        );
+    }
+
+    /// #1d The over-correction guard for #1c. Hoisting the `keep_pin` test out of the
+    /// `!tried` guard must not make a pin STICKY: a pin that fails an ACCOUNT-level
+    /// HARD gate still re-keys, and being in `tried` as well changes nothing. Both
+    /// hard shapes are exercised — `quota.status == "rejected"`, and a hold that
+    /// outlives the prompt cache (>= `CACHE_WARM_HOLD_SECS`).
+    #[test]
+    fn revalidation_rekeys_when_the_pin_fails_a_hard_gate() {
+        let key = 626_262u64;
+        let now = OffsetDateTime::now_utc();
+        let tried = HashSet::from([2usize]);
+        let pin_session = |manager: &Manager, idx: usize| {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (idx, odt_to_ms(now)));
+        };
+        let pin_of = |manager: &Manager| {
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .get(&key)
+                .map(|&(idx, _)| idx)
+        };
+
+        // (a) REJECTED and tried — a durable block, so the session must move off it.
+        let rejected = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&rejected, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&rejected, 1, 0.970, "allowed_warning");
+        set_over_threshold(&rejected, 2, 0.999, "rejected");
+        pin_session(&rejected, 2);
+        assert_eq!(
+            rejected.select_revalidation(&tried, now, None, Some(key)),
+            Some(0),
+            "a rejected pin is skipped; the least-utilized survivor serves"
+        );
+        assert_eq!(
+            pin_of(&rejected),
+            Some(0),
+            "a rejected pin RE-KEYS — `tried` must not shield it from the hard gate"
+        );
+
+        // (b) HELD PAST THE CACHE and tried — also durable (a fresh manager, so the
+        // anti-storm valve the serve above armed does not swallow this call).
+        let held = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("pinned", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&held, 0, 0.950, "allowed_warning"); // least utilized
+        set_over_threshold(&held, 1, 0.970, "allowed_warning");
+        set_over_threshold(&held, 2, 0.999, "allowed_warning");
+        {
+            let mut a = held.accounts.write().expect("accounts lock poisoned");
+            a[2].rate_limited_until_ms = Some(crate::now_ms() + 3_600_000);
+        }
+        pin_session(&held, 2);
+        assert_eq!(
+            held.select_revalidation(&tried, now, None, Some(key)),
+            Some(0),
+            "a pin held past its cache lifetime is skipped; the survivor serves"
+        );
+        assert_eq!(
+            pin_of(&held),
+            Some(0),
+            "a hold that outlives the cache RE-KEYS — `tried` must not shield it"
+        );
+    }
+
+    /// #2 A `rejected` account is skipped even when least-utilized; a higher-util
+    /// `allowed` one is served. If ALL are `rejected` → `None`.
+    #[test]
+    fn revalidation_skips_rejected_accounts() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.960, "rejected"); // least util but blocked
+        set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(1),
+            "the least-utilized account is rejected → skip it, serve the allowed one"
+        );
+
+        // Now reject BOTH → nothing servable → None.
+        set_over_threshold(&manager, 1, 0.990, "rejected");
+        // A fresh manager to reset the anti-storm valve (previous serve armed it).
+        let manager2 = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager2, 0, 0.960, "rejected");
+        set_over_threshold(&manager2, 1, 0.990, "rejected");
+        assert_eq!(
+            manager2.select_revalidation(&HashSet::new(), now, None, None),
+            None,
+            "all accounts rejected → no revalidation target, honest 429"
+        );
+    }
+
+    /// #3 An account under a live rate-limit hold is skipped even if least-utilized.
+    #[test]
+    fn revalidation_skips_hard_held_account() {
+        let manager = build_manager(
+            config_with(vec![account("held", 0), account("free", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.950, "allowed_warning"); // least util …
+        set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+        {
+            let mut a = manager.accounts.write().expect("accounts lock poisoned");
+            a[0].rate_limited_until_ms = Some(crate::now_ms() + 60_000); // … but held.
+        }
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(1),
+            "a live-held account is a HARD block — skipped even as least-utilized"
+        );
+    }
+
+    /// #4 Anti-storm: two back-to-back calls — the first serves, the second (inside
+    /// `REVALIDATION_MIN_SPACING_MS`) returns `None`.
+    #[test]
+    fn revalidation_throttle_spacing_respected() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.970, "allowed_warning");
+        set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            Some(0),
+            "first call serves"
+        );
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, None, None),
+            None,
+            "a second call within the spacing window is throttled to None"
+        );
+    }
+
+    /// #5 When one account is UNDER threshold, normal `select` returns it and the
+    /// revalidation path is never consulted — the normal path stays unchanged.
+    #[test]
+    fn revalidation_not_consulted_when_an_account_is_eligible() {
+        let manager = build_manager(
+            config_with(vec![account("hot", 0), account("cool", 0)]),
+            pacing_refresher(),
+        );
+        set_over_threshold(&manager, 0, 0.999, "allowed_warning");
+        // account 1 stays healthy (no quota set) → under threshold → eligible.
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None),
+            Some(1),
+            "an under-threshold account is served by the normal path; revalidation \
+             is only consulted after select() returns None"
+        );
+    }
+
+    /// #6 A Fable request skips an account whose Fable weekly (`7d_oi`) is a hard
+    /// reject, but a non-Fable request serves that same account.
+    #[test]
+    fn revalidation_fable_skips_fable_exhausted() {
+        let build = || {
+            let manager = build_manager(
+                config_with(vec![account("fable-full", 0), account("other", 0)]),
+                pacing_refresher(),
+            );
+            let now = OffsetDateTime::now_utc();
+            // account 0: least-utilized on shared dims but Fable weekly exhausted.
+            set_over_threshold(&manager, 0, 0.950, "allowed_warning");
+            set_over_threshold(&manager, 1, 0.990, "allowed_warning");
+            set_fable_exhausted(&manager, 0, 0.999);
+            (manager, now)
+        };
+
+        // Fable request: account 0's Fable weekly is a hard reject → skip → serve 1.
+        let (manager, now) = build();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, Some("claude-fable-5"), None),
+            Some(1),
+            "a Fable request skips the Fable-exhausted account even when least-utilized"
+        );
+
+        // Non-Fable request on a fresh manager: account 0 IS served (Fable weekly
+        // gates Fable traffic only; on shared dims account 0 is least-utilized).
+        let (manager, now) = build();
+        assert_eq!(
+            manager.select_revalidation(&HashSet::new(), now, Some("claude-opus-4-6"), None),
+            Some(0),
+            "a non-Fable request still serves the Fable-exhausted account"
         );
     }
 }

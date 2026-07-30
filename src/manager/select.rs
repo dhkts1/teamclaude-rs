@@ -28,9 +28,55 @@ impl Manager {
     /// `tried` and still passes [`Self::eligible`], that pinned account is
     /// returned — still stamped with a fresh select tick so *other* sessions' LRU
     /// steers away from a busy pinned account. Otherwise a normal LRU/priority
-    /// pick runs and its winner is recorded as the session's pin (the initial pin
-    /// or a re-pin when the old pin became ineligible / was already tried).
-    /// Affinity never overrides priority — the pin is always a normal pick.
+    /// pick runs. Affinity never overrides priority — the pin is always a normal
+    /// pick.
+    ///
+    /// **The invariant, and the whole point of a pin: a session's pin is re-keyed
+    /// ONLY when the pinned ACCOUNT fails a HARD gate** ([`Self::account_hard_ok`] is
+    /// the sole authority). Anthropic's prompt cache is per-account, so a re-key
+    /// re-creates the entire conversation prefix on a cold account. Only disabled /
+    /// [`AccountStatus::Error`] / `rejected` / a hold that OUTLIVES the prompt cache
+    /// ([`CACHE_WARM_HOLD_SECS`]) re-key durably. This is self-healing: a durable
+    /// failure arms a long hold or sets `rejected` on the very next attempt, and
+    /// those fail `account_hard_ok`.
+    ///
+    /// Everything else is a fact about ONE REQUEST, not about the account. Such a
+    /// fact never re-keys, and — the second half of the same argument — mostly does
+    /// not even DIVERT, because a divert costs that request the same cold prefix a
+    /// re-key would. The five split by how much they actually know:
+    ///  - **over the utilization threshold** → **SERVE the pin anyway.** That
+    ///    threshold is our own arithmetic over headers that go stale by minutes, and
+    ///    Anthropic keeps answering 200s for accounts it benches. Upstream is the
+    ///    oracle: serve, and let a real 429 arm a real (HARD) hold.
+    ///  - **paced out** (at the in-flight cap / inside min-spacing, see
+    ///    [`Self::paced_out`]) → divert this ONE request, keep the pin. Our own
+    ///    concurrency is measured exactly and never stale, and spreading a session's
+    ///    burst is precisely what the cap exists to do.
+    ///  - **model-class blocked** (a Fable request whose pin has an exhausted Fable
+    ///    weekly, see [`Self::model_blocked`]) → divert this ONE request, keep the
+    ///    pin. The account cannot answer THIS request and answers every other model
+    ///    class perfectly, so treating it as death let a one-line title call drag a
+    ///    200k-token Opus conversation onto a cold account.
+    ///  - **already in `tried`** → divert this ONE request, keep the pin. It has
+    ///    failed THIS request upstream, so re-serving it would spin — but one blip is
+    ///    not proof the account is gone.
+    ///  - **held by a rate-limit timer that clears while the cache is still warm**
+    ///    (see [`Self::hold_clears_while_warm`]) → divert this ONE request, keep the
+    ///    pin. A hold is a timer, not a death, and the ones we arm are mostly short:
+    ///    a no-guidance park is 15s + jitter, and a `retry-after` park is clamped to
+    ///    300s. Re-keying on one would discard a prefix that is still warm when the
+    ///    account frees. Past [`CACHE_WARM_HOLD_SECS`] the trade inverts and the hold
+    ///    goes back to being an ACCOUNT-level hard gate.
+    ///
+    /// Every divert routes to the fall-through pick while the pin stays put (see
+    /// `keep_pin`); the utilization case returns from the fast-path.
+    ///
+    /// The one remaining voluntary mover — the load-balancing migration that
+    /// re-pins a stacked session onto a less-loaded account — is therefore
+    /// OPT-IN and ships OFF (top-level `loadBalanceMigration`, see
+    /// [`Self::load_balance_migration_enabled`]). Disabled, the scan is skipped
+    /// entirely and the pin is honoured; set to `true`, the balancing behaviour
+    /// below is unchanged.
     pub fn select(
         &self,
         tried: &HashSet<usize>,
@@ -48,6 +94,23 @@ impl Manager {
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
+
+        // Set (to the OLD pin index) for the four per-REQUEST failures that DIVERT —
+        // the pin is paced out, it cannot serve this request's model class, it is
+        // already in `tried`, or it is parked on a hold that clears while its prompt
+        // cache is still warm — while still clearing every ACCOUNT-level HARD gate
+        // (`Self::account_hard_ok`). A per-request fact may divert a request; it may
+        // never RE-KEY a session: Anthropic's prompt cache is per-account, so a re-pin
+        // re-creates the whole conversation prefix on the next request. The
+        // fall-through re-pin at the bottom honours this and keeps the old index.
+        // The fourth — over the utilization threshold — does not divert at all; the
+        // fast-path below serves the pin and returns.
+        let mut keep_pin: Option<usize> = None;
+        // WHY the pin was kept while another account serves, carried down to the
+        // re-pin at the bottom because only there are BOTH the kept pin and the
+        // account actually serving known. `None` means no divert happened. Purely
+        // for the log line — nothing branches on it.
+        let mut divert_reason: Option<&'static str> = None;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
         // the pin under the affinity lock, then DROP that lock before taking the
@@ -68,20 +131,48 @@ impl Manager {
                 (pinned, counts)
             };
             if let Some(idx) = pinned {
-                if !tried.contains(&idx) {
+                if tried.contains(&idx) {
+                    // The pin already failed THIS request upstream. That is NOT proof
+                    // the account is gone — a transient blip (a dropped connection, a
+                    // 5xx) leaves every ACCOUNT-level gate clear. So divert this
+                    // request and keep the pin. Self-healing: a DURABLE failure arms a
+                    // hold or sets `rejected`, both of which fail `account_hard_ok`, so
+                    // the re-key still happens — one request later, on evidence.
+                    //
+                    // `account_hard_ok`, not `hard_ok`: the model-class gate is about
+                    // THIS request, so a Fable-exhausted pin that a Fable request
+                    // already tried still keeps its pin for the session's Opus turns.
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    if accounts
+                        .get(idx)
+                        .is_some_and(|a| Self::account_hard_ok(a, now_ms))
+                    {
+                        keep_pin = Some(idx);
+                        divert_reason = Some("pin-tried");
+                    }
+                } else {
                     let count_x = counts.get(&idx).copied().unwrap_or(0);
+                    // Load-balancing migration ships OFF (see
+                    // [`Self::load_balance_migration_enabled`]): a session that HAS a
+                    // pin is by definition already warm, so moving it to even out
+                    // counts is a guaranteed prompt-cache loss. Read the flag HERE,
+                    // while NO other lock is held — the affinity lock dropped above
+                    // and the accounts lock is taken below, so the config lock is
+                    // never nested under either. Short-circuited on `count_x`, so the
+                    // common lone-session path does not touch the config lock at all.
+                    let migration_ok = count_x >= 2 && self.load_balance_migration_enabled();
                     // (2) UNDER THE ACCOUNTS LOCK ONLY: confirm the pin `X` is still
-                    // usable, then — and only when >=2 sessions stack on `X` — look
-                    // for the least-loaded ELIGIBLE account `Y` that strictly improves
-                    // balance (`count(Y)+1 < count(X)`). Stamp whichever we settle on.
+                    // usable, then — and only when migration is ENABLED and >=2
+                    // sessions stack on `X` — look for the least-loaded ELIGIBLE
+                    // account `Y` that strictly improves balance
+                    // (`count(Y)+1 < count(X)`). Stamp whichever we settle on.
                     // `None` means `X` is ineligible → fall through to the normal
                     // pick/re-pin path (which already handles a dead pin).
                     let decision: Option<(usize, Option<(String, String)>)> = {
                         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-                        // Respect pacing on the pin: a saturated pinned account
-                        // temporarily YIELDS here and the LRU pick below (with its
-                        // soft fallback) steers to a cooler account, so a session's
-                        // concurrent burst spreads instead of all slamming one pin.
+                        // The full (soft-inclusive) gate. Failing it does NOT bench the
+                        // pin — it only means we drop into the hard-gate re-test below,
+                        // which decides serve-anyway vs durable re-key.
                         let x_usable = accounts.get(idx).is_some_and(|a| {
                             Self::eligible(
                                 a,
@@ -94,15 +185,113 @@ impl Manager {
                             )
                         });
                         if !x_usable {
-                            None
+                            // Re-test the SAME account against the ACCOUNT-level HARD
+                            // gates ALONE to separate a per-REQUEST yield from a real
+                            // block. Passing there means the pin cleared
+                            // disabled/error/hold/rejected and only tripped a gate that
+                            // describes this one request — the utilization threshold
+                            // (`quota.is_near`), the concurrency-cap / min-spacing
+                            // pacing gate, or the model-class gate. None of those is
+                            // proof this account is gone. Failing it IS a genuine HARD
+                            // block → fall through to the normal pick, which durably
+                            // re-keys (the session's account really is gone).
+                            //
+                            // The four then part ways, because they are not the same
+                            // kind of claim (see `Self::paced_out`, `Self::model_blocked`,
+                            // `Self::hold_clears_while_warm`):
+                            //
+                            //  - PACED OUT → yield THIS request and keep the pin, as
+                            //    before. Our own concurrency is a fact we measure
+                            //    exactly, and spreading a burst is what the cap is for.
+                            //
+                            //  - HELD, BUT THE HOLD CLEARS WHILE THE CACHE IS WARM →
+                            //    same shape. A hold is a TIMER, not a death, and the
+                            //    timers we arm are mostly short (a no-guidance park is
+                            //    15s + jitter). Diverting the one request costs one cold
+                            //    prefix; re-keying throws away a cache that would still
+                            //    have been warm when the account came back, and the
+                            //    session never returns to it. A hold that OUTLIVES the
+                            //    cache is a different claim and fails `account_alive`
+                            //    above — see `CACHE_WARM_HOLD_SECS`.
+                            //
+                            //  - MODEL-CLASS BLOCKED (a Fable request, Fable weekly
+                            //    exhausted) → same shape: this account cannot answer
+                            //    THIS request, and answers every other model class
+                            //    fine. Divert the one request, keep the pin — otherwise
+                            //    a one-line title call re-keys a 200k-token Opus
+                            //    conversation onto a cold account.
+                            //
+                            //  - OVER THE UTILIZATION THRESHOLD → SERVE THE PIN. That
+                            //    threshold is our own arithmetic over headers stale by
+                            //    minutes, and Anthropic keeps answering 200s for
+                            //    accounts it benches. Keeping the pin while still
+                            //    diverting the request — the earlier half-fix — bought
+                            //    nothing: the pin survived and the request paid the
+                            //    cold prefix anyway (measured live: a 44.4%
+                            //    account-switch rate on SUCCESSFUL serves, with zero
+                            //    pacing events and zero hard failures). This is the
+                            //    behaviour `select_revalidation`'s PIN-HONOR path
+                            //    already had, hoisted to where it is reachable; both
+                            //    log the identical line so they grep together.
+                            let account_alive = accounts
+                                .get(idx)
+                                .is_some_and(|a| Self::account_hard_ok(a, now_ms));
+                            let model_blocked = accounts.get(idx).is_some_and(|a| {
+                                Self::model_blocked(a, self.global_threshold, now, is_fable)
+                            });
+                            let paced_out = accounts
+                                .get(idx)
+                                .is_some_and(|a| Self::paced_out(a, &self.pacing, now_ms));
+                            // Reached only when `account_alive` holds, so any live hold
+                            // left here is by construction a short one — named anyway so
+                            // the branch does not depend on the ordering above.
+                            let held_briefly = accounts
+                                .get(idx)
+                                .is_some_and(|a| Self::hold_clears_while_warm(a, now_ms));
+                            if !account_alive {
+                                // Genuinely gone: fall through and durably re-key.
+                                None
+                            } else if held_briefly || model_blocked || paced_out {
+                                // Yield this ONE request to the fall-through pick; the
+                                // re-pin at the bottom re-inserts the OLD index and now
+                                // logs WHICH of the three per-request gates diverted it.
+                                keep_pin = Some(idx);
+                                divert_reason = Some(if held_briefly {
+                                    "short-hold"
+                                } else if model_blocked {
+                                    "model-class"
+                                } else {
+                                    "paced"
+                                });
+                                None
+                            } else {
+                                let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                                let util = accounts
+                                    .get(idx)
+                                    .map(|a| a.quota.max_utilization(now, is_fable))
+                                    .unwrap_or_default();
+                                if let Some(account) = accounts.get_mut(idx) {
+                                    account.last_selected_seq = tick;
+                                    tracing::info!(
+                                        account = %account.name,
+                                        utilization = util,
+                                        is_fable,
+                                        "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                                    );
+                                }
+                                // `target == idx`, so the commit section below is a
+                                // plain pin refresh: OLD index, fresh `now_ms`.
+                                Some((idx, None))
+                            }
                         } else {
-                            // Default: honour the pin. When `count_x < 2` (a LONE
-                            // session) `target` stays `idx` and nothing below runs, so
-                            // this path is byte-identical to the pre-migration
-                            // behaviour — a lone session's warm cache is never moved.
+                            // Default: honour the pin. With migration disabled (the
+                            // default), or when `count_x < 2` (a LONE session),
+                            // `target` stays `idx` and nothing below runs, so this
+                            // path is byte-identical to the pre-migration behaviour —
+                            // a warm session's cache is never moved.
                             let mut target = idx;
                             let mut migrate_names: Option<(String, String)> = None;
-                            if count_x >= 2 {
+                            if migration_ok {
                                 // Least-loaded eligible target, ordered by
                                 // (pinned-session-count asc, in_flight asc,
                                 // last_selected_seq asc / LRU). A candidate qualifies
@@ -259,22 +448,469 @@ impl Manager {
         // migration). Skipped entirely when affinity is off, so the map stays
         // empty on the disabled path.
         if let (Some(key), Some(idx)) = (affinity, best) {
-            let mut pins = self.affinity.lock().expect("affinity lock poisoned");
-            pins.insert(key, (idx, now_ms));
-            // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
-            // the single oldest-last-touch entry (not the one we just inserted). Stable
-            // pins survive reconnects, so this size cap — not a disconnect hook — is
-            // what keeps a long-lived proxy from growing the map without limit.
-            const AFFINITY_CAP: usize = 1024;
-            if pins.len() > AFFINITY_CAP {
-                if let Some((&oldest, _)) = pins.iter().min_by_key(|(_, &(_, touch))| touch) {
-                    if oldest != key {
-                        pins.remove(&oldest);
+            // A per-REQUEST-gated pin (paced, model-class blocked, or transiently in
+            // `tried`) diverted THIS request only: re-insert the OLD index, not the
+            // account we are about to serve. The insert still has to happen — this
+            // `now_ms` is one of only two writers of the last-touch stamp that the
+            // AFFINITY_CAP eviction below sorts on, so skipping it would make a
+            // heavily-diverted session the eviction victim.
+            let pin_idx = keep_pin.unwrap_or(idx);
+            let moved_off = {
+                let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                let previous = pins.get(&key).map(|&(i, _)| i);
+                pins.insert(key, (pin_idx, now_ms));
+                // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
+                // the single oldest-last-touch entry (not the one we just inserted). Stable
+                // pins survive reconnects, so this size cap — not a disconnect hook — is
+                // what keeps a long-lived proxy from growing the map without limit.
+                const AFFINITY_CAP: usize = 1024;
+                if pins.len() > AFFINITY_CAP {
+                    if let Some((&oldest, _)) = pins.iter().min_by_key(|(_, &(_, touch))| touch) {
+                        if oldest != key {
+                            pins.remove(&oldest);
+                        }
                     }
                 }
+                // Only a real change is worth a line: `None` on an initial pin, and on
+                // a soft divert (where `pin_idx` is the unchanged old index).
+                previous.filter(|&p| p != pin_idx)
+            };
+            // The only durable re-key that happens here, and until now it logged
+            // nothing — which is why a 39.4% live account-switch rate went unnoticed.
+            // Reaching this line now means the pin failed an ACCOUNT-level HARD gate,
+            // so the line doubles as the audit trail for the invariant.
+            // The accounts lock is taken ONLY after the affinity lock has dropped
+            // above; the two are never held simultaneously.
+            if let Some(previous) = moved_off {
+                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let old_name = accounts.get(previous).map_or("?", |a| a.name.as_str());
+                let new_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
+                tracing::info!(
+                    "affinity: re-pin session {} off {} -> {} (pin failed an ACCOUNT HARD gate)",
+                    short_session_id(key),
+                    old_name,
+                    new_name
+                );
+            }
+            // The SOFT counterpart, and until now it emitted nothing at all: the pin
+            // survived, a DIFFERENT account served, and no line said so — which is why
+            // off-pin serves were unattributable in the live logs. Normally exclusive
+            // with `moved_off` (a divert re-inserts the OLD index, so `previous ==
+            // pin_idx` and `moved_off` is `None`); a concurrent select that re-pinned
+            // this session between the two reads can make both fire, which is two
+            // honest lines about one request, not a defect. The accounts lock is taken
+            // only after the affinity lock dropped above — never nested.
+            if let Some(reason) = divert_reason {
+                let accounts = self.accounts.read().expect("accounts lock poisoned");
+                let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
+                let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+                tracing::info!(
+                    "affinity: divert session {} pin {} -> serving {} (reason={}, pin kept)",
+                    short_session_id(key),
+                    pin_name,
+                    serve_name,
+                    reason
+                );
             }
         }
         best
+    }
+
+    /// LAST-RESORT serve when normal [`Self::select`] found nothing (the whole
+    /// fleet reads over the SOFT switch threshold). Serves an account that Anthropic
+    /// still allows, ignoring the soft utilization/pacing gates but honoring the
+    /// HARD blocks:
+    ///   - `disabled` / [`AccountStatus::Error`] → skip;
+    ///   - ANY live rate-limit hold (`rate_limited_until_ms` in the future) → skip.
+    ///     A SERVE decision honours the whole hold; only the PIN decision softens the
+    ///     short ones (see [`Self::hard_ok`] and [`CACHE_WARM_HOLD_SECS`]);
+    ///   - `quota.status == Some("rejected")` → skip (genuinely blocked; would 429);
+    ///   - a Fable request whose model-scoped weekly (`7d_oi`) is a hard reject → skip
+    ///     (that same account still serves every non-Fable model).
+    ///
+    /// TWO paths, mirroring [`Self::select`]'s never-nested lock discipline (read the
+    /// pin under the affinity lock, DROP it before taking the accounts lock):
+    ///  - **(A) PIN-HONOR** (cache-warm): when `affinity` is `Some(key)` and the
+    ///    session's pinned account is not in `tried` and passes the HARD gates, serve
+    ///    THAT pin — even over the soft threshold — to keep the operator's prompt
+    ///    cache warm. NO revalidation throttle here (the global egress throttle
+    ///    already paces); the pin is left as-is. [`Self::select`] now runs this same
+    ///    serve-the-pin rule in its own affinity fast-path (identical log line), so a
+    ///    servable pin is honoured there and this path is the belt-and-braces copy for
+    ///    any caller that reaches revalidation directly.
+    ///  - **(B) FALLBACK** (no pin, or the pin is rejected/held/tried/model-blocked):
+    ///    the least-utilized surviving account wins (lowest
+    ///    [`crate::quota::Quota::max_utilization`]; ties: LRU `last_selected_seq`).
+    ///    The anti-storm throttle applies HERE ONLY — at most one NEW-account
+    ///    revalidation per [`REVALIDATION_MIN_SPACING_MS`]; inside that window return
+    ///    `None` (the caller emits the honest 429). The window is spent only once a
+    ///    servable candidate exists. On success the session is RE-PINNED to the
+    ///    chosen account, mirroring `select()`'s re-pin — EXCEPT when the pin was
+    ///    passed over merely because it cannot serve THIS request: its MODEL CLASS
+    ///    ([`Self::model_blocked`]) or a hold that clears while its cache is still
+    ///    warm ([`Self::hold_clears_while_warm`]). Both are per-request facts, so
+    ///    they re-write the OLD index instead (`keep_pin`, exactly as `select()`
+    ///    does).
+    ///
+    /// The winner's `last_selected_seq` is stamped and ONE `tracing::info!` names the
+    /// path (pin-honor vs fallback), the account, and its utilization.
+    pub fn select_revalidation(
+        &self,
+        tried: &HashSet<usize>,
+        now: OffsetDateTime,
+        model: Option<&str>,
+        affinity: Option<u64>,
+    ) -> Option<usize> {
+        // Anti-storm spacing on the FALLBACK path only: the upstream 429→hold and the
+        // global egress throttle are the real backstops; this just stops a
+        // synchronized burst from slamming one over-threshold account when the fleet
+        // saturates. The pin-honor path is never throttled here.
+        const REVALIDATION_MIN_SPACING_MS: i64 = 2000;
+
+        let now_ms = odt_to_ms(now);
+        let is_fable = model.is_some_and(crate::model::is_fable_model);
+
+        // HARD-gate predicate shared by both paths: the blocks that even a
+        // revalidation serve must honor (soft utilization/pacing deliberately absent).
+        let hard_ok = |account: &AccountRuntime| -> bool {
+            Self::hard_ok(account, self.global_threshold, now, now_ms, is_fable)
+        };
+
+        // Mirrors `select()`'s `keep_pin`: set to the OLD pin index when the pin
+        // cannot serve THIS request but the ACCOUNT is alive, so the fallback below
+        // serves elsewhere while re-writing the OLD index. Without it a Fable request
+        // that reaches this path re-keys the session and the next Opus turn pays a
+        // cold prefix — the same defect this file fixed in `select()`, one path over.
+        let mut keep_pin: Option<usize> = None;
+
+        // (A) PIN-HONOR — read the pin under the affinity lock, DROP it, then check
+        // the pin's HARD gates under the accounts lock (never nested). No throttle.
+        if let Some(key) = affinity {
+            let pinned = {
+                let pins = self.affinity.lock().expect("affinity lock poisoned");
+                pins.get(&key).map(|&(idx, _)| idx)
+            };
+            if let Some(idx) = pinned {
+                let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+                // `tried` gates SERVING and nothing else: the pin already failed THIS
+                // request upstream, so it cannot answer it. Whether the PIN MOVES is
+                // decided below, on ACCOUNT-level evidence alone — see the comment
+                // there.
+                if !tried.contains(&idx) && accounts.get(idx).is_some_and(&hard_ok) {
+                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                    let util = accounts
+                        .get(idx)
+                        .map(|a| a.quota.max_utilization(now, is_fable))
+                        .unwrap_or_default();
+                    if let Some(account) = accounts.get_mut(idx) {
+                        account.last_selected_seq = tick;
+                        tracing::info!(
+                            account = %account.name,
+                            utilization = util,
+                            is_fable,
+                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                        );
+                    }
+                    return Some(idx);
+                }
+                // The pin cannot serve THIS request → fall through to the fallback
+                // path (lock drops at the end of this scope, before the affinity
+                // lock below). Whether that fall-through also MOVES the pin depends
+                // on WHY: a model-class block leaves the account alive for every
+                // other class, a short hold leaves it alive for every LATER request,
+                // and membership in `tried` says only that ONE request failed on it
+                // — none of the three is evidence the account is gone, so in all of
+                // them the pin stays. Only an ACCOUNT-level HARD block is a durable
+                // re-key.
+                //
+                // This test used to sit INSIDE `if !tried.contains(&idx)`, so a pin
+                // that merely failed this one request left `keep_pin` at `None` and
+                // the fallback's `pins.insert` re-keyed the session for good — a
+                // transient blip throwing away a warm prompt cache. `select()` takes
+                // the opposite decision on the identical fact and documents why
+                // (see its affinity fast-path); the two now agree.
+                if accounts
+                    .get(idx)
+                    .is_some_and(|a| Self::account_hard_ok(a, now_ms))
+                {
+                    keep_pin = Some(idx);
+                }
+            }
+        }
+
+        // (B) FALLBACK — least-utilized surviving account, throttled, then re-pinned.
+        let idx = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+
+            let mut best: Option<usize> = None;
+            // (util as ordered bits, last_selected_seq) — utilizations are finite and
+            // non-negative here (NaN/inf headers filtered at parse), so the raw bit
+            // pattern orders correctly for ascending "least utilized first".
+            let mut best_key: Option<(u64, u64)> = None;
+            for (i, account) in accounts.iter().enumerate() {
+                if tried.contains(&i) || !hard_ok(account) {
+                    continue;
+                }
+                let util = account.quota.max_utilization(now, is_fable);
+                let key = (util.to_bits(), account.last_selected_seq);
+                if best_key.is_none_or(|b| key < b) {
+                    best = Some(i);
+                    best_key = Some(key);
+                }
+            }
+
+            let idx = best?;
+
+            // A servable candidate exists — spend the anti-storm window now (after
+            // selection, so a fleet with nothing to serve never burns the valve).
+            let next_at = self.next_revalidation_at_ms.load(Ordering::Relaxed);
+            if now_ms < next_at {
+                return None;
+            }
+            self.next_revalidation_at_ms
+                .store(now_ms + REVALIDATION_MIN_SPACING_MS, Ordering::Relaxed);
+
+            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+            let util = accounts
+                .get(idx)
+                .map(|a| a.quota.max_utilization(now, is_fable))
+                .unwrap_or_default();
+            if let Some(account) = accounts.get_mut(idx) {
+                account.last_selected_seq = tick;
+                tracing::info!(
+                    account = %account.name,
+                    utilization = util,
+                    is_fable,
+                    "revalidation-serve (fallback): whole fleet over soft threshold — serving least-utilized allowed account"
+                );
+            }
+            idx
+        };
+
+        // Re-pin the session (accounts lock already dropped — never nest the two).
+        // Mirrors `select()`'s re-pin, `keep_pin` included: a model-class divert
+        // re-writes the OLD index with a fresh `now_ms`, so the session comes home on
+        // its next request of another class. No size-cap eviction here because a
+        // revalidation serve only ever touches an EXISTING session's pin.
+        if let Some(key) = affinity {
+            let pin_idx = keep_pin.unwrap_or(idx);
+            let previous = {
+                let mut pins = self.affinity.lock().expect("affinity lock poisoned");
+                let previous = pins.get(&key).map(|&(i, _)| i);
+                pins.insert(key, (pin_idx, now_ms));
+                previous
+            };
+            // Until now this arm emitted nothing, so a request served off-pin by the
+            // fallback was unattributable: the logs showed a serve on an account the
+            // session was not pinned to and no line explaining it. One greppable line
+            // carrying the same `reason=` field as `select()`'s divert log, so all
+            // four reasons grep together. It says KEPT or RE-KEYED rather than
+            // assuming a divert, because this arm does both: `keep_pin` set means the
+            // pin stayed and another account served; `keep_pin` unset means the
+            // fallback account became the new pin. The accounts lock is taken only
+            // after the affinity lock has dropped above — never simultaneously.
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let pin_name = accounts.get(pin_idx).map_or("?", |a| a.name.as_str());
+            let serve_name = accounts.get(idx).map_or("?", |a| a.name.as_str());
+            tracing::info!(
+                "affinity: revalidation session {} pin {} -> serving {} (reason=revalidation-fallback, pin {})",
+                short_session_id(key),
+                pin_name,
+                serve_name,
+                if previous.is_some_and(|p| p != pin_idx) {
+                    "re-keyed"
+                } else {
+                    "kept"
+                }
+            );
+        }
+        Some(idx)
+    }
+
+    /// Milliseconds still to run on a LIVE rate-limit hold, or `None` when the
+    /// account is not held right now — either no hold is armed, or its deadline has
+    /// already passed (a past hold reads as expired live, no mutation needed).
+    ///
+    /// The single place `rate_limited_until_ms` is turned into a duration, so the
+    /// three hold questions — held at all? clears warm? outlives the cache? — can
+    /// never drift apart. Pure and lock-free.
+    pub(super) fn hold_remaining_ms(account: &AccountRuntime, now_ms: i64) -> Option<i64> {
+        account
+            .rate_limited_until_ms
+            .map(|until| until - now_ms)
+            .filter(|&remaining_ms| remaining_ms > 0)
+    }
+
+    /// Whether account `idx` has NO live rate-limit hold at `now_ms` — either none
+    /// was ever armed, or the one that was has already run out.
+    ///
+    /// The locking wrapper around [`Self::hold_remaining_ms`] for callers OUTSIDE
+    /// the manager (the proxy's rotation loop), so `rate_limited_until_ms` stays
+    /// private and the "is it still held?" question keeps exactly one answer.
+    ///
+    /// An index that names no account answers `false` (treated as still held) —
+    /// the safe direction, since the only caller uses a `true` to re-admit an
+    /// account into a request's rotation.
+    pub fn hold_expired(&self, idx: usize, now_ms: i64) -> bool {
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        accounts
+            .get(idx)
+            .is_some_and(|account| Self::hold_remaining_ms(account, now_ms).is_none())
+    }
+
+    /// Whether a live hold is still running when this account's prompt cache dies
+    /// ([`CACHE_WARM_HOLD_SECS`] or more remaining) — the only hold long enough to
+    /// be worth re-keying a session for, and so the only one
+    /// [`Self::account_hard_ok`] counts as account death.
+    ///
+    /// The boundary is `>=`: a hold that clears at exactly the cache TTL is treated
+    /// as LONG, because the prefix is gone at the same instant the account frees.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hold_outlives_cache(account: &AccountRuntime, now_ms: i64) -> bool {
+        Self::hold_remaining_ms(account, now_ms)
+            .is_some_and(|remaining_ms| remaining_ms >= CACHE_WARM_HOLD_SECS * 1000)
+    }
+
+    /// Whether a live hold clears while this account's prompt cache is still warm
+    /// (under [`CACHE_WARM_HOLD_SECS`] remaining). The exact complement of
+    /// [`Self::hold_outlives_cache`] over live holds, and the SOFT case: this
+    /// account cannot answer THIS request, but it is a timer and not a death, so
+    /// divert the one request and leave the pin where it is.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hold_clears_while_warm(account: &AccountRuntime, now_ms: i64) -> bool {
+        Self::hold_remaining_ms(account, now_ms)
+            .is_some_and(|remaining_ms| remaining_ms < CACHE_WARM_HOLD_SECS * 1000)
+    }
+
+    /// The TERMINAL account-level gates — the blocks that are a fact about the
+    /// CREDENTIAL rather than about one request or one window, and that never
+    /// self-free (so they carry no clear-instant): `disabled`,
+    /// [`AccountStatus::Error`], and `quota.status == Some("rejected")` —
+    /// Anthropic's own verdict, which unlike a window has no reset to wait on.
+    /// `None` when no terminal gate is active.
+    ///
+    /// **This is the one list both [`Self::account_hard_ok`] and
+    /// [`Self::account_gate`] read**, and it exists because they used to keep two
+    /// hand-maintained copies of it that drifted: `account_hard_ok` blocked on
+    /// `rejected` while `account_gate` had no `Rejected` arm at all, so an account
+    /// Anthropic had explicitly rejected was held out of rotation while rendering
+    /// `OK` in the TUI and feeding [`Manager::retry_after_hint`] as though it were
+    /// healthy. A terminal gate added HERE reaches both callers at once; one added
+    /// to either caller alone is exactly the bug this prevents.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn account_terminal_gate(account: &AccountRuntime) -> Option<GateReason> {
+        if account.disabled {
+            return Some(GateReason::Disabled);
+        }
+        if account.status == AccountStatus::Error {
+            return Some(GateReason::Login);
+        }
+        if account.quota.status.as_deref() == Some("rejected") {
+            return Some(GateReason::Rejected);
+        }
+        None
+    }
+
+    /// The ACCOUNT-level HARD gates alone — the blocks that mean *this account is
+    /// gone for every model class*, with every SOFT gate deliberately absent:
+    ///   - every terminal gate ([`Self::account_terminal_gate`]: `disabled`,
+    ///     [`AccountStatus::Error`], `rejected`) → hard fail;
+    ///   - a rate-limit hold that OUTLIVES the prompt cache
+    ///     ([`Self::hold_outlives_cache`]) — a SHORTER hold is a timer, not a death,
+    ///     and deliberately passes here.
+    ///
+    /// **This — not [`Self::hard_ok`] — is the SOLE authority on whether a session's
+    /// pin may be re-keyed**, because a re-key re-creates the conversation prefix on
+    /// a cold account. Everything absent from it is a fact about ONE REQUEST rather
+    /// than about the account, and a per-request fact may divert a request but must
+    /// never move a pin. That covers the soft utilization threshold
+    /// ([`crate::quota::Quota::is_near`]), pacing, an entry in `tried`, model-scoped
+    /// exhaustion ([`Self::model_blocked`]), and — the newest — a rate-limit hold
+    /// that clears while the cache is still warm ([`Self::hold_clears_while_warm`]).
+    ///
+    /// The hold split is why this predicate is NOT the right one for a SERVE
+    /// decision: a short-held account passes here (its pin survives) while it still
+    /// cannot answer a request until the timer runs out. [`Self::hard_ok`] adds that
+    /// back.
+    ///
+    /// Known staleness caveat: `quota.status` is written ONLY from live response
+    /// headers ([`crate::quota`]), never by the background probe, so for a benched
+    /// account it is stale-or-`None` and `None` passes here. That is acceptable
+    /// precisely because a genuine rejection answers the next attempt with a 429,
+    /// which arms a real hold — upstream stays the oracle instead of our own
+    /// possibly-stale arithmetic.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn account_hard_ok(account: &AccountRuntime, now_ms: i64) -> bool {
+        if Self::account_terminal_gate(account).is_some() {
+            return false;
+        }
+        if Self::hold_outlives_cache(account, now_ms) {
+            return false;
+        }
+        true
+    }
+
+    /// Whether this account cannot serve **this request's model class** while still
+    /// serving every other one: a Fable request against an exhausted model-scoped
+    /// weekly (`7d_oi`) bucket.
+    ///
+    /// Model-scoped exhaustion is a property of the REQUEST CLASS, never of the
+    /// account — an account out of its Fable weekly answers Opus perfectly — so it is
+    /// deliberately NOT part of [`Self::account_hard_ok`]. At a pin it belongs with
+    /// the soft-divert family: divert THAT ONE request and keep the pin, so the
+    /// session's next Opus turn still lands on the account holding its warm prefix.
+    /// It remains a hard skip for every SERVE decision ([`Self::hard_ok`],
+    /// [`Self::eligible`]) — serving a Fable request from an exhausted bucket only
+    /// buys a 429.
+    ///
+    /// The live shape that makes the distinction load-bearing: every Claude Code
+    /// session mixes classes — Opus for the conversation plus a one-line Fable call
+    /// for titles and summaries — while a real fleet reads 95-99% on the Fable weekly
+    /// across nearly every account. Counted as account death, one cheap title request
+    /// re-keyed the session and dragged a 200k-token conversation onto a cold
+    /// account.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn model_blocked(
+        account: &AccountRuntime,
+        global_threshold: f64,
+        now: OffsetDateTime,
+        is_fable: bool,
+    ) -> bool {
+        let threshold = account.switch_threshold.unwrap_or(global_threshold);
+        is_fable && account.quota.model_weekly_exhausted(threshold, now)
+    }
+
+    /// Can this account SERVE this request at all, soft gates aside: the
+    /// account-level blocks ([`Self::account_hard_ok`]), **any** live rate-limit
+    /// hold, and this request's own model-class block ([`Self::model_blocked`]).
+    ///
+    /// The short-hold term is the one that is not implied by `account_hard_ok`, and
+    /// it is load-bearing in exactly one direction. A hold under
+    /// [`CACHE_WARM_HOLD_SECS`] deliberately passes `account_hard_ok` so the session
+    /// keeps its pin — but the account is still parked, so serving it only buys
+    /// another 429. Every SERVE decision therefore re-adds the full hold here; only
+    /// the PIN decision gets the softened one.
+    ///
+    /// The right predicate for a serve decision (may this account answer *this*
+    /// request?) and the wrong one for a pin decision (is this session's account
+    /// gone?) — see [`Self::account_hard_ok`], which owns the latter.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn hard_ok(
+        account: &AccountRuntime,
+        global_threshold: f64,
+        now: OffsetDateTime,
+        now_ms: i64,
+        is_fable: bool,
+    ) -> bool {
+        Self::account_hard_ok(account, now_ms)
+            && !Self::hold_clears_while_warm(account, now_ms)
+            && !Self::model_blocked(account, global_threshold, now, is_fable)
     }
 
     pub(super) fn eligible(
@@ -302,37 +938,64 @@ impl Manager {
         }
         // Per-model routing: only a Fable request gates on the model-scoped weekly
         // (`7d_oi`) bucket — every non-Fable model still serves from this account.
-        if is_fable && account.quota.model_weekly_exhausted(threshold, now) {
+        // Kept here on purpose: for an UNPINNED pick a Fable-exhausted account
+        // genuinely cannot serve this request, so it must be skipped. What changed
+        // is only that it is no longer grounds to MOVE AN EXISTING PIN — that
+        // decision reads [`Self::account_hard_ok`], which excludes this gate.
+        if Self::model_blocked(account, global_threshold, now, is_fable) {
             return false;
         }
         // SOFT pacing gate, evaluated LAST so it only ever narrows an already-healthy
         // account. When `respect_pacing` is false (the fallback pass) or pacing is
         // unconfigured, this is inert — so a default-OFF build is byte-identical here
         // and the fallback pass can always still find a servable account.
-        if respect_pacing && pacing.is_active() {
-            if let Some(cap) = pacing.effective_max_in_flight() {
-                if account.in_flight >= cap {
-                    return false;
-                }
-            }
-            if let Some(gap) = pacing.min_spacing_ms {
-                if now_ms.saturating_sub(account.last_served_ms) < gap as i64 {
-                    return false;
-                }
-            }
+        if respect_pacing && Self::paced_out(account, pacing, now_ms) {
+            return false;
         }
         true
     }
 
+    /// Whether the SOFT pacing gate ALONE holds this account out: it is at the
+    /// per-account in-flight cap, or inside the min-spacing window since its last
+    /// serve. Inert (always `false`) when pacing is unconfigured, which is how it
+    /// ships.
+    ///
+    /// Split out of [`Self::eligible`] because [`Self::select`] needs to tell the two
+    /// soft gates apart. They are not the same kind of signal:
+    ///   - the **utilization threshold** is OUR arithmetic over headers that go stale
+    ///     by minutes, and it routinely benches an account Anthropic is still
+    ///     answering 200s for — so it may not bench a warm pin;
+    ///   - **pacing** is a fact we measure exactly and continuously about our OWN
+    ///     concurrency, and spreading a session's burst is the entire reason the cap
+    ///     exists. It stays a per-REQUEST yield: divert this one, keep the pin.
+    pub(super) fn paced_out(account: &AccountRuntime, pacing: &PacingConfig, now_ms: i64) -> bool {
+        if !pacing.is_active() {
+            return false;
+        }
+        if let Some(cap) = pacing.effective_max_in_flight() {
+            if account.in_flight >= cap {
+                return true;
+            }
+        }
+        if let Some(gap) = pacing.min_spacing_ms {
+            if now_ms.saturating_sub(account.last_served_ms) < gap as i64 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Why this account is out of rotation and when it clears — the display and
     /// hint-side companion to [`Self::eligible`], mirroring its HARD gates exactly
-    /// (disabled/error → hold → 5-hour → weekly → Fable weekly) while deliberately
+    /// (disabled/error/rejected → hold → 5-hour → weekly → Fable weekly) while deliberately
     /// omitting soft pacing, which only ever narrows an already-healthy account and
     /// never holds one out. Pure and lock-free so both [`Manager::snapshot`] and
     /// [`Manager::retry_after_hint`] can call it as the single source of truth.
     ///
-    /// The terminal gates (`Disabled`, `Login`) never self-free, so their instant
-    /// is `None`. Otherwise every ACTIVE gate contributes the instant it clears:
+    /// The terminal gates ([`Self::account_terminal_gate`]: `Disabled`, `Login`,
+    /// `Rejected`) never self-free, so their instant is `None` — a rejected account
+    /// therefore stops feeding [`Manager::retry_after_hint`] a clear-instant it was
+    /// never going to honour. Otherwise every ACTIVE gate contributes the instant it clears:
     /// a future hold its deadline, and a window at/over `threshold` its
     /// [`crate::quota::QuotaWindow::live_reset`]. An account frees only once ALL of
     /// its gates clear, so the binding gate is the LATEST-clearing one and
@@ -348,11 +1011,10 @@ impl Manager {
         is_fable: bool,
     ) -> (GateReason, Option<OffsetDateTime>) {
         // Terminal states that never self-free — reported with no clear-instant.
-        if account.disabled {
-            return (GateReason::Disabled, None);
-        }
-        if account.status == AccountStatus::Error {
-            return (GateReason::Login, None);
+        // Shared with `account_hard_ok` so the two can no longer disagree about
+        // which blocks are account-level (see `account_terminal_gate`).
+        if let Some(reason) = Self::account_terminal_gate(account) {
+            return (reason, None);
         }
 
         // Every ACTIVE hard gate paired with the instant it clears (`None` = active
