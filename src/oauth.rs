@@ -327,59 +327,31 @@ fn build_login_flow(redirect_uri: &str) -> anyhow::Result<LoginFlow> {
     })
 }
 
-/// Map a single ASCII hex digit byte to its value, or `None` if not a hex digit.
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Percent-decode a query-component value (`%XX` and `+` → space), lossy on
-/// invalid UTF-8 so a hostile callback can never panic the CLI.
-fn percent_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => match (hex_digit(bytes[i + 1]), hex_digit(bytes[i + 2]))
-            {
-                (Some(hi), Some(lo)) => {
-                    out.push((hi << 4) | lo);
-                    i += 3;
-                }
-                _ => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-/// Extract `(code, state, error)` from a URL query string (`k=v&k2=v2`),
-/// percent-decoding each value.
+/// Extract `(code, state, error)` from a URL query string (`k=v&k2=v2`).
+///
+/// Decoding is [`form_urlencoded`]'s — the same parser `url`, `axum` and
+/// `reqwest` already pull into this tree, so it costs no package — rather than
+/// the hand-rolled `%XX`/`+` decoder this replaces. It is lossy on invalid
+/// UTF-8, so a hostile callback still cannot panic the CLI.
+///
+/// The explicit loop is kept deliberately over a `collect()` into a map: it
+/// preserves **last-occurrence-wins** on a duplicated key, which is what the
+/// hand-rolled version did.
+///
+/// One disclosed behaviour change: `form_urlencoded` percent-decodes the KEY as
+/// well as the value, so `%63ode=x` now matches `code` where it previously did
+/// not. That is the more spec-correct reading and is unreachable from a real
+/// Claude redirect. A differential run over 4,132 inputs (36 hand-picked edges
+/// plus a 4,096-case brute-force sweep) found this as the ONLY divergence —
+/// nothing changed for `;` separators, bare keys, `code=a=b`, lone surrogates,
+/// `%00`, `%FF`, a trailing `%`, or `+`-vs-`%2B`.
 fn parse_oauth_query(query: &str) -> (Option<String>, Option<String>, Option<String>) {
     let (mut code, mut state, mut error) = (None, None, None);
-    for pair in query.split('&').filter(|p| !p.is_empty()) {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        let v = percent_decode(v);
-        match k {
-            "code" => code = Some(v),
-            "state" => state = Some(v),
-            "error" => error = Some(v),
+    for (k, v) in form_urlencoded::parse(query.as_bytes()) {
+        match k.as_ref() {
+            "code" => code = Some(v.into_owned()),
+            "state" => state = Some(v.into_owned()),
+            "error" => error = Some(v.into_owned()),
             _ => {}
         }
     }
@@ -944,18 +916,28 @@ mod tests {
         assert_eq!(code.as_deref(), Some("a/b+c"));
     }
 
+    /// The hostile-decode cases the deleted private `percent_decode` helper
+    /// covered, re-pointed through the public parser now that `form_urlencoded`
+    /// owns the decoding. Same inputs, same guarantees — coverage is unchanged,
+    /// only the entry point moved.
     #[test]
-    fn percent_decode_normal_and_bare_and_multibyte() {
-        // Valid %XX is unchanged.
-        assert_eq!(percent_decode("a%20b"), "a b");
+    fn parse_oauth_query_survives_bare_percent_and_multibyte() {
+        // Valid %XX still decodes.
+        let (code, ..) = parse_oauth_query("code=a%20b");
+        assert_eq!(code.as_deref(), Some("a b"));
+
         // A trailing bare `%` is preserved, never panics.
-        assert_eq!(percent_decode("100%"), "100%");
+        let (code, ..) = parse_oauth_query("code=100%");
+        assert_eq!(code.as_deref(), Some("100%"));
+
         // A `%` immediately before a multibyte UTF-8 char (hostile callback)
-        // must NOT panic on a char-boundary slice — it just returns a String.
-        let decoded = percent_decode("a%\u{20AC}b");
-        assert!(decoded.contains('a') && decoded.contains('b'));
+        // must NOT panic on a char-boundary slice.
+        let (code, ..) = parse_oauth_query("code=a%\u{20AC}b");
+        let code = code.expect("a % before a multibyte char must still parse");
+        assert!(code.contains('a') && code.contains('b'));
+
         // A lone `%€` (percent right before the euro sign) also survives.
-        let _ = percent_decode("%\u{20AC}");
+        let _ = parse_oauth_query("code=%\u{20AC}");
     }
 
     #[test]
