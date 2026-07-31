@@ -107,8 +107,17 @@ impl HeaderView for reqwest::header::HeaderMap {
 impl Quota {
     /// Merge in whatever rate-limit headers are present on a response, leaving
     /// windows that were not reported this time untouched.
-    pub fn update_from_headers(&mut self, headers: &impl HeaderView) {
+    ///
+    /// Returns whether this response actually reported the **5-hour** window. That
+    /// is the one dimension a caller needs to distinguish from silence: a response
+    /// carrying the header is first-hand evidence about the account's session
+    /// window, while a response without it (an error page, a non-Anthropic
+    /// upstream) says nothing at all — and the two must never be confused for the
+    /// keep-warm gate. See [`crate::manager::AccountRuntime::quota_known`].
+    #[must_use]
+    pub fn update_from_headers(&mut self, headers: &impl HeaderView) -> bool {
         let now = OffsetDateTime::now_utc();
+        let mut read_five_hour = false;
         if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-5h-utilization")
             .filter(|v| v.is_finite())
         {
@@ -123,6 +132,7 @@ impl Quota {
                 utilization: util,
                 reset,
             });
+            read_five_hour = true;
         }
         if let Some(util) = get_parsed::<f64>(headers, "anthropic-ratelimit-unified-7d-utilization")
             .filter(|v| v.is_finite())
@@ -177,6 +187,7 @@ impl Quota {
         {
             self.standard_reset = Some(reset);
         }
+        read_five_hour
     }
 
     /// Is this account at/over `threshold` on any gating dimension, evaluated
@@ -367,7 +378,10 @@ mod tests {
             ("anthropic-ratelimit-unified-status", "allowed_warning"),
         ]);
         let mut quota = Quota::default();
-        quota.update_from_headers(&headers);
+        assert!(
+            quota.update_from_headers(&headers),
+            "a response carrying the unified 5h header reports the window"
+        );
 
         let five = quota.five_hour.unwrap();
         assert_eq!(five.utilization, 0.42);
@@ -394,7 +408,10 @@ mod tests {
                 "{bad:?} must parse to None"
             );
             let mut quota = Quota::default();
-            quota.update_from_headers(&headers);
+            assert!(
+                !quota.update_from_headers(&headers),
+                "{bad:?} is not a readable window, so it must not report one either"
+            );
             assert!(
                 quota.five_hour.is_none(),
                 "{bad:?} utilization must not create a window"
@@ -471,7 +488,7 @@ mod tests {
         let mut quota = Quota::default();
         // Utilization with NO reset header.
         let headers = TestHeaders::new(&[("anthropic-ratelimit-unified-5h-utilization", "0.95")]);
-        quota.update_from_headers(&headers);
+        assert!(quota.update_from_headers(&headers));
 
         let now = OffsetDateTime::now_utc();
         // A reset was synthesized in the future, so it gates right now …

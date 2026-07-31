@@ -8,10 +8,36 @@ impl Manager {
     /// it deliberately does NOT touch the request counter — that would double-count
     /// a client request that was retried across accounts (bug #4). Request counting
     /// happens once, in [`Manager::record_served`].
+    ///
+    /// A response that CARRIED the unified 5h header also latches
+    /// [`AccountRuntime::quota_known`], on the same terms and for the same reason
+    /// [`Self::apply_usage`] does: those headers are a first-hand read of this
+    /// account's session window, so an account serving live traffic must not go on
+    /// reading as "we have never seen this account's quota" — it plainly is not
+    /// true, and keep-warm's gate is asking exactly that question. A response
+    /// WITHOUT the header latches nothing: an error page or a non-Anthropic
+    /// upstream tells us nothing about the window, and silence must never be
+    /// mistaken for evidence.
+    ///
+    /// `probe_status` is deliberately still untouched here — that field is about
+    /// probe HEALTH, which a served response says nothing about.
     pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
-            account.quota.update_from_headers(headers);
+        let newly_known = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            match accounts.get_mut(idx) {
+                Some(account) => {
+                    let read_five_hour = account.quota.update_from_headers(headers);
+                    let flipped = read_five_hour && !account.quota_known;
+                    account.quota_known |= read_five_hour;
+                    flipped
+                }
+                None => false,
+            }
+        };
+        // Edge-triggered, with the accounts lock RELEASED — identical to
+        // `apply_usage`, whose comment explains both halves.
+        if newly_known {
+            self.warm_wake.notify_one();
         }
     }
 

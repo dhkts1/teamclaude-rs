@@ -56,6 +56,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         // their quota reads as READ too — otherwise every demo row would render as
         // a permanently un-warmable account.
         quota_known: true,
+        consecutive_probe_failures: 0,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
