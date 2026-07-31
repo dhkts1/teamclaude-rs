@@ -1232,6 +1232,33 @@ mod tests {
         config
     }
 
+    /// Build a config carrying an unmodelled top-level `quotaProbeSeconds` value.
+    /// `0` turns probing OFF, which is what makes the keep-warm boot gate fall
+    /// back to its pre-gate behaviour.
+    fn config_with_probe_seconds(accounts: Vec<Account>, probe_seconds: i64) -> Config {
+        let mut config = config_with(accounts);
+        config.extra.insert(
+            "quotaProbeSeconds".to_string(),
+            serde_json::Value::from(probe_seconds),
+        );
+        config
+    }
+
+    /// Mark every account as having been probed at least once.
+    ///
+    /// `warm_targets` skips a never-probed account while probing is enabled (a
+    /// blank quota is unknown, not known-cold), and `config_with` leaves
+    /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm
+    /// test below would be measuring the boot gate instead of the predicate it is
+    /// actually about. `update_quota` (which `set_5h`/`set_7d` drive) deliberately
+    /// does not touch `probe_status`; only a real probe does.
+    fn mark_all_probed(manager: &Manager) {
+        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        for account in accounts.iter_mut() {
+            account.probe_status = ProbeStatus::Ok;
+        }
+    }
+
     // ---- hard account lock (`lockAccount`; no failover) -----------------------
 
     fn lock_refresher() -> Arc<CountingRefresher> {
@@ -4384,6 +4411,7 @@ mod tests {
             ]),
             refresher,
         );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
         manager.set_disabled(1, true);
         manager.mark_error(2);
         manager.mark_rate_limited(3, 300); // → Throttled
@@ -4411,6 +4439,7 @@ mod tests {
             ]),
             refresher,
         );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
         set_5h(&manager, 0, "0.10", 3); // live: low util, reset 3h out → already warm
                                         // account 1 (cold): no 5h data at all
         set_5h(&manager, 2, "0.10", -1); // past: reset 1h ago → window elapsed
@@ -4434,6 +4463,7 @@ mod tests {
             config_with(vec![account("full", 0), account("idle", 0)]),
             refresher,
         );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
         set_7d(&manager, 0, "0.95"); // over the 0.90 threshold
 
         assert_eq!(
@@ -4464,6 +4494,7 @@ mod tests {
             refresher,
             warmer,
         );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
         set_5h(&manager, 1, "0.10", 3); // live window → already warm
         manager.set_disabled(2, true);
         manager.mark_error(3);
@@ -4514,7 +4545,8 @@ mod tests {
         });
         let manager =
             build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
-        // Before: no 5h window, so this account is a target.
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+                                   // Before: no 5h window, so this account is a target.
         assert_eq!(manager.warm_targets(), vec![0]);
 
         manager.warm_account(0).await;
@@ -4533,6 +4565,91 @@ mod tests {
         assert!(
             manager.warm_targets().is_empty(),
             "a freshly-warmed account is no longer a target"
+        );
+    }
+
+    /// THE boot gate. At startup every account's quota is blank (`from_config`
+    /// seeds `Quota::default()` and nothing restores it), so before the gate every
+    /// probeable account looked cold and the warm loop's immediate first tick
+    /// would have fired a real quota-spending request at all of them — including
+    /// accounts whose 5h window is genuinely live. A never-probed account's blank
+    /// quota is unknown, not known-cold, so with probing on there are no targets.
+    #[test]
+    fn warm_targets_is_empty_at_boot_while_probing_is_enabled() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            refresher,
+        );
+        // Boot state, untouched: probing on by default (75s), nothing probed yet.
+        assert!(manager.probe_interval_seconds() > 0);
+
+        assert!(
+            manager.warm_targets().is_empty(),
+            "a never-probed account's blank quota is unknown, not known-cold"
+        );
+    }
+
+    /// Once the probe has actually spoken, a genuinely cold or expired window IS
+    /// warmed again — the gate defers the first sweep, it does not disable
+    /// keep-warm. A probed account with a LIVE window stays skipped.
+    #[test]
+    fn warm_targets_resumes_once_the_probe_has_reported() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![
+                account("cold", 0),
+                account("live", 0),
+                account("dark", 0),
+            ]),
+            refresher,
+        );
+        // Only the first two have been probed; the third is still `Never`.
+        {
+            let mut accounts = manager.accounts.write().unwrap();
+            accounts[0].probe_status = ProbeStatus::Ok;
+            accounts[1].probe_status = ProbeStatus::Ok;
+        }
+        set_5h(&manager, 0, "0.10", -1); // probed, window expired → genuinely cold
+        set_5h(&manager, 1, "0.10", 3); // probed, window live → already warm
+
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "a probed account with an expired window is a target; a live one and an unprobed one are not"
+        );
+    }
+
+    /// The dark-feature guard. With `quotaProbeSeconds: 0` no probe task is ever
+    /// spawned, so `probe_status` stays `Never` forever. Gating on it
+    /// unconditionally would make keep-warm structurally unable to fire while
+    /// still reading as enabled — so with probing off, the gate does not apply.
+    #[test]
+    fn warm_targets_ignores_the_boot_gate_when_probing_is_disabled() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with_probe_seconds(vec![account("a", 0), account("b", 0)], 0),
+            refresher,
+        );
+        assert_eq!(manager.probe_interval_seconds(), 0);
+        // Nothing has been (or ever will be) probed.
+        assert!(manager
+            .accounts
+            .read()
+            .unwrap()
+            .iter()
+            .all(|a| a.probe_status == ProbeStatus::Never));
+
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0, 1],
+            "with the probe off there is nothing to wait for; keep-warm must not go dark"
         );
     }
 
