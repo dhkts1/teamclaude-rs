@@ -73,6 +73,7 @@ fn install_panic_hook() {
 }
 
 /// What a key event asks the loop to do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Action {
     None,
     Quit,
@@ -95,24 +96,65 @@ const NOTICE_SECONDS: u64 = 6;
 struct Notice {
     text: &'static str,
     expires_at: std::time::Instant,
+    /// The account the notice is ABOUT, by name — `None` when the keypress named
+    /// no account at all. Every notice describes one row, so it must not be read
+    /// against another: a warning raised for `alice` still on screen while `bob` is
+    /// selected reads as a warning about `bob`.
+    account: Option<String>,
 }
 
 impl Notice {
-    fn new(text: &'static str) -> Self {
+    fn new(text: &'static str, account: Option<String>) -> Self {
         Self {
             text,
             expires_at: std::time::Instant::now() + Duration::from_secs(NOTICE_SECONDS),
+            account,
         }
     }
 }
 
-/// The notice to paint this frame: the current one until it expires, then nothing.
-/// Pure so the expiry rule is testable without a terminal or a real clock.
-fn live_notice(notice: &Option<Notice>, now: std::time::Instant) -> Option<&str> {
+/// The notice to paint this frame: the current one while it is unexpired AND still
+/// about the row on screen, then nothing. Pure so both rules are testable without a
+/// terminal or a real clock.
+///
+/// `selected_account` is the name of the currently selected row (`None` when there
+/// is no such row, which is also what a `NoSuchAccount` notice carries — so those
+/// two agree rather than falling through).
+fn live_notice<'a>(
+    notice: &'a Option<Notice>,
+    now: std::time::Instant,
+    selected_account: Option<&str>,
+) -> Option<&'a str> {
     notice
         .as_ref()
         .filter(|n| now < n.expires_at)
+        .filter(|n| n.account.as_deref() == selected_account)
         .map(|n| n.text)
+}
+
+/// The selected row forced back inside a table of `count` rows — `0` when the table
+/// is empty.
+fn clamp_selected(selected: usize, count: usize) -> usize {
+    selected.min(count.saturating_sub(1))
+}
+
+/// The selection a key event leaves behind: clamped into the table FIRST, then
+/// moved. Every key event goes through this, which is the whole point — the
+/// ordering is the fix, so it lives in one pure function rather than in the shape
+/// of the event loop.
+///
+/// `Down` advances with a `saturating_add` and deliberately may overshoot; the next
+/// event pulls it back. Before, the 500ms repaint was the ONLY thing that clamped,
+/// so a `Down` immediately followed by `d`/`e` reached `set_disabled` with an index
+/// past the end of the table: nothing was benched, and the user got a "that account
+/// row no longer exists" banner about a row plainly on screen.
+fn next_selection(selected: usize, count: usize, action: Action) -> usize {
+    let selected = clamp_selected(selected, count);
+    match action {
+        Action::Up => selected.saturating_sub(1),
+        Action::Down => selected.saturating_add(1),
+        Action::None | Action::Quit | Action::Disable | Action::Enable => selected,
+    }
 }
 
 /// Run the dashboard until the user quits (`q` or `Ctrl-C`). Returns once the
@@ -131,13 +173,12 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
         tokio::select! {
             _ = ticker.tick() => {
                 let snapshot = manager.snapshot(OffsetDateTime::now_utc());
-                let count = snapshot.accounts.len();
-                if count == 0 {
-                    selected = 0;
-                } else if selected >= count {
-                    selected = count - 1;
-                }
-                let live = live_notice(&notice, std::time::Instant::now());
+                selected = clamp_selected(selected, snapshot.accounts.len());
+                let live = live_notice(
+                    &notice,
+                    std::time::Instant::now(),
+                    snapshot.accounts.get(selected).map(|a| a.name.as_str()),
+                );
                 // A single failed repaint must not crash the process.
                 if let Err(err) = terminal.draw(|frame| render(frame, &snapshot, selected, live)) {
                     tracing::warn!(error = %err, "tui repaint failed");
@@ -145,22 +186,34 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
             }
             maybe_event = events.next() => {
                 match maybe_event {
-                    Some(Ok(Event::Key(key))) => match key_action(&key) {
-                        Action::Quit => break,
-                        Action::Up => selected = selected.saturating_sub(1),
-                        Action::Down => selected = selected.saturating_add(1),
-                        // A persist that did not reach disk is surfaced HERE, not
-                        // only in the log the TUI has redirected away from the
-                        // screen — otherwise the row renders benched and the user
-                        // finds out at the next restart.
-                        Action::Disable => {
-                            notice = manager.set_disabled(selected, true).warning().map(Notice::new);
+                    Some(Ok(Event::Key(key))) => {
+                        let action = key_action(&key);
+                        // Clamp FIRST, move second — and both here, BEFORE the
+                        // arms below read `selected`. The 500ms repaint used to be
+                        // the only clamp, so a key acting on the selection could
+                        // read an index `Down` had already pushed past the end.
+                        selected = next_selection(selected, manager.account_count(), action);
+                        match action {
+                            Action::Quit => break,
+                            // Moving off a row abandons whatever was said about it.
+                            Action::Up | Action::Down => notice = None,
+                            // A persist that did not reach disk is surfaced HERE,
+                            // not only in the log the TUI has redirected away from
+                            // the screen — otherwise the row renders benched and
+                            // the user finds out at the next restart. The notice
+                            // carries the name of the row it is about, so it cannot
+                            // be read against a different one.
+                            Action::Disable | Action::Enable => {
+                                let disabled = action == Action::Disable;
+                                let account = manager.account_name(selected);
+                                notice = manager
+                                    .set_disabled(selected, disabled)
+                                    .warning(disabled)
+                                    .map(|text| Notice::new(text, account));
+                            }
+                            Action::None => {}
                         }
-                        Action::Enable => {
-                            notice = manager.set_disabled(selected, false).warning().map(Notice::new);
-                        }
-                        Action::None => {}
-                    },
+                    }
                     // Paste / resize / focus / mouse are non-fatal; a multi-char
                     // paste can never crash the loop.
                     Some(Ok(_)) => {}
@@ -333,9 +386,9 @@ fn render_fleet_banner(
             None => text.push_str(" · next free unknown"),
         }
     }
-    // Red + bold when the fleet is down (0 eligible); a calm green otherwise.
+    // The alarm style when the fleet is down (0 eligible); a calm green otherwise.
     let style = if status.eligible == 0 {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        alarm_style()
     } else {
         Style::default()
             .fg(Color::Green)
@@ -344,13 +397,19 @@ fn render_fleet_banner(
     frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
 }
 
-/// The transient notice row. Red + bold, same alarm styling the fleet banner uses
-/// when the fleet is down: every notice we raise means an action the user believes
-/// happened did not.
+/// The one style for "this needs you NOW", shared by the two rows that raise an
+/// alarm: the fleet banner with nothing in rotation, and any notice. Shared so the
+/// two cannot drift apart — a notice that stopped looking like the banner would
+/// read as ordinary chrome, which is exactly what it is not.
+fn alarm_style() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+
+/// The transient notice row. Painted in the alarm style, because every notice we
+/// raise means an action the user believes happened did not.
 fn render_notice(frame: &mut Frame, area: Rect, text: &str) {
-    let style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text.to_string(), style))),
+        Paragraph::new(Line::from(Span::styled(text.to_string(), alarm_style()))),
         area,
     );
 }
@@ -1583,7 +1642,7 @@ mod tests {
     fn render_shows_a_failed_persist_notice_without_hiding_the_fleet_banner() {
         let snapshot = util_snapshot(QuotaState::Normal);
         let warning = crate::manager::DisablePersist::NoEntry
-            .warning()
+            .warning(true)
             .expect("a NoEntry persist must warn");
 
         let with = {
@@ -1629,21 +1688,116 @@ mod tests {
     /// warning can never outlive the state it describes.
     #[test]
     fn a_notice_expires_and_stops_rendering() {
-        let notice = Some(Notice::new("NOT SAVED: test"));
+        let notice = Some(Notice::new("NOT SAVED: test", Some("alice".to_string())));
         let start = std::time::Instant::now();
 
-        assert_eq!(live_notice(&notice, start), Some("NOT SAVED: test"));
         assert_eq!(
-            live_notice(&notice, start + Duration::from_secs(NOTICE_SECONDS - 1)),
+            live_notice(&notice, start, Some("alice")),
+            Some("NOT SAVED: test")
+        );
+        assert_eq!(
+            live_notice(
+                &notice,
+                start + Duration::from_secs(NOTICE_SECONDS - 1),
+                Some("alice")
+            ),
             Some("NOT SAVED: test"),
             "the notice must survive long enough to be read"
         );
         assert_eq!(
-            live_notice(&notice, start + Duration::from_secs(NOTICE_SECONDS + 1)),
+            live_notice(
+                &notice,
+                start + Duration::from_secs(NOTICE_SECONDS + 1),
+                Some("alice")
+            ),
             None,
             "the notice must clear itself once it expires"
         );
-        assert_eq!(live_notice(&None, start), None);
+        assert_eq!(live_notice(&None, start, Some("alice")), None);
+    }
+
+    /// A notice describes ONE row, so it may only be painted while that row is the
+    /// one on screen. Unscoped, a warning raised for `alice` kept rendering after
+    /// the selection moved to `bob` — where it reads as a warning about `bob`, an
+    /// account nothing was ever attempted on.
+    #[test]
+    fn a_notice_is_scoped_to_the_account_it_was_raised_for() {
+        let notice = Some(Notice::new("NOT SAVED: test", Some("alice".to_string())));
+        let now = std::time::Instant::now();
+
+        assert_eq!(
+            live_notice(&notice, now, Some("alice")),
+            Some("NOT SAVED: test"),
+            "unexpired and about the selected row → painted"
+        );
+        assert_eq!(
+            live_notice(&notice, now, Some("bob")),
+            None,
+            "a warning about alice must never be shown over bob's row"
+        );
+        assert_eq!(
+            live_notice(&notice, now, None),
+            None,
+            "…nor when no row is selected at all"
+        );
+
+        // The one notice that names no account — `NoSuchAccount`, raised when the
+        // selection pointed at nothing — pairs with the empty selection.
+        let rowless = Some(Notice::new("NOT SAVED: no row", None));
+        assert_eq!(live_notice(&rowless, now, None), Some("NOT SAVED: no row"));
+        assert_eq!(live_notice(&rowless, now, Some("alice")), None);
+    }
+
+    /// **THE off-by-one guard.** `Down` advances with a `saturating_add` and the
+    /// 500ms repaint was the ONLY thing that pulled it back in range, so a `Down`
+    /// immediately followed by `d` handed `set_disabled` an index past the end of
+    /// the table: nothing was benched, and the user was told "that account row no
+    /// longer exists" about a row plainly on screen.
+    ///
+    /// Asserted on `next_selection` rather than on `clamp_selected`, because the
+    /// bug was never in the clamp — it was in WHEN the clamp ran. A test of the
+    /// clamp alone passes with the fix reverted, which makes it no gate at all.
+    #[test]
+    fn a_key_acts_on_a_clamped_selection_not_on_an_overshot_one() {
+        // The `Down` that overshoots: last row of a 3-row table → 3, out of range.
+        assert_eq!(next_selection(2, 3, Action::Down), 3);
+
+        // Whatever key comes NEXT must act on row 2, not on row 3.
+        for action in [Action::Disable, Action::Enable, Action::None] {
+            assert_eq!(
+                next_selection(3, 3, action),
+                2,
+                "{action:?} must act on the last row, not on an index past the end"
+            );
+        }
+        assert_eq!(
+            next_selection(3, 3, Action::Up),
+            1,
+            "`Up` starts from the clamped row too, or it takes two presses to move one"
+        );
+
+        // Ordinary movement is untouched.
+        assert_eq!(next_selection(1, 3, Action::Up), 0);
+        assert_eq!(
+            next_selection(0, 3, Action::Up),
+            0,
+            "no underflow at the top"
+        );
+        assert_eq!(next_selection(1, 3, Action::Down), 2);
+
+        // An empty table has no row to select and must not underflow.
+        assert_eq!(next_selection(4, 0, Action::Disable), 0);
+        assert_eq!(next_selection(0, 0, Action::Up), 0);
+    }
+
+    /// The alarm styling is defined once. Two literals would drift, and a notice
+    /// that stopped looking like the fleet-down banner would read as ordinary
+    /// chrome — which is exactly what it is not.
+    #[test]
+    fn the_notice_and_the_downed_fleet_banner_share_one_alarm_style() {
+        let style = alarm_style();
+        assert_eq!(style.fg, Some(Color::Red));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]

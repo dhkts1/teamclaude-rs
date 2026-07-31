@@ -92,6 +92,26 @@ const ERROR_REPROBE_BASE_MS: i64 = 60_000;
 /// most ~twice an hour, so re-probing can never hammer the OAuth endpoint.
 const ERROR_REPROBE_CAP_MS: i64 = 30 * 60_000;
 
+/// How many probe sweeps in a row may fail to read an account's quota before
+/// keep-warm stops waiting for evidence and proceeds without it — the escape valve
+/// on [`Manager::warm_targets`]'s boot gate.
+///
+/// The gate waits because a blank quota is *unknown*, not *known-cold*, and
+/// warming an account whose 5h window is already live is wasted spend. But absence
+/// of evidence is not evidence of a live window, and if the probe fails
+/// persistently the wait never ends: keep-warm goes silently dark while config and
+/// TUI both read as enabled. That is the worse failure — an unbounded wait is a
+/// kill switch, a bounded one costs a few minutes.
+///
+/// Three, from the probe cadence. One failed sweep proves nothing: the fleet-wide
+/// false error `probing.rs` documents (a bursted sweep 429ing itself) is exactly a
+/// one-sweep event, and lifting on it would hand the boot burst straight back.
+/// Three failures are three separate sweeps a full cadence apart, which at the
+/// default [`crate::probe::DEFAULT_PROBE_SECONDS`] (75s) is ~2.5 minutes — a
+/// persistent condition, and a small fraction of any sane `warmupSeconds`. The
+/// wait is bounded by three probe cadences no matter how long the warm interval is.
+const PROBE_FAILURES_BEFORE_WARMING_UNPROBED: u32 = 3;
+
 /// Hard state of an account.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccountStatus {
@@ -136,15 +156,27 @@ pub struct AccountRuntime {
     pub expires_at_ms: Option<i64>,
     pub status: AccountStatus,
     pub quota: Quota,
-    /// Latched `true` the first time this account's quota was actually READ from
-    /// the usage endpoint (in [`Manager::apply_usage`], which runs only on a
-    /// successful probe). Never cleared — once we have read an account's quota we
-    /// have read it, and a later probe FAILURE deliberately leaves the
-    /// last-learned windows in place rather than blanking them.
+    /// Latched `true` the first time this account's 5h window was actually READ —
+    /// "we have evidence about this account's window", which is the question
+    /// [`Manager::warm_targets`]' boot gate is really asking. Never cleared: once
+    /// we have read it we have read it, and a later probe FAILURE deliberately
+    /// leaves the last-learned windows in place rather than blanking them.
     ///
-    /// This, and NOT `probe_status`, is [`Manager::warm_targets`]' boot gate.
-    /// `record_probe` stamps `Error`/`Timeout`/`RateLimited` on a FAILED probe too,
-    /// so `probe_status != Never` while `quota` is still `Quota::default()` — and a
+    /// TWO sources latch it, because the evidence genuinely has two sources:
+    ///  - [`Manager::apply_usage`], on a SUCCESSFUL probe of the usage endpoint —
+    ///    including one that reports no 5h bucket at all, which is itself the
+    ///    positive fact "this account has no live window";
+    ///  - [`Manager::update_quota`], when a served response's rate-limit headers
+    ///    carry the unified 5h window. Those headers are first-hand evidence about
+    ///    that account, so an account carrying live traffic must not read as
+    ///    "quota unknown" — it plainly is not.
+    ///
+    /// A response with NO 5h header latches nothing: that is silence, not the
+    /// endpoint telling us there is no window.
+    ///
+    /// This, and NOT `probe_status`, is the gate. `record_probe` stamps
+    /// `Error`/`Timeout`/`RateLimited` on a FAILED probe too, so
+    /// `probe_status != Never` while `quota` is still `Quota::default()` — and a
     /// gate keyed on that lifts on blank quota, which is the boot burst coming
     /// straight back (a real fleet-wide false-error sweep is documented in
     /// `probing.rs`). It is equally NOT `quota.five_hour.is_some()`: `apply_bucket`
@@ -152,6 +184,14 @@ pub struct AccountRuntime {
     /// responses never carry a 5h bucket would become permanently warm-INELIGIBLE —
     /// a dark feature that reads as enabled.
     pub quota_known: bool,
+    /// Probe sweeps that have failed CONSECUTIVELY without reading this account's
+    /// quota. Bumped by [`Manager::record_probe`] on every terminal failure and
+    /// reset to `0` by a success.
+    ///
+    /// It exists to bound the wait: `quota_known` alone can never latch when the
+    /// probe fails forever, so gating on it unconditionally makes keep-warm
+    /// structurally dark. See [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`].
+    pub consecutive_probe_failures: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
@@ -220,6 +260,7 @@ impl AccountRuntime {
             // Nothing restores the last known windows across a restart, so at boot
             // every account's quota is genuinely unread.
             quota_known: false,
+            consecutive_probe_failures: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -271,21 +312,35 @@ impl DisablePersist {
     /// The one line to put in front of the user, or `None` when the outcome needs
     /// no explanation. Short enough for a single terminal row and phrased so the
     /// headline (`NOT SAVED`) survives truncation on a narrow pane.
-    pub fn warning(self) -> Option<&'static str> {
+    ///
+    /// `disabled` is the DIRECTION the keypress asked for, and it is required
+    /// because the consequence of a failed write is its exact opposite in the two
+    /// directions. Nothing was written either way, so the file still says whatever
+    /// it said: after a failed **disable** the account comes back IN ROTATION,
+    /// after a failed **enable** it comes back BENCHED. A single direction-blind
+    /// line told the user "it returns to rotation on restart" for both — so on a
+    /// failed enable they restarted on that advice and got the opposite.
+    pub fn warning(self, disabled: bool) -> Option<&'static str> {
         match self {
             // The flag is durable, or was never meant to be (demo/status have no
             // config file at all) — nothing to say.
             Self::Persisted | Self::NoConfigFile => None,
             Self::NoSuchAccount => Some("NOT SAVED: that account row no longer exists"),
-            Self::NoEntry => Some(
-                "NOT SAVED: no config entry matches this account — it returns to rotation on restart",
-            ),
+            Self::NoEntry => Some(if disabled {
+                "NOT SAVED: no config entry matches this account — it returns to rotation on restart"
+            } else {
+                "NOT SAVED: no config entry matches this account — it stays benched after a restart"
+            }),
+            // Says nothing about a restart, so it needs no direction — only an
+            // action that actually helps.
             Self::Ambiguous => Some(
-                "NOT SAVED: two config entries share this account's identity — rename one to fix",
+                "NOT SAVED: two config entries share this account's identity — give each its own orgUuid",
             ),
-            Self::WriteFailed => {
-                Some("NOT SAVED: writing the config failed — it returns to rotation on restart")
-            }
+            Self::WriteFailed => Some(if disabled {
+                "NOT SAVED: writing the config failed — it returns to rotation on restart"
+            } else {
+                "NOT SAVED: writing the config failed — it stays benched after a restart"
+            }),
         }
     }
 }
@@ -778,19 +833,36 @@ impl Manager {
         // buffer for a single-use token. If this save fails, the freshly rotated
         // token still sits in the snapshot for `persist_now` to flush at shutdown;
         // rolling memory back on failure would lose it for good.
-        let snapshot = {
+        let (snapshot, placement) = {
             let mut config = self.config.lock().expect("config lock poisoned");
-            if let Some(account) = config
-                .accounts
-                .iter_mut()
-                .find(|a| crate::identity::same_identity(a, &probe))
-            {
-                account.access_token = tokens.access_token.clone();
-                account.refresh_token = Some(tokens.refresh_token.clone());
-                account.expires_at = Some(tokens.expires_at_ms);
+            // Resolved, never first-match: `same_identity` treats an unknown org as
+            // a match, so with the legacy two-org shape in the file a first-match
+            // search lands THIS account's rotated credential on the OTHER account's
+            // record — overwriting a single-use refresh token that is then dead.
+            // An unbreakable tie writes nothing and says so.
+            let placement = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
+            if let crate::identity::Resolved::One(position) = placement {
+                if let Some(account) = config.accounts.get_mut(position) {
+                    account.access_token = tokens.access_token.clone();
+                    account.refresh_token = Some(tokens.refresh_token.clone());
+                    account.expires_at = Some(tokens.expires_at_ms);
+                }
             }
-            config.clone()
+            (config.clone(), placement)
         };
+        // Logged with the config lock released (INV2) — a `warn!` is cheap but the
+        // critical section above is on the per-connection path's lock.
+        match placement {
+            crate::identity::Resolved::One(_) => {}
+            crate::identity::Resolved::None => tracing::warn!(
+                account = %name,
+                "no loaded config account carries this identity; the rotated token is not in the snapshot and will not reach disk"
+            ),
+            crate::identity::Resolved::Many => tracing::warn!(
+                account = %name,
+                "more than one loaded config account carries this identity; refusing to guess which one just rotated, so the rotated token will not reach disk and this account may need `tcr login`"
+            ),
+        }
         // Tokens only: the in-memory config is a boot-time snapshot, so writing
         // it whole would stamp stale settings over the user's live file.
         if let Err(err) = config::save_tokens(path, &snapshot) {
@@ -850,14 +922,16 @@ impl Manager {
             Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
-            // Matched by identity, exactly as persist_tokens matches, so both land
-            // on the same entry as the write above did.
-            if let Some(account) = config
-                .accounts
-                .iter_mut()
-                .find(|a| crate::identity::same_identity(a, target))
+            // Resolved by identity, exactly as `persist_tokens` and `save_disabled`
+            // resolve, so all three land on the same record. An unbreakable tie
+            // writes nothing: `save_disabled` refuses one too, and memory must not
+            // drift onto a record the file was not allowed to touch.
+            if let crate::identity::Resolved::One(position) =
+                crate::identity::resolve(config.accounts.iter().enumerate(), target)
             {
-                account.disabled = if disabled { Some(true) } else { None };
+                if let Some(account) = config.accounts.get_mut(position) {
+                    account.disabled = if disabled { Some(true) } else { None };
+                }
             }
         }
         match outcome {
@@ -1462,9 +1536,14 @@ mod tests {
     /// enabled (blank quota is unknown, not known-cold), and `config_with` leaves
     /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm test
     /// below would be measuring the boot gate instead of the predicate it is
-    /// actually about. `update_quota` (which `set_5h`/`set_7d` drive) is the
-    /// response-header path and deliberately touches neither `quota_known` nor
-    /// `probe_status`; only a successful probe does.
+    /// actually about.
+    ///
+    /// `set_5h` now latches `quota_known` by itself (a response's 5h header is
+    /// evidence about the window, and `update_quota` treats it as such), so calling
+    /// this stays necessary only for the accounts a test does NOT drive with
+    /// `set_5h` — including every account driven by `set_7d`, which reports no 5h
+    /// window and so latches nothing. `probe_status` is still only ever set by a
+    /// probe.
     fn mark_all_probed(manager: &Manager) {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
         for account in accounts.iter_mut() {
@@ -4633,27 +4712,75 @@ mod tests {
     /// silent failure arm here is a lie on screen.
     #[test]
     fn every_non_durable_persist_outcome_warns() {
-        for outcome in [DisablePersist::Persisted, DisablePersist::NoConfigFile] {
-            assert_eq!(
-                outcome.warning(),
-                None,
-                "{outcome:?} is not a failure — warning about it would be noise"
-            );
+        for disabled in [true, false] {
+            for outcome in [DisablePersist::Persisted, DisablePersist::NoConfigFile] {
+                assert_eq!(
+                    outcome.warning(disabled),
+                    None,
+                    "{outcome:?} is not a failure — warning about it would be noise"
+                );
+            }
+            for outcome in [
+                DisablePersist::NoSuchAccount,
+                DisablePersist::NoEntry,
+                DisablePersist::Ambiguous,
+                DisablePersist::WriteFailed,
+            ] {
+                let warning = outcome
+                    .warning(disabled)
+                    .unwrap_or_else(|| panic!("{outcome:?} must warn — it did not persist"));
+                assert!(
+                    warning.starts_with("NOT SAVED"),
+                    "{outcome:?} must lead with the headline so it survives truncation: {warning}"
+                );
+            }
         }
-        for outcome in [
-            DisablePersist::NoSuchAccount,
-            DisablePersist::NoEntry,
-            DisablePersist::Ambiguous,
-            DisablePersist::WriteFailed,
-        ] {
-            let warning = outcome
-                .warning()
-                .unwrap_or_else(|| panic!("{outcome:?} must warn — it did not persist"));
+    }
+
+    /// **THE direction guard.** Nothing was written, so the file still says what it
+    /// said — and that means the consequence of a failed write is the OPPOSITE in
+    /// the two directions. A failed `d` (disable) leaves the account in rotation; a
+    /// failed `e` (enable) leaves it BENCHED. One direction-blind line used to
+    /// claim "it returns to rotation on restart" for both, so a user whose enable
+    /// failed restarted on that advice and got the account benched anyway.
+    #[test]
+    fn a_failed_persist_states_the_consequence_of_its_own_direction() {
+        for outcome in [DisablePersist::NoEntry, DisablePersist::WriteFailed] {
+            let disabling = outcome.warning(true).expect("a failed disable must warn");
             assert!(
-                warning.starts_with("NOT SAVED"),
-                "{outcome:?} must lead with the headline so it survives truncation: {warning}"
+                disabling.ends_with("it returns to rotation on restart"),
+                "a failed DISABLE leaves the account in rotation: {disabling}"
+            );
+
+            let enabling = outcome.warning(false).expect("a failed enable must warn");
+            assert!(
+                enabling.ends_with("it stays benched after a restart"),
+                "a failed ENABLE leaves the account benched: {enabling}"
+            );
+            assert!(
+                !enabling.contains("returns to rotation"),
+                "a failed enable must never promise the opposite of what happens: {enabling}"
             );
         }
+    }
+
+    /// The ambiguity refusal must name an action that actually works. It used to
+    /// say "rename one to fix", which is provably wrong whenever both entries carry
+    /// an `accountUuid`: the match never consults names on that path, so renaming
+    /// changes nothing and the next `d` fails identically.
+    #[test]
+    fn the_ambiguity_warning_names_a_remedy_that_works() {
+        let warning = DisablePersist::Ambiguous
+            .warning(true)
+            .expect("an ambiguous refusal must warn");
+        assert!(
+            warning.contains("orgUuid"),
+            "the remedy is giving the entries distinct org keys: {warning}"
+        );
+        assert!(
+            !warning.contains("rename"),
+            "renaming does not break a UUID-matched tie: {warning}"
+        );
     }
 
     /// A manager with no config file behind it reports that distinctly and does NOT
@@ -5131,6 +5258,157 @@ mod tests {
                 .await
                 .is_err(),
             "quota_known is already latched, so a repeat probe must not re-wake the loop"
+        );
+    }
+
+    /// **State 1 — evidence from the OTHER source.** A served response's
+    /// rate-limit headers are a first-hand read of that account's 5h window, so
+    /// they open the gate exactly as a probe does. Without this an account carrying
+    /// live traffic read as "quota unknown", which is false on its face: we have
+    /// its window, we just did not get it from the probe.
+    ///
+    /// The header path must also WAKE the loop, for the same reason the probe path
+    /// does — an eligible account may not sit out a whole `warmupSeconds`.
+    #[tokio::test]
+    async fn a_served_response_header_is_quota_evidence_and_opens_the_gate() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        let wake_window = std::time::Duration::from_millis(50);
+        assert!(manager.probe_interval_seconds() > 0);
+        assert!(manager.warm_targets().is_empty(), "boot: nothing read yet");
+
+        // A response carrying the unified 5h window, with a reset already past —
+        // so the window it reports is EXPIRED and the account is genuinely cold.
+        set_5h(&manager, 0, "0.10", -1);
+
+        assert!(
+            manager.accounts.read().unwrap()[0].quota_known,
+            "a response that reported the 5h window is evidence about that window"
+        );
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "with the window read and not live, the account is a target"
+        );
+        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            .await
+            .expect("the first read wakes the warm loop whichever source it came from");
+    }
+
+    /// …but only a response that actually SAID something about the 5h window. A
+    /// response without the header — an error page, a non-Anthropic upstream — is
+    /// silence, and silence is not evidence. `set_7d` reports the weekly window and
+    /// no 5h window, which is exactly that shape.
+    #[test]
+    fn a_response_without_the_five_hour_header_latches_nothing() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+
+        set_7d(&manager, 0, "0.10");
+
+        assert!(
+            !manager.accounts.read().unwrap()[0].quota_known,
+            "a weekly-only response says nothing about the 5h window"
+        );
+        assert!(
+            manager.warm_targets().is_empty(),
+            "so the gate must still be waiting"
+        );
+    }
+
+    /// **State 3 — the bounded wait.** `quota_known` can never latch while the
+    /// probe fails, so gating on it *unconditionally* makes keep-warm structurally
+    /// dark: silently doing nothing while config and TUI both read as enabled.
+    /// After `PROBE_FAILURES_BEFORE_WARMING_UNPROBED` consecutive failed sweeps the
+    /// gate stops waiting — absence of evidence is not evidence of a live window —
+    /// and wakes the loop it kept parked.
+    ///
+    /// One failure must NOT be enough: the fleet-wide false error `probing.rs`
+    /// documents is a one-sweep event, and lifting on it hands the boot burst back.
+    #[tokio::test]
+    async fn a_persistently_failing_probe_stops_blocking_keep_warm() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        // No account carries `ok_token`, so every sweep fails on every row.
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            refresher,
+            Arc::new(ScriptedProber {
+                ok_token: "at-nobody".to_string(),
+            }),
+        );
+        let wake_window = std::time::Duration::from_millis(50);
+        assert!(manager.probe_interval_seconds() > 0);
+
+        for sweep in 1..PROBE_FAILURES_BEFORE_WARMING_UNPROBED {
+            manager.probe_all().await;
+            assert!(
+                manager.warm_targets().is_empty(),
+                "sweep {sweep} of {PROBE_FAILURES_BEFORE_WARMING_UNPROBED}: one or two failures are a hiccup, not a verdict"
+            );
+            assert!(
+                tokio::time::timeout(wake_window, manager.warm_wake().notified())
+                    .await
+                    .is_err(),
+                "sweep {sweep}: nothing may wake the loop while the gate is still waiting"
+            );
+        }
+
+        manager.probe_all().await;
+
+        {
+            let accounts = manager.accounts.read().unwrap();
+            assert!(
+                !accounts[0].quota_known,
+                "the escape valve must NOT fake evidence — nothing was ever read"
+            );
+            assert_eq!(
+                accounts[0].consecutive_probe_failures,
+                PROBE_FAILURES_BEFORE_WARMING_UNPROBED
+            );
+        }
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "a probe that has failed every sweep is not going to answer; waiting forever is a kill switch"
+        );
+        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            .await
+            .expect("giving up on the wait must wake the loop, not leave it a full interval away");
+    }
+
+    /// The escape valve is armed by a RUN of failures, not a total: one success in
+    /// between resets it. Otherwise an account that fails, recovers, and fails
+    /// again drifts into "stop waiting" on evidence it actually has.
+    #[tokio::test]
+    async fn a_successful_probe_resets_the_failure_run() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            refresher,
+            Arc::new(ScriptedProber {
+                ok_token: "at-nobody".to_string(),
+            }),
+        );
+        manager.probe_all().await;
+        assert_eq!(
+            manager.accounts.read().unwrap()[0].consecutive_probe_failures,
+            1
+        );
+
+        manager.record_probe(0, ProbeStatus::Ok, None);
+
+        assert_eq!(
+            manager.accounts.read().unwrap()[0].consecutive_probe_failures,
+            0,
+            "a successful read ends the run"
         );
     }
 

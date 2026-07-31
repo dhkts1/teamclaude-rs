@@ -20,28 +20,47 @@ impl Manager {
     /// blank. Blank is *unknown*, not *known-cold* — and the warm loop's ticker
     /// fires its first tick immediately, so without a gate the first sweep spends a
     /// real upstream request on every probeable account, including ones whose 5h
-    /// window is genuinely live and ones sitting at 100% weekly. An account whose
-    /// quota we have never READ is therefore not a target: we do not warm on quota
-    /// we have not read.
+    /// window is genuinely live and ones sitting at 100% weekly.
     ///
-    /// The predicate is [`AccountRuntime::quota_known`] — "a probe successfully read
-    /// this account's quota" — and NOT `probe_status`. `probe_status` is the wrong
-    /// question: `record_probe` stamps `Error`/`Timeout`/`RateLimited` on a FAILED
-    /// probe, which leaves `probe_status != Never` while the quota is still
-    /// `Quota::default()`, so a gate keyed on it lifts on blank quota and hands the
-    /// boot burst straight back. `probing.rs` documents a real sweep that painted a
-    /// false error on every row — exactly that shape.
+    /// # The gate is about EVIDENCE, and has three states, not two
     ///
-    /// The gate applies ONLY while probing is actually enabled. With
-    /// `quotaProbeSeconds == 0` no probe task is ever spawned, so `quota_known`
-    /// would stay `false` forever and gating on it unconditionally would make
-    /// keep-warm structurally unable to fire — a dark feature that looks enabled.
-    /// With the probe off there is nothing to wait for, so today's behaviour stands.
+    /// "Safe to warm" means: we have evidence about this account's 5h window, and
+    /// that evidence says no window is currently live. So:
     ///
-    /// With probing ON, the deferral costs one probe cycle, not one warm interval:
-    /// [`Manager::apply_usage`] signals [`Manager::warm_wake`] on the flip and the
-    /// warm loop `select!`s on it, so the gate can never strand keep-warm for a
-    /// whole `warmupSeconds`.
+    /// 1. **Evidence present** → open. [`AccountRuntime::quota_known`] is that
+    ///    evidence, and it has TWO sources: a successful probe
+    ///    ([`Manager::apply_usage`]) and a served response whose rate-limit headers
+    ///    carried the unified 5h window ([`Manager::update_quota`]). Both are
+    ///    first-hand reads of this account's window. Leaving the second one out is
+    ///    why an account carrying live traffic used to read as "quota unknown",
+    ///    which was simply false.
+    /// 2. **No evidence yet, still expected** → wait. This is the boot case the
+    ///    gate exists for, and it costs one probe cycle rather than one warm
+    ///    interval: both latch sites signal [`Manager::warm_wake`] on the flip and
+    ///    the warm loop `select!`s on it.
+    /// 3. **Evidence unavailable** → proceed anyway, and say so once.
+    ///    [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] consecutive failed sweeps mean
+    ///    the probe is not going to answer. Absence of evidence is not evidence of
+    ///    a live window, and a permanently dark feature is worse than a bounded
+    ///    warm on stale information — the wait must be BOUNDED, or gating on
+    ///    `quota_known` is a silent kill switch whenever the probe stays broken.
+    ///
+    /// State 3 is self-limiting, which is what makes it safe: `warm_account` folds
+    /// the warm response's own rate-limit headers back in, so one warm request per
+    /// account produces the evidence the gate wanted and states 1/2 take over
+    /// again. It cannot become a repeating burst.
+    ///
+    /// The predicate is NOT `probe_status`: `record_probe` stamps
+    /// `Error`/`Timeout`/`RateLimited` on a FAILED probe, which leaves
+    /// `probe_status != Never` while the quota is still `Quota::default()`, so a
+    /// gate keyed on it lifts on blank quota after ONE failure and hands the boot
+    /// burst straight back. `probing.rs` documents a real fleet-wide false-error
+    /// sweep — exactly that shape, and exactly why state 3 needs several failures
+    /// rather than one.
+    ///
+    /// The whole gate applies only while probing is actually enabled. With
+    /// `quotaProbeSeconds == 0` no probe task is ever spawned, so there is nothing
+    /// to wait for and no failure count to accrue either.
     pub fn warm_targets(&self) -> Vec<usize> {
         let now = OffsetDateTime::now_utc();
         // Read the probe cadence BEFORE taking the accounts lock: this touches the
@@ -58,10 +77,13 @@ impl Manager {
                     && !a.disabled
                     && a.status != AccountStatus::Error
                     && a.status != AccountStatus::Throttled
-                    // Quota never READ while the probe is running: it is unknown,
-                    // not known-cold. Wait for a probe to actually read it — a
-                    // probe that merely FAILED has read nothing.
-                    && (!awaiting_first_probe || a.quota_known)
+                    // Evidence about the 5h window, or a bounded wait for it. A
+                    // probe that merely FAILED has read nothing — but once it has
+                    // failed enough times in a row it is not going to read
+                    // anything, and waiting forever is a kill switch, not caution.
+                    && (!awaiting_first_probe
+                        || a.quota_known
+                        || a.consecutive_probe_failures >= PROBE_FAILURES_BEFORE_WARMING_UNPROBED)
                     // A live future 5h reset means the session window is already running.
                     && a.quota.five_hour.and_then(|w| w.live_reset(now)).is_none()
                     // Warming an at/over-threshold account is wasted spend.

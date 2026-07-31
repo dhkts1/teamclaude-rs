@@ -6,9 +6,17 @@ impl Manager {
     /// Record the health of account `idx`'s most recent probe. A failing probe
     /// stamps a visible status + message (never a silently-frozen bar), while an
     /// `Ok` probe clears any prior error.
+    ///
+    /// Also keeps the run of consecutive failures that bounds keep-warm's wait for
+    /// quota evidence, and — on the sweep that crosses
+    /// [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] — says once, greppably, that
+    /// keep-warm is giving up on waiting for this account.
     pub fn record_probe(&self, idx: usize, status: ProbeStatus, error: Option<String>) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
+        let gave_up_waiting = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
             account.probe_status = status;
             account.probe_error = error;
             // "Running" is a transient in-flight marker; only a terminal outcome
@@ -16,6 +24,39 @@ impl Manager {
             if status != ProbeStatus::Never {
                 account.last_probe_ms = Some(crate::now_ms());
             }
+            match status {
+                // A read succeeded — `apply_usage` has already latched
+                // `quota_known` on this path, and the run of failures is over.
+                ProbeStatus::Ok => {
+                    account.consecutive_probe_failures = 0;
+                    false
+                }
+                // Not a terminal outcome; it says nothing either way.
+                ProbeStatus::Never => false,
+                ProbeStatus::Error | ProbeStatus::Timeout | ProbeStatus::RateLimited => {
+                    account.consecutive_probe_failures =
+                        account.consecutive_probe_failures.saturating_add(1);
+                    // The CROSSING sweep only, so a probe that stays broken logs
+                    // once rather than every cadence. An account whose quota we did
+                    // read has nothing to give up on.
+                    !account.quota_known
+                        && account.consecutive_probe_failures
+                            == PROBE_FAILURES_BEFORE_WARMING_UNPROBED
+                }
+            }
+        };
+        if gave_up_waiting {
+            let name = self.account_name(idx).unwrap_or_default();
+            tracing::warn!(
+                account = %name,
+                index = idx,
+                failed_sweeps = PROBE_FAILURES_BEFORE_WARMING_UNPROBED,
+                "keep-warm: proceeding without quota evidence — the probe has failed every sweep and absence of evidence is not evidence of a live 5h window"
+            );
+            // Same edge-triggered wake `apply_usage` fires when the gate opens the
+            // other way: without it the account waits out a whole `warmupSeconds`
+            // after becoming eligible.
+            self.warm_wake.notify_one();
         }
     }
 
