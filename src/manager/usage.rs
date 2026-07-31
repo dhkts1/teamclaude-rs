@@ -39,11 +39,34 @@ impl Manager {
         }
     }
 
-    /// Fold a background probe's usage into account `idx`'s quota windows.
+    /// Fold a background probe's usage into account `idx`'s quota windows and latch
+    /// [`AccountRuntime::quota_known`].
+    ///
+    /// This is the ONLY place the latch is set, and that is the whole point: it runs
+    /// exclusively on the `Ok` arm of [`Manager::probe_account`], so every probe
+    /// FAILURE — `Error`, `Timeout`, `RateLimited` — leaves the latch (and therefore
+    /// the account's keep-warm eligibility) untouched. Note it latches even when the
+    /// endpoint reported no 5h bucket at all: "we have read this account's quota" is
+    /// about the READ, not about which windows came back.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
-            account.quota.apply_usage(usage);
+        let newly_known = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            match accounts.get_mut(idx) {
+                Some(account) => {
+                    account.quota.apply_usage(usage);
+                    let flipped = !account.quota_known;
+                    account.quota_known = true;
+                    flipped
+                }
+                None => false,
+            }
+        };
+        // Wake the keep-warm loop only on the false→true flip — at most once per
+        // account per process, so the loop can never be spun by a steady-state
+        // probe cadence. Signalled with the accounts lock RELEASED: the loop's
+        // first act on waking is `warm_targets()`, which takes that same lock.
+        if newly_known {
+            self.warm_wake.notify_one();
         }
     }
 

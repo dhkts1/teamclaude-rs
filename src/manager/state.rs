@@ -81,6 +81,14 @@ impl Manager {
             .unwrap_or(false)
     }
 
+    /// The keep-warm wake signal. The warm loop `select!`s over its own ticker and
+    /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
+    /// the probe has read some quota rather than a full `warmupSeconds` later. See
+    /// the field docs on [`Manager`] for why a lost wake is impossible here.
+    pub fn warm_wake(&self) -> &Notify {
+        &self.warm_wake
+    }
+
     /// Mint the next session key: a strictly-increasing, unique `u64` starting at
     /// 1. Called once per connection by the hybrid server when affinity is on.
     pub fn next_session_key(&self) -> u64 {

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use time::OffsetDateTime;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::config::{self, Config, PacingConfig, ThrottleConfig};
 use crate::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
@@ -136,6 +136,22 @@ pub struct AccountRuntime {
     pub expires_at_ms: Option<i64>,
     pub status: AccountStatus,
     pub quota: Quota,
+    /// Latched `true` the first time this account's quota was actually READ from
+    /// the usage endpoint (in [`Manager::apply_usage`], which runs only on a
+    /// successful probe). Never cleared — once we have read an account's quota we
+    /// have read it, and a later probe FAILURE deliberately leaves the
+    /// last-learned windows in place rather than blanking them.
+    ///
+    /// This, and NOT `probe_status`, is [`Manager::warm_targets`]' boot gate.
+    /// `record_probe` stamps `Error`/`Timeout`/`RateLimited` on a FAILED probe too,
+    /// so `probe_status != Never` while `quota` is still `Quota::default()` — and a
+    /// gate keyed on that lifts on blank quota, which is the boot burst coming
+    /// straight back (a real fleet-wide false-error sweep is documented in
+    /// `probing.rs`). It is equally NOT `quota.five_hour.is_some()`: `apply_bucket`
+    /// early-returns when the endpoint omits the bucket, so an account whose
+    /// responses never carry a 5h bucket would become permanently warm-INELIGIBLE —
+    /// a dark feature that reads as enabled.
+    pub quota_known: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
@@ -201,6 +217,9 @@ impl AccountRuntime {
             expires_at_ms: account.expires_at.map(oauth::normalize_expires_at),
             status: AccountStatus::Active,
             quota: Quota::default(),
+            // Nothing restores the last known windows across a restart, so at boot
+            // every account's quota is genuinely unread.
+            quota_known: false,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -217,6 +236,56 @@ impl AccountRuntime {
             probe_status: ProbeStatus::Never,
             last_probe_ms: None,
             probe_error: None,
+        }
+    }
+}
+
+/// What [`Manager::set_disabled`] achieved about DURABILITY — whether the bench
+/// will still be there after a restart.
+///
+/// Returned rather than only logged because `tracing` is redirected to a log file
+/// in TUI mode, so a failed write was invisible to the one person who could act on
+/// it: the TUI kept rendering the account as disabled while the flag had provably
+/// not reached disk. Every non-`None` [`Self::warning`] is a state where pressing
+/// `d` looked like it worked and did not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisablePersist {
+    /// The config file carries the flag — written just now, or already correct.
+    Persisted,
+    /// No config file behind this manager (`tcr demo`, `tcr status --probe`, the
+    /// tests). Memory-only BY DESIGN: nothing to persist to, nothing wrong.
+    NoConfigFile,
+    /// The index named no account, so nothing changed in memory either.
+    NoSuchAccount,
+    /// Nothing on disk carries this account's identity — the entry was deleted or
+    /// renamed while the proxy ran.
+    NoEntry,
+    /// More than one entry carries this identity; the write was refused rather
+    /// than landed on a guess. See [`config::DisabledWrite::Ambiguous`].
+    Ambiguous,
+    /// The write itself failed (unreadable, malformed, or unwritable file).
+    WriteFailed,
+}
+
+impl DisablePersist {
+    /// The one line to put in front of the user, or `None` when the outcome needs
+    /// no explanation. Short enough for a single terminal row and phrased so the
+    /// headline (`NOT SAVED`) survives truncation on a narrow pane.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            // The flag is durable, or was never meant to be (demo/status have no
+            // config file at all) — nothing to say.
+            Self::Persisted | Self::NoConfigFile => None,
+            Self::NoSuchAccount => Some("NOT SAVED: that account row no longer exists"),
+            Self::NoEntry => Some(
+                "NOT SAVED: no config entry matches this account — it returns to rotation on restart",
+            ),
+            Self::Ambiguous => Some(
+                "NOT SAVED: two config entries share this account's identity — rename one to fix",
+            ),
+            Self::WriteFailed => {
+                Some("NOT SAVED: writing the config failed — it returns to rotation on restart")
+            }
         }
     }
 }
@@ -245,12 +314,46 @@ pub struct Manager {
     warmer: Arc<dyn AccountWarmer>,
     /// Ensures two keep-warm sweeps never overlap (mirrors the JS `_running` flag).
     warm_in_flight: AtomicBool,
+    /// Wakes the keep-warm loop the moment an account's quota is first READ, so the
+    /// boot gate on [`Self::warm_targets`] costs a probe cycle rather than a full
+    /// `warmupSeconds` of dark time.
+    ///
+    /// Without it the gate is a silent kill switch: the warm loop's ticker fires its
+    /// first tick immediately, that sweep necessarily finds no targets (no quota has
+    /// been read yet), and `MissedTickBehavior::Skip` puts the next tick a whole
+    /// interval away — so at `warmupSeconds: 3600` a proxy restarted more often than
+    /// hourly warms NOTHING, ever, while reading as enabled in config and TUI.
+    ///
+    /// `Notify` rather than a channel because a permit stored by `notify_one` before
+    /// the loop is waiting is consumed by its next `notified()` — the wake survives
+    /// the race between the first probe and the loop reaching its `select!`, and a
+    /// `Notified` dropped by a losing `select!` branch hands its permit back. Fired
+    /// ONLY on the false→true `quota_known` flip, which happens at most once per
+    /// account per process, so it can never become a self-feeding loop of sweeps.
+    warm_wake: Notify,
     /// Client used for upstream forwarding — deliberately no total timeout so
     /// long SSE streams are never cut (an idle guard belongs on the read side).
     http: reqwest::Client,
     /// The persisted config, kept so token refreshes can be written back with
     /// every unmodelled field intact.
     config: Mutex<Config>,
+    /// Serializes the whole read-modify-write of the CONFIG FILE, and nothing else
+    /// (**INV1**). Every writer — [`Self::persist_now`], [`Self::persist_tokens`],
+    /// [`Self::persist_disabled`] — holds this across its whole read, modify,
+    /// `sync_all` and rename, so two persists can never interleave and a stale
+    /// document can never clobber a just-rotated single-use refresh token.
+    ///
+    /// It exists so `self.config` no longer has to do that job (**INV2**). The
+    /// config mutex is taken on the PER-CONNECTION path —
+    /// [`Self::session_affinity_enabled`], from `mitm.rs`'s serve path — so holding
+    /// it across an fsync let one TUI keypress stall connection setup. Splitting the
+    /// two gives serialization without putting file I/O under a lock that request
+    /// handling waits on.
+    ///
+    /// Lock order is `config_write` → `config`, never the reverse: nothing that
+    /// holds `config` ever reaches for this. A `()` payload — it guards an external
+    /// resource (the file), not data.
+    config_write: Mutex<()>,
     config_path: Option<PathBuf>,
     upstream: String,
     proxy_api_key: Option<String>,
@@ -426,6 +529,7 @@ impl Manager {
             prober,
             warmer,
             warm_in_flight: AtomicBool::new(false),
+            warm_wake: Notify::new(),
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
             // proxy — routing our upstream through an ambient proxy (e.g. the JS
             // teamclaude on :3456) loops us through the thing we replace and every
@@ -456,6 +560,7 @@ impl Manager {
                 .build()
                 .expect("build reqwest client"),
             config: Mutex::new(config),
+            config_write: Mutex::new(()),
             config_path,
             upstream,
             proxy_api_key,
@@ -618,11 +723,19 @@ impl Manager {
         let Some(path) = &self.config_path else {
             return;
         };
-        // Save UNDER the lock (not clone-then-save-unlocked) so a shutdown flush
-        // can't race a concurrent persist_tokens and clobber a just-rotated token.
-        // The lock also serializes save_tokens' read-modify-write of the file.
-        let config = self.config.lock().expect("config lock poisoned");
-        if let Err(err) = config::save_tokens(path, &config) {
+        // INV1 — the write lock, held across the whole read-modify-write below, is
+        // what stops a shutdown flush racing a concurrent persist_tokens and
+        // clobbering a just-rotated token. It replaces the config lock in that role;
+        // dropping it here while persist_tokens no longer holds `config` across its
+        // save would leave BOTH writers unserialized.
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        // INV2 — clone inside a short critical section so the config lock is
+        // released on this line, before any file I/O below runs.
+        let snapshot = self.config.lock().expect("config lock poisoned").clone();
+        if let Err(err) = config::save_tokens(path, &snapshot) {
             tracing::error!(error = %err, "failed to flush config on shutdown");
         }
     }
@@ -643,25 +756,44 @@ impl Manager {
         // is logged into two orgs (finding #9). With all identity fields None
         // (today's config) same_identity falls back to name equality — unchanged.
         let probe = crate::identity::probe(name, account_uuid, org_uuid, org_name);
-        // Modify AND save while HOLDING the config lock. Cloning under the lock
-        // then saving unlocked lets two concurrent refreshes race on the file: a
-        // stale save clobbers the other account's just-rotated refresh token,
-        // which then 400s ("invalid_grant") on its next refresh. Holding the lock
-        // through the save serializes writes — including save_tokens' whole
-        // read-modify-write of the file — so every rotation lands on disk.
-        let mut config = self.config.lock().expect("config lock poisoned");
-        if let Some(account) = config
-            .accounts
-            .iter_mut()
-            .find(|a| crate::identity::same_identity(a, &probe))
-        {
-            account.access_token = tokens.access_token.clone();
-            account.refresh_token = Some(tokens.refresh_token.clone());
-            account.expires_at = Some(tokens.expires_at_ms);
-        }
+        // INV1 — the modify and the save must be ONE atomic step against the file.
+        // Without that, two concurrent refreshes race: a stale save clobbers the
+        // other account's just-rotated refresh token, which then 400s
+        // ("invalid_grant") on its next refresh and is dead until re-authed by hand.
+        // This lock — not the config lock — is what provides that serialization now,
+        // and it covers save_tokens' whole read-modify-write of the file.
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        // INV2 — the config lock is taken ONLY for this block: apply the rotation to
+        // the snapshot and clone it out. The guard drops at the closing brace, so
+        // `save_tokens` below runs with `self.config` free and a per-connection
+        // `session_affinity_enabled()` never waits on an fsync. Cloning is safe here
+        // in a way it was NOT before: INV1 already serializes the writers, so no
+        // second writer can slip a stale document in between.
+        //
+        // Deliberately NOT INV3 (mutate only after a successful write): the mutation
+        // IS the write's content — it has to precede it — and memory is the recovery
+        // buffer for a single-use token. If this save fails, the freshly rotated
+        // token still sits in the snapshot for `persist_now` to flush at shutdown;
+        // rolling memory back on failure would lose it for good.
+        let snapshot = {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            if let Some(account) = config
+                .accounts
+                .iter_mut()
+                .find(|a| crate::identity::same_identity(a, &probe))
+            {
+                account.access_token = tokens.access_token.clone();
+                account.refresh_token = Some(tokens.refresh_token.clone());
+                account.expires_at = Some(tokens.expires_at_ms);
+            }
+            config.clone()
+        };
         // Tokens only: the in-memory config is a boot-time snapshot, so writing
         // it whole would stamp stale settings over the user's live file.
-        if let Err(err) = config::save_tokens(path, &config) {
+        if let Err(err) = config::save_tokens(path, &snapshot) {
             tracing::error!(error = %err, "failed to persist refreshed token to config");
         }
     }
@@ -669,12 +801,22 @@ impl Manager {
     /// Flush account `idx`'s `disabled` flag to the config file, so an account
     /// deliberately benched from the TUI is still benched after a restart.
     ///
-    /// Takes the SAME `self.config` lock as [`Self::persist_tokens`], for the same
-    /// reason: that lock is what serializes this file write against a concurrent
-    /// token rotation's whole read-modify-write. Writing outside it lets this
-    /// write's snapshot of the document clobber a refresh token that rotated in
-    /// between — and a refresh token is single-use, so the clobbered account 400s
-    /// (`invalid_grant`) on its next refresh and is dead until re-authed by hand.
+    /// Upholds the same three invariants as [`Self::persist_tokens`], with the line
+    /// carrying each marked below:
+    ///  - **INV1** — the `config_write` guard spans the whole read-modify-write, so
+    ///    this write and a concurrent token rotation never interleave. That matters
+    ///    more here than the flag does: an interleaved write can clobber a refresh
+    ///    token that rotated in between, and a refresh token is single-use, so the
+    ///    clobbered account 400s (`invalid_grant`) on its next refresh and is dead
+    ///    until re-authed by hand.
+    ///  - **INV2** — `save_disabled` runs with `self.config` NOT held. That lock is
+    ///    on the per-connection path (`session_affinity_enabled`), so holding it
+    ///    across a read + `sync_all` + rename let one keypress stall connection
+    ///    setup.
+    ///  - **INV3** — the in-memory snapshot is mutated only once the file is known
+    ///    to carry the flag. Mutating first (and regardless of the outcome) left
+    ///    memory and disk permanently diverged on `NoEntry`/`Ambiguous`/`Err`, with
+    ///    nothing to reconcile or retry them — the exact opposite of the guarantee.
     ///
     /// Writes the flag ONLY, via [`config::save_disabled`], never the whole config:
     /// the in-memory `Config` is a boot-time snapshot, so flushing it whole would
@@ -682,47 +824,89 @@ impl Manager {
     ///
     /// A missing `config_path` (tests, `tcr demo`, `tcr status --probe`) is a
     /// SILENT no-op — those managers must never touch a real config file.
-    fn persist_disabled(&self, idx: usize, target: &config::Account, disabled: bool) {
+    fn persist_disabled(
+        &self,
+        idx: usize,
+        target: &config::Account,
+        disabled: bool,
+    ) -> DisablePersist {
         let Some(path) = &self.config_path else {
-            return;
+            return DisablePersist::NoConfigFile;
         };
-        let mut config = self.config.lock().expect("config lock poisoned");
-        // Keep the boot-time snapshot in step with the file so the two views of
-        // the flag cannot diverge. Matched by identity, exactly as persist_tokens
-        // matches, so both land on the same entry.
-        if let Some(account) = config
-            .accounts
-            .iter_mut()
-            .find(|a| crate::identity::same_identity(a, target))
-        {
-            account.disabled = if disabled { Some(true) } else { None };
+        // INV1 — held across `save_disabled`'s whole read + modify + sync + rename.
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        // INV2 — no `self.config` guard is alive on this line, so the file I/O
+        // cannot block a per-connection config read.
+        let outcome = config::save_disabled(path, target, disabled);
+        // INV3 — memory is touched only on the arms where the FILE now carries the
+        // desired state. `Unchanged` qualifies: it means the document already said
+        // exactly this, so nothing was written precisely because nothing needed to
+        // be. Every other arm leaves the snapshot alone.
+        if matches!(
+            outcome,
+            Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
+        ) {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            // Matched by identity, exactly as persist_tokens matches, so both land
+            // on the same entry as the write above did.
+            if let Some(account) = config
+                .accounts
+                .iter_mut()
+                .find(|a| crate::identity::same_identity(a, target))
+            {
+                account.disabled = if disabled { Some(true) } else { None };
+            }
         }
-        match config::save_disabled(path, target, disabled) {
-            Ok(config::DisabledWrite::Updated) => tracing::info!(
-                account = %target.name,
-                index = idx,
-                disabled,
-                "persisted account disabled flag to config"
-            ),
-            Ok(config::DisabledWrite::Unchanged) => tracing::debug!(
-                account = %target.name,
-                index = idx,
-                disabled,
-                "config already carries this disabled state; nothing written"
-            ),
-            Ok(config::DisabledWrite::NoEntry) => tracing::warn!(
-                account = %target.name,
-                index = idx,
-                path = %path.display(),
-                "no config entry carries this account's identity; the disabled flag will NOT survive a restart"
-            ),
-            Err(err) => tracing::error!(
-                error = %err,
-                account = %target.name,
-                index = idx,
-                path = %path.display(),
-                "failed to persist the disabled flag to config"
-            ),
+        match outcome {
+            Ok(config::DisabledWrite::Updated) => {
+                tracing::info!(
+                    account = %target.name,
+                    index = idx,
+                    disabled,
+                    "persisted account disabled flag to config"
+                );
+                DisablePersist::Persisted
+            }
+            Ok(config::DisabledWrite::Unchanged) => {
+                tracing::debug!(
+                    account = %target.name,
+                    index = idx,
+                    disabled,
+                    "config already carries this disabled state; nothing written"
+                );
+                DisablePersist::Persisted
+            }
+            Ok(config::DisabledWrite::NoEntry) => {
+                tracing::warn!(
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "no config entry carries this account's identity; the disabled flag will NOT survive a restart"
+                );
+                DisablePersist::NoEntry
+            }
+            Ok(config::DisabledWrite::Ambiguous) => {
+                tracing::warn!(
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "more than one config entry carries this account's identity; refusing to guess which one to flag, so the disabled flag will NOT survive a restart"
+                );
+                DisablePersist::Ambiguous
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "failed to persist the disabled flag to config"
+                );
+                DisablePersist::WriteFailed
+            }
         }
     }
 
@@ -743,7 +927,13 @@ impl Manager {
     /// The flag is also PERSISTED (see [`Self::persist_disabled`]) — memory-only
     /// was the bug: a restart silently returned a deliberately benched account to
     /// rotation, because the server writes nothing but credentials back.
-    pub fn set_disabled(&self, idx: usize, disabled: bool) {
+    ///
+    /// Returns what became of the DURABLE half, because in TUI mode `tracing` is
+    /// redirected to a log file: a failed write reported only there leaves the TUI
+    /// rendering the account as benched while the bench provably will not survive a
+    /// restart. The caller is expected to put [`DisablePersist::warning`] in front of
+    /// the person who pressed the key.
+    pub fn set_disabled(&self, idx: usize, disabled: bool) -> DisablePersist {
         // Take the identity out under the accounts lock and RELEASE that lock
         // before persisting. The persist path takes the config lock, and holding
         // both at once here would invert the order `warm_targets` reads them in
@@ -751,7 +941,7 @@ impl Manager {
         let target = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             let Some(account) = accounts.get_mut(idx) else {
-                return;
+                return DisablePersist::NoSuchAccount;
             };
             account.disabled = disabled;
             if !disabled && account.status == AccountStatus::Error {
@@ -765,7 +955,7 @@ impl Manager {
                 account.org_name.clone(),
             )
         };
-        self.persist_disabled(idx, &target, disabled);
+        self.persist_disabled(idx, &target, disabled)
     }
 
     /// Record which account actually served the most recent request.
@@ -1096,6 +1286,28 @@ mod tests {
         }
     }
 
+    /// A prober that SUCCEEDS for every account and reports a weekly window only —
+    /// no 5h bucket at all. That is the shape that separates the two candidate boot
+    /// predicates: the quota was genuinely read (so `quota_known` latches and the
+    /// account is warm-eligible), while `quota.five_hour` stays `None` because
+    /// `apply_bucket` early-returns on an absent bucket. Gating on
+    /// `five_hour.is_some()` would leave such an account warm-INELIGIBLE forever.
+    struct ColdOkProber;
+    impl UsageProber for ColdOkProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            Box::pin(async {
+                Ok(Usage {
+                    five_hour: None,
+                    seven_day: Some(UsageBucket {
+                        utilization: Some(0.10),
+                        reset_at_ms: Some(crate::now_ms() + 86_400_000),
+                    }),
+                    seven_day_oi: None,
+                })
+            })
+        }
+    }
+
     /// A warmer that never hits the network — the default for tests that do not
     /// exercise keep-warm. If invoked it records nothing and returns empty headers.
     struct NoWarmer;
@@ -1244,18 +1456,20 @@ mod tests {
         config
     }
 
-    /// Mark every account as having been probed at least once.
+    /// Mark every account as having had its quota successfully READ at least once.
     ///
-    /// `warm_targets` skips a never-probed account while probing is enabled (a
-    /// blank quota is unknown, not known-cold), and `config_with` leaves
-    /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm
-    /// test below would be measuring the boot gate instead of the predicate it is
-    /// actually about. `update_quota` (which `set_5h`/`set_7d` drive) deliberately
-    /// does not touch `probe_status`; only a real probe does.
+    /// `warm_targets` skips an account whose quota was never read while probing is
+    /// enabled (blank quota is unknown, not known-cold), and `config_with` leaves
+    /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm test
+    /// below would be measuring the boot gate instead of the predicate it is
+    /// actually about. `update_quota` (which `set_5h`/`set_7d` drive) is the
+    /// response-header path and deliberately touches neither `quota_known` nor
+    /// `probe_status`; only a successful probe does.
     fn mark_all_probed(manager: &Manager) {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
         for account in accounts.iter_mut() {
             account.probe_status = ProbeStatus::Ok;
+            account.quota_known = true;
         }
     }
 
@@ -4353,6 +4567,209 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// **INV3 / FIX 4.** A write that did not land must leave the in-memory snapshot
+    /// alone. Mutating memory first and regardless of the outcome left the two views
+    /// permanently diverged — memory saying benched, disk saying nothing — with
+    /// nothing to reconcile or retry them, which is the opposite of the guarantee the
+    /// comment above `persist_disabled` claimed.
+    ///
+    /// All three failure shapes, because each takes a different arm:
+    /// `NoEntry` (identity absent from disk), `Ambiguous` (two entries share it), and
+    /// `Err` (the file cannot even be parsed).
+    #[test]
+    fn a_failed_persist_leaves_the_in_memory_snapshot_unchanged() {
+        // NoEntry — the runtime row exists, the disk entry does not.
+        let path = tmp_config_path("persist-noentry");
+        write_account_file(&path, &["someone-else"]);
+        let manager =
+            build_manager_with_path(config_with(vec![account("acct-a", 0)]), path.clone());
+        assert_eq!(
+            manager.set_disabled(0, true),
+            DisablePersist::NoEntry,
+            "no disk entry carries this identity"
+        );
+        assert_eq!(
+            manager.config.lock().unwrap().accounts[0].disabled,
+            None,
+            "a write that never landed must not be reflected in memory"
+        );
+        // The runtime row still flips — the bench takes effect NOW, it just is not
+        // durable, which is exactly what the caller is told.
+        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled);
+        std::fs::remove_file(&path).ok();
+
+        // Ambiguous — two disk entries share the identity, so none may be chosen.
+        let path = tmp_config_path("persist-ambiguous");
+        write_account_file(&path, &["acct-a", "acct-a"]);
+        let manager =
+            build_manager_with_path(config_with(vec![account("acct-a", 0)]), path.clone());
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(manager.set_disabled(0, true), DisablePersist::Ambiguous);
+        assert_eq!(manager.config.lock().unwrap().accounts[0].disabled, None);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "an ambiguous identity must leave the file byte-identical"
+        );
+        std::fs::remove_file(&path).ok();
+
+        // Err — the file cannot be parsed, so nothing can be merged into it.
+        let path = tmp_config_path("persist-malformed");
+        std::fs::write(&path, "{ not json").unwrap();
+        let manager =
+            build_manager_with_path(config_with(vec![account("acct-a", 0)]), path.clone());
+        assert_eq!(manager.set_disabled(0, true), DisablePersist::WriteFailed);
+        assert_eq!(manager.config.lock().unwrap().accounts[0].disabled, None);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ not json",
+            "a malformed config must be left exactly as found"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Every outcome the user could mistake for success must SAY so, and the two
+    /// that are fine must stay silent. This is the mapping the TUI renders, so a
+    /// silent failure arm here is a lie on screen.
+    #[test]
+    fn every_non_durable_persist_outcome_warns() {
+        for outcome in [DisablePersist::Persisted, DisablePersist::NoConfigFile] {
+            assert_eq!(
+                outcome.warning(),
+                None,
+                "{outcome:?} is not a failure — warning about it would be noise"
+            );
+        }
+        for outcome in [
+            DisablePersist::NoSuchAccount,
+            DisablePersist::NoEntry,
+            DisablePersist::Ambiguous,
+            DisablePersist::WriteFailed,
+        ] {
+            let warning = outcome
+                .warning()
+                .unwrap_or_else(|| panic!("{outcome:?} must warn — it did not persist"));
+            assert!(
+                warning.starts_with("NOT SAVED"),
+                "{outcome:?} must lead with the headline so it survives truncation: {warning}"
+            );
+        }
+    }
+
+    /// A manager with no config file behind it reports that distinctly and does NOT
+    /// warn: `tcr demo` and `tcr status --probe` are memory-only by design, and a
+    /// "not saved" banner on every keypress there would be noise, not honesty.
+    #[test]
+    fn set_disabled_without_a_config_file_is_not_a_failure() {
+        let manager = build_manager(
+            config_with(vec![account("acct-a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert_eq!(manager.set_disabled(0, true), DisablePersist::NoConfigFile);
+        assert_eq!(manager.set_disabled(9, true), DisablePersist::NoSuchAccount);
+    }
+
+    /// **INV2 / FIX 6.** The config file write must not run under the config mutex.
+    /// That mutex is taken on the PER-CONNECTION path — `state.rs`'s
+    /// `session_affinity_enabled()`, called from `mitm.rs`'s serve path — so holding
+    /// it across `save_disabled`'s read + `sync_all` + rename let one TUI keypress
+    /// stall connection setup on an fsync.
+    ///
+    /// Measured by holding the config mutex here and requiring the write to complete
+    /// anyway. Under a persist that holds `config` across the save, the write cannot
+    /// start until this guard drops, so the poll below never sees the flag and the
+    /// test fails on its deadline.
+    #[test]
+    fn the_config_file_write_does_not_run_under_the_config_mutex() {
+        let path = tmp_config_path("persist-inv2");
+        write_account_file(&path, &["acct-a"]);
+        let manager =
+            build_manager_with_path(config_with(vec![account("acct-a", 0)]), path.clone());
+
+        // Stand in for a request-path `session_affinity_enabled()` holding the lock.
+        let held = manager.config.lock().expect("config lock poisoned");
+
+        let writer = {
+            let m = Arc::clone(&manager);
+            std::thread::spawn(move || m.set_disabled(0, true))
+        };
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if read_config_json(&path)["accounts"][0]
+                .get("disabled")
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the config file write blocked on the config mutex — INV2 violated"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        // INV3 still applies: the memory update is what waits for this guard.
+        drop(held);
+        assert_eq!(
+            writer.join().expect("persist thread panicked"),
+            DisablePersist::Persisted
+        );
+        assert_eq!(
+            manager.config.lock().unwrap().accounts[0].disabled,
+            Some(true)
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// **INV1 / FIX 6.** Concurrent persists must not interleave their
+    /// read-modify-write of the file. Each of these threads benches a DIFFERENT
+    /// account, so every flag must be present at the end; an interleaved
+    /// read-modify-write drops the flags written between another thread's read and
+    /// its rename, which shows up here as a missing flag.
+    #[test]
+    fn concurrent_persists_do_not_lose_each_others_writes() {
+        const ACCOUNTS: usize = 8;
+        let names: Vec<String> = (0..ACCOUNTS).map(|i| format!("acct-{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let path = tmp_config_path("persist-inv1");
+        write_account_file(&path, &refs);
+        let manager = build_manager_with_path(
+            config_with(names.iter().map(|n| account(n, 0)).collect()),
+            path.clone(),
+        );
+
+        let threads: Vec<_> = (0..ACCOUNTS)
+            .map(|idx| {
+                let m = Arc::clone(&manager);
+                std::thread::spawn(move || m.set_disabled(idx, true))
+            })
+            .collect();
+        for thread in threads {
+            assert_eq!(
+                thread.join().expect("persist thread panicked"),
+                DisablePersist::Persisted
+            );
+        }
+
+        let after = read_config_json(&path);
+        for idx in 0..ACCOUNTS {
+            assert_eq!(
+                after["accounts"][idx]["disabled"],
+                serde_json::json!(true),
+                "account {idx}'s flag was lost to an interleaved write: {after}"
+            );
+        }
+        assert_eq!(
+            after["warmupSeconds"],
+            serde_json::json!(900),
+            "an unmodelled key was dropped by the concurrent writes"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
     /// An out-of-range index is a no-op on both halves: nothing flips in memory
     /// and nothing is written, rather than persisting a flag for an account that
     /// does not exist.
@@ -4588,7 +5005,132 @@ mod tests {
 
         assert!(
             manager.warm_targets().is_empty(),
-            "a never-probed account's blank quota is unknown, not known-cold"
+            "an unread account's blank quota is unknown, not known-cold"
+        );
+    }
+
+    /// **THE spec-error guard.** The boot gate's predicate must be "a probe actually
+    /// READ this account's quota", never "a probe reported *something*":
+    /// `probe_account` calls `apply_usage` only on `Ok`, while `record_probe` stamps
+    /// `Error`/`Timeout`/`RateLimited` on failure — so after a failed first sweep
+    /// `probe_status != Never` with the quota still blank, and a `probe_status`-keyed
+    /// gate lifts on blank quota and hands the boot burst straight back. A FAILED
+    /// probe must leave the account a NON-target.
+    #[tokio::test]
+    async fn warm_targets_stays_empty_after_a_failed_probe() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        // `ScriptedProber` errors (500) on every token but `ok_token`; no account
+        // here carries that token, so the whole sweep fails — the fleet-wide false
+        // error `probing.rs` documents.
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+            Arc::new(ScriptedProber {
+                ok_token: "at-nobody".to_string(),
+            }),
+        );
+        assert!(manager.probe_interval_seconds() > 0);
+
+        manager.probe_all().await;
+
+        {
+            let accounts = manager.accounts.read().unwrap();
+            // The probe SPOKE — this is what makes `probe_status` the wrong gate.
+            assert!(
+                accounts
+                    .iter()
+                    .all(|a| a.probe_status != ProbeStatus::Never),
+                "the failed sweep must still stamp a terminal probe status on every row"
+            );
+            // …but it read nothing.
+            assert!(
+                accounts.iter().all(|a| !a.quota_known),
+                "a FAILED probe must never latch quota_known"
+            );
+        }
+        assert!(
+            manager.warm_targets().is_empty(),
+            "a failed probe leaves the quota unread, so nothing may be a warm target"
+        );
+    }
+
+    /// FIX 2's guard, and the other half of FIX 1. A SUCCESSFUL probe latches the
+    /// gate open and must WAKE the warm loop: its ticker fired its only immediate
+    /// tick before any quota existed and `MissedTickBehavior::Skip` puts the next one
+    /// a full `warmupSeconds` away, so without the wake a proxy restarted more often
+    /// than its warm interval warms nothing, ever.
+    ///
+    /// The prober reports a weekly bucket and NO 5h bucket on purpose: it proves the
+    /// latch is about the read, not about `five_hour.is_some()` — the account is a
+    /// target with `five_hour` still `None`.
+    #[tokio::test]
+    async fn a_successful_probe_opens_the_gate_and_wakes_the_warm_loop() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            refresher,
+            Arc::new(ColdOkProber),
+        );
+        let wake_window = std::time::Duration::from_millis(50);
+        assert!(manager.warm_targets().is_empty(), "boot: nothing read yet");
+        assert!(
+            tokio::time::timeout(wake_window, manager.warm_wake().notified())
+                .await
+                .is_err(),
+            "nothing may wake the warm loop before any quota has been read"
+        );
+
+        manager.probe_all().await;
+
+        assert!(
+            manager.accounts.read().unwrap()[0]
+                .quota
+                .five_hour
+                .is_none(),
+            "the fixture must leave the 5h window absent, or it proves nothing about the predicate"
+        );
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "a read quota opens the gate even with no 5h bucket in the response"
+        );
+        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            .await
+            .expect("the first successful probe must wake the warm loop, not leave it a full interval away");
+    }
+
+    /// The wake is edge-triggered on the false→true flip, so a steady-state probe
+    /// cadence cannot spin the warm loop: the SECOND successful sweep over the same
+    /// accounts signals nothing.
+    #[tokio::test]
+    async fn a_repeat_probe_does_not_re_wake_the_warm_loop() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            refresher,
+            Arc::new(ColdOkProber),
+        );
+        let wake_window = std::time::Duration::from_millis(50);
+
+        manager.probe_all().await;
+        // Consume the one wake the first read is entitled to.
+        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            .await
+            .expect("first read wakes the loop");
+
+        manager.probe_all().await;
+
+        assert!(
+            tokio::time::timeout(wake_window, manager.warm_wake().notified())
+                .await
+                .is_err(),
+            "quota_known is already latched, so a repeat probe must not re-wake the loop"
         );
     }
 
@@ -4608,11 +5150,13 @@ mod tests {
             ]),
             refresher,
         );
-        // Only the first two have been probed; the third is still `Never`.
+        // Only the first two have had their quota read; the third never has.
         {
             let mut accounts = manager.accounts.write().unwrap();
             accounts[0].probe_status = ProbeStatus::Ok;
+            accounts[0].quota_known = true;
             accounts[1].probe_status = ProbeStatus::Ok;
+            accounts[1].quota_known = true;
         }
         set_5h(&manager, 0, "0.10", -1); // probed, window expired → genuinely cold
         set_5h(&manager, 1, "0.10", 3); // probed, window live → already warm
@@ -4625,7 +5169,7 @@ mod tests {
     }
 
     /// The dark-feature guard. With `quotaProbeSeconds: 0` no probe task is ever
-    /// spawned, so `probe_status` stays `Never` forever. Gating on it
+    /// spawned, so `quota_known` stays `false` forever. Gating on it
     /// unconditionally would make keep-warm structurally unable to fire while
     /// still reading as enabled — so with probing off, the gate does not apply.
     #[test]
@@ -4638,13 +5182,13 @@ mod tests {
             refresher,
         );
         assert_eq!(manager.probe_interval_seconds(), 0);
-        // Nothing has been (or ever will be) probed.
+        // Nothing has been (or ever will be) probed, so no quota is known.
         assert!(manager
             .accounts
             .read()
             .unwrap()
             .iter()
-            .all(|a| a.probe_status == ProbeStatus::Never));
+            .all(|a| !a.quota_known));
 
         assert_eq!(
             manager.warm_targets(),
