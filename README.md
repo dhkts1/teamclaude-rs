@@ -94,6 +94,8 @@ affinity. Three are opt-in via `~/.config/teamclaude.json`, off by default:
   account while different sessions still spread across accounts.
 - `"warmupSeconds": <n>` — periodically warm idle accounts so their 5-hour window
   stays active. This one *spends real quota*, so enable it deliberately.
+  Keep-warm never warms an account whose quota it has not actually read, so it
+  does nothing until the first probe sweep has reported.
 - `"loadBalanceMigration": true` — re-pin a session off an account that several
   sessions stack on, onto a less-loaded one. Off by default for the same
   per-account-cache reason: a session that has a pin is already warm, so every

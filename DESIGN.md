@@ -6,7 +6,7 @@ company multi-tenant pool (that stays a separate multi-tenant service). Single u
 ~1000–1500 lines. Binary name: `tcr`.
 
 ## Drop-in config — `~/.config/teamclaude.json` (existing, unchanged)
-Read the SAME file the JS proxy uses. serde structs (camelCase via `#[serde(rename_all="camelCase")]`), tolerant of unknown fields (`#[serde(default)]` + ignore extras — the file also has `quotaProbeSeconds`, `routes`, `sx`, `warmupSeconds` we don't need). Persist token refreshes back to it atomically (temp file + rename), 0600, preserving unknown fields (round-trip via `serde_json::Value` for the parts we don't model, OR re-serialize a struct that carries `#[serde(flatten)] extra: Map<String,Value>`).
+Read the SAME file the JS proxy uses. serde structs (camelCase via `#[serde(rename_all="camelCase")]`), tolerant of unknown fields (`#[serde(default)]` + ignore extras — the file also has `routes` and `sx` we don't need; `quotaProbeSeconds` and `warmupSeconds` we DO read — see `manager/state.rs`). Persist token refreshes back to it atomically (temp file + rename), 0600, preserving unknown fields (round-trip via `serde_json::Value` for the parts we don't model, OR re-serialize a struct that carries `#[serde(flatten)] extra: Map<String,Value>`).
 
 ```
 Config { proxy: {port:u16=3456, apiKey:Option<String>}, upstream:String="https://api.anthropic.com",
@@ -42,4 +42,18 @@ Runtime-only (NOT persisted): current index, per-account learned quota + reset t
 - A local end-to-end smoke on a FREE port (NOT 3456 — Gil's live proxy owns it): boot headless with a 1-account test config (a dummy account is fine for the non-network paths), assert the server binds + `/` with no key → 401 + with the key → attempts upstream. Do not hit the real Anthropic API in tests; mock or gate that.
 
 ## Non-goals (keep it lean — NOT in this binary)
-Per-client keys, admin API, client locks, per-client attribution, keep-warm, egress routing, the configurable route table. Single global user. If Gil wants any later it's additive.
+Per-client keys, admin API, client locks, per-client attribution, egress routing, the configurable route table. Single global user. If Gil wants any later it's additive.
+
+**Keep-warm was a non-goal and is now shipped** (`src/warmer.rs`, `src/manager/warm.rs`), opt-in via
+`warmupSeconds` and OFF by default because — unlike the zero-spend usage probe — it costs real quota.
+It is called out here so this section is not read as a claim that it is absent: a doc that denies a
+shipped feature is worse than no doc, because the next reader reasons from it. This one did mislead a
+reader, in 2026-07.
+
+**Persisting runtime state across restarts was evaluated and rejected** (2026-07-31). Rate-limit holds
+looked like the one candidate worth keeping — they are self-expiring and no probe can re-derive them —
+but persisting them removes the restart escape hatch: with every account held, a restored fleet refuses
+every selection path and the proxy makes no upstream attempt at all until the holds expire, turning
+"restart to clear it" into an outage with a non-obvious recovery. The measured benefit was a handful of
+429 round trips per restart. Not worth it. Quota is likewise deliberately not persisted — the probe
+re-derives it within seconds, and a stale window can outlive its truth.
