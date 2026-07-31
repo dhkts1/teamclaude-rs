@@ -666,6 +666,66 @@ impl Manager {
         }
     }
 
+    /// Flush account `idx`'s `disabled` flag to the config file, so an account
+    /// deliberately benched from the TUI is still benched after a restart.
+    ///
+    /// Takes the SAME `self.config` lock as [`Self::persist_tokens`], for the same
+    /// reason: that lock is what serializes this file write against a concurrent
+    /// token rotation's whole read-modify-write. Writing outside it lets this
+    /// write's snapshot of the document clobber a refresh token that rotated in
+    /// between — and a refresh token is single-use, so the clobbered account 400s
+    /// (`invalid_grant`) on its next refresh and is dead until re-authed by hand.
+    ///
+    /// Writes the flag ONLY, via [`config::save_disabled`], never the whole config:
+    /// the in-memory `Config` is a boot-time snapshot, so flushing it whole would
+    /// revert every setting the user edited while the proxy was running.
+    ///
+    /// A missing `config_path` (tests, `tcr demo`, `tcr status --probe`) is a
+    /// SILENT no-op — those managers must never touch a real config file.
+    fn persist_disabled(&self, idx: usize, target: &config::Account, disabled: bool) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let mut config = self.config.lock().expect("config lock poisoned");
+        // Keep the boot-time snapshot in step with the file so the two views of
+        // the flag cannot diverge. Matched by identity, exactly as persist_tokens
+        // matches, so both land on the same entry.
+        if let Some(account) = config
+            .accounts
+            .iter_mut()
+            .find(|a| crate::identity::same_identity(a, target))
+        {
+            account.disabled = if disabled { Some(true) } else { None };
+        }
+        match config::save_disabled(path, target, disabled) {
+            Ok(config::DisabledWrite::Updated) => tracing::info!(
+                account = %target.name,
+                index = idx,
+                disabled,
+                "persisted account disabled flag to config"
+            ),
+            Ok(config::DisabledWrite::Unchanged) => tracing::debug!(
+                account = %target.name,
+                index = idx,
+                disabled,
+                "config already carries this disabled state; nothing written"
+            ),
+            Ok(config::DisabledWrite::NoEntry) => tracing::warn!(
+                account = %target.name,
+                index = idx,
+                path = %path.display(),
+                "no config entry carries this account's identity; the disabled flag will NOT survive a restart"
+            ),
+            Err(err) => tracing::error!(
+                error = %err,
+                account = %target.name,
+                index = idx,
+                path = %path.display(),
+                "failed to persist the disabled flag to config"
+            ),
+        }
+    }
+
     /// Sideline account `idx` on a proven-dead credential. Arms the recovery backoff
     /// with it, so even a hand-sidelined row is re-probed rather than stuck forever.
     pub fn mark_error(&self, idx: usize) {
@@ -679,15 +739,33 @@ impl Manager {
     }
 
     /// Enable/disable account `idx`. Re-enabling clears a stuck error/hold.
+    ///
+    /// The flag is also PERSISTED (see [`Self::persist_disabled`]) — memory-only
+    /// was the bug: a restart silently returned a deliberately benched account to
+    /// rotation, because the server writes nothing but credentials back.
     pub fn set_disabled(&self, idx: usize, disabled: bool) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
+        // Take the identity out under the accounts lock and RELEASE that lock
+        // before persisting. The persist path takes the config lock, and holding
+        // both at once here would invert the order `warm_targets` reads them in
+        // (config, then accounts) — the shape a deadlock is made of.
+        let target = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
             account.disabled = disabled;
             if !disabled && account.status == AccountStatus::Error {
                 account.status = AccountStatus::Active;
                 account.rate_limited_until_ms = None;
             }
-        }
+            crate::identity::probe(
+                &account.name,
+                account.account_uuid.clone(),
+                account.org_uuid.clone(),
+                account.org_name.clone(),
+            )
+        };
+        self.persist_disabled(idx, &target, disabled);
     }
 
     /// Record which account actually served the most recent request.
@@ -1085,6 +1163,29 @@ mod tests {
         warmer: Arc<dyn AccountWarmer>,
     ) -> Arc<Manager> {
         Manager::new(config, refresher, Arc::new(NoProber), warmer, None)
+    }
+
+    /// A manager that DOES have a config file behind it — the live server's shape.
+    /// Every other builder here passes `config_path = None`, which makes each
+    /// persist a silent no-op.
+    fn build_manager_with_path(config: Config, path: PathBuf) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(NoProber),
+            Arc::new(NoWarmer),
+            Some(path),
+        )
+    }
+
+    /// A unique temp path per test — the suite runs tests in parallel threads of
+    /// ONE process, so a pid-only name collides.
+    fn tmp_config_path(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("tcr-mgr-{tag}-{}-{seq}.json", std::process::id()))
     }
 
     /// Drive account `idx`'s 5-hour window to `util` with a reset `hours_from_now`
@@ -4119,6 +4220,127 @@ mod tests {
             assert!(seen.insert(key), "session keys must be unique");
             prev = key;
         }
+    }
+
+    // ---- durable disable (the TUI's `d`/`e` survives a restart) ----
+
+    /// A config file for `accounts`, in the on-disk shape, carrying an unmodelled
+    /// top-level key so collateral damage is visible.
+    fn write_account_file(path: &std::path::Path, names: &[&str]) {
+        let entries: Vec<String> = names
+            .iter()
+            .map(|n| {
+                format!(
+                    r#"{{ "name": "{n}", "type": "oauth", "accessToken": "at-{n}", "refreshToken": "rt-{n}" }}"#
+                )
+            })
+            .collect();
+        std::fs::write(
+            path,
+            format!(
+                r#"{{ "warmupSeconds": 900, "accounts": [ {} ] }}"#,
+                entries.join(", ")
+            ),
+        )
+        .expect("write test config");
+    }
+
+    fn read_config_json(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read test config"))
+            .expect("test config is valid JSON")
+    }
+
+    /// THE regression guard for this fix. Benching an account from the TUI wrote
+    /// memory only, so a restart silently returned it to rotation. `set_disabled`
+    /// must reach the file — and `e` must remove the key again, not write `false`.
+    #[test]
+    fn set_disabled_persists_through_to_the_config_file() {
+        let path = tmp_config_path("durable-disable");
+        write_account_file(&path, &["acct-a", "acct-b"]);
+        let manager = build_manager_with_path(
+            config_with(vec![account("acct-a", 0), account("acct-b", 0)]),
+            path.clone(),
+        );
+
+        manager.set_disabled(0, true);
+
+        let after = read_config_json(&path);
+        assert_eq!(after["accounts"][0]["disabled"], serde_json::json!(true));
+        assert!(
+            after["accounts"][1].get("disabled").is_none(),
+            "the unrelated account was flagged too: {after}"
+        );
+        assert_eq!(
+            after["warmupSeconds"],
+            serde_json::json!(900),
+            "an unmodelled key was dropped by the flag write"
+        );
+        // The in-memory config must agree with the file, so the two views of the
+        // flag cannot diverge.
+        assert_eq!(
+            manager.config.lock().unwrap().accounts[0].disabled,
+            Some(true)
+        );
+
+        // Re-enabling DROPS the key (the CLI contract), never writes false.
+        manager.set_disabled(0, false);
+        let after = read_config_json(&path);
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "re-enable must drop the key, not write false: {after}"
+        );
+        assert_eq!(manager.config.lock().unwrap().accounts[0].disabled, None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A manager with NO `config_path` — every test here, `tcr demo`, and
+    /// `tcr status --probe` — must write nothing at all. The demo drives
+    /// `set_disabled` on rows that have no config file behind them.
+    ///
+    /// Differential against the test above: same fixture, same call, and the only
+    /// difference is the absent path. Without the pair, "the file did not change"
+    /// would prove nothing.
+    #[test]
+    fn set_disabled_writes_nothing_without_a_config_path() {
+        let path = tmp_config_path("durable-disable-none");
+        write_account_file(&path, &["acct-a"]);
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let manager = build_manager(
+            config_with(vec![account("acct-a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert!(manager.config_path.is_none());
+
+        manager.set_disabled(0, true);
+
+        // The runtime row still flips — only the disk write is suppressed.
+        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a manager with no config_path must never write to disk"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An out-of-range index is a no-op on both halves: nothing flips in memory
+    /// and nothing is written, rather than persisting a flag for an account that
+    /// does not exist.
+    #[test]
+    fn set_disabled_out_of_range_writes_nothing() {
+        let path = tmp_config_path("durable-disable-oob");
+        write_account_file(&path, &["acct-a"]);
+        let before = std::fs::read_to_string(&path).unwrap();
+        let manager =
+            build_manager_with_path(config_with(vec![account("acct-a", 0)]), path.clone());
+
+        manager.set_disabled(9, true);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_file(&path).ok();
     }
 
     // ---- keep-warm (opt-in idle-account warming) ----
