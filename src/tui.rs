@@ -82,6 +82,39 @@ enum Action {
     Enable,
 }
 
+/// How long a [`Notice`] stays on screen. Long enough to read a full line without
+/// hunting for it, short enough that a stale warning never outlives the state it
+/// describes.
+const NOTICE_SECONDS: u64 = 6;
+
+/// A short-lived line above the accounts table, for the one thing the dashboard
+/// otherwise cannot tell you: that the key you just pressed did not do what the
+/// table now shows. `tracing` is redirected to a log file in TUI mode, so a failed
+/// `disabled` write was reported only somewhere the user is not looking, while the
+/// row happily rendered as benched.
+struct Notice {
+    text: &'static str,
+    expires_at: std::time::Instant,
+}
+
+impl Notice {
+    fn new(text: &'static str) -> Self {
+        Self {
+            text,
+            expires_at: std::time::Instant::now() + Duration::from_secs(NOTICE_SECONDS),
+        }
+    }
+}
+
+/// The notice to paint this frame: the current one until it expires, then nothing.
+/// Pure so the expiry rule is testable without a terminal or a real clock.
+fn live_notice(notice: &Option<Notice>, now: std::time::Instant) -> Option<&str> {
+    notice
+        .as_ref()
+        .filter(|n| now < n.expires_at)
+        .map(|n| n.text)
+}
+
 /// Run the dashboard until the user quits (`q` or `Ctrl-C`). Returns once the
 /// terminal has been restored by [`TerminalGuard`]'s drop.
 pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
@@ -91,6 +124,8 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     let mut selected: usize = 0;
+    // The most recent "that keypress did not stick" warning, if it is still fresh.
+    let mut notice: Option<Notice> = None;
 
     loop {
         tokio::select! {
@@ -102,8 +137,9 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                 } else if selected >= count {
                     selected = count - 1;
                 }
+                let live = live_notice(&notice, std::time::Instant::now());
                 // A single failed repaint must not crash the process.
-                if let Err(err) = terminal.draw(|frame| render(frame, &snapshot, selected)) {
+                if let Err(err) = terminal.draw(|frame| render(frame, &snapshot, selected, live)) {
                     tracing::warn!(error = %err, "tui repaint failed");
                 }
             }
@@ -113,8 +149,16 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                         Action::Quit => break,
                         Action::Up => selected = selected.saturating_sub(1),
                         Action::Down => selected = selected.saturating_add(1),
-                        Action::Disable => manager.set_disabled(selected, true),
-                        Action::Enable => manager.set_disabled(selected, false),
+                        // A persist that did not reach disk is surfaced HERE, not
+                        // only in the log the TUI has redirected away from the
+                        // screen — otherwise the row renders benched and the user
+                        // finds out at the next restart.
+                        Action::Disable => {
+                            notice = manager.set_disabled(selected, true).warning().map(Notice::new);
+                        }
+                        Action::Enable => {
+                            notice = manager.set_disabled(selected, false).warning().map(Notice::new);
+                        }
                         Action::None => {}
                     },
                     // Paste / resize / focus / mouse are non-fatal; a multi-char
@@ -185,19 +229,31 @@ fn accounts_title(shown: u16, total: u16) -> String {
 
 /// Paint the whole frame: accounts table on top, sessions pane in the middle,
 /// request log below.
-fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize) {
+fn render(frame: &mut Frame, snapshot: &StatsSnapshot, selected: usize, notice: Option<&str>) {
     let now = OffsetDateTime::now_utc();
     let area = frame.area();
     // A single-row fleet banner sits above everything — the fleet aggregate the
     // per-row table can't show (how many accounts are actually in rotation, and
     // when the first one returns when none are). The rest of the frame lays out
     // below it exactly as before.
+    //
+    // A transient notice takes ONE more row directly under it, and only while there
+    // is something to say — it is added to the layout rather than painted over the
+    // banner, so a warning never costs the fleet status it might explain.
+    let notice_height = u16::from(notice.is_some());
     let outer = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(notice_height),
+            Constraint::Min(0),
+        ])
         .split(area);
     render_fleet_banner(frame, outer[0], snapshot, now);
-    let body = outer[1];
+    if let Some(text) = notice {
+        render_notice(frame, outer[1], text);
+    }
+    let body = outer[2];
     // Accounts is the primary data: budget its height first so it is the LAST
     // thing clipped. SESSIONS absorbs the vertical slack (grows when the terminal
     // is tall); the recent-log lives in whatever remains, so it shrinks/vanishes
@@ -286,6 +342,17 @@ fn render_fleet_banner(
             .add_modifier(Modifier::BOLD)
     };
     frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), area);
+}
+
+/// The transient notice row. Red + bold, same alarm styling the fleet banner uses
+/// when the fleet is down: every notice we raise means an action the user believes
+/// happened did not.
+fn render_notice(frame: &mut Frame, area: Rect, text: &str) {
+    let style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text.to_string(), style))),
+        area,
+    );
 }
 
 /// The shared skeleton behind the two data panes ([`render_accounts`] and
@@ -1506,6 +1573,77 @@ mod tests {
         assert!(text.contains("full"), "compact keeps the 7d quota label");
         assert!(!text.contains("Probe"), "compact drops the Probe column");
         assert!(!text.contains("Cache"), "compact drops the Cache column");
+    }
+
+    /// The person who pressed `d` must find out the write failed WITHOUT reading a
+    /// log file. `tracing` goes to a file in TUI mode, so a failed persist was
+    /// invisible while the row kept rendering as benched — the warning has to be on
+    /// screen, and it has to cost a row rather than paint over the fleet banner.
+    #[test]
+    fn render_shows_a_failed_persist_notice_without_hiding_the_fleet_banner() {
+        let snapshot = util_snapshot(QuotaState::Normal);
+        let warning = crate::manager::DisablePersist::NoEntry
+            .warning()
+            .expect("a NoEntry persist must warn");
+
+        let with = {
+            let backend = TestBackend::new(120, 14);
+            let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render(frame, &snapshot, 0, Some(warning)))
+                .expect("render succeeds");
+            buffer_rows(terminal.backend().buffer())
+        };
+        assert!(
+            with.iter().any(|row| row.contains("NOT SAVED")),
+            "the failed persist must be on screen\n{}",
+            with.join("\n")
+        );
+        assert!(
+            with[0].contains("FLEET"),
+            "the notice must not paint over the fleet banner\n{}",
+            with.join("\n")
+        );
+
+        // And with nothing to say it costs no rows at all — the notice is added to
+        // the layout only while it is live.
+        let without = {
+            let backend = TestBackend::new(120, 14);
+            let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+            terminal
+                .draw(|frame| render(frame, &snapshot, 0, None))
+                .expect("render succeeds");
+            buffer_rows(terminal.backend().buffer())
+        };
+        assert!(
+            !without.iter().any(|row| row.contains("NOT SAVED")),
+            "no notice may render when there is nothing to warn about"
+        );
+        assert_ne!(
+            with[1], without[1],
+            "the notice must SHIFT the body down by a row, not overwrite it"
+        );
+    }
+
+    /// A notice is transient: it shows until it expires and then stops, so a stale
+    /// warning can never outlive the state it describes.
+    #[test]
+    fn a_notice_expires_and_stops_rendering() {
+        let notice = Some(Notice::new("NOT SAVED: test"));
+        let start = std::time::Instant::now();
+
+        assert_eq!(live_notice(&notice, start), Some("NOT SAVED: test"));
+        assert_eq!(
+            live_notice(&notice, start + Duration::from_secs(NOTICE_SECONDS - 1)),
+            Some("NOT SAVED: test"),
+            "the notice must survive long enough to be read"
+        );
+        assert_eq!(
+            live_notice(&notice, start + Duration::from_secs(NOTICE_SECONDS + 1)),
+            None,
+            "the notice must clear itself once it expires"
+        );
+        assert_eq!(live_notice(&None, start), None);
     }
 
     #[test]
