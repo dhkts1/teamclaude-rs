@@ -462,7 +462,21 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             let mut ticker = tokio::time::interval(Duration::from_secs(warmup_seconds));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
+                // Two things start a sweep: the configured cadence, and the probe
+                // reporting that it has READ an account's quota for the first time.
+                // The second is what keeps `warm_targets`' boot gate from being a
+                // kill switch — the ticker's immediate first tick necessarily finds
+                // no targets (no quota read yet) and `Skip` puts the next one a whole
+                // `warmupSeconds` away, so at 3600s a proxy restarted more often than
+                // hourly would otherwise warm nothing, ever. A wake arriving while
+                // this task is inside `warm_all` is stored as a permit by
+                // `notify_one` and consumed by the next `notified()`, so it is never
+                // lost; the flip fires at most once per account per process, so this
+                // cannot spin.
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    _ = m.warm_wake().notified() => {}
+                }
                 m.warm_all().await;
             }
         });

@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use time::OffsetDateTime;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::config::{self, Config, PacingConfig, ThrottleConfig};
 use crate::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
@@ -136,6 +136,22 @@ pub struct AccountRuntime {
     pub expires_at_ms: Option<i64>,
     pub status: AccountStatus,
     pub quota: Quota,
+    /// Latched `true` the first time this account's quota was actually READ from
+    /// the usage endpoint (in [`Manager::apply_usage`], which runs only on a
+    /// successful probe). Never cleared — once we have read an account's quota we
+    /// have read it, and a later probe FAILURE deliberately leaves the
+    /// last-learned windows in place rather than blanking them.
+    ///
+    /// This, and NOT `probe_status`, is [`Manager::warm_targets`]' boot gate.
+    /// `record_probe` stamps `Error`/`Timeout`/`RateLimited` on a FAILED probe too,
+    /// so `probe_status != Never` while `quota` is still `Quota::default()` — and a
+    /// gate keyed on that lifts on blank quota, which is the boot burst coming
+    /// straight back (a real fleet-wide false-error sweep is documented in
+    /// `probing.rs`). It is equally NOT `quota.five_hour.is_some()`: `apply_bucket`
+    /// early-returns when the endpoint omits the bucket, so an account whose
+    /// responses never carry a 5h bucket would become permanently warm-INELIGIBLE —
+    /// a dark feature that reads as enabled.
+    pub quota_known: bool,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
@@ -201,6 +217,9 @@ impl AccountRuntime {
             expires_at_ms: account.expires_at.map(oauth::normalize_expires_at),
             status: AccountStatus::Active,
             quota: Quota::default(),
+            // Nothing restores the last known windows across a restart, so at boot
+            // every account's quota is genuinely unread.
+            quota_known: false,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -245,6 +264,23 @@ pub struct Manager {
     warmer: Arc<dyn AccountWarmer>,
     /// Ensures two keep-warm sweeps never overlap (mirrors the JS `_running` flag).
     warm_in_flight: AtomicBool,
+    /// Wakes the keep-warm loop the moment an account's quota is first READ, so the
+    /// boot gate on [`Self::warm_targets`] costs a probe cycle rather than a full
+    /// `warmupSeconds` of dark time.
+    ///
+    /// Without it the gate is a silent kill switch: the warm loop's ticker fires its
+    /// first tick immediately, that sweep necessarily finds no targets (no quota has
+    /// been read yet), and `MissedTickBehavior::Skip` puts the next tick a whole
+    /// interval away — so at `warmupSeconds: 3600` a proxy restarted more often than
+    /// hourly warms NOTHING, ever, while reading as enabled in config and TUI.
+    ///
+    /// `Notify` rather than a channel because a permit stored by `notify_one` before
+    /// the loop is waiting is consumed by its next `notified()` — the wake survives
+    /// the race between the first probe and the loop reaching its `select!`, and a
+    /// `Notified` dropped by a losing `select!` branch hands its permit back. Fired
+    /// ONLY on the false→true `quota_known` flip, which happens at most once per
+    /// account per process, so it can never become a self-feeding loop of sweeps.
+    warm_wake: Notify,
     /// Client used for upstream forwarding — deliberately no total timeout so
     /// long SSE streams are never cut (an idle guard belongs on the read side).
     http: reqwest::Client,
@@ -426,6 +462,7 @@ impl Manager {
             prober,
             warmer,
             warm_in_flight: AtomicBool::new(false),
+            warm_wake: Notify::new(),
             // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
             // proxy — routing our upstream through an ambient proxy (e.g. the JS
             // teamclaude on :3456) loops us through the thing we replace and every
@@ -1096,6 +1133,28 @@ mod tests {
         }
     }
 
+    /// A prober that SUCCEEDS for every account and reports a weekly window only —
+    /// no 5h bucket at all. That is the shape that separates the two candidate boot
+    /// predicates: the quota was genuinely read (so `quota_known` latches and the
+    /// account is warm-eligible), while `quota.five_hour` stays `None` because
+    /// `apply_bucket` early-returns on an absent bucket. Gating on
+    /// `five_hour.is_some()` would leave such an account warm-INELIGIBLE forever.
+    struct ColdOkProber;
+    impl UsageProber for ColdOkProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            Box::pin(async {
+                Ok(Usage {
+                    five_hour: None,
+                    seven_day: Some(UsageBucket {
+                        utilization: Some(0.10),
+                        reset_at_ms: Some(crate::now_ms() + 86_400_000),
+                    }),
+                    seven_day_oi: None,
+                })
+            })
+        }
+    }
+
     /// A warmer that never hits the network — the default for tests that do not
     /// exercise keep-warm. If invoked it records nothing and returns empty headers.
     struct NoWarmer;
@@ -1244,18 +1303,20 @@ mod tests {
         config
     }
 
-    /// Mark every account as having been probed at least once.
+    /// Mark every account as having had its quota successfully READ at least once.
     ///
-    /// `warm_targets` skips a never-probed account while probing is enabled (a
-    /// blank quota is unknown, not known-cold), and `config_with` leaves
-    /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm
-    /// test below would be measuring the boot gate instead of the predicate it is
-    /// actually about. `update_quota` (which `set_5h`/`set_7d` drive) deliberately
-    /// does not touch `probe_status`; only a real probe does.
+    /// `warm_targets` skips an account whose quota was never read while probing is
+    /// enabled (blank quota is unknown, not known-cold), and `config_with` leaves
+    /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm test
+    /// below would be measuring the boot gate instead of the predicate it is
+    /// actually about. `update_quota` (which `set_5h`/`set_7d` drive) is the
+    /// response-header path and deliberately touches neither `quota_known` nor
+    /// `probe_status`; only a successful probe does.
     fn mark_all_probed(manager: &Manager) {
         let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
         for account in accounts.iter_mut() {
             account.probe_status = ProbeStatus::Ok;
+            account.quota_known = true;
         }
     }
 
@@ -4588,7 +4649,132 @@ mod tests {
 
         assert!(
             manager.warm_targets().is_empty(),
-            "a never-probed account's blank quota is unknown, not known-cold"
+            "an unread account's blank quota is unknown, not known-cold"
+        );
+    }
+
+    /// **THE spec-error guard.** The boot gate's predicate must be "a probe actually
+    /// READ this account's quota", never "a probe reported *something*":
+    /// `probe_account` calls `apply_usage` only on `Ok`, while `record_probe` stamps
+    /// `Error`/`Timeout`/`RateLimited` on failure — so after a failed first sweep
+    /// `probe_status != Never` with the quota still blank, and a `probe_status`-keyed
+    /// gate lifts on blank quota and hands the boot burst straight back. A FAILED
+    /// probe must leave the account a NON-target.
+    #[tokio::test]
+    async fn warm_targets_stays_empty_after_a_failed_probe() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        // `ScriptedProber` errors (500) on every token but `ok_token`; no account
+        // here carries that token, so the whole sweep fails — the fleet-wide false
+        // error `probing.rs` documents.
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+            Arc::new(ScriptedProber {
+                ok_token: "at-nobody".to_string(),
+            }),
+        );
+        assert!(manager.probe_interval_seconds() > 0);
+
+        manager.probe_all().await;
+
+        {
+            let accounts = manager.accounts.read().unwrap();
+            // The probe SPOKE — this is what makes `probe_status` the wrong gate.
+            assert!(
+                accounts
+                    .iter()
+                    .all(|a| a.probe_status != ProbeStatus::Never),
+                "the failed sweep must still stamp a terminal probe status on every row"
+            );
+            // …but it read nothing.
+            assert!(
+                accounts.iter().all(|a| !a.quota_known),
+                "a FAILED probe must never latch quota_known"
+            );
+        }
+        assert!(
+            manager.warm_targets().is_empty(),
+            "a failed probe leaves the quota unread, so nothing may be a warm target"
+        );
+    }
+
+    /// FIX 2's guard, and the other half of FIX 1. A SUCCESSFUL probe latches the
+    /// gate open and must WAKE the warm loop: its ticker fired its only immediate
+    /// tick before any quota existed and `MissedTickBehavior::Skip` puts the next one
+    /// a full `warmupSeconds` away, so without the wake a proxy restarted more often
+    /// than its warm interval warms nothing, ever.
+    ///
+    /// The prober reports a weekly bucket and NO 5h bucket on purpose: it proves the
+    /// latch is about the read, not about `five_hour.is_some()` — the account is a
+    /// target with `five_hour` still `None`.
+    #[tokio::test]
+    async fn a_successful_probe_opens_the_gate_and_wakes_the_warm_loop() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            refresher,
+            Arc::new(ColdOkProber),
+        );
+        let wake_window = std::time::Duration::from_millis(50);
+        assert!(manager.warm_targets().is_empty(), "boot: nothing read yet");
+        assert!(
+            tokio::time::timeout(wake_window, manager.warm_wake().notified())
+                .await
+                .is_err(),
+            "nothing may wake the warm loop before any quota has been read"
+        );
+
+        manager.probe_all().await;
+
+        assert!(
+            manager.accounts.read().unwrap()[0]
+                .quota
+                .five_hour
+                .is_none(),
+            "the fixture must leave the 5h window absent, or it proves nothing about the predicate"
+        );
+        assert_eq!(
+            manager.warm_targets(),
+            vec![0],
+            "a read quota opens the gate even with no 5h bucket in the response"
+        );
+        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            .await
+            .expect("the first successful probe must wake the warm loop, not leave it a full interval away");
+    }
+
+    /// The wake is edge-triggered on the false→true flip, so a steady-state probe
+    /// cadence cannot spin the warm loop: the SECOND successful sweep over the same
+    /// accounts signals nothing.
+    #[tokio::test]
+    async fn a_repeat_probe_does_not_re_wake_the_warm_loop() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            refresher,
+            Arc::new(ColdOkProber),
+        );
+        let wake_window = std::time::Duration::from_millis(50);
+
+        manager.probe_all().await;
+        // Consume the one wake the first read is entitled to.
+        tokio::time::timeout(wake_window, manager.warm_wake().notified())
+            .await
+            .expect("first read wakes the loop");
+
+        manager.probe_all().await;
+
+        assert!(
+            tokio::time::timeout(wake_window, manager.warm_wake().notified())
+                .await
+                .is_err(),
+            "quota_known is already latched, so a repeat probe must not re-wake the loop"
         );
     }
 
@@ -4608,11 +4794,13 @@ mod tests {
             ]),
             refresher,
         );
-        // Only the first two have been probed; the third is still `Never`.
+        // Only the first two have had their quota read; the third never has.
         {
             let mut accounts = manager.accounts.write().unwrap();
             accounts[0].probe_status = ProbeStatus::Ok;
+            accounts[0].quota_known = true;
             accounts[1].probe_status = ProbeStatus::Ok;
+            accounts[1].quota_known = true;
         }
         set_5h(&manager, 0, "0.10", -1); // probed, window expired → genuinely cold
         set_5h(&manager, 1, "0.10", 3); // probed, window live → already warm
@@ -4625,7 +4813,7 @@ mod tests {
     }
 
     /// The dark-feature guard. With `quotaProbeSeconds: 0` no probe task is ever
-    /// spawned, so `probe_status` stays `Never` forever. Gating on it
+    /// spawned, so `quota_known` stays `false` forever. Gating on it
     /// unconditionally would make keep-warm structurally unable to fire while
     /// still reading as enabled — so with probing off, the gate does not apply.
     #[test]
@@ -4638,13 +4826,13 @@ mod tests {
             refresher,
         );
         assert_eq!(manager.probe_interval_seconds(), 0);
-        // Nothing has been (or ever will be) probed.
+        // Nothing has been (or ever will be) probed, so no quota is known.
         assert!(manager
             .accounts
             .read()
             .unwrap()
             .iter()
-            .all(|a| a.probe_status == ProbeStatus::Never));
+            .all(|a| !a.quota_known));
 
         assert_eq!(
             manager.warm_targets(),
