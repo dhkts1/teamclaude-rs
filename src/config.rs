@@ -656,6 +656,122 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeRe
     Ok(report)
 }
 
+/// What a targeted [`save_disabled`] did to the on-disk document. Reported
+/// rather than swallowed so the caller can say, in one line, whether a benched
+/// account will actually still be benched after a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisabledWrite {
+    /// The flag was set (or dropped) on the matching entry and the file rewritten.
+    Updated,
+    /// The document already said exactly this, so nothing was written and the
+    /// file is byte-identical. A file holding single-use refresh tokens is
+    /// rewritten only when it must be.
+    Unchanged,
+    /// Nothing on disk carries that identity — the entry was deleted or renamed
+    /// while the proxy ran — or the document has no usable `accounts` array.
+    /// Nothing was written, so the flag will NOT survive a restart.
+    NoEntry,
+}
+
+impl std::fmt::Display for DisabledWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Updated => "updated",
+            Self::Unchanged => "unchanged",
+            Self::NoEntry => "no matching entry on disk",
+        })
+    }
+}
+
+/// Persist ONLY the `disabled` flag of the one account matching `target`'s
+/// identity into the file at `path`, leaving every other key — and every other
+/// account — exactly as the user left it.
+///
+/// Same read-modify-write shape as [`save_tokens`], and for the same reason: the
+/// running server's `Config` is a boot-time snapshot, so writing it whole (what
+/// [`save`] does) reverts every setting the user edited while the proxy ran. The
+/// edit therefore runs on the file's RAW JSON document and never on a `Config`
+/// round-trip, so a key the user just deleted cannot reappear as its serde
+/// default.
+///
+/// `disabled == false` REMOVES the key rather than writing `false` — matching
+/// the CLI contract pinned by `cli::tests::set_enabled_false_drops_the_disabled_key`
+/// and the JS `delete account.disabled` it was ported from. A stale `false`
+/// already on disk is dropped for the same reason.
+///
+/// Unlike [`save_tokens`] there is deliberately NO whole-config fallback when the
+/// file is unreadable or malformed. A rotated refresh token is single-use, so
+/// losing one is unrecoverable and worth the clobber risk; a lost `disabled` flag
+/// costs one un-benched account and is fixed by pressing `d` again. Writing a
+/// whole boot-time snapshot over a file we could not even parse is the exact
+/// clobber this module exists to prevent, so the error comes back instead.
+pub fn save_disabled(
+    path: &Path,
+    target: &Account,
+    disabled: bool,
+) -> Result<DisabledWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_disabled(&mut doc, target, disabled);
+    if outcome == DisabledWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+/// Set or remove `disabled` on the one entry in `doc` matching `target`. Reports
+/// whether the document actually changed, so the caller can skip a pointless
+/// rewrite of a credential file.
+fn merge_disabled(doc: &mut Map<String, Value>, target: &Account, disabled: bool) -> DisabledWrite {
+    let Some(entry) = find_account_entry(doc, target) else {
+        return DisabledWrite::NoEntry;
+    };
+    // `true` writes the key; `false` DROPS it (never a `false` literal).
+    let desired = disabled.then_some(Value::Bool(true));
+    if entry.get("disabled").cloned() == desired {
+        return DisabledWrite::Unchanged;
+    }
+    match desired {
+        Some(value) => entry.insert("disabled".to_string(), value),
+        None => entry.remove("disabled"),
+    };
+    DisabledWrite::Updated
+}
+
+/// The on-disk `accounts` entry whose identity matches `target`.
+///
+/// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::same_identity`]
+/// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled
+/// flag can never land on two different entries. The first match wins:
+/// `same_identity` is unique per identity in a well-formed config, and the CLI
+/// already refuses an ambiguous query outright rather than guessing.
+///
+/// `None` covers every "nothing to write into" shape — no `accounts` key, an
+/// `accounts` that is not an array, or no entry carrying that identity.
+fn find_account_entry<'a>(
+    doc: &'a mut Map<String, Value>,
+    target: &Account,
+) -> Option<&'a mut Map<String, Value>> {
+    for entry in doc.get_mut("accounts")?.as_array_mut()? {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
+        else {
+            continue;
+        };
+        let probe = crate::identity::probe(
+            &stored.name,
+            stored.account_uuid,
+            stored.org_uuid,
+            stored.org_name,
+        );
+        if crate::identity::same_identity(target, &probe) {
+            return Some(object);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1237,6 +1353,284 @@ mod tests {
         // …and the fallback.
         fs::remove_file(&path).unwrap();
         save_tokens(&path, &memory).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- save_disabled (the TUI's `d`/`e`, made durable) -------------------
+
+    /// A file carrying keys the server does not model, plus a second account, so
+    /// a targeted flag write can be checked for collateral damage.
+    const DISABLE_SAMPLE: &str = r#"{
+      "warmupSeconds": 900,
+      "pacing": { "maxInFlightPerAccount": 3 },
+      "routes": [{ "name": "r1", "match": "*fable*" }],
+      "accounts": [
+        { "name": "acct-a", "type": "oauth", "accessToken": "at-a",
+          "refreshToken": "rt-a", "expiresAt": 1, "models": ["claude-fable-5"] },
+        { "name": "acct-b", "type": "oauth", "accessToken": "at-b",
+          "refreshToken": "rt-b", "expiresAt": 2 }
+      ]
+    }"#;
+
+    /// An identity probe in the legacy (no-uuid) shape every real config uses,
+    /// where `same_identity` reduces to name equality.
+    fn by_name(name: &str) -> Account {
+        crate::identity::probe(name, None, None, None)
+    }
+
+    /// Disabling writes `"disabled": true` onto the right entry and changes
+    /// NOTHING else — the whole point of editing the raw document instead of
+    /// round-tripping a boot-time `Config`. Strip the one key we asked for and
+    /// the document must be identical to what the user had.
+    #[test]
+    fn disable_writes_the_flag_and_changes_nothing_else() {
+        let path = tmp_path("disable-write");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-a"), true).unwrap(),
+            DisabledWrite::Updated
+        );
+
+        let mut after = read_json(&path);
+        assert_eq!(after["accounts"][0]["disabled"], json!(true));
+        after["accounts"][0]
+            .as_object_mut()
+            .expect("the entry is an object")
+            .remove("disabled");
+        let before: Value = serde_json::from_str(DISABLE_SAMPLE).unwrap();
+        assert_eq!(
+            after, before,
+            "the write touched something other than the disabled flag"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Re-enabling DROPS the key rather than writing `false`, matching the CLI
+    /// contract pinned by `cli::tests::set_enabled_false_drops_the_disabled_key`.
+    /// A full disable→enable round trip must leave the file as it started.
+    #[test]
+    fn re_enable_drops_the_key_and_round_trips_the_document() {
+        let path = tmp_path("disable-roundtrip");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        save_disabled(&path, &by_name("acct-a"), true).unwrap();
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-a"), false).unwrap(),
+            DisabledWrite::Updated
+        );
+
+        let after = read_json(&path);
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "re-enable must DROP the disabled key, not write false: {after}"
+        );
+        let before: Value = serde_json::from_str(DISABLE_SAMPLE).unwrap();
+        assert_eq!(
+            after, before,
+            "a disable→enable round trip must leave the document as it started"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The unrelated account and the unmodelled keys (`warmupSeconds`, `pacing`,
+    /// `routes`, per-account `models`) survive the write untouched. Named
+    /// separately from the equality check above so weakening that one still trips
+    /// a gate on the preserve-unknown-keys guarantee.
+    #[test]
+    fn disable_leaves_other_accounts_and_unmodelled_keys_untouched() {
+        let path = tmp_path("disable-collateral");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        save_disabled(&path, &by_name("acct-a"), true).unwrap();
+
+        let after = read_json(&path);
+        assert_eq!(after["warmupSeconds"], json!(900));
+        assert_eq!(after["pacing"]["maxInFlightPerAccount"], json!(3));
+        assert!(after["routes"].is_array());
+        assert_eq!(after["accounts"][0]["models"], json!(["claude-fable-5"]));
+        // The account we did NOT name keeps its credentials and gains no flag.
+        assert_eq!(after["accounts"][1]["name"], json!("acct-b"));
+        assert_eq!(after["accounts"][1]["accessToken"], json!("at-b"));
+        assert_eq!(after["accounts"][1]["refreshToken"], json!("rt-b"));
+        assert!(
+            after["accounts"][1].get("disabled").is_none(),
+            "the unrelated account was flagged too: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A redundant write — the document already says exactly this — reports
+    /// `Unchanged` and does not rewrite the file. A file holding single-use
+    /// refresh tokens is not rewritten to say what it already said.
+    #[test]
+    fn redundant_write_reports_unchanged_and_leaves_the_file_alone() {
+        let path = tmp_path("disable-noop");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        // Already enabled (no key at all) → re-enabling is a no-op.
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-a"), false).unwrap(),
+            DisabledWrite::Unchanged
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            DISABLE_SAMPLE,
+            "an Unchanged write must leave the file byte-identical, not reformat it"
+        );
+
+        // And once disabled, disabling again is a no-op too.
+        save_disabled(&path, &by_name("acct-a"), true).unwrap();
+        let disabled_text = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-a"), true).unwrap(),
+            DisabledWrite::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), disabled_text);
+        fs::remove_file(&path).ok();
+    }
+
+    /// A `"disabled": false` already on disk is normalized away on re-enable
+    /// rather than left sitting there — same end state the CLI produces.
+    #[test]
+    fn stale_disabled_false_on_disk_is_dropped() {
+        let path = tmp_path("disable-stale-false");
+        fs::write(
+            &path,
+            r#"{ "accounts": [ { "name": "acct-a", "accessToken": "at-a", "disabled": false } ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-a"), false).unwrap(),
+            DisabledWrite::Updated
+        );
+        let after = read_json(&path);
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "a stale false must be dropped, not kept: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// No on-disk entry carries that identity (deleted or renamed while the proxy
+    /// ran): report `NoEntry` and write NOTHING, so the caller can warn that the
+    /// flag will not survive a restart instead of silently believing it landed.
+    #[test]
+    fn disable_with_no_matching_entry_writes_nothing() {
+        let path = tmp_path("disable-no-entry");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-gone"), true).unwrap(),
+            DisabledWrite::NoEntry
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            DISABLE_SAMPLE,
+            "a no-match write must leave the file byte-identical"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A document with no usable `accounts` list is `NoEntry`, never a fallback
+    /// that writes a whole config over it — the clobber `save_tokens` accepts for
+    /// a single-use token is NOT worth it for a flag that can be re-set by hand.
+    #[test]
+    fn disable_with_no_usable_accounts_list_writes_nothing() {
+        for document in [r#"{ "upstream": "x" }"#, r#"{ "accounts": "nope" }"#] {
+            let path = tmp_path("disable-unusable");
+            fs::write(&path, document).unwrap();
+            assert_eq!(
+                save_disabled(&path, &by_name("acct-a"), true).unwrap(),
+                DisabledWrite::NoEntry
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), document);
+            fs::remove_file(&path).ok();
+        }
+    }
+
+    /// An unreadable or malformed file surfaces the ERROR rather than taking
+    /// `save_tokens`' whole-config fallback. Writing a boot-time snapshot over a
+    /// file we could not parse is the clobber this module exists to prevent.
+    #[test]
+    fn disable_surfaces_errors_instead_of_clobbering() {
+        let missing = tmp_path("disable-missing");
+        assert!(!missing.exists());
+        assert!(matches!(
+            save_disabled(&missing, &by_name("acct-a"), true),
+            Err(ConfigError::Io(_))
+        ));
+        assert!(
+            !missing.exists(),
+            "a missing config must not be created by a flag write"
+        );
+
+        let malformed = tmp_path("disable-malformed");
+        fs::write(&malformed, "{ not json").unwrap();
+        assert!(matches!(
+            save_disabled(&malformed, &by_name("acct-a"), true),
+            Err(ConfigError::Parse(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(&malformed).unwrap(),
+            "{ not json",
+            "a malformed config must be left exactly as found"
+        );
+        fs::remove_file(&malformed).ok();
+    }
+
+    /// The flag lands on the right ORG when one email is logged into two — the
+    /// same identity matching `merge_tokens` uses, so a rotated credential and a
+    /// disabled flag can never land on two different entries.
+    #[test]
+    fn disable_picks_the_right_entry_when_one_email_has_two_orgs() {
+        let path = tmp_path("disable-two-orgs");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
+                  "orgUuid": "org-a", "orgName": "Org A" },
+                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
+                  "orgUuid": "org-b", "orgName": "Org B" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let target = crate::identity::probe(
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            Some("org-b".to_string()),
+            Some("Org B".to_string()),
+        );
+        assert_eq!(
+            save_disabled(&path, &target, true).unwrap(),
+            DisabledWrite::Updated
+        );
+
+        let after = read_json(&path);
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "the flag landed on the wrong org: {after}"
+        );
+        assert_eq!(after["accounts"][1]["disabled"], json!(true));
+        fs::remove_file(&path).ok();
+    }
+
+    /// The flag write goes through the same atomic 0600 path as every other
+    /// write, so it can never leave the token file world-readable.
+    #[test]
+    fn save_disabled_writes_owner_only_permissions() {
+        let path = tmp_path("disable-perm");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        save_disabled(&path, &by_name("acct-a"), true).unwrap();
+
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
