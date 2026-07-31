@@ -778,19 +778,36 @@ impl Manager {
         // buffer for a single-use token. If this save fails, the freshly rotated
         // token still sits in the snapshot for `persist_now` to flush at shutdown;
         // rolling memory back on failure would lose it for good.
-        let snapshot = {
+        let (snapshot, placement) = {
             let mut config = self.config.lock().expect("config lock poisoned");
-            if let Some(account) = config
-                .accounts
-                .iter_mut()
-                .find(|a| crate::identity::same_identity(a, &probe))
-            {
-                account.access_token = tokens.access_token.clone();
-                account.refresh_token = Some(tokens.refresh_token.clone());
-                account.expires_at = Some(tokens.expires_at_ms);
+            // Resolved, never first-match: `same_identity` treats an unknown org as
+            // a match, so with the legacy two-org shape in the file a first-match
+            // search lands THIS account's rotated credential on the OTHER account's
+            // record — overwriting a single-use refresh token that is then dead.
+            // An unbreakable tie writes nothing and says so.
+            let placement = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
+            if let crate::identity::Resolved::One(position) = placement {
+                if let Some(account) = config.accounts.get_mut(position) {
+                    account.access_token = tokens.access_token.clone();
+                    account.refresh_token = Some(tokens.refresh_token.clone());
+                    account.expires_at = Some(tokens.expires_at_ms);
+                }
             }
-            config.clone()
+            (config.clone(), placement)
         };
+        // Logged with the config lock released (INV2) — a `warn!` is cheap but the
+        // critical section above is on the per-connection path's lock.
+        match placement {
+            crate::identity::Resolved::One(_) => {}
+            crate::identity::Resolved::None => tracing::warn!(
+                account = %name,
+                "no loaded config account carries this identity; the rotated token is not in the snapshot and will not reach disk"
+            ),
+            crate::identity::Resolved::Many => tracing::warn!(
+                account = %name,
+                "more than one loaded config account carries this identity; refusing to guess which one just rotated, so the rotated token will not reach disk and this account may need `tcr login`"
+            ),
+        }
         // Tokens only: the in-memory config is a boot-time snapshot, so writing
         // it whole would stamp stale settings over the user's live file.
         if let Err(err) = config::save_tokens(path, &snapshot) {
@@ -850,14 +867,16 @@ impl Manager {
             Ok(config::DisabledWrite::Updated) | Ok(config::DisabledWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
-            // Matched by identity, exactly as persist_tokens matches, so both land
-            // on the same entry as the write above did.
-            if let Some(account) = config
-                .accounts
-                .iter_mut()
-                .find(|a| crate::identity::same_identity(a, target))
+            // Resolved by identity, exactly as `persist_tokens` and `save_disabled`
+            // resolve, so all three land on the same record. An unbreakable tie
+            // writes nothing: `save_disabled` refuses one too, and memory must not
+            // drift onto a record the file was not allowed to touch.
+            if let crate::identity::Resolved::One(position) =
+                crate::identity::resolve(config.accounts.iter().enumerate(), target)
             {
-                account.disabled = if disabled { Some(true) } else { None };
+                if let Some(account) = config.accounts.get_mut(position) {
+                    account.disabled = if disabled { Some(true) } else { None };
+                }
             }
         }
         match outcome {

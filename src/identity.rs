@@ -27,6 +27,12 @@ pub fn org_key(a: &Account) -> Option<&str> {
         .or_else(|| a.org_name.as_deref().filter(|s| !s.is_empty()))
 }
 
+/// The account UUID of a record, when one is actually stored (an empty string is
+/// treated as absent, exactly as [`org_key`] treats an empty org).
+fn uuid_key(a: &Account) -> Option<&str> {
+    a.account_uuid.as_deref().filter(|s| !s.is_empty())
+}
+
 /// Whether two account records refer to the same account+org.
 ///
 /// - Both have an `account_uuid`: it must match. If both org keys are known they
@@ -36,10 +42,7 @@ pub fn org_key(a: &Account) -> Option<&str> {
 ///   an org key, a *different* org is correctly seen as a distinct account.
 /// - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
 pub fn same_identity(a: &Account, b: &Account) -> bool {
-    match (
-        a.account_uuid.as_deref().filter(|s| !s.is_empty()),
-        b.account_uuid.as_deref().filter(|s| !s.is_empty()),
-    ) {
+    match (uuid_key(a), uuid_key(b)) {
         (Some(ua), Some(ub)) => {
             if ua != ub {
                 return false;
@@ -50,6 +53,77 @@ pub fn same_identity(a: &Account, b: &Account) -> bool {
             }
         }
         _ => a.name == b.name,
+    }
+}
+
+/// Whether two records match on FULLY KNOWN identity: both carry an account UUID,
+/// both carry an org key, and both agree on each.
+///
+/// This is [`same_identity`] with its tolerance removed, and it exists only to
+/// break ties. `same_identity` treats an unknown org as a match so a
+/// freshly-profiled login can backfill a legacy entry written before org UUIDs
+/// were stored — which necessarily means that one legacy entry also matches
+/// EVERY other org of the same person. A record that matches with nothing left
+/// unknown matches on evidence; the others match only on absence. See [`resolve`].
+///
+/// Records with no UUID on either side are never exact: `same_identity` falls back
+/// to name equality there, and two entries sharing a name are genuinely
+/// indistinguishable — there is no stricter fact to prefer one by.
+pub fn same_identity_exact(a: &Account, b: &Account) -> bool {
+    match (uuid_key(a), uuid_key(b)) {
+        (Some(ua), Some(ub)) if ua == ub => {
+            matches!((org_key(a), org_key(b)), (Some(ka), Some(kb)) if ka == kb)
+        }
+        _ => false,
+    }
+}
+
+/// Which of a set of candidate records an identity resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolved {
+    /// Exactly one candidate is the answer, at this index.
+    One(usize),
+    /// No candidate carries that identity.
+    None,
+    /// Two or more candidates match and the tie cannot be broken on the stored
+    /// identity alone.
+    Many,
+}
+
+/// Resolve `target` to at most ONE of `candidates` — the single record a rotated
+/// credential or a `disabled` flag may be written to.
+///
+/// One loose match is the answer. Several loose matches are the legacy two-org
+/// shape far more often than a real ambiguity: an entry stored before org UUIDs
+/// existed carries a UUID and no org, so `same_identity` matches it against every
+/// org of that person. When exactly one of the tied candidates matches on fully
+/// known identity ([`same_identity_exact`]) the rest matched only because
+/// something was missing, so the exact one is the answer.
+///
+/// An unbreakable tie is [`Resolved::Many`] and every caller REFUSES rather than
+/// guesses. Guessing is not a cosmetic error here: stamping account A's rotated
+/// credential onto account B's record overwrites B's own single-use refresh token,
+/// which then 400s (`invalid_grant`) on its next use and leaves B dead until it is
+/// re-authed by hand.
+pub fn resolve<'a, I>(candidates: I, target: &Account) -> Resolved
+where
+    I: IntoIterator<Item = (usize, &'a Account)>,
+{
+    let mut loose: Vec<usize> = Vec::new();
+    let mut exact: Vec<usize> = Vec::new();
+    for (index, candidate) in candidates {
+        if same_identity(target, candidate) {
+            loose.push(index);
+            if same_identity_exact(target, candidate) {
+                exact.push(index);
+            }
+        }
+    }
+    match (loose.as_slice(), exact.as_slice()) {
+        ([], _) => Resolved::None,
+        ([only], _) => Resolved::One(*only),
+        (_, [only]) => Resolved::One(*only),
+        _ => Resolved::Many,
     }
 }
 
@@ -231,6 +305,104 @@ mod tests {
             "unknown org on one side → same"
         );
         assert!(same_identity(&fresh, &legacy), "symmetric");
+    }
+
+    #[test]
+    fn exact_match_needs_both_sides_fully_known() {
+        let full = acct("me@example.com", Some("u1"), Some("org-a"), Some("Corp"));
+        let legacy = acct("me@example.com", Some("u1"), None, None);
+        let other_org = acct(
+            "me@example.com",
+            Some("u1"),
+            Some("org-b"),
+            Some("Personal"),
+        );
+        let no_uuid = acct("me@example.com", None, None, None);
+
+        assert!(same_identity_exact(&full, &full.clone()));
+        assert!(
+            !same_identity_exact(&full, &legacy),
+            "an unknown org on one side is a LOOSE match, never an exact one"
+        );
+        assert!(
+            same_identity(&full, &legacy),
+            "…but it is still loose-equal"
+        );
+        assert!(!same_identity_exact(&full, &other_org));
+        assert!(
+            !same_identity_exact(&no_uuid, &no_uuid.clone()),
+            "name equality is never exact — two same-named entries are indistinguishable"
+        );
+    }
+
+    /// The legacy two-org shape, which is the whole reason `resolve` prefers the
+    /// exact match: entry `{uuid, org-a}` and entry `{uuid}` (written before org
+    /// UUIDs were stored) are TWO REAL ACCOUNTS, and `same_identity` matches the
+    /// org-carrying target against both.
+    #[test]
+    fn resolve_breaks_the_legacy_tie_on_the_exact_match() {
+        let candidates = [
+            acct("me@example.com", Some("u1"), Some("org-a"), Some("Corp")),
+            acct("me@example.com", Some("u1"), None, None),
+        ];
+        let indexed = || candidates.iter().enumerate();
+
+        let corp = acct("me@example.com", Some("u1"), Some("org-a"), Some("Corp"));
+        assert_eq!(
+            resolve(indexed(), &corp),
+            Resolved::One(0),
+            "both candidates match loosely; only one matches on fully known identity"
+        );
+
+        // The same target with its org still unknown has nothing stricter to
+        // prefer either candidate by — that tie is real.
+        let legacy = acct("me@example.com", Some("u1"), None, None);
+        assert_eq!(resolve(indexed(), &legacy), Resolved::Many);
+    }
+
+    #[test]
+    fn resolve_reports_none_one_and_an_unbreakable_tie() {
+        let one = [acct("me@example.com", None, None, None)];
+        assert_eq!(
+            resolve(
+                one.iter().enumerate(),
+                &acct("me@example.com", None, None, None)
+            ),
+            Resolved::One(0)
+        );
+        assert_eq!(
+            resolve(
+                one.iter().enumerate(),
+                &acct("nobody@example.com", None, None, None)
+            ),
+            Resolved::None
+        );
+
+        // Two same-named entries with no UUID: nothing stored distinguishes them.
+        let twins = [
+            acct("me@example.com", None, None, None),
+            acct("me@example.com", None, None, None),
+        ];
+        assert_eq!(
+            resolve(
+                twins.iter().enumerate(),
+                &acct("me@example.com", None, None, None)
+            ),
+            Resolved::Many
+        );
+
+        // Two candidates that BOTH match exactly are equally unbreakable.
+        let duplicates = [
+            acct("me@example.com", Some("u1"), Some("org-a"), None),
+            acct("me@example.com", Some("u1"), Some("org-a"), None),
+        ];
+        assert_eq!(
+            resolve(
+                duplicates.iter().enumerate(),
+                &acct("me@example.com", Some("u1"), Some("org-a"), None)
+            ),
+            Resolved::Many
+        );
     }
 
     #[test]
