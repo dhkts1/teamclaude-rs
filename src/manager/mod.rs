@@ -753,6 +753,12 @@ impl Manager {
                 path = %path.display(),
                 "no config entry carries this account's identity; the disabled flag will NOT survive a restart"
             ),
+            Ok(config::DisabledWrite::Ambiguous) => tracing::warn!(
+                account = %target.name,
+                index = idx,
+                path = %path.display(),
+                "more than one config entry carries this account's identity; refusing to guess which one to flag, so the disabled flag will NOT survive a restart"
+            ),
             Err(err) => tracing::error!(
                 error = %err,
                 account = %target.name,
