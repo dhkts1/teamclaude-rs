@@ -154,10 +154,10 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                         // screen — otherwise the row renders benched and the user
                         // finds out at the next restart.
                         Action::Disable => {
-                            notice = manager.set_disabled(selected, true).warning().map(Notice::new);
+                            notice = manager.set_disabled(selected, true).warning(true).map(Notice::new);
                         }
                         Action::Enable => {
-                            notice = manager.set_disabled(selected, false).warning().map(Notice::new);
+                            notice = manager.set_disabled(selected, false).warning(false).map(Notice::new);
                         }
                         Action::None => {}
                     },
@@ -1583,7 +1583,7 @@ mod tests {
     fn render_shows_a_failed_persist_notice_without_hiding_the_fleet_banner() {
         let snapshot = util_snapshot(QuotaState::Normal);
         let warning = crate::manager::DisablePersist::NoEntry
-            .warning()
+            .warning(true)
             .expect("a NoEntry persist must warn");
 
         let with = {

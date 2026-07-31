@@ -271,21 +271,35 @@ impl DisablePersist {
     /// The one line to put in front of the user, or `None` when the outcome needs
     /// no explanation. Short enough for a single terminal row and phrased so the
     /// headline (`NOT SAVED`) survives truncation on a narrow pane.
-    pub fn warning(self) -> Option<&'static str> {
+    ///
+    /// `disabled` is the DIRECTION the keypress asked for, and it is required
+    /// because the consequence of a failed write is its exact opposite in the two
+    /// directions. Nothing was written either way, so the file still says whatever
+    /// it said: after a failed **disable** the account comes back IN ROTATION,
+    /// after a failed **enable** it comes back BENCHED. A single direction-blind
+    /// line told the user "it returns to rotation on restart" for both — so on a
+    /// failed enable they restarted on that advice and got the opposite.
+    pub fn warning(self, disabled: bool) -> Option<&'static str> {
         match self {
             // The flag is durable, or was never meant to be (demo/status have no
             // config file at all) — nothing to say.
             Self::Persisted | Self::NoConfigFile => None,
             Self::NoSuchAccount => Some("NOT SAVED: that account row no longer exists"),
-            Self::NoEntry => Some(
-                "NOT SAVED: no config entry matches this account — it returns to rotation on restart",
-            ),
+            Self::NoEntry => Some(if disabled {
+                "NOT SAVED: no config entry matches this account — it returns to rotation on restart"
+            } else {
+                "NOT SAVED: no config entry matches this account — it stays benched after a restart"
+            }),
+            // Says nothing about a restart, so it needs no direction — only an
+            // action that actually helps.
             Self::Ambiguous => Some(
-                "NOT SAVED: two config entries share this account's identity — rename one to fix",
+                "NOT SAVED: two config entries share this account's identity — give each its own orgUuid",
             ),
-            Self::WriteFailed => {
-                Some("NOT SAVED: writing the config failed — it returns to rotation on restart")
-            }
+            Self::WriteFailed => Some(if disabled {
+                "NOT SAVED: writing the config failed — it returns to rotation on restart"
+            } else {
+                "NOT SAVED: writing the config failed — it stays benched after a restart"
+            }),
         }
     }
 }
@@ -4652,27 +4666,75 @@ mod tests {
     /// silent failure arm here is a lie on screen.
     #[test]
     fn every_non_durable_persist_outcome_warns() {
-        for outcome in [DisablePersist::Persisted, DisablePersist::NoConfigFile] {
-            assert_eq!(
-                outcome.warning(),
-                None,
-                "{outcome:?} is not a failure — warning about it would be noise"
-            );
+        for disabled in [true, false] {
+            for outcome in [DisablePersist::Persisted, DisablePersist::NoConfigFile] {
+                assert_eq!(
+                    outcome.warning(disabled),
+                    None,
+                    "{outcome:?} is not a failure — warning about it would be noise"
+                );
+            }
+            for outcome in [
+                DisablePersist::NoSuchAccount,
+                DisablePersist::NoEntry,
+                DisablePersist::Ambiguous,
+                DisablePersist::WriteFailed,
+            ] {
+                let warning = outcome
+                    .warning(disabled)
+                    .unwrap_or_else(|| panic!("{outcome:?} must warn — it did not persist"));
+                assert!(
+                    warning.starts_with("NOT SAVED"),
+                    "{outcome:?} must lead with the headline so it survives truncation: {warning}"
+                );
+            }
         }
-        for outcome in [
-            DisablePersist::NoSuchAccount,
-            DisablePersist::NoEntry,
-            DisablePersist::Ambiguous,
-            DisablePersist::WriteFailed,
-        ] {
-            let warning = outcome
-                .warning()
-                .unwrap_or_else(|| panic!("{outcome:?} must warn — it did not persist"));
+    }
+
+    /// **THE direction guard.** Nothing was written, so the file still says what it
+    /// said — and that means the consequence of a failed write is the OPPOSITE in
+    /// the two directions. A failed `d` (disable) leaves the account in rotation; a
+    /// failed `e` (enable) leaves it BENCHED. One direction-blind line used to
+    /// claim "it returns to rotation on restart" for both, so a user whose enable
+    /// failed restarted on that advice and got the account benched anyway.
+    #[test]
+    fn a_failed_persist_states_the_consequence_of_its_own_direction() {
+        for outcome in [DisablePersist::NoEntry, DisablePersist::WriteFailed] {
+            let disabling = outcome.warning(true).expect("a failed disable must warn");
             assert!(
-                warning.starts_with("NOT SAVED"),
-                "{outcome:?} must lead with the headline so it survives truncation: {warning}"
+                disabling.ends_with("it returns to rotation on restart"),
+                "a failed DISABLE leaves the account in rotation: {disabling}"
+            );
+
+            let enabling = outcome.warning(false).expect("a failed enable must warn");
+            assert!(
+                enabling.ends_with("it stays benched after a restart"),
+                "a failed ENABLE leaves the account benched: {enabling}"
+            );
+            assert!(
+                !enabling.contains("returns to rotation"),
+                "a failed enable must never promise the opposite of what happens: {enabling}"
             );
         }
+    }
+
+    /// The ambiguity refusal must name an action that actually works. It used to
+    /// say "rename one to fix", which is provably wrong whenever both entries carry
+    /// an `accountUuid`: the match never consults names on that path, so renaming
+    /// changes nothing and the next `d` fails identically.
+    #[test]
+    fn the_ambiguity_warning_names_a_remedy_that_works() {
+        let warning = DisablePersist::Ambiguous
+            .warning(true)
+            .expect("an ambiguous refusal must warn");
+        assert!(
+            warning.contains("orgUuid"),
+            "the remedy is giving the entries distinct org keys: {warning}"
+        );
+        assert!(
+            !warning.contains("rename"),
+            "renaming does not break a UUID-matched tie: {warning}"
+        );
     }
 
     /// A manager with no config file behind it reports that distinctly and does NOT
