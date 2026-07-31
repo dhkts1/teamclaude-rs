@@ -43,7 +43,12 @@ ln -sfn "$PWD/target/release/tcr" ~/.local/bin/tcr   # put `tcr` on PATH
 
 ## Configure
 
-Config lives at `~/.config/teamclaude.json`:
+Config lives at `~/.config/teamclaude.json`. It holds **working OAuth credentials** for every account
+in the pool, so it never belongs in a commit — this repository is public, and its contents (tokens,
+account emails, org UUIDs) must stay out of code, fixtures, tests and PR descriptions. Contributors:
+see [`CLAUDE.md`](CLAUDE.md).
+
+The shape:
 
 ```json
 {
