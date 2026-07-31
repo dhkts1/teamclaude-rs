@@ -680,7 +680,7 @@ enum EntryPlan {
 /// tie that was unbreakable a moment ago. That is what keeps the legacy two-org
 /// shape working — one person, two orgs, where the older entry predates org UUIDs
 /// and so carries none. The org-carrying entry pairs off first (it is the only
-/// *exact* match on either side), and the pre-org entry, which matched BOTH
+/// *strict* match on either side), and the pre-org entry, which matched BOTH
 /// accounts while they were both in the pool, is then left facing exactly one.
 /// Resolved in a single pass it would tie forever and neither account would ever
 /// have its rotated token persisted. Iterating also makes the result independent
@@ -816,16 +816,23 @@ pub enum DisabledWrite {
     /// while the proxy ran — or the document has no usable `accounts` array.
     /// Nothing was written, so the flag will NOT survive a restart.
     NoEntry,
-    /// MORE than one entry carries that identity, so no entry can be chosen
-    /// without guessing. Nothing was written.
+    /// More than one entry carries that identity and nothing stored breaks the
+    /// tie, so no entry can be chosen without guessing. Nothing was written.
     ///
     /// [`crate::identity::same_identity`] falls back to name equality when either
-    /// side lacks a uuid and treats an unknown org as a match, so two entries
-    /// sharing a name both match either runtime row. The caller selects by ROW
-    /// INDEX (the TUI does), so silently taking the first match lands the flag on
-    /// whichever entry happens to be earlier — benching a healthy account and
-    /// returning an exhausted one to rotation, with the TUI showing the opposite.
-    /// Refusing is the same posture the CLI takes on an ambiguous query.
+    /// side lacks a uuid, so two entries sharing a name both match either runtime
+    /// row. The caller selects by ROW INDEX (the TUI does), so silently taking the
+    /// first match lands the flag on whichever entry happens to be earlier —
+    /// benching a healthy account and returning an exhausted one to rotation, with
+    /// the TUI showing the opposite. Refusing is the same posture the CLI takes on
+    /// an ambiguous query.
+    ///
+    /// This is now genuine ambiguity only. `same_identity` ALSO treats an unknown
+    /// org as a match, which used to make the legacy two-org shape (an entry with
+    /// an org beside a pre-org entry that has none) report `Ambiguous` even though
+    /// the two entries are trivially distinguishable — so neither of two real
+    /// accounts could ever be durably benched. [`crate::identity::resolve`] breaks
+    /// that tie on the org key; see [`find_account_entry`].
     Ambiguous,
 }
 
@@ -918,38 +925,48 @@ fn locate_account_entry(doc: &Map<String, Value>, target: &Account) -> EntryMatc
     let Some(entries) = doc.get("accounts").and_then(Value::as_array) else {
         return EntryMatch::None;
     };
-    let mut found: Option<usize> = None;
-    for (index, entry) in entries.iter().enumerate() {
-        let Some(object) = entry.as_object() else {
-            continue;
-        };
-        let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
-        else {
-            continue;
-        };
-        let probe = crate::identity::probe(
-            &stored.name,
-            stored.account_uuid,
-            stored.org_uuid,
-            stored.org_name,
-        );
-        if crate::identity::same_identity(target, &probe) {
-            if found.is_some() {
-                return EntryMatch::Many;
-            }
-            found = Some(index);
-        }
-    }
-    match found {
-        Some(index) => EntryMatch::One(index),
-        None => EntryMatch::None,
+    // Parse every entry's identity first, then resolve over the whole set at once.
+    // Returning `Many` on the second `same_identity` hit — which is what a single
+    // scanning pass can do — refuses the LEGACY TWO-ORG SHAPE, where entry
+    // `{name, uuid U, orgUuid "org-a"}` sits beside a pre-org entry `{name, uuid
+    // U}` written before org UUIDs were stored. Those are two real accounts, one
+    // person in two orgs, and `same_identity` matches the pre-org entry against
+    // both of them because an unknown org is deliberately tolerated. Refused that
+    // way, NEITHER account can ever be durably benched.
+    //
+    // `resolve` breaks exactly that tie and only that tie: when one candidate
+    // matches on fully known identity and the rest matched only because something
+    // was missing, the known one wins. A tie with nothing stricter to prefer is
+    // still `Many`, and still refused.
+    let probes: Vec<(usize, Account)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let object = entry.as_object()?;
+            let stored =
+                serde_json::from_value::<DiskIdentity>(Value::Object(object.clone())).ok()?;
+            Some((
+                index,
+                crate::identity::probe(
+                    &stored.name,
+                    stored.account_uuid,
+                    stored.org_uuid,
+                    stored.org_name,
+                ),
+            ))
+        })
+        .collect();
+    match crate::identity::resolve(probes.iter().map(|(index, probe)| (*index, probe)), target) {
+        crate::identity::Resolved::One(index) => EntryMatch::One(index),
+        crate::identity::Resolved::None => EntryMatch::None,
+        crate::identity::Resolved::Many => EntryMatch::Many,
     }
 }
 
 /// The on-disk `accounts` entry whose identity matches `target`, or the
 /// [`DisabledWrite`] refusal explaining why there is no single entry to write.
 ///
-/// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::same_identity`]
+/// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::resolve`]
 /// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled flag
 /// can never land on two different entries.
 ///
@@ -961,6 +978,12 @@ fn locate_account_entry(doc: &Map<String, Value>, target: &Account) -> EntryMatc
 /// side lacks a uuid, so two entries sharing a name match either runtime row: the
 /// flag would land on whichever is earlier in the file, benching a healthy account
 /// while the TUI shows the other one disabled.
+///
+/// Refused, but only where the tie is real — which is not the same as "a second
+/// entry satisfied `same_identity`". `resolve` first tries the org key, so the
+/// legacy two-org shape (one entry with an org, one written before org UUIDs
+/// existed and carrying none) resolves both of its rows instead of locking both
+/// out of ever being benched.
 fn find_account_entry<'a>(
     doc: &'a mut Map<String, Value>,
     target: &Account,
@@ -1375,8 +1398,8 @@ mod tests {
     /// older entry predates org UUIDs and so carries none. `same_identity` matches
     /// the pre-org entry against BOTH accounts, so resolving each entry
     /// independently ties forever and neither account's rotated token is ever
-    /// persisted. The exact pairing settles first and leaves the pre-org entry
-    /// facing exactly one unclaimed account.
+    /// persisted. The strict pairing settles it: each side has exactly one partner
+    /// whose org key it actually equals.
     ///
     /// Asserted in BOTH disk orders — the real config has the older (pre-org) entry
     /// first, which is precisely the order a single forward pass gets wrong.
@@ -2058,6 +2081,93 @@ mod tests {
         );
         let after = read_json(&path);
         assert_eq!(after["accounts"][0]["disabled"], json!(true));
+        assert!(after["accounts"][1].get("disabled").is_none());
+        fs::remove_file(&path).ok();
+    }
+
+    /// The shape the test above does NOT cover, and the one the refusal actually
+    /// broke: the older entry predates org UUIDs and carries none, so its org key
+    /// is `(None)` while its sibling's is `Some("org-a")`. `same_identity`
+    /// deliberately treats an unknown org as a match — that is what lets a
+    /// freshly-profiled login backfill a legacy entry — which also means the
+    /// pre-org entry matches BOTH runtime rows. These are two real accounts, one
+    /// person in two orgs, and refusing on the second `same_identity` hit left
+    /// NEITHER of them durably benchable.
+    ///
+    /// Each row must reach its own entry: the org-carrying row by the exact match,
+    /// and the pre-org row by name — it is the only entry with no org at all.
+    #[test]
+    fn a_pre_org_entry_beside_its_org_carrying_sibling_is_not_ambiguous() {
+        let path = tmp_path("disable-legacy-backfill");
+        let file = r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
+                  "orgUuid": "org-a", "orgName": "Org A" },
+                { "name": "me@example.com", "accessToken": "at-legacy", "accountUuid": "uuid-person" }
+            ] }"#;
+
+        // The org-carrying row: both entries match it loosely, one matches exactly.
+        fs::write(&path, file).unwrap();
+        let with_org = crate::identity::probe(
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            Some("org-a".to_string()),
+            Some("Org A".to_string()),
+        );
+        assert_eq!(
+            save_disabled(&path, &with_org, true).unwrap(),
+            DisabledWrite::Updated,
+            "the fully-known identity resolves to the entry that carries the same org"
+        );
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][0]["disabled"], json!(true));
+        assert!(
+            after["accounts"][1].get("disabled").is_none(),
+            "the flag must not land on the pre-org sibling: {after}"
+        );
+
+        // And the pre-org row, whose own org is still unknown, resolves to the one
+        // entry that likewise has none.
+        fs::write(&path, file).unwrap();
+        let pre_org = crate::identity::probe(
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(
+            save_disabled(&path, &pre_org, true).unwrap(),
+            DisabledWrite::Updated
+        );
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][1]["disabled"], json!(true));
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "the flag must not land on the org-carrying sibling: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The refusal still fires where it must. Two entries that share a name and
+    /// carry no UUID at all are genuinely indistinguishable — there is no stricter
+    /// fact to prefer one by — so nothing is written and the caller is told.
+    #[test]
+    fn two_entries_with_nothing_to_tell_them_apart_are_still_refused() {
+        let path = tmp_path("disable-truly-ambiguous");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-one" },
+                { "name": "me@example.com", "accessToken": "at-two" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("me@example.com"), true).unwrap(),
+            DisabledWrite::Ambiguous
+        );
+        let after = read_json(&path);
+        assert!(after["accounts"][0].get("disabled").is_none());
         assert!(after["accounts"][1].get("disabled").is_none());
         fs::remove_file(&path).ok();
     }

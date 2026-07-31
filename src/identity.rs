@@ -56,26 +56,25 @@ pub fn same_identity(a: &Account, b: &Account) -> bool {
     }
 }
 
-/// Whether two records match on FULLY KNOWN identity: both carry an account UUID,
-/// both carry an org key, and both agree on each.
+/// Whether two records match with the org tolerance REMOVED: the account UUID is
+/// known on both sides and equal, and the org discriminators are equal — both
+/// known and the same, or both absent.
 ///
-/// This is [`same_identity`] with its tolerance removed, and it exists only to
-/// break ties. `same_identity` treats an unknown org as a match so a
+/// This exists only to break ties, and it is exactly [`same_identity`] minus its
+/// one asymmetry. `same_identity` calls an unknown org a match so a
 /// freshly-profiled login can backfill a legacy entry written before org UUIDs
-/// were stored — which necessarily means that one legacy entry also matches
-/// EVERY other org of the same person. A record that matches with nothing left
-/// unknown matches on evidence; the others match only on absence. See [`resolve`].
+/// were stored; the price is that such an entry then matches EVERY org of that
+/// person. Under this comparison a record with an org matches only records with
+/// the same org, and a record without one matches only records that likewise have
+/// none — so in the two-org shape each side has exactly one strict partner, which
+/// is what [`resolve`] needs to tell them apart.
 ///
-/// Records with no UUID on either side are never exact: `same_identity` falls back
-/// to name equality there, and two entries sharing a name are genuinely
-/// indistinguishable — there is no stricter fact to prefer one by.
-pub fn same_identity_exact(a: &Account, b: &Account) -> bool {
-    match (uuid_key(a), uuid_key(b)) {
-        (Some(ua), Some(ub)) if ua == ub => {
-            matches!((org_key(a), org_key(b)), (Some(ka), Some(kb)) if ka == kb)
-        }
-        _ => false,
-    }
+/// Records with no UUID are never strict-equal. `same_identity` falls back to name
+/// equality there, and two entries sharing a name are genuinely indistinguishable
+/// — there is no stricter fact to prefer one by.
+pub fn same_identity_strict(a: &Account, b: &Account) -> bool {
+    matches!((uuid_key(a), uuid_key(b)), (Some(ua), Some(ub)) if ua == ub)
+        && org_key(a) == org_key(b)
 }
 
 /// Which of a set of candidate records an identity resolves to.
@@ -96,9 +95,9 @@ pub enum Resolved {
 /// One loose match is the answer. Several loose matches are the legacy two-org
 /// shape far more often than a real ambiguity: an entry stored before org UUIDs
 /// existed carries a UUID and no org, so `same_identity` matches it against every
-/// org of that person. When exactly one of the tied candidates matches on fully
-/// known identity ([`same_identity_exact`]) the rest matched only because
-/// something was missing, so the exact one is the answer.
+/// org of that person. When exactly one of the tied candidates also matches
+/// strictly ([`same_identity_strict`]) the rest matched only on the org tolerance,
+/// so the strict one is the answer.
 ///
 /// An unbreakable tie is [`Resolved::Many`] and every caller REFUSES rather than
 /// guesses. Guessing is not a cosmetic error here: stamping account A's rotated
@@ -114,7 +113,7 @@ where
     for (index, candidate) in candidates {
         if same_identity(target, candidate) {
             loose.push(index);
-            if same_identity_exact(target, candidate) {
+            if same_identity_strict(target, candidate) {
                 exact.push(index);
             }
         }
@@ -308,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_match_needs_both_sides_fully_known() {
+    fn a_strict_match_drops_the_unknown_org_tolerance() {
         let full = acct("me@example.com", Some("u1"), Some("org-a"), Some("Corp"));
         let legacy = acct("me@example.com", Some("u1"), None, None);
         let other_org = acct(
@@ -319,28 +318,33 @@ mod tests {
         );
         let no_uuid = acct("me@example.com", None, None, None);
 
-        assert!(same_identity_exact(&full, &full.clone()));
+        assert!(same_identity_strict(&full, &full.clone()));
         assert!(
-            !same_identity_exact(&full, &legacy),
-            "an unknown org on one side is a LOOSE match, never an exact one"
+            !same_identity_strict(&full, &legacy),
+            "an unknown org on ONE side is a loose match only — that is the tolerance"
         );
         assert!(
             same_identity(&full, &legacy),
-            "…but it is still loose-equal"
+            "…and loosely they are still the same, which is what backfill needs"
         );
-        assert!(!same_identity_exact(&full, &other_org));
         assert!(
-            !same_identity_exact(&no_uuid, &no_uuid.clone()),
-            "name equality is never exact — two same-named entries are indistinguishable"
+            same_identity_strict(&legacy, &legacy.clone()),
+            "unknown on BOTH sides is agreement, not tolerance: the org keys are equal"
+        );
+        assert!(!same_identity_strict(&full, &other_org));
+        assert!(
+            !same_identity_strict(&no_uuid, &no_uuid.clone()),
+            "no UUID is never strict — two same-named entries are indistinguishable"
         );
     }
 
     /// The legacy two-org shape, which is the whole reason `resolve` prefers the
-    /// exact match: entry `{uuid, org-a}` and entry `{uuid}` (written before org
-    /// UUIDs were stored) are TWO REAL ACCOUNTS, and `same_identity` matches the
-    /// org-carrying target against both.
+    /// strict match: entry `{uuid, org-a}` and entry `{uuid}` (written before org
+    /// UUIDs were stored) are TWO REAL ACCOUNTS, and `same_identity` matches
+    /// EITHER target against both of them. Each target has exactly one strict
+    /// partner, so both resolve — refusing them was what left neither benchable.
     #[test]
-    fn resolve_breaks_the_legacy_tie_on_the_exact_match() {
+    fn resolve_breaks_the_legacy_tie_in_both_directions() {
         let candidates = [
             acct("me@example.com", Some("u1"), Some("org-a"), Some("Corp")),
             acct("me@example.com", Some("u1"), None, None),
@@ -351,13 +355,37 @@ mod tests {
         assert_eq!(
             resolve(indexed(), &corp),
             Resolved::One(0),
-            "both candidates match loosely; only one matches on fully known identity"
+            "both candidates match loosely; only one carries the same org"
         );
 
-        // The same target with its org still unknown has nothing stricter to
-        // prefer either candidate by — that tie is real.
         let legacy = acct("me@example.com", Some("u1"), None, None);
-        assert_eq!(resolve(indexed(), &legacy), Resolved::Many);
+        assert_eq!(
+            resolve(indexed(), &legacy),
+            Resolved::One(1),
+            "a target with no org resolves to the candidate that likewise has none"
+        );
+    }
+
+    /// The tolerance is only dropped where dropping it decides something. One
+    /// pre-org entry against a person who really is in two orgs stays a refusal:
+    /// neither candidate shares the target's (absent) org key, so nothing is
+    /// stricter and the tie is real.
+    #[test]
+    fn resolve_still_refuses_when_the_strict_pass_decides_nothing() {
+        let candidates = [
+            acct("me@example.com", Some("u1"), Some("org-a"), Some("Corp")),
+            acct(
+                "me@example.com",
+                Some("u1"),
+                Some("org-b"),
+                Some("Personal"),
+            ),
+        ];
+        let legacy = acct("me@example.com", Some("u1"), None, None);
+        assert_eq!(
+            resolve(candidates.iter().enumerate(), &legacy),
+            Resolved::Many
+        );
     }
 
     #[test]
