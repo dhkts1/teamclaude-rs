@@ -1594,15 +1594,50 @@ mod tests {
         }
     }
 
+    /// The Full layout's minimum width, DERIVED from the columns themselves:
+    /// every declared width, one cell of `column_spacing` between each adjacent
+    /// pair, and the block's two borders.
+    ///
+    /// Computed, never transcribed. A test that copies the constant it is meant
+    /// to check agrees with a stale value by construction.
+    fn derived_full_layout_min_width() -> u16 {
+        let columns: u16 = FULL_COLUMN_WIDTHS.iter().sum();
+        let gaps = FULL_COLUMN_WIDTHS.len() as u16 - 1;
+        let borders = 2;
+        columns + gaps + borders
+    }
+
+    /// The constant must EQUAL its own columns' derived total, so it cannot drift
+    /// from the table it measures.
+    ///
+    /// This is the assertion that executes the arithmetic the constant's doc
+    /// comment merely states. Without it the number is commentary: a fifteenth
+    /// column moves the true minimum without moving the constant, and a gate that
+    /// only *mentions* the number stays green while the layout clips.
+    #[test]
+    fn full_layout_min_width_equals_the_derived_total() {
+        assert_eq!(
+            FULL_LAYOUT_MIN_WIDTH,
+            derived_full_layout_min_width(),
+            "FULL_LAYOUT_MIN_WIDTH must equal Σ FULL_COLUMN_WIDTHS ({}) + {} inter-column gaps \
+             + 2 borders; a column was added or resized without updating it",
+            FULL_COLUMN_WIDTHS.iter().sum::<u16>(),
+            FULL_COLUMN_WIDTHS.len() - 1,
+        );
+    }
+
     #[test]
     fn accounts_layout_picks_mode_at_threshold() {
-        // The breakpoint is exact: FULL_LAYOUT_MIN_WIDTH still fits the full
-        // table; one column narrower drops to compact.
-        assert_eq!(accounts_layout(FULL_LAYOUT_MIN_WIDTH), AccountsLayout::Full);
-        assert_eq!(
-            accounts_layout(FULL_LAYOUT_MIN_WIDTH - 1),
-            AccountsLayout::Compact
-        );
+        // The breakpoint is exact: the derived minimum still fits the full table;
+        // one column narrower drops to compact.
+        //
+        // Fed the DERIVED width, never FULL_LAYOUT_MIN_WIDTH. `accounts_layout` is
+        // `width >= FULL_LAYOUT_MIN_WIDTH`, so passing it the constant returns Full
+        // for every value that constant could possibly hold — it asserts the
+        // comparison operator and learns nothing about the width.
+        let derived = derived_full_layout_min_width();
+        assert_eq!(accounts_layout(derived), AccountsLayout::Full);
+        assert_eq!(accounts_layout(derived - 1), AccountsLayout::Compact);
     }
 
     #[test]
