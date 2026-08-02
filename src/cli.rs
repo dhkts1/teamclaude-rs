@@ -1047,7 +1047,11 @@ mod tests {
             true,
         )
         .await;
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Live);
+        // Offline is the honest source for a snapshot built by `snapshot_offline`,
+        // and it is the exact line shape `tcr accounts` emits — that verb is
+        // offline by construction, so this is the greppable line a human reads
+        // most often.
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per account");
         // Each line is greppable: name + priority + per-window utilization.
@@ -1072,6 +1076,15 @@ mod tests {
             !text.contains("held=") && !text.contains("quota="),
             "legacy quota/held fields are gone: {text}"
         );
+        // Every token stays `key=value`, so the new stream-error token is greppable
+        // wherever it sits in the line and does not displace its neighbours.
+        for line in &lines {
+            assert!(
+                line.contains("probe=") && line.contains("stream_errors=n/a"),
+                "the offline line keeps probe= and carries an unmeasured \
+                 stream-error token: {line}"
+            );
+        }
     }
 
     /// THE HONESTY TEST. An offline snapshot's serving counters live in the
