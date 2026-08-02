@@ -128,11 +128,11 @@ pub struct AccountStatus {
     /// Decayed count of in-band SSE `error` events (see
     /// [`AccountSnapshot::stream_error_count`]). Put ON the wire deliberately —
     /// it carries no credential material and `tcr status --json` is how an
-    /// operator sees the fleet; see this module's doc comment on the
-    /// no-secret invariant.
+    /// operator sees the fleet (`tcr status --json | jq '.[].streamErrorCount'`);
+    /// see this module's doc comment on the no-secret invariant.
     pub stream_error_count: usize,
     /// The most recent stream error's type, alongside the count above. Same
-    /// on-the-wire decision as `stream_error_count`.
+    /// on-the-wire decision as `stream_error_count`; rendered as `lastStreamError`.
     pub last_stream_error: Option<String>,
 }
 

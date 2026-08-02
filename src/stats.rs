@@ -130,10 +130,20 @@ pub struct AccountSnapshot {
     /// OBSERVABILITY ONLY: nothing in `select.rs` reads it, so it never gates
     /// rotation. On the wire deliberately (see `status.rs`'s module doc): it
     /// carries no credential material, and `tcr status --json` is how an
-    /// operator sees the fleet.
+    /// operator sees the fleet — `tcr status --json | jq '.[].streamErrorCount'`,
+    /// rendered by `cli::render_accounts_json`, with the plain-text `tcr status`
+    /// carrying the same number as a `stream_errors=` token.
+    ///
+    /// That last sentence was FALSE when this field was introduced: the renderers
+    /// did not exist, so the value reached the wire and stopped there. Both were
+    /// added afterwards, which is what makes the claim true now. It is load-bearing
+    /// — if a future change drops either renderer, delete the claim with it rather
+    /// than leaving a rationale the code no longer earns.
     pub stream_error_count: usize,
     /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
-    /// alongside the count above. Same on-the-wire decision as `stream_error_count`.
+    /// alongside the count above. Same on-the-wire decision as `stream_error_count`,
+    /// and surfaced by the same two renderers (`lastStreamError` in JSON, the
+    /// `last_stream_error=` token in text).
     pub last_stream_error: Option<String>,
 }
 
