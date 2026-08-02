@@ -493,7 +493,7 @@ fn render_accounts(
     let header = match layout {
         AccountsLayout::Full => Row::new(vec![
             "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Fable", "Reqs", "In",
-            "Cache", "Out", "Last",
+            "Cache", "Out", "Last", "Err",
         ]),
         AccountsLayout::Compact => Row::new(vec![
             "Account", "Pri", "Status", "Gate", "5h", "7d", "Fable", "Reqs", "In", "Out", "Last",
@@ -555,6 +555,13 @@ fn render_accounts(
                         )),
                         output,
                         last,
+                        // In-band SSE `error` events (decayed count), observability
+                        // only — never a routing input. `-` when none observed.
+                        Cell::from(if account.stream_error_count > 0 {
+                            account.stream_error_count.to_string()
+                        } else {
+                            "-".to_string()
+                        }),
                     ]
                 }
                 // Compact mode: Probe and Cache dropped; each quota bucket becomes a
@@ -613,9 +620,12 @@ fn render_accounts(
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(6),
+            // Decayed in-band SSE error count, or "-".
+            Constraint::Length(4),
         ],
         // 91 widths + 10 spacing + 2 borders ≈ 103 cols. The three bar columns
-        // collapse to bare percentages and Probe/Cache are gone.
+        // collapse to bare percentages and Probe/Cache are gone. The stream-error
+        // column stays Full-only — Compact is already the narrow-terminal squeeze.
         AccountsLayout::Compact => vec![
             Constraint::Length(18),
             Constraint::Length(3),
@@ -1411,6 +1421,8 @@ mod tests {
             quota_state: QuotaState::Normal,
             gate,
             free_at,
+            stream_error_count: 0,
+            last_stream_error: None,
         }
     }
 

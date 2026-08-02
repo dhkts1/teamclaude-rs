@@ -125,6 +125,15 @@ pub struct AccountStatus {
     /// The account's effective switch threshold on the SERVER (its own
     /// `switchThreshold`, else the global one).
     pub threshold: f64,
+    /// Decayed count of in-band SSE `error` events (see
+    /// [`AccountSnapshot::stream_error_count`]). Put ON the wire deliberately —
+    /// it carries no credential material and `tcr status --json` is how an
+    /// operator sees the fleet; see this module's doc comment on the
+    /// no-secret invariant.
+    pub stream_error_count: usize,
+    /// The most recent stream error's type, alongside the count above. Same
+    /// on-the-wire decision as `stream_error_count`.
+    pub last_stream_error: Option<String>,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -172,6 +181,8 @@ impl StatusPayload {
                 gate: a.gate,
                 free_at_ms: a.free_at.map(to_ms),
                 threshold: thresholds.get(i).copied().unwrap_or(1.0),
+                stream_error_count: a.stream_error_count,
+                last_stream_error: a.last_stream_error.clone(),
             })
             .collect();
         Self {
@@ -220,6 +231,8 @@ impl StatusPayload {
                     quota_state: a.quota_state,
                     gate: a.gate,
                     free_at: a.free_at_ms.and_then(from_ms),
+                    stream_error_count: a.stream_error_count,
+                    last_stream_error: a.last_stream_error,
                 }
             })
             .collect();
@@ -264,6 +277,8 @@ mod tests {
                 quota_state: QuotaState::Normal,
                 gate: GateReason::Ok,
                 free_at: None,
+                stream_error_count: 0,
+                last_stream_error: None,
             }],
             current: Some(0),
             recent: Vec::new(),

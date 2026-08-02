@@ -173,6 +173,11 @@ impl Manager {
                     quota_state,
                     gate,
                     free_at,
+                    stream_error_count: super::usage::stream_error_count(
+                        &a.stream_error_times_ms,
+                        now_ms,
+                    ),
+                    last_stream_error: a.last_stream_error.clone(),
                 }
             })
             .collect();

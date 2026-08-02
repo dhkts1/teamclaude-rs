@@ -1274,7 +1274,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         .await
                         .map(|bytes| (Ok::<Bytes, Infallible>(bytes), rx))
                 });
-                let parsed = parse_sse_usage(byte_stream).await;
+                let (parsed, stream_error) = parse_sse_usage(byte_stream).await;
                 if parsed.input_total > 0 || parsed.output > 0 {
                     manager_side.update_usage(
                         idx,
@@ -1283,6 +1283,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         parsed.cache_read,
                         parsed.cache_creation,
                     );
+                }
+                // Sibling of the usage guard above, not nested in it: an error
+                // event with NO message_start leaves input_total == output == 0,
+                // and this must still be recorded — that is precisely the bug
+                // (a truncated stream booked as a clean serve). Called ONCE per
+                // stream, after the parse loop ends, never per event — a
+                // per-event call on a long erroring stream is a log-flood vector.
+                if let Some(kind) = stream_error {
+                    manager_side.record_stream_error(idx, &kind);
                 }
             });
             let passthrough = resp.bytes_stream().map(move |chunk| {
@@ -1819,7 +1828,9 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
     }
 }
 
-/// Parse the total usage breakdown from an SSE messages stream.
+/// Parse the total usage breakdown from an SSE messages stream, plus — out of
+/// band, so [`ParsedUsage`] can stay `Copy` — the FIRST in-band `error` event's
+/// `error.type`, if any arrived.
 ///
 /// `input_total` is taken from `message_start` (base + cache tokens); `output`
 /// is the latest cumulative count from `message_delta` (or `message_start` if
@@ -1829,7 +1840,13 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
 /// boundary-split `message_start` is still parsed whole (bug #1 designed out).
 /// The cache components come from the same `message_start` usage via the shared
 /// [`cache_breakdown`] (R2: identical extraction to the JSON path).
-async fn parse_sse_usage<S, B, E>(stream: S) -> ParsedUsage
+///
+/// An Anthropic error envelope can arrive INSIDE a 200 `text/event-stream` body
+/// (the same shape this proxy itself synthesizes — see [`error_response`] used
+/// as a template, and the `event: error` fixture below) — that is a truncated,
+/// failed turn, not usage to add to the quota. First `error` event wins; a
+/// second is ignored, so multi-event streams still name their root cause.
+async fn parse_sse_usage<S, B, E>(stream: S) -> (ParsedUsage, Option<String>)
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -1838,6 +1855,7 @@ where
     futures::pin_mut!(events);
 
     let mut parsed = ParsedUsage::default();
+    let mut stream_error: Option<String> = None;
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
             break; // malformed/utf8/transport error — stop parsing, keep totals
@@ -1867,10 +1885,21 @@ where
                     parsed.output = out;
                 }
             }
+            // First `error` event wins — a later one is ignored (guard skips the
+            // arm rather than nesting an `if` inside it, per clippy).
+            Some("error") if stream_error.is_none() => {
+                let kind = value
+                    .get("error")
+                    .and_then(|e| e.get("type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                stream_error = Some(kind);
+            }
             _ => {}
         }
     }
-    parsed
+    (parsed, stream_error)
 }
 
 /// A JSON error response in Anthropic's error envelope.
@@ -2308,7 +2337,8 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[..split])),
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[split..])),
         ];
-        let parsed = parse_sse_usage(futures::stream::iter(chunks)).await;
+        let (parsed, stream_error) = parse_sse_usage(futures::stream::iter(chunks)).await;
+        assert_eq!(stream_error, None, "a clean stream has no error event");
         // R1: the quota sum is byte-identical to before.
         assert_eq!(
             parsed.input_total, 1110,
@@ -2334,7 +2364,8 @@ mod tests {
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":37}}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let parsed = parse_sse_usage(stream).await;
+        let (parsed, stream_error) = parse_sse_usage(stream).await;
+        assert_eq!(stream_error, None, "a clean stream has no error event");
         assert_eq!(parsed.input_total, 5);
         assert_eq!(parsed.output, 37, "final cumulative output, not 20 + 37");
         // No cache tokens in this fixture → both stay zero.
@@ -3754,6 +3785,170 @@ mod tests {
             "a 2nd 401 is rotation churn, not a dead credential — it must leave the \
              account Active; `Error` is terminal and would sideline a healthy account \
              forever (nothing re-probes or re-selects an errored row)"
+        );
+    }
+
+    /// Bounded-poll the manager's decayed stream-error count for account 0 until
+    /// it matches `want`, or give up after ~2s. The tee task that records it runs
+    /// in a DETACHED `tokio::spawn`, so the client can observe body EOF before
+    /// that task has drained its channel and finished the parse loop — reading to
+    /// EOF then asserting immediately is racy. Returns the last-observed count and
+    /// how many times it polled, so a caller's failure message states what it saw
+    /// rather than reading as a hang or a bare timing artifact.
+    async fn poll_stream_error_count(manager: &Manager, want: usize) -> (usize, u32) {
+        let mut polls = 0u32;
+        let mut seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count;
+        while seen != want && polls < 200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count;
+            polls += 1;
+        }
+        (seen, polls)
+    }
+
+    /// THE BUG: an Anthropic error envelope delivered inside a 200
+    /// `text/event-stream` body — the same shape this proxy itself synthesizes,
+    /// and the shape Anthropic's real upstream uses for a mid-stream failure —
+    /// must be OBSERVED, not silently booked as a clean serve. Before the fix,
+    /// `parse_sse_usage`'s match had no `error` arm, so the event fell into
+    /// `_ => {}` and nothing was recorded.
+    #[tokio::test]
+    async fn sse_error_event_is_observed_not_counted_as_clean_serve() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = concat!(
+                        "event: error\n",
+                        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        // Read the body to completion FIRST — the client can see EOF before the
+        // detached tee task has finished parsing (see `poll_stream_error_count`).
+        let _ = resp.bytes().await.unwrap();
+
+        let (seen, polls) = poll_stream_error_count(&manager, 1).await;
+        assert_eq!(
+            seen, 1,
+            "polled {polls} times, stream-error count stayed {seen} — an in-band \
+             SSE error event must be observed, not silently dropped as a clean serve"
+        );
+
+        // The terminal-outcome counter (`record_served`) is UNCHANGED by this —
+        // it fires on the upstream's 200 status same as any clean serve, and this
+        // fix is deliberately observability-only: it adds a SECOND signal, it
+        // does not replace or gate the first.
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
+            1,
+            "the request-served counter is untouched by this fix"
+        );
+    }
+
+    /// NEGATIVE CONTROL: a clean 200 SSE stream (normal `message_start` /
+    /// `message_delta`, no `error` event) must record NO stream error. Uses the
+    /// same bounded-poll discipline as the positive case — asserting absence
+    /// after a trivially-passing zero-wait would be vacuous.
+    #[tokio::test]
+    async fn sse_clean_stream_records_no_stream_error() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                        "event: message_delta\n",
+                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let _ = resp.bytes().await.unwrap();
+
+        // Poll for the USAGE to land (a positive, waitable signal that the tee
+        // task has finished), then assert the error count is absent — never a
+        // zero-wait check, which would pass vacuously before the tee even runs.
+        let mut polls = 0u32;
+        let mut input_tokens = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
+        while input_tokens == 0 && polls < 200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            input_tokens = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
+            polls += 1;
+        }
+        assert_eq!(
+            input_tokens, 5,
+            "polled {polls} times waiting for usage to land"
+        );
+
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count,
+            0,
+            "a clean SSE stream must record no stream error"
         );
     }
 

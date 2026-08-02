@@ -124,6 +124,17 @@ pub struct AccountSnapshot {
     /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
     /// we cannot promise a time).
     pub free_at: Option<OffsetDateTime>,
+    /// Count of in-band SSE `error` events this account's streams carried within
+    /// the decay window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`) — a
+    /// truncated 200 that got booked as a clean serve before this field existed.
+    /// OBSERVABILITY ONLY: nothing in `select.rs` reads it, so it never gates
+    /// rotation. On the wire deliberately (see `status.rs`'s module doc): it
+    /// carries no credential material, and `tcr status --json` is how an
+    /// operator sees the fleet.
+    pub stream_error_count: usize,
+    /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
+    /// alongside the count above. Same on-the-wire decision as `stream_error_count`.
+    pub last_stream_error: Option<String>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

@@ -124,4 +124,58 @@ impl Manager {
             }
         }
     }
+
+    /// Record that account `idx` served a stream that carried an in-band SSE
+    /// `error` event (`kind` is `error.error.type`, e.g. `"overloaded_error"`) —
+    /// a truncated turn the client saw as a 200 that must not read as a clean
+    /// serve. OBSERVABILITY ONLY: this warns and updates a decayed counter and
+    /// the account's last-error label; it deliberately does NOT call
+    /// `mark_error` (that condemns terminally — see its doc comment on the 2026-07-17
+    /// incident) or `mark_rate_limited` (an overloaded account is not over quota —
+    /// see [`Self::mark_rate_limited`]'s doc comment), and nothing in
+    /// `select.rs`'s `eligible`/`hard_ok`/`account_terminal_gate` reads the
+    /// counter this writes — wiring it into routing is a separate, later,
+    /// premortem'd change.
+    pub fn record_stream_error(&self, idx: usize, kind: &str) {
+        let now_ms = crate::now_ms();
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            tracing::warn!(
+                account = %account.name,
+                index = idx,
+                error_type = kind,
+                "SSE stream carried an in-band error event — truncated turn, not a clean serve"
+            );
+            account.stream_error_times_ms.push_back(now_ms);
+            prune_stream_errors(&mut account.stream_error_times_ms, now_ms);
+            account.last_stream_error = Some(kind.to_string());
+        }
+    }
+}
+
+/// Prune `times` to [`STREAM_ERROR_WINDOW_MS`] and hard-cap at
+/// [`STREAM_ERROR_CAP`] entries, oldest first. The mutating half of pruning —
+/// called on INSERT, where the caller already holds the accounts write lock.
+fn prune_stream_errors(times: &mut VecDeque<i64>, now_ms: i64) {
+    while times
+        .front()
+        .is_some_and(|&t| now_ms - t > STREAM_ERROR_WINDOW_MS)
+    {
+        times.pop_front();
+    }
+    while times.len() > STREAM_ERROR_CAP {
+        times.pop_front();
+    }
+}
+
+/// The account's DECAYED stream-error count as of `now_ms`: entries within
+/// [`STREAM_ERROR_WINDOW_MS`]. The read-side half of pruning — [`Manager::snapshot`]
+/// holds only the accounts READ lock, so it cannot pop stale entries the way
+/// [`prune_stream_errors`] does on insert; this counts without mutating instead,
+/// which is equivalent for display purposes (the next insert physically prunes).
+pub(super) fn stream_error_count(times: &VecDeque<i64>, now_ms: i64) -> usize {
+    times
+        .iter()
+        .filter(|&&t| now_ms - t <= STREAM_ERROR_WINDOW_MS)
+        .count()
 }
