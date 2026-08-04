@@ -112,6 +112,17 @@ const ERROR_REPROBE_CAP_MS: i64 = 30 * 60_000;
 /// wait is bounded by three probe cadences no matter how long the warm interval is.
 const PROBE_FAILURES_BEFORE_WARMING_UNPROBED: u32 = 3;
 
+/// Decay window for [`AccountRuntime::stream_error_times_ms`] — how far back a
+/// stream error still counts toward the operator-facing decayed count. An hour:
+/// long enough to show a persistent pattern, short enough that a stale blip from
+/// hours ago does not linger in the TUI forever.
+const STREAM_ERROR_WINDOW_MS: i64 = 3_600_000;
+
+/// Hard cap on [`AccountRuntime::stream_error_times_ms`] so a pathological
+/// account (erroring on every request, indefinitely) cannot grow the queue
+/// without bound even inside the decay window.
+const STREAM_ERROR_CAP: usize = 64;
+
 /// Hard state of an account.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccountStatus {
@@ -238,6 +249,15 @@ pub struct AccountRuntime {
     pub probe_status: ProbeStatus,
     pub last_probe_ms: Option<i64>,
     pub probe_error: Option<String>,
+    /// Wall-clock ms of each in-band SSE `error` event observed on a stream this
+    /// account served (see [`Manager::record_stream_error`]), pruned to
+    /// [`STREAM_ERROR_WINDOW_MS`] and hard-capped at [`STREAM_ERROR_CAP`] entries
+    /// on BOTH insert and read, so it cannot grow unbounded. OBSERVABILITY ONLY —
+    /// nothing in `select.rs` reads this field; see that module's gates for why.
+    pub stream_error_times_ms: VecDeque<i64>,
+    /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
+    /// alongside the decayed count above.
+    pub last_stream_error: Option<String>,
 }
 
 impl AccountRuntime {
@@ -277,6 +297,8 @@ impl AccountRuntime {
             probe_status: ProbeStatus::Never,
             last_probe_ms: None,
             probe_error: None,
+            stream_error_times_ms: VecDeque::new(),
+            last_stream_error: None,
         }
     }
 }

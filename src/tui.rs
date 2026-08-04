@@ -443,7 +443,7 @@ fn render_table<'a>(
 /// of bare percentages) rather than letting the solver clip a number silently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccountsLayout {
-    /// The full 13-column table, unchanged. Chosen at or above
+    /// The full 14-column table, unchanged. Chosen at or above
     /// [`FULL_LAYOUT_MIN_WIDTH`].
     Full,
     /// The reduced 11-column table: Probe/Cache dropped, the three quota buckets
@@ -452,18 +452,44 @@ enum AccountsLayout {
     Compact,
 }
 
-/// The narrowest terminal width that still fits the full 13-column table without
+/// The Full layout's column headers, in render order. Paired BY INDEX with
+/// [`FULL_COLUMN_WIDTHS`]; `full_layout_header_and_widths_are_paired` holds the
+/// two lengths equal, because a header added without its width is the same class
+/// of drift as a width added without its constant.
+const FULL_COLUMNS: [&str; 14] = [
+    "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Fable", "Reqs", "In", "Cache", "Out",
+    "Last", "Err",
+];
+
+/// The Full layout's declared column widths, paired by index with
+/// [`FULL_COLUMNS`]. Sized to their widest legitimate content — the reason each
+/// non-obvious one is what it is:
+///
+/// * `Gate` (15) — the widest gate chip, `FABLE-7D 47h30m`.
+/// * `5h`/`Fable` (15) — a learned bar is `[########] 100%`; 14 clipped the `%`.
+/// * `7d` (20) — the same bar plus a `near`/`full` quota label.
+/// * `Cache` (7) — the hit ratio as a percentage, or `-` before any input.
+/// * `Err` (4) — the decayed in-band SSE error count, or `-`.
+const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 15, 20, 15, 6, 8, 7, 8, 6, 4];
+
+/// The narrowest terminal width that still fits the full 14-column table without
 /// the constraint solver clipping a column. Kept a literal with the arithmetic
 /// shown so a future column edit must update it *consciously* rather than
 /// silently re-introducing the squeeze it exists to prevent:
 ///
 /// ```text
-///   141  Σ the 13 column widths: 18+3+9+15+11+15+20+15+6+8+7+8+6
-/// +  12  column_spacing (1 cell × 12 inter-column gaps)
+///   145  Σ FULL_COLUMN_WIDTHS: 18+3+9+15+11+15+20+15+6+8+7+8+6+4
+/// +  13  column_spacing (1 cell × 13 inter-column gaps)
 /// +   2  the block's left + right borders
-/// = 155
+/// = 160
 /// ```
-const FULL_LAYOUT_MIN_WIDTH: u16 = 155;
+///
+/// The arithmetic is not taken on faith: `full_layout_min_width_fits_every_column`
+/// RENDERS the table at this width and reads back each column's realised width
+/// from the buffer. It was 155 while the table had 13 columns; the `Err` column
+/// landed without it, and at 155 the solver silently took `Gate` down to 11 —
+/// truncating exactly the `FABLE-7D 47h30m` label that column exists to show.
+const FULL_LAYOUT_MIN_WIDTH: u16 = 160;
 
 /// Pick the accounts-table layout for a pane `width` — the pure, rendering-free
 /// core of the responsive table, so the breakpoint is unit-testable without a
@@ -476,7 +502,7 @@ fn accounts_layout(width: u16) -> AccountsLayout {
     }
 }
 
-/// The accounts table. Responsive: [`AccountsLayout::Full`] renders all 13
+/// The accounts table. Responsive: [`AccountsLayout::Full`] renders all 14
 /// columns; [`AccountsLayout::Compact`] (below [`FULL_LAYOUT_MIN_WIDTH`]) drops
 /// Probe/Cache and renders the quota buckets as bar-less percentages so the
 /// utilization numbers stay visible on a narrow pane instead of being silently
@@ -491,10 +517,7 @@ fn render_accounts(
     let layout = accounts_layout(area.width);
 
     let header = match layout {
-        AccountsLayout::Full => Row::new(vec![
-            "Account", "Pri", "Status", "Gate", "Probe", "5h", "7d", "Fable", "Reqs", "In",
-            "Cache", "Out", "Last",
-        ]),
+        AccountsLayout::Full => Row::new(FULL_COLUMNS.to_vec()),
         AccountsLayout::Compact => Row::new(vec![
             "Account", "Pri", "Status", "Gate", "5h", "7d", "Fable", "Reqs", "In", "Out", "Last",
         ]),
@@ -521,7 +544,8 @@ fn render_accounts(
             // Columns shared by both layouts, in their shared order.
             let name = Cell::from(format!("{marker}{}", account.name));
             let priority = Cell::from(account.priority.to_string());
-            let status = Cell::from(account.status.clone()).style(status_style(&account.status));
+            let status =
+                Cell::from(status_label(account, now)).style(status_style(&account.status));
             let gate = Cell::from(gate_label).style(gate_style);
             let reqs = Cell::from(account.requests.to_string());
             let input = Cell::from(fmt_tokens(account.input_tokens));
@@ -555,6 +579,13 @@ fn render_accounts(
                         )),
                         output,
                         last,
+                        // In-band SSE `error` events (decayed count), observability
+                        // only — never a routing input. `-` when none observed.
+                        Cell::from(if account.stream_error_count > 0 {
+                            account.stream_error_count.to_string()
+                        } else {
+                            "-".to_string()
+                        }),
                     ]
                 }
                 // Compact mode: Probe and Cache dropped; each quota bucket becomes a
@@ -593,29 +624,15 @@ fn render_accounts(
         .collect();
 
     let widths = match layout {
-        AccountsLayout::Full => vec![
-            Constraint::Length(18),
-            Constraint::Length(3),
-            Constraint::Length(9),
-            // Gate chip: fits the widest label + back-when (`FABLE-7D 47h30m`).
-            Constraint::Length(15),
-            Constraint::Length(11),
-            // A learned bar is 15 chars (`[########] 100%`) — 14 clipped the `%`.
-            Constraint::Length(15),
-            // 7d bar + a "near"/"full" quota label — wider than the 5h column.
-            Constraint::Length(20),
-            // Fable weekly bar, same shape as 5h (no quota label).
-            Constraint::Length(15),
-            Constraint::Length(6),
-            Constraint::Length(8),
-            // Cache hit ratio (`cache_read / input`) as a percentage, or "-" when
-            // no input has been counted yet.
-            Constraint::Length(7),
-            Constraint::Length(8),
-            Constraint::Length(6),
-        ],
+        // Straight from the declared widths, so the table ratatui lays out and the
+        // number `FULL_LAYOUT_MIN_WIDTH` is computed from can never be two things.
+        AccountsLayout::Full => FULL_COLUMN_WIDTHS
+            .iter()
+            .map(|w| Constraint::Length(*w))
+            .collect(),
         // 91 widths + 10 spacing + 2 borders ≈ 103 cols. The three bar columns
-        // collapse to bare percentages and Probe/Cache are gone.
+        // collapse to bare percentages and Probe/Cache are gone. The stream-error
+        // column stays Full-only — Compact is already the narrow-terminal squeeze.
         AccountsLayout::Compact => vec![
             Constraint::Length(18),
             Constraint::Length(3),
@@ -957,9 +974,16 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         .add_modifier(Modifier::DIM);
     // A quota/Fable gate's back-when: the compact `rel`, or just the prefix when
     // the reset is unknown.
+    // Exact instant when we have one; otherwise the known FLOOR (">=3d") when some
+    // other active gate's unknown reset suppressed `free_at`. Showing the floor
+    // beats showing nothing: the badge alone hides a bound we actually know. The
+    // ">=" is load-bearing punctuation — this is "not before", never "at".
     let back = |prefix: &str| match account.free_at {
         Some(f) if f > now => format!("{prefix} {}", rel(f - now)),
-        _ => prefix.to_string(),
+        _ => match account.free_at_floor {
+            Some(fl) if fl > now => format!("{prefix} \u{2265}{}", rel(fl - now)),
+            _ => prefix.to_string(),
+        },
     };
     match account.gate {
         GateReason::Ok => ("OK".to_string(), dim),
@@ -986,6 +1010,32 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         GateReason::Disabled => ("OFF".to_string(), dim),
+    }
+}
+
+/// The Status cell's text: the raw status word, plus the clear-instant when the
+/// account is on a live 429 hold ("throttled 12s").
+///
+/// "When does it come back" is the only actionable thing about a hold, and the
+/// bare word forces the operator over to the Gate column — which shows `HOLD`
+/// only when no later-clearing gate outranks it, so a throttled-AND-quota-gated
+/// account shows the hold nowhere at all.
+///
+/// DISPLAY ONLY, and deliberately so. [`crate::manager::Manager::account_gate`]
+/// reports `free_at = None` whenever any active gate's reset is unknown, and
+/// [`crate::manager::Manager::retry_after_hint`] turns that into the client-facing
+/// `retry-after` — its doc records that promising a recovery which will not happen
+/// was a real bug. This cell must never become a source of truth for that path.
+///
+/// `rate_limited_until` is already live-filtered by the snapshot (an expired hold
+/// arrives as `None`); the `until > now` guard is belt-and-braces for a snapshot
+/// rendered slightly after it was taken.
+fn status_label(account: &AccountSnapshot, now: OffsetDateTime) -> String {
+    match account.rate_limited_until {
+        Some(until) if account.status == "throttled" && until > now => {
+            format!("{} {}", account.status, rel(until - now))
+        }
+        _ => account.status.clone(),
     }
 }
 
@@ -1411,12 +1461,44 @@ mod tests {
             quota_state: QuotaState::Normal,
             gate,
             free_at,
+            free_at_floor: None,
+            stream_error_count: 0,
+            last_stream_error: None,
         }
     }
 
     /// A stable, far-from-epoch anchor so `now + delta` never underflows.
     fn anchor() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + TimeDuration::days(3650)
+    }
+
+    #[test]
+    fn status_label_shows_a_live_hold_and_nothing_else() {
+        let now = anchor();
+        let mut a = snap_gate("acct", GateReason::Ok, None);
+
+        // A live hold renders its clear-instant beside the word.
+        a.status = "throttled".to_string();
+        a.rate_limited_until = Some(now + TimeDuration::seconds(12));
+        assert_eq!(status_label(&a, now), "throttled 12s");
+
+        // No deadline (or one that has already passed — the snapshot normally
+        // filters those to None, this is the belt-and-braces arm) falls back to the
+        // bare word rather than inventing or negating a time.
+        a.rate_limited_until = None;
+        assert_eq!(status_label(&a, now), "throttled");
+        a.rate_limited_until = Some(now - TimeDuration::seconds(1));
+        assert_eq!(status_label(&a, now), "throttled");
+
+        // THE LEAK GUARD: a deadline must never decorate a row that is not on a
+        // hold. `clear_rate_limited` nulls the field when it flips the status back,
+        // but the two are separate writes and this cell must not depend on that
+        // ordering — an `active` row showing a countdown would read as gated.
+        a.status = "active".to_string();
+        a.rate_limited_until = Some(now + TimeDuration::seconds(12));
+        assert_eq!(status_label(&a, now), "active");
+        a.status = "error".to_string();
+        assert_eq!(status_label(&a, now), "error");
     }
 
     #[test]
@@ -1576,14 +1658,118 @@ mod tests {
         }
     }
 
+    /// The Full layout's minimum width, DERIVED from the columns themselves:
+    /// every declared width, one cell of `column_spacing` between each adjacent
+    /// pair, and the block's two borders.
+    ///
+    /// Computed, never transcribed. A test that copies the constant it is meant
+    /// to check agrees with a stale value by construction.
+    fn derived_full_layout_min_width() -> u16 {
+        let columns: u16 = FULL_COLUMN_WIDTHS.iter().sum();
+        let gaps = FULL_COLUMN_WIDTHS.len() as u16 - 1;
+        let borders = 2;
+        columns + gaps + borders
+    }
+
+    /// The constant must EQUAL its own columns' derived total, so it cannot drift
+    /// from the table it measures.
+    ///
+    /// This is the assertion that executes the arithmetic the constant's doc
+    /// comment merely states. Without it the number is commentary: a fifteenth
+    /// column moves the true minimum without moving the constant, and a gate that
+    /// only *mentions* the number stays green while the layout clips.
+    #[test]
+    fn full_layout_min_width_equals_the_derived_total() {
+        assert_eq!(
+            FULL_LAYOUT_MIN_WIDTH,
+            derived_full_layout_min_width(),
+            "FULL_LAYOUT_MIN_WIDTH must equal Σ FULL_COLUMN_WIDTHS ({}) + {} inter-column gaps \
+             + 2 borders; a column was added or resized without updating it",
+            FULL_COLUMN_WIDTHS.iter().sum::<u16>(),
+            FULL_COLUMN_WIDTHS.len() - 1,
+        );
+    }
+
     #[test]
     fn accounts_layout_picks_mode_at_threshold() {
-        // The breakpoint is exact: FULL_LAYOUT_MIN_WIDTH still fits the full
-        // table; one column narrower drops to compact.
-        assert_eq!(accounts_layout(FULL_LAYOUT_MIN_WIDTH), AccountsLayout::Full);
+        // The breakpoint is exact: the derived minimum still fits the full table;
+        // one column narrower drops to compact.
+        //
+        // Fed the DERIVED width, never FULL_LAYOUT_MIN_WIDTH. `accounts_layout` is
+        // `width >= FULL_LAYOUT_MIN_WIDTH`, so passing it the constant returns Full
+        // for every value that constant could possibly hold — it asserts the
+        // comparison operator and learns nothing about the width.
+        let derived = derived_full_layout_min_width();
+        assert_eq!(accounts_layout(derived), AccountsLayout::Full);
+        assert_eq!(accounts_layout(derived - 1), AccountsLayout::Compact);
+    }
+
+    #[test]
+    fn full_layout_header_and_widths_are_paired() {
+        // Two parallel lists indexed against each other. A header added without
+        // its width (or the reverse) shifts every column right of the seam.
+        assert_eq!(FULL_COLUMNS.len(), FULL_COLUMN_WIDTHS.len());
+    }
+
+    /// Read back each Full column's REALISED width from a render at exactly
+    /// [`FULL_LAYOUT_MIN_WIDTH`] and hold it to the width that was declared.
+    ///
+    /// This is the assertion the old one only gestured at. Asserting
+    /// `accounts_layout(FULL_LAYOUT_MIN_WIDTH) == Full` compares the constant
+    /// against itself and passes for every value it could possibly hold; this one
+    /// puts the table through ratatui's constraint solver — the thing that does the
+    /// silent squeezing — and fails when the constant is too small for the columns
+    /// actually in the table. At the shipped 155 it reports `Gate` realised 11 of
+    /// its declared 15.
+    #[test]
+    fn full_layout_min_width_fits_every_column() {
+        let snapshot = util_snapshot(QuotaState::Normal);
+        let backend = TestBackend::new(FULL_LAYOUT_MIN_WIDTH, 6);
+        let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
+            .expect("render succeeds");
+        let rows = buffer_rows(terminal.backend().buffer());
+        // Row 0 is the block's top border; row 1 is the header. Indexed in CHARS,
+        // never bytes: the block's `│` borders are 3 bytes each, so a byte offset
+        // reads 2 cells to the right of the cell it names.
+        let header: Vec<char> = rows[1].chars().collect();
+
+        // Walk the header left to right, taking each label's offset in turn, so a
+        // repeated substring cannot match an earlier column's cell.
+        let mut starts = Vec::with_capacity(FULL_COLUMNS.len());
+        let mut from = 0usize;
+        for label in FULL_COLUMNS {
+            let needle: Vec<char> = label.chars().collect();
+            let at = (from..=header.len().saturating_sub(needle.len()))
+                .find(|i| header[*i..*i + needle.len()] == needle[..])
+                .unwrap_or_else(|| {
+                    panic!(
+                        "header column {label:?} is missing from {:?}",
+                        rows[1].as_str()
+                    )
+                });
+            starts.push(at);
+            from = at + needle.len();
+        }
+
+        // Each column runs to the next column's start, less the 1-cell spacing;
+        // the last runs to the block's right border.
+        let right_border = usize::from(FULL_LAYOUT_MIN_WIDTH) - 1;
+        let realised: Vec<u16> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let end = starts.get(i + 1).map_or(right_border, |next| next - 1);
+                (end - start) as u16
+            })
+            .collect();
+
         assert_eq!(
-            accounts_layout(FULL_LAYOUT_MIN_WIDTH - 1),
-            AccountsLayout::Compact
+            realised,
+            FULL_COLUMN_WIDTHS.to_vec(),
+            "at FULL_LAYOUT_MIN_WIDTH ({FULL_LAYOUT_MIN_WIDTH}) every column must realise its \
+             declared width; a shortfall means the constant has not followed the columns"
         );
     }
 

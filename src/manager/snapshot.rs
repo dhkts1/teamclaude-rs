@@ -130,6 +130,12 @@ impl Manager {
                 // never gates a general fleet row (an account spent only on its
                 // Fable bucket still serves every other model, so it reads `Ok`).
                 let (gate, free_at) = Self::account_gate(a, threshold, now, now_ms, false);
+                // Display-only floor for the Gate cell when `free_at` is None
+                // because an active gate's reset is unknown. Same `is_fable=false`
+                // view as the line above, so the two always describe one account
+                // state rather than two.
+                let free_at_floor =
+                    Self::account_gate_known_floor(a, threshold, now, now_ms, false);
                 AccountSnapshot {
                     name: a.name.clone(),
                     priority: a.priority,
@@ -173,6 +179,12 @@ impl Manager {
                     quota_state,
                     gate,
                     free_at,
+                    free_at_floor,
+                    stream_error_count: super::usage::stream_error_count(
+                        &a.stream_error_times_ms,
+                        now_ms,
+                    ),
+                    last_stream_error: a.last_stream_error.clone(),
                 }
             })
             .collect();

@@ -390,7 +390,15 @@ fn render_window(
 /// output is greppable (`account NAME priority=P quota=Q% status=S ...`). The
 /// ratatui TUI renderer is unusable for stdout, and per Gil's greppable-output
 /// rule a naive grep must be able to match any single field.
-pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
+///
+/// `source` is taken rather than inferred because one token depends on it:
+/// `stream_errors` is a SERVING counter, so an offline snapshot's zero is
+/// structurally unmeasured (see [`StatusSource`]) and renders `n/a`, never `0`.
+pub fn render_accounts(
+    snapshot: &StatsSnapshot,
+    thresholds: &[f64],
+    source: StatusSource,
+) -> String {
     if snapshot.accounts.is_empty() {
         return "no accounts configured\n".to_string();
     }
@@ -422,8 +430,29 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
                 a.cache_read_tokens as f64 / a.input_tokens as f64 * 100.0
             )
         };
+        // In-band SSE `error` events this account's streams carried (decayed
+        // window). A truncated 200 books as a clean serve, so this is the only
+        // place that class of failure is visible at all.
+        //
+        // `n/a` — never `0` — on an OFFLINE snapshot, for the same reason
+        // `cache=n/a` exists: the counter lives in the serving process, so a fresh
+        // one reads structurally zero, and "0 stream errors" is an affirmative
+        // all-clear in a way "0 requests" is not. Publishing an unmeasured
+        // all-clear on an error counter is precisely the failure this field was
+        // added to end.
+        let stream_errors = match source {
+            StatusSource::Offline => " stream_errors=n/a".to_string(),
+            StatusSource::Live => format!(" stream_errors={}", a.stream_error_count),
+        };
+        // The latest error's `error.type`, alongside the count. Omitted entirely
+        // when none has been seen, matching the `fable=` idiom — the count above
+        // already distinguishes "none" from "not measured".
+        let last_stream_error = match (source, a.last_stream_error.as_deref()) {
+            (StatusSource::Live, Some(kind)) => format!(" last_stream_error={kind}"),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "account {} priority={} {} {}{}{} state={} status={} probe={}{}\n",
+            "account {} priority={} {} {}{}{} state={} status={} probe={}{}{}{}\n",
             a.name,
             a.priority,
             five_hour,
@@ -433,6 +462,8 @@ pub fn render_accounts(snapshot: &StatsSnapshot, thresholds: &[f64]) -> String {
             quota_state_token(a.quota_state),
             a.status,
             a.probe_status.as_str(),
+            stream_errors,
+            last_stream_error,
             if a.disabled { " disabled" } else { "" },
         ));
     }
@@ -539,6 +570,23 @@ fn render_accounts_json(
                 },
                 "probeStatus": a.probe_status.as_str(),
                 "probeError": a.probe_error,
+                // Decayed count of in-band SSE `error` events — a truncated 200
+                // that books as a clean serve. `null`, NEVER 0, on the offline
+                // path: the counter lives in the serving process, so a fresh one
+                // is structurally zero, and an unmeasured `0` on an ERROR counter
+                // publishes an all-clear nobody measured. Same "not measured"
+                // idiom as `cacheHitRatio`; `source` says which process would
+                // have measured it.
+                "streamErrorCount": match source {
+                    StatusSource::Offline => serde_json::Value::Null,
+                    StatusSource::Live => serde_json::json!(a.stream_error_count),
+                },
+                // The latest error's `error.type` (e.g. "overloaded_error"), or
+                // null when none has been observed / nothing measured.
+                "lastStreamError": match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => a.last_stream_error.clone(),
+                },
                 "held": held,
             })
         })
@@ -560,7 +608,13 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
         probe,
     )
     .await;
-    print!("{}", render_accounts(&snapshot, &thresholds));
+    // `tcr accounts` is the offline verb by construction — it builds its own
+    // Manager and never asks the server — so its serving counters are structurally
+    // zero and must render as unmeasured, not as a measurement.
+    print!(
+        "{}",
+        render_accounts(&snapshot, &thresholds, StatusSource::Offline)
+    );
     Ok(())
 }
 
@@ -714,7 +768,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             },
             build_fields(server_build.as_ref()),
         );
-        print!("{}", render_accounts(&snapshot, &thresholds));
+        print!("{}", render_accounts(&snapshot, &thresholds, source));
     }
     Ok(())
 }
@@ -993,7 +1047,11 @@ mod tests {
             true,
         )
         .await;
-        let text = render_accounts(&snapshot, &thresholds);
+        // Offline is the honest source for a snapshot built by `snapshot_offline`,
+        // and it is the exact line shape `tcr accounts` emits — that verb is
+        // offline by construction, so this is the greppable line a human reads
+        // most often.
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per account");
         // Each line is greppable: name + priority + per-window utilization.
@@ -1018,6 +1076,15 @@ mod tests {
             !text.contains("held=") && !text.contains("quota="),
             "legacy quota/held fields are gone: {text}"
         );
+        // Every token stays `key=value`, so the new stream-error token is greppable
+        // wherever it sits in the line and does not displace its neighbours.
+        for line in &lines {
+            assert!(
+                line.contains("probe=") && line.contains("stream_errors=n/a"),
+                "the offline line keeps probe= and carries an unmeasured \
+                 stream-error token: {line}"
+            );
+        }
     }
 
     /// THE HONESTY TEST. An offline snapshot's serving counters live in the
@@ -1082,7 +1149,7 @@ mod tests {
         );
 
         // The human view uses the same `n/a` idiom the unknown quota windows use.
-        let text = render_accounts(&snapshot, &thresholds);
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
         for line in text.lines() {
             assert!(
                 line.contains("cache=n/a"),
@@ -1091,8 +1158,87 @@ mod tests {
             assert!(!line.contains("cache=0%"), "no false measured zero: {line}");
         }
         assert!(
-            render_accounts(&counted, &thresholds).contains("cache=75%"),
+            render_accounts(&counted, &thresholds, StatusSource::Live).contains("cache=75%"),
             "a measured ratio still renders as a percentage"
+        );
+    }
+
+    /// The stream-error counter obeys the same rule as the cache ratio above, and
+    /// for a sharper reason: `0` on an ERROR counter is an affirmative all-clear.
+    /// Offline it is structurally zero — the count lives in the serving process —
+    /// so publishing it as `0` would claim "no truncated streams" about a process
+    /// this one never spoke to.
+    #[tokio::test]
+    async fn offline_status_reports_null_not_zero_stream_errors() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            true,
+        )
+        .await;
+
+        let offline = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&offline).expect("valid json");
+        for row in &rows {
+            // `get`, not `row[...]`: indexing a MISSING key also yields Null, so
+            // `row["streamErrorCount"].is_null()` would pass against the very bug
+            // this test exists for — the field never being rendered at all.
+            assert_eq!(
+                row.get("streamErrorCount"),
+                Some(&serde_json::Value::Null),
+                "the key is present AND null — unmeasured, never a 0 all-clear: {row}"
+            );
+            assert_eq!(
+                row.get("lastStreamError"),
+                Some(&serde_json::Value::Null),
+                "nothing measured: {row}"
+            );
+        }
+
+        // Measured and genuinely clean is a DIFFERENT state, and renders as 0.
+        let live = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
+        assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(0));
+
+        // Measured and dirty carries both the count and the latest error type.
+        let mut errored = snapshot.clone();
+        errored.accounts[0].stream_error_count = 3;
+        errored.accounts[0].last_stream_error = Some("overloaded_error".to_string());
+        let live = render_accounts_json(&errored, &thresholds, StatusSource::Live, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
+        assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(3));
+        assert_eq!(
+            rows[0]["lastStreamError"],
+            serde_json::json!("overloaded_error")
+        );
+
+        // The text view carries the same three states as greppable tokens.
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
+        for line in text.lines() {
+            assert!(
+                line.contains("stream_errors=n/a"),
+                "unmeasured reads n/a, never 0: {line}"
+            );
+            assert!(
+                !line.contains("stream_errors=0"),
+                "no false all-clear: {line}"
+            );
+        }
+        assert!(
+            render_accounts(&snapshot, &thresholds, StatusSource::Live).contains("stream_errors=0"),
+            "a measured clean fleet still renders a real 0"
+        );
+        let text = render_accounts(&errored, &thresholds, StatusSource::Live);
+        assert!(
+            text.contains("stream_errors=3"),
+            "the count is greppable: {text}"
+        );
+        assert!(
+            text.contains("last_stream_error=overloaded_error"),
+            "the latest error type is greppable: {text}"
         );
     }
 
@@ -1335,7 +1481,7 @@ mod tests {
             calls: calls.clone(),
         });
         let snapshot = snapshot_offline(config, refresher, Arc::new(RejectingProber), true).await;
-        let text = render_accounts(&snapshot, &thresholds);
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
         assert!(
             text.contains("stale@example.com"),
             "renders the account: {text}"
@@ -1433,7 +1579,7 @@ mod tests {
         let thresholds = resolve_thresholds(&config);
         let snapshot =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
-        let text = render_accounts(&snapshot, &thresholds);
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Live);
         let alice = text
             .lines()
             .find(|l| l.contains("alice@example.com"))
@@ -1505,7 +1651,7 @@ mod tests {
         let thresholds = resolve_thresholds(&config);
         let snapshot =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(ExhaustedProber), true).await;
-        let text = render_accounts(&snapshot, &thresholds);
+        let text = render_accounts(&snapshot, &thresholds, StatusSource::Live);
         let line = text
             .lines()
             .find(|l| l.contains("alice@example.com"))
