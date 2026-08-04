@@ -4226,61 +4226,6 @@ mod tests {
     }
 
     #[test]
-    fn account_gate_known_floor_surfaces_the_time_free_at_suppresses() {
-        // The companion to the test above, on the SAME shape: `free_at` is None
-        // because the 7d reset is unknown, but we DO know the 5h one, and the
-        // account cannot come back before it. The floor surfaces that bound for the
-        // renderer without ever becoming a promise.
-        let now = OffsetDateTime::now_utc();
-        let soon = now + Duration::seconds(300);
-        let mut a = gate_runtime();
-        a.quota.five_hour = Some(window(0.99, Some(soon)));
-        a.quota.seven_day = Some(window(0.99, None));
-        assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
-            (GateReason::SevenDay, None),
-            "precondition: free_at is still suppressed"
-        );
-        assert_eq!(
-            Manager::account_gate_known_floor(&a, 0.90, now, odt_to_ms(now), false),
-            Some(soon),
-            "the known 5h reset is a real floor and must be recoverable"
-        );
-
-        // Every reset known: the floor is the LATEST, i.e. it agrees with free_at
-        // rather than contradicting it.
-        let later = now + Duration::seconds(900);
-        a.quota.seven_day = Some(window(0.99, Some(later)));
-        assert_eq!(
-            Manager::account_gate_known_floor(&a, 0.90, now, odt_to_ms(now), false),
-            Some(later)
-        );
-        assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false).1,
-            Some(later),
-            "floor and free_at must not disagree when nothing is unknown"
-        );
-
-        // In rotation: nothing gates, so there is no floor to report.
-        let clear = gate_runtime();
-        assert_eq!(
-            Manager::account_gate_known_floor(&clear, 0.90, now, odt_to_ms(now), false),
-            None
-        );
-
-        // TERMINAL: a state that never self-frees gets no floor, however many
-        // window resets happen to be known — inventing one would tell the operator
-        // to wait for a recovery that only a human can cause.
-        let mut dead = gate_runtime();
-        dead.quota.five_hour = Some(window(0.99, Some(soon)));
-        dead.disabled = true;
-        assert_eq!(
-            Manager::account_gate_known_floor(&dead, 0.90, now, odt_to_ms(now), false),
-            None
-        );
-    }
-
-    #[test]
     fn account_gate_fable_weekly_only_gates_fable() {
         // The 7d_oi bucket gates a Fable evaluation and is invisible to the general
         // one — the exact `is_fable` split `eligible` makes.

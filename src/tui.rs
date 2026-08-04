@@ -974,16 +974,9 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         .add_modifier(Modifier::DIM);
     // A quota/Fable gate's back-when: the compact `rel`, or just the prefix when
     // the reset is unknown.
-    // Exact instant when we have one; otherwise the known FLOOR (">=3d") when some
-    // other active gate's unknown reset suppressed `free_at`. Showing the floor
-    // beats showing nothing: the badge alone hides a bound we actually know. The
-    // ">=" is load-bearing punctuation — this is "not before", never "at".
     let back = |prefix: &str| match account.free_at {
         Some(f) if f > now => format!("{prefix} {}", rel(f - now)),
-        _ => match account.free_at_floor {
-            Some(fl) if fl > now => format!("{prefix} \u{2265}{}", rel(fl - now)),
-            _ => prefix.to_string(),
-        },
+        _ => prefix.to_string(),
     };
     match account.gate {
         GateReason::Ok => ("OK".to_string(), dim),
@@ -1461,7 +1454,6 @@ mod tests {
             quota_state: QuotaState::Normal,
             gate,
             free_at,
-            free_at_floor: None,
             stream_error_count: 0,
             last_stream_error: None,
         }
@@ -2029,5 +2021,85 @@ mod tests {
             rows[session_row].contains("→bob"),
             "the divert stays visible as a marker on the row\n{text}"
         );
+    }
+
+    // ---- HENRY REVIEW PROBE (throwaway, remove before commit) ----
+    fn probe_throttled_snapshot(hold_secs: i64) -> StatsSnapshot {
+        let mut account = snap_gate(
+            "acct",
+            GateReason::Hold,
+            Some(anchor() + TimeDuration::seconds(hold_secs)),
+        );
+        account.status = "throttled".to_string();
+        account.rate_limited_until = Some(anchor() + TimeDuration::seconds(hold_secs));
+        account.five_hour = Some(0.47);
+        account.seven_day = Some(0.9);
+        account.seven_day_oi = Some(0.62);
+        account.requests = 1234;
+        account.input_tokens = 2_000_000;
+        account.output_tokens = 1_500;
+        account.cache_read_tokens = 1_000_000;
+        account.stream_error_count = 7;
+        account.last_used = Some(anchor() - TimeDuration::seconds(30));
+        account.probe_status = ProbeStatus::Ok;
+        StatsSnapshot {
+            accounts: vec![account],
+            current: Some(0),
+            recent: vec![],
+            sessions: vec![],
+        }
+    }
+
+    #[test]
+    fn henry_probe_countdown_render_truth() {
+        for hold in [12i64, 3600] {
+            let snapshot = probe_throttled_snapshot(hold);
+            let expected = status_label(&snapshot.accounts[0], anchor());
+            for width in [103u16, 120, 159, FULL_LAYOUT_MIN_WIDTH, 200] {
+                let backend = TestBackend::new(width, 6);
+                let mut terminal = Terminal::new(backend).expect("terminal");
+                terminal
+                    .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
+                    .expect("render");
+                let rows = buffer_rows(terminal.backend().buffer());
+                println!(
+                    "\n=== hold={hold}s width={width} layout={:?} expected_label={expected:?} ===",
+                    accounts_layout(width)
+                );
+                for (i, r) in rows.iter().enumerate() {
+                    println!("  [{i}] |{r}|");
+                }
+                println!(
+                    "  CONTAINS_FULL_LABEL={}",
+                    rows.iter().any(|r| r.contains(&expected))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn henry_probe_hold_invisible_when_quota_gate_outranks() {
+        // The exact case status_label's own doc names: throttled AND 7d-gated, so
+        // the Gate column shows 7D (not HOLD) and the Status cell is the only
+        // place the hold could appear.
+        let mut snapshot = probe_throttled_snapshot(45);
+        snapshot.accounts[0].gate = GateReason::SevenDay;
+        snapshot.accounts[0].free_at = Some(anchor() + TimeDuration::seconds(9000));
+        let expected = status_label(&snapshot.accounts[0], anchor());
+        for width in [103u16, FULL_LAYOUT_MIN_WIDTH] {
+            let backend = TestBackend::new(width, 6);
+            let mut terminal = Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
+                .expect("render");
+            let rows = buffer_rows(terminal.backend().buffer());
+            println!("\n=== quota-outranks width={width} expected_label={expected:?} ===");
+            println!("  [1] |{}|", rows[1]);
+            println!("  [2] |{}|", rows[2]);
+            println!(
+                "  HOLD_45s_VISIBLE_ANYWHERE={}",
+                rows.iter().any(|r| r.contains("45"))
+            );
+        }
     }
 }
