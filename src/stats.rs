@@ -124,6 +124,12 @@ pub struct AccountSnapshot {
     /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
     /// we cannot promise a time).
     pub free_at: Option<OffsetDateTime>,
+    /// DISPLAY ONLY floor: the latest clear-instant among the gates that HAVE one,
+    /// when [`Self::free_at`] is `None` because some other active gate's reset is
+    /// unknown. Read as "not before this, possibly later" — never as a promise,
+    /// and never fed to `retry_after_hint` (see
+    /// [`crate::manager::Manager::account_gate_known_floor`]).
+    pub free_at_floor: Option<OffsetDateTime>,
     /// Count of in-band SSE `error` events this account's streams carried within
     /// the decay window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`) — a
     /// truncated 200 that got booked as a clean serve before this field existed.

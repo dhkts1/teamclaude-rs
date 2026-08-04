@@ -974,9 +974,16 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         .add_modifier(Modifier::DIM);
     // A quota/Fable gate's back-when: the compact `rel`, or just the prefix when
     // the reset is unknown.
+    // Exact instant when we have one; otherwise the known FLOOR (">=3d") when some
+    // other active gate's unknown reset suppressed `free_at`. Showing the floor
+    // beats showing nothing: the badge alone hides a bound we actually know. The
+    // ">=" is load-bearing punctuation — this is "not before", never "at".
     let back = |prefix: &str| match account.free_at {
         Some(f) if f > now => format!("{prefix} {}", rel(f - now)),
-        _ => prefix.to_string(),
+        _ => match account.free_at_floor {
+            Some(fl) if fl > now => format!("{prefix} \u{2265}{}", rel(fl - now)),
+            _ => prefix.to_string(),
+        },
     };
     match account.gate {
         GateReason::Ok => ("OK".to_string(), dim),
@@ -1454,6 +1461,7 @@ mod tests {
             quota_state: QuotaState::Normal,
             gate,
             free_at,
+            free_at_floor: None,
             stream_error_count: 0,
             last_stream_error: None,
         }

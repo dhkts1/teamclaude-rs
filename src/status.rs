@@ -122,6 +122,8 @@ pub struct AccountStatus {
     pub quota_state: QuotaState,
     pub gate: GateReason,
     pub free_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_at_floor_ms: Option<i64>,
     /// The account's effective switch threshold on the SERVER (its own
     /// `switchThreshold`, else the global one).
     pub threshold: f64,
@@ -180,6 +182,7 @@ impl StatusPayload {
                 quota_state: a.quota_state,
                 gate: a.gate,
                 free_at_ms: a.free_at.map(to_ms),
+                free_at_floor_ms: a.free_at_floor.map(to_ms),
                 threshold: thresholds.get(i).copied().unwrap_or(1.0),
                 stream_error_count: a.stream_error_count,
                 last_stream_error: a.last_stream_error.clone(),
@@ -231,6 +234,7 @@ impl StatusPayload {
                     quota_state: a.quota_state,
                     gate: a.gate,
                     free_at: a.free_at_ms.and_then(from_ms),
+                    free_at_floor: a.free_at_floor_ms.and_then(from_ms),
                     stream_error_count: a.stream_error_count,
                     last_stream_error: a.last_stream_error,
                 }
@@ -277,6 +281,7 @@ mod tests {
                 quota_state: QuotaState::Normal,
                 gate: GateReason::Ok,
                 free_at: None,
+                free_at_floor: None,
                 stream_error_count: 0,
                 last_stream_error: None,
             }],
