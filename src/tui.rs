@@ -544,8 +544,7 @@ fn render_accounts(
             // Columns shared by both layouts, in their shared order.
             let name = Cell::from(format!("{marker}{}", account.name));
             let priority = Cell::from(account.priority.to_string());
-            let status =
-                Cell::from(status_label(account, now)).style(status_style(&account.status));
+            let status = Cell::from(account.status.clone()).style(status_style(&account.status));
             let gate = Cell::from(gate_label).style(gate_style);
             let reqs = Cell::from(account.requests.to_string());
             let input = Cell::from(fmt_tokens(account.input_tokens));
@@ -1006,32 +1005,6 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
     }
 }
 
-/// The Status cell's text: the raw status word, plus the clear-instant when the
-/// account is on a live 429 hold ("throttled 12s").
-///
-/// "When does it come back" is the only actionable thing about a hold, and the
-/// bare word forces the operator over to the Gate column — which shows `HOLD`
-/// only when no later-clearing gate outranks it, so a throttled-AND-quota-gated
-/// account shows the hold nowhere at all.
-///
-/// DISPLAY ONLY, and deliberately so. [`crate::manager::Manager::account_gate`]
-/// reports `free_at = None` whenever any active gate's reset is unknown, and
-/// [`crate::manager::Manager::retry_after_hint`] turns that into the client-facing
-/// `retry-after` — its doc records that promising a recovery which will not happen
-/// was a real bug. This cell must never become a source of truth for that path.
-///
-/// `rate_limited_until` is already live-filtered by the snapshot (an expired hold
-/// arrives as `None`); the `until > now` guard is belt-and-braces for a snapshot
-/// rendered slightly after it was taken.
-fn status_label(account: &AccountSnapshot, now: OffsetDateTime) -> String {
-    match account.rate_limited_until {
-        Some(until) if account.status == "throttled" && until > now => {
-            format!("{} {}", account.status, rel(until - now))
-        }
-        _ => account.status.clone(),
-    }
-}
-
 fn status_style(status: &str) -> Style {
     match status {
         "active" => Style::default().fg(Color::Green),
@@ -1462,35 +1435,6 @@ mod tests {
     /// A stable, far-from-epoch anchor so `now + delta` never underflows.
     fn anchor() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + TimeDuration::days(3650)
-    }
-
-    #[test]
-    fn status_label_shows_a_live_hold_and_nothing_else() {
-        let now = anchor();
-        let mut a = snap_gate("acct", GateReason::Ok, None);
-
-        // A live hold renders its clear-instant beside the word.
-        a.status = "throttled".to_string();
-        a.rate_limited_until = Some(now + TimeDuration::seconds(12));
-        assert_eq!(status_label(&a, now), "throttled 12s");
-
-        // No deadline (or one that has already passed — the snapshot normally
-        // filters those to None, this is the belt-and-braces arm) falls back to the
-        // bare word rather than inventing or negating a time.
-        a.rate_limited_until = None;
-        assert_eq!(status_label(&a, now), "throttled");
-        a.rate_limited_until = Some(now - TimeDuration::seconds(1));
-        assert_eq!(status_label(&a, now), "throttled");
-
-        // THE LEAK GUARD: a deadline must never decorate a row that is not on a
-        // hold. `clear_rate_limited` nulls the field when it flips the status back,
-        // but the two are separate writes and this cell must not depend on that
-        // ordering — an `active` row showing a countdown would read as gated.
-        a.status = "active".to_string();
-        a.rate_limited_until = Some(now + TimeDuration::seconds(12));
-        assert_eq!(status_label(&a, now), "active");
-        a.status = "error".to_string();
-        assert_eq!(status_label(&a, now), "error");
     }
 
     #[test]
@@ -2021,85 +1965,5 @@ mod tests {
             rows[session_row].contains("→bob"),
             "the divert stays visible as a marker on the row\n{text}"
         );
-    }
-
-    // ---- HENRY REVIEW PROBE (throwaway, remove before commit) ----
-    fn probe_throttled_snapshot(hold_secs: i64) -> StatsSnapshot {
-        let mut account = snap_gate(
-            "acct",
-            GateReason::Hold,
-            Some(anchor() + TimeDuration::seconds(hold_secs)),
-        );
-        account.status = "throttled".to_string();
-        account.rate_limited_until = Some(anchor() + TimeDuration::seconds(hold_secs));
-        account.five_hour = Some(0.47);
-        account.seven_day = Some(0.9);
-        account.seven_day_oi = Some(0.62);
-        account.requests = 1234;
-        account.input_tokens = 2_000_000;
-        account.output_tokens = 1_500;
-        account.cache_read_tokens = 1_000_000;
-        account.stream_error_count = 7;
-        account.last_used = Some(anchor() - TimeDuration::seconds(30));
-        account.probe_status = ProbeStatus::Ok;
-        StatsSnapshot {
-            accounts: vec![account],
-            current: Some(0),
-            recent: vec![],
-            sessions: vec![],
-        }
-    }
-
-    #[test]
-    fn henry_probe_countdown_render_truth() {
-        for hold in [12i64, 3600] {
-            let snapshot = probe_throttled_snapshot(hold);
-            let expected = status_label(&snapshot.accounts[0], anchor());
-            for width in [103u16, 120, 159, FULL_LAYOUT_MIN_WIDTH, 200] {
-                let backend = TestBackend::new(width, 6);
-                let mut terminal = Terminal::new(backend).expect("terminal");
-                terminal
-                    .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
-                    .expect("render");
-                let rows = buffer_rows(terminal.backend().buffer());
-                println!(
-                    "\n=== hold={hold}s width={width} layout={:?} expected_label={expected:?} ===",
-                    accounts_layout(width)
-                );
-                for (i, r) in rows.iter().enumerate() {
-                    println!("  [{i}] |{r}|");
-                }
-                println!(
-                    "  CONTAINS_FULL_LABEL={}",
-                    rows.iter().any(|r| r.contains(&expected))
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn henry_probe_hold_invisible_when_quota_gate_outranks() {
-        // The exact case status_label's own doc names: throttled AND 7d-gated, so
-        // the Gate column shows 7D (not HOLD) and the Status cell is the only
-        // place the hold could appear.
-        let mut snapshot = probe_throttled_snapshot(45);
-        snapshot.accounts[0].gate = GateReason::SevenDay;
-        snapshot.accounts[0].free_at = Some(anchor() + TimeDuration::seconds(9000));
-        let expected = status_label(&snapshot.accounts[0], anchor());
-        for width in [103u16, FULL_LAYOUT_MIN_WIDTH] {
-            let backend = TestBackend::new(width, 6);
-            let mut terminal = Terminal::new(backend).expect("terminal");
-            terminal
-                .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
-                .expect("render");
-            let rows = buffer_rows(terminal.backend().buffer());
-            println!("\n=== quota-outranks width={width} expected_label={expected:?} ===");
-            println!("  [1] |{}|", rows[1]);
-            println!("  [2] |{}|", rows[2]);
-            println!(
-                "  HOLD_45s_VISIBLE_ANYWHERE={}",
-                rows.iter().any(|r| r.contains("45"))
-            );
-        }
     }
 }
