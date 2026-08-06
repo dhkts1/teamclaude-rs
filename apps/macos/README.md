@@ -1,8 +1,9 @@
 # TcrBar
 
 A macOS menu-bar front end for `tcr`. It shows the live fleet — one row per
-account, with its quota bar, `quotaState` pill and reset countdown — and can start
-the proxy as a supervised child process.
+account, with its quota bar, `quotaState` pill and reset time — can take a single
+account in or out of rotation, and can start the proxy as a supervised child
+process.
 
 It contains no Rust and changes none: everything it knows comes from shelling out
 to `tcr status --json`.
@@ -24,6 +25,37 @@ TcrBar therefore always spawns `tcr server --no-replace`, and only ever signals 
 child **it** spawned. A server that was already running is displayed and left
 alone — there is no code path that can terminate it. A spawn that declines because
 an incumbent holds the port is reported as "already running", which is a success.
+
+## Enabling and disabling an account
+
+Each row has an Enable/Disable button. It shells out to `tcr enable <name>` /
+`tcr disable <name>` and nothing else — TcrBar never writes
+`~/.config/teamclaude.json`, because that file holds credentials and `tcr` owns it.
+
+`tcr`'s account query is a *case-insensitive substring* match, so even passing the
+exact configured name is not a guarantee of a unique hit. The exit code and stderr
+are therefore captured and the CLI's own words are rendered in the row on failure;
+a toggle that did not happen never looks like one that did. On success the panel
+re-polls rather than flipping its own copy of `disabled`, so what you see is
+always what `tcr status` reports.
+
+That is a statement about the *config*. Whether a proxy that is already running
+picks the change up without a restart is not something this app verifies, in
+either direction, and it does not claim to.
+
+Disabling is reversible, so there is no confirmation dialog.
+
+## What the menu-bar glyph means
+
+Fleet **capacity**, not the worst account:
+
+- any account ready → ok
+- none ready, at least one `near` → amber
+- none ready, none near → red
+
+A rotating pool is *supposed* to contain spent accounts — that is the mechanism
+working. A worst-account-wins glyph sat at its most alarming setting permanently
+and therefore meant nothing.
 
 ## Build and run
 
@@ -69,7 +101,8 @@ Three states look similar and are not:
 
 ```
 Package.swift
-Sources/TcrBarCore/   FleetStatus.swift  StatusPoller.swift  ServerController.swift  TcrTool.swift
+Sources/TcrBarCore/   FleetStatus.swift  StatusPoller.swift  ServerController.swift
+                      AccountControl.swift  LoginItem.swift  TcrTool.swift
 Sources/TcrBar/       TcrBarApp.swift  FleetView.swift  Tokens.swift
 Tests/TcrBarTests/    FleetStatusTests.swift
 scripts/build-tcrbar.sh

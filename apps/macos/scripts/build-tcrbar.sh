@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Assemble TcrBar.app by hand — no Xcode project, no .xcodeproj to keep in sync.
 #
-# Output: apps/macos/build/TcrBar.app, ad-hoc signed. Developer ID signing,
-# notarization, stapling, DMGs and Sparkle are deliberately out of scope: this is
-# a local operator tool, not a distributed product.
+# Output: apps/macos/build/TcrBar.app, signed with the best certificate present on
+# the machine (see the signing ladder below). Notarization, stapling, DMGs and
+# Sparkle are deliberately out of scope: this is a local operator tool, not a
+# distributed product.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -64,7 +65,60 @@ cat >"$app_dir/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "==> codesign (ad-hoc)"
-codesign -s - --force "$app_dir"
+# Signing ladder — loudest-safe-first.
+#
+# The signature is not ceremony here: "Launch at login" registers the bundle with
+# macOS by *code identity*. An ad-hoc signature has no certificate behind it, so
+# its cdhash changes on every rebuild and a previously-registered login item ends
+# up pointing at an identity that no longer matches. The same is true of any
+# permission grant the app is ever given.
+#
+# So: prefer a real certificate. No identity name, team id or email is written
+# down here — this repository is public. The label prefix is matched with
+# `grep -F` (fixed string, no regex) and the full quoted identity is read out of
+# the keychain at build time.
+first_identity_matching() {
+  # $1 is a certificate-class label prefix, e.g. "Developer ID Application".
+  # Lines look like: `  1) <SHA1> "<Class>: <Name> (<TEAM>)"`
+  # `|| true`: "no identity of this class" is a normal answer, and under
+  # `set -o pipefail` grep's exit 1 would otherwise abort the whole build.
+  security find-identity -v -p codesigning 2>/dev/null \
+    | grep -F "\"$1: " \
+    | head -n 1 \
+    | sed -E 's/^[^"]*"(.*)"[[:space:]]*$/\1/' || true
+}
 
-echo "built $app_dir  version=$short_version build=$build_number sha=$git_sha"
+sign_identity=""
+sign_tier=""
+for class in "Developer ID Application" "Apple Development"; do
+  sign_identity="$(first_identity_matching "$class")"
+  if [ -n "$sign_identity" ]; then
+    sign_tier="$class"
+    break
+  fi
+done
+
+if [ -n "$sign_identity" ]; then
+  echo "==> codesign ($sign_tier)"
+  codesign -s "$sign_identity" --force "$app_dir"
+else
+  sign_tier="ad-hoc"
+  echo "==> codesign (ad-hoc)"
+  codesign -s - --force "$app_dir"
+  {
+    echo
+    echo "WARNING: no codesigning certificate found — signed ad-hoc."
+    echo "WARNING: an ad-hoc signature has no stable code identity, so its hash"
+    echo "WARNING: changes on every rebuild. Consequences:"
+    echo "WARNING:   - 'Launch at login' silently stops working after a rebuild,"
+    echo "WARNING:     because the registered login item points at an identity"
+    echo "WARNING:     that no longer matches this bundle."
+    echo "WARNING:   - any future permission grant (Accessibility, Screen"
+    echo "WARNING:     Recording, Automation) has to be re-granted each rebuild."
+    echo "WARNING: Fix: install a 'Developer ID Application' or 'Apple"
+    echo "WARNING: Development' certificate into the login keychain, then rebuild."
+    echo
+  } >&2
+fi
+
+echo "built $app_dir  version=$short_version build=$build_number sha=$git_sha signing=$sign_tier"

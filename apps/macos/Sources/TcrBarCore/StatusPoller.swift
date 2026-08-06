@@ -31,9 +31,17 @@ public enum PollState: Equatable {
         case .loaded(let fleet):
             let n = fleet.accounts.count
             let noun = n == 1 ? "account" : "accounts"
-            return fleet.source.countersAreStructural
+            // Every row failed to decode. Saying "0 accounts" here would read as
+            // "you have none configured", which is a different and much calmer
+            // fact than "tcr answered and this build could not read any of it".
+            if n == 0, let unreadable = fleet.unreadableNotice {
+                return "no account decoded — \(unreadable)"
+            }
+            let base = fleet.source.countersAreStructural
                 ? "\(n) \(noun) — offline read, counters are structurally zero"
                 : "\(n) \(noun) — live"
+            guard let unreadable = fleet.unreadableNotice else { return base }
+            return "\(base) · \(unreadable)"
         case .toolMissing(let searched):
             return "tcr not found on PATH (searched \(searched.count) locations)"
         case .commandFailed(let code, let message):
