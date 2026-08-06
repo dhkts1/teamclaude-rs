@@ -17,6 +17,19 @@ struct FleetView: View {
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
 
+    /// Render the account list unscrolled, for the PNG harness only.
+    ///
+    /// `ImageRenderer` does not rasterise `ScrollView` content — measured, not
+    /// assumed: the harness first produced a panel with a correct header above an
+    /// empty void, and giving the scroll area a generous fixed height changed the
+    /// output not by one byte. The scroll view is the thing that does not draw.
+    ///
+    /// So a snapshot lays the rows out in a plain stack. That is also the better
+    /// review artifact: every row is visible at once instead of clipped to
+    /// whatever the panel happens to show. Runtime is untouched — the default is
+    /// `false` and the live panel still scrolls.
+    var snapshotMode: Bool = false
+
     /// Measured height of the account rows.
     ///
     /// A `ScrollView` has a flexible ideal height, and the `MenuBarExtra` window
@@ -144,25 +157,34 @@ struct FleetView: View {
             if fleet.source.countersAreStructural {
                 offlineNotice(fleet.source)
             }
-            ScrollView {
-                VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-                    ForEach(fleet.rowsInDisplayOrder) { account in
-                        AccountRow(
-                            account: account,
-                            countersAreStructural: fleet.source.countersAreStructural,
-                            accounts: accounts,
-                            onChanged: { await poller.pollOnce() }
+            if snapshotMode {
+                rowStack(fleet)
+            } else {
+                ScrollView {
+                    rowStack(fleet)
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: RowsHeightKey.self, value: proxy.size.height)
+                            }
                         )
-                    }
                 }
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(key: RowsHeightKey.self, value: proxy.size.height)
-                    }
+                .frame(height: min(max(rowsHeight, Tok.rowSpacing), Tok.panelMaxHeight))
+                .onPreferenceChange(RowsHeightKey.self) { rowsHeight = $0 }
+            }
+        }
+    }
+
+    private func rowStack(_ fleet: Fleet) -> some View {
+        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            ForEach(fleet.rowsInDisplayOrder) { account in
+                AccountRow(
+                    account: account,
+                    countersAreStructural: fleet.source.countersAreStructural,
+                    accounts: accounts,
+                    onChanged: { await poller.pollOnce() }
                 )
             }
-            .frame(height: min(max(rowsHeight, Tok.rowSpacing), Tok.panelMaxHeight))
-            .onPreferenceChange(RowsHeightKey.self) { rowsHeight = $0 }
         }
     }
 
@@ -442,10 +464,18 @@ struct AccountRow: View {
                 .font(Tok.secondaryDigitFont)
                 .foregroundStyle(.secondary)
                 Spacer()
-                Text(account.status)
-                    .font(Tok.secondaryFont)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                // `status` is the account's own field and it keeps saying
+                // "active" while `disabled` is true — verified against live
+                // output, not just a fixture. Printing it next to a DISABLED
+                // pill puts "disabled" and "active" in one line and makes the
+                // row argue with itself, so the pill speaks for a parked
+                // account and the raw status only shows when it can be true.
+                if !account.disabled {
+                    Text(account.status)
+                        .font(Tok.secondaryFont)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
             }
             if let hold = account.soonestHold {
                 Label(hold.countdownLabel, systemImage: "hourglass")

@@ -70,6 +70,20 @@ public final class StatusPoller: ObservableObject {
         self.interval = interval
     }
 
+    /// A poller pinned to one state, for deterministic rendering.
+    ///
+    /// The state-rendering harness and SwiftUI previews both need a panel that
+    /// shows a chosen state without running `tcr` or starting a timer. Without
+    /// this seam the only way to see a state is to make the real fleet enter it,
+    /// which for "unreadable row" or "zero capacity" means waiting for a bad day.
+    ///
+    /// It never calls `start()`, so no timer exists and nothing is executed.
+    public init(pinnedState: PollState, lastPollAt: Date? = nil) {
+        self.interval = Self.defaultInterval
+        self.state = pinnedState
+        self.lastPollAt = lastPollAt
+    }
+
     deinit { task?.cancel() }
 
     public func start() {
