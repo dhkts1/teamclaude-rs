@@ -32,8 +32,10 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 
 ## Branching
 
-- **The primary checkout stays on `main`.** A pre-commit hook enforces this. Do feature work in a
-  worktree: `git worktree add ~/worktrees/<name> -b <branch> main`.
+- **The primary checkout stays on `main`.** This is a convention, not something the repo checks — the
+  pre-commit hook in `.githooks/` runs a `gitleaks` secret scan and a `cargo fmt --check` gate, and
+  looks at no branch. Keeping to it is on you. Do feature work in a worktree:
+  `git worktree add ~/worktrees/<name> -b <branch> main`.
 - Branch **before** you start editing. Making changes in the primary checkout and then wanting a branch
   is a trap — a fresh worktree branches from `HEAD` without your uncommitted work, and any shared file
   (`Cargo.toml`) blocks a clean move.
