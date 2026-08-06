@@ -91,10 +91,23 @@ public final class ServerController: ObservableObject {
     /// here. It is reachable only from `startTakingOverPort()`, behind an
     /// explicit confirmation, because it wipes the session→account pin map and
     /// costs every live session a cold prompt-cache prefix.
-    public nonisolated static let safeArguments = ["server", "--no-replace"]
+    /// `--headless` is not optional here, it is what makes the child survive.
+    ///
+    /// Without it `tcr server` runs its ratatui TUI (`src/main.rs:590`, "the TUI
+    /// owns the foreground"), which calls `enable_raw_mode()?` on stdout
+    /// (`src/tui.rs:47`). This app spawns with a `Pipe`, so there is no terminal,
+    /// raw mode fails, the `?` propagates and the process exits immediately.
+    ///
+    /// That was a shipped bug and it was not takeover-specific: every spawn path
+    /// lacked the flag, so "Start server", "Start server at launch" and the
+    /// takeover all launched a server that died on startup. It presented as the
+    /// server appearing briefly and vanishing, which reads like a crash in the
+    /// proxy rather than a missing argument in its launcher.
+    public nonisolated static let safeArguments = ["server", "--headless", "--no-replace"]
 
-    /// Deliberately omits `--no-replace`. See `safeArguments`.
-    public nonisolated static let takeoverArguments = ["server"]
+    /// Deliberately omits `--no-replace`. See `safeArguments`. Keeps `--headless`
+    /// for the same reason every other spawn does.
+    public nonisolated static let takeoverArguments = ["server", "--headless"]
 
     /// The default argument set. Kept as a distinct name so existing call sites
     /// and tests read as "the safe one" rather than "the only one".

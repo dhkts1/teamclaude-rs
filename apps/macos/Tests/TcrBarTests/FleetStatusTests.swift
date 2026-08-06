@@ -578,20 +578,39 @@ final class ServerControllerTests: XCTestCase {
         // The safety property: replacing an incumbent proxy wipes the session pin
         // map and costs every live session a cold prompt-cache prefix. Every
         // routine start must therefore refuse to do it.
-        XCTAssertEqual(ServerController.safeArguments, ["server", "--no-replace"])
+        XCTAssertTrue(ServerController.safeArguments.contains("--no-replace"))
         XCTAssertEqual(ServerController.serverArguments, ServerController.safeArguments)
     }
 
-    func testTakeoverOmitsNoReplaceAndNothingElse() {
+    func testTakeoverOmitsNoReplace() {
         // The takeover is expressed *only* by dropping `--no-replace`: tcr's own
-        // singleton then does the replacing. Anything else appearing here would
-        // mean the app grew a second way to disturb a process it did not spawn.
-        XCTAssertEqual(ServerController.takeoverArguments, ["server"])
+        // singleton then does the replacing.
         XCTAssertFalse(ServerController.takeoverArguments.contains("--no-replace"))
     }
 
+    /// The regression that made every spawn path dead on arrival.
+    ///
+    /// Without `--headless`, `tcr server` runs its ratatui TUI
+    /// (`src/main.rs:590`) which calls `enable_raw_mode()?` on stdout
+    /// (`src/tui.rs:47`). A GUI spawns with a `Pipe`, so there is no terminal, raw
+    /// mode fails and the child exits at once — the server appeared for an instant
+    /// and vanished.
+    ///
+    /// The previous version of these tests asserted the exact argument arrays and
+    /// passed for the entire time the feature was broken, because pinning a
+    /// literal list says nothing about whether the list works. This asserts the
+    /// property that actually matters.
+    func testEverySpawnPathIsHeadless() {
+        for arguments in [ServerController.safeArguments, ServerController.takeoverArguments] {
+            XCTAssertTrue(
+                arguments.contains("--headless"),
+                "\(arguments) would start a TUI with no terminal and die on launch"
+            )
+        }
+    }
+
     func testNeitherArgumentSetCarriesAnythingUnexpected() {
-        let known: Set<String> = ["server", "--no-replace"]
+        let known: Set<String> = ["server", "--no-replace", "--headless"]
         for arguments in [ServerController.safeArguments, ServerController.takeoverArguments] {
             XCTAssertEqual(arguments.first, "server", "both sets are `tcr server`")
             XCTAssertTrue(
