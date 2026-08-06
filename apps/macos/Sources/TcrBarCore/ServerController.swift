@@ -32,6 +32,10 @@ public final class ServerController: ObservableObject {
         /// The spawn declined because another proxy already holds the port. That
         /// server is *not* ours; it will never be signalled.
         case incumbentHoldsPort(message: String)
+        /// A takeover was requested and did NOT happen — the incumbent is still
+        /// there. Distinct from ``incumbentHoldsPort`` because on the takeover path
+        /// that same condition is a failure, not the benign outcome.
+        case takeoverRefused(message: String)
         /// The child exited (or never started). Reported verbatim.
         case exited(exitCode: Int32, message: String)
         /// `tcr` could not be located.
@@ -51,6 +55,14 @@ public final class ServerController: ObservableObject {
                 return "Supervised by TcrBar (pid \(pid))"
             case .incumbentHoldsPort(let message):
                 return "Already running — not ours, left alone. \(message)"
+            case .takeoverRefused(let message):
+                return """
+                    Takeover did not happen — the existing proxy is still serving. \
+                    tcr refuses to replace a proxy hosted inside a `tcr run` \
+                    process, because killing it would kill the Claude session \
+                    running through it. Stop that process from its own terminal \
+                    instead; retrying here will not change the outcome. \(message)
+                    """
             case .exited(let code, let message):
                 let detail = message.isEmpty ? "no output" : message
                 return "Server exited (\(code)): \(detail)"
@@ -89,7 +101,7 @@ public final class ServerController: ObservableObject {
     public nonisolated static var serverArguments: [String] { safeArguments }
 
     public func start() {
-        launch(arguments: Self.safeArguments)
+        launch(intent: .safeStart, arguments: Self.safeArguments)
     }
 
     /// Start a server that *replaces* whatever holds the port.
@@ -99,20 +111,20 @@ public final class ServerController: ObservableObject {
     /// confirmed with the operator first — this is the most expensive action in
     /// the app.
     public func startTakingOverPort() {
-        launch(arguments: Self.takeoverArguments)
+        launch(intent: .takeover, arguments: Self.takeoverArguments)
     }
 
-    private func launch(arguments: [String]) {
+    private func launch(intent: Intent, arguments: [String]) {
         guard child == nil else { return }
         switch TcrTool.resolve() {
         case .failure(let notFound):
             state = .toolMissing(searched: notFound.searched)
         case .success(let executable):
-            spawn(executable: executable, arguments: arguments)
+            spawn(executable: executable, intent: intent, arguments: arguments)
         }
     }
 
-    private func spawn(executable: URL, arguments: [String]) {
+    private func spawn(executable: URL, intent: Intent, arguments: [String]) {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -132,7 +144,7 @@ public final class ServerController: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.child = nil
-                self.state = Self.classifyExit(exitCode: code, stderr: text)
+                self.state = Self.classifyExit(intent: intent, exitCode: code, stderr: text)
             }
         }
         do {
@@ -177,14 +189,46 @@ public final class ServerController: ObservableObject {
         "address already in use",
     ]
 
+    /// Why the spawn was made. The same stderr means opposite things on the two
+    /// paths, so classification cannot be argument-blind.
+    public enum Intent: Equatable, Sendable {
+        /// `--no-replace`. Finding an incumbent is the expected, benign outcome.
+        case safeStart
+        /// No `--no-replace`. The user explicitly asked to replace the incumbent,
+        /// so finding one still there means the request did NOT happen.
+        case takeover
+    }
+
     /// Pure classification of a finished spawn.
     ///
-    /// "Another proxy already holds the port" is the *success* path: a server is
-    /// running, it simply is not ours.
-    public nonisolated static func classifyExit(exitCode: Int32, stderr: String) -> State {
+    /// On `.safeStart`, "another proxy already holds the port" is the *success*
+    /// path: a server is running, it simply is not ours.
+    ///
+    /// On `.takeover` the identical stderr is a *failure*. This was a real shipped
+    /// bug: the user clicked "Take over port", `tcr` declined to replace the
+    /// incumbent, the bind then failed with `failed to bind 127.0.0.1:3456`, and
+    /// this function — knowing nothing about which arguments were used — reported
+    /// the benign "already running" outcome. Nothing was taken over and the panel
+    /// said everything was fine.
+    ///
+    /// The common cause is not transient, so the message says so rather than
+    /// inviting a retry: `tcr`'s port singleton deliberately refuses to replace a
+    /// proxy hosted inside a `tcr run` process (`src/singleton.rs:27,52`, asserted
+    /// at `:192`), because killing it would kill the Claude session running
+    /// through it. No number of clicks will change that outcome.
+    public nonisolated static func classifyExit(
+        intent: Intent = .safeStart,
+        exitCode: Int32,
+        stderr: String
+    ) -> State {
         let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         if incumbentMarkers.contains(where: { trimmed.contains($0) }) {
-            return .incumbentHoldsPort(message: trimmed)
+            switch intent {
+            case .safeStart:
+                return .incumbentHoldsPort(message: trimmed)
+            case .takeover:
+                return .takeoverRefused(message: trimmed)
+            }
         }
         return .exited(exitCode: exitCode, message: trimmed)
     }
