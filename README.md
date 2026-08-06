@@ -43,7 +43,12 @@ ln -sfn "$PWD/target/release/tcr" ~/.local/bin/tcr   # put `tcr` on PATH
 
 ## Configure
 
-Config lives at `~/.config/teamclaude.json`:
+Config lives at `~/.config/teamclaude.json`. It holds **working OAuth credentials** for every account
+in the pool, so it never belongs in a commit — this repository is public, and its contents (tokens,
+account emails, org UUIDs) must stay out of code, fixtures, tests and PR descriptions. Contributors:
+see [`CLAUDE.md`](CLAUDE.md).
+
+The shape:
 
 ```json
 {
@@ -94,6 +99,8 @@ affinity. Three are opt-in via `~/.config/teamclaude.json`, off by default:
   account while different sessions still spread across accounts.
 - `"warmupSeconds": <n>` — periodically warm idle accounts so their 5-hour window
   stays active. This one *spends real quota*, so enable it deliberately.
+  Keep-warm never warms an account whose quota it has not actually read, so it
+  does nothing until the first probe sweep has reported.
 - `"loadBalanceMigration": true` — re-pin a session off an account that several
   sessions stack on, onto a less-loaded one. Off by default for the same
   per-account-cache reason: a session that has a pin is already warm, so every

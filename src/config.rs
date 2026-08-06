@@ -461,6 +461,14 @@ enum SkipReason {
     /// signature of an account renamed on disk while the proxy was running,
     /// which is exactly the live-edit workflow [`save_tokens`] exists to support.
     NoMemoryMatch,
+    /// The entry is well-formed and has a loaded account it could belong to, but
+    /// the pairing is not unique: either several loaded accounts carry its
+    /// identity, or another on-disk entry carries the same identity and nothing
+    /// stored says which entry is which. Writing here means picking one of them at
+    /// random and stamping a rotated credential over another account's own
+    /// single-use refresh token, so nothing is written and the entry keeps what it
+    /// had. See [`crate::identity::resolve`].
+    Ambiguous,
     /// The credential triple would not serialize. Structurally unreachable —
     /// reported rather than swallowed precisely because reaching it would mean an
     /// assumption this module rests on has broken.
@@ -473,6 +481,9 @@ impl std::fmt::Display for SkipReason {
             Self::NotAnObject => "the entry is not a JSON object",
             Self::NoIdentity => "the entry has no readable account name",
             Self::NoMemoryMatch => "no loaded account has that identity (renamed on disk?)",
+            Self::Ambiguous => {
+                "that identity does not pick out one loaded account and one entry, so no credential could be chosen"
+            }
             Self::CredentialEncoding => "the credentials would not serialize",
         })
     }
@@ -572,11 +583,23 @@ impl MergeReport {
 /// one write. A skipped entry is not an error for the others — the merge runs to
 /// the end of the list either way.
 fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeReport, Unmergeable> {
-    let Some(accounts) = doc.get_mut("accounts") else {
+    // Plan against an IMMUTABLE view first. Deciding one entry at a time under a
+    // mutable borrow is what made the old first-match resolution unfixable: the
+    // assignment for entry N depends on which accounts the other entries claim,
+    // which a single mutable pass cannot see. Same split, and for the same reason,
+    // as `locate_account_entry` vs `find_account_entry`.
+    let Some(accounts) = doc.get("accounts") else {
         return Err(Unmergeable::Missing);
     };
-    let Some(accounts) = accounts.as_array_mut() else {
+    let Some(entries) = accounts.as_array() else {
         return Err(Unmergeable::NotAnArray);
+    };
+    let plan = plan_merge(entries, &memory.accounts);
+
+    let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+        // The immutable read above already proved both of these; this is the
+        // total-function tail, not a reachable outcome.
+        return Err(Unmergeable::Missing);
     };
 
     let mut report = MergeReport::default();
@@ -584,47 +607,22 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeRe
     // afterwards — a rename shows up here as well as in `skipped`.
     let mut placed = vec![false; memory.accounts.len()];
 
-    for (index, entry) in accounts.iter_mut().enumerate() {
-        let Some(object) = entry.as_object_mut() else {
-            report.skipped.push(SkippedEntry {
-                index,
-                name: None,
-                reason: SkipReason::NotAnObject,
-            });
-            continue;
+    for (index, (entry, (name, plan))) in accounts.iter_mut().zip(plan).enumerate() {
+        let position = match plan {
+            EntryPlan::Skip(reason) => {
+                report.skipped.push(SkippedEntry {
+                    index,
+                    name,
+                    reason,
+                });
+                continue;
+            }
+            EntryPlan::Write(position) => position,
         };
-        // Read the name BEFORE the identity parse, so a half-edited entry that
-        // fails to deserialize can still be named in the warning.
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
+        // A `Write` plan only comes from an entry the planner parsed, so both of
+        // these hold by construction.
+        let (Some(object), Some(fresh)) = (entry.as_object_mut(), memory.accounts.get(position))
         else {
-            report.skipped.push(SkippedEntry {
-                index,
-                name,
-                reason: SkipReason::NoIdentity,
-            });
-            continue;
-        };
-        let probe = crate::identity::probe(
-            &stored.name,
-            stored.account_uuid,
-            stored.org_uuid,
-            stored.org_name,
-        );
-        let Some((position, fresh)) = memory
-            .accounts
-            .iter()
-            .enumerate()
-            .find(|(_, a)| crate::identity::same_identity(a, &probe))
-        else {
-            report.skipped.push(SkippedEntry {
-                index,
-                name,
-                reason: SkipReason::NoMemoryMatch,
-            });
             continue;
         };
         let credentials = Credentials {
@@ -656,6 +654,153 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeRe
     Ok(report)
 }
 
+/// What the read-only planning pass decided about one on-disk entry.
+enum EntryPlan {
+    /// Write the loaded account at this position into the entry.
+    Write(usize),
+    /// Leave the entry's credentials exactly as they are, for this reason.
+    Skip(SkipReason),
+}
+
+/// Decide, for the whole `accounts` array at once, which loaded account owns each
+/// on-disk entry — paired with the entry's readable `name` for the report.
+///
+/// An entry is written ONLY when the pairing is unambiguous in BOTH directions:
+/// the entry resolves to exactly one loaded account, AND that account is claimed
+/// by exactly one entry. One direction is not enough. Resolving each entry
+/// independently — which is what a first-match search does — let two entries both
+/// take the same loaded account, stamping that account's freshly rotated
+/// credential onto an entry belonging to a DIFFERENT account and destroying that
+/// account's own single-use refresh token. And an entry that has only one
+/// candidate is still a guess when that candidate has two suitors: writing picks
+/// one of two entries to be "the real one" on nothing.
+///
+/// Pairings are committed REPEATEDLY until no more can be, because each commitment
+/// removes an account from one pool and an entry from the other, which can break a
+/// tie that was unbreakable a moment ago. That is what keeps the legacy two-org
+/// shape working — one person, two orgs, where the older entry predates org UUIDs
+/// and so carries none. The org-carrying entry pairs off first (it is the only
+/// *strict* match on either side), and the pre-org entry, which matched BOTH
+/// accounts while they were both in the pool, is then left facing exactly one.
+/// Resolved in a single pass it would tie forever and neither account would ever
+/// have its rotated token persisted. Iterating also makes the result independent
+/// of the order the entries happen to sit in the file.
+///
+/// Whatever is still unpaired when the fixed point is reached is reported, never
+/// guessed.
+fn plan_merge(entries: &[Value], memory: &[Account]) -> Vec<(Option<String>, EntryPlan)> {
+    // Parse each entry's identity once. A `None` probe is an entry no match can
+    // reach, and its plan is already final — so `plan[i].is_some()` is exactly
+    // "this entry is settled", for both the unmatchable and the paired.
+    let mut probes: Vec<Option<Account>> = Vec::with_capacity(entries.len());
+    let mut names: Vec<Option<String>> = Vec::with_capacity(entries.len());
+    let mut plan: Vec<Option<EntryPlan>> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            probes.push(None);
+            names.push(None);
+            plan.push(Some(EntryPlan::Skip(SkipReason::NotAnObject)));
+            continue;
+        };
+        // Read the name BEFORE the identity parse, so a half-edited entry that
+        // fails to deserialize can still be named in the warning.
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        names.push(name);
+        let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
+        else {
+            probes.push(None);
+            plan.push(Some(EntryPlan::Skip(SkipReason::NoIdentity)));
+            continue;
+        };
+        probes.push(Some(crate::identity::probe(
+            &stored.name,
+            stored.account_uuid,
+            stored.org_uuid,
+            stored.org_name,
+        )));
+        plan.push(None);
+    }
+
+    let mut claimed = vec![false; memory.len()];
+
+    // Commit the mutually-unambiguous pairings until there are none left. Each
+    // round settles at least one entry or ends the loop, so this terminates in at
+    // most `entries.len()` rounds.
+    loop {
+        let mut progressed = false;
+        for index in 0..probes.len() {
+            let Some(probe) = probes[index].as_ref().filter(|_| plan[index].is_none()) else {
+                continue;
+            };
+            // Which unclaimed account does this entry point at?
+            let crate::identity::Resolved::One(position) = crate::identity::resolve(
+                memory
+                    .iter()
+                    .enumerate()
+                    .filter(|(position, _)| !claimed[*position]),
+                probe,
+            ) else {
+                continue;
+            };
+            // …and does that account point back at this entry alone? Any other
+            // unsettled entry with the same identity makes the write a coin flip.
+            let mutual = crate::identity::resolve(
+                probes
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, _)| plan[*other].is_none())
+                    .filter_map(|(other, probe)| probe.as_ref().map(|probe| (other, probe))),
+                &memory[position],
+            ) == crate::identity::Resolved::One(index);
+            if mutual {
+                plan[index] = Some(EntryPlan::Write(position));
+                claimed[position] = true;
+                progressed = true;
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // Everything the fixed point could not settle. An entry with no candidate left
+    // at all is the rename/removal case the report already had a name for; an entry
+    // that still has candidates is one this function refused to guess between.
+    for index in 0..probes.len() {
+        let Some(probe) = probes[index].as_ref().filter(|_| plan[index].is_none()) else {
+            continue;
+        };
+        let unmatched = crate::identity::resolve(
+            memory
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| !claimed[*position]),
+            probe,
+        ) == crate::identity::Resolved::None;
+        plan[index] = Some(EntryPlan::Skip(if unmatched {
+            SkipReason::NoMemoryMatch
+        } else {
+            SkipReason::Ambiguous
+        }));
+    }
+
+    names
+        .into_iter()
+        .zip(plan)
+        // Every slot was assigned above: unmatchable at parse, paired in the fixed
+        // point, or classified in the sweep. This is the total-function tail.
+        .map(|(name, plan)| {
+            (
+                name,
+                plan.unwrap_or(EntryPlan::Skip(SkipReason::NoMemoryMatch)),
+            )
+        })
+        .collect()
+}
+
 /// What a targeted [`save_disabled`] did to the on-disk document. Reported
 /// rather than swallowed so the caller can say, in one line, whether a benched
 /// account will actually still be benched after a restart.
@@ -671,6 +816,24 @@ pub enum DisabledWrite {
     /// while the proxy ran — or the document has no usable `accounts` array.
     /// Nothing was written, so the flag will NOT survive a restart.
     NoEntry,
+    /// More than one entry carries that identity and nothing stored breaks the
+    /// tie, so no entry can be chosen without guessing. Nothing was written.
+    ///
+    /// [`crate::identity::same_identity`] falls back to name equality when either
+    /// side lacks a uuid, so two entries sharing a name both match either runtime
+    /// row. The caller selects by ROW INDEX (the TUI does), so silently taking the
+    /// first match lands the flag on whichever entry happens to be earlier —
+    /// benching a healthy account and returning an exhausted one to rotation, with
+    /// the TUI showing the opposite. Refusing is the same posture the CLI takes on
+    /// an ambiguous query.
+    ///
+    /// This is now genuine ambiguity only. `same_identity` ALSO treats an unknown
+    /// org as a match, which used to make the legacy two-org shape (an entry with
+    /// an org beside a pre-org entry that has none) report `Ambiguous` even though
+    /// the two entries are trivially distinguishable — so neither of two real
+    /// accounts could ever be durably benched. [`crate::identity::resolve`] breaks
+    /// that tie on the org key; see [`find_account_entry`].
+    Ambiguous,
 }
 
 impl std::fmt::Display for DisabledWrite {
@@ -679,6 +842,7 @@ impl std::fmt::Display for DisabledWrite {
             Self::Updated => "updated",
             Self::Unchanged => "unchanged",
             Self::NoEntry => "no matching entry on disk",
+            Self::Ambiguous => "more than one entry on disk carries this identity",
         })
     }
 }
@@ -705,6 +869,10 @@ impl std::fmt::Display for DisabledWrite {
 /// costs one un-benched account and is fixed by pressing `d` again. Writing a
 /// whole boot-time snapshot over a file we could not even parse is the exact
 /// clobber this module exists to prevent, so the error comes back instead.
+///
+/// An identity matching MORE than one entry writes nothing and reports
+/// [`DisabledWrite::Ambiguous`] — see [`find_account_entry`] for why guessing the
+/// first match is worse than refusing.
 pub fn save_disabled(
     path: &Path,
     target: &Account,
@@ -722,8 +890,10 @@ pub fn save_disabled(
 /// whether the document actually changed, so the caller can skip a pointless
 /// rewrite of a credential file.
 fn merge_disabled(doc: &mut Map<String, Value>, target: &Account, disabled: bool) -> DisabledWrite {
-    let Some(entry) = find_account_entry(doc, target) else {
-        return DisabledWrite::NoEntry;
+    let entry = match find_account_entry(doc, target) {
+        Ok(entry) => entry,
+        // No entry, or too many to choose between — either way nothing is written.
+        Err(refusal) => return refusal,
     };
     // `true` writes the key; `false` DROPS it (never a `false` literal).
     let desired = disabled.then_some(Value::Bool(true));
@@ -737,39 +907,99 @@ fn merge_disabled(doc: &mut Map<String, Value>, target: &Account, disabled: bool
     DisabledWrite::Updated
 }
 
-/// The on-disk `accounts` entry whose identity matches `target`.
+/// Where the ONE `accounts` entry carrying `target`'s identity lives — or why
+/// there is no one entry to write into. Separate from [`find_account_entry`] so
+/// the whole array can be scanned immutably (counting matches) before any mutable
+/// borrow is taken; a single mutable pass cannot both count and hand back a
+/// reference.
+enum EntryMatch {
+    /// Exactly one entry matches, at this index of the `accounts` array.
+    One(usize),
+    /// No usable `accounts` array, or nothing in it carries that identity.
+    None,
+    /// Two or more entries match.
+    Many,
+}
+
+fn locate_account_entry(doc: &Map<String, Value>, target: &Account) -> EntryMatch {
+    let Some(entries) = doc.get("accounts").and_then(Value::as_array) else {
+        return EntryMatch::None;
+    };
+    // Parse every entry's identity first, then resolve over the whole set at once.
+    // Returning `Many` on the second `same_identity` hit — which is what a single
+    // scanning pass can do — refuses the LEGACY TWO-ORG SHAPE, where entry
+    // `{name, uuid U, orgUuid "org-a"}` sits beside a pre-org entry `{name, uuid
+    // U}` written before org UUIDs were stored. Those are two real accounts, one
+    // person in two orgs, and `same_identity` matches the pre-org entry against
+    // both of them because an unknown org is deliberately tolerated. Refused that
+    // way, NEITHER account can ever be durably benched.
+    //
+    // `resolve` breaks exactly that tie and only that tie: when one candidate
+    // matches on fully known identity and the rest matched only because something
+    // was missing, the known one wins. A tie with nothing stricter to prefer is
+    // still `Many`, and still refused.
+    let probes: Vec<(usize, Account)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            let object = entry.as_object()?;
+            let stored =
+                serde_json::from_value::<DiskIdentity>(Value::Object(object.clone())).ok()?;
+            Some((
+                index,
+                crate::identity::probe(
+                    &stored.name,
+                    stored.account_uuid,
+                    stored.org_uuid,
+                    stored.org_name,
+                ),
+            ))
+        })
+        .collect();
+    match crate::identity::resolve(probes.iter().map(|(index, probe)| (*index, probe)), target) {
+        crate::identity::Resolved::One(index) => EntryMatch::One(index),
+        crate::identity::Resolved::None => EntryMatch::None,
+        crate::identity::Resolved::Many => EntryMatch::Many,
+    }
+}
+
+/// The on-disk `accounts` entry whose identity matches `target`, or the
+/// [`DisabledWrite`] refusal explaining why there is no single entry to write.
 ///
-/// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::same_identity`]
-/// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled
-/// flag can never land on two different entries. The first match wins:
-/// `same_identity` is unique per identity in a well-formed config, and the CLI
-/// already refuses an ambiguous query outright rather than guessing.
+/// Matching reuses the [`DiskIdentity`] probe + [`crate::identity::resolve`]
+/// pairing that [`merge_tokens`] uses, so a rotated credential and a disabled flag
+/// can never land on two different entries.
 ///
-/// `None` covers every "nothing to write into" shape — no `accounts` key, an
-/// `accounts` that is not an array, or no entry carrying that identity.
+/// An AMBIGUOUS identity is refused, not resolved to the first match. The old
+/// first-match-wins rested on "the CLI already refuses an ambiguous query", but
+/// the TUI is a caller that never goes through that check — it selects by row
+/// index — and `config::load` validates no uniqueness, so nothing upstream makes
+/// the identity unique. `same_identity` falls back to name equality when either
+/// side lacks a uuid, so two entries sharing a name match either runtime row: the
+/// flag would land on whichever is earlier in the file, benching a healthy account
+/// while the TUI shows the other one disabled.
+///
+/// Refused, but only where the tie is real — which is not the same as "a second
+/// entry satisfied `same_identity`". `resolve` first tries the org key, so the
+/// legacy two-org shape (one entry with an org, one written before org UUIDs
+/// existed and carrying none) resolves both of its rows instead of locking both
+/// out of ever being benched.
 fn find_account_entry<'a>(
     doc: &'a mut Map<String, Value>,
     target: &Account,
-) -> Option<&'a mut Map<String, Value>> {
-    for entry in doc.get_mut("accounts")?.as_array_mut()? {
-        let Some(object) = entry.as_object_mut() else {
-            continue;
-        };
-        let Ok(stored) = serde_json::from_value::<DiskIdentity>(Value::Object(object.clone()))
-        else {
-            continue;
-        };
-        let probe = crate::identity::probe(
-            &stored.name,
-            stored.account_uuid,
-            stored.org_uuid,
-            stored.org_name,
-        );
-        if crate::identity::same_identity(target, &probe) {
-            return Some(object);
-        }
-    }
-    None
+) -> Result<&'a mut Map<String, Value>, DisabledWrite> {
+    let index = match locate_account_entry(doc, target) {
+        EntryMatch::One(index) => index,
+        EntryMatch::None => return Err(DisabledWrite::NoEntry),
+        EntryMatch::Many => return Err(DisabledWrite::Ambiguous),
+    };
+    // The immutable scan above proved this path resolves; `NoEntry` here is the
+    // total-function tail, not a reachable outcome.
+    doc.get_mut("accounts")
+        .and_then(Value::as_array_mut)
+        .and_then(|entries| entries.get_mut(index))
+        .and_then(Value::as_object_mut)
+        .ok_or(DisabledWrite::NoEntry)
 }
 
 #[cfg(test)]
@@ -1082,6 +1312,148 @@ mod tests {
         assert_eq!(value["accounts"][1]["accessToken"], json!("at-a-new"));
         assert_eq!(value["accounts"][1]["expiresAt"], json!(11));
         fs::remove_file(&path).ok();
+    }
+
+    /// **THE token-clobber guard.** Two on-disk entries whose identities both match
+    /// one loaded account, with nothing stored to tell them apart. The old
+    /// first-match resolution walked the array and stamped the SAME account's
+    /// freshly rotated credential onto both, so the second entry's own single-use
+    /// refresh token was destroyed on disk — its next refresh 400s
+    /// (`invalid_grant`) and the account is dead until re-authed by hand.
+    ///
+    /// Nothing may be written into either entry: an unbreakable tie is reported,
+    /// never guessed. The entries keep the credentials they already held, which is
+    /// recoverable; a foreign account's token in their place is not.
+    #[test]
+    fn persist_refuses_to_write_a_credential_into_an_ambiguous_entry() {
+        let path = tmp_path("persist-ambiguous");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-new", "refreshToken": "rt-new", "expiresAt": 99 } ] }"#,
+        )
+        .unwrap();
+        // Two entries share the name and carry no UUID, so `same_identity` matches
+        // the loaded account against both. Entry 1 holds its OWN refresh token.
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-one-old", "refreshToken": "rt-one-old" },
+                   { "name": "acct-a", "accessToken": "at-two-old", "refreshToken": "rt-two-old" } ] }"#,
+        )
+        .unwrap();
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][1]["refreshToken"],
+            json!("rt-two-old"),
+            "the second entry's own single-use refresh token was overwritten: {value}"
+        );
+        assert_eq!(value["accounts"][1]["accessToken"], json!("at-two-old"));
+        assert_eq!(
+            value["accounts"][0]["refreshToken"],
+            json!("rt-one-old"),
+            "a tie is refused on BOTH sides — picking the earlier entry is still a guess: {value}"
+        );
+        assert_eq!(value["accounts"][0]["accessToken"], json!("at-one-old"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// The refusal above is reported, not silent: both entries come back as
+    /// skipped, and the loaded account comes back as having found no home — which
+    /// is what makes `save_tokens` warn by name that a rotated credential did not
+    /// reach the file.
+    #[test]
+    fn an_ambiguous_entry_is_reported_as_skipped() {
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [ { "name": "acct-a", "accessToken": "at-new" } ] }"#,
+        )
+        .unwrap();
+        let mut doc: Map<String, Value> = serde_json::from_str(
+            r#"{ "accounts": [ { "name": "acct-a" }, { "name": "acct-a" } ] }"#,
+        )
+        .unwrap();
+
+        let report = merge_tokens(&mut doc, &memory).unwrap();
+
+        assert_eq!(
+            report.skipped,
+            vec![
+                SkippedEntry {
+                    index: 0,
+                    name: Some("acct-a".to_string()),
+                    reason: SkipReason::Ambiguous,
+                },
+                SkippedEntry {
+                    index: 1,
+                    name: Some("acct-a".to_string()),
+                    reason: SkipReason::Ambiguous,
+                },
+            ]
+        );
+        assert_eq!(report.absent_from_disk, vec!["acct-a".to_string()]);
+    }
+
+    /// The legacy two-org shape must keep working: one person, two orgs, where the
+    /// older entry predates org UUIDs and so carries none. `same_identity` matches
+    /// the pre-org entry against BOTH accounts, so resolving each entry
+    /// independently ties forever and neither account's rotated token is ever
+    /// persisted. The strict pairing settles it: each side has exactly one partner
+    /// whose org key it actually equals.
+    ///
+    /// Asserted in BOTH disk orders — the real config has the older (pre-org) entry
+    /// first, which is precisely the order a single forward pass gets wrong.
+    #[test]
+    fn persist_places_both_tokens_on_the_legacy_two_org_shape() {
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "me@example.com", "accountUuid": "u1", "orgUuid": "org-a",
+                     "accessToken": "at-a-new", "refreshToken": "rt-a-new" },
+                   { "name": "me@example.com", "accountUuid": "u1",
+                     "accessToken": "at-legacy-new", "refreshToken": "rt-legacy-new" } ] }"#,
+        )
+        .unwrap();
+
+        for (label, disk) in [
+            (
+                "org-carrying entry first",
+                r#"{ "accounts": [
+                       { "name": "me@example.com", "accountUuid": "u1", "orgUuid": "org-a", "accessToken": "at-a-old" },
+                       { "name": "me@example.com", "accountUuid": "u1", "accessToken": "at-legacy-old" } ] }"#,
+            ),
+            (
+                "pre-org entry first",
+                r#"{ "accounts": [
+                       { "name": "me@example.com", "accountUuid": "u1", "accessToken": "at-legacy-old" },
+                       { "name": "me@example.com", "accountUuid": "u1", "orgUuid": "org-a", "accessToken": "at-a-old" } ] }"#,
+            ),
+        ] {
+            let path = tmp_path("persist-two-org");
+            fs::write(&path, disk).unwrap();
+            save_tokens(&path, &memory).unwrap();
+
+            let value = read_json(&path);
+            let by_org = |org: Option<&str>| {
+                value["accounts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e.get("orgUuid").and_then(Value::as_str) == org)
+                    .unwrap_or_else(|| panic!("no entry with orgUuid {org:?} ({label}): {value}"))
+                    .clone()
+            };
+            assert_eq!(
+                by_org(Some("org-a"))["refreshToken"],
+                json!("rt-a-new"),
+                "the org-carrying entry missed its rotated token ({label}): {value}"
+            );
+            assert_eq!(
+                by_org(None)["refreshToken"],
+                json!("rt-legacy-new"),
+                "the pre-org entry missed its rotated token ({label}): {value}"
+            );
+            fs::remove_file(&path).ok();
+        }
     }
 
     #[test]
@@ -1618,6 +1990,185 @@ mod tests {
             "the flag landed on the wrong org: {after}"
         );
         assert_eq!(after["accounts"][1]["disabled"], json!(true));
+        fs::remove_file(&path).ok();
+    }
+
+    /// An AMBIGUOUS identity is refused, never resolved to the first match. Two
+    /// entries sharing a name both satisfy `same_identity` (it falls back to name
+    /// equality when either side lacks a uuid), and the TUI selects by ROW INDEX —
+    /// so guessing lands the flag on whichever entry is earlier in the file,
+    /// benching a healthy account while the TUI renders the other one disabled.
+    /// Nothing is written and the ambiguity is reported distinctly.
+    #[test]
+    fn disable_refuses_an_ambiguous_identity_and_writes_nothing() {
+        let path = tmp_path("disable-ambiguous");
+        let document = r#"{ "accounts": [
+            { "name": "acct-dup", "accessToken": "at-first" },
+            { "name": "acct-dup", "accessToken": "at-second" }
+        ] }"#;
+        fs::write(&path, document).unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-dup"), true).unwrap(),
+            DisabledWrite::Ambiguous
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            document,
+            "an ambiguous identity must leave the file byte-identical"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The refusal is scoped to the AMBIGUOUS identity, not to the file: an
+    /// unambiguous account in the same document still writes. Without this pair,
+    /// "nothing was written" above would be satisfied by a save_disabled that had
+    /// simply stopped working.
+    #[test]
+    fn a_duplicate_elsewhere_does_not_block_an_unambiguous_write() {
+        let path = tmp_path("disable-ambiguous-neighbour");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "acct-dup", "accessToken": "at-first" },
+                { "name": "acct-dup", "accessToken": "at-second" },
+                { "name": "acct-unique", "accessToken": "at-unique" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("acct-unique"), true).unwrap(),
+            DisabledWrite::Updated
+        );
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][2]["disabled"], json!(true));
+        assert!(
+            after["accounts"][0].get("disabled").is_none()
+                && after["accounts"][1].get("disabled").is_none(),
+            "only the unambiguous entry may be touched: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Two entries that share a NAME but are separated by org are NOT ambiguous —
+    /// `same_identity` tells them apart, so the write still lands. The refusal must
+    /// bite on genuinely indistinguishable entries only, or the two-org config the
+    /// identity work exists to support would stop being writable.
+    #[test]
+    fn two_orgs_under_one_name_are_not_ambiguous() {
+        let path = tmp_path("disable-two-orgs-unambiguous");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
+                  "orgUuid": "org-a", "orgName": "Org A" },
+                { "name": "me@example.com", "accessToken": "at-b", "accountUuid": "uuid-person",
+                  "orgUuid": "org-b", "orgName": "Org B" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let target = crate::identity::probe(
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            Some("org-a".to_string()),
+            Some("Org A".to_string()),
+        );
+        assert_eq!(
+            save_disabled(&path, &target, true).unwrap(),
+            DisabledWrite::Updated
+        );
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][0]["disabled"], json!(true));
+        assert!(after["accounts"][1].get("disabled").is_none());
+        fs::remove_file(&path).ok();
+    }
+
+    /// The shape the test above does NOT cover, and the one the refusal actually
+    /// broke: the older entry predates org UUIDs and carries none, so its org key
+    /// is `(None)` while its sibling's is `Some("org-a")`. `same_identity`
+    /// deliberately treats an unknown org as a match — that is what lets a
+    /// freshly-profiled login backfill a legacy entry — which also means the
+    /// pre-org entry matches BOTH runtime rows. These are two real accounts, one
+    /// person in two orgs, and refusing on the second `same_identity` hit left
+    /// NEITHER of them durably benchable.
+    ///
+    /// Each row must reach its own entry: the org-carrying row by the exact match,
+    /// and the pre-org row by name — it is the only entry with no org at all.
+    #[test]
+    fn a_pre_org_entry_beside_its_org_carrying_sibling_is_not_ambiguous() {
+        let path = tmp_path("disable-legacy-backfill");
+        let file = r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-a", "accountUuid": "uuid-person",
+                  "orgUuid": "org-a", "orgName": "Org A" },
+                { "name": "me@example.com", "accessToken": "at-legacy", "accountUuid": "uuid-person" }
+            ] }"#;
+
+        // The org-carrying row: both entries match it loosely, one matches exactly.
+        fs::write(&path, file).unwrap();
+        let with_org = crate::identity::probe(
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            Some("org-a".to_string()),
+            Some("Org A".to_string()),
+        );
+        assert_eq!(
+            save_disabled(&path, &with_org, true).unwrap(),
+            DisabledWrite::Updated,
+            "the fully-known identity resolves to the entry that carries the same org"
+        );
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][0]["disabled"], json!(true));
+        assert!(
+            after["accounts"][1].get("disabled").is_none(),
+            "the flag must not land on the pre-org sibling: {after}"
+        );
+
+        // And the pre-org row, whose own org is still unknown, resolves to the one
+        // entry that likewise has none.
+        fs::write(&path, file).unwrap();
+        let pre_org = crate::identity::probe(
+            "me@example.com",
+            Some("uuid-person".to_string()),
+            None,
+            None,
+        );
+        assert_eq!(
+            save_disabled(&path, &pre_org, true).unwrap(),
+            DisabledWrite::Updated
+        );
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][1]["disabled"], json!(true));
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "the flag must not land on the org-carrying sibling: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The refusal still fires where it must. Two entries that share a name and
+    /// carry no UUID at all are genuinely indistinguishable — there is no stricter
+    /// fact to prefer one by — so nothing is written and the caller is told.
+    #[test]
+    fn two_entries_with_nothing_to_tell_them_apart_are_still_refused() {
+        let path = tmp_path("disable-truly-ambiguous");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-one" },
+                { "name": "me@example.com", "accessToken": "at-two" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_disabled(&path, &by_name("me@example.com"), true).unwrap(),
+            DisabledWrite::Ambiguous
+        );
+        let after = read_json(&path);
+        assert!(after["accounts"][0].get("disabled").is_none());
+        assert!(after["accounts"][1].get("disabled").is_none());
         fs::remove_file(&path).ok();
     }
 

@@ -124,6 +124,33 @@ pub struct AccountSnapshot {
     /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
     /// we cannot promise a time).
     pub free_at: Option<OffsetDateTime>,
+    /// DISPLAY ONLY floor: the latest clear-instant among the gates that HAVE one,
+    /// when [`Self::free_at`] is `None` because some other active gate's reset is
+    /// unknown. Read as "not before this, possibly later" — never as a promise,
+    /// and never fed to `retry_after_hint` (see
+    /// [`crate::manager::Manager::account_gate_known_floor`]).
+    pub free_at_floor: Option<OffsetDateTime>,
+    /// Count of in-band SSE `error` events this account's streams carried within
+    /// the decay window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`) — a
+    /// truncated 200 that got booked as a clean serve before this field existed.
+    /// OBSERVABILITY ONLY: nothing in `select.rs` reads it, so it never gates
+    /// rotation. On the wire deliberately (see `status.rs`'s module doc): it
+    /// carries no credential material, and `tcr status --json` is how an
+    /// operator sees the fleet — `tcr status --json | jq '.[].streamErrorCount'`,
+    /// rendered by `cli::render_accounts_json`, with the plain-text `tcr status`
+    /// carrying the same number as a `stream_errors=` token.
+    ///
+    /// That last sentence was FALSE when this field was introduced: the renderers
+    /// did not exist, so the value reached the wire and stopped there. Both were
+    /// added afterwards, which is what makes the claim true now. It is load-bearing
+    /// — if a future change drops either renderer, delete the claim with it rather
+    /// than leaving a rationale the code no longer earns.
+    pub stream_error_count: usize,
+    /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
+    /// alongside the count above. Same on-the-wire decision as `stream_error_count`,
+    /// and surfaced by the same two renderers (`lastStreamError` in JSON, the
+    /// `last_stream_error=` token in text).
+    pub last_stream_error: Option<String>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

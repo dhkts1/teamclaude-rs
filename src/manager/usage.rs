@@ -8,10 +8,36 @@ impl Manager {
     /// it deliberately does NOT touch the request counter — that would double-count
     /// a client request that was retried across accounts (bug #4). Request counting
     /// happens once, in [`Manager::record_served`].
+    ///
+    /// A response that CARRIED the unified 5h header also latches
+    /// [`AccountRuntime::quota_known`], on the same terms and for the same reason
+    /// [`Self::apply_usage`] does: those headers are a first-hand read of this
+    /// account's session window, so an account serving live traffic must not go on
+    /// reading as "we have never seen this account's quota" — it plainly is not
+    /// true, and keep-warm's gate is asking exactly that question. A response
+    /// WITHOUT the header latches nothing: an error page or a non-Anthropic
+    /// upstream tells us nothing about the window, and silence must never be
+    /// mistaken for evidence.
+    ///
+    /// `probe_status` is deliberately still untouched here — that field is about
+    /// probe HEALTH, which a served response says nothing about.
     pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
-            account.quota.update_from_headers(headers);
+        let newly_known = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            match accounts.get_mut(idx) {
+                Some(account) => {
+                    let read_five_hour = account.quota.update_from_headers(headers);
+                    let flipped = read_five_hour && !account.quota_known;
+                    account.quota_known |= read_five_hour;
+                    flipped
+                }
+                None => false,
+            }
+        };
+        // Edge-triggered, with the accounts lock RELEASED — identical to
+        // `apply_usage`, whose comment explains both halves.
+        if newly_known {
+            self.warm_wake.notify_one();
         }
     }
 
@@ -39,11 +65,34 @@ impl Manager {
         }
     }
 
-    /// Fold a background probe's usage into account `idx`'s quota windows.
+    /// Fold a background probe's usage into account `idx`'s quota windows and latch
+    /// [`AccountRuntime::quota_known`].
+    ///
+    /// This is the ONLY place the latch is set, and that is the whole point: it runs
+    /// exclusively on the `Ok` arm of [`Manager::probe_account`], so every probe
+    /// FAILURE — `Error`, `Timeout`, `RateLimited` — leaves the latch (and therefore
+    /// the account's keep-warm eligibility) untouched. Note it latches even when the
+    /// endpoint reported no 5h bucket at all: "we have read this account's quota" is
+    /// about the READ, not about which windows came back.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
-            account.quota.apply_usage(usage);
+        let newly_known = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            match accounts.get_mut(idx) {
+                Some(account) => {
+                    account.quota.apply_usage(usage);
+                    let flipped = !account.quota_known;
+                    account.quota_known = true;
+                    flipped
+                }
+                None => false,
+            }
+        };
+        // Wake the keep-warm loop only on the false→true flip — at most once per
+        // account per process, so the loop can never be spun by a steady-state
+        // probe cadence. Signalled with the accounts lock RELEASED: the loop's
+        // first act on waking is `warm_targets()`, which takes that same lock.
+        if newly_known {
+            self.warm_wake.notify_one();
         }
     }
 
@@ -75,4 +124,58 @@ impl Manager {
             }
         }
     }
+
+    /// Record that account `idx` served a stream that carried an in-band SSE
+    /// `error` event (`kind` is `error.error.type`, e.g. `"overloaded_error"`) —
+    /// a truncated turn the client saw as a 200 that must not read as a clean
+    /// serve. OBSERVABILITY ONLY: this warns and updates a decayed counter and
+    /// the account's last-error label; it deliberately does NOT call
+    /// `mark_error` (that condemns terminally — see its doc comment on the 2026-07-17
+    /// incident) or `mark_rate_limited` (an overloaded account is not over quota —
+    /// see [`Self::mark_rate_limited`]'s doc comment), and nothing in
+    /// `select.rs`'s `eligible`/`hard_ok`/`account_terminal_gate` reads the
+    /// counter this writes — wiring it into routing is a separate, later,
+    /// premortem'd change.
+    pub fn record_stream_error(&self, idx: usize, kind: &str) {
+        let now_ms = crate::now_ms();
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            tracing::warn!(
+                account = %account.name,
+                index = idx,
+                error_type = kind,
+                "SSE stream carried an in-band error event — truncated turn, not a clean serve"
+            );
+            account.stream_error_times_ms.push_back(now_ms);
+            prune_stream_errors(&mut account.stream_error_times_ms, now_ms);
+            account.last_stream_error = Some(kind.to_string());
+        }
+    }
+}
+
+/// Prune `times` to [`STREAM_ERROR_WINDOW_MS`] and hard-cap at
+/// [`STREAM_ERROR_CAP`] entries, oldest first. The mutating half of pruning —
+/// called on INSERT, where the caller already holds the accounts write lock.
+fn prune_stream_errors(times: &mut VecDeque<i64>, now_ms: i64) {
+    while times
+        .front()
+        .is_some_and(|&t| now_ms - t > STREAM_ERROR_WINDOW_MS)
+    {
+        times.pop_front();
+    }
+    while times.len() > STREAM_ERROR_CAP {
+        times.pop_front();
+    }
+}
+
+/// The account's DECAYED stream-error count as of `now_ms`: entries within
+/// [`STREAM_ERROR_WINDOW_MS`]. The read-side half of pruning — [`Manager::snapshot`]
+/// holds only the accounts READ lock, so it cannot pop stale entries the way
+/// [`prune_stream_errors`] does on insert; this counts without mutating instead,
+/// which is equivalent for display purposes (the next insert physically prunes).
+pub(super) fn stream_error_count(times: &VecDeque<i64>, now_ms: i64) -> usize {
+    times
+        .iter()
+        .filter(|&&t| now_ms - t <= STREAM_ERROR_WINDOW_MS)
+        .count()
 }

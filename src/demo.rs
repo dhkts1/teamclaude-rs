@@ -52,6 +52,11 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         expires_at_ms: Some(now + 3_600_000),
         status: AccountStatus::Active,
         quota: Quota::default(),
+        // The demo's rows are presented as already-probed (`probe_status: Ok`), so
+        // their quota reads as READ too — otherwise every demo row would render as
+        // a permanently un-warmable account.
+        quota_known: true,
+        consecutive_probe_failures: 0,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
@@ -68,6 +73,8 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         probe_status: ProbeStatus::Ok,
         last_probe_ms: Some(now - 12_000),
         probe_error: None,
+        stream_error_times_ms: std::collections::VecDeque::new(),
+        last_stream_error: None,
     }
 }
 
