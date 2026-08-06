@@ -143,7 +143,24 @@ public final class ServerController: ObservableObject {
         process.arguments = arguments
         let err = Pipe()
         process.standardError = err
-        process.standardOutput = Pipe()
+        // Discard stdout — do NOT hand it a Pipe.
+        //
+        // `--headless` means "log to stdout" (`src/main.rs`), so a spawned server
+        // writes a steady stream there. A `Pipe()` nothing reads fills its 64KiB
+        // kernel buffer and the next write blocks FOREVER: the proxy wedges
+        // mid-serve, still alive, so `terminationHandler` never fires and this app
+        // keeps reporting `.supervising`. A hung server displayed as healthy.
+        //
+        // Only `standardError` gets a Pipe, and it is drained by the
+        // `readabilityHandler` below — that is what makes it safe.
+        //
+        // Nothing is lost: the server's durable log is `$TMPDIR/teamclaude-rs.log`,
+        // which is where `tcr status` and every diagnostic already read from.
+        //
+        // Pairs with ce1cb27 (`--headless`, without which the child died instantly).
+        // That fix let the server SURVIVE startup, which is precisely what let it
+        // live long enough to reach this second wall.
+        process.standardOutput = FileHandle.nullDevice
         stderrBuffer.reset()
         err.fileHandleForReading.readabilityHandler = { [stderrBuffer] handle in
             let data = handle.availableData
