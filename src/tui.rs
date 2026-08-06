@@ -544,8 +544,7 @@ fn render_accounts(
             // Columns shared by both layouts, in their shared order.
             let name = Cell::from(format!("{marker}{}", account.name));
             let priority = Cell::from(account.priority.to_string());
-            let status =
-                Cell::from(status_label(account, now)).style(status_style(&account.status));
+            let status = Cell::from(account.status.clone()).style(status_style(&account.status));
             let gate = Cell::from(gate_label).style(gate_style);
             let reqs = Cell::from(account.requests.to_string());
             let input = Cell::from(fmt_tokens(account.input_tokens));
@@ -974,16 +973,9 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
         .add_modifier(Modifier::DIM);
     // A quota/Fable gate's back-when: the compact `rel`, or just the prefix when
     // the reset is unknown.
-    // Exact instant when we have one; otherwise the known FLOOR (">=3d") when some
-    // other active gate's unknown reset suppressed `free_at`. Showing the floor
-    // beats showing nothing: the badge alone hides a bound we actually know. The
-    // ">=" is load-bearing punctuation — this is "not before", never "at".
     let back = |prefix: &str| match account.free_at {
         Some(f) if f > now => format!("{prefix} {}", rel(f - now)),
-        _ => match account.free_at_floor {
-            Some(fl) if fl > now => format!("{prefix} \u{2265}{}", rel(fl - now)),
-            _ => prefix.to_string(),
-        },
+        _ => prefix.to_string(),
     };
     match account.gate {
         GateReason::Ok => ("OK".to_string(), dim),
@@ -1010,32 +1002,6 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         GateReason::Disabled => ("OFF".to_string(), dim),
-    }
-}
-
-/// The Status cell's text: the raw status word, plus the clear-instant when the
-/// account is on a live 429 hold ("throttled 12s").
-///
-/// "When does it come back" is the only actionable thing about a hold, and the
-/// bare word forces the operator over to the Gate column — which shows `HOLD`
-/// only when no later-clearing gate outranks it, so a throttled-AND-quota-gated
-/// account shows the hold nowhere at all.
-///
-/// DISPLAY ONLY, and deliberately so. [`crate::manager::Manager::account_gate`]
-/// reports `free_at = None` whenever any active gate's reset is unknown, and
-/// [`crate::manager::Manager::retry_after_hint`] turns that into the client-facing
-/// `retry-after` — its doc records that promising a recovery which will not happen
-/// was a real bug. This cell must never become a source of truth for that path.
-///
-/// `rate_limited_until` is already live-filtered by the snapshot (an expired hold
-/// arrives as `None`); the `until > now` guard is belt-and-braces for a snapshot
-/// rendered slightly after it was taken.
-fn status_label(account: &AccountSnapshot, now: OffsetDateTime) -> String {
-    match account.rate_limited_until {
-        Some(until) if account.status == "throttled" && until > now => {
-            format!("{} {}", account.status, rel(until - now))
-        }
-        _ => account.status.clone(),
     }
 }
 
@@ -1461,7 +1427,6 @@ mod tests {
             quota_state: QuotaState::Normal,
             gate,
             free_at,
-            free_at_floor: None,
             stream_error_count: 0,
             last_stream_error: None,
         }
@@ -1470,35 +1435,6 @@ mod tests {
     /// A stable, far-from-epoch anchor so `now + delta` never underflows.
     fn anchor() -> OffsetDateTime {
         OffsetDateTime::UNIX_EPOCH + TimeDuration::days(3650)
-    }
-
-    #[test]
-    fn status_label_shows_a_live_hold_and_nothing_else() {
-        let now = anchor();
-        let mut a = snap_gate("acct", GateReason::Ok, None);
-
-        // A live hold renders its clear-instant beside the word.
-        a.status = "throttled".to_string();
-        a.rate_limited_until = Some(now + TimeDuration::seconds(12));
-        assert_eq!(status_label(&a, now), "throttled 12s");
-
-        // No deadline (or one that has already passed — the snapshot normally
-        // filters those to None, this is the belt-and-braces arm) falls back to the
-        // bare word rather than inventing or negating a time.
-        a.rate_limited_until = None;
-        assert_eq!(status_label(&a, now), "throttled");
-        a.rate_limited_until = Some(now - TimeDuration::seconds(1));
-        assert_eq!(status_label(&a, now), "throttled");
-
-        // THE LEAK GUARD: a deadline must never decorate a row that is not on a
-        // hold. `clear_rate_limited` nulls the field when it flips the status back,
-        // but the two are separate writes and this cell must not depend on that
-        // ordering — an `active` row showing a countdown would read as gated.
-        a.status = "active".to_string();
-        a.rate_limited_until = Some(now + TimeDuration::seconds(12));
-        assert_eq!(status_label(&a, now), "active");
-        a.status = "error".to_string();
-        assert_eq!(status_label(&a, now), "error");
     }
 
     #[test]

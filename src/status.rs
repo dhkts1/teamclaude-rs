@@ -80,9 +80,31 @@ pub struct StatusPayload {
     ///   [`BuildInfo::default`] — every field `unknown` — and the client renders
     ///   "cannot tell whether the server is current", which is the truth.
     ///
-    /// The rule this encodes: `kind` gates INCOMPATIBLE shape changes (a field
-    /// removed, retyped, or given new meaning), never additive ones that both
-    /// directions degrade through honestly.
+    /// The rule this encodes: `kind` gates a change that would be MISREAD in
+    /// either skew direction — never one both directions degrade through
+    /// honestly. The test is behavioural, not a taxonomy of edits:
+    ///
+    /// * Would an OLD client reading a NEW payload render something FALSE (as
+    ///   opposed to something absent)? Unknown fields are skipped by default, so
+    ///   an addition passes; a field RETYPED or given new meaning under the same
+    ///   name does not, because the old client parses it and believes it.
+    /// * Would a NEW client reading an OLD payload render something FALSE? With
+    ///   `#[serde(default)]` plus `skip_serializing_if` the field simply reads as
+    ///   its default, which is the truth "the server did not report this".
+    ///   WITHOUT a default it is a hard deserialize error and the client falls
+    ///   back to the all-zeros offline snapshot — a fabricated healthy fleet.
+    ///
+    /// A field REMOVAL is therefore not automatically a bump, and an earlier
+    /// wording of this rule said it was. `free_at_floor_ms` was removed without
+    /// one, correctly: it was `Option` with `default` + `skip_serializing_if` on
+    /// both sides and there is no `deny_unknown_fields` on this payload, so an
+    /// old client sees an absent optional and a new client sees `None` — both
+    /// true. Bumping there would have made every not-yet-rebuilt client reject
+    /// the payload and render the structural zeros this endpoint exists to end.
+    ///
+    /// The real hazard is the opposite one, and it has bitten: adding a REQUIRED
+    /// field. See [`AccountRow::stream_error_count`] — added without a default,
+    /// it made a newer client unable to parse an older running server at all.
     #[serde(default)]
     pub build: BuildInfo,
 }
@@ -122,8 +144,6 @@ pub struct AccountStatus {
     pub quota_state: QuotaState,
     pub gate: GateReason,
     pub free_at_ms: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub free_at_floor_ms: Option<i64>,
     /// The account's effective switch threshold on the SERVER (its own
     /// `switchThreshold`, else the global one).
     pub threshold: f64,
@@ -132,6 +152,23 @@ pub struct AccountStatus {
     /// it carries no credential material and `tcr status --json` is how an
     /// operator sees the fleet (`tcr status --json | jq '.[].streamErrorCount'`);
     /// see this module's doc comment on the no-secret invariant.
+    ///
+    /// `#[serde(default)]` is load-bearing, not tidiness. This field was ADDED,
+    /// and a newer client routinely talks to an older still-running server: the
+    /// binary on disk is rebuilt on merge while the live process keeps serving
+    /// until someone restarts it, which is the normal state of this system, not
+    /// an edge case. Without a default, that skew is a hard deserialize failure
+    /// ("missing field `streamErrorCount`") and `tcr status` falls back to an
+    /// OFFLINE snapshot whose serving counters are all structural zeros — the
+    /// operator is shown a fabricated healthy fleet at exactly the moment the
+    /// real one is on fire. Observed live 2026-08-04: client bd60839 against
+    /// server 325df03 reported all 13 accounts `active` while the log carried
+    /// 52 rate-limit events and 8 accounts sat on hour-long holds.
+    ///
+    /// Absent → 0, which reads identically to "no stream errors seen". That is
+    /// the honest degradation: `source` on the same payload already tells the
+    /// operator the reading came from a server that could not report it.
+    #[serde(default)]
     pub stream_error_count: usize,
     /// The most recent stream error's type, alongside the count above. Same
     /// on-the-wire decision as `stream_error_count`; rendered as `lastStreamError`.
@@ -182,7 +219,6 @@ impl StatusPayload {
                 quota_state: a.quota_state,
                 gate: a.gate,
                 free_at_ms: a.free_at.map(to_ms),
-                free_at_floor_ms: a.free_at_floor.map(to_ms),
                 threshold: thresholds.get(i).copied().unwrap_or(1.0),
                 stream_error_count: a.stream_error_count,
                 last_stream_error: a.last_stream_error.clone(),
@@ -234,7 +270,6 @@ impl StatusPayload {
                     quota_state: a.quota_state,
                     gate: a.gate,
                     free_at: a.free_at_ms.and_then(from_ms),
-                    free_at_floor: a.free_at_floor_ms.and_then(from_ms),
                     stream_error_count: a.stream_error_count,
                     last_stream_error: a.last_stream_error,
                 }
@@ -281,7 +316,6 @@ mod tests {
                 quota_state: QuotaState::Normal,
                 gate: GateReason::Ok,
                 free_at: None,
-                free_at_floor: None,
                 stream_error_count: 0,
                 last_stream_error: None,
             }],
@@ -379,6 +413,38 @@ mod tests {
             serde_json::from_str(future).expect("an unknown field is skipped, not fatal");
         assert_eq!(payload.kind, STATUS_KIND, "and the kind never had to move");
         assert_eq!(payload.build.sha, "cd146ce");
+    }
+
+    /// The MIRROR of the test above, for the direction that actually broke: a
+    /// NEW client reading an OLD server's payload.
+    ///
+    /// This is the normal state of the system, not an edge case — the on-disk
+    /// binary is rebuilt on merge while the live process keeps serving the old
+    /// one until someone restarts it, so `tcr status` routinely runs newer code
+    /// than the server it queries. On 2026-08-04 a client at bd60839 queried a
+    /// server at 325df03, could not parse the reply for want of
+    /// `streamErrorCount`, fell back to the offline snapshot, and reported all
+    /// 13 accounts `active` while the log carried 52 rate-limit events and 8
+    /// accounts sat on hour-long holds. A REQUIRED added field is the hazard;
+    /// `#[serde(default)]` is the fix, and this test is what keeps it.
+    ///
+    /// The row below is deliberately spelled the way the OLD server emits it —
+    /// no `streamErrorCount`, no `lastStreamError`, no `freeAtFloorMs`.
+    #[test]
+    fn status_payload_parses_an_older_servers_row() {
+        let old = r#"{"kind":"tcr.status.v1","accounts":[{"name":"a@example.com","priority":0,
+            "status":"throttled","disabled":false,"requests":7,"inputTokens":1,"outputTokens":2,
+            "cacheReadTokens":0,"cacheCreationTokens":0,"probeStatus":"ok","quotaState":"normal",
+            "gate":"hold","threshold":0.9}]}"#;
+        let payload: StatusPayload = serde_json::from_str(old)
+            .expect("a newer client MUST parse an older server's row, not fall back to offline");
+        let row = &payload.accounts[0];
+        assert_eq!(row.stream_error_count, 0, "absent reads as 'not reported'");
+        assert_eq!(row.last_stream_error, None);
+        // The fields the old server DID send must survive intact — the point is
+        // graceful degradation, not a payload parsed into defaults wholesale.
+        assert_eq!(row.status, "throttled");
+        assert_eq!(row.requests, 7);
     }
 
     /// The `kind` discriminator is what stops an older server's upstream-forwarded

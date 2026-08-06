@@ -1003,25 +1003,18 @@ impl Manager {
     /// reset (a window over threshold whose reset is unknown) is the
     /// longest-possible constraint, so it sorts as "latest": it becomes the reason
     /// and `free_at` is `None` (we cannot promise a time). No active gate → `Ok`.
-    /// Every ACTIVE hard gate on `account`, paired with the instant it clears
-    /// (`None` = active but no known reset).
-    ///
-    /// Extracted so [`Self::account_gate`] and [`Self::account_gate_known_floor`]
-    /// fold the SAME collection two different ways and cannot drift apart. `Err`
-    /// carries a terminal state (never self-frees), which both callers must treat
-    /// as "no clear-instant at all" rather than as an empty gate list.
-    fn active_gates(
+    pub(super) fn account_gate(
         account: &AccountRuntime,
         threshold: f64,
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
-    ) -> Result<Vec<(GateReason, Option<OffsetDateTime>)>, GateReason> {
+    ) -> (GateReason, Option<OffsetDateTime>) {
         // Terminal states that never self-free — reported with no clear-instant.
         // Shared with `account_hard_ok` so the two can no longer disagree about
         // which blocks are account-level (see `account_terminal_gate`).
         if let Some(reason) = Self::account_terminal_gate(account) {
-            return Err(reason);
+            return (reason, None);
         }
 
         // Every ACTIVE hard gate paired with the instant it clears (`None` = active
@@ -1081,50 +1074,10 @@ impl Manager {
         // wins here and carries its `None` out as `free_at` — exactly the
         // "cannot promise a time" case. `max_by_key` breaks ties toward the
         // last-collected gate, a deterministic order.
-        Ok(gates)
-    }
-
-    pub(super) fn account_gate(
-        account: &AccountRuntime,
-        threshold: f64,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-    ) -> (GateReason, Option<OffsetDateTime>) {
-        match Self::active_gates(account, threshold, now, now_ms, is_fable) {
-            Err(reason) => (reason, None),
-            Ok(gates) => gates
-                .into_iter()
-                .max_by_key(|&(_, at)| gate_clear_key(at))
-                .unwrap_or((GateReason::Ok, None)),
-        }
-    }
-
-    /// DISPLAY ONLY: the LATEST clear-instant among the gates that have one, or
-    /// `None` when no active gate has a known reset.
-    ///
-    /// This is a FLOOR ("will not free before this, possibly later"), not a
-    /// promise. It exists because [`Self::account_gate`] reports `free_at = None`
-    /// whenever ANY active gate's reset is unknown — that unknown sorts last in
-    /// `gate_clear_key` and wins — so an account gated on both a known 7-day reset
-    /// and an unknown one renders with no time at all, hiding a bound we do know.
-    ///
-    /// It must NEVER feed [`super::Manager::retry_after_hint`]. That path is
-    /// deliberately honest-by-construction: its doc records that minimising over
-    /// raw window resets "promised a recovery that would not happen", and a floor
-    /// is exactly such a too-early promise. Renderers only.
-    pub(super) fn account_gate_known_floor(
-        account: &AccountRuntime,
-        threshold: f64,
-        now: OffsetDateTime,
-        now_ms: i64,
-        is_fable: bool,
-    ) -> Option<OffsetDateTime> {
-        Self::active_gates(account, threshold, now, now_ms, is_fable)
-            .ok()?
+        gates
             .into_iter()
-            .filter_map(|(_, at)| at)
-            .max()
+            .max_by_key(|&(_, at)| gate_clear_key(at))
+            .unwrap_or((GateReason::Ok, None))
     }
 
     /// The best pacing-respecting eligible account not in `tried`, by ascending

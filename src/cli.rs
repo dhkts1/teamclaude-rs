@@ -451,8 +451,21 @@ pub fn render_accounts(
             (StatusSource::Live, Some(kind)) => format!(" last_stream_error={kind}"),
             _ => String::new(),
         };
+        // WHEN it comes back — the question `status=` cannot answer. `free_at` is
+        // the instant ALL of this account's active gates clear, so it never
+        // promises a return the weekly cap will not honour.
+        //
+        // Omitted (not `n/a`) when there is no instant to name, matching the
+        // `fable=`/`last_stream_error=` idiom: a terminal gate (REJECTED / LOGIN /
+        // disabled) is cleared only by a human, and a gate whose reset upstream
+        // never reported has no time to give. Absent means "no time can be
+        // promised" — printing `free_in=0s` there would read as "returns now".
+        let free_in = match a.free_at {
+            Some(f) if f > now => format!(" free_in={}s", (f - now).whole_seconds().max(1)),
+            _ => String::new(),
+        };
         out.push_str(&format!(
-            "account {} priority={} {} {}{}{} state={} status={} probe={}{}{}{}\n",
+            "account {} priority={} {} {}{}{} state={} status={}{} probe={}{}{}{}\n",
             a.name,
             a.priority,
             five_hour,
@@ -461,6 +474,7 @@ pub fn render_accounts(
             cache,
             quota_state_token(a.quota_state),
             a.status,
+            free_in,
             a.probe_status.as_str(),
             stream_errors,
             last_stream_error,
@@ -588,6 +602,32 @@ fn render_accounts_json(
                     StatusSource::Live => a.last_stream_error.clone(),
                 },
                 "held": held,
+                // WHEN THE ACCOUNT COMES BACK — the question `status` cannot
+                // answer. `status: "throttled"` is a state; this is the instant.
+                //
+                // It lives here rather than in the TUI's Status cell because that
+                // column is Length(9) and "throttled" is exactly 9 characters, so
+                // a countdown there is clipped at every terminal width; and it is
+                // `free_at`, not the raw hold, because free_at is the instant ALL
+                // of this account's active gates clear. Rendering the hold alone
+                // would promise a return the weekly cap will not honour.
+                //
+                // Null is honest and load-bearing: `account_gate` reports no
+                // instant for a terminal state (REJECTED / LOGIN / disabled —
+                // only a human clears those) and for a gate whose reset upstream
+                // never reported. Absent means "no time can be promised", never
+                // "returns now".
+                "freeAtMs": a.free_at.map(|f| (f.unix_timestamp_nanos() / 1_000_000) as i64),
+                "secondsUntilFree": a
+                    .free_at
+                    .filter(|f| *f > now)
+                    .map(|f| (f - now).whole_seconds()),
+                // The 429 hold specifically, so an operator can tell a short
+                // transient park from a week-scale quota cap without inferring it
+                // from `gate`.
+                "rateLimitedUntilMs": a
+                    .rate_limited_until
+                    .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
             })
         })
         .collect();
@@ -1527,6 +1567,65 @@ mod tests {
         assert_eq!(
             format_reset_countdown(now - Duration::minutes(5), now),
             "+0m"
+        );
+    }
+
+    /// `free_in=` answers "when does it come back" — the question
+    /// `status=throttled` cannot. It lives on THIS surface because the TUI's
+    /// Status column is Length(9) and "throttled" is exactly 9 characters, so a
+    /// countdown there is clipped at every terminal width.
+    ///
+    /// Asserts the RENDERED LINE and the emitted JSON, never a formatting helper.
+    /// A unit test on the helper is what let a clipped countdown ship green.
+    #[tokio::test]
+    async fn free_in_names_the_instant_and_is_omitted_when_none_can_be_promised() {
+        // WindowProber gates alice on 5h (~+92m) and bob on 7d (+3d) — real gates
+        // with known resets, so account_gate yields a free_at for both.
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let gated =
+            snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
+        let text = render_accounts(&gated, &thresholds, StatusSource::Live);
+        for line in text.lines() {
+            assert!(
+                line.contains("free_in="),
+                "a gated account names its instant: {line}"
+            );
+            let secs: i64 = line
+                .split("free_in=")
+                .nth(1)
+                .and_then(|t| t.split('s').next())
+                .and_then(|n| n.parse().ok())
+                .expect("free_in carries whole seconds");
+            assert!(secs > 0, "a promised instant is in the future: {line}");
+        }
+        // JSON mirrors it for machine consumers, in ms like every other instant.
+        let json = render_accounts_json(&gated, &thresholds, StatusSource::Live, None);
+        assert!(
+            json.contains("\"freeAtMs\""),
+            "json carries freeAtMs: {json}"
+        );
+        assert!(
+            json.contains("\"secondsUntilFree\""),
+            "and the countdown: {json}"
+        );
+
+        // UNGATED: nothing binds, so there is no instant to promise. The token is
+        // OMITTED, never rendered as zero — `free_in=0s` would read as "returns
+        // now", which is the same false promise `free_at = None` exists to avoid.
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let open = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            true,
+        )
+        .await;
+        let text = render_accounts(&open, &thresholds, StatusSource::Live);
+        assert!(
+            !text.contains("free_in="),
+            "an account in rotation promises nothing: {text}"
         );
     }
 

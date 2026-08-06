@@ -66,6 +66,14 @@ const NO_GUIDANCE_HOLD_SECS: i64 = 15;
 /// of accounts that tripped together, so a synchronized wave can't re-arm a
 /// sliding-window limiter.
 const NO_GUIDANCE_JITTER_MAX_SECS: i64 = 5;
+/// Ceiling for a quota-rejection hold, mirroring `MAX_RATE_LIMIT_HOLD_SECONDS`
+/// in `manager/mod.rs` (which clamps again, so this is the value that actually
+/// binds at the call site).
+const MAX_QUOTA_HOLD_SECS: i64 = 3600;
+/// Spread applied to a CEILING-CLAMPED quota hold so accounts rejected together
+/// do not free together. Sized well under the ceiling: it must desync the herd
+/// without materially shortening a genuine cap. See [`jittered_quota_hold`].
+const QUOTA_HOLD_JITTER_MAX_SECS: i64 = 90;
 /// Ceiling for soft-waiting out a *transient* all-parked fleet at the exhausted
 /// branch instead of firing the hard 429. Set to the maximum no-guidance park
 /// (`NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_JITTER_MAX_SECS` = 20s): a burst park
@@ -170,6 +178,40 @@ enum Transient429 {
 ///
 /// `jitter` (seconds) is added ONLY to the no-guidance hold so accounts that
 /// tripped together un-park at staggered times; the present-`retry-after` path
+/// The hold to arm for a QUOTA-REJECTED 429, jittered so a burst of accounts
+/// rejected together does not un-park in lockstep.
+///
+/// Why this exists, measured 2026-08-04: a fan-out drew 52 rate-limit events in
+/// 72 minutes, and **42 of them armed an identical 3600s hold** — eight accounts
+/// inside a four-second window. They would then all have freed within that same
+/// four seconds and re-burst as one wave. [`NO_GUIDANCE_JITTER_MAX_SECS`] already
+/// documents this hazard verbatim ("desync the un-park of accounts that tripped
+/// together, so a synchronized wave can't re-arm a sliding-window limiter") but
+/// was only ever wired to the no-guidance path, never to this one.
+///
+/// The jitter is SUBTRACTED, and only from a hold that hit the ceiling. That is
+/// deliberate and is the only direction that is safe here:
+///
+/// * Adding is useless — [`Manager::mark_rate_limited`] clamps to
+///   `MAX_RATE_LIMIT_HOLD_SECONDS` (3600), so `3600 + jitter` clamps straight
+///   back to 3600 and the herd stays synchronized. The 42 identical holds were
+///   synchronized by OUR ceiling, not by upstream's number.
+/// * Subtracting from a SHORT hold would return an account before upstream said
+///   it may come back — the one thing this path must never do. So a hold under
+///   the ceiling is armed verbatim, unjittered.
+/// * At the ceiling we are ALREADY returning earlier than asked (upstream wanted
+///   `3600s` or more and got exactly 3600), so spreading within
+///   `[3600 - N, 3600]` stays inside an envelope we had already chosen, and
+///   strictly improves on arming every account at one instant.
+fn jittered_quota_hold(retry_after: i64, nanos: u32) -> i64 {
+    let clamped = retry_after.clamp(1, MAX_QUOTA_HOLD_SECS);
+    if clamped < MAX_QUOTA_HOLD_SECS {
+        return clamped;
+    }
+    let jitter = (nanos as i64) % (QUOTA_HOLD_JITTER_MAX_SECS + 1);
+    (clamped - jitter).max(1)
+}
+
 /// ignores it and stays byte-identical to the historical behavior.
 fn classify_transient_429(retry_after: Option<i64>, retried: u32, jitter: i64) -> Transient429 {
     match retry_after {
@@ -1097,7 +1139,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             let retry_after_raw = parse_retry_after(&up_headers);
             let retry_after = retry_after_raw.unwrap_or(60);
             if is_quota_rejected(&up_headers) {
-                manager.mark_rate_limited(idx, retry_after.clamp(1, 3600));
+                manager.mark_rate_limited(idx, jittered_quota_hold(retry_after, now.nanosecond()));
                 tried.insert(idx);
                 continue;
             }
@@ -5245,6 +5287,39 @@ mod tests {
 
     /// The 502 predicate itself, over the four states the two counters can be in.
     /// The bug was that the second row returned `true`.
+    /// The measured failure this exists to prevent: 42 of 52 quota rejections on
+    /// 2026-08-04 armed an IDENTICAL 3600s hold, eight accounts inside four
+    /// seconds, so the whole fleet would have un-parked as one wave.
+    #[test]
+    fn a_ceiling_clamped_hold_is_spread_but_a_genuine_one_is_verbatim() {
+        // AT THE CEILING: upstream asked for >= 3600 and we were already going to
+        // return early, so spreading inside [3600-N, 3600] costs nothing and
+        // desyncs the herd. Distinct nanos MUST yield distinct holds.
+        let spread: std::collections::HashSet<i64> = (0..8)
+            .map(|k| jittered_quota_hold(7200, k * 111_111_111))
+            .collect();
+        assert!(
+            spread.len() > 1,
+            "eight accounts rejected together must not share one hold: {spread:?}"
+        );
+        for h in &spread {
+            assert!(
+                (MAX_QUOTA_HOLD_SECS - QUOTA_HOLD_JITTER_MAX_SECS..=MAX_QUOTA_HOLD_SECS)
+                    .contains(h),
+                "stays inside the envelope we already chose: {h}"
+            );
+        }
+
+        // BELOW THE CEILING: armed verbatim. Returning an account before upstream
+        // said it may come back is the one thing this path must never do — the
+        // 829s hold observed live must stay 829s.
+        assert_eq!(jittered_quota_hold(829, 999_999_999), 829);
+        assert_eq!(jittered_quota_hold(1, 999_999_999), 1);
+        // And a nonsense/negative header can never produce a zero-length hold.
+        assert_eq!(jittered_quota_hold(0, 12_345), 1);
+        assert_eq!(jittered_quota_hold(-5, 12_345), 1);
+    }
+
     #[test]
     fn bad_gateway_only_when_nothing_reached_an_upstream() {
         assert!(
