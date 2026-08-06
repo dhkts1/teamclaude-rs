@@ -72,11 +72,52 @@ open build/TcrBar.app
 the commit count plus a `TcrGitSHA` key from the short SHA, suffixed `-dirty` on a
 dirty tree. Developer ID signing, notarization and DMG packaging are out of scope.
 
+## The bundled `tcr`
+
+`build-tcrbar.sh` builds the Rust `tcr` binary and copies it into
+`TcrBar.app/Contents/MacOS/tcr`, so the app and the server it drives are one
+artifact and cannot drift. They previously drifted twice in a single day.
+
+Two details are load-bearing:
+
+- The build reads cargo's output directory from
+  `cargo metadata --no-deps --format-version 1`, never assuming `target/release`.
+  `CARGO_TARGET_DIR` redirects it, and a build that lands elsewhere while
+  reporting success is exactly how the drift happened.
+- The copy is then checked for the `TCR_BUILD_SHA` that `build.rs` stamps, and
+  the build fails if it does not match `HEAD`. A bundle holding a stale `tcr` is
+  worse than no bundle, because the app would confidently serve old code.
+
+`Contents/MacOS/tcr` is codesigned **before** the bundle around it. Signing a
+nested Mach-O afterwards mutates a file the outer signature seals, which
+invalidates it — and per the note in the script an invalid signature silently
+breaks "Launch at login" and every permission grant. `codesign -v --deep
+--strict build/TcrBar.app` is the gate that proves the order.
+
+### Optionally pointing the CLI at the bundle
+
+Once the bundle is verified runnable, `~/.local/bin/tcr` can be repointed at
+`/Applications/TcrBar.app/Contents/MacOS/tcr` so the CLI and the app share one
+binary and only one thing needs updating.
+
+Do this by hand, and verify first — `Contents/MacOS/tcr --version` must run from
+the installed bundle. That symlink is what every shell `tcr` invocation resolves
+through, **including live `tcr run` sessions**: aim it at a missing, unsigned or
+quarantined binary and every `tcr` command on the machine breaks at once. The
+build script deliberately does not touch it.
+
 ## Finding the `tcr` binary
 
-An app launched from Finder inherits a minimal `PATH`, so TcrBar probes `PATH`
-first and then the usual install directories (`~/.local/bin`, `~/.cargo/bin`,
-`/opt/homebrew/bin`, `/usr/local/bin`). Override it explicitly with either:
+An app launched from Finder inherits a minimal `PATH`, so TcrBar probes, in
+order: the `TCR_BIN` environment variable, the `TcrExecutablePath` defaults key,
+the `tcr` bundled next to its own executable, then `PATH`, then the usual
+install directories (`~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`,
+`/usr/local/bin`).
+
+The bundled binary sits between the overrides and `PATH` on purpose: an operator
+who names a path means it, but a `tcr` shipped inside this bundle must beat
+whatever happens to be on `PATH`, or bundling buys nothing. Override explicitly
+with either:
 
 ```sh
 defaults write com.github.dhkts1.tcrbar TcrExecutablePath /path/to/tcr
@@ -84,7 +125,7 @@ TCR_BIN=/path/to/tcr open build/TcrBar.app     # env override, shell launches
 ```
 
 If nothing is found the panel says so and names how many locations it searched —
-it never shows an empty list.
+the bundle path included — it never shows an empty list.
 
 ## Reading the panel honestly
 

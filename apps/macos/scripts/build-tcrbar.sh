@@ -38,6 +38,48 @@ rm -rf "$app_dir"
 mkdir -p "$macos_dir"
 cp "$binary" "$macos_dir/$app_name"
 
+# Bundle the `tcr` server binary alongside the app.
+#
+# The app and the server ship as ONE artifact so they cannot drift: before this,
+# the two were built separately and TcrBar resolved `tcr` from `PATH`, which
+# drifted twice in a single day. `TcrTool.resolve()` probes
+# `Contents/MacOS/tcr` ahead of `PATH` for the same reason.
+#
+# The output path is READ OUT OF CARGO, never assumed to be `$repo_root/target`.
+# `CARGO_TARGET_DIR` redirects it, and assuming otherwise is not a hypothetical:
+# `.githooks/post-merge` announced `built <sha>` for a binary that had landed in
+# `$CARGO_TARGET_DIR` while the `target/release/tcr` a symlink actually resolved
+# to stayed at the old sha. A build that reports success from the wrong path is
+# worse than a failed one.
+echo "==> cargo build --release --bin tcr"
+cargo build --manifest-path "$repo_root/Cargo.toml" --release --bin tcr
+cargo_target_dir="$(cargo metadata --manifest-path "$repo_root/Cargo.toml" --no-deps --format-version 1 | jq -r .target_directory)"
+tcr_binary="$cargo_target_dir/release/tcr"
+if [ ! -x "$tcr_binary" ]; then
+  echo "ERROR: cargo reported target_directory=$cargo_target_dir but $tcr_binary is not executable." >&2
+  exit 1
+fi
+cp "$tcr_binary" "$macos_dir/tcr"
+chmod +x "$macos_dir/tcr"
+
+# Assert the COPY carries the sha we think we built.
+#
+# `build.rs` stamps `TCR_BUILD_SHA` into the binary, so the bundled file can be
+# asked what it is rather than trusted. A bundle holding a stale `tcr` is worse
+# than no bundle at all — the app would then confidently serve old code. The
+# expected value is the bare short sha; `$git_sha` may carry a `-dirty` suffix
+# that is not part of the stamp.
+expected_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ "$expected_sha" = "unknown" ]; then
+  echo "    tcr: bundled (no git sha to verify against)"
+elif grep -aq "$expected_sha" "$macos_dir/tcr"; then
+  echo "    tcr: bundled from $tcr_binary (sha $expected_sha)"
+else
+  echo "ERROR: $macos_dir/tcr does not carry the expected build sha $expected_sha." >&2
+  echo "ERROR: the bundled server would be a DIFFERENT build from this checkout." >&2
+  exit 1
+fi
+
 # The icon is DRAWN BY THE APP, not committed as a binary asset.
 #
 # `AppIcon.swift` renders it from the same `Tok` values the panel uses, so the
@@ -127,12 +169,21 @@ for class in "Developer ID Application" "Apple Development"; do
   fi
 done
 
+# Nested Mach-O binaries are signed BEFORE the bundle that contains them.
+#
+# The outer signature seals the bundle's contents, so signing `Contents/MacOS/tcr`
+# afterwards would mutate a file the app's own seal covers and invalidate it.
+# `codesign -v --deep --strict` on the finished bundle is what proves the order
+# is right, and per the note above an invalid signature is not cosmetic: it
+# silently breaks "Launch at login" and every permission grant.
 if [ -n "$sign_identity" ]; then
   echo "==> codesign ($sign_tier)"
+  codesign -s "$sign_identity" --force "$macos_dir/tcr"
   codesign -s "$sign_identity" --force "$app_dir"
 else
   sign_tier="ad-hoc"
   echo "==> codesign (ad-hoc)"
+  codesign -s - --force "$macos_dir/tcr"
   codesign -s - --force "$app_dir"
   {
     echo

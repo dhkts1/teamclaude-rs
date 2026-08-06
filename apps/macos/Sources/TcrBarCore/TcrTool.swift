@@ -37,6 +37,22 @@ public enum TcrTool {
         ]
     }
 
+    /// The directory holding this app's own executable, which is where
+    /// `build-tcrbar.sh` also puts the `tcr` it bundles (`Contents/MacOS/`).
+    ///
+    /// Derived from `Bundle.main`, never hard-coded: this repository is public
+    /// and no user-absolute path belongs in it. `executableURL` is used rather
+    /// than `bundleURL` because it resolves correctly for BOTH shapes this code
+    /// runs in — inside `TcrBar.app` it is `…/TcrBar.app/Contents/MacOS/TcrBar`,
+    /// and under `swift run`/`swift test` it is the bare tool — while
+    /// `bundleURL` alone would need a different suffix for each.
+    ///
+    /// `nil` when the bundle cannot name its executable; the caller then simply
+    /// has no bundle candidate to probe.
+    public static func bundledDirectory(bundle: Bundle = .main) -> URL? {
+        bundle.executableURL?.deletingLastPathComponent()
+    }
+
     /// Candidate directories, `PATH` first, in probe order.
     public static func searchDirectories(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -50,12 +66,20 @@ public enum TcrTool {
     }
 
     /// Resolve the binary, honouring the env override, then the defaults
-    /// override, then the search path.
+    /// override, then the bundled binary, then the search path.
+    ///
+    /// The bundled binary sits between the two explicit overrides and `PATH` on
+    /// purpose. An operator who names a path in `TCR_BIN` or the defaults key
+    /// means it, so those still win. But a `tcr` that shipped inside this very
+    /// bundle must beat whatever happens to be on `PATH`: the app and the server
+    /// are built and installed as one artifact precisely so they cannot drift,
+    /// and letting an older `PATH` copy win would give that away for nothing.
     public static func resolve(
         environment: [String: String] = ProcessInfo.processInfo.environment,
         defaults: UserDefaults = .standard,
         home: URL = FileManager.default.homeDirectoryForCurrentUser,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        bundle: URL? = bundledDirectory()
     ) -> Result<URL, NotFound> {
         var searched: [String] = []
         for override in [environment[overrideEnvKey], defaults.string(forKey: overrideDefaultsKey)] {
@@ -63,6 +87,11 @@ public enum TcrTool {
             let url = URL(fileURLWithPath: override)
             searched.append(url.path)
             if fileManager.isExecutableFile(atPath: url.path) { return .success(url) }
+        }
+        if let bundle {
+            let candidate = bundle.appendingPathComponent("tcr")
+            searched.append(candidate.path)
+            if fileManager.isExecutableFile(atPath: candidate.path) { return .success(candidate) }
         }
         for dir in searchDirectories(environment: environment, home: home) {
             let candidate = dir.appendingPathComponent("tcr")
