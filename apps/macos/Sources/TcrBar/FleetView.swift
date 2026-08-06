@@ -30,6 +30,10 @@ struct FleetView: View {
     /// `false` and the live panel still scrolls.
     var snapshotMode: Bool = false
 
+    /// Surfaced in place rather than swallowed: a button that silently does
+    /// nothing is worse than one that says why.
+    @State private var loginError: String?
+
     /// Measured height of the account rows.
     ///
     /// A `ScrollView` has a flexible ideal height, and the `MenuBarExtra` window
@@ -227,10 +231,23 @@ struct FleetView: View {
                     Button("Start server") { server.start() }
                 }
                 Button("Refresh") { Task { await poller.pollOnce() } }
+                Button("Add account…") { addAccount() }
+                    .help(
+                        "Opens `tcr login` in a Terminal window. It needs one: it "
+                            + "prompts for a name, may ask for a pasted code, and "
+                            + "refuses while a proxy is holding the port."
+                    )
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
             .buttonStyle(.bordered)
+
+            if let loginError {
+                Text(loginError)
+                    .font(Tok.detailFont)
+                    .foregroundStyle(Tok.spent)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             launchAtLogin
             startServerToggle
@@ -260,6 +277,25 @@ struct FleetView: View {
                     .foregroundStyle(Tok.near)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    /// Hand `tcr login` to a Terminal window.
+    ///
+    /// Deliberately a hand-off, not an in-app flow. `tcr login` refuses while a
+    /// proxy holds the port and prompts on stdin, so a background spawn would
+    /// usually fail and would hide its own prompts when it did not. The ellipsis
+    /// in the label is doing real work: this opens something.
+    private func addAccount() {
+        if case .failure(let why) = LoginLauncher.launch() {
+            switch why {
+            case .toolMissing(let searched):
+                loginError = "tcr not found (searched \(searched.count) locations)."
+            case .couldNotWriteScript(let message):
+                loginError = "Could not open Terminal: \(message)"
+            }
+        } else {
+            loginError = nil
         }
     }
 
