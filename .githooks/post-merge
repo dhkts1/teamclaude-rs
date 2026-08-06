@@ -58,17 +58,49 @@ echo "post-merge: rebuilding tcr (release) at $sha — this takes a moment." >&2
 
 # Quiet on success, loud on failure: cargo's output is captured and only replayed
 # when the build fails.
+# WHERE the build lands is not `target/` by assumption.
+#
+# `CARGO_TARGET_DIR` (or `build.target-dir` in a config.toml) redirects it
+# elsewhere, and every agent session in this repo sets that variable. Measured
+# 2026-08-06: this hook announced "built 2dc3138" while the binary went to
+# ~/.cache/cargo-target and the repo's own target/release/tcr — the path the
+# operator's `tcr` resolves through — stayed on the PREVIOUS sha. The hook
+# reported success for work that landed somewhere the reader was not looking,
+# which is the exact failure this hook exists to prevent, aimed at itself.
+#
+# `cargo metadata` is authoritative (it honours the env var AND config.toml).
+# The `${CARGO_TARGET_DIR:-...}` fallback covers a machine without `jq` and is
+# cargo's own rule minus the config-file case.
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || echo .)
+target_dir=""
+if command -v jq >/dev/null 2>&1; then
+  target_dir=$(cargo metadata --no-deps --format-version 1 2>/dev/null | jq -r '.target_directory // empty' || true)
+fi
+[ -n "$target_dir" ] || target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
+bin="$target_dir/release/tcr"
+
 log=$(mktemp -t tcr-post-merge)
 if cargo build --release >"$log" 2>&1; then
   rm -f "$log"
-  # Replacing target/release/tcr does NOT disturb a running server: on Unix the
+  # Replacing the release binary does NOT disturb a running server: on Unix the
   # live process holds its own open inode, and cargo writes a NEW file over the
   # path. The old process keeps executing the old bytes until someone restarts
   # it — deliberately, per the note above. Do not "fix" this by signalling it.
-  echo "post-merge: built $sha — a RUNNING tcr still serves the old binary; restart it when convenient." >&2
+  #
+  # Verify rather than assert. "built $sha" was previously a claim; build.rs
+  # stamps TCR_BUILD_SHA into the binary, so it costs one grep to make it a fact.
+  if [ -f "$bin" ] && grep -aq "$sha" "$bin" 2>/dev/null; then
+    echo "post-merge: built $sha -> $bin — a RUNNING tcr still serves the old binary; restart it when convenient." >&2
+  else
+    echo "post-merge: built at $sha but $bin does not carry that sha — treat the on-disk binary as UNTRUSTED." >&2
+  fi
+  # Say it plainly when the artifact is not where a reader would look for it.
+  if [ "$target_dir" != "$repo_root/target" ]; then
+    echo "post-merge: NOTE — CARGO_TARGET_DIR is in effect, so $repo_root/target/release/tcr was NOT updated." >&2
+  fi
 else
   echo "" >&2
-  echo "post-merge: BUILD FAILED at $sha — target/release/tcr is now STALE or missing." >&2
+  echo "post-merge: BUILD FAILED at $sha — $bin is now STALE or missing." >&2
   echo "  The merge itself completed; only the rebuild failed. Full output:" >&2
   cat "$log" >&2
   rm -f "$log"
