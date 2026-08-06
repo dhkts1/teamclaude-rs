@@ -13,6 +13,9 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    /// Owned by the app so it survives the panel closing; bound here so the
+    /// checkbox and the launch path can never disagree about its value.
+    @Binding var startServerAtLaunch: Bool
 
     /// Measured height of the account rows.
     ///
@@ -208,8 +211,33 @@ struct FleetView: View {
             .buttonStyle(.bordered)
 
             launchAtLogin
+            startServerToggle
 
             dangerZone
+        }
+    }
+
+    /// Bring the proxy up when TcrBar starts. Pairs with "Launch at login" to
+    /// mean "the proxy is always up".
+    ///
+    /// The warning is not decoration. Once TcrBar supervises the server, Quit
+    /// stops it — correct for a supervisor, and a genuinely expensive surprise if
+    /// nobody said so before the box was ticked.
+    private var startServerToggle: some View {
+        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            Toggle("Start server at launch", isOn: $startServerAtLaunch)
+                .toggleStyle(.checkbox)
+                .font(Tok.secondaryFont)
+                .help(
+                    "Runs `tcr server --no-replace` when TcrBar starts, so a proxy "
+                        + "that is already serving is never disturbed."
+                )
+            if startServerAtLaunch {
+                Text("TcrBar supervises the server, so quitting TcrBar stops it.")
+                    .font(Tok.detailFont)
+                    .foregroundStyle(Tok.near)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 

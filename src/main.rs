@@ -57,6 +57,8 @@ enum Command {
     Update(UpdateArgs),
     /// Render the TUI against fake accounts (for a sanitized README screenshot).
     Demo,
+    /// Open TcrBar, the macOS menu-bar app (macOS only).
+    Ui,
 }
 
 #[derive(clap::Args)]
@@ -198,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
+        Some(Command::Ui) => run_ui(),
         None => run_server(cli.server).await,
     }
 }
@@ -245,6 +248,45 @@ fn run_disable(args: DisableArgs) -> anyhow::Result<()> {
 async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     cli::status(&config_path, args.json).await
+}
+
+/// `tcr ui` — open TcrBar, the macOS menu-bar app.
+///
+/// This exists for discoverability, not capability: `open -a TcrBar` already
+/// works. Without it nothing in `tcr --help` reveals that a UI exists at all, so
+/// the app is only findable by knowing it is there.
+///
+/// It deliberately does NOT build the app or know where the checkout is. It asks
+/// LaunchServices to open a bundle id, which resolves wherever the app was
+/// installed. A `tcr` that shells into a source tree would break the moment the
+/// checkout moved.
+#[cfg(target_os = "macos")]
+fn run_ui() -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let status = std::process::Command::new("open")
+        .args(["-b", "com.github.dhkts1.tcrbar"])
+        .status()
+        .context("failed to run `open`")?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    // `open -b` fails when the bundle id is not registered, which almost always
+    // means "not installed" rather than "broken". Say which, and say how to fix
+    // it, rather than surfacing LaunchServices' own opaque exit code.
+    anyhow::bail!(
+        "TcrBar is not installed. Build and install it with:\n    \
+         bash apps/macos/scripts/install.sh"
+    )
+}
+
+/// Non-macOS builds keep the subcommand so `--help` is identical everywhere, and
+/// fail with the reason rather than a missing-subcommand error.
+#[cfg(not(target_os = "macos"))]
+fn run_ui() -> anyhow::Result<()> {
+    anyhow::bail!("`tcr ui` opens the macOS menu-bar app, and this is not macOS.")
 }
 
 /// `tcr run [-- args…]` — launch Claude Code already pointed at this proxy.
