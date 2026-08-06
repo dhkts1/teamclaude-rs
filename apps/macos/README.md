@@ -67,7 +67,7 @@ bash scripts/build-tcrbar.sh
 open build/TcrBar.app
 ```
 
-`scripts/build-tcrbar.sh` produces an ad-hoc-signed `build/TcrBar.app` with
+`scripts/build-tcrbar.sh` produces a `build/TcrBar.app` with
 `LSUIElement` set (menu-bar only, no Dock icon) and stamps `CFBundleVersion` from
 the commit count plus a `TcrGitSHA` key from the short SHA, suffixed `-dirty` on a
 dirty tree. Developer ID signing, notarization and DMG packaging are out of scope.

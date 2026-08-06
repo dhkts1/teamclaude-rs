@@ -38,6 +38,31 @@ rm -rf "$app_dir"
 mkdir -p "$macos_dir"
 cp "$binary" "$macos_dir/$app_name"
 
+# The icon is DRAWN BY THE APP, not committed as a binary asset.
+#
+# `AppIcon.swift` renders it from the same `Tok` values the panel uses, so the
+# mark cannot drift from the palette the way a checked-in .icns silently does.
+# That is why this runs after the binary is copied: the binary is the generator.
+#
+# Non-fatal on purpose. A missing icon costs a generic placeholder in Finder; it
+# is not worth failing a build that is otherwise fine, and a hard failure here
+# would block `swift build` working on a machine without `iconutil`.
+iconset="$(mktemp -d)/AppIcon.iconset"
+if "$macos_dir/$app_name" --render-icon "$iconset" >/dev/null 2>&1 \
+    && command -v iconutil >/dev/null 2>&1 \
+    && iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+  echo "    icon: generated"
+else
+  mkdir -p "$app_dir/Contents/Resources"
+  if "$macos_dir/$app_name" --render-icon "$iconset" >/dev/null 2>&1 \
+      && iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+    echo "    icon: generated"
+  else
+    echo "    WARNING: could not generate the app icon — Finder will show a placeholder." >&2
+  fi
+fi
+rm -rf "$(dirname "$iconset")"
+
 cat >"$app_dir/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,6 +72,10 @@ cat >"$app_dir/Contents/Info.plist" <<PLIST
 	<string>$app_name</string>
 	<key>CFBundleIdentifier</key>
 	<string>$bundle_id</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleName</key>
 	<string>$app_name</string>
 	<key>CFBundlePackageType</key>
