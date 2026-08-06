@@ -1,11 +1,31 @@
+import AppKit
 import SwiftUI
 import TcrBarCore
+
+/// The real entry point.
+///
+/// `TcrBarApp` cannot carry `@main` itself, because the render harness has to run
+/// and exit BEFORE SwiftUI installs a menu-bar item or the poller starts. Doing it
+/// from `applicationDidFinishLaunching` would flash an icon in the menu bar and
+/// fire a `tcr` subprocess on a machine that only asked for PNGs.
+@main
+enum TcrBarEntry {
+    @MainActor
+    static func main() {
+        if let directory = RenderStates.requestedDirectory() {
+            // AppKit needs to exist before anything can be rasterised, but the
+            // app is never activated and no window or status item is created.
+            _ = NSApplication.shared
+            RenderStates.run(into: directory)  // exits
+        }
+        TcrBarApp.main()
+    }
+}
 
 /// TcrBar — a menu-bar accessory for the `tcr` rotating proxy.
 ///
 /// `LSUIElement` is set in the bundle's Info.plist, so there is no Dock icon and
 /// no main window: the whole app is the `MenuBarExtra`.
-@main
 struct TcrBarApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var poller = StatusPoller()
