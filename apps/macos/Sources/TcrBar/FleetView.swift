@@ -45,12 +45,12 @@ struct FleetView: View {
                 Spacer()
                 if let at = poller.lastPollAt {
                     Text(at, style: .time)
-                        .font(.caption.monospacedDigit())
+                        .font(Tok.secondaryDigitFont)
                         .foregroundStyle(.secondary)
                 }
             }
             Text(poller.state.summary)
-                .font(.caption)
+                .font(Tok.secondaryFont)
                 .foregroundStyle(poller.state.isHealthyRead ? .secondary : .primary)
                 .fixedSize(horizontal: false, vertical: true)
             if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
@@ -58,7 +58,7 @@ struct FleetView: View {
             }
             if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
                 Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
-                    .font(.caption2.monospaced())
+                    .font(Tok.detailDigitFont)
                     .foregroundStyle(.tertiary)
             }
         }
@@ -75,10 +75,10 @@ struct FleetView: View {
             HStack(spacing: Tok.tightSpacing) {
                 ForEach(Array(fleet.breakdown.enumerated()), id: \.offset) { index, tally in
                     if index > 0 {
-                        Text("·").font(.caption).foregroundStyle(.tertiary)
+                        Text("·").font(Tok.secondaryFont).foregroundStyle(.tertiary)
                     }
                     Text(tally.label)
-                        .font(.caption.monospacedDigit())
+                        .font(Tok.secondaryDigitFont)
                         .foregroundStyle(Tok.color(for: tally.kind))
                 }
             }
@@ -169,7 +169,7 @@ struct FleetView: View {
             Text("source: \(source.token) — quota is real, all serving counters are structurally zero.")
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .font(.caption)
+        .font(Tok.secondaryFont)
         .foregroundStyle(Tok.offline)
     }
 
@@ -179,7 +179,7 @@ struct FleetView: View {
             VStack(alignment: .leading, spacing: Tok.tightSpacing) {
                 Text(title).font(.subheadline.weight(.semibold))
                 Text(detail)
-                    .font(.caption)
+                    .font(Tok.secondaryFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -192,7 +192,7 @@ struct FleetView: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             Text(server.state.summary)
-                .font(.caption)
+                .font(Tok.secondaryFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -225,16 +225,16 @@ struct FleetView: View {
                 )
             )
             .toggleStyle(.checkbox)
-            .font(.caption)
+            .font(Tok.secondaryFont)
             if let detail = loginItem.status.detail {
                 Text(detail)
-                    .font(.caption2)
+                    .font(Tok.detailFont)
                     .foregroundStyle(Tok.near)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let error = loginItem.lastError {
                 Text(error)
-                    .font(.caption2)
+                    .font(Tok.detailFont)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -348,10 +348,16 @@ struct AccountRow: View {
         VStack(alignment: .leading, spacing: Tok.rowLineSpacing) {
             HStack(spacing: Tok.tightSpacing) {
                 Text(account.name)
-                    .font(.system(.body, design: .rounded).weight(.medium))
-                    .foregroundStyle(account.disabled ? Tok.disabled : .primary)
+                    .font(Tok.bodyFont)
+                    .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(1)
+                    // Middle truncation eats the middle of an address, which is
+                    // exactly the part that distinguishes two accounts on the
+                    // same domain. Truncation hides content, so the full value
+                    // has to stay reachable somewhere.
                     .truncationMode(.middle)
+                    .help(account.name)
+                    .textSelection(.enabled)
                 Spacer(minLength: Tok.tightSpacing)
                 if account.disabled { pill("disabled", tint: Tok.disabled) }
                 // A never-probed account's `quotaState` is Rust's default, not a
