@@ -51,3 +51,7 @@ docs/plans/
 # ── OS cruft ─────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ── macOS app (TcrBar) build output ───────────────────────────
+apps/macos/.build/
+apps/macos/build/
