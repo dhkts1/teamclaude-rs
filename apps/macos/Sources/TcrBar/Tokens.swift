@@ -214,7 +214,6 @@ public enum Tok {
     public static let pillPaddingH: CGFloat = 6
     public static let pillPaddingV: CGFloat = 2
     public static let hairlineWidth: CGFloat = 0.5
-    public static let dotDiameter: CGFloat = 7
 
     // MARK: - Motion
     //
@@ -317,19 +316,6 @@ public struct StatusPill: View {
     }
 }
 
-/// A small status dot, for where a pill would be too heavy.
-public struct StatusDot: View {
-    private let tint: Color
-
-    public init(tint: Color) { self.tint = tint }
-
-    public var body: some View {
-        Circle()
-            .fill(tint)
-            .frame(width: Tok.dotDiameter, height: Tok.dotDiameter)
-    }
-}
-
 /// A 0.5pt hairline. `Divider()` picks up the system separator, which no longer
 /// matches this palette's ramp.
 public struct Hairline: View {
@@ -338,12 +324,5 @@ public struct Hairline: View {
         Rectangle()
             .fill(Tok.hairline)
             .frame(height: Tok.hairlineWidth)
-    }
-}
-
-extension View {
-    /// A raised container: the surface rows and cards sit on.
-    public func raisedSurface(radius: CGFloat = Tok.radiusMedium) -> some View {
-        background(RoundedRectangle(cornerRadius: radius).fill(Tok.raised))
     }
 }

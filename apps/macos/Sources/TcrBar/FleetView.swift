@@ -26,9 +26,9 @@ struct FleetView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
             header
-            Divider().overlay(Tok.hairline)
+            Hairline()
             content
-            Divider().overlay(Tok.hairline)
+            Hairline()
             footer
         }
         .padding(Tok.gutter)
@@ -250,7 +250,7 @@ struct FleetView: View {
     /// the hand is already in.
     private var dangerZone: some View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-            Divider().overlay(Tok.hairline)
+            Hairline()
             HStack {
                 Spacer()
                 Button("Take over port…") { confirmTakeover() }
@@ -344,7 +344,39 @@ struct AccountRow: View {
         account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
     }
 
+    /// One utterance for the whole row.
+    ///
+    /// Without this, VoiceOver walks roughly eight separate elements per account
+    /// — name, pills, bar, two percentage runs, status, countdown — which is
+    /// about a hundred stops to traverse thirteen accounts. The toggle stays
+    /// OUTSIDE the combined element so it remains separately focusable and
+    /// actionable.
+    private var rowAccessibilityLabel: String {
+        var parts = [account.name]
+        if account.disabled { parts.append("disabled") }
+        parts.append(
+            account.hasQuotaEvidence
+                ? "\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used"
+                : "never probed, quota unknown"
+        )
+        if let hold = account.soonestHold { parts.append(hold.countdownLabel) }
+        if let failure = accounts.failure(for: account.name) {
+            parts.append("last action failed: \(failure.summary)")
+        }
+        return parts.joined(separator: ", ")
+    }
+
     var body: some View {
+        HStack(alignment: .top, spacing: Tok.tightSpacing) {
+            information
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(rowAccessibilityLabel)
+            toggleButton
+        }
+        .padding(.vertical, Tok.rowPaddingV)
+    }
+
+    private var information: some View {
         VStack(alignment: .leading, spacing: Tok.rowLineSpacing) {
             HStack(spacing: Tok.tightSpacing) {
                 Text(account.name)
@@ -359,17 +391,16 @@ struct AccountRow: View {
                     .help(account.name)
                     .textSelection(.enabled)
                 Spacer(minLength: Tok.tightSpacing)
-                if account.disabled { pill("disabled", tint: Tok.disabled) }
+                if account.disabled { StatusPill("disabled", tint: Tok.disabled) }
                 // A never-probed account's `quotaState` is Rust's default, not a
                 // reading. Printing `ok` on it would be the panel asserting
                 // something nothing has ever checked.
                 if account.hasQuotaEvidence {
-                    pill(account.quotaState.token, tint: quotaTint)
+                    StatusPill(account.quotaState.token, tint: quotaTint)
                 } else {
-                    pill("unmeasured", tint: quotaTint)
+                    StatusPill("unmeasured", tint: quotaTint)
                         .help("Never probed — this account's quota is unknown, not zero.")
                 }
-                toggleButton
             }
             QuotaBar(fraction: account.quota, tint: quotaTint)
             HStack(spacing: Tok.tightSpacing) {
@@ -413,7 +444,6 @@ struct AccountRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .padding(.vertical, Tok.rowPaddingV)
     }
 
     /// `tcr enable <name>` / `tcr disable <name>`, keyed off the account's own
@@ -421,7 +451,12 @@ struct AccountRow: View {
     private var toggleButton: some View {
         let enabling = account.disabled
         let pending = accounts.isPending(account.name)
-        return Button(pending ? "…" : (enabling ? "Enable" : "Disable")) {
+        // A bare "…" names neither the action nor its progress, and a screen
+        // reader announces it as punctuation. The button is already disabled
+        // while in flight, so its label is the only signal anything is happening.
+        let verb = enabling ? "Enable" : "Disable"
+        let title = pending ? (enabling ? "Enabling…" : "Disabling…") : verb
+        return Button(title) {
             Task {
                 if await accounts.setEnabled(enabling, account: account.name) {
                     await onChanged()
@@ -431,6 +466,10 @@ struct AccountRow: View {
         .buttonStyle(.borderless)
         .font(Tok.detailFont)
         .disabled(pending)
+        // Thirteen rows otherwise render thirteen controls whose entire
+        // accessible name is "Disable", with nothing to say which account is
+        // about to leave rotation. `.help` is a tooltip, not an accessible name.
+        .accessibilityLabel("\(verb) \(account.name)")
         .help(
             enabling
                 ? "Run `tcr enable` for this account and re-read the fleet."
@@ -449,14 +488,6 @@ struct AccountRow: View {
         "\(Int((value * 100).rounded()))%"
     }
 
-    private func pill(_ text: String, tint: Color) -> some View {
-        Text(text)
-            .font(Tok.pillFont)
-            .padding(.horizontal, Tok.pillPaddingH)
-            .padding(.vertical, Tok.pillPaddingV)
-            .background(tint.opacity(0.18), in: RoundedRectangle(cornerRadius: Tok.pillRadius))
-            .foregroundStyle(tint)
-    }
 }
 
 /// A clamped quota bar. Over-100% clamps visually but the numeric label beside it
@@ -473,6 +504,23 @@ struct QuotaBar: View {
     let fraction: Double?
     let tint: Color
 
+    /// Honour the system Reduce Motion setting. SwiftUI does not suppress an
+    /// explicit `.animation` for you.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// What assistive technology hears.
+    ///
+    /// Without this the bar is a nameless graphic, so the panel's single most
+    /// important number is invisible to VoiceOver — and worse, the nil-vs-zero
+    /// distinction that the decoder, `readyCount` and the pill all take care to
+    /// preserve would survive only as a dashed outline. "Never measured" and
+    /// "exhausted" would be identical again, which is the exact defect the
+    /// optional model exists to prevent.
+    private var spokenValue: String {
+        guard let fraction else { return "not measured" }
+        return "\(Int((fraction * 100).rounded())) percent used"
+    }
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
@@ -488,5 +536,9 @@ struct QuotaBar: View {
             }
         }
         .frame(height: Tok.barHeight)
+        .animation(reduceMotion ? nil : Tok.standardAnimation, value: fraction)
+        .accessibilityElement()
+        .accessibilityLabel("Quota")
+        .accessibilityValue(spokenValue)
     }
 }
