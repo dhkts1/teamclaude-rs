@@ -143,7 +143,7 @@ struct FleetView: View {
             }
             ScrollView {
                 VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-                    ForEach(fleet.accounts.sorted(by: { $0.priority < $1.priority })) { account in
+                    ForEach(fleet.rowsInDisplayOrder) { account in
                         AccountRow(
                             account: account,
                             countersAreStructural: fleet.source.countersAreStructural,

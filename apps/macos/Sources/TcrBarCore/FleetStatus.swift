@@ -367,6 +367,28 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return quotaState.severity + 1
     }
 
+    /// Row order for the panel: what can serve you, first.
+    ///
+    /// Deliberately NOT ``severity``. That key answers "which single account is the
+    /// worst news" for a glyph, and it collides here — `disabled` returns 1 and an
+    /// `ok` account returns `quotaState.severity + 1`, which is also 1 — so sorting
+    /// rows by it would interleave parked accounts with healthy ones.
+    ///
+    /// The panel is read to answer "what can serve right now", so usable accounts
+    /// come first and the operator's own parked accounts sink to the bottom.
+    /// `unmeasured` sits below `near` because an unprobed account is not capacity,
+    /// and above `spent` because it is not known to be exhausted either.
+    public var displayOrder: Int {
+        if disabled { return 5 }
+        if !hasQuotaEvidence { return 3 }
+        switch quotaState {
+        case .ok: return 0
+        case .near: return 1
+        case .unknown: return 2
+        case .spent: return 4
+        }
+    }
+
     /// The window with the soonest reset, when the account is held.
     public var soonestHold: HeldWindow? {
         held.min(by: { $0.minutesUntilReset < $1.minutesUntilReset })
@@ -563,6 +585,20 @@ public struct Fleet: Equatable, Sendable {
     }
 
     public var enabledAccounts: [Account] { accounts.filter { !$0.disabled } }
+
+    /// The accounts in the order the panel lists them: usable first, parked last.
+    ///
+    /// Ties break on `priority` so rotation order is preserved *within* a group —
+    /// the grouping answers "can this serve me", the tiebreak keeps tcr's own
+    /// preference visible. `name` is the final tiebreak purely so the list cannot
+    /// reshuffle between two polls that carry identical data, which would read as
+    /// flicker.
+    public var rowsInDisplayOrder: [Account] {
+        accounts.sorted {
+            ($0.displayOrder, $0.priority, $0.name)
+                < ($1.displayOrder, $1.priority, $1.name)
+        }
+    }
 
     // MARK: Capacity summary
     //

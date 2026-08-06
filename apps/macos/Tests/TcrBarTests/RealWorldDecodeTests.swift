@@ -185,4 +185,34 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertEqual(hold.minutesUntilReset, 6498)
         XCTAssertEqual(hold.resetAtMs, 1_786_406_400_224)
     }
+
+    /// Rows are ordered by "can this serve me", not by rotation priority alone.
+    ///
+    /// The fixture is rewritten to give the DISABLED account the best priority,
+    /// because on the unmodified data both orderings happen to agree — asserting
+    /// against that would be a test that cannot fail. The final assertion pins the
+    /// discrimination itself: a priority-only sort really does lead with the parked
+    /// account.
+    func testParkedAccountSinksBelowUsableOnesWhateverItsPriority() throws {
+        let json = realWorldFixture.replacingOccurrences(
+            of: "\"priority\": 10",
+            with: "\"priority\": -1"
+        )
+        let fleet = try Fleet.decode(Data(json.utf8))
+
+        XCTAssertEqual(
+            fleet.accounts.first(where: \.disabled)?.priority, -1,
+            "precondition: the parked account holds the best priority"
+        )
+        XCTAssertEqual(
+            fleet.rowsInDisplayOrder.map(\.name),
+            ["alice@example.com", "carol@example.com", "bob@example.com"],
+            "usable first (ok, then near), parked last"
+        )
+        XCTAssertEqual(
+            fleet.accounts.sorted(by: { $0.priority < $1.priority }).first?.name,
+            "bob@example.com",
+            "control: the old priority-only sort would have led with the parked account"
+        )
+    }
 }
