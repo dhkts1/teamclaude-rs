@@ -183,6 +183,56 @@ final class StandDownExitCodeTests: XCTestCase {
             + "this_binary_dirty=false — the proxy on :3456 is running a DIFFERENT commit."
     }
 
+    /// The other half of a cross-language contract no compiler checks.
+    ///
+    /// These numbers are `EXIT_STOOD_DOWN_STALE` and
+    /// `EXIT_STOOD_DOWN_NOT_ANSWERING` in `src/main.rs`, and Rust's
+    /// `the_stand_down_exit_codes_are_the_numbers_tcrbar_switches_on` transcribes
+    /// them in the opposite direction. Both copies are needed, because each test
+    /// only catches a renumbering that starts on the *other* side: theirs pins
+    /// Rust against a copy of these values, so a change made here would leave it
+    /// green, and this one closes that direction.
+    ///
+    /// Renumbering is a one-character edit that every other test in either suite
+    /// survives, and the consequence is silent — TcrBar falls through to a bare
+    /// `.exited(5, …)` and reports a proxy serving NOTHING as a clean exit, which
+    /// is the misreport this whole round exists to eliminate.
+    ///
+    /// The numbers are SPELLED OUT rather than referenced through the constants.
+    /// `XCTAssertEqual(StandDownExit.stale, StandDownExit.stale)` compares a value
+    /// with itself and passes for every value of it — the constant is exactly the
+    /// thing that must not drift, so the test has to hold the other copy. This is
+    /// not hypothetical: a mutation earlier in this branch survived because an
+    /// assertion was written against the implementation instead of against an
+    /// independent statement of the expected value.
+    func testTheStandDownExitCodesAreTheNumbersTcrIsAsserting() {
+        XCTAssertEqual(
+            ServerController.StandDownExit.stale, 3,
+            "EXIT_STOOD_DOWN_STALE is 3 in src/main.rs — change one, change both"
+        )
+        XCTAssertEqual(
+            ServerController.StandDownExit.notAnswering, 4,
+            "EXIT_STOOD_DOWN_NOT_ANSWERING is 4 in src/main.rs — change one, change both"
+        )
+    }
+
+    /// The constants being right is worthless if the classifier does not act on
+    /// them, so the contract is asserted a second time through the function the
+    /// panel's text actually comes from, against the same literals rather than
+    /// through the constants.
+    func testTheLiteralCodesReachTheStatesTheyAreDefinedFor() {
+        guard case .incumbentIsStale = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 3, stderr: standDown
+        ) else {
+            return XCTFail("literal 3 must classify as a stale incumbent")
+        }
+        guard case .incumbentNotAnswering = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 4, stderr: standDown
+        ) else {
+            return XCTFail("literal 4 must classify as a wedged incumbent")
+        }
+    }
+
     func testASilentIncumbentIsNotReportedAsAlreadyRunning() {
         let state = ServerController.classifyExit(
             intent: .safeStart, exitCode: 4, stderr: silentIncumbent
