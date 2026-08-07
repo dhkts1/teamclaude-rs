@@ -73,17 +73,33 @@ pub fn find_repo_root() -> Option<PathBuf> {
     find_repo_root_from(&exe)
 }
 
-/// Walk UP from `start` to the first ancestor directory whose name ends in
-/// `.app` — the root of a macOS application bundle. `TcrBar.app` ships the CLI
-/// at `Contents/MacOS/tcr`, so a binary running from inside a bundle must be
-/// recognised as such rather than as a generic installed copy.
+/// Walk UP from `start` to the first ancestor directory that is a macOS
+/// application bundle. `TcrBar.app` ships the CLI at `Contents/MacOS/tcr`, so a
+/// binary running from inside a bundle must be recognised as such rather than
+/// as a generic installed copy.
+///
+/// The name suffix ALONE is not the test, and that is the point. A checkout
+/// living under a directory a human happened to name `myapp.app` matched the
+/// old suffix-only check, and because [`classify_install_from`] tries the
+/// bundle first, that false positive beat the `GitCheckout` classification that
+/// would have worked — `tcr update` refused to self-update a perfectly ordinary
+/// checkout. So the candidate must also actually CONTAIN `Contents/MacOS`,
+/// which is what makes a directory a bundle rather than a name that ends in
+/// `.app`.
+///
+/// Two smaller corrections in the same check: the suffix is compared
+/// case-insensitively, because HFS+/APFS are case-insensitive by default and
+/// `TcrBar.APP` is the same directory as `TcrBar.app` there; and the name is
+/// read with `to_string_lossy` rather than `to_str`, so a path component that
+/// is not valid UTF-8 anywhere above the binary no longer silently drops the
+/// whole ancestor out of consideration.
 pub fn find_app_bundle_from(start: &Path) -> Option<PathBuf> {
     for dir in start.ancestors() {
-        let is_bundle = dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".app") && n.len() > ".app".len());
-        if is_bundle {
+        let named_app = dir.file_name().is_some_and(|n| {
+            let n = n.to_string_lossy();
+            n.len() > ".app".len() && n.to_ascii_lowercase().ends_with(".app")
+        });
+        if named_app && dir.join("Contents").join("MacOS").is_dir() {
             return Some(dir.to_path_buf());
         }
     }
@@ -163,9 +179,22 @@ pub fn parse_target_directory(stdout: &str) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Absolute path of the release binary cargo just built in `root`. Errors are
-/// returned, never swallowed into a guessed path — an invented path is exactly
-/// the defect this function exists to remove.
+/// Absolute path of the release binary cargo just built in `root`.
+///
+/// What this DOES guarantee: the target directory is read from `cargo metadata`
+/// rather than assumed to be `<root>/target`, and a failure to obtain it is
+/// returned as an error instead of degrading into a hardcoded path.
+///
+/// What it does NOT guarantee: that the returned path exists. The final
+/// `release/tcr` is still joined by hand, and `cargo metadata` reports no
+/// target triple — so with `CARGO_BUILD_TARGET` set (or `[build] target` in a
+/// config file) cargo writes `<target-dir>/<triple>/release/tcr` and the path
+/// composed here is a file that is not there. Callers must therefore check for
+/// existence before presenting it as fact; [`update_checkout`] does.
+///
+/// Resolving that properly means reading the artifact path out of
+/// `cargo build --message-format=json`, which is a deliberate follow-up rather
+/// than part of this change.
 fn built_binary_path(root: &Path) -> anyhow::Result<PathBuf> {
     let output = Command::new("cargo")
         .args(cargo_metadata_argv())
@@ -206,14 +235,26 @@ pub fn run_update_with(kind: InstallKind, force: bool) -> anyhow::Result<()> {
             );
             Ok(())
         }
+        // Reinstall via `scripts/install-cli.sh`, NOT `cargo install --path`.
+        // The AppBundle arm above already refuses `cargo install` because it
+        // writes a third competing copy at ~/.cargo/bin/tcr; this arm used to
+        // recommend exactly that. README.md now installs with
+        // `scripts/install-cli.sh`, which writes a regular file, so every new
+        // user lands HERE — and was being routed straight into the artifact
+        // drift the installer exists to prevent. The installer resolves the
+        // build output from `cargo metadata`, refuses a stale binary, and
+        // renames it into place instead of rewriting a live inode.
         InstallKind::Installed => {
             println!(
                 "tcr was not run from a git checkout, so it can't self-update.\n\
                  Reinstall from the source tree:\n\
-                 \n    git -C <teamclaude-rs> pull --ff-only && cargo install --path <teamclaude-rs>\n\
-                 \n(or `cargo build --release` there and copy the built binary onto your PATH — \
-                 `cargo metadata --format-version 1 --no-deps` reports the target directory, which \
-                 CARGO_TARGET_DIR may move well outside the checkout)."
+                 \n    git -C <teamclaude-rs> pull --ff-only \\\n      \
+                 && cargo build --release --manifest-path <teamclaude-rs>/Cargo.toml \\\n      \
+                 && <teamclaude-rs>/scripts/install-cli.sh\n\
+                 \nDo NOT `cargo install --path` here: that writes ~/.cargo/bin/tcr, a copy \
+                 competing with whatever is already on your PATH. install-cli.sh reads the build \
+                 output location from `cargo metadata` (CARGO_TARGET_DIR may move it well outside \
+                 the checkout) and refuses to install a binary that does not match HEAD."
             );
             Ok(())
         }
@@ -281,7 +322,24 @@ fn update_checkout(root: &Path, force: bool) -> anyhow::Result<()> {
     }
 
     match built_binary_path(root) {
-        Ok(built) => println!("tcr: built {}", built.display()),
+        // The path is composed, not observed (see `built_binary_path`), so it
+        // is checked before it is announced. With a target triple configured
+        // cargo writes one directory deeper and this file does not exist;
+        // printing it anyway would name an artifact that is not there, which is
+        // the same lie as reporting a build that did not land.
+        Ok(built) if built.exists() => println!("tcr: built {}", built.display()),
+        Ok(built) => println!(
+            "tcr: the build succeeded, but the binary is not at {} — nothing is there.\n\
+             tcr: that is expected when a target triple is configured \
+             (CARGO_BUILD_TARGET, or `[build] target` in a cargo config): cargo then writes \
+             <target-dir>/<triple>/release/tcr. Look one level down from {}.",
+            built.display(),
+            built
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(root)
+                .display()
+        ),
         // The build itself succeeded, so this is not fatal — but we refuse to
         // print a guessed path. Say plainly that we don't know where it landed.
         Err(err) => eprintln!(
@@ -465,6 +523,63 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// False positive the suffix-only check produced: an ordinary checkout that
+    /// happens to live under a directory someone named `…app` is NOT a bundle,
+    /// and misclassifying it beat the `GitCheckout` answer that would have
+    /// worked (the bundle test runs first), so `tcr update` refused to update a
+    /// checkout it could perfectly well have pulled and rebuilt. What makes a
+    /// bundle is `Contents/MacOS`, not the name.
+    #[test]
+    fn checkout_under_an_app_named_directory_is_not_a_bundle() {
+        let base = scratch("app-named-parent");
+        let root = base.join("myapp.app").join("checkout");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\n").unwrap();
+        let exe = root.join("target").join("release").join("tcr");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"fake").unwrap();
+
+        assert_eq!(find_app_bundle_from(&exe), None);
+        assert_eq!(classify_install_from(&exe), InstallKind::GitCheckout(root));
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// False negative in the other direction: APFS and HFS+ are case-insensitive
+    /// by default, so `TcrBar.APP` names the same bundle as `TcrBar.app` and must
+    /// classify the same way.
+    #[test]
+    fn find_app_bundle_matches_the_suffix_case_insensitively() {
+        let root = scratch("bundle-uppercase");
+        let bundle = root.join("TcrBar.APP");
+        let exe = bundle.join("Contents").join("MacOS").join("tcr");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"fake").unwrap();
+
+        assert_eq!(
+            find_app_bundle_from(&exe).as_deref(),
+            Some(bundle.as_path())
+        );
+        assert_eq!(classify_install_from(&exe), InstallKind::AppBundle(bundle));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `.app` directory with no `Contents/MacOS` inside it is a name, not a
+    /// bundle — and with no checkout above it the honest answer is `Installed`.
+    #[test]
+    fn app_named_directory_without_contents_macos_is_not_a_bundle() {
+        let root = scratch("bundle-shell-only");
+        let exe = root.join("Empty.app").join("tcr");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, b"fake").unwrap();
+
+        assert_eq!(find_app_bundle_from(&exe), None);
+        assert_eq!(classify_install_from(&exe), InstallKind::Installed);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn run_update_app_bundle_notifies_without_spawning() {
         let kind = InstallKind::AppBundle(PathBuf::from("/Applications/TcrBar.app"));
@@ -523,6 +638,22 @@ mod tests {
         assert_eq!(
             cargo_metadata_argv(),
             ["metadata", "--format-version", "1", "--no-deps"]
+        );
+    }
+
+    /// The `Installed` arm tells the user to run `scripts/install-cli.sh`.
+    /// Naming a path that is not there is the same class of defect as printing
+    /// a built-binary path that does not exist, so the recommendation is
+    /// checked against the tree rather than trusted to stay true.
+    #[test]
+    fn the_recommended_installer_script_exists() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("install-cli.sh");
+        assert!(
+            script.is_file(),
+            "run_update_with(Installed) recommends {}, which does not exist",
+            script.display()
         );
     }
 

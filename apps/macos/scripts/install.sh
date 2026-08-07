@@ -41,8 +41,13 @@
 # the old bundle is moved aside first; if the second rename fails it is moved
 # back. The only gap is between those two renames, and it is recoverable.
 #
-# Everything staged is removed by an EXIT trap on every path, success or failure,
-# so a failed install never leaves an orphan bundle sitting in /Applications.
+# Everything staged is removed by an EXIT trap on every CATCHABLE path, success
+# or failure, so a failed install does not leave an orphan bundle sitting in
+# /Applications. "Catchable" is the honest word and the limit is real: INT, TERM
+# and HUP are trapped and turned into ordinary exits precisely so cleanup runs
+# (see the traps below), but SIGKILL and a power loss cannot be caught by any
+# shell, and either one between the two renames leaves a `.TcrBar.install.*`
+# directory behind. Removing it by hand is the recovery.
 #
 # Idempotent: safe to re-run. Uninstall with scripts/uninstall.sh.
 set -euo pipefail
@@ -67,11 +72,30 @@ BACKUP="$STAGE_DIR/${APP_NAME}.previous.app"
 # missing and the old bundle is still in the staging directory — put it back
 # before the staging directory is removed, or the cleanup would delete the only
 # copy of the app.
+#
+# It also has to speak up about the app it stopped. Once the running TcrBar is
+# pkill'd, any later failure restores the OLD bundle to disk but leaves nothing
+# running — and the script used to exit silently, so the user was left with a
+# vanished menu-bar item and no statement that it had been deliberately stopped.
+# Relaunching automatically would be wrong (a failed install may have left the
+# reason for the failure in place), so say it plainly instead.
+STOPPED_APP=0
 cleanup() {
+  rc=$?
   if [ ! -e "$DEST" ] && [ -d "$BACKUP" ]; then
     mv "$BACKUP" "$DEST" || true
   fi
   rm -rf "$STAGE_DIR"
+  if [ "$rc" -ne 0 ] && [ "$STOPPED_APP" = "1" ]; then
+    echo "" >&2
+    echo "NOTE: ${APP_NAME} was stopped before this failed, and was NOT restarted." >&2
+    if [ -e "$DEST" ]; then
+      echo "      The previous install is still at $DEST — relaunch it with:" >&2
+      echo "        open \"$DEST\"" >&2
+    else
+      echo "      Nothing is installed at $DEST — re-run this script once the build is fixed." >&2
+    fi
+  fi
 }
 trap cleanup EXIT
 # A shell killed by an UNCAUGHT signal does not run its EXIT trap — verified in
@@ -102,6 +126,7 @@ fi
 if pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
   echo "==> Stopping the running ${APP_NAME}…"
   pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" || true
+  STOPPED_APP=1
   # Give the supervised child, if any, a moment to be reaped cleanly.
   sleep 1
 fi
