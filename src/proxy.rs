@@ -848,6 +848,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // account that already failed it, in a loop. An account leaves this set the
     // moment it is re-admitted, so membership always means "currently parked".
     let mut parked_transient: HashSet<usize> = HashSet::new();
+    // Accounts already granted their ONE same-account transport retry in this
+    // request. The failing resource in a transport error is the CONNECTION, not
+    // the account: reqwest pools by `(scheme, authority)` and the account is only a
+    // Bearer header, so it is not in the pool key at all. Benching the account for
+    // the whole request therefore fails over on the wrong axis — and with a small
+    // eligible pool a single blip walks it to empty and answers a 502 (measured:
+    // 42 of 205 client-visible 502s fired at `transport_failures == 1`). A dead
+    // connection is evicted from the pool by the error itself, so the retry gets a
+    // fresh one. Bounded to one per account per request: the second failure IS
+    // evidence about the account, and `tried.insert` then behaves exactly as before.
+    let mut transport_retried: HashSet<usize> = HashSet::new();
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
@@ -1035,12 +1046,32 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // attribute it to; `is_connect` / `is_timeout` separate "never
                 // reached the host" from "the host went quiet mid-request".
                 transport_failures += 1;
+                // `?err`, NOT `%err`. reqwest's `Display` prints only its own top
+                // frame and never walks `source()`, so the h2 sub-kind
+                // (`SendRequest` / `Canceled` / `ChannelClosed`) and its reason code
+                // — the only things that say WHY the connection died — are
+                // structurally unreachable from a `%` rendering. `Debug` carries the
+                // whole chain. Do not "tidy" this back to `%err`.
+                if transport_retried.insert(idx) {
+                    // First blip on this account this request: retry it on a fresh
+                    // connection rather than benching an account that is probably fine.
+                    tracing::warn!(
+                        account_index = idx,
+                        account = account_name.as_deref().unwrap_or("?"),
+                        is_connect = err.is_connect(),
+                        is_timeout = err.is_timeout(),
+                        error = ?err,
+                        "upstream transport failure — retrying the SAME account on a fresh connection"
+                    );
+                    next_idx = Some(idx);
+                    continue;
+                }
                 tracing::warn!(
                     account_index = idx,
                     account = account_name.as_deref().unwrap_or("?"),
                     is_connect = err.is_connect(),
                     is_timeout = err.is_timeout(),
-                    error = %err,
+                    error = ?err,
                     "upstream transport failure — rotating to another account"
                 );
                 tried.insert(idx);
@@ -4703,12 +4734,21 @@ mod tests {
     /// over the SOFT threshold so normal `select` benches it while the
     /// revalidation-serve may still use it. Reaching `c` at all requires surviving
     /// the check the bool used to fail. Old code: 502. New code: `c` serves a 200.
+    ///
+    /// The script carries TWO blips because a transport failure now buys the same
+    /// account one retry on a fresh connection
+    /// (`transport_failure_retries_the_same_account_first`), so it takes two to
+    /// bench `a` and reach `b`. The scenario under test is unchanged — one account
+    /// transport-benched, one real upstream 429, one revalidation serve; only the
+    /// number of sends it takes to set it up moved. A single blip here would leave
+    /// `a` retried into the 429 slot and never exercise the revalidation ladder.
     #[tokio::test]
     async fn transport_blip_does_not_disable_recovery() {
         let up_addr = spawn_scripted_upstream(vec![
             None,                        // attempt 1 — `a` fails in transport
-            Some(raw_429_rejected(120)), // attempt 2 — `b` answers, durably 429
-            Some(raw_200()),             // attempt 3 — `c` serves via revalidation
+            None,                        // attempt 2 — `a`'s one retry fails too
+            Some(raw_429_rejected(120)), // attempt 3 — `b` answers, durably 429
+            Some(raw_200()),             // attempt 4 — `c` serves via revalidation
         ])
         .await;
         let manager = fleet(up_addr, &["a", "b", "c"]);
@@ -4776,6 +4816,103 @@ mod tests {
             total, 0,
             "a transport failure serves nothing, so nothing counts"
         );
+    }
+
+    /// A transport failure kills a CONNECTION, not an account — reqwest pools by
+    /// `(scheme, authority)` and the account is only a Bearer header, so it is not
+    /// in the pool key. Retrying the same account on a fresh connection is
+    /// therefore the failover on the RIGHT axis, and it keeps the account's warm
+    /// prompt cache instead of paying a cold prefix for a network blip.
+    ///
+    /// Same shape as `overloaded_529_retries_the_same_account`: the fleet is LRU,
+    /// so a fresh fleet picks `a` and any rotation picks `b`. Scripting blip-then-200
+    /// makes the two behaviours distinguishable in the stats — retry-in-place
+    /// credits `a`, the old bench-and-rotate credits `b`.
+    #[tokio::test]
+    async fn transport_failure_retries_the_same_account_first() {
+        let up_addr = spawn_scripted_upstream(vec![
+            None,            // attempt 1 — `a`'s connection dies
+            Some(raw_200()), // attempt 2 — the SAME account, fresh connection
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(status, 200, "the retry must serve the client");
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let served: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.requests > 0)
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            ["a"],
+            "a transport blip must retry the account it blipped on — landing on `b` \
+             means one dead connection benched a healthy account and threw away its \
+             warm prompt cache"
+        );
+    }
+
+    /// The other half of the bound: the retry is ONE per account per request. A
+    /// second failure is evidence about the account rather than the connection, so
+    /// it benches it and rotates exactly as before this arm existed.
+    ///
+    /// The attempt count is read from the upstream rather than inferred: exactly
+    /// three sends (`a`, `a` again, then `b`) — a fourth would mean the same-account
+    /// retry can repeat, which is how a blipping upstream would burn the whole
+    /// `max_attempts` budget on one account.
+    #[tokio::test]
+    async fn a_second_transport_failure_benches_the_account_and_rotates() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            None,            // attempt 1 — `a` blips
+            None,            // attempt 2 — `a`'s fresh connection blips too
+            Some(raw_200()), // attempt 3 — rotated to `b`
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(status, 200, "`b` still serves the request");
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        let served: Vec<&str> = snap
+            .accounts
+            .iter()
+            .filter(|a| a.requests > 0)
+            .map(|a| a.name.as_str())
+            .collect();
+        assert_eq!(
+            served,
+            ["b"],
+            "twice-failed `a` is benched for the rest of the request"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "one retry for `a`, then a rotation — not an unbounded same-account ladder"
+        );
+    }
+
+    /// The same-account transport retry doubles the sends a fleet can spend on
+    /// transport alone, so the rotation loop's budget has to cover it. Asserted
+    /// against [`max_attempts_for`] itself rather than a copy of the formula: a
+    /// budget narrowed to (say) `n + 4` would silently truncate the walk on any
+    /// fleet of 5+, and the request would stop early for a reason nothing logs.
+    #[test]
+    fn the_transport_retry_ladder_fits_the_attempt_budget() {
+        for accounts in 1..=16usize {
+            // Worst case: every account blips, is retried once, then benched.
+            let sends = accounts * 2;
+            assert!(
+                sends <= max_attempts_for(accounts),
+                "a {accounts}-account fleet can spend {sends} transport sends but the \
+                 loop allows only {} attempts",
+                max_attempts_for(accounts)
+            );
+        }
     }
 
     /// A 529 is transient upstream overload, so it is retried IN PLACE — the client

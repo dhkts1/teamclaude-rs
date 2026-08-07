@@ -256,6 +256,63 @@ impl Drift {
     }
 }
 
+/// The build half of the message printed when startup finds a healthy proxy
+/// already on the port and stands down instead of replacing it.
+///
+/// # Why this line has to exist
+///
+/// Standing down is the right default (a takeover costs every live session its
+/// prompt cache) but it creates a trap the old kill-the-incumbent behaviour did
+/// not have: `cargo build && tcr` used to GUARANTEE the new binary was serving.
+/// Now it exits 0 with the OLD build still serving, and an exit 0 with no
+/// complaint reads exactly like success — the "the fix is in the source" vs "the
+/// fix is in the process serving traffic" confusion this whole module exists to
+/// end, reintroduced by the default path. So the stand-down always says which
+/// build keeps serving, and warns when that is not the one just run.
+///
+/// `running` is the incumbent's own stamp, read best-effort from its status
+/// endpoint; `None` means it would not answer, which renders as
+/// `build-skew-unknown` and never as agreement. Pure, so the whole decision table
+/// is unit-testable without a server.
+pub fn stand_down_build_line(port: u16, ours: &BuildInfo, running: Option<&BuildInfo>) -> String {
+    let Some(running) = running else {
+        return format!(
+            "[tcr] note build-skew-unknown: this binary={} but the proxy on :{port} did not report \
+             its build — it may be serving older code. `tcr status` reports the running build; \
+             `tcr --replace` restarts the port onto this binary.",
+            ours.sha
+        );
+    };
+    let keys = format!(
+        "running={} this_binary={} built_dirty={} this_binary_dirty={}",
+        running.sha,
+        ours.sha,
+        running.dirty_str(),
+        ours.dirty_str()
+    );
+    if !is_comparable_sha(&running.sha) || !is_comparable_sha(&ours.sha) {
+        return format!(
+            "[tcr] note build-skew-unknown: {keys} — cannot tell whether the proxy on :{port} is \
+             running this binary's code. `tcr --replace` restarts the port onto this binary."
+        );
+    }
+    if !same_commit(&running.sha, &ours.sha) {
+        return format!(
+            "[tcr] WARNING stale-server: {keys} — the proxy on :{port} is NOT running this \
+             binary's code and will keep serving its own until it is restarted. \
+             `tcr --replace` takes the port over with this build."
+        );
+    }
+    if running.dirty.unwrap_or(false) || ours.dirty.unwrap_or(false) {
+        return format!(
+            "[tcr] note dirty-build: {keys} — the shas match but at least one side was compiled \
+             from an uncommitted tree, so this is not proof the proxy on :{port} is running this \
+             binary's code."
+        );
+    }
+    format!("[tcr] build in sync: {keys} — the proxy on :{port} is running this binary's commit.")
+}
+
 /// Two shas name the same commit when the shorter is a prefix of the longer.
 ///
 /// Not string equality: `--short` abbreviates to the shortest UNAMBIGUOUS
@@ -566,6 +623,82 @@ mod tests {
             compare(&default, &checkout("cd146ce", Some(false), None)),
             Skew::Indeterminate { .. }
         ));
+    }
+
+    /// THE TRAP THE STAND-DOWN DEFAULT CREATES. `cargo build && tcr` no longer
+    /// guarantees the new binary serves; if the line said nothing, exit 0 would
+    /// read as "my fix is live" while the old build kept serving. A different sha
+    /// must be LOUD, name both builds, and name the escape hatch.
+    #[test]
+    fn standing_down_on_a_different_build_warns_loudly() {
+        let line = stand_down_build_line(
+            3456,
+            &build("9f3a1b2", Some(false)),
+            Some(&build("cd146ce", Some(false))),
+        );
+        assert!(line.contains("stale-server"), "greppable token: {line}");
+        assert!(line.contains("running=cd146ce"), "names the server: {line}");
+        assert!(
+            line.contains("this_binary=9f3a1b2"),
+            "names this build: {line}"
+        );
+        assert!(line.contains("--replace"), "names the escape hatch: {line}");
+    }
+
+    /// The incumbent would not report its build. That is "cannot tell", never
+    /// agreement — and it still has to point at the two commands that resolve it.
+    #[test]
+    fn standing_down_with_no_answer_from_the_incumbent_says_so() {
+        let line = stand_down_build_line(3456, &build("9f3a1b2", Some(false)), None);
+        assert!(line.contains("build-skew-unknown"), "{line}");
+        assert!(
+            !line.contains("in sync"),
+            "an unanswered probe is not agreement: {line}"
+        );
+        assert!(line.contains("tcr status"), "{line}");
+        assert!(line.contains("--replace"), "{line}");
+    }
+
+    /// Matching shas, both clean: say so plainly. This is the ordinary case and it
+    /// must not carry a warning, or the warning stops being read.
+    #[test]
+    fn standing_down_on_the_same_build_is_quiet() {
+        let line = stand_down_build_line(
+            3456,
+            &build("cd146ce", Some(false)),
+            Some(&build("cd146ce", Some(false))),
+        );
+        assert!(line.contains("in sync"), "{line}");
+        assert!(!line.contains("WARNING"), "{line}");
+        assert!(!line.contains("stale-server"), "{line}");
+    }
+
+    /// A dirty build on either side: the shas match and the code still may not.
+    /// Noted, not claimed in sync — the same honesty [`compare`] applies.
+    #[test]
+    fn standing_down_never_claims_a_dirty_build_is_in_sync() {
+        for (ours, theirs) in [(Some(true), Some(false)), (Some(false), Some(true))] {
+            let line = stand_down_build_line(
+                3456,
+                &build("cd146ce", ours),
+                Some(&build("cd146ce", theirs)),
+            );
+            assert!(line.contains("dirty-build"), "{line}");
+            assert!(!line.contains("in sync"), "{line}");
+        }
+    }
+
+    /// An unknown sha from an old server degrades to "cannot tell" rather than
+    /// manufacturing a stale-server warning out of a missing field.
+    #[test]
+    fn standing_down_on_an_unknown_sha_is_indeterminate_not_stale() {
+        let line = stand_down_build_line(
+            3456,
+            &build("cd146ce", Some(false)),
+            Some(&BuildInfo::default()),
+        );
+        assert!(line.contains("build-skew-unknown"), "{line}");
+        assert!(!line.contains("stale-server"), "{line}");
     }
 
     /// The git plumbing against a REAL repository — the half no amount of pure

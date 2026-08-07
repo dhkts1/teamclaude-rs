@@ -17,12 +17,16 @@ never handles a token and never sends an `Authorization` header.
 
 ## The one safety property
 
-`tcr`'s port singleton is a *takeover*: by default a starting server kills a proxy
-already holding the port, which wipes the session→account pin map and costs every
-live session a full cold prompt-cache prefix.
+`tcr`'s port singleton can take the port over: a starting server may kill a proxy
+already holding it, which wipes the session→account pin map and costs every live
+session a full cold prompt-cache prefix. That kill is now behind an explicit
+`--replace`; the default is to stand down and exit without binding.
 
-TcrBar therefore always spawns `tcr server --no-replace`, and only ever signals a
-child **it** spawned. A server that was already running is displayed and left
+TcrBar therefore always spawns `tcr server --no-replace` on the routine path, and
+reaches for `--replace` only from "Take over port…", behind a confirmation. (The
+flag is redundant against a current `tcr`, where standing down is the default, and
+load-bearing against an older one, where omitting it meant takeover.) It only ever
+signals a child **it** spawned. A server that was already running is displayed and left
 alone — there is no code path that can terminate it. A spawn that declines because
 an incumbent holds the port is reported as "already running", which is a success.
 

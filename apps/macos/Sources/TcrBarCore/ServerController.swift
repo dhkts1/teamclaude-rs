@@ -5,23 +5,25 @@ import Foundation
 ///
 /// The safety property this type exists to hold:
 ///
-/// `tcr`'s port singleton is a *takeover* by default — a starting server kills a
-/// recognised proxy already holding the port, because two proxies mutually
-/// invalidate each other's single-use OAuth refresh tokens. That kill also wipes
+/// `tcr`'s port singleton resolves the port down to exactly one proxy, because
+/// two proxies mutually invalidate each other's single-use OAuth refresh tokens.
+/// It can resolve it either way — replace the incumbent, or stand down and exit
+/// without binding — and replacing is by far the more expensive: that kill wipes
 /// the session→account pin map, and Anthropic's prompt cache is per-account, so
 /// every live session pays a full cold prefix. It is the most expensive event in
 /// this system.
 ///
-/// So: the routine path *always* spawns with `--no-replace`, and this controller
-/// signals **only** a child it spawned itself. An incumbent server it merely
-/// observed is never touched, and failing to start because one already holds the
-/// port is reported as "already running" — a success, not an error.
+/// So `tcr`'s default is to stand down, and the kill lives behind an explicit
+/// `--replace` (`src/singleton.rs`). This controller signals **only** a child it
+/// spawned itself. An incumbent server it merely observed is never touched, and
+/// failing to start because one already holds the port is reported as "already
+/// running" — a success, not an error.
 ///
 /// There is one deliberate exception, `startTakingOverPort()`, and it is still
-/// not a signal: it spawns `tcr server` *without* `--no-replace` and lets `tcr`'s
-/// own singleton (`src/singleton.rs`) do the replacing, inside the code written
-/// to do it safely. This app never sends a signal to a pid it did not spawn, and
-/// there is deliberately no code path here that could.
+/// not a signal: it spawns `tcr server` *with* `--replace` and lets `tcr`'s own
+/// singleton do the replacing, inside the code written to do it safely. This app
+/// never sends a signal to a pid it did not spawn, and there is deliberately no
+/// code path here that could.
 @MainActor
 public final class ServerController: ObservableObject {
     public enum State: Equatable {
@@ -81,19 +83,23 @@ public final class ServerController: ObservableObject {
 
     /// The two — and only two — argument sets this app will ever spawn.
     ///
-    /// `safeArguments` is the default for every routine start. `--no-replace`
-    /// makes `tcr` refuse the port if another proxy already holds it, so an
-    /// accidental click cannot cost anything: the worst outcome is
-    /// `.incumbentHoldsPort`, which is a report, not damage.
+    /// `safeArguments` is the default for every routine start. It withholds
+    /// `--replace`, so `tcr` refuses the port if another proxy already holds it
+    /// and an accidental click cannot cost anything: the worst outcome is
+    /// `.incumbentHoldsPort`, which is a report, not damage. `--no-replace` is
+    /// kept in the list even though standing down is now `tcr`'s default — the
+    /// flag is still accepted (`src/main.rs:192`), and passing it means this app
+    /// stays safe against an older `tcr` on `PATH`, where omitting it meant
+    /// takeover.
     ///
-    /// `takeoverArguments` omits that flag, which is precisely what asks `tcr`'s
+    /// `takeoverArguments` adds `--replace`, which is precisely what asks `tcr`'s
     /// singleton to replace the incumbent. That kill happens inside `tcr`, never
     /// here. It is reachable only from `startTakingOverPort()`, behind an
     /// explicit confirmation, because it wipes the session→account pin map and
     /// costs every live session a cold prompt-cache prefix.
     /// `--headless` is not optional here, it is what makes the child survive.
     ///
-    /// Without it `tcr server` runs its ratatui TUI (`src/main.rs:590`, "the TUI
+    /// Without it `tcr server` runs its ratatui TUI (`src/main.rs:615`, "the TUI
     /// owns the foreground"), which calls `enable_raw_mode()?` on stdout
     /// (`src/tui.rs:47`). This app spawns with a `Pipe`, so there is no terminal,
     /// raw mode fails, the `?` propagates and the process exits immediately.
@@ -105,9 +111,12 @@ public final class ServerController: ObservableObject {
     /// proxy rather than a missing argument in its launcher.
     public nonisolated static let safeArguments = ["server", "--headless", "--no-replace"]
 
-    /// Deliberately omits `--no-replace`. See `safeArguments`. Keeps `--headless`
-    /// for the same reason every other spawn does.
-    public nonisolated static let takeoverArguments = ["server", "--headless"]
+    /// Deliberately carries `--replace`, and deliberately never `--no-replace` —
+    /// when both are passed `tcr` lets the safe one win (`src/main.rs:486`), so a
+    /// takeover set containing both would silently do nothing. See
+    /// `safeArguments`. Keeps `--headless` for the same reason every other spawn
+    /// does.
+    public nonisolated static let takeoverArguments = ["server", "--headless", "--replace"]
 
     /// The default argument set. Kept as a distinct name so existing call sites
     /// and tests read as "the safe one" rather than "the only one".
@@ -120,7 +129,7 @@ public final class ServerController: ObservableObject {
     /// Start a server that *replaces* whatever holds the port.
     ///
     /// The replacement is performed by `tcr` itself, as a consequence of the
-    /// missing `--no-replace`. No pid is signalled from Swift. Callers must have
+    /// `--replace` flag. No pid is signalled from Swift. Callers must have
     /// confirmed with the operator first — this is the most expensive action in
     /// the app.
     public func startTakingOverPort() {
@@ -202,15 +211,22 @@ public final class ServerController: ObservableObject {
         stop()
     }
 
-    /// Markers `tcr` prints when `--no-replace` keeps it from taking the port, or
-    /// when the subsequent bind fails because the incumbent is still there.
+    /// Markers `tcr` prints when it stands down rather than take the port, or when
+    /// the subsequent bind fails because the incumbent is still there.
     ///
-    /// The first two come from the `--no-replace` refusal at `src/singleton.rs:146`;
-    /// `failed to bind` is the anyhow context wrapping the listener at
-    /// `src/main.rs:505`. Those three are strings *this project* owns, so they only
-    /// move when someone edits those lines. `Address already in use` is the OS
-    /// strerror, kept because it can still surface in the anyhow cause chain — but
-    /// it is the runtime's wording, not ours, and is never relied on alone.
+    /// `another proxy holds` is the live one: it is `singleton::INCUMBENT_MARKER`,
+    /// a named constant on the Rust side precisely because this list is the only
+    /// thing reading it, across a language boundary no compiler checks. Note that
+    /// a stand-down now exits **0** — the marker, not the exit code, is what says
+    /// an incumbent is there, and `classifyExit` matches markers first for exactly
+    /// that reason. `--no-replace was set` is the wording an older `tcr` used for
+    /// the same refusal, kept so this app still reads a build that predates the
+    /// `--replace` flip. `failed to bind` is the anyhow context wrapping the
+    /// listener at `src/main.rs:571`. Those three are strings *this project* owns,
+    /// so they only move when someone edits those lines. `Address already in use`
+    /// is the OS strerror, kept because it can still surface in the anyhow cause
+    /// chain — but it is the runtime's wording, not ours, and is never relied on
+    /// alone.
     nonisolated static let incumbentMarkers = [
         "--no-replace was set",
         "another proxy holds",
@@ -222,10 +238,10 @@ public final class ServerController: ObservableObject {
     /// Why the spawn was made. The same stderr means opposite things on the two
     /// paths, so classification cannot be argument-blind.
     public enum Intent: Equatable, Sendable {
-        /// `--no-replace`. Finding an incumbent is the expected, benign outcome.
+        /// No `--replace`. Finding an incumbent is the expected, benign outcome.
         case safeStart
-        /// No `--no-replace`. The user explicitly asked to replace the incumbent,
-        /// so finding one still there means the request did NOT happen.
+        /// `--replace`. The user explicitly asked to replace the incumbent, so
+        /// finding one still there means the request did NOT happen.
         case takeover
     }
 
@@ -243,8 +259,8 @@ public final class ServerController: ObservableObject {
     ///
     /// The common cause is not transient, so the message says so rather than
     /// inviting a retry: `tcr`'s port singleton deliberately refuses to replace a
-    /// proxy hosted inside a `tcr run` process (`src/singleton.rs:27,52`, asserted
-    /// at `:192`), because killing it would kill the Claude session running
+    /// proxy hosted inside a `tcr run` process (`src/singleton.rs:38,62`, asserted
+    /// at `:257`), because killing it would kill the Claude session running
     /// through it. No number of clicks will change that outcome.
     public nonisolated static func classifyExit(
         intent: Intent = .safeStart,

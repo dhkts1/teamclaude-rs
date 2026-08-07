@@ -737,6 +737,19 @@ async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusE
     Ok(payload)
 }
 
+/// Best-effort read of the build the RUNNING proxy is executing.
+///
+/// For the startup stand-down path in `main`: when a healthy incumbent holds the
+/// port we exit instead of replacing it, and the user needs to know whether the
+/// build they just compiled is the one serving. `None` on ANY failure — no
+/// server, a rejected key, an older tcr with no status route — because this is a
+/// diagnostic on a path that is already exiting, never a dependency of startup.
+/// Bounded by [`fetch_live_status`]'s own 2s connect / 5s total timeouts, so it
+/// cannot hang.
+pub async fn live_server_build(config: &Config) -> Option<BuildInfo> {
+    fetch_live_status(config).await.ok().map(|p| p.build)
+}
+
 /// `tcr status [--json]` — render the fleet as greppable text or a JSON array,
 /// preferring the RUNNING proxy's own numbers.
 ///
