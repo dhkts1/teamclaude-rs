@@ -255,6 +255,31 @@ final class ReplaceFlagCapabilityTests: XCTestCase {
         }
     }
 
+    /// A probe that never answers must not disable the button forever. Before the
+    /// deadline, one unanswerable `--help` left `probing` true for the lifetime of
+    /// the app and every later click returned at the guard, in silence.
+    func testAProbeThatNeverAnswersFallsBackInsteadOfHanging() async {
+        let started = Date()
+        let support = await ServerController.support(within: 0.2) {
+            // Blocking and cancellation-deaf, exactly like the subprocess read it
+            // stands in for. A task-group race cannot abandon this.
+            Thread.sleep(forTimeInterval: 5)
+            return .unsupported
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(support, .supported, "a timed-out probe assumes the current flag")
+        XCTAssertLessThan(
+            elapsed, 2,
+            "the deadline did not fire after \(elapsed)s — the takeover would hang"
+        )
+    }
+
+    /// And a probe that does answer is still the one that decides.
+    func testAnAnsweringProbeIsNotOverriddenByTheDeadline() async {
+        let support = await ServerController.support(within: 30) { .unsupported }
+        XCTAssertEqual(support, .unsupported)
+    }
+
     /// Neither vintage may ever name a pid or a signal: the replacement happens
     /// inside `tcr`, never here.
     func testNeitherVintageNamesAProcess() {

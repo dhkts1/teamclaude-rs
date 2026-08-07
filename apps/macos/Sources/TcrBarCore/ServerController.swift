@@ -202,6 +202,47 @@ public final class ServerController: ObservableObject {
         return replaceFlagSupport(inHelpText: text)
     }
 
+    /// How long the capability probe may take before the takeover proceeds
+    /// without it. `--help` is a parse and a write; anything slower is not a slow
+    /// answer, it is no answer.
+    static let probeTimeout: Double = 5
+
+    /// Run a probe under a deadline, falling back to `.supported` when it does not
+    /// answer in time.
+    ///
+    /// Without this, one unanswerable `--help` disables the takeover button for
+    /// the lifetime of the app: `probing` would stay true forever and every later
+    /// click would return at the guard, silently. `TCR_BIN` and the defaults key
+    /// let an operator point `tcr` at an arbitrary executable, so "the binary
+    /// always answers" is not something this app gets to assume.
+    ///
+    /// The abandoned probe is not cancellable mid-read; it is simply no longer
+    /// waited on. It holds no port and signals nothing.
+    ///
+    /// Deliberately *not* a `withTaskGroup` race, which is the obvious shape and
+    /// does not work: a task group awaits every child before it returns, so
+    /// `cancelAll()` cannot abandon a subprocess read that ignores cancellation —
+    /// the group returns the timeout's answer only once the probe has finished
+    /// anyway, which is the hang it was supposed to prevent. The first version of
+    /// this function did exactly that and took 30 seconds to honour a 0.2-second
+    /// deadline. The probe therefore runs on a Dispatch queue, off the cooperative
+    /// pool entirely, and is waited on by a semaphore that has its own deadline.
+    static func support(
+        within seconds: Double,
+        probe: @escaping @Sendable () -> ReplaceFlagSupport
+    ) async -> ReplaceFlagSupport {
+        let answer = LockedSupport()
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            answer.value = probe()
+            finished.signal()
+        }
+        return await Task.detached(priority: .userInitiated) {
+            _ = finished.wait(timeout: .now() + seconds)
+            return answer.value ?? .supported
+        }.value
+    }
+
     /// The default argument set. Kept as a distinct name so existing call sites
     /// and tests read as "the safe one" rather than "the only one".
     public nonisolated static var serverArguments: [String] { safeArguments }
@@ -230,9 +271,9 @@ public final class ServerController: ObservableObject {
         case .success(let executable):
             probing = true
             Task { [weak self] in
-                let support = await Task.detached(priority: .userInitiated) {
+                let support = await Self.support(within: Self.probeTimeout) {
                     Self.probeReplaceFlagSupport(executable: executable)
-                }.value
+                }
                 guard let self else { return }
                 self.probing = false
                 guard self.child == nil else { return }
@@ -468,6 +509,26 @@ final class ChildStderr: @unchecked Sendable {
             buffer.append(text)
         }
         return buffer.value
+    }
+}
+
+/// A capability answer written by a probe thread and read by whoever is still
+/// waiting when the deadline passes. `nil` means "no answer yet".
+final class LockedSupport: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: ServerController.ReplaceFlagSupport?
+
+    var value: ServerController.ReplaceFlagSupport? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storage
+        }
+        set {
+            lock.lock()
+            storage = newValue
+            lock.unlock()
+        }
     }
 }
 
