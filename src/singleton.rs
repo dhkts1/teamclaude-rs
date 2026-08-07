@@ -201,11 +201,19 @@ pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
 
 /// Which of the recognized incumbents this run will actually signal.
 ///
-/// With `--replace`, all of them. Without it, only the legacy JS proxy — the
-/// pairing of [`takeover_decision`]'s `Proceed` with the kill loop, kept as one
-/// pure function so "we proceeded" and "we killed exactly the JS incumbents"
-/// cannot drift apart.
+/// Gated on [`takeover_decision`] rather than reimplementing its reasoning, so
+/// "we proceeded" and "we signalled exactly these" cannot drift apart: a
+/// stand-down signals NOTHING, including a legacy JS proxy sharing the port with
+/// the `tcr` peer we are standing down for. Half-killing there would leave the
+/// port held by the survivor and this process refusing to bind anyway — all cost,
+/// no benefit.
+///
+/// Past that gate: with `--replace`, every incumbent. Without it, only the legacy
+/// JS proxy, which is the one case that reaches `Proceed` unasked.
 fn incumbents_to_signal(replaceable: &[Incumbent], replace: bool) -> Vec<Incumbent> {
+    if takeover_decision(replaceable, replace) != Takeover::Proceed {
+        return Vec::new();
+    }
     replaceable
         .iter()
         .copied()

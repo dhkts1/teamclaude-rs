@@ -4943,23 +4943,126 @@ mod tests {
         );
     }
 
-    /// The same-account transport retry doubles the sends a fleet can spend on
-    /// transport alone, so the rotation loop's budget has to cover it. Asserted
-    /// against [`max_attempts_for`] itself rather than a copy of the formula: a
-    /// budget narrowed to (say) `n + 4` would silently truncate the walk on any
-    /// fleet of 5+, and the request would stop early for a reason nothing logs.
+    /// A CONNECT failure is not retried on the same account.
+    ///
+    /// The retry exists because a pooled connection can die between requests: the
+    /// error itself evicts it, so the retry gets a fresh one and the account —
+    /// which was never the failing resource — keeps its warm prompt cache. None
+    /// of that holds when the connect itself failed: there was no pooled
+    /// connection, nothing was evicted, and the second send is the identical
+    /// operation. What it does buy is a second full `connect_timeout` (10s), and
+    /// on a blackholed route (no RST, no reply) that doubles every request's
+    /// worst-case time-to-502 — ~80s to ~160s on an eight-account fleet — with a
+    /// per-account in-flight slot held for the whole of it.
+    ///
+    /// Read off the 502 the client actually receives, whose body carries the
+    /// attempt count: two accounts that each fail to connect ONCE is `2`, and the
+    /// retry firing here would make it `4`. An unreachable upstream is a dead
+    /// port — the one shape that produces `is_connect()` for real rather than by
+    /// simulation.
+    #[tokio::test]
+    async fn a_connect_failure_is_not_retried_on_the_same_account() {
+        // Bind then drop: the address is guaranteed to have been free, and now
+        // refuses. `spawn_counted_upstream`'s no-reply script cannot produce this
+        // — dropping an ACCEPTED socket is a mid-request error, not a connect one.
+        let dead = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let manager = fleet(dead, &["a", "b"]);
+
+        let (status, body) = post_one_with_body(manager).await;
+        assert_eq!(
+            status, 502,
+            "nothing reached an upstream, so the honest answer is a gateway error: {body}"
+        );
+        assert!(
+            body.contains("all 2 attempt(s)"),
+            "one connect attempt per account. `all 4 attempt(s)` means each was \
+             retried into a second connect timeout for no new information: {body}"
+        );
+    }
+
+    /// The MIXED ladder — a transport blip AND the 529 walk on one request — must
+    /// fit the rotation loop's budget.
+    ///
+    /// This replaces a guard that could not fail. The previous version asserted
+    /// `accounts * 2 <= max_attempts_for(accounts)` against a formula of
+    /// `2n + 4`, i.e. `2n <= 2n + 4`: true by construction for every input and
+    /// for every fleet size, so it passed unchanged through the very change it
+    /// was written to guard. A gate that cannot go red is not a gate.
+    ///
+    /// The ladder below is derived from the LADDER constants instead, so it is
+    /// an independent claim about the loop and not a restatement of the budget:
+    ///
+    /// * Each of the (up to `1 + MAX_529_FAILOVERS_PER_REQUEST`) accounts on the
+    ///   529 walk can spend `1` send, `1` transport retry, and
+    ///   `MAX_SAME_ACCOUNT_529_RETRIES` in-place retries before it fails over.
+    /// * Every remaining account in the fleet is still reachable by the plain
+    ///   transport ladder, at `1` send plus `1` retry each.
+    ///
+    /// Under the old `2n + 4` this is false from three accounts up (12 sends
+    /// against a budget of 10) — which is the truncation
+    /// [`the_mixed_ladder_forwards_the_real_529_instead_of_synthesizing_a_429`]
+    /// shows a client actually receiving.
     #[test]
-    fn the_transport_retry_ladder_fits_the_attempt_budget() {
+    fn the_mixed_transport_and_529_ladder_fits_the_attempt_budget() {
+        let walked = 1 + MAX_529_FAILOVERS_PER_REQUEST as usize;
         for accounts in 1..=16usize {
-            // Worst case: every account blips, is retried once, then benched.
-            let sends = accounts * 2;
+            let on_the_529_walk = accounts.min(walked);
+            let sends = on_the_529_walk * (2 + MAX_SAME_ACCOUNT_529_RETRIES as usize)
+                + (accounts - on_the_529_walk) * 2;
             assert!(
                 sends <= max_attempts_for(accounts),
-                "a {accounts}-account fleet can spend {sends} transport sends but the \
-                 loop allows only {} attempts",
+                "a {accounts}-account fleet can spend {sends} sends on a blip-plus-529 \
+                 ladder but the loop allows only {} attempts — the walk is truncated \
+                 mid-request and the client gets a synthesized 429",
                 max_attempts_for(accounts)
             );
         }
+    }
+
+    /// THE CLIENT-VISIBLE CONSEQUENCE of the budget above, end to end through
+    /// `handle`: a fleet where every account blips once and is then overloaded.
+    ///
+    /// Each account spends 4 sends (blip, retry, then the two in-place 529
+    /// backoffs) before failing over, so the full three-account walk is 12 —
+    /// against the old budget of `2*3 + 4 = 10`. Truncated, the loop falls out
+    /// mid-walk, `every_attempt_transport_failed` is false because upstreams did
+    /// respond, and the client is handed `exhausted_response`: HTTP 429 "All 3
+    /// accounts exhausted" with a FABRICATED retry-after, for a request whose
+    /// honest answer is the upstream's own 529. The status is the assertion; the
+    /// attempt count is what proves the whole mixed ladder actually ran rather
+    /// than the test having accidentally taken a shorter path to the same code.
+    #[tokio::test]
+    async fn the_mixed_ladder_forwards_the_real_529_instead_of_synthesizing_a_429() {
+        let blip_then_overloaded = || vec![None, Some(raw_529()), Some(raw_529()), Some(raw_529())];
+        let script: Vec<Option<String>> = (0..3).flat_map(|_| blip_then_overloaded()).collect();
+        assert_eq!(
+            script.len(),
+            12,
+            "three accounts of blip + a full 529 ladder"
+        );
+
+        let (up_addr, attempts) = spawn_counted_upstream(script).await;
+        let manager = fleet(up_addr, &["a", "b", "c"]);
+
+        let (status, body) = post_one_with_body(manager).await;
+        assert_eq!(
+            status, 529,
+            "the upstream's own 529 must reach the client, not a 429 we invented \
+             because the loop ran out of attempts: {body}"
+        );
+        assert!(
+            !body.contains("exhausted"),
+            "a synthesized exhaustion body means the walk was truncated: {body}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            12,
+            "every rung of the mixed ladder has to have been walked — a smaller \
+             number means the request stopped early and the 529 above was luck"
+        );
     }
 
     /// A 529 is transient upstream overload, so it is retried IN PLACE — the client

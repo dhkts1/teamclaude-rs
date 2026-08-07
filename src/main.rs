@@ -796,7 +796,6 @@ fn init_tracing(headless: bool) {
 mod tests {
     use super::*;
     use build_info::StandDownBuild;
-    use clap::Parser as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
     fn silent() -> cli::Liveness {
@@ -865,8 +864,11 @@ mod tests {
     /// by name instead.
     #[test]
     fn replace_and_no_replace_together_are_a_usage_error() {
-        let err = Cli::try_parse_from(["tcr", "server", "--replace", "--no-replace"])
-            .expect_err("the pair is a contradiction, not a precedence puzzle");
+        // `let Err(..) else`, not `expect_err`: the Ok side is `Cli`, which does
+        // not implement Debug (nor should it — it would print the config path).
+        let Err(err) = Cli::try_parse_from(["tcr", "server", "--replace", "--no-replace"]) else {
+            panic!("the pair is a contradiction, not a precedence puzzle — clap accepted it");
+        };
         assert_eq!(
             err.kind(),
             clap::error::ErrorKind::ArgumentConflict,
