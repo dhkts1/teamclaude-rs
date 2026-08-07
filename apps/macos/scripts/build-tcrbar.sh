@@ -40,48 +40,65 @@ fi
 # Cargo.toml -- two copies of one fact, kept in step by memory alone. And it
 # never moved, so every build of every commit claimed the same version.
 #
-# MAJOR.MINOR is read from Cargo.toml (the one place a human sets it); PATCH is
-# the commit count, which rises with every commit and therefore with every push.
-# That makes "bump the version before pushing" impossible to forget, because
-# there is nothing to bump.
+# The two plist version keys answer DIFFERENT questions, and conflating them
+# shipped two version numbers for one release.
+#
+# CFBundleShortVersionString is the MARKETING version -- what a human reads in
+# About, and what a release is called. It must equal the version the rest of the
+# project publishes: `tcr --version`, the Cargo.toml version, the git tag. It
+# used to be MAJOR.MINOR from Cargo.toml with the commit count glued on as PATCH,
+# so tagging v0.1.0 shipped an app calling itself 0.1.348 -- one release, two
+# numbers, and neither `tcr --version` nor the tag agreed with the app.
+#
+# CFBundleVersion is the BUILD number. It is the key macOS actually orders on,
+# it only has to increase, and it is nobody's marketing claim. The commit count
+# is exactly right for it, and it is already used for it below -- which is why
+# the auto-advancing property survives this change untouched: two builds of two
+# commits still differ, and still sort correctly.
+#
+# So: read the FULL version from Cargo.toml (the one place a human sets it) and
+# leave the commit count to CFBundleVersion.
 #
 # Deliberately NOT a pre-push hook: git resolves the refs to push before
 # pre-push runs, so a hook that edits a version file cannot get that edit into
 # the push it is running for. It would either leave the tree dirty with the bump
 # excluded, or commit a bump that ships one push late -- forever publishing N
 # while the tree reads N+1.
-base_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9]\{1,\}\.[0-9]\{1,\}\)\..*"/\1/p' "$repo_root/Cargo.toml" 2>/dev/null | head -1)"
-if [ -z "$base_version" ]; then
-  echo "WARNING: could not read version from Cargo.toml — falling back to 0.0" >&2
-  base_version="0.0"
+short_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9][^"]*\)".*/\1/p' "$repo_root/Cargo.toml" 2>/dev/null | head -1)"
+if [ -z "$short_version" ]; then
+  echo "ERROR: could not read version from Cargo.toml — refusing to build an app" >&2
+  echo "ERROR: whose marketing version disagrees with every other artifact." >&2
+  exit 1
 fi
 
 # A shallow clone must not be allowed to build a version.
 #
-# PATCH is `git rev-list --count HEAD`, which counts the commits the clone
-# actually HAS. In a `--depth 1` clone that is 1, so the build emits
-# CFBundleShortVersionString 0.1.1 and CFBundleVersion 1 — numerically LOWER
-# than anything a full clone produces. macOS reads a decreasing CFBundleVersion
-# as a downgrade: LaunchServices can keep preferring the older copy, and any
-# updater comparing versions concludes there is nothing to install. The build
-# would report success while silently shipping a version that goes backwards.
+# CFBundleVersion is `git rev-list --count HEAD`, which counts the commits the
+# clone actually HAS. In a `--depth 1` clone that is 1 — numerically LOWER than
+# anything a full clone produces. macOS reads a decreasing CFBundleVersion as a
+# downgrade: LaunchServices can keep preferring the older copy, and any updater
+# comparing versions concludes there is nothing to install. The build would
+# report success while silently shipping a version that goes backwards.
+#
+# This still bites after CFBundleShortVersionString was decoupled from the commit
+# count: the marketing version now comes from Cargo.toml and is shallow-safe, but
+# CFBundleVersion is the key macOS actually orders on, so a shallow build is still
+# a silent downgrade.
 #
 # There is no fix inside this scheme — the count is simply not available — so
 # this fails loudly and names the unshallow command rather than inventing a
 # different version format.
 if [ "$(git -C "$repo_root" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
   {
-    echo "ERROR: this is a SHALLOW clone, so the version cannot be derived."
-    echo "ERROR: PATCH is the commit count (git rev-list --count HEAD), which a"
-    echo "ERROR: shallow clone reports as $build_number — a version LOWER than any"
+    echo "ERROR: this is a SHALLOW clone, so the build number cannot be derived."
+    echo "ERROR: CFBundleVersion is the commit count (git rev-list --count HEAD),"
+    echo "ERROR: which a shallow clone reports as $build_number — LOWER than any"
     echo "ERROR: full-clone build. macOS treats a decreasing CFBundleVersion as a"
     echo "ERROR: downgrade, so the app would refuse to supersede an older copy."
     echo "ERROR: Fix:  git -C \"\$repo_root\" fetch --unshallow"
   } >&2
   exit 1
 fi
-
-short_version="$base_version.$build_number"
 
 echo "==> swift build -c release --product $app_name"
 swift build --package-path "$pkg_dir" -c release --product "$app_name"
