@@ -724,14 +724,97 @@ final class TcrToolTests: XCTestCase {
     }
 
     func testMissingToolReportsWhatItSearched() {
+        let bundle = URL(fileURLWithPath: "/nonexistent-bundle", isDirectory: true)
         let result = TcrTool.resolve(
             environment: ["PATH": "/nonexistent-dir"],
             defaults: UserDefaults(suiteName: "com.github.dhkts1.tcrbar.tests")!,
-            home: URL(fileURLWithPath: "/nonexistent-home", isDirectory: true)
+            home: URL(fileURLWithPath: "/nonexistent-home", isDirectory: true),
+            bundle: bundle
         )
         guard case .failure(let notFound) = result else {
             return XCTFail("no tcr should have been found under a fake PATH")
         }
         XCTAssertFalse(notFound.searched.isEmpty, "the error must name where it looked")
+        // The bundled candidate is a real place this looked, so a truthful
+        // "not found" has to name it too.
+        XCTAssertTrue(
+            notFound.searched.contains("/nonexistent-bundle/tcr"),
+            "the searched list must include the bundle candidate, got \(notFound.searched)"
+        )
+    }
+
+    /// Writes an executable `tcr` into a fresh temp directory and returns it.
+    private func makeToolDirectory() throws -> URL {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("tcrtool-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        let tool = dir.appendingPathComponent("tcr")
+        try "#!/bin/sh\nexit 0\n".write(to: tool, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tool.path)
+        return tool
+    }
+
+    private var scratchDefaults: UserDefaults {
+        let defaults = UserDefaults(suiteName: "com.github.dhkts1.tcrbar.tests")!
+        defaults.removeObject(forKey: TcrTool.overrideDefaultsKey)
+        return defaults
+    }
+
+    func testBundledBinaryBeatsPath() throws {
+        let bundled = try makeToolDirectory()
+        let onPath = try makeToolDirectory()
+        let result = TcrTool.resolve(
+            environment: ["PATH": onPath.deletingLastPathComponent().path],
+            defaults: scratchDefaults,
+            home: URL(fileURLWithPath: "/nonexistent-home", isDirectory: true),
+            bundle: bundled.deletingLastPathComponent()
+        )
+        guard case .success(let found) = result else {
+            return XCTFail("a tcr exists in both the bundle and on PATH, got \(result)")
+        }
+        XCTAssertEqual(
+            found.path, bundled.path,
+            "the bundled tcr must win over the one on PATH (\(onPath.path))"
+        )
+    }
+
+    func testEnvironmentOverrideBeatsBundledBinary() throws {
+        let bundled = try makeToolDirectory()
+        let override = try makeToolDirectory()
+        let result = TcrTool.resolve(
+            environment: [TcrTool.overrideEnvKey: override.path, "PATH": "/nonexistent-dir"],
+            defaults: scratchDefaults,
+            home: URL(fileURLWithPath: "/nonexistent-home", isDirectory: true),
+            bundle: bundled.deletingLastPathComponent()
+        )
+        guard case .success(let found) = result else {
+            return XCTFail("TCR_BIN names a real executable, got \(result)")
+        }
+        XCTAssertEqual(
+            found.path, override.path,
+            "an explicit TCR_BIN must still beat the bundled tcr (\(bundled.path))"
+        )
+    }
+
+    func testDefaultsOverrideBeatsBundledBinary() throws {
+        let bundled = try makeToolDirectory()
+        let override = try makeToolDirectory()
+        let defaults = scratchDefaults
+        defaults.set(override.path, forKey: TcrTool.overrideDefaultsKey)
+        defer { defaults.removeObject(forKey: TcrTool.overrideDefaultsKey) }
+        let result = TcrTool.resolve(
+            environment: ["PATH": "/nonexistent-dir"],
+            defaults: defaults,
+            home: URL(fileURLWithPath: "/nonexistent-home", isDirectory: true),
+            bundle: bundled.deletingLastPathComponent()
+        )
+        guard case .success(let found) = result else {
+            return XCTFail("the defaults key names a real executable, got \(result)")
+        }
+        XCTAssertEqual(
+            found.path, override.path,
+            "an explicit defaults override must still beat the bundled tcr (\(bundled.path))"
+        )
     }
 }

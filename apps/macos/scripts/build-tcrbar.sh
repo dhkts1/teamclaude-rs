@@ -13,21 +13,49 @@ repo_root="$(cd "$pkg_dir/../.." && pwd)"
 
 app_name="TcrBar"
 bundle_id="com.github.dhkts1.tcrbar"
-short_version="0.1.0"
 build_dir="$pkg_dir/build"
 app_dir="$build_dir/$app_name.app"
 macos_dir="$app_dir/Contents/MacOS"
 
 # Build stamp. A missing or unreadable .git must never fail the build.
+#
+# `--untracked-files=no` matches what `build.rs` uses for TCR_BUILD_DIRTY, and
+# for the same reason: an untracked file cannot reach a build unless some
+# TRACKED file starts referring to it. Counting untracked files made this stamp
+# call a clean tracked tree "dirty" whenever scratch scripts were lying around,
+# which is both wrong and exactly the kind of stamp nobody believes twice.
 git_sha="unknown"
 build_number="0"
 if git -C "$repo_root" rev-parse --git-dir >/dev/null 2>&1; then
   git_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
   build_number="$(git -C "$repo_root" rev-list --count HEAD 2>/dev/null || echo 0)"
-  if [ -n "$(git -C "$repo_root" status --porcelain 2>/dev/null)" ]; then
+  if [ -n "$(git -C "$repo_root" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
     git_sha="$git_sha-dirty"
   fi
 fi
+
+# The version is DERIVED, never written down here.
+#
+# It used to be a literal `0.1.0` in this script AND a literal `0.1.0` in
+# Cargo.toml -- two copies of one fact, kept in step by memory alone. And it
+# never moved, so every build of every commit claimed the same version.
+#
+# MAJOR.MINOR is read from Cargo.toml (the one place a human sets it); PATCH is
+# the commit count, which rises with every commit and therefore with every push.
+# That makes "bump the version before pushing" impossible to forget, because
+# there is nothing to bump.
+#
+# Deliberately NOT a pre-push hook: git resolves the refs to push before
+# pre-push runs, so a hook that edits a version file cannot get that edit into
+# the push it is running for. It would either leave the tree dirty with the bump
+# excluded, or commit a bump that ships one push late -- forever publishing N
+# while the tree reads N+1.
+base_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9]\{1,\}\.[0-9]\{1,\}\)\..*"/\1/p' "$repo_root/Cargo.toml" 2>/dev/null | head -1)"
+if [ -z "$base_version" ]; then
+  echo "WARNING: could not read version from Cargo.toml — falling back to 0.0" >&2
+  base_version="0.0"
+fi
+short_version="$base_version.$build_number"
 
 echo "==> swift build -c release --product $app_name"
 swift build --package-path "$pkg_dir" -c release --product "$app_name"
@@ -37,6 +65,48 @@ echo "==> assembling $app_dir"
 rm -rf "$app_dir"
 mkdir -p "$macos_dir"
 cp "$binary" "$macos_dir/$app_name"
+
+# Bundle the `tcr` server binary alongside the app.
+#
+# The app and the server ship as ONE artifact so they cannot drift: before this,
+# the two were built separately and TcrBar resolved `tcr` from `PATH`, which
+# drifted twice in a single day. `TcrTool.resolve()` probes
+# `Contents/MacOS/tcr` ahead of `PATH` for the same reason.
+#
+# The output path is READ OUT OF CARGO, never assumed to be `$repo_root/target`.
+# `CARGO_TARGET_DIR` redirects it, and assuming otherwise is not a hypothetical:
+# `.githooks/post-merge` announced `built <sha>` for a binary that had landed in
+# `$CARGO_TARGET_DIR` while the `target/release/tcr` a symlink actually resolved
+# to stayed at the old sha. A build that reports success from the wrong path is
+# worse than a failed one.
+echo "==> cargo build --release --bin tcr"
+cargo build --manifest-path "$repo_root/Cargo.toml" --release --bin tcr
+cargo_target_dir="$(cargo metadata --manifest-path "$repo_root/Cargo.toml" --no-deps --format-version 1 | jq -r .target_directory)"
+tcr_binary="$cargo_target_dir/release/tcr"
+if [ ! -x "$tcr_binary" ]; then
+  echo "ERROR: cargo reported target_directory=$cargo_target_dir but $tcr_binary is not executable." >&2
+  exit 1
+fi
+cp "$tcr_binary" "$macos_dir/tcr"
+chmod +x "$macos_dir/tcr"
+
+# Assert the COPY carries the sha we think we built.
+#
+# `build.rs` stamps `TCR_BUILD_SHA` into the binary, so the bundled file can be
+# asked what it is rather than trusted. A bundle holding a stale `tcr` is worse
+# than no bundle at all — the app would then confidently serve old code. The
+# expected value is the bare short sha; `$git_sha` may carry a `-dirty` suffix
+# that is not part of the stamp.
+expected_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ "$expected_sha" = "unknown" ]; then
+  echo "    tcr: bundled (no git sha to verify against)"
+elif grep -aq "$expected_sha" "$macos_dir/tcr"; then
+  echo "    tcr: bundled from $tcr_binary (sha $expected_sha)"
+else
+  echo "ERROR: $macos_dir/tcr does not carry the expected build sha $expected_sha." >&2
+  echo "ERROR: the bundled server would be a DIFFERENT build from this checkout." >&2
+  exit 1
+fi
 
 # The icon is DRAWN BY THE APP, not committed as a binary asset.
 #
@@ -127,12 +197,21 @@ for class in "Developer ID Application" "Apple Development"; do
   fi
 done
 
+# Nested Mach-O binaries are signed BEFORE the bundle that contains them.
+#
+# The outer signature seals the bundle's contents, so signing `Contents/MacOS/tcr`
+# afterwards would mutate a file the app's own seal covers and invalidate it.
+# `codesign -v --deep --strict` on the finished bundle is what proves the order
+# is right, and per the note above an invalid signature is not cosmetic: it
+# silently breaks "Launch at login" and every permission grant.
 if [ -n "$sign_identity" ]; then
   echo "==> codesign ($sign_tier)"
+  codesign -s "$sign_identity" --force "$macos_dir/tcr"
   codesign -s "$sign_identity" --force "$app_dir"
 else
   sign_tier="ad-hoc"
   echo "==> codesign (ad-hoc)"
+  codesign -s - --force "$macos_dir/tcr"
   codesign -s - --force "$app_dir"
   {
     echo

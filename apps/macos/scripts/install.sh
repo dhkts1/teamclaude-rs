@@ -16,6 +16,34 @@
 # /Applications is a stable path, so the login item survives rebuilds and the app
 # shows up in Spotlight and Launchpad like anything else.
 #
+# HOW THE INSTALL IS ORDERED, and that ordering is the point.
+#
+# The obvious `rm -rf "$DEST" && ditto "$SRC" "$DEST"` has two faults. For the
+# whole duration of the copy /Applications/TcrBar.app does not exist — Spotlight,
+# Launchpad, the login item and anyone double-clicking see nothing — and if the
+# copy fails you are left with no app at all and no way back. So instead:
+#
+#   stage → verify → stop the app → swap → drop the old copy
+#
+# The staged bundle is ditto'd to a temp directory inside /Applications (same
+# filesystem, which rename(2) requires) and code-signature-checked THERE. Only a
+# bundle that passed the check is ever moved over the good one; a failed build or
+# a broken signature aborts with the existing install untouched and still running.
+# Because the check now happens before the swap it is load-bearing, which the
+# old post-install `codesign -dv` printout never was.
+#
+# The swap is `mv` of directories, not a copy: rename(2) is atomic and the new
+# bundle arrives with fresh inodes. That keeps the property `rm -rf` + `ditto`
+# had and an in-place `cp -R` does not — nothing rewrites an executable another
+# process is exec'ing, which is what SIGKILLed running binaries with
+# `Code Signature Invalid` on 2026-08-06 (see scripts/install-cli.sh, same rule
+# applied to a single file). A directory rename cannot clobber a directory, so
+# the old bundle is moved aside first; if the second rename fails it is moved
+# back. The only gap is between those two renames, and it is recoverable.
+#
+# Everything staged is removed by an EXIT trap on every path, success or failure,
+# so a failed install never leaves an orphan bundle sitting in /Applications.
+#
 # Idempotent: safe to re-run. Uninstall with scripts/uninstall.sh.
 set -euo pipefail
 
@@ -29,8 +57,48 @@ bash "$MACOS_DIR/scripts/build-tcrbar.sh"
 
 [ -d "$SRC" ] || { echo "build produced no bundle at $SRC" >&2; exit 1; }
 
+# Staging directory lives beside the destination: rename(2) is only atomic within
+# one filesystem, and /tmp is frequently a different one.
+STAGE_DIR="$(mktemp -d "$(dirname "$DEST")/.${APP_NAME}.install.XXXXXX")"
+STAGE="$STAGE_DIR/${APP_NAME}.app"
+BACKUP="$STAGE_DIR/${APP_NAME}.previous.app"
+
+# Runs on every exit path. If we died between the two renames the destination is
+# missing and the old bundle is still in the staging directory — put it back
+# before the staging directory is removed, or the cleanup would delete the only
+# copy of the app.
+cleanup() {
+  if [ ! -e "$DEST" ] && [ -d "$BACKUP" ]; then
+    mv "$BACKUP" "$DEST" || true
+  fi
+  rm -rf "$STAGE_DIR"
+}
+trap cleanup EXIT
+# A shell killed by an UNCAUGHT signal does not run its EXIT trap — verified in
+# the sandbox gate, where a SIGTERM mid-ditto orphaned the staging directory.
+# Catching the signal turns it into an ordinary exit, which does run cleanup.
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+echo "==> Staging the new bundle…"
+# ditto, not cp -R: it preserves the bundle's resource forks, extended
+# attributes and the code signature. A cp -R can invalidate the signature.
+ditto "$SRC" "$STAGE"
+
+echo "==> Verifying the staged bundle…"
+# --deep --strict, because the inner Contents/MacOS/tcr is signed before the
+# bundle around it and only a deep check proves that order held (apps/macos/README.md).
+# This runs while the currently installed app is still in place: a failure here
+# aborts and leaves it exactly as it was.
+if ! codesign -v --deep --strict "$STAGE"; then
+  echo "staged bundle at $SRC failed code-signature verification — refusing to install" >&2
+  echo "the existing install at $DEST is untouched" >&2
+  exit 1
+fi
+
 # Stop only OUR app, and only the copy being replaced. `pkill -f TcrBar` would
-# also match an editor with the name in its title or a grep for it.
+# also match an editor with the name in its title or a grep for it. This happens
+# after verification so a bad build never costs you the running app.
 if pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
   echo "==> Stopping the running ${APP_NAME}…"
   pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" || true
@@ -39,17 +107,23 @@ if pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
 fi
 
 echo "==> Installing to ${DEST}…"
-# ditto, not cp -R: it preserves the bundle's resource forks, extended
-# attributes and the code signature. A cp -R can invalidate the signature.
-rm -rf "$DEST"
-ditto "$SRC" "$DEST"
+if [ -e "$DEST" ]; then
+  mv "$DEST" "$BACKUP"
+fi
+if ! mv "$STAGE" "$DEST"; then
+  echo "could not move the staged bundle into place — restoring the previous install" >&2
+  exit 1
+fi
+rm -rf "$BACKUP"
 
 # Re-register so LaunchServices knows about the new copy immediately rather than
 # whenever it next rescans.
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
   -f "$DEST" >/dev/null 2>&1 || true
 
-echo "==> Verifying the installed bundle…"
+# Informational only — the gate that can still save you already ran, above, on
+# the staged copy. This just shows what landed.
+echo "==> Installed signature…"
 codesign -dv "$DEST" 2>&1 | rg -i 'Identifier|Authority=Apple|Signature' | sed 's/^/    /' || true
 
 echo "==> Launching…"
