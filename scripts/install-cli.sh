@@ -34,19 +34,74 @@
 #      error -- and binary drift between the app and the CLI is back. Refusing is
 #      the only way that undoing is visible; TCR_INSTALL_FORCE=1 (or --force) is
 #      the deliberate override.
+#
+#   4. The source binary is checked against HEAD, not merely for existence.
+#      `build.rs` stamps TCR_BUILD_SHA into the binary, so the file can be asked
+#      which commit it came from. Without that check this script installed a
+#      six-commits-old artifact and printed "installed" with exit 0 — reporting
+#      success for a build it did not do, which is the one thing this whole
+#      family of scripts exists to stop. apps/macos/scripts/build-tcrbar.sh and
+#      .githooks/post-merge already grep for the same stamp; this now matches.
+#
+# KNOWN LIMIT: the symlink refusal in note 3 catches symlinks, not HARDLINKS. A
+# hardlinked destination is detected by its link count where `stat` supports it
+# (BSD and GNU are probed separately) and refused the same way, but on a system
+# with neither `stat` form the check is skipped with a warning rather than
+# silently passing — a hardlink shared with the app bundle would otherwise be
+# split into two drifting inodes with no error at all.
 set -euo pipefail
 
 FORCE="${TCR_INSTALL_FORCE:-0}"
 DEST=""
+DEST_SET=0
+
+usage() {
+  cat <<'USAGE'
+Install the release `tcr` binary onto PATH.
+
+Usage: scripts/install-cli.sh [--force] [destination]
+
+  destination   Full path to the installed FILE, not a directory.
+                Default: ~/.local/bin/tcr
+  --force       Install even when the destination is a symlink or hardlink, or
+                when the built binary does not match HEAD.
+                Equivalent to TCR_INSTALL_FORCE=1.
+  -h, --help    Show this message.
+USAGE
+}
+
+fail() { printf '!! %s\n' "$1" >&2; exit 1; }
+
+# Unknown flags and surplus positionals are refused rather than absorbed.
+# Previously every non-`--force` token became the destination, so `--help` was
+# treated as a path (and died inside `dirname` with `illegal option`), and
+# `install-cli.sh a b` silently installed to `b` while looking like it honoured
+# `a`. Both are the same defect: an argument the script did not understand,
+# accepted anyway.
 for arg in "$@"; do
   case "$arg" in
-    --force) FORCE=1 ;;
-    *)       DEST="$arg" ;;
+    --force)
+      FORCE=1
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    -*)
+      usage >&2
+      fail "unknown option: $arg"
+      ;;
+    *)
+      if [ "$DEST_SET" = "1" ]; then
+        usage >&2
+        fail "too many arguments -- one destination only (got '$DEST' and '$arg')"
+      fi
+      DEST="$arg"
+      DEST_SET=1
+      ;;
   esac
 done
 DEST="${DEST:-$HOME/.local/bin/tcr}"
-
-fail() { printf '!! %s\n' "$1" >&2; exit 1; }
 
 command -v cargo >/dev/null 2>&1 || fail "cargo not found on PATH"
 command -v jq    >/dev/null 2>&1 || fail "jq not found on PATH"
@@ -57,6 +112,32 @@ SRC="$TARGET_DIR/release/tcr"
 
 [ -f "$SRC" ] || fail "no release binary at $SRC -- build it first:  cargo build --release"
 [ -x "$SRC" ] || fail "$SRC is not executable"
+
+# See note 4 in the header. `-f` proves a file is THERE, never that it is the
+# one this checkout describes; a binary built six commits ago satisfies it just
+# as well. build.rs stamps the short sha as TCR_BUILD_SHA, so grep the artifact
+# and make it a fact. Same test, same stamp, as apps/macos/scripts/build-tcrbar.sh
+# and .githooks/post-merge.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+expected_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [ "$expected_sha" = "unknown" ]; then
+  echo "note: no git sha available -- cannot verify $SRC matches this checkout." >&2
+elif grep -aq "$expected_sha" "$SRC"; then
+  : # the built binary carries this checkout's sha
+elif [ "$FORCE" = "1" ]; then
+  echo "note: $SRC does not carry HEAD's sha $expected_sha -- installing anyway (--force)." >&2
+else
+  fail "$(printf '%s\n' \
+    "stale binary -- refusing to install" \
+    "  $SRC" \
+    "does not carry this checkout's build sha $expected_sha, so it was built from" \
+    "a DIFFERENT commit. Installing it would ship old code under a new version and" \
+    "every 'the fix is live' claim afterwards would be false." \
+    "Rebuild first:" \
+    "  cargo build --release" \
+    "then re-run this script. To install the stale binary on purpose:" \
+    "  scripts/install-cli.sh --force  (TCR_INSTALL_FORCE=1)")"
+fi
 
 # See note 3 in the header: `mv -f` replaces a symlink destination rather than
 # following it, so installing over the app-bundle symlink would quietly split the
@@ -72,6 +153,45 @@ if [ -L "$DEST" ] && [ "$FORCE" != "1" ]; then
     "  update the bundle:  apps/macos/scripts/install.sh" \
     "  or install elsewhere:  scripts/install-cli.sh /some/other/path/tcr" \
     "  or override on purpose:  scripts/install-cli.sh --force  (TCR_INSTALL_FORCE=1)")"
+fi
+
+# The destination is a FILE path. Given a directory, `mv -f "$TMP" "$DEST"`
+# succeeds by moving the temp file INTO it under its hidden `.tcr.install.XXXXXX`
+# name -- so `scripts/install-cli.sh ~/.local/bin` exited 0, printed "installed",
+# and left a 10MB dotfile nothing will ever exec. Refuse instead, and say what
+# the argument should have been.
+if [ -d "$DEST" ]; then
+  fail "$(printf '%s\n' \
+    "destination is a directory -- refusing to install" \
+    "  $DEST" \
+    "This argument is the full path of the installed FILE, not the directory to" \
+    "put it in. Moving into a directory would land the binary under the installer's" \
+    "own hidden temp name, which nothing on your PATH would ever find." \
+    "Did you mean:" \
+    "  scripts/install-cli.sh ${DEST%/}/tcr")"
+fi
+
+# See the KNOWN LIMIT note in the header: `-L` is blind to hardlinks, which
+# split a shared app/CLI inode just as silently (measured: nlink 2 -> 1, no
+# error). Link count is the only portable-ish signal; BSD and GNU `stat` spell
+# it differently, and a system with neither gets a warning rather than a pass.
+if [ -f "$DEST" ] && [ ! -L "$DEST" ] && [ "$FORCE" != "1" ]; then
+  dest_links="$(stat -f %l "$DEST" 2>/dev/null || stat -c %h "$DEST" 2>/dev/null || echo "")"
+  if [ -z "$dest_links" ]; then
+    echo "note: no usable \`stat\` -- cannot check whether $DEST is hardlinked." >&2
+  elif [ "$dest_links" -gt 1 ]; then
+    fail "$(printf '%s\n' \
+      "hardlinked destination ($dest_links links) -- refusing to install" \
+      "  $DEST" \
+      "It shares an inode with at least one other path, most likely the TcrBar.app" \
+      "copy documented in apps/macos/README.md. This installer renames a new file" \
+      "over the destination, which gives it a NEW inode and breaks that sharing" \
+      "silently -- the app and the CLI would drift apart from the next build on." \
+      "Instead:" \
+      "  update the bundle:  apps/macos/scripts/install.sh" \
+      "  or install elsewhere:  scripts/install-cli.sh /some/other/path/tcr" \
+      "  or override on purpose:  scripts/install-cli.sh --force  (TCR_INSTALL_FORCE=1)")"
+  fi
 fi
 
 DEST_DIR="$(dirname "$DEST")"

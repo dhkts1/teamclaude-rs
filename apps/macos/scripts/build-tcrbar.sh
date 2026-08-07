@@ -55,6 +55,32 @@ if [ -z "$base_version" ]; then
   echo "WARNING: could not read version from Cargo.toml — falling back to 0.0" >&2
   base_version="0.0"
 fi
+
+# A shallow clone must not be allowed to build a version.
+#
+# PATCH is `git rev-list --count HEAD`, which counts the commits the clone
+# actually HAS. In a `--depth 1` clone that is 1, so the build emits
+# CFBundleShortVersionString 0.1.1 and CFBundleVersion 1 — numerically LOWER
+# than anything a full clone produces. macOS reads a decreasing CFBundleVersion
+# as a downgrade: LaunchServices can keep preferring the older copy, and any
+# updater comparing versions concludes there is nothing to install. The build
+# would report success while silently shipping a version that goes backwards.
+#
+# There is no fix inside this scheme — the count is simply not available — so
+# this fails loudly and names the unshallow command rather than inventing a
+# different version format.
+if [ "$(git -C "$repo_root" rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+  {
+    echo "ERROR: this is a SHALLOW clone, so the version cannot be derived."
+    echo "ERROR: PATCH is the commit count (git rev-list --count HEAD), which a"
+    echo "ERROR: shallow clone reports as $build_number — a version LOWER than any"
+    echo "ERROR: full-clone build. macOS treats a decreasing CFBundleVersion as a"
+    echo "ERROR: downgrade, so the app would refuse to supersede an older copy."
+    echo "ERROR: Fix:  git -C \"\$repo_root\" fetch --unshallow"
+  } >&2
+  exit 1
+fi
+
 short_version="$base_version.$build_number"
 
 echo "==> swift build -c release --product $app_name"
