@@ -398,6 +398,10 @@ impl Manager {
                         // Re-pin the session (migration target, or the honoured/kept X)
                         // and refresh its last-touch for LRU eviction.
                         pins.insert(key, (committed, now_ms));
+                        // The map changed, so the on-disk copy is now behind. A
+                        // relaxed store under the lock: no allocation, no second
+                        // lock, nothing that can block the request path.
+                        self.mark_affinity_dirty();
                         return Some(committed);
                     }
                 }
@@ -459,6 +463,7 @@ impl Manager {
                 let mut pins = self.affinity.lock().expect("affinity lock poisoned");
                 let previous = pins.get(&key).map(|&(i, _)| i);
                 pins.insert(key, (pin_idx, now_ms));
+                self.mark_affinity_dirty();
                 // Bound the map by size + LRU-by-last-touch: once over AFFINITY_CAP, evict
                 // the single oldest-last-touch entry (not the one we just inserted). Stable
                 // pins survive reconnects, so this size cap — not a disconnect hook — is
@@ -698,6 +703,7 @@ impl Manager {
                 let mut pins = self.affinity.lock().expect("affinity lock poisoned");
                 let previous = pins.get(&key).map(|&(i, _)| i);
                 pins.insert(key, (pin_idx, now_ms));
+                self.mark_affinity_dirty();
                 previous
             };
             // Until now this arm emitted nothing, so a request served off-pin by the

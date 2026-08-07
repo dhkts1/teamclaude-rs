@@ -15,7 +15,7 @@ use std::sync::Arc;
 use teamclaude_rs::cli::{self, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::manager::Manager;
-use teamclaude_rs::{build_info, demo, mitm, oauth, singleton, tui, update};
+use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, singleton, tui, update};
 
 #[derive(Parser)]
 #[command(
@@ -569,6 +569,63 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     let manager = Manager::with_live_refresher(config, persist_path);
 
+    // Session-affinity pins survive a restart via their own cache file (NOT the
+    // credential config — see `teamclaude_rs::affinity`). Restore before the
+    // listener binds, so the first request after a bounce already routes on its
+    // old pin instead of cold-starting the account's prompt cache.
+    //
+    // Only when affinity is enabled: with the feature off the map is never
+    // consulted, and a restore would put entries in it that nothing reads.
+    let affinity_path = affinity::default_path();
+    if manager.session_affinity_enabled() {
+        let report = manager.restore_affinity(&affinity_path, affinity::PIN_TTL_MS);
+        if let Some(reason) = &report.degraded {
+            // Never fatal: the pin file is a cache, so an unusable one costs the
+            // warm start it would have bought and nothing else.
+            tracing::warn!(
+                path = %affinity_path.display(),
+                reason = %reason,
+                "session-affinity pins ignored; starting with an empty pin map"
+            );
+        } else {
+            tracing::info!(
+                path = %affinity_path.display(),
+                restored = report.pins.len(),
+                expired = report.expired,
+                unresolved = report.unresolved,
+                ambiguous = report.ambiguous,
+                ttl_minutes = affinity::PIN_TTL_MS / 60_000,
+                "session-affinity pins restored"
+            );
+        }
+
+        // Debounced incremental flush. Shutdown-only would miss the case this
+        // exists to survive: `--replace` follows SIGTERM with SIGKILL, and a
+        // SIGKILL runs no shutdown path at all. A 5-second timer that writes only
+        // when the map actually changed bounds the loss to one interval while
+        // keeping a busy proxy to at most one small atomic write per interval;
+        // pins settle early in a session, so steady state is no writes.
+        let flusher = manager.clone();
+        let flush_path = affinity_path.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(5));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if !flusher.take_affinity_dirty() {
+                    continue;
+                }
+                if let Err(err) = flusher.flush_affinity(&flush_path) {
+                    tracing::warn!(
+                        path = %flush_path.display(),
+                        error = %err,
+                        "could not write the session-affinity pin file; pins will not survive this restart"
+                    );
+                }
+            }
+        });
+    }
+
     // Background probe loop: refresh every account's quota on the configured
     // cadence (a value <= 0 in `quotaProbeSeconds` disables it). The first tick
     // fires immediately, so the bars populate at startup rather than after a lag.
@@ -718,6 +775,23 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // incrementally; this is the final belt-and-suspenders write).
     server.abort();
     manager.persist_now();
+    // Final pin flush on a CLEAN shutdown, capturing whatever changed inside the
+    // last flusher interval. Belt-and-braces only — the timer above is what makes
+    // the pins survive a SIGKILL, which is the case that actually matters.
+    if manager.session_affinity_enabled() {
+        match manager.flush_affinity(&affinity_path) {
+            Ok(count) => tracing::info!(
+                path = %affinity_path.display(),
+                pins = count,
+                "session-affinity pins written for the next boot"
+            ),
+            Err(err) => tracing::warn!(
+                path = %affinity_path.display(),
+                error = %err,
+                "final session-affinity pin write failed; pins will not survive this restart"
+            ),
+        }
+    }
     Ok(())
 }
 

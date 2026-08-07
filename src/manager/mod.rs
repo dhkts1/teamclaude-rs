@@ -38,6 +38,7 @@ use crate::stats::{
 };
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
+mod pins;
 mod probing;
 mod refresh;
 mod select;
@@ -466,6 +467,13 @@ pub struct Manager {
     /// held while the accounts lock is taken (read the pin, drop this lock, then do
     /// eligibility) so the two can never deadlock.
     affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    /// Set whenever `affinity` is mutated, cleared by the flusher task that
+    /// writes the map to disk (see [`Manager::mark_affinity_dirty`] and
+    /// [`crate::affinity`]). A relaxed atomic rather than a channel because the
+    /// setter sits on the request path and the reader is a 5-second timer: the
+    /// only ordering that matters is "a change eventually causes a write", and a
+    /// tick that observes the flag late simply writes on the next one.
+    affinity_dirty: AtomicBool,
     /// Per-session serving stats (session key → account/count/last-seen), for
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
@@ -650,6 +658,7 @@ impl Manager {
             current: Mutex::new(None),
             select_seq: AtomicU64::new(1),
             affinity: Mutex::new(HashMap::new()),
+            affinity_dirty: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
