@@ -38,7 +38,7 @@ so it's a drop-in on the same port.
 
 ```sh
 cargo build --release
-ln -sfn "$PWD/target/release/tcr" ~/.local/bin/tcr   # put `tcr` on PATH
+scripts/install-cli.sh          # put `tcr` on PATH (~/.local/bin/tcr by default)
 ```
 
 ## Configure
