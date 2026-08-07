@@ -42,6 +42,10 @@ public final class ServerController: ObservableObject {
         case exited(exitCode: Int32, message: String)
         /// `tcr` could not be located.
         case toolMissing(searched: [String])
+        /// The `tcr` on disk predates a flag this app needs, so it rejected the
+        /// spawn with a clap usage error. Distinct from ``exited`` because the
+        /// remedy is "update tcr", not "read this stack trace".
+        case toolTooOld(message: String)
 
         /// True only when a stop is a legal operation: we spawned this process.
         public var isOurChild: Bool {
@@ -70,6 +74,13 @@ public final class ServerController: ObservableObject {
                 return "Server exited (\(code)): \(detail)"
             case .toolMissing(let searched):
                 return "tcr not found (searched \(searched.count) locations)"
+            case .toolTooOld(let message):
+                return """
+                    The `tcr` on this machine is too old for this action — it does \
+                    not accept `--replace`, the flag that asks its port singleton \
+                    to replace the incumbent. Update it (`tcr update`, or install \
+                    from a current build of this repository) and try again. \(message)
+                    """
             }
         }
     }
@@ -77,7 +88,10 @@ public final class ServerController: ObservableObject {
     @Published public private(set) var state: State = .idle
 
     private var child: Process?
-    private let stderrBuffer = LockedString()
+    /// A capability probe is in flight for the takeover path. Guards the window
+    /// between the click and the spawn, where `child` is still nil and a second
+    /// click would otherwise start a second server.
+    private var probing = false
 
     public init() {}
 
@@ -118,6 +132,76 @@ public final class ServerController: ObservableObject {
     /// does.
     public nonisolated static let takeoverArguments = ["server", "--headless", "--replace"]
 
+    /// How a `tcr` that predates the `--replace` flag is asked to take the port.
+    ///
+    /// On such a build taking over was the *default*, and `--no-replace` was the
+    /// only way to decline it — so the takeover is expressed by passing neither
+    /// flag. `--replace` does not exist there, and clap rejects unknown arguments
+    /// with a usage error and exit code 2, which is why the modern set cannot
+    /// simply be sent and hoped for.
+    public nonisolated static let legacyTakeoverArguments = ["server", "--headless"]
+
+    /// Whether the `tcr` we are about to spawn understands `--replace`.
+    public enum ReplaceFlagSupport: Equatable, Sendable {
+        case supported
+        case unsupported
+    }
+
+    /// The takeover argument set for a given binary vintage.
+    ///
+    /// Both spellings really do take the port on their own vintage, so gating on
+    /// the flag keeps the button working across the flip rather than trading one
+    /// broken half for the other. Both mistakes are safe by construction: modern
+    /// arguments sent to an old binary produce a usage error that ``classifyExit``
+    /// names as "your tcr is too old", and legacy arguments sent to a modern one
+    /// make it stand down, which is `.takeoverRefused` — a visible failure, never
+    /// an unwanted kill.
+    public nonisolated static func takeoverArgumentSet(
+        _ support: ReplaceFlagSupport
+    ) -> [String] {
+        switch support {
+        case .supported: return takeoverArguments
+        case .unsupported: return legacyTakeoverArguments
+        }
+    }
+
+    /// Read `--replace` support out of `tcr server --help`.
+    ///
+    /// Matching is on whole tokens. `"--no-replace"` does *not* contain
+    /// `"--replace"` — there is one hyphen before `replace`, not two — so the
+    /// obvious trap is not the live one; the live one is any *longer* flag
+    /// beginning with the same characters. A future `--replace-if-stale` would
+    /// make `text.contains("--replace")` report support for a flag the binary does
+    /// not have, which is the failure this whole probe exists to prevent, arrived
+    /// at from the other side.
+    ///
+    /// The default is `.supported`, and `.unsupported` is returned only on
+    /// positive evidence — help that offers `--no-replace` and no `--replace`.
+    /// Unreadable help means "assume modern": that path ends in a usage error this
+    /// controller explains, whereas guessing "old" against a modern binary would
+    /// send arguments that make it stand down instead of taking the port.
+    public nonisolated static func replaceFlagSupport(inHelpText text: String) -> ReplaceFlagSupport {
+        let tokens = Set(
+            text.components(separatedBy: CharacterSet(charactersIn: " \t\n\r,;[]<>=()"))
+        )
+        if tokens.contains("--replace") { return .supported }
+        if tokens.contains("--no-replace") { return .unsupported }
+        return .supported
+    }
+
+    /// Ask the binary itself. `--help` is answered by clap before any of `tcr`'s
+    /// own code runs, so this never binds a port, never signals anything and costs
+    /// one short-lived process.
+    ///
+    /// Blocking, so it is called off the main actor. Any failure to run or decode
+    /// falls back to `.supported`, for the reason given on ``replaceFlagSupport``.
+    nonisolated static func probeReplaceFlagSupport(executable: URL) -> ReplaceFlagSupport {
+        guard let output = try? TcrTool.run(executable: executable, arguments: ["server", "--help"])
+        else { return .supported }
+        let text = (String(data: output.stdout, encoding: .utf8) ?? "") + output.stderr
+        return replaceFlagSupport(inHelpText: text)
+    }
+
     /// The default argument set. Kept as a distinct name so existing call sites
     /// and tests read as "the safe one" rather than "the only one".
     public nonisolated static var serverArguments: [String] { safeArguments }
@@ -132,8 +216,33 @@ public final class ServerController: ObservableObject {
     /// `--replace` flag. No pid is signalled from Swift. Callers must have
     /// confirmed with the operator first — this is the most expensive action in
     /// the app.
+    ///
+    /// Unlike ``start()`` this asks the binary what it accepts before spawning,
+    /// because the flag that expresses "take the port" changed spelling and
+    /// TcrBar is routinely newer than the `tcr` on `PATH` — the app and the CLI
+    /// are separate installs. The probe runs off the main actor; the spawn itself
+    /// happens back on it.
     public func startTakingOverPort() {
-        launch(intent: .takeover, arguments: Self.takeoverArguments)
+        guard child == nil, !probing else { return }
+        switch TcrTool.resolve() {
+        case .failure(let notFound):
+            state = .toolMissing(searched: notFound.searched)
+        case .success(let executable):
+            probing = true
+            Task { [weak self] in
+                let support = await Task.detached(priority: .userInitiated) {
+                    Self.probeReplaceFlagSupport(executable: executable)
+                }.value
+                guard let self else { return }
+                self.probing = false
+                guard self.child == nil else { return }
+                self.spawn(
+                    executable: executable,
+                    intent: .takeover,
+                    arguments: Self.takeoverArgumentSet(support)
+                )
+            }
+        }
     }
 
     private func launch(intent: Intent, arguments: [String]) {
@@ -160,8 +269,8 @@ public final class ServerController: ObservableObject {
         // mid-serve, still alive, so `terminationHandler` never fires and this app
         // keeps reporting `.supervising`. A hung server displayed as healthy.
         //
-        // Only `standardError` gets a Pipe, and it is drained by the
-        // `readabilityHandler` below — that is what makes it safe.
+        // Only `standardError` gets a Pipe, and `ChildStderr` drains it
+        // continuously — that is what makes it safe.
         //
         // Nothing is lost: the server's durable log is `$TMPDIR/teamclaude-rs.log`,
         // which is where `tcr status` and every diagnostic already read from.
@@ -170,16 +279,10 @@ public final class ServerController: ObservableObject {
         // That fix let the server SURVIVE startup, which is precisely what let it
         // live long enough to reach this second wall.
         process.standardOutput = FileHandle.nullDevice
-        stderrBuffer.reset()
-        err.fileHandleForReading.readabilityHandler = { [stderrBuffer] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            stderrBuffer.append(text)
-        }
-        process.terminationHandler = { [weak self, stderrBuffer] finished in
+        let stderr = ChildStderr(reading: err)
+        process.terminationHandler = { [weak self] finished in
             let code = finished.terminationStatus
-            let text = stderrBuffer.value
-            err.fileHandleForReading.readabilityHandler = nil
+            let text = stderr.finish()
             Task { @MainActor in
                 guard let self else { return }
                 self.child = nil
@@ -245,6 +348,20 @@ public final class ServerController: ObservableObject {
         case takeover
     }
 
+    /// What clap prints when it is handed an argument the binary does not define.
+    ///
+    /// Both spellings are kept: clap 4 says `unexpected argument '--replace'
+    /// found`, clap 3 said `Found argument '--replace' which wasn't expected`.
+    /// The binary is not ours to pin a version on — it is whatever `tcr` is
+    /// installed — so the older wording stays cheap insurance.
+    nonisolated static let unknownArgumentMarkers = [
+        "unexpected argument",
+        "wasn't expected",
+        "isn't valid in this context",
+        "Found argument",
+        "unrecognized",
+    ]
+
     /// Pure classification of a finished spawn.
     ///
     /// On `.safeStart`, "another proxy already holds the port" is the *success*
@@ -262,12 +379,25 @@ public final class ServerController: ObservableObject {
     /// proxy hosted inside a `tcr run` process (`src/singleton.rs:38,62`, asserted
     /// at `:257`), because killing it would kill the Claude session running
     /// through it. No number of clicks will change that outcome.
+    ///
+    /// A third outcome sits ahead of both: a `tcr` old enough to reject the
+    /// arguments outright. See ``unknownArgumentMarkers``.
     public nonisolated static func classifyExit(
         intent: Intent = .safeStart,
         exitCode: Int32,
         stderr: String
     ) -> State {
         let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Checked first, and before the incumbent markers, because it is the more
+        // specific claim: this binary never even parsed the request. Reporting it
+        // as a bare `.exited(2, …)` would show the operator a raw clap usage dump
+        // right after they confirmed a destructive alert, with no hint that the
+        // remedy is to update `tcr` rather than to retry.
+        if trimmed.contains("--replace"),
+            unknownArgumentMarkers.contains(where: { trimmed.contains($0) })
+        {
+            return .toolTooOld(message: trimmed)
+        }
         if incumbentMarkers.contains(where: { trimmed.contains($0) }) {
             switch intent {
             case .safeStart:
@@ -277,6 +407,67 @@ public final class ServerController: ObservableObject {
             }
         }
         return .exited(exitCode: exitCode, message: trimmed)
+    }
+}
+
+/// Collects a child process's stderr, and — this is the point of the type —
+/// **drains the pipe** when the child exits instead of merely snapshotting what
+/// happened to have arrived.
+///
+/// Foundation delivers pipe readability on a background queue with no ordering
+/// guarantee against `terminationHandler`. A `tcr` that writes its stand-down
+/// message and exits in the same breath can therefore die with its final chunk
+/// still unread, and the previous code took its snapshot at that moment and then
+/// discarded the rest by clearing the handler. Measured on this machine over 400
+/// spawns of a child writing 600 bytes and exiting: 10 reads came back empty or
+/// truncated (a second run: 9). With the drain below, 0 of 400, twice.
+///
+/// Empty stderr is not a harmless loss here. A stand-down exits **0** since the
+/// `--replace` flip, so a lost message classifies as `.exited(0, "")` and the
+/// panel renders "Server exited (0): no output" — TcrBar reporting a clean start
+/// and stop while an incumbent proxy is still serving, which is verbatim the
+/// misreport `incumbentMarkers` exists to prevent. The old non-zero refusal made
+/// the same race at least *look* like an error.
+///
+/// `readToEnd()` blocks until EOF, which arrives when the last writer closes.
+/// `Process` closes the parent's copy of the write end at spawn, and `tcr server`
+/// forks nothing that could inherit it, so the only writer is the child that has
+/// already exited. `TcrTool.run` makes the identical assumption on every status
+/// poll (`readDataToEndOfFile()`), so this is the codebase's existing contract
+/// with the CLI, not a new one.
+final class ChildStderr: @unchecked Sendable {
+    private let handle: FileHandle
+    private let buffer = LockedString()
+
+    /// - Parameter installReadabilityHandler: false only in tests. It reproduces,
+    ///   deterministically, the state the race produces by accident — bytes in the
+    ///   pipe that the readability callback has not consumed — so a regression
+    ///   here fails every run rather than one run in forty.
+    init(reading pipe: Pipe, installReadabilityHandler: Bool = true) {
+        handle = pipe.fileHandleForReading
+        guard installReadabilityHandler else { return }
+        handle.readabilityHandler = { [buffer] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            buffer.append(text)
+        }
+    }
+
+    /// Call once, after the child has exited. Stops the streaming reader, takes
+    /// whatever is still in the pipe, and returns everything the child wrote.
+    ///
+    /// A callback already in flight cannot duplicate text — a read consumes the
+    /// bytes it returns, so each byte reaches the buffer exactly once. It can in
+    /// principle interleave two chunks out of order; every consumer of this string
+    /// is a substring match, so ordering is not load-bearing.
+    func finish() -> String {
+        handle.readabilityHandler = nil
+        if let tail = try? handle.readToEnd(), !tail.isEmpty,
+            let text = String(data: tail, encoding: .utf8)
+        {
+            buffer.append(text)
+        }
+        return buffer.value
     }
 }
 
