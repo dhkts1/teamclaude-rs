@@ -91,6 +91,35 @@ if cargo build --release >"$log" 2>&1; then
   # stamps TCR_BUILD_SHA into the binary, so it costs one grep to make it a fact.
   if [ -f "$bin" ] && grep -aq "$sha" "$bin" 2>/dev/null; then
     echo "post-merge: built $sha -> $bin — a RUNNING tcr still serves the old binary; restart it when convenient." >&2
+
+    # Build it AND put it on PATH. Building alone was the drift source: every
+    # pull produced a fresh binary in the target dir while `~/.local/bin/tcr`
+    # kept whatever it had, so `tcr` on PATH silently fell further behind HEAD
+    # with each merge and the operator had no signal until something misbehaved.
+    #
+    # Safe against the class this repo cares about: install-cli.sh stages into
+    # the destination's own directory and finishes with rename(2), so a running
+    # `tcr` keeps its own inode and only the NEXT invocation picks up new code.
+    # That is the same reasoning as the note above about cargo and the server —
+    # replacing a path never disturbs a process already executing it. An
+    # in-place `cp` here would instead SIGKILL every subsequent exec with
+    # "Code Signature Invalid"; that is why this calls the script rather than
+    # copying, and why it must keep calling the script.
+    #
+    # The script re-verifies the sha itself and refuses a symlinked or directory
+    # destination, so a deliberate arrangement (e.g. ~/.local/bin/tcr pointed
+    # into TcrBar.app) is reported and left alone rather than silently clobbered.
+    #
+    # Never fails the hook: the merge has already happened, and a post-merge
+    # non-zero exit helps nobody. A refusal is printed, not swallowed.
+    if [ -x "$repo_root/scripts/install-cli.sh" ]; then
+      if install_out=$("$repo_root/scripts/install-cli.sh" 2>&1); then
+        echo "post-merge: installed $sha onto PATH." >&2
+      else
+        echo "post-merge: PATH install declined or failed — \`tcr\` on PATH is NOT $sha:" >&2
+        printf '%s\n' "$install_out" | sed 's/^/  /' >&2
+      fi
+    fi
   else
     echo "post-merge: built at $sha but $bin does not carry that sha — treat the on-disk binary as UNTRUSTED." >&2
   fi
