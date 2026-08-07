@@ -74,6 +74,11 @@ cleanup() {
   rm -rf "$STAGE_DIR"
 }
 trap cleanup EXIT
+# A shell killed by an UNCAUGHT signal does not run its EXIT trap — verified in
+# the sandbox gate, where a SIGTERM mid-ditto orphaned the staging directory.
+# Catching the signal turns it into an ordinary exit, which does run cleanup.
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 
 echo "==> Staging the new bundle…"
 # ditto, not cp -R: it preserves the bundle's resource forks, extended
