@@ -158,6 +158,28 @@ pub fn takeover_decision(replaceable: &[u32], replace: bool) -> Takeover {
     }
 }
 
+/// A marker phrase in [`stand_down_message`] that a SECOND codebase parses.
+///
+/// TcrBar (`apps/macos`) supervises a spawned `tcr server` by scanning its
+/// stderr: `ServerController.incumbentMarkers` turns a match into
+/// `.incumbentHoldsPort` (a benign report) or `.takeoverRefused` (the takeover
+/// did not happen), and a miss into a bare `.exited(0)` — which for a stand-down
+/// would render "the server exited cleanly" for a server that never bound.
+/// The phrase is load-bearing across a language boundary that no compiler
+/// checks, so it is a named constant with a test, not an inline literal.
+pub const INCUMBENT_MARKER: &str = "another proxy holds";
+
+/// What we print before standing down, as a pure function so the cross-language
+/// marker contract above is testable.
+fn stand_down_message(port: u16, pid: u32) -> String {
+    format!(
+        "[tcr] {INCUMBENT_MARKER} :{port} (pid {pid}) and it is healthy — leaving it alone and \
+         exiting without binding. Replacing it would wipe its session→account pin map and \
+         cold-start every live session's prompt cache, the most expensive event in this system. \
+         Pass --replace to take the port over anyway."
+    )
+}
+
 /// Resolve `port` down to one proxy for this server.
 ///
 /// With `replace`, a recognized proxy incumbent is terminated (SIGTERM, then
@@ -186,9 +208,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         // Only the pid and the instruction live here; `main` prints the build
         // comparison, because THAT is the part a user typing `tcr` after a rebuild
         // actually needs and it requires an async status read we must not do here.
-        eprintln!(
-            "[tcr] :{port} is already served by a tcr proxy (pid {pid}) — leaving it alone and exiting. Replacing it would wipe its session→account pin map and cold-start every live session's prompt cache. Pass --replace to take the port over anyway."
-        );
+        eprintln!("{}", stand_down_message(port, pid));
         return Takeover::IncumbentPresent(pid);
     }
 
@@ -293,6 +313,38 @@ mod tests {
     fn an_empty_port_always_proceeds() {
         assert_eq!(takeover_decision(&[], false), Takeover::Proceed);
         assert_eq!(takeover_decision(&[], true), Takeover::Proceed);
+    }
+
+    /// The stand-down message is read by TcrBar's `incumbentMarkers`, in another
+    /// language, with no compiler between the two. Dropping the phrase would make
+    /// a stand-down render in the menu-bar app as a clean `exited(0)` — "the
+    /// server started and stopped" for a server that never bound — and would turn
+    /// its takeover button into a silent no-op instead of a reported refusal.
+    #[test]
+    fn the_stand_down_message_carries_the_marker_tcrbar_greps_for() {
+        // The literal is SPELLED OUT rather than referenced through
+        // `INCUMBENT_MARKER`, deliberately. Asserting `message.contains(MARKER)`
+        // compares the constant with itself and passes for ANY value of it — the
+        // constant is exactly the thing that must not drift, so the test has to
+        // hold the other copy. This literal must equal the entry in
+        // `apps/macos/Sources/TcrBarCore/ServerController.swift`'s
+        // `incumbentMarkers`; nothing but this assertion couples them.
+        let tcrbar_greps_for = "another proxy holds";
+        assert_eq!(
+            INCUMBENT_MARKER, tcrbar_greps_for,
+            "the marker must stay the string TcrBar's incumbentMarkers list carries"
+        );
+        let message = stand_down_message(3456, 4242);
+        assert!(
+            message.contains(tcrbar_greps_for),
+            "apps/macos ServerController.incumbentMarkers greps for \
+             {tcrbar_greps_for:?}: {message}"
+        );
+        assert!(message.contains("4242"), "names the incumbent: {message}");
+        assert!(
+            message.contains("--replace"),
+            "names the override: {message}"
+        );
     }
 
     /// Several incumbents (a leftover JS `teamclaude` beside a `tcr`) report the
