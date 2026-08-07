@@ -757,38 +757,89 @@ fn default_config() -> Config {
     serde_json::from_str("{}").expect("an empty JSON object is always a valid default config")
 }
 
-/// Initialise tracing. Headless logs to stdout; the TUI redirects logs to a file
-/// so they never corrupt the alternate screen (stderr fallback if it won't open).
-fn init_tracing(headless: bool) {
-    use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if headless {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-        return;
-    }
-    // The TUI log holds account emails + request paths; keep it owner-only (0600)
-    // rather than the umask default (typically world-readable 0644).
+/// The one durable log both modes append to.
+fn log_file_path() -> std::path::PathBuf {
+    std::env::temp_dir().join("teamclaude-rs.log")
+}
+
+/// Open the durable log, append-mode and owner-only.
+///
+/// The log holds account emails + request paths, so it is created 0600 rather
+/// than at the umask default (typically world-readable 0644). Both the headless
+/// and TUI paths go through here — the mode is defined once, not per caller.
+fn open_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt as _;
-    let log_path = std::env::temp_dir().join("teamclaude-rs.log");
-    match std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(&log_path)
-    {
-        Ok(file) => {
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_env_filter(filter)
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-        }
+        .open(log_path)
+}
+
+/// Build the headless subscriber: every event goes to **both** `stdout_sink` and
+/// (when it could be opened) the durable log file.
+///
+/// Headless used to be stdout-only, which meant its logs were destroyed outright
+/// whenever a supervisor discarded the child's stdout — as TcrBar does
+/// (`ServerController.swift`, `standardOutput = FileHandle.nullDevice`, and older
+/// builds hand it an undrained pipe). A crashing proxy then left no evidence of
+/// why. Stdout is kept as well, because someone running `tcr server --headless`
+/// in a terminal expects output, and launchd-style supervisors capture it.
+///
+/// `file` is an `Option` on purpose: a logging failure must never take the proxy
+/// down, so a log that will not open degrades to stdout-only.
+fn headless_subscriber<W>(
+    filter: tracing_subscriber::EnvFilter,
+    file: Option<std::fs::File>,
+    stdout_sink: W,
+) -> impl tracing::Subscriber + Send + Sync
+where
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::layer::SubscriberExt as _;
+    // The file sink is non-ANSI: escape codes in a log read back as garbage.
+    let file_layer = file.map(|file| {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+    });
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(stdout_sink))
+        .with(file_layer)
+}
+
+/// Initialise tracing. Headless logs to stdout *and* the durable log file; the
+/// TUI logs only to the file, so events never corrupt the alternate screen.
+/// Either way, a log file that will not open is a warning, never a failure.
+fn init_tracing(headless: bool) {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let log_path = log_file_path();
+    let file = match open_log_file(&log_path) {
+        Ok(file) => Some(file),
         Err(err) => {
             eprintln!(
-                "[tcr] could not open TUI log file {}: {err}",
+                "[tcr] could not open log file {}: {err}",
                 log_path.display()
             );
+            None
         }
+    };
+    if headless {
+        headless_subscriber(filter, file, std::io::stdout).init();
+        return;
+    }
+    // No file? Already warned above. The TUI cannot fall back to stdout without
+    // corrupting the alternate screen, so it runs without tracing rather than
+    // refusing to start.
+    if let Some(file) = file {
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
     }
 }
 
@@ -796,7 +847,7 @@ fn init_tracing(headless: bool) {
 mod tests {
     use super::*;
     use build_info::StandDownBuild;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::os::unix::fs::PermissionsExt as _;
 
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
@@ -994,12 +1045,9 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or_default()
         ));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)
-            .expect("open temp log file");
+        // Goes through the production opener: re-implementing the mode here
+        // would assert 0o600 == 0o600 and pass however `open_log_file` drifts.
+        let file = open_log_file(&path).expect("open temp log file");
         let mode = file
             .metadata()
             .expect("stat temp log file")
@@ -1008,5 +1056,119 @@ mod tests {
             & 0o777;
         std::fs::remove_file(&path).ok();
         assert_eq!(mode, 0o600, "log file must be owner-only (0600)");
+    }
+
+    /// A `MakeWriter` that keeps what was written, so a test can inspect the
+    /// stdout sink without capturing the process's real stdout.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().expect("shared buffer poisoned").clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn unique_log_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "teamclaude-rs-{tag}-{}-{:?}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ))
+    }
+
+    /// HEADLESS MUST REACH DISK. TcrBar spawns `tcr server --headless` and throws
+    /// the child's stdout away, so a stdout-only headless subscriber destroys
+    /// 100% of the proxy's logs — which is exactly why a restart loop could not
+    /// be diagnosed. Both sinks are asserted: dropping either one is a
+    /// regression, and asserting only the file would let stdout silently die for
+    /// everyone running it in a terminal.
+    #[test]
+    fn headless_logging_reaches_both_the_file_and_stdout() {
+        let path = unique_log_path("headless-test");
+        let file = open_log_file(&path).expect("open temp log file");
+        let stdout = SharedBuf::default();
+        let marker = format!("headless-sink-probe-{}", std::process::id());
+
+        let subscriber = headless_subscriber(
+            tracing_subscriber::EnvFilter::new("info"),
+            Some(file),
+            stdout.clone(),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("{marker}");
+        });
+
+        let on_disk = std::fs::read_to_string(&path).expect("read temp log file");
+        std::fs::remove_file(&path).ok();
+        assert!(
+            on_disk.contains(&marker),
+            "headless event never reached the log file; file held: {on_disk:?}"
+        );
+        assert!(
+            !on_disk.contains('\u{1b}'),
+            "the log file must be non-ANSI; escape codes read back as garbage"
+        );
+        assert!(
+            stdout.contents().contains(&marker),
+            "headless event never reached stdout; stdout held: {:?}",
+            stdout.contents()
+        );
+    }
+
+    /// A log file that will not open must degrade to stdout-only, never take the
+    /// proxy down: logging is not worth the traffic it is observing.
+    #[test]
+    fn headless_logging_survives_an_unopenable_log_file() {
+        let stdout = SharedBuf::default();
+        let marker = format!("headless-degraded-probe-{}", std::process::id());
+
+        let subscriber = headless_subscriber(
+            tracing_subscriber::EnvFilter::new("info"),
+            None,
+            stdout.clone(),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("{marker}");
+        });
+
+        assert!(
+            stdout.contents().contains(&marker),
+            "with no log file, stdout must still receive every event"
+        );
+    }
+
+    /// `init_tracing` must target the one shared log, not a private path — this
+    /// is what `tcr status` and every diagnostic already read.
+    #[test]
+    fn the_log_path_is_the_shared_tmpdir_log() {
+        assert_eq!(
+            log_file_path(),
+            std::env::temp_dir().join("teamclaude-rs.log")
+        );
     }
 }
