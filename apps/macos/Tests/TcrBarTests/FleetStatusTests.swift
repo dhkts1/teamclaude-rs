@@ -659,10 +659,10 @@ final class ServerControllerTests: XCTestCase {
     /// cannot lean on a non-zero exit code: without a marker match this would
     /// render "the server exited cleanly" for a server that never bound.
     func testTheStandDownIsRecognisedEvenThoughItExitsZero() {
-        let stderr = "[tcr] another proxy holds :3456 (pid 123) and it is healthy — leaving it "
-            + "alone and exiting without binding. Replacing it would wipe its session→account "
-            + "pin map and cold-start every live session's prompt cache, the most expensive "
-            + "event in this system. Pass --replace to take the port over anyway."
+        let stderr = "[tcr] another proxy holds :3456 (pid 123) and it is still listening — "
+            + "leaving it alone and exiting without binding. Replacing it would wipe its "
+            + "session→account pin map and cold-start every live session's prompt cache, the "
+            + "most expensive event in this system. Pass --replace to take the port over anyway."
         guard case .incumbentHoldsPort = ServerController.classifyExit(
             intent: .safeStart, exitCode: 0, stderr: stderr
         ) else {

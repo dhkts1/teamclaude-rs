@@ -171,12 +171,19 @@ pub const INCUMBENT_MARKER: &str = "another proxy holds";
 
 /// What we print before standing down, as a pure function so the cross-language
 /// marker contract above is testable.
+///
+/// Says "is listening", NOT "is healthy". All we established is that a
+/// command-verified proxy holds the port (`pids_to_replace` -> `is_proxy_server`);
+/// nothing here probes whether it still serves. A wedged proxy holds its port just
+/// fine, and the build line printed right after this one can say the incumbent never
+/// answered — so claiming health here would both overstate the check and contradict
+/// the next line. Assert only what the code checked.
 fn stand_down_message(port: u16, pid: u32) -> String {
     format!(
-        "[tcr] {INCUMBENT_MARKER} :{port} (pid {pid}) and it is healthy — leaving it alone and \
-         exiting without binding. Replacing it would wipe its session→account pin map and \
-         cold-start every live session's prompt cache, the most expensive event in this system. \
-         Pass --replace to take the port over anyway."
+        "[tcr] {INCUMBENT_MARKER} :{port} (pid {pid}) and it is still listening — leaving it \
+         alone and exiting without binding. Replacing it would wipe its session→account pin map \
+         and cold-start every live session's prompt cache, the most expensive event in this \
+         system. Pass --replace to take the port over anyway."
     )
 }
 
