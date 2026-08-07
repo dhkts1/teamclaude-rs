@@ -1,12 +1,15 @@
-//! `tcr update` — self-update by pulling the source checkout and rebuilding.
+//! `tcr update` — self-update, by rebuilding a checkout or by re-running the
+//! published release installer.
 //!
-//! The notify-vs-act split mirrors the JS `updater.js`: we only *act* when we
-//! can locate the git checkout that `tcr` was built from (walk up from the
-//! running executable to the first ancestor holding BOTH `.git` and
-//! `Cargo.toml`). In that case we `git -C <root> pull --ff-only` and, if that
-//! moved HEAD, `cargo build --release` in the checkout. If the binary lives
-//! outside any checkout (an installed copy under `~/.cargo/bin`, say) we do NOT
-//! try to self-replace — we just print the reinstall command and return.
+//! The act-how split mirrors the JS `updater.js`: when we can locate the git
+//! checkout that `tcr` was built from (walk up from the running executable to
+//! the first ancestor holding BOTH `.git` and `Cargo.toml`) we
+//! `git -C <root> pull --ff-only` and, if that moved HEAD,
+//! `cargo build --release` in the checkout. When the binary is an *installed*
+//! copy outside any checkout, we fetch the release installer published with the
+//! newest GitHub release and run it against the directory the running binary
+//! actually lives in. Only the `.app`-bundled copy is notify-only: it is a copy
+//! that its own installer owns.
 //!
 //! Two invariants, both from Principle 9 (don't clobber in-flight work):
 //!   * `--ff-only` — NEVER `git reset --hard`. A dirty or diverged tree makes
@@ -15,6 +18,13 @@
 //!   * The running process keeps executing the OLD binary after the rebuild, so
 //!     the output says "built — restart tcr", never "updated". Claiming a live
 //!     update would be a lie.
+//!
+//! And one for the installed path: we do NOT hand-roll download-and-replace.
+//! Overwriting a live binary in place is how you get a half-written executable
+//! under a running process. The published installer stages into a temp dir
+//! *inside* the destination and finishes with a same-filesystem `mv`, i.e. an
+//! atomic `rename(2)`; reusing it means the atomic swap is the vendor's tested
+//! code path, not ours.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,7 +41,8 @@ pub enum InstallKind {
     /// notify: the bundled binary is a COPY, so rebuilding a checkout would not
     /// replace it, and `cargo install` would write a third competing artifact.
     AppBundle(PathBuf),
-    /// Installed outside any checkout — we only notify, never self-replace.
+    /// Installed outside any checkout — updated by re-running the release
+    /// installer against the running binary's own directory.
     Installed,
 }
 
@@ -214,6 +225,273 @@ fn built_binary_path(root: &Path) -> anyhow::Result<PathBuf> {
     Ok(target_dir.join("release").join("tcr"))
 }
 
+// ---------------------------------------------------------------------------
+// Installed copies: update via the published release installer.
+// ---------------------------------------------------------------------------
+
+/// `owner/repo` the releases are published under. Kept as one constant so the
+/// API URL and the asset URL can never drift apart.
+const RELEASE_REPO: &str = "dhkts1/teamclaude-rs";
+
+/// The installer asset name `dist` publishes with every release.
+const INSTALLER_ASSET: &str = "teamclaude-rs-installer.sh";
+
+/// The environment variable that makes `dist`'s installer write the binary into
+/// exactly one directory. Without an override the installer picks its own
+/// default (`CARGO_HOME/bin`, `~/.local/bin`), so for a copy installed anywhere
+/// else the update lands as a SECOND binary while the one on your PATH stays
+/// stale — the exact drift `tcr update` exists to end.
+///
+/// It is deliberately NOT `CARGO_DIST_FORCE_INSTALL_DIR`. Read the published
+/// v0.1.0 installer: that variable selects the **cargo-home** layout, which
+/// appends `/bin` (`_install_dir="$_force_install_dir/bin"`), so pointing it at
+/// the running binary's directory installs to `<dir>/bin/tcr` — a second copy,
+/// the very failure being fixed. `<APP>_UNMANAGED_INSTALL` selects the **flat**
+/// layout, `_install_dir="$_force_install_dir"` verbatim, and additionally sets
+/// `NO_MODIFY_PATH=1` and skips the receipt/self-updater — correct for
+/// replacing a binary that is already installed and already on PATH.
+const UNMANAGED_INSTALL_ENV: &str = "TEAMCLAUDE_RS_UNMANAGED_INSTALL";
+
+/// What the version comparison decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateDecision {
+    /// Running version equals the latest release — nothing to download.
+    AlreadyCurrent,
+    /// Running version is strictly ahead of the latest release (a local build
+    /// from an unreleased commit). Installing would be a DOWNGRADE, so we stop.
+    RunningNewer,
+    /// A different — and not newer — version is published: install it.
+    Install,
+}
+
+/// GitHub release tags are cut as `v<Cargo.toml version>`; strip the `v` (and
+/// surrounding whitespace) so the tag and `CARGO_PKG_VERSION` are comparable.
+pub fn normalize_version(v: &str) -> &str {
+    v.trim().trim_start_matches('v')
+}
+
+/// The dotted numeric core of a version (`1.2.3-rc1` → `[1, 2, 3]`), or `None`
+/// when any component is not a plain number. `None` means "cannot order these",
+/// NOT "equal" — callers must treat it as unknown rather than as a match.
+fn version_parts(v: &str) -> Option<Vec<u64>> {
+    let core = v.split(['-', '+']).next()?;
+    if core.is_empty() {
+        return None;
+    }
+    core.split('.').map(|p| p.parse::<u64>().ok()).collect()
+}
+
+/// Order two versions by their numeric cores, zero-padding the shorter one so
+/// `0.2` and `0.2.0` compare equal. `None` when either side is unparseable.
+fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let (a, b) = (version_parts(a)?, version_parts(b)?);
+    let width = a.len().max(b.len());
+    let at = (0..width).map(|i| a.get(i).copied().unwrap_or(0));
+    let bt = (0..width).map(|i| b.get(i).copied().unwrap_or(0));
+    Some(at.cmp(bt))
+}
+
+/// Decide whether to install `latest_tag` over `current`.
+///
+/// `force` short-circuits every check — that is what `--force` is for, and it is
+/// the escape hatch when a version string lies (a binary rebuilt from a dirty
+/// tree still reports the released version).
+///
+/// An UNPARSEABLE version is deliberately not treated as a match: we install,
+/// rather than silently skipping an update because we could not read a string.
+pub fn decide_update(current: &str, latest_tag: &str, force: bool) -> UpdateDecision {
+    if force {
+        return UpdateDecision::Install;
+    }
+    let (current, latest) = (normalize_version(current), normalize_version(latest_tag));
+    if current == latest {
+        return UpdateDecision::AlreadyCurrent;
+    }
+    match compare_versions(current, latest) {
+        Some(std::cmp::Ordering::Greater) => UpdateDecision::RunningNewer,
+        _ => UpdateDecision::Install,
+    }
+}
+
+/// The GitHub API URL for the newest release.
+///
+/// We ask the API rather than just fetching `/releases/latest/download/<asset>`
+/// because the API is the only cheap way to learn the *version* before
+/// downloading anything: the asset URL would make "already current" cost a full
+/// installer download plus an install, on every run.
+pub fn latest_release_api_url() -> String {
+    format!("https://api.github.com/repos/{RELEASE_REPO}/releases/latest")
+}
+
+/// The installer asset URL for one specific tag.
+///
+/// Tag-pinned, not `/releases/latest/download/…`: we already resolved the tag
+/// when we decided to update, and a release cut between those two requests
+/// would otherwise install a version we never compared against.
+pub fn installer_url_for_tag(tag: &str) -> String {
+    format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{INSTALLER_ASSET}")
+}
+
+/// Extract `tag_name` from the GitHub "latest release" JSON.
+pub fn parse_latest_tag(body: &str) -> anyhow::Result<String> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).context("the GitHub releases API did not return valid JSON")?;
+    match json.get("tag_name").and_then(|v| v.as_str()) {
+        Some(tag) if !tag.trim().is_empty() => Ok(tag.trim().to_string()),
+        _ => bail!("the GitHub releases API response has no usable `tag_name` field"),
+    }
+}
+
+/// The directory an update must write into: the one holding the RUNNING binary,
+/// with symlinks resolved. Resolving matters — when the PATH entry is a symlink,
+/// its own directory is not where the real binary lives, and installing there
+/// would leave the link pointing at the old file.
+pub fn install_dir_for_exe(exe: &Path) -> anyhow::Result<PathBuf> {
+    let resolved = std::fs::canonicalize(exe)
+        .with_context(|| format!("cannot resolve the running executable at {}", exe.display()))?;
+    resolved
+        .parent()
+        .map(Path::to_path_buf)
+        .with_context(|| format!("{} has no parent directory", resolved.display()))
+}
+
+/// Blocking HTTP GET returning the body bytes.
+///
+/// Runs on a DEDICATED thread with its own current-thread runtime: `run_update`
+/// is called from inside `#[tokio::main]`, and `block_on` from a thread already
+/// driving a runtime panics. A fresh thread has no runtime of its own, so this
+/// is legal from either context.
+fn fetch_bytes(url: &str, accept: &str) -> anyhow::Result<Vec<u8>> {
+    let (url, accept) = (url.to_string(), accept.to_string());
+    let worker = std::thread::spawn(move || -> anyhow::Result<Vec<u8>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("could not start a runtime for the download")?;
+        rt.block_on(async move {
+            let client = reqwest::Client::builder()
+                // GitHub's API rejects requests without a User-Agent.
+                .user_agent(concat!("tcr/", env!("CARGO_PKG_VERSION")))
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .context("could not build the HTTP client")?;
+            let response = client
+                .get(&url)
+                .header(reqwest::header::ACCEPT, accept)
+                .send()
+                .await
+                .with_context(|| format!("GET {url} failed"))?;
+            let status = response.status();
+            if !status.is_success() {
+                bail!("GET {url} returned HTTP {status}");
+            }
+            let body = response
+                .bytes()
+                .await
+                .with_context(|| format!("could not read the response body of {url}"))?;
+            Ok(body.to_vec())
+        })
+    });
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => bail!("the download thread panicked"),
+    }
+}
+
+/// Write the installer into a fresh private directory and mark it executable.
+///
+/// The directory is created 0700 and freshly named. `/tmp` is world-writable, so
+/// a predictable path would let any local user pre-create it and swap the script
+/// we are about to run as ourselves.
+fn stage_installer(script: &[u8]) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let dir = std::env::temp_dir().join(format!("tcr-update-{}-{nanos}", std::process::id()));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .with_context(|| format!("could not create the staging directory {}", dir.display()))?;
+
+    let path = dir.join(INSTALLER_ASSET);
+    std::fs::write(&path, script)
+        .with_context(|| format!("could not write the installer to {}", path.display()))?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("could not make {} executable", path.display()))?;
+    Ok(path)
+}
+
+/// Update an installed copy: resolve the latest release, compare, then download
+/// and run the published installer against the running binary's own directory.
+fn update_installed(force: bool) -> anyhow::Result<()> {
+    let exe = std::env::current_exe().context("cannot determine the running executable's path")?;
+    let install_dir = install_dir_for_exe(&exe)?;
+
+    let api_url = latest_release_api_url();
+    println!("tcr: checking {api_url}");
+    let body = fetch_bytes(&api_url, "application/vnd.github+json")
+        .context("could not reach the GitHub releases API — no update was attempted")?;
+    let tag = parse_latest_tag(&String::from_utf8_lossy(&body))?;
+
+    let current = env!("CARGO_PKG_VERSION");
+    match decide_update(current, &tag, force) {
+        UpdateDecision::AlreadyCurrent => {
+            println!("tcr: already current — running {current}, latest release is {tag}.");
+            return Ok(());
+        }
+        UpdateDecision::RunningNewer => {
+            println!(
+                "tcr: this build is {current}, ahead of the latest release {tag} — \
+                 installing it would be a downgrade, so nothing was changed.\n\
+                 tcr: re-run with `tcr update --force` if you really want {tag}."
+            );
+            return Ok(());
+        }
+        UpdateDecision::Install => {
+            println!(
+                "tcr: updating {current} → {tag} in {}",
+                install_dir.display()
+            );
+        }
+    }
+
+    let url = installer_url_for_tag(&tag);
+    let script = fetch_bytes(&url, "application/octet-stream")
+        .with_context(|| format!("could not download the installer from {url}"))?;
+    let staged = stage_installer(&script)?;
+
+    // Stdio inherited so the installer's own progress and errors are the user's
+    // progress and errors — we add nothing by capturing and re-printing them.
+    let status = Command::new(&staged)
+        .env(UNMANAGED_INSTALL_ENV, &install_dir)
+        .status()
+        .with_context(|| format!("failed to run the installer at {}", staged.display()))?;
+
+    // Best effort, and loud when it fails: a leftover staging dir is harmless,
+    // but silently swallowing the error would hide a filesystem problem.
+    if let Some(dir) = staged.parent() {
+        if let Err(err) = std::fs::remove_dir_all(dir) {
+            eprintln!("tcr: could not clean up {}: {err}", dir.display());
+        }
+    }
+
+    if !status.success() {
+        bail!(
+            "the {tag} installer exited with {status} — {} was NOT updated.",
+            install_dir.display()
+        );
+    }
+
+    println!(
+        "tcr: installed {tag} into {}.\n\
+         tcr: this process is still running {current} — restart tcr to run the new build.",
+        install_dir.display()
+    );
+    Ok(())
+}
+
 /// `tcr update [--force]` — self-update entry point.
 pub fn run_update(force: bool) -> anyhow::Result<()> {
     run_update_with(classify_install(), force)
@@ -235,29 +513,14 @@ pub fn run_update_with(kind: InstallKind, force: bool) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        // Reinstall via `scripts/install-cli.sh`, NOT `cargo install --path`.
-        // The AppBundle arm above already refuses `cargo install` because it
-        // writes a third competing copy at ~/.cargo/bin/tcr; this arm used to
-        // recommend exactly that. README.md now installs with
-        // `scripts/install-cli.sh`, which writes a regular file, so every new
-        // user lands HERE — and was being routed straight into the artifact
-        // drift the installer exists to prevent. The installer resolves the
-        // build output from `cargo metadata`, refuses a stale binary, and
-        // renames it into place instead of rewriting a live inode.
-        InstallKind::Installed => {
-            println!(
-                "tcr was not run from a git checkout, so it can't self-update.\n\
-                 Reinstall from the source tree:\n\
-                 \n    git -C <teamclaude-rs> pull --ff-only \\\n      \
-                 && cargo build --release --manifest-path <teamclaude-rs>/Cargo.toml \\\n      \
-                 && <teamclaude-rs>/scripts/install-cli.sh\n\
-                 \nDo NOT `cargo install --path` here: that writes ~/.cargo/bin/tcr, a copy \
-                 competing with whatever is already on your PATH. install-cli.sh reads the build \
-                 output location from `cargo metadata` (CARGO_TARGET_DIR may move it well outside \
-                 the checkout) and refuses to install a binary that does not match HEAD."
-            );
-            Ok(())
-        }
+        // An installed copy updates from the PUBLISHED RELEASE, not from a
+        // source tree it has no reason to have. This arm used to print reinstall
+        // instructions that assumed a checkout on the machine — for anyone who
+        // installed from the release installer, that is advice they cannot
+        // follow. Now it fetches the installer for the newest release and runs
+        // it against the directory the running binary is in, so the update
+        // replaces the copy actually on your PATH instead of adding a second.
+        InstallKind::Installed => update_installed(force),
     }
 }
 
@@ -358,6 +621,7 @@ fn update_checkout(root: &Path, force: bool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cmp::Ordering;
     use std::fs;
 
     /// A unique scratch dir under the system temp root, following the repo's
@@ -641,27 +905,265 @@ mod tests {
         );
     }
 
-    /// The `Installed` arm tells the user to run `scripts/install-cli.sh`.
+    /// The `AppBundle` arm tells the user to run `apps/macos/scripts/install.sh`.
     /// Naming a path that is not there is the same class of defect as printing
     /// a built-binary path that does not exist, so the recommendation is
     /// checked against the tree rather than trusted to stay true.
     #[test]
-    fn the_recommended_installer_script_exists() {
+    fn the_recommended_app_installer_script_exists() {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("apps")
+            .join("macos")
             .join("scripts")
-            .join("install-cli.sh");
+            .join("install.sh");
         assert!(
             script.is_file(),
-            "run_update_with(Installed) recommends {}, which does not exist",
+            "run_update_with(AppBundle) recommends {}, which does not exist",
             script.display()
         );
     }
 
+    // -- installed-copy update: version comparison ---------------------------
+
+    /// The whole point of the check: the common case must cost one API call and
+    /// no download at all.
     #[test]
-    fn run_update_installed_notifies_without_spawning() {
-        // The Installed kind must reach the notify branch and return Ok without
-        // ever touching git/cargo or the real filesystem.
-        assert!(run_update_with(InstallKind::Installed, false).is_ok());
-        assert!(run_update_with(InstallKind::Installed, true).is_ok());
+    fn equal_versions_skip_the_download() {
+        assert_eq!(
+            decide_update("0.1.0", "v0.1.0", false),
+            UpdateDecision::AlreadyCurrent
+        );
+        // The tag is normally `v`-prefixed, but a bare tag must behave the same.
+        assert_eq!(
+            decide_update("0.1.0", "0.1.0", false),
+            UpdateDecision::AlreadyCurrent
+        );
+        // …and trailing whitespace from a sloppy tag must not read as a change.
+        assert_eq!(
+            decide_update("0.1.0", " v0.1.0\n", false),
+            UpdateDecision::AlreadyCurrent
+        );
+    }
+
+    #[test]
+    fn a_newer_release_is_installed() {
+        assert_eq!(
+            decide_update("0.1.0", "v0.1.1", false),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            decide_update("0.1.0", "v0.2.0", false),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            decide_update("0.9.9", "v1.0.0", false),
+            UpdateDecision::Install
+        );
+        // Numeric ordering, not lexicographic: "0.10.0" > "0.9.0".
+        assert_eq!(
+            decide_update("0.9.0", "v0.10.0", false),
+            UpdateDecision::Install
+        );
+    }
+
+    /// A local build from an unreleased commit must not be silently downgraded
+    /// to the newest published tag.
+    #[test]
+    fn a_build_ahead_of_the_release_is_not_downgraded() {
+        assert_eq!(
+            decide_update("0.2.0", "v0.1.0", false),
+            UpdateDecision::RunningNewer
+        );
+        assert_eq!(
+            decide_update("0.10.0", "v0.9.0", false),
+            UpdateDecision::RunningNewer
+        );
+        // Zero-padded compare: 0.2 and 0.2.0 are the same version.
+        assert_eq!(
+            decide_update("0.2", "v0.2.0", false),
+            UpdateDecision::Install
+        );
+        assert_eq!(compare_versions("0.2", "0.2.0"), Some(Ordering::Equal));
+    }
+
+    /// `--force` is the escape hatch for a version string that lies (a binary
+    /// rebuilt from a dirty tree still reports the released version), so it must
+    /// bypass EVERY skip branch, not just the equal one.
+    #[test]
+    fn force_always_installs() {
+        assert_eq!(
+            decide_update("0.1.0", "v0.1.0", true),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            decide_update("0.2.0", "v0.1.0", true),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            decide_update("not-a-version", "v0.1.0", true),
+            UpdateDecision::Install
+        );
+    }
+
+    /// An unreadable version must NOT be mistaken for a match: failing to parse
+    /// a string is not evidence that we are up to date.
+    #[test]
+    fn unparseable_versions_install_rather_than_skip() {
+        assert_eq!(
+            decide_update("0.1.0-dev", "v0.1.0", false),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            decide_update("main", "v0.1.0", false),
+            UpdateDecision::Install
+        );
+        assert_eq!(
+            decide_update("0.1.0", "nightly", false),
+            UpdateDecision::Install
+        );
+        assert_eq!(compare_versions("main", "0.1.0"), None);
+        assert_eq!(version_parts("0.1.x"), None);
+        assert_eq!(version_parts("0.1.0-rc1"), Some(vec![0, 1, 0]));
+    }
+
+    /// The version this binary reports is what gets compared, so it has to be a
+    /// version at all — the release tags are cut FROM it.
+    #[test]
+    fn the_crate_version_is_comparable() {
+        assert!(
+            version_parts(env!("CARGO_PKG_VERSION")).is_some(),
+            "CARGO_PKG_VERSION {} has no numeric core, so decide_update can never \
+             report AlreadyCurrent",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert_eq!(
+            decide_update(
+                env!("CARGO_PKG_VERSION"),
+                &format!("v{}", env!("CARGO_PKG_VERSION")),
+                false
+            ),
+            UpdateDecision::AlreadyCurrent
+        );
+    }
+
+    // -- installed-copy update: URLs and JSON --------------------------------
+
+    #[test]
+    fn asset_and_api_urls_are_built_from_one_repo_constant() {
+        assert_eq!(
+            latest_release_api_url(),
+            "https://api.github.com/repos/dhkts1/teamclaude-rs/releases/latest"
+        );
+        assert_eq!(
+            installer_url_for_tag("v0.1.0"),
+            "https://github.com/dhkts1/teamclaude-rs/releases/download/v0.1.0/teamclaude-rs-installer.sh"
+        );
+        // Tag-pinned, NOT /releases/latest/download/…: a release cut between the
+        // API query and the download would otherwise install a version we never
+        // compared against.
+        assert!(!installer_url_for_tag("v0.1.0").contains("/latest/"));
+    }
+
+    /// Measured against the published v0.1.0 installer, both directions:
+    /// `TEAMCLAUDE_RS_UNMANAGED_INSTALL=<dir>` installed `<dir>/tcr`, while
+    /// `CARGO_DIST_FORCE_INSTALL_DIR=<dir>` installed `<dir>/bin/tcr`. Pointing
+    /// the latter at the running binary's directory would therefore create the
+    /// second copy this whole path exists to prevent, so the variable name is
+    /// pinned rather than left to look interchangeable.
+    #[test]
+    fn the_install_dir_override_is_the_flat_layout_variable() {
+        assert_eq!(UNMANAGED_INSTALL_ENV, "TEAMCLAUDE_RS_UNMANAGED_INSTALL");
+        assert_ne!(UNMANAGED_INSTALL_ENV, "CARGO_DIST_FORCE_INSTALL_DIR");
+    }
+
+    #[test]
+    fn parse_latest_tag_reads_the_tag_name() {
+        let body = r#"{"tag_name":"v0.1.0","name":"v0.1.0","assets":[{"name":"teamclaude-rs-installer.sh"}]}"#;
+        assert_eq!(parse_latest_tag(body).unwrap(), "v0.1.0");
+    }
+
+    /// The release-query error path: every failure shape must surface as an
+    /// error, never as a version we then compare against.
+    #[test]
+    fn parse_latest_tag_errors_are_not_swallowed() {
+        assert!(parse_latest_tag(r#"{"message":"Not Found"}"#).is_err());
+        assert!(parse_latest_tag(r#"{"tag_name":null}"#).is_err());
+        assert!(parse_latest_tag(r#"{"tag_name":""}"#).is_err());
+        assert!(parse_latest_tag(r#"{"tag_name":"   "}"#).is_err());
+        assert!(parse_latest_tag(r#"{"tag_name":123}"#).is_err());
+        assert!(parse_latest_tag("<html>502 Bad Gateway</html>").is_err());
+        assert!(parse_latest_tag("").is_err());
+    }
+
+    // -- installed-copy update: destination ----------------------------------
+
+    /// The update must land where the RUNNING binary is. With a symlink on PATH,
+    /// that is the link's target directory — installing next to the link would
+    /// leave the link pointing at the old file.
+    #[test]
+    fn install_dir_follows_a_symlinked_exe_to_the_real_binary() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("install-dir");
+        let real_dir = base.join("opt").join("tcr-0.1.0");
+        fs::create_dir_all(&real_dir).unwrap();
+        let real_exe = real_dir.join("tcr");
+        fs::write(&real_exe, b"fake").unwrap();
+
+        let bindir = base.join("bin");
+        fs::create_dir_all(&bindir).unwrap();
+        let link = bindir.join("tcr");
+        symlink(&real_exe, &link).unwrap();
+
+        assert_eq!(
+            install_dir_for_exe(&link).unwrap(),
+            fs::canonicalize(&real_dir).unwrap()
+        );
+        // A plain copied file (the common install shape) resolves to its own dir.
+        assert_eq!(
+            install_dir_for_exe(&real_exe).unwrap(),
+            fs::canonicalize(&real_dir).unwrap()
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// An exe path that does not exist must error, not degrade into some default
+    /// install directory that would write a second binary somewhere else.
+    #[test]
+    fn install_dir_errors_when_the_exe_cannot_be_resolved() {
+        let base = scratch("install-dir-missing");
+        assert!(install_dir_for_exe(&base.join("nope").join("tcr")).is_err());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The staged installer must be executable and live in a private directory —
+    /// the system temp root is world-writable.
+    #[test]
+    fn stage_installer_writes_a_private_executable_script() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let staged = stage_installer(b"#!/bin/sh\nexit 0\n").unwrap();
+
+        assert_eq!(fs::read(&staged).unwrap(), b"#!/bin/sh\nexit 0\n");
+        assert_eq!(staged.file_name().unwrap(), INSTALLER_ASSET);
+        let mode = fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o100, 0o100, "installer is not executable: {mode:o}");
+        assert_eq!(mode & 0o077, 0, "installer is group/world accessible");
+
+        let dir = staged.parent().unwrap();
+        let dir_mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "staging dir is not private: {dir_mode:o}");
+
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Two stagings in the same process must not collide — a fixed path in a
+    /// world-writable temp root is a script-swap window.
+    #[test]
+    fn stage_installer_uses_a_fresh_directory_each_time() {
+        let a = stage_installer(b"#!/bin/sh\nexit 0\n").unwrap();
+        let b = stage_installer(b"#!/bin/sh\nexit 0\n").unwrap();
+        assert_ne!(a.parent(), b.parent());
+        fs::remove_dir_all(a.parent().unwrap()).ok();
+        fs::remove_dir_all(b.parent().unwrap()).ok();
     }
 }
