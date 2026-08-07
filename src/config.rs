@@ -277,9 +277,12 @@ pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     write_atomic(path, &serde_json::to_string_pretty(config)?)
 }
 
-/// The atomic 0600 write itself, shared by [`save`] and [`save_tokens`] so both
-/// paths get the same durability and permission guarantees.
-fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
+/// The atomic 0600 write itself, shared by [`save`], [`save_tokens`] and the
+/// session-affinity pin file ([`crate::affinity::save`]) so every path gets the
+/// same durability and permission guarantees. One implementation deliberately:
+/// a second hand-rolled temp+rename is a second place for the ordering to be
+/// subtly wrong.
+pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let dir = dir.unwrap_or_else(|| Path::new("."));
 
