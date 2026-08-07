@@ -78,12 +78,17 @@ final class TakeoverIntentTests: XCTestCase {
     /// Verbatim clap 4 output when an argument the binary does not define is
     /// passed — what a `tcr` predating the `--replace` flip answers the takeover
     /// with, on exit code 2.
+    ///
+    /// Measured, not recalled: produced by compiling this project's own
+    /// `ServerArgs` wiring minus `--replace` against clap 4 and parsing
+    /// `["server", "--headless", "--replace"]`. The `tip:` line in particular is
+    /// not what one would guess — clap suggests the *similar* argument.
     private let unknownArgument = """
         error: unexpected argument '--replace' found
 
-          tip: to pass '--replace' as a value, use '-- --replace'
+          tip: a similar argument exists: '--no-replace'
 
-        Usage: tcr server [OPTIONS]
+        Usage: tcr server --headless --no-replace
 
         For more information, try '--help'.
         """
@@ -139,6 +144,214 @@ final class TakeoverIntentTests: XCTestCase {
         }
         XCTAssertEqual(code, 101)
         XCTAssertEqual(message, "config parse error")
+    }
+}
+
+/// A stand-down is no longer one outcome with one exit code.
+///
+/// `tcr` now distinguishes three (`src/main.rs:479-494`): 0 when it stood down
+/// and the incumbent answered, 3 when the incumbent is serving a stale build, and
+/// 4 when the incumbent answered *nothing* — it holds the listening socket and
+/// serves no requests.
+///
+/// All three print the same `another proxy holds` line, so classification on the
+/// marker alone collapses them into the benign "already running". For exit 4 that
+/// is the inverse of the truth, and it is the worst thing this panel can do: tell
+/// the operator the proxy is fine while every session through the port fails.
+final class StandDownExitCodeTests: XCTestCase {
+
+    /// Verbatim from `singleton::stand_down_message` — the line every stand-down
+    /// prints, regardless of which of the three it is.
+    private let standDown = "[tcr] another proxy holds :3456 (pid 123) and it is still "
+        + "listening — leaving it alone and exiting without binding. Replacing it would wipe "
+        + "its session→account pin map and cold-start every live session's prompt cache, the "
+        + "most expensive event in this system. Pass --replace to take the port over anyway."
+
+    /// Verbatim from the `Liveness::Silent` arm at `src/main.rs:559-565`.
+    private var silentIncumbent: String {
+        standDown + "\n"
+            + "[tcr] WARNING incumbent-not-answering: port=3456 pid=123 probe=\"timeout\" — the "
+            + "process holding :3456 did not respond, so standing down leaves NOTHING serving "
+            + "on it. Run `tcr --replace` to take the port over; that is the recovery for a "
+            + "wedged proxy, and it is not being done automatically because it also wipes the "
+            + "pin map of a proxy that was merely slow to answer."
+    }
+
+    private var staleIncumbent: String {
+        standDown + "\n"
+            + "[tcr] WARNING stale-server: running=abc1234 this_binary=def5678 built_dirty=false "
+            + "this_binary_dirty=false — the proxy on :3456 is running a DIFFERENT commit."
+    }
+
+    func testASilentIncumbentIsNotReportedAsAlreadyRunning() {
+        let state = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 4, stderr: silentIncumbent
+        )
+        if case .incumbentHoldsPort = state {
+            XCTFail("a process serving nothing was reported as a healthy incumbent")
+        }
+        guard case .incumbentNotAnswering = state else {
+            return XCTFail("expected the not-answering state, got \(state)")
+        }
+    }
+
+    /// The panel must not claim service that is not happening, and must name the
+    /// recovery without performing it — the Rust side deliberately refuses to
+    /// auto-takeover on this evidence, and this app must not re-introduce that
+    /// decision quietly.
+    func testTheSilentIncumbentSummaryTellsTheTruthAndNamesTheRecovery() {
+        let summary = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 4, stderr: silentIncumbent
+        ).summary
+
+        XCTAssertTrue(
+            summary.contains("NOT SERVING"),
+            "the headline fact is that nothing is being served: \(summary)"
+        )
+        XCTAssertFalse(
+            summary.contains("Already running — not ours, left alone."),
+            "that is the benign wording, and it is false here: \(summary)"
+        )
+        XCTAssertTrue(
+            summary.contains("Take over port"),
+            "name the recovery: \(summary)"
+        )
+        XCTAssertTrue(
+            summary.contains("will not make that call for you"),
+            "say that the takeover is the operator's decision, not ours: \(summary)"
+        )
+    }
+
+    /// On the takeover path the same code is still the more useful fact.
+    /// `.takeoverRefused` says "the existing proxy is still serving", which for
+    /// exit 4 would be a second lie on top of the first.
+    func testASilentIncumbentIsNotDressedUpAsAMerelyRefusedTakeover() {
+        let state = ServerController.classifyExit(
+            intent: .takeover, exitCode: 4, stderr: silentIncumbent
+        )
+        guard case .incumbentNotAnswering = state else {
+            return XCTFail("expected the not-answering state, got \(state)")
+        }
+        XCTAssertFalse(
+            state.summary.contains("the existing proxy is still serving"),
+            "it is not serving: \(state.summary)"
+        )
+    }
+
+    /// The exit code carries the verdict even when stderr does not arrive at all.
+    /// That is not hypothetical — the pipe race this file also tests could drop
+    /// the whole message, and a lost stand-down used to read as a clean exit.
+    func testTheVerdictSurvivesAnEmptyStderr() {
+        guard case .incumbentNotAnswering = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 4, stderr: ""
+        ) else {
+            return XCTFail("the exit code alone must carry a wedged incumbent")
+        }
+        guard case .incumbentIsStale = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 3, stderr: ""
+        ) else {
+            return XCTFail("the exit code alone must carry a stale incumbent")
+        }
+    }
+
+    func testAStaleIncumbentIsDistinguishableButNotAnAlarm() {
+        let state = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 3, stderr: staleIncumbent
+        )
+        guard case .incumbentIsStale = state else {
+            return XCTFail("expected the stale state, got \(state)")
+        }
+        // It IS serving, so it must not borrow the not-answering alarm.
+        XCTAssertFalse(state.summary.contains("NOT SERVING"), state.summary)
+        XCTAssertTrue(
+            state.summary.contains("older build"),
+            "say what is actually wrong with it: \(state.summary)"
+        )
+        XCTAssertFalse(state.isOurChild)
+    }
+
+    /// Exit 0 is unchanged: a stand-down against an answering incumbent is the
+    /// benign outcome on a safe start and a failure on a takeover, exactly as
+    /// before the exit codes existed.
+    func testAnAnsweringIncumbentKeepsTheOldBehaviourOnBothPaths() {
+        guard case .incumbentHoldsPort = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 0, stderr: standDown
+        ) else {
+            return XCTFail("exit 0 on a safe start is still the benign outcome")
+        }
+        guard case .takeoverRefused = ServerController.classifyExit(
+            intent: .takeover, exitCode: 0, stderr: standDown
+        ) else {
+            return XCTFail("exit 0 on a takeover is still a failure")
+        }
+    }
+
+    /// All three stand-downs print the same marker line, which is precisely why
+    /// the code has to be read: on the marker alone these are one state.
+    func testTheThreeStandDownsAreNotDistinguishableByTheirMarker() {
+        for text in [standDown, silentIncumbent, staleIncumbent] {
+            XCTAssertTrue(
+                text.contains("another proxy holds"),
+                "the marker is common to all three — the exit code is the only separator"
+            )
+        }
+        let states = [Int32(0), 3, 4].map {
+            ServerController.classifyExit(intent: .safeStart, exitCode: $0, stderr: standDown)
+        }
+        XCTAssertEqual(Set(states.map(\.summary)).count, 3, "identical stderr, three verdicts")
+    }
+}
+
+/// `--replace` together with `--no-replace` is now a hard clap conflict
+/// (`conflicts_with`), and it exits 2 — the same code as an unknown argument.
+///
+/// The two must not be confused. Telling an operator their `tcr` is too old and
+/// to go rebuild it, when the binary is current and the real fault is a
+/// contradictory flag pair, is confidently wrong in the direction that wastes the
+/// most of their time.
+final class FlagConflictTests: XCTestCase {
+
+    /// Measured against clap 4 with this project's own `ServerArgs` wiring,
+    /// including `#[arg(long, conflicts_with = "replace")]`.
+    private let flagConflict = """
+        error: the argument '--replace' cannot be used with '--no-replace'
+
+        Usage: tcr server --headless --replace
+
+        For more information, try '--help'.
+        """
+
+    func testAFlagConflictIsNotReportedAsAnOutdatedTool() {
+        let state = ServerController.classifyExit(
+            intent: .takeover, exitCode: 2, stderr: flagConflict
+        )
+        if case .toolTooOld = state {
+            XCTFail("a current binary would be sent to be rebuilt for no reason: \(state.summary)")
+        }
+        guard case .exited(let code, let message) = state else {
+            return XCTFail("a flag conflict is a bug in this app, reported verbatim, got \(state)")
+        }
+        XCTAssertEqual(code, 2)
+        XCTAssertTrue(message.contains("cannot be used with"))
+    }
+
+    /// The reason the collision cannot happen in the field, asserted rather than
+    /// assumed: no argument set this app can spawn carries both flags. Checked
+    /// across every set, not just the takeover one.
+    func testNoArgumentSetThisAppCanSpawnCarriesBothFlags() {
+        for arguments in [
+            ServerController.safeArguments,
+            ServerController.serverArguments,
+            ServerController.takeoverArguments,
+            ServerController.legacyTakeoverArguments,
+            ServerController.takeoverArgumentSet(.supported),
+            ServerController.takeoverArgumentSet(.unsupported),
+        ] {
+            XCTAssertFalse(
+                arguments.contains("--replace") && arguments.contains("--no-replace"),
+                "\(arguments) is now rejected by clap outright — tcr exits 2 and nothing starts"
+            )
+        }
     }
 }
 

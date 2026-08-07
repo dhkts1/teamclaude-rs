@@ -38,6 +38,14 @@ public final class ServerController: ObservableObject {
         /// there. Distinct from ``incumbentHoldsPort`` because on the takeover path
         /// that same condition is a failure, not the benign outcome.
         case takeoverRefused(message: String)
+        /// A process holds the port and answered nothing. It is not serving, and
+        /// it is not ours to signal. The most alarming state this app can report:
+        /// every session pointed at the port is failing right now.
+        case incumbentNotAnswering(message: String)
+        /// The incumbent is serving, but from a different build than the one on
+        /// disk. Benign next to ``incumbentNotAnswering`` — the proxy works, it is
+        /// merely old — so it is a note, not an alarm.
+        case incumbentIsStale(message: String)
         /// The child exited (or never started). Reported verbatim.
         case exited(exitCode: Int32, message: String)
         /// `tcr` could not be located.
@@ -68,6 +76,25 @@ public final class ServerController: ObservableObject {
                     process, because killing it would kill the Claude session \
                     running through it. Stop that process from its own terminal \
                     instead; retrying here will not change the outcome. \(message)
+                    """
+            case .incumbentNotAnswering(let message):
+                return """
+                    NOT SERVING — a process holds the port but answered nothing, \
+                    so requests through it are failing. It was left alone rather \
+                    than replaced: a proxy that was merely slow to answer would \
+                    lose its session→account pin map, so this app will not make \
+                    that call for you. "Take over port…" is the recovery. If a \
+                    takeover is what produced this, tcr declined to replace this \
+                    particular holder — a proxy hosted inside a `tcr run` process \
+                    is deliberately never replaced — and it has to be stopped from \
+                    its own terminal. \(message)
+                    """
+            case .incumbentIsStale(let message):
+                return """
+                    Already running — not ours, left alone. It is serving an older \
+                    build than the `tcr` on disk, so a fix you just built is not \
+                    live on the port. "Take over port…" replaces it, at the cost of \
+                    every live session's prompt cache. \(message)
                     """
             case .exited(let code, let message):
                 let detail = message.isEmpty ? "no output" : message
@@ -389,12 +416,44 @@ public final class ServerController: ObservableObject {
         case takeover
     }
 
+    /// The stand-down exit codes `tcr` defines at `src/main.rs:479-494`.
+    ///
+    /// A stand-down no longer always means exit 0. These two codes carry facts
+    /// about the incumbent that the *markers cannot*, because a stand-down prints
+    /// the same "another proxy holds" line in all three cases — only the code
+    /// separates a healthy incumbent from a wedged one.
+    ///
+    /// Keying on the code rather than on the prose is deliberate and matches the
+    /// Rust side's own reasoning: a verdict grepped out of a sentence is disarmed
+    /// by any rewording. It also survives a lost stderr, which is not theoretical
+    /// here — see ``ChildStderr``.
+    ///
+    /// Neither code can arrive from a `tcr` predating them: those builds exit 0,
+    /// 1 or 2, so reading 3 and 4 costs nothing in version-robustness.
+    enum StandDownExit {
+        /// The incumbent is serving an older build than the binary just run.
+        static let stale: Int32 = 3
+        /// The incumbent never answered the liveness probe. It holds the socket
+        /// and serves nothing.
+        static let notAnswering: Int32 = 4
+    }
+
     /// What clap prints when it is handed an argument the binary does not define.
     ///
-    /// Both spellings are kept: clap 4 says `unexpected argument '--replace'
-    /// found`, clap 3 said `Found argument '--replace' which wasn't expected`.
-    /// The binary is not ours to pin a version on — it is whatever `tcr` is
-    /// installed — so the older wording stays cheap insurance.
+    /// Measured against clap 4 with this project's own `ServerArgs` wiring rather
+    /// than recalled: `error: unexpected argument '--replace' found`, followed by
+    /// `tip: a similar argument exists: '--no-replace'`. The clap 3 spellings are
+    /// kept as cheap insurance, since the binary is whatever `tcr` is installed
+    /// and this app does not get to pin its version.
+    ///
+    /// Deliberately excludes the *conflict* wording. `--replace` together with
+    /// `--no-replace` is now a hard clap conflict which also exits 2, and it reads
+    /// `error: the argument '--replace' cannot be used with '--no-replace'` —
+    /// measured, same run. Matching that as "your tcr is too old" would tell an
+    /// operator to rebuild a perfectly current binary. It carries none of the
+    /// markers below, so it falls through to a verbatim `.exited(2, …)`, which is
+    /// the honest report: no path in this app builds both flags, so seeing it at
+    /// all would mean a bug here, not a stale CLI.
     nonisolated static let unknownArgumentMarkers = [
         "unexpected argument",
         "wasn't expected",
@@ -423,6 +482,13 @@ public final class ServerController: ObservableObject {
     ///
     /// A third outcome sits ahead of both: a `tcr` old enough to reject the
     /// arguments outright. See ``unknownArgumentMarkers``.
+    ///
+    /// And ahead of the markers sit the stand-down exit codes. Every stand-down
+    /// prints the same "another proxy holds" line, so on the marker alone all
+    /// three are indistinguishable and all three read as the benign "already
+    /// running". For exit 4 that is the inverse of the truth — the port is held by
+    /// something serving nothing — and a panel that says a wedged proxy is fine is
+    /// worse than one that says nothing at all. See ``StandDownExit``.
     public nonisolated static func classifyExit(
         intent: Intent = .safeStart,
         exitCode: Int32,
@@ -438,6 +504,16 @@ public final class ServerController: ObservableObject {
             unknownArgumentMarkers.contains(where: { trimmed.contains($0) })
         {
             return .toolTooOld(message: trimmed)
+        }
+        // Both intents, deliberately. On the takeover path these are still the
+        // more useful facts than "refused": exit 4 says the thing that kept the
+        // port is not serving, which `.takeoverRefused`'s wording ("the existing
+        // proxy is still serving") would flatly contradict.
+        if exitCode == StandDownExit.notAnswering {
+            return .incumbentNotAnswering(message: trimmed)
+        }
+        if exitCode == StandDownExit.stale {
+            return .incumbentIsStale(message: trimmed)
         }
         if incumbentMarkers.contains(where: { trimmed.contains($0) }) {
             switch intent {
