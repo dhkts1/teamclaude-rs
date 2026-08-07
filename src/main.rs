@@ -857,6 +857,92 @@ mod tests {
         );
     }
 
+    /// THE EXIT CODES ARE A CROSS-LANGUAGE CONTRACT, exactly like
+    /// `singleton::INCUMBENT_MARKER`, and nothing but this test couples them.
+    ///
+    /// TcrBar switches on the numbers: `ServerController.StandDownExit` in
+    /// `apps/macos/Sources/TcrBarCore/ServerController.swift` declares
+    /// `stale = 3` and `notAnswering = 4`, and `classifyExit` turns them into
+    /// `.incumbentIsStale` and `.incumbentNotAnswering`. Renumbering a constant
+    /// here is a one-character edit that every other Rust test survives, while
+    /// the menu-bar app silently falls through to a bare `.exited(5, …)` and
+    /// reports a wedged proxy — one serving NOTHING — as a clean exit. That is
+    /// the misreport this whole round exists to eliminate.
+    ///
+    /// The numbers are SPELLED OUT rather than referenced through the constants,
+    /// deliberately: `assert_eq!(EXIT_STOOD_DOWN_STALE, EXIT_STOOD_DOWN_STALE)`
+    /// compares a value with itself and passes for every value of it. The
+    /// constant is the thing that must not drift, so the test has to hold the
+    /// other copy — the one Swift carries.
+    #[test]
+    fn the_stand_down_exit_codes_are_the_numbers_tcrbar_switches_on() {
+        // Transcribed from ServerController.StandDownExit.
+        let tcrbar_stale: i32 = 3;
+        let tcrbar_not_answering: i32 = 4;
+
+        assert_eq!(
+            EXIT_STOOD_DOWN_OK, 0,
+            "a clean stand-down is success; anything else fails every `tcr && next`"
+        );
+        assert_eq!(
+            EXIT_STOOD_DOWN_STALE, tcrbar_stale,
+            "ServerController.StandDownExit.stale is 3 — change one, change both"
+        );
+        assert_eq!(
+            EXIT_STOOD_DOWN_NOT_ANSWERING, tcrbar_not_answering,
+            "ServerController.StandDownExit.notAnswering is 4 — change one, change both"
+        );
+
+        // The constants being right is worthless if the mapping does not emit
+        // them, so the contract is asserted through the function TcrBar's input
+        // actually comes from, against the same literals.
+        assert_eq!(
+            stand_down_exit_code(&cli::Liveness::Answering, StandDownBuild::InSync),
+            0
+        );
+        assert_eq!(
+            stand_down_exit_code(&cli::Liveness::Answering, StandDownBuild::Stale),
+            3,
+            "a stale incumbent must reach Swift as .incumbentIsStale"
+        );
+        assert_eq!(
+            stand_down_exit_code(&silent(), StandDownBuild::Unknown),
+            4,
+            "a wedged incumbent must reach Swift as .incumbentNotAnswering"
+        );
+
+        // Liveness outranks build skew across the boundary too: a proxy that
+        // answers nothing is not merely stale, and 4 must win over 3 — the
+        // operator's next command differs (recover, not upgrade).
+        assert_eq!(
+            stand_down_exit_code(&silent(), StandDownBuild::Stale),
+            4,
+            "NOT SERVING outranks a stale build; reporting 3 here understates it"
+        );
+
+        // Three outcomes, three codes. Two of them collapsing would make the
+        // Swift switch pick one arm for both.
+        let codes = [
+            EXIT_STOOD_DOWN_OK,
+            EXIT_STOOD_DOWN_STALE,
+            EXIT_STOOD_DOWN_NOT_ANSWERING,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            for b in &codes[i + 1..] {
+                assert_ne!(a, b, "the stand-down codes must stay distinct: {codes:?}");
+            }
+        }
+        // And neither may take a code that already means something else.
+        assert!(
+            !codes[1..].contains(&1),
+            "1 is a genuine startup failure (anyhow::Error out of main)"
+        );
+        assert!(
+            !codes[1..].contains(&2),
+            "2 is clap's usage error, which TcrBar maps to the unknown-argument hint"
+        );
+    }
+
     /// `--no-replace` is documented as a deprecated no-op, and used to be wired as
     /// a SILENT VETO over `--replace`: an operator whose launchd plist or alias
     /// already carried it, adding `--replace` to force a rebuilt binary onto the
