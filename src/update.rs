@@ -25,6 +25,22 @@
 //! *inside* the destination and finishes with a same-filesystem `mv`, i.e. an
 //! atomic `rename(2)`; reusing it means the atomic swap is the vendor's tested
 //! code path, not ours.
+//!
+//! What that installer download is NOT protected by, stated plainly because a
+//! file that documents every other defence makes silence read as "handled":
+//! **TLS and nothing else.** The release publishes no checksum for the
+//! installer script — `sha256.sum` covers the four platform tarballs and
+//! `source.tar.gz` only, there is no `teamclaude-rs-installer.sh.sha256`
+//! asset, and `dist-manifest.json` records `checksum: None` for it — so there
+//! is nothing to verify the script against and this code deliberately does not
+//! pretend otherwise. We fetch over HTTPS (`https_only`, so an https→http
+//! redirect cannot downgrade the hop), from a pinned `github.com` URL built
+//! from one repo constant, with every installer environment override scrubbed
+//! (see [`INSTALLER_ENV_OVERRIDES`]) so nothing in the caller's shell can
+//! redirect where the script is fetched from or written to. That is exactly the
+//! trust level of the documented `curl … | sh` bootstrap: you are trusting
+//! GitHub's TLS and the release contents. Anything stronger needs a signed or
+//! checksummed asset published upstream first.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -252,6 +268,114 @@ const INSTALLER_ASSET: &str = "teamclaude-rs-installer.sh";
 /// replacing a binary that is already installed and already on PATH.
 const UNMANAGED_INSTALL_ENV: &str = "TEAMCLAUDE_RS_UNMANAGED_INSTALL";
 
+/// The file name the installer writes into the install directory.
+const BINARY_NAME: &str = "tcr";
+
+/// Every environment variable the published installer honours that can move
+/// where it installs TO, where it downloads FROM, or what credential it sends —
+/// all of them scrubbed from the child before it runs.
+///
+/// A child process inherits the whole environment by default, so setting
+/// [`UNMANAGED_INSTALL_ENV`] and nothing else is not a choice of install
+/// directory, it is a *suggestion* that anything already exported in the user's
+/// shell (or by a direnv `.envrc`) outranks. Measured against the published
+/// installer, sha256 `d79d3de…`:
+///
+///   * `TEAMCLAUDE_RS_INSTALL_DIR` and `CARGO_DIST_FORCE_INSTALL_DIR` sit ABOVE
+///     `UNMANAGED_INSTALL` in the precedence chain (installer.sh:657-666), and
+///     the second selects the cargo-home layout that appends `/bin` — so an
+///     inherited one installs to `<dir>/bin/tcr`: the second-copy failure this
+///     whole path exists to prevent, while we print a directory nothing was
+///     written to.
+///   * `TEAMCLAUDE_RS_DOWNLOAD_URL`, `INSTALLER_DOWNLOAD_URL`,
+///     `TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL` and
+///     `TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL` (installer.sh:28-37) replace
+///     the artifact download URLs wholesale, `http://` included. The binary we
+///     are about to put on the user's PATH would come from there.
+///   * `TEAMCLAUDE_RS_GITHUB_TOKEN` (installer.sh:66, 1523-1530) is sent as an
+///     `Authorization: Bearer` header to whatever those URLs point at. A
+///     poisoned URL plus an inherited token is token exfiltration. The releases
+///     are public, so the installer never needs a credential from us.
+const INSTALLER_ENV_OVERRIDES: [&str; 7] = [
+    "TEAMCLAUDE_RS_INSTALL_DIR",
+    "CARGO_DIST_FORCE_INSTALL_DIR",
+    "TEAMCLAUDE_RS_DOWNLOAD_URL",
+    "INSTALLER_DOWNLOAD_URL",
+    "TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL",
+    "TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL",
+    "TEAMCLAUDE_RS_GITHUB_TOKEN",
+];
+
+/// Remove every [`INSTALLER_ENV_OVERRIDES`] entry from a child's environment.
+///
+/// `env_remove` is not "leave it unset": it records a removal that beats both
+/// inheritance and an earlier `.env()` on the same key, which is what makes the
+/// scrub testable against a variable that would otherwise have won.
+fn scrub_installer_env(cmd: &mut Command) {
+    for key in INSTALLER_ENV_OVERRIDES {
+        cmd.env_remove(key);
+    }
+}
+
+/// The installer invocation: scrubbed environment, then exactly one override —
+/// the flat-layout install directory. Order matters, and the scrub goes first
+/// so it can never remove the variable we are deliberately setting.
+fn installer_command(staged: &Path, install_dir: &Path) -> Command {
+    let mut cmd = Command::new(staged);
+    scrub_installer_env(&mut cmd);
+    cmd.env(UNMANAGED_INSTALL_ENV, install_dir);
+    cmd
+}
+
+/// Confirm the installer actually wrote the binary before we claim it did.
+///
+/// A zero exit is the installer's own report, not an observation of the
+/// filesystem, and this module already refuses to name an artifact it has not
+/// seen (see the built-binary branch in [`update_checkout`]). Same rule here:
+/// if `<install_dir>/tcr` is not there, the update failed no matter what the
+/// exit code said, and saying otherwise sends the user off to debug a stale
+/// binary they were told had been replaced.
+fn verify_installed_binary(install_dir: &Path, tag: &str) -> anyhow::Result<PathBuf> {
+    let binary = install_dir.join(BINARY_NAME);
+    if !binary.exists() {
+        bail!(
+            "the {tag} installer reported success, but {} does not exist — the update did NOT \
+             land where the running binary lives. Check whether a second copy was written \
+             elsewhere (look for {}/bin/{BINARY_NAME}), then re-run `tcr update`.",
+            binary.display(),
+            install_dir.display()
+        );
+    }
+    Ok(binary)
+}
+
+/// Remove a staging directory, loudly on failure. Called on EVERY path out of
+/// the install step — a `?` that skipped it left the script in TMPDIR forever.
+fn clean_up_staging(staged: &Path) {
+    let Some(dir) = staged.parent() else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_dir_all(dir) {
+        eprintln!("tcr: could not clean up {}: {err}", dir.display());
+    }
+}
+
+/// Run the staged installer and clean up the staging directory, whatever
+/// happens.
+///
+/// Cleanup ran only on the success path before: the `?` on the spawn result
+/// returned first, so an installer that could not be executed at all left its
+/// directory in TMPDIR forever. The status is captured, the staging dir is
+/// removed, and only then is the spawn error propagated.
+///
+/// Stdio is inherited so the installer's own progress and errors are the user's
+/// progress and errors — we add nothing by capturing and re-printing them.
+fn run_installer(staged: &Path, install_dir: &Path) -> anyhow::Result<std::process::ExitStatus> {
+    let spawned = installer_command(staged, install_dir).status();
+    clean_up_staging(staged);
+    spawned.with_context(|| format!("failed to run the installer at {}", staged.display()))
+}
+
 /// What the version comparison decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateDecision {
@@ -299,6 +423,14 @@ fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 ///
 /// An UNPARSEABLE version is deliberately not treated as a match: we install,
 /// rather than silently skipping an update because we could not read a string.
+///
+/// A NUMERICALLY EQUAL pair is a match even when the strings differ. The string
+/// compare above only catches textually identical versions, so without the
+/// `Equal` arm below `0.1.0` vs `v0.1.0-rc1` fell through to `Install`: running
+/// `tcr update` on a stable build would download and execute the installer for
+/// a PRERELEASE of the same version, and do it again on every single
+/// invocation, which is precisely the download-per-run the API-first check
+/// exists to avoid. Same for `v0.1.0+build7`, `v0.1.0.0` and `v0.01.0`.
 pub fn decide_update(current: &str, latest_tag: &str, force: bool) -> UpdateDecision {
     if force {
         return UpdateDecision::Install;
@@ -309,6 +441,7 @@ pub fn decide_update(current: &str, latest_tag: &str, force: bool) -> UpdateDeci
     }
     match compare_versions(current, latest) {
         Some(std::cmp::Ordering::Greater) => UpdateDecision::RunningNewer,
+        Some(std::cmp::Ordering::Equal) => UpdateDecision::AlreadyCurrent,
         _ => UpdateDecision::Install,
     }
 }
@@ -328,16 +461,61 @@ pub fn latest_release_api_url() -> String {
 /// Tag-pinned, not `/releases/latest/download/…`: we already resolved the tag
 /// when we decided to update, and a release cut between those two requests
 /// would otherwise install a version we never compared against.
-pub fn installer_url_for_tag(tag: &str) -> String {
-    format!("https://github.com/{RELEASE_REPO}/releases/download/{tag}/{INSTALLER_ASSET}")
+///
+/// Fallible because the tag is interpolated into a URL PATH. It arrives from
+/// the API response body, and an unvalidated one does not stay inside
+/// `RELEASE_REPO`: a `tag_name` of `../../../../attacker/evil/releases/download/v1`
+/// resolves — measured — to an asset on a different account, i.e. this function
+/// would hand back a URL for a script we then execute. Git's own refname rules
+/// reject `..`, so reachability is low, but the repo pin is the whole security
+/// property of the URL and it costs one check to actually hold.
+pub fn installer_url_for_tag(tag: &str) -> anyhow::Result<String> {
+    validate_release_tag(tag)?;
+    Ok(format!(
+        "https://github.com/{RELEASE_REPO}/releases/download/{tag}/{INSTALLER_ASSET}"
+    ))
+}
+
+/// Accept only a release tag shape: `^v?[0-9A-Za-z][0-9A-Za-z.+_-]*$`.
+///
+/// Written as an explicit character test rather than a regex because the crate
+/// has no regex dependency and this does not justify one. Rejecting is LOUD —
+/// an error the caller propagates — never a fallback to some default tag.
+fn validate_release_tag(tag: &str) -> anyhow::Result<()> {
+    let bad = |why: &str| -> anyhow::Error {
+        anyhow::anyhow!(
+            "the release tag {tag:?} is not a valid tag ({why}) — refusing to build a download \
+             URL from it, because a tag is interpolated into the URL path and could otherwise \
+             point outside {RELEASE_REPO}."
+        )
+    };
+    let mut chars = tag.chars();
+    let first = chars.next().ok_or_else(|| bad("it is empty"))?;
+    if !first.is_ascii_alphanumeric() {
+        return Err(bad("it does not start with an ASCII letter or digit"));
+    }
+    if let Some(c) =
+        chars.find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '_' | '-')))
+    {
+        return Err(bad(&format!("it contains {c:?}")));
+    }
+    Ok(())
 }
 
 /// Extract `tag_name` from the GitHub "latest release" JSON.
+///
+/// Validated at this ingress too, not only at the URL builder: a tag that
+/// cannot name a release is a broken response, and failing here means the
+/// version comparison never runs against a string we already know is junk.
 pub fn parse_latest_tag(body: &str) -> anyhow::Result<String> {
     let json: serde_json::Value =
         serde_json::from_str(body).context("the GitHub releases API did not return valid JSON")?;
     match json.get("tag_name").and_then(|v| v.as_str()) {
-        Some(tag) if !tag.trim().is_empty() => Ok(tag.trim().to_string()),
+        Some(tag) if !tag.trim().is_empty() => {
+            let tag = tag.trim();
+            validate_release_tag(tag)?;
+            Ok(tag.to_string())
+        }
         _ => bail!("the GitHub releases API response has no usable `tag_name` field"),
     }
 }
@@ -372,6 +550,14 @@ fn fetch_bytes(url: &str, accept: &str) -> anyhow::Result<Vec<u8>> {
             let client = reqwest::Client::builder()
                 // GitHub's API rejects requests without a User-Agent.
                 .user_agent(concat!("tcr/", env!("CARGO_PKG_VERSION")))
+                // Both URLs this ever fetches are HTTPS, so refusing plaintext
+                // costs nothing and closes the one hop that is not obviously
+                // covered: reqwest 0.12 defaults `https_only` to FALSE and its
+                // redirect policy only rejects schemes that are not http(s), so
+                // an https→http redirect is FOLLOWED. The installer script is
+                // executed and is published with no checksum or signature (see
+                // the module doc), so TLS is the entire chain of custody.
+                .https_only(true)
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .context("could not build the HTTP client")?;
@@ -400,9 +586,17 @@ fn fetch_bytes(url: &str, accept: &str) -> anyhow::Result<Vec<u8>> {
 
 /// Write the installer into a fresh private directory and mark it executable.
 ///
-/// The directory is created 0700 and freshly named. `/tmp` is world-writable, so
-/// a predictable path would let any local user pre-create it and swap the script
-/// we are about to run as ourselves.
+/// The directory is created 0700 and freshly named, and the two properties do
+/// different jobs — an earlier version of this comment credited the wrong one.
+///
+/// The 0700 MODE is what stops a script swap: `/tmp` is world-writable, but a
+/// directory only we can write is one only we can drop a file into. The fresh
+/// NAME is not a second lock on that door — [`std::fs::DirBuilder::create`] is a
+/// non-recursive `mkdir(2)`, so a path another local user pre-created (or
+/// symlinked) fails `EEXIST` and the update stops loudly. That is a denial of
+/// service, not a swap. What the nanos+pid suffix actually buys is avoiding
+/// SELF-collision — two stagings in one process, which is what
+/// `stage_installer_uses_a_fresh_directory_each_time` asserts.
 fn stage_installer(script: &[u8]) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 
@@ -457,25 +651,12 @@ fn update_installed(force: bool) -> anyhow::Result<()> {
         }
     }
 
-    let url = installer_url_for_tag(&tag);
+    let url = installer_url_for_tag(&tag)?;
     let script = fetch_bytes(&url, "application/octet-stream")
         .with_context(|| format!("could not download the installer from {url}"))?;
     let staged = stage_installer(&script)?;
 
-    // Stdio inherited so the installer's own progress and errors are the user's
-    // progress and errors — we add nothing by capturing and re-printing them.
-    let status = Command::new(&staged)
-        .env(UNMANAGED_INSTALL_ENV, &install_dir)
-        .status()
-        .with_context(|| format!("failed to run the installer at {}", staged.display()))?;
-
-    // Best effort, and loud when it fails: a leftover staging dir is harmless,
-    // but silently swallowing the error would hide a filesystem problem.
-    if let Some(dir) = staged.parent() {
-        if let Err(err) = std::fs::remove_dir_all(dir) {
-            eprintln!("tcr: could not clean up {}: {err}", dir.display());
-        }
-    }
+    let status = run_installer(&staged, &install_dir)?;
 
     if !status.success() {
         bail!(
@@ -484,10 +665,12 @@ fn update_installed(force: bool) -> anyhow::Result<()> {
         );
     }
 
+    let binary = verify_installed_binary(&install_dir, &tag)?;
+
     println!(
-        "tcr: installed {tag} into {}.\n\
+        "tcr: installed {tag} at {}.\n\
          tcr: this process is still running {current} — restart tcr to run the new build.",
-        install_dir.display()
+        binary.display()
     );
     Ok(())
 }
@@ -978,12 +1161,51 @@ mod tests {
             decide_update("0.10.0", "v0.9.0", false),
             UpdateDecision::RunningNewer
         );
-        // Zero-padded compare: 0.2 and 0.2.0 are the same version.
+        assert_eq!(compare_versions("0.2", "0.2.0"), Some(Ordering::Equal));
+    }
+
+    /// Numerically equal but textually different tags are ALREADY CURRENT, not
+    /// an install. Without the `Equal` arm each of these fell through to
+    /// `Install`: `0.1.0` would download and execute the installer for a
+    /// PRERELEASE of its own version — a downgrade in everything but the number
+    /// — and would do it again on every invocation, which is exactly the
+    /// download-per-run that `equal_versions_skip_the_download` exists to
+    /// forbid.
+    #[test]
+    fn numerically_equal_tags_are_already_current() {
+        for tag in [
+            "v0.1.0-rc1",
+            "v0.1.0+build7",
+            "v0.1.0.0",
+            "v0.01.0",
+            "0.1.0-alpha.1",
+        ] {
+            assert_eq!(
+                decide_update("0.1.0", tag, false),
+                UpdateDecision::AlreadyCurrent,
+                "tag {tag} is version 0.1.0, so it must not trigger an install"
+            );
+        }
+        // Zero-padded compare: 0.2 and 0.2.0 are the same version, in both
+        // directions.
         assert_eq!(
             decide_update("0.2", "v0.2.0", false),
+            UpdateDecision::AlreadyCurrent
+        );
+        assert_eq!(
+            decide_update("0.2.0", "v0.2", false),
+            UpdateDecision::AlreadyCurrent
+        );
+        // A local pre-release of the same number is not an update either.
+        assert_eq!(
+            decide_update("0.1.0-dev", "v0.1.0", false),
+            UpdateDecision::AlreadyCurrent
+        );
+        // …and none of this weakens --force.
+        assert_eq!(
+            decide_update("0.1.0", "v0.1.0-rc1", true),
             UpdateDecision::Install
         );
-        assert_eq!(compare_versions("0.2", "0.2.0"), Some(Ordering::Equal));
     }
 
     /// `--force` is the escape hatch for a version string that lies (a binary
@@ -1009,10 +1231,6 @@ mod tests {
     /// a string is not evidence that we are up to date.
     #[test]
     fn unparseable_versions_install_rather_than_skip() {
-        assert_eq!(
-            decide_update("0.1.0-dev", "v0.1.0", false),
-            UpdateDecision::Install
-        );
         assert_eq!(
             decide_update("main", "v0.1.0", false),
             UpdateDecision::Install
@@ -1055,13 +1273,61 @@ mod tests {
             "https://api.github.com/repos/dhkts1/teamclaude-rs/releases/latest"
         );
         assert_eq!(
-            installer_url_for_tag("v0.1.0"),
+            installer_url_for_tag("v0.1.0").unwrap(),
             "https://github.com/dhkts1/teamclaude-rs/releases/download/v0.1.0/teamclaude-rs-installer.sh"
         );
         // Tag-pinned, NOT /releases/latest/download/…: a release cut between the
         // API query and the download would otherwise install a version we never
         // compared against.
-        assert!(!installer_url_for_tag("v0.1.0").contains("/latest/"));
+        assert!(!installer_url_for_tag("v0.1.0")
+            .unwrap()
+            .contains("/latest/"));
+    }
+
+    /// The tag is interpolated into a URL PATH, so the repo pin is only real if
+    /// the tag cannot escape it. `../../../../attacker/evil/releases/download/v1`
+    /// resolves to an asset on a different account — and that asset is a script
+    /// we execute.
+    #[test]
+    fn a_tag_cannot_escape_the_pinned_repo() {
+        for tag in [
+            "../../../../attacker/evil/releases/download/v1",
+            "..",
+            "v1.0.0/../../other",
+            "v1.0.0?x=y",
+            "v1.0.0#frag",
+            "v1.0.0 v2.0.0",
+            "-v1.0.0",
+            ".v1.0.0",
+            "/v1.0.0",
+            "v1.0.0%2f..",
+            "v1.0.0\nv2",
+            "",
+        ] {
+            assert!(
+                installer_url_for_tag(tag).is_err(),
+                "tag {tag:?} must be rejected, not turned into a download URL"
+            );
+            assert!(
+                validate_release_tag(tag).is_err(),
+                "tag {tag:?} must be rejected"
+            );
+        }
+
+        // …while every shape a real release tag takes still works.
+        for tag in ["v0.1.0", "0.1.0", "v0.1.0-rc1", "v0.1.0+build7", "v1_2"] {
+            assert!(
+                validate_release_tag(tag).is_ok(),
+                "tag {tag:?} is a legitimate release tag and must be accepted"
+            );
+            assert!(installer_url_for_tag(tag)
+                .unwrap()
+                .starts_with("https://github.com/dhkts1/teamclaude-rs/releases/download/"));
+        }
+
+        // The same rejection happens at the API ingress, so a poisoned
+        // `tag_name` never even reaches the version comparison.
+        assert!(parse_latest_tag(r#"{"tag_name":"../../attacker/evil"}"#).is_err());
     }
 
     /// Measured against the published v0.1.0 installer, both directions:
@@ -1165,5 +1431,200 @@ mod tests {
         assert_ne!(a.parent(), b.parent());
         fs::remove_dir_all(a.parent().unwrap()).ok();
         fs::remove_dir_all(b.parent().unwrap()).ok();
+    }
+
+    // -- installed-copy update: the installer child's environment ------------
+
+    /// A stand-in for the published installer that reimplements its install-dir
+    /// precedence chain (installer.sh:657-666) and records where it decided to
+    /// write. Enough to make an inherited override actually WIN, which is the
+    /// failure the scrub exists to stop.
+    fn fake_installer(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = dir.join("fake-installer.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             if [ -n \"${TEAMCLAUDE_RS_INSTALL_DIR:-}\" ]; then\n\
+             \x20 d=\"$TEAMCLAUDE_RS_INSTALL_DIR\"\n\
+             elif [ -n \"${CARGO_DIST_FORCE_INSTALL_DIR:-}\" ]; then\n\
+             \x20 d=\"$CARGO_DIST_FORCE_INSTALL_DIR/bin\"\n\
+             elif [ -n \"${TEAMCLAUDE_RS_UNMANAGED_INSTALL:-}\" ]; then\n\
+             \x20 d=\"$TEAMCLAUDE_RS_UNMANAGED_INSTALL\"\n\
+             else\n\
+             \x20 d=\"$HOME/.local/bin\"\n\
+             fi\n\
+             mkdir -p \"$d\" && printf 'fake' > \"$d/tcr\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    /// Every variable that can redirect the installer must be REMOVED from the
+    /// child, not merely left unset — the child inherits our whole environment,
+    /// so "we did not set it" is not the same as "it is not set".
+    #[test]
+    fn the_installer_child_has_every_override_scrubbed() {
+        let base = scratch("scrub-envs");
+        let cmd = installer_command(&base.join("installer.sh"), &base);
+
+        let envs: Vec<(String, Option<String>)> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+
+        for key in INSTALLER_ENV_OVERRIDES {
+            assert!(
+                envs.iter().any(|(k, v)| k == key && v.is_none()),
+                "{key} is not scrubbed from the installer child: {envs:?}"
+            );
+        }
+        // The six named in review, spelled out so a rename cannot quietly drop
+        // one from the array and still pass the loop above.
+        for key in [
+            "TEAMCLAUDE_RS_INSTALL_DIR",
+            "CARGO_DIST_FORCE_INSTALL_DIR",
+            "TEAMCLAUDE_RS_DOWNLOAD_URL",
+            "INSTALLER_DOWNLOAD_URL",
+            "TEAMCLAUDE_RS_INSTALLER_GHE_BASE_URL",
+            "TEAMCLAUDE_RS_INSTALLER_GITHUB_BASE_URL",
+            // …plus the credential, which is what a poisoned URL would steal.
+            "TEAMCLAUDE_RS_GITHUB_TOKEN",
+        ] {
+            assert!(
+                envs.iter().any(|(k, v)| k == key && v.is_none()),
+                "{key} must be removed from the installer child"
+            );
+        }
+        // …and the one variable we DO set survives the scrub.
+        assert!(envs
+            .iter()
+            .any(|(k, v)| k == UNMANAGED_INSTALL_ENV
+                && v.as_deref() == Some(&*base.to_string_lossy())));
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The scrub proved against a variable that would otherwise have WON.
+    /// `env_remove` overrides an explicit `env()` on the same key exactly as it
+    /// overrides inheritance, so setting the poison var on the command is a
+    /// faithful stand-in for finding it in the user's shell — and the control
+    /// run shows the poison really does beat our override when nothing scrubs
+    /// it.
+    #[test]
+    fn an_inherited_install_dir_cannot_beat_the_scrub() {
+        let base = scratch("scrub-wins");
+        let script = fake_installer(&base);
+        let intended = base.join("intended");
+        let attacker = base.join("attacker");
+        fs::create_dir_all(&intended).unwrap();
+
+        // CONTROL: no scrub — the inherited variable wins and the binary lands
+        // somewhere we never asked for, while `intended` stays empty.
+        let control = Command::new(&script)
+            .env("TEAMCLAUDE_RS_INSTALL_DIR", &attacker)
+            .env(UNMANAGED_INSTALL_ENV, &intended)
+            .status()
+            .unwrap();
+        assert!(control.success());
+        assert!(
+            attacker.join("tcr").exists(),
+            "control is broken: the fake installer never honoured the poison var"
+        );
+        assert!(
+            !intended.join("tcr").exists(),
+            "control is broken: the poison var did not actually win"
+        );
+        fs::remove_dir_all(&attacker).unwrap();
+
+        // PROOF: the same poison var, scrubbed by installer_command — the
+        // binary lands in the directory we asked for and nowhere else.
+        let mut cmd = Command::new(&script);
+        cmd.env("TEAMCLAUDE_RS_INSTALL_DIR", &attacker);
+        scrub_installer_env(&mut cmd);
+        cmd.env(UNMANAGED_INSTALL_ENV, &intended);
+        assert!(cmd.status().unwrap().success());
+        assert!(
+            intended.join("tcr").exists(),
+            "the scrubbed run did not install into the intended directory"
+        );
+        assert!(
+            !attacker.join("tcr").exists(),
+            "the poison var still redirected the install"
+        );
+
+        // Same for the cargo-home-layout variable, which appends /bin.
+        let second = base.join("second");
+        fs::create_dir_all(&second).unwrap();
+        let mut cmd = Command::new(&script);
+        cmd.env("CARGO_DIST_FORCE_INSTALL_DIR", &attacker);
+        scrub_installer_env(&mut cmd);
+        cmd.env(UNMANAGED_INSTALL_ENV, &second);
+        assert!(cmd.status().unwrap().success());
+        assert!(second.join("tcr").exists());
+        assert!(!attacker.join("bin").join("tcr").exists());
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A zero exit is the installer's claim, not an observation. If the binary
+    /// is not there, the update failed — printing the directory anyway is the
+    /// same lie as naming a built binary that does not exist.
+    #[test]
+    fn success_is_not_claimed_when_the_binary_is_absent() {
+        let base = scratch("verify-installed");
+        assert!(
+            verify_installed_binary(&base, "v0.1.0").is_err(),
+            "an empty install dir must not read as a successful install"
+        );
+
+        // A second copy under <dir>/bin — the failure shape an unscrubbed
+        // CARGO_DIST_FORCE_INSTALL_DIR produces — is still not an install here.
+        fs::create_dir_all(base.join("bin")).unwrap();
+        fs::write(base.join("bin").join(BINARY_NAME), b"fake").unwrap();
+        assert!(verify_installed_binary(&base, "v0.1.0").is_err());
+
+        // And the real thing is accepted, at the path that gets printed.
+        fs::write(base.join(BINARY_NAME), b"fake").unwrap();
+        assert_eq!(
+            verify_installed_binary(&base, "v0.1.0").unwrap(),
+            base.join(BINARY_NAME)
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A staged installer that cannot be executed at all must not leave its
+    /// directory behind in the world-writable temp root.
+    #[test]
+    fn a_failed_spawn_still_removes_the_staging_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = scratch("staging-cleanup");
+        let staged = stage_installer(b"#!/bin/sh\nexit 0\n").unwrap();
+        let dir = staged.parent().unwrap().to_path_buf();
+
+        // Not executable → the spawn itself fails, which is the path that used
+        // to return before any cleanup ran.
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(run_installer(&staged, &base).is_err());
+        assert!(
+            !dir.exists(),
+            "the staging directory {} survived a failed spawn",
+            dir.display()
+        );
+
+        // The success path cleans up too.
+        let staged = stage_installer(b"#!/bin/sh\nexit 0\n").unwrap();
+        let dir = staged.parent().unwrap().to_path_buf();
+        assert!(run_installer(&staged, &base).unwrap().success());
+        assert!(!dir.exists());
+
+        fs::remove_dir_all(&base).ok();
     }
 }
