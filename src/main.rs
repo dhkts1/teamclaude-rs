@@ -186,9 +186,16 @@ struct ServerArgs {
     replace: bool,
     /// DEPRECATED and now a no-op: this is the default. Kept accepted so existing
     /// scripts and launch agents that pass it keep working. Pass `--replace` for
-    /// the old default (take the port over); if both are given, this one wins,
-    /// since the safe outcome is the one that touches nothing.
-    #[arg(long)]
+    /// the old default (take the port over).
+    ///
+    /// `conflicts_with` rather than a silent precedence rule: the two flags are a
+    /// contradiction, and the previous wiring resolved it by quietly discarding
+    /// `--replace`. An operator whose launchd plist or shell alias already carries
+    /// `--no-replace`, adding `--replace` to force a rebuilt binary onto the port,
+    /// got a stand-down and exit 0 — while `--help` told them the flag they left
+    /// in place does nothing. clap now rejects the pair by name, which is the only
+    /// outcome that cannot be misread.
+    #[arg(long, conflicts_with = "replace")]
     no_replace: bool,
 }
 
@@ -467,6 +474,48 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A stand-down that resolved cleanly: a peer proxy holds the port and is
+/// serving this binary's code (or something we have no reason to doubt).
+const EXIT_STOOD_DOWN_OK: i32 = 0;
+/// A stand-down where the incumbent is serving a DIFFERENT commit than the
+/// binary that was just run.
+///
+/// `cargo build && tcr` used to GUARANTEE the new binary was serving; standing
+/// down silently broke that guarantee, and a warning on stderr is routinely
+/// unread in a headless or piped context. This is the machine-readable half, so
+/// `tcr && <next step>` stops instead of proceeding as if the new build were
+/// live. Not `1`: that is a genuine startup failure, and not `2`, which clap
+/// uses for a usage error.
+const EXIT_STOOD_DOWN_STALE: i32 = 3;
+/// A stand-down where the incumbent never answered the liveness probe — it holds
+/// the listening socket and serves nothing. Distinct from [`EXIT_STOOD_DOWN_STALE`]
+/// because the operator's next command is different: `--replace` is a recovery
+/// here, not an upgrade.
+const EXIT_STOOD_DOWN_NOT_ANSWERING: i32 = 4;
+
+/// The stand-down's exit code, as a pure function of what was actually measured.
+///
+/// Keyed on the probe's verdict values, never on the rendered sentence: an exit
+/// code grepped out of our own prose is a gate any rewording silently disarms.
+///
+/// Liveness outranks build skew because it is the more urgent fact — nothing is
+/// serving at all — and because a proxy that would not answer also could not
+/// report a build, so its build verdict is `Unknown` by construction.
+fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDownBuild) -> i32 {
+    if matches!(liveness, cli::Liveness::Silent { .. }) {
+        return EXIT_STOOD_DOWN_NOT_ANSWERING;
+    }
+    match verdict {
+        build_info::StandDownBuild::Stale => EXIT_STOOD_DOWN_STALE,
+        // `Unknown` stays 0: an older tcr that answers but ships no build stamp
+        // is a working proxy, and failing every such start would be noise for a
+        // question that was never answered either way.
+        build_info::StandDownBuild::InSync
+        | build_info::StandDownBuild::DirtyBuild
+        | build_info::StandDownBuild::Unknown => EXIT_STOOD_DOWN_OK,
+    }
+}
+
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let (mut config, persist_path) = load_config(&config_path);
@@ -479,24 +528,43 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
     // so our own startup can never token-war with the incumbent. Only a
-    // command-verified teamclaude/tcr server on THIS port is ever signalled — and
-    // only under `--replace`. `--no-replace` is the default now, so passing it
-    // simply withholds `--replace`.
-    if let singleton::Takeover::IncumbentPresent(_pid) =
-        singleton::takeover_port(port, args.replace && !args.no_replace)
+    // command-verified teamclaude/tcr server on THIS port is ever signalled — a
+    // `tcr` peer only under `--replace`, a legacy JS `teamclaude` always, since
+    // displacing that one is what the takeover exists for. `--no-replace` is the
+    // default now, and clap rejects it alongside `--replace`.
+    if let singleton::Takeover::IncumbentPresent(pid) = singleton::takeover_port(port, args.replace)
     {
+        // ONE probe of the incumbent, answering two questions: which build it is
+        // executing, and whether it is executing anything at all.
+        let probe = cli::probe_incumbent(&config).await;
+        // Read the checkout LIVE. The build stamps alone cannot see an edit made
+        // since the last commit (build.rs re-runs only when a git ref moves), so
+        // comparing two stamps would print "build in sync" for a proxy that
+        // predates the edit — see `build_info::stand_down_build_report`.
+        let checkout = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| build_info::find_tcr_checkout(&cwd))
+            .map(|root| build_info::read_checkout_state(&root, build_info::SHA));
         // Standing down is cheap and correct, but silent success here would mean
         // `cargo build && tcr` exits 0 with the OLD build still serving — say which
         // build actually holds the port before we go.
-        eprintln!(
-            "{}",
-            build_info::stand_down_build_line(
-                port,
-                &build_info::BuildInfo::current(),
-                cli::live_server_build(&config).await.as_ref(),
-            )
+        let report = build_info::stand_down_build_report(
+            port,
+            &build_info::BuildInfo::current(),
+            probe.build.as_ref(),
+            checkout.as_ref(),
         );
-        return Ok(());
+        eprintln!("{}", report.line);
+        if let cli::Liveness::Silent { why } = &probe.liveness {
+            eprintln!(
+                "[tcr] WARNING incumbent-not-answering: port={port} pid={pid} probe={why:?} — the \
+                 process holding :{port} did not respond, so standing down leaves NOTHING serving \
+                 on it. Run `tcr --replace` to take the port over; that is the recovery for a \
+                 wedged proxy, and it is not being done automatically because it also wipes the \
+                 pin map of a proxy that was merely slow to answer."
+            );
+        }
+        std::process::exit(stand_down_exit_code(&probe.liveness, report.verdict));
     }
 
     let manager = Manager::with_live_refresher(config, persist_path);
@@ -726,7 +794,104 @@ fn init_tracing(headless: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use build_info::StandDownBuild;
+    use clap::Parser as _;
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+    fn silent() -> cli::Liveness {
+        cli::Liveness::Silent {
+            why: "the server did not answer within 5s".to_string(),
+        }
+    }
+
+    /// The ordinary stand-down: a peer is serving this binary's commit. Exit 0,
+    /// or every `tcr` in a script becomes a failure.
+    #[test]
+    fn a_clean_stand_down_exits_zero() {
+        for verdict in [
+            StandDownBuild::InSync,
+            StandDownBuild::DirtyBuild,
+            StandDownBuild::Unknown,
+        ] {
+            assert_eq!(
+                stand_down_exit_code(&cli::Liveness::Answering, verdict),
+                0,
+                "{verdict:?} is a working incumbent"
+            );
+        }
+    }
+
+    /// DETECTED BUILD SKEW MUST NOT EXIT 0. The whole point of the stale-server
+    /// warning is that `cargo build && tcr` no longer guarantees the new binary
+    /// is serving; returning success anyway leaves the guarantee broken for every
+    /// script, CI step and launchd job, which read the code and not the stderr.
+    #[test]
+    fn a_stale_incumbent_exits_non_zero() {
+        let code = stand_down_exit_code(&cli::Liveness::Answering, StandDownBuild::Stale);
+        assert_ne!(code, 0, "a detected skew must be visible to `tcr && next`");
+        assert_ne!(code, 1, "1 is a genuine startup failure");
+        assert_ne!(code, 2, "2 is clap's usage error");
+        assert_eq!(code, EXIT_STOOD_DOWN_STALE);
+    }
+
+    /// THE WEDGED PROXY. Nothing is serving on the port, so exiting 0 tells every
+    /// caller — and TcrBar — that the server is up. The code has to say
+    /// otherwise, and it outranks the build verdict: a proxy that will not answer
+    /// cannot report a build either, so `Unknown` is what it always comes with.
+    #[test]
+    fn a_silent_incumbent_exits_its_own_non_zero_code() {
+        assert_eq!(
+            stand_down_exit_code(&silent(), StandDownBuild::Unknown),
+            EXIT_STOOD_DOWN_NOT_ANSWERING
+        );
+        assert_ne!(EXIT_STOOD_DOWN_NOT_ANSWERING, 0);
+        assert_ne!(
+            EXIT_STOOD_DOWN_NOT_ANSWERING, EXIT_STOOD_DOWN_STALE,
+            "the two need different recoveries, so they need different codes"
+        );
+        // Liveness outranks every build verdict, including a comparable one.
+        assert_eq!(
+            stand_down_exit_code(&silent(), StandDownBuild::InSync),
+            EXIT_STOOD_DOWN_NOT_ANSWERING,
+            "a matching sha from a process that answers nothing is not a healthy port"
+        );
+    }
+
+    /// `--no-replace` is documented as a deprecated no-op, and used to be wired as
+    /// a SILENT VETO over `--replace`: an operator whose launchd plist or alias
+    /// already carried it, adding `--replace` to force a rebuilt binary onto the
+    /// port, took over nothing and got exit 0. clap must reject the contradiction
+    /// by name instead.
+    #[test]
+    fn replace_and_no_replace_together_are_a_usage_error() {
+        let err = Cli::try_parse_from(["tcr", "server", "--replace", "--no-replace"])
+            .expect_err("the pair is a contradiction, not a precedence puzzle");
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "it must fail as a conflict, not as some other parse error: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--no-replace") && rendered.contains("--replace"),
+            "the message must name BOTH flags so the operator knows what to remove: {rendered}"
+        );
+    }
+
+    /// Each flag alone still parses — the deprecated one is accepted, as promised
+    /// to the scripts and launch agents that already pass it.
+    #[test]
+    fn each_replace_flag_alone_still_parses() {
+        for args in [
+            vec!["tcr", "server", "--replace"],
+            vec!["tcr", "server", "--no-replace"],
+            vec!["tcr", "--no-replace"],
+            vec!["tcr", "server"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+        }
+    }
 
     /// The TUI log file (account emails + request paths) must be created
     /// owner-only. `.mode(0o600)` carries only owner bits, so it survives any

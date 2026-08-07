@@ -241,16 +241,48 @@ fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
     }
 }
 
-/// The rotation loop's TOTAL attempt budget for a fleet of `account_count` — two
-/// sends per account plus a small constant, so the per-account retry ladders (401
-/// force-refresh, transient-429 inline wait, the 529 backoff ladder and its
-/// failovers) can never spin [`handle`]'s loop.
+/// The most upstream sends ONE account can absorb inside a single client
+/// request, derived from the per-account ladders rather than guessed.
 ///
-/// Extracted from the loop so the headroom assertion in
-/// `overloaded_529_failover_worst_case_latency_is_bounded` binds THIS formula
-/// instead of a copy of it that could silently drift from it.
+/// Every term is a counter in [`handle`] that is monotone per account, so this
+/// is a real ceiling and not an estimate:
+///
+/// * `1` — the send itself.
+/// * `1` — the same-account transport retry (`transport_retried`).
+/// * `1` — the 401 force-refresh retry (`forced_401`).
+/// * [`MAX_SAME_ACCOUNT_429`] — transient-429 inline waits (`retried_429`).
+/// * [`MAX_SAME_ACCOUNT_529_RETRIES`] — 529 in-place backoffs (`retried_529`).
+const MAX_SENDS_PER_ACCOUNT: usize =
+    3 + MAX_SAME_ACCOUNT_429 as usize + MAX_SAME_ACCOUNT_529_RETRIES as usize;
+
+/// The rotation loop's TOTAL attempt budget for a fleet of `account_count`: the
+/// per-account ladder ceiling times the fleet, plus a small constant for the
+/// iterations that consume a turn without sending (the one-shot exhaustion
+/// soft-wait). Bounds [`handle`]'s loop without ever truncating a walk the
+/// ladders themselves permit.
+///
+/// It used to be `2n + 4` — "two sends per account plus a small constant" — which
+/// stopped being true when the same-account transport retry added a third
+/// potential send. The failure was silent and specifically MIXED: a blip on one
+/// account plus the 529 ladder on the next spends 4 sends per account, so a
+/// 3-account walk needs 12 against a budget of 10. The loop fell out mid-walk,
+/// `every_attempt_transport_failed` was false, and the client got a SYNTHESIZED
+/// 429 ("all accounts exhausted", with a fabricated retry-after) in place of the
+/// real 529 — or of a 200 from an account that was never tried.
+///
+/// Every ladder in the sum is independently bounded and each rung is capped
+/// (`RETRY_529_MAX_BACKOFF_SECS`, `INLINE_WAIT_MAX_SECS`), so widening this does
+/// not widen any latency ceiling; it removes a truncation, not a guard.
+///
+/// Extracted from the loop so the headroom assertions in
+/// `overloaded_529_failover_worst_case_latency_is_bounded` and
+/// `the_mixed_transport_and_529_ladder_fits_the_attempt_budget` bind THIS
+/// formula instead of a copy of it that could silently drift from it.
 fn max_attempts_for(account_count: usize) -> usize {
-    account_count.saturating_mul(2).saturating_add(4).max(1)
+    account_count
+        .saturating_mul(MAX_SENDS_PER_ACCOUNT)
+        .saturating_add(4)
+        .max(1)
 }
 
 /// The client's socket address, injected into request extensions by the hybrid

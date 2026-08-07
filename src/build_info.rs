@@ -256,6 +256,33 @@ impl Drift {
     }
 }
 
+/// What the stand-down established about the incumbent's build, as a value
+/// rather than as words in a line.
+///
+/// `main` turns this into the process's exit code, and an exit code must key on
+/// a STRUCTURAL fact — grepping our own rendered sentence for "WARNING" would be
+/// a gate that any rewording silently disarms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandDownBuild {
+    /// Same commit, and neither side has any evidence of uncommitted code.
+    InSync,
+    /// Shas match, but at least one side is not provably that commit's code.
+    DirtyBuild,
+    /// The incumbent is executing a DIFFERENT commit than this binary.
+    Stale,
+    /// Not comparable: the incumbent would not report a build, or a sha is
+    /// unknown. Never collapses into agreement.
+    Unknown,
+}
+
+/// [`stand_down_build_report`]'s output: the verdict a caller can branch on and
+/// the line a human reads, produced together so they can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandDownReport {
+    pub verdict: StandDownBuild,
+    pub line: String,
+}
+
 /// The build half of the message printed when startup finds a healthy proxy
 /// already on the port and stands down instead of replacing it.
 ///
@@ -274,43 +301,96 @@ impl Drift {
 /// endpoint; `None` means it would not answer, which renders as
 /// `build-skew-unknown` and never as agreement. Pure, so the whole decision table
 /// is unit-testable without a server.
-pub fn stand_down_build_line(port: u16, ours: &BuildInfo, running: Option<&BuildInfo>) -> String {
+///
+/// # Why `checkout` is an input and not a build stamp
+///
+/// `ours.dirty` comes from `build.rs`, which re-runs only when a git REF moves
+/// (its own doc-comment states the limitation verbatim: "editing a tracked file
+/// and rebuilding does NOT restamp"). So the ordinary loop — edit a file,
+/// `cargo build --release`, run `tcr` — produces a binary whose `dirty` stamp
+/// still reads `false`. Comparing that stamp against the incumbent's equally
+/// stale one prints "build in sync" for a proxy that predates the edit, which is
+/// the exact false all-clear this function exists to prevent.
+///
+/// [`compare`] does not have the bug because it pairs the running stamp with a
+/// LIVE [`read_checkout_state`]. This takes the same input for the same reason:
+/// uncommitted changes in the checkout we are standing in, at the commit this
+/// binary was built from, mean neither side is provably this commit's code. When
+/// no checkout is available (run from outside the source tree, no git) the
+/// verdict degrades to the build stamps — which is what it was before, so the
+/// degradation is never worse than the old behaviour.
+pub fn stand_down_build_report(
+    port: u16,
+    ours: &BuildInfo,
+    running: Option<&BuildInfo>,
+    checkout: Option<&CheckoutState>,
+) -> StandDownReport {
     let Some(running) = running else {
-        return format!(
-            "[tcr] note build-skew-unknown: this binary={} but the proxy on :{port} did not report \
-             its build — it may be serving older code. `tcr status` reports the running build; \
-             `tcr --replace` restarts the port onto this binary.",
-            ours.sha
-        );
+        return StandDownReport {
+            verdict: StandDownBuild::Unknown,
+            line: format!(
+                "[tcr] note build-skew-unknown: this_binary={} but the proxy on :{port} did not \
+                 report its build — it may be serving older code. `tcr status` reports the \
+                 running build; `tcr --replace` restarts the port onto this binary.",
+                ours.sha
+            ),
+        };
     };
+    // The LIVE half. `Some(true)` only when git actually said the checkout we are
+    // standing in has uncommitted tracked changes AND its HEAD is the commit this
+    // binary claims — anywhere else the answer is about a different commit and
+    // says nothing about whether this binary matches that one.
+    let checkout_dirty_now = checkout
+        .filter(|state| same_commit(&state.head, &ours.sha))
+        .and_then(|state| state.dirty);
+    // A dirty checkout at our own commit is evidence about THIS binary that its
+    // build stamp structurally cannot carry, so it counts the same as the stamp.
+    let ours_dirty = ours.dirty.unwrap_or(false) || checkout_dirty_now.unwrap_or(false);
+
     let keys = format!(
-        "running={} this_binary={} built_dirty={} this_binary_dirty={}",
+        "running={} this_binary={} built_dirty={} this_binary_dirty={} checkout_dirty={}",
         running.sha,
         ours.sha,
         running.dirty_str(),
-        ours.dirty_str()
+        ours.dirty_str(),
+        tri_bool_str(checkout_dirty_now),
     );
     if !is_comparable_sha(&running.sha) || !is_comparable_sha(&ours.sha) {
-        return format!(
-            "[tcr] note build-skew-unknown: {keys} — cannot tell whether the proxy on :{port} is \
-             running this binary's code. `tcr --replace` restarts the port onto this binary."
-        );
+        return StandDownReport {
+            verdict: StandDownBuild::Unknown,
+            line: format!(
+                "[tcr] note build-skew-unknown: {keys} — cannot tell whether the proxy on :{port} \
+                 is running this binary's code. `tcr --replace` restarts the port onto this binary."
+            ),
+        };
     }
     if !same_commit(&running.sha, &ours.sha) {
-        return format!(
-            "[tcr] WARNING stale-server: {keys} — the proxy on :{port} is NOT running this \
-             binary's code and will keep serving its own until it is restarted. \
-             `tcr --replace` takes the port over with this build."
-        );
+        return StandDownReport {
+            verdict: StandDownBuild::Stale,
+            line: format!(
+                "[tcr] WARNING stale-server: {keys} — the proxy on :{port} is NOT running this \
+                 binary's code and will keep serving its own until it is restarted. \
+                 `tcr --replace` takes the port over with this build."
+            ),
+        };
     }
-    if running.dirty.unwrap_or(false) || ours.dirty.unwrap_or(false) {
-        return format!(
-            "[tcr] note dirty-build: {keys} — the shas match but at least one side was compiled \
-             from an uncommitted tree, so this is not proof the proxy on :{port} is running this \
-             binary's code."
-        );
+    if running.dirty.unwrap_or(false) || ours_dirty {
+        return StandDownReport {
+            verdict: StandDownBuild::DirtyBuild,
+            line: format!(
+                "[tcr] note dirty-build: {keys} — the shas match but at least one side is not \
+                 provably this commit's code (a build was compiled from an uncommitted tree, or \
+                 this checkout has uncommitted changes now — a build stamp cannot see edits made \
+                 since the last commit). Not proof the proxy on :{port} is running this binary."
+            ),
+        };
     }
-    format!("[tcr] build in sync: {keys} — the proxy on :{port} is running this binary's commit.")
+    StandDownReport {
+        verdict: StandDownBuild::InSync,
+        line: format!(
+            "[tcr] build in sync: {keys} — the proxy on :{port} is running this binary's commit."
+        ),
+    }
 }
 
 /// Two shas name the same commit when the shorter is a prefix of the longer.
@@ -631,11 +711,18 @@ mod tests {
     /// must be LOUD, name both builds, and name the escape hatch.
     #[test]
     fn standing_down_on_a_different_build_warns_loudly() {
-        let line = stand_down_build_line(
+        let report = stand_down_build_report(
             3456,
             &build("9f3a1b2", Some(false)),
             Some(&build("cd146ce", Some(false))),
+            None,
         );
+        assert_eq!(
+            report.verdict,
+            StandDownBuild::Stale,
+            "the verdict, not just the wording, is what main exits on"
+        );
+        let line = report.line;
         assert!(line.contains("stale-server"), "greppable token: {line}");
         assert!(line.contains("running=cd146ce"), "names the server: {line}");
         assert!(
@@ -649,7 +736,9 @@ mod tests {
     /// agreement — and it still has to point at the two commands that resolve it.
     #[test]
     fn standing_down_with_no_answer_from_the_incumbent_says_so() {
-        let line = stand_down_build_line(3456, &build("9f3a1b2", Some(false)), None);
+        let report = stand_down_build_report(3456, &build("9f3a1b2", Some(false)), None, None);
+        assert_eq!(report.verdict, StandDownBuild::Unknown);
+        let line = report.line;
         assert!(line.contains("build-skew-unknown"), "{line}");
         assert!(
             !line.contains("in sync"),
@@ -657,20 +746,107 @@ mod tests {
         );
         assert!(line.contains("tcr status"), "{line}");
         assert!(line.contains("--replace"), "{line}");
+        // The KEY SPELLING, not just the value. Every other branch emits
+        // `this_binary=`; this branch used to write `this binary=` with a space,
+        // so `grep 'this_binary='` over tcr's stderr silently dropped the one
+        // case that most needs surfacing — the incumbent would not say what it
+        // is running. The module's contract (see `Skew::report_line`) is that
+        // every line is `token key=value …`, so the key is the assertion.
+        assert!(
+            line.contains("this_binary=9f3a1b2"),
+            "the sha must carry the same greppable key as every other branch: {line}"
+        );
+        assert!(
+            !line.contains("this binary="),
+            "a space here breaks `grep this_binary=`: {line}"
+        );
     }
 
     /// Matching shas, both clean: say so plainly. This is the ordinary case and it
     /// must not carry a warning, or the warning stops being read.
     #[test]
     fn standing_down_on_the_same_build_is_quiet() {
-        let line = stand_down_build_line(
+        let report = stand_down_build_report(
             3456,
             &build("cd146ce", Some(false)),
             Some(&build("cd146ce", Some(false))),
+            // A checkout that is clean AT our commit corroborates the stamps.
+            Some(&checkout("cd146ce", Some(false), None)),
         );
+        assert_eq!(report.verdict, StandDownBuild::InSync);
+        let line = report.line;
         assert!(line.contains("in sync"), "{line}");
         assert!(!line.contains("WARNING"), "{line}");
         assert!(!line.contains("stale-server"), "{line}");
+        assert!(line.contains("checkout_dirty=false"), "{line}");
+    }
+
+    /// THE STALE-STAMP CASE, and the reason this function takes a live checkout.
+    ///
+    /// `build.rs` re-runs only when a git ref MOVES — its own doc says editing a
+    /// tracked file and rebuilding does not restamp — so the ordinary
+    /// edit → `cargo build --release` → `tcr` loop leaves BOTH `dirty` stamps
+    /// reading `false` at the SAME sha. Comparing the two stamps against each
+    /// other therefore prints "build in sync" for a proxy that predates the edit:
+    /// the developer reads exit 0 plus "in sync" as "my fix is live" and debugs
+    /// against a binary that cannot contain it. The live read is the only input
+    /// that can see the edit, which is exactly why `compare` takes one too.
+    #[test]
+    fn a_live_dirty_checkout_beats_a_stale_clean_build_stamp() {
+        let stamps_say_clean = || build("cd146ce", Some(false));
+        // Control: with no live checkout to consult, the stamps are all we have
+        // and the old (wrong-in-this-scenario) verdict is the honest best effort.
+        assert_eq!(
+            stand_down_build_report(3456, &stamps_say_clean(), Some(&stamps_say_clean()), None)
+                .verdict,
+            StandDownBuild::InSync,
+            "without a checkout there is no evidence of the edit"
+        );
+
+        // The real loop: same commit, both stamps stale-clean, and the checkout
+        // has uncommitted tracked changes RIGHT NOW.
+        let report = stand_down_build_report(
+            3456,
+            &stamps_say_clean(),
+            Some(&stamps_say_clean()),
+            Some(&checkout("cd146ce", Some(true), None)),
+        );
+        assert_eq!(
+            report.verdict,
+            StandDownBuild::DirtyBuild,
+            "an edited checkout at our own commit is not proof of a match"
+        );
+        assert!(
+            !report.line.contains("in sync"),
+            "the false all-clear this function exists to prevent: {}",
+            report.line
+        );
+        assert!(report.line.contains("dirty-build"), "{}", report.line);
+        assert!(
+            report.line.contains("checkout_dirty=true"),
+            "the live evidence has to be IN the line, or the verdict is unexplainable: {}",
+            report.line
+        );
+    }
+
+    /// The live read is scoped to OUR commit. A checkout sitting on a different
+    /// commit says nothing about whether this binary matches the one it claims,
+    /// and must not manufacture a `dirty-build` note out of an unrelated tree —
+    /// `tcr status`/[`compare`] is what reports a moved HEAD.
+    #[test]
+    fn a_dirty_checkout_at_another_commit_does_not_taint_the_verdict() {
+        let report = stand_down_build_report(
+            3456,
+            &build("cd146ce", Some(false)),
+            Some(&build("cd146ce", Some(false))),
+            Some(&checkout("9f3a1b2", Some(true), Some(3))),
+        );
+        assert_eq!(report.verdict, StandDownBuild::InSync);
+        assert!(
+            report.line.contains("checkout_dirty=unknown"),
+            "unmeasured for THIS commit is `unknown`, never a bare `false`: {}",
+            report.line
+        );
     }
 
     /// A dirty build on either side: the shas match and the code still may not.
@@ -678,11 +854,14 @@ mod tests {
     #[test]
     fn standing_down_never_claims_a_dirty_build_is_in_sync() {
         for (ours, theirs) in [(Some(true), Some(false)), (Some(false), Some(true))] {
-            let line = stand_down_build_line(
+            let report = stand_down_build_report(
                 3456,
                 &build("cd146ce", ours),
                 Some(&build("cd146ce", theirs)),
+                Some(&checkout("cd146ce", Some(false), None)),
             );
+            assert_eq!(report.verdict, StandDownBuild::DirtyBuild);
+            let line = report.line;
             assert!(line.contains("dirty-build"), "{line}");
             assert!(!line.contains("in sync"), "{line}");
         }
@@ -692,11 +871,14 @@ mod tests {
     /// manufacturing a stale-server warning out of a missing field.
     #[test]
     fn standing_down_on_an_unknown_sha_is_indeterminate_not_stale() {
-        let line = stand_down_build_line(
+        let report = stand_down_build_report(
             3456,
             &build("cd146ce", Some(false)),
             Some(&BuildInfo::default()),
+            None,
         );
+        assert_eq!(report.verdict, StandDownBuild::Unknown);
+        let line = report.line;
         assert!(line.contains("build-skew-unknown"), "{line}");
         assert!(!line.contains("stale-server"), "{line}");
     }
