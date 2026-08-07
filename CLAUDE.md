@@ -24,8 +24,18 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 - **Never restart, kill or signal it** without being asked. A restart wipes the in-memory
   session→account pin map, and Anthropic's prompt cache is per-account, so every live session pays a
   full cold prefix. It is the most expensive event in this system.
-- **Never run `cargo build --release`** while it is running — that replaces the binary at the path the
-  running process was launched from. Use `cargo test` / `cargo clippy` for verification.
+- **`cargo build --release` is safe while it is running.** Cargo writes a new file and renames, so the
+  live process keeps its own inode and its own bytes (measured 2026-08-07, N=5 — a fresh `exec` during
+  the build exits 0). The real hazard is overwriting a binary *in place*: `cp` onto a path something is
+  executing rewrites the **same inode**, and macOS then SIGKILLs every later `exec` of it with
+  `Code Signature Invalid`. That killed 25 processes on 2026-08-06. `codesign -v` returns 0 on the
+  corrupted file — the artifact is fine, the kernel's cached signature is stale — so it cannot detect
+  this class. Place a binary with `scripts/install-cli.sh` (stage in the destination dir, then
+  `rename(2)`), never `cp`.
+- **The build probably does not land in `target/`.** `CARGO_TARGET_DIR` redirects it and every agent
+  session here sets it, so `<repo>/target/release/tcr` is usually a stale orphan from before that
+  variable existed. Resolve the real path from `cargo metadata --format-version 1 --no-deps`
+  (`.target_directory`) rather than writing it down.
 - The running process can be several commits behind the source. `tcr status --json` reports the running
   build's SHA — check it before concluding a fix is live. "The fix is in `main`" and "the fix is in the
   process serving traffic" are routinely different facts.
