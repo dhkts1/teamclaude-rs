@@ -890,6 +890,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // connection is evicted from the pool by the error itself, so the retry gets a
     // fresh one. Bounded to one per account per request: the second failure IS
     // evidence about the account, and `tried.insert` then behaves exactly as before.
+    //
+    // Gated on the error KIND at the arm below: that rationale is about a pooled
+    // connection dying, so it does not hold for a CONNECT failure, where there was
+    // no connection to evict and the retry only pays a second connect timeout.
     let mut transport_retried: HashSet<usize> = HashSet::new();
 
     for _ in 0..max_attempts {
@@ -1084,7 +1088,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // — the only things that say WHY the connection died — are
                 // structurally unreachable from a `%` rendering. `Debug` carries the
                 // whole chain. Do not "tidy" this back to `%err`.
-                if transport_retried.insert(idx) {
+                // A CONNECT-phase failure is not a blip on a pooled connection —
+                // there was no connection. Nothing was evicted, nothing is
+                // refreshed by trying again, and the retry is the identical
+                // operation with no new information; all it buys is a second full
+                // `connect_timeout` (10s, `manager/mod.rs`) on a route that is
+                // already not answering. On a blackholed upstream (VPN drop,
+                // captive portal, edge unreachable — no RST, no reply) that
+                // doubles every request's time-to-502 — ~80s to ~160s on an
+                // 8-account fleet — while each request holds its per-account
+                // in-flight slot for the whole of it. Bench the account and let
+                // the rotation do its job.
+                if !err.is_connect() && transport_retried.insert(idx) {
                     // First blip on this account this request: retry it on a fresh
                     // connection rather than benching an account that is probably fine.
                     tracing::warn!(
