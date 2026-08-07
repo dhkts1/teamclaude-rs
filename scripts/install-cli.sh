@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install the release `tcr` binary onto PATH.
 #
-# Usage: scripts/install-cli.sh [destination]        (default: ~/.local/bin/tcr)
+# Usage: scripts/install-cli.sh [--force] [destination]    (default: ~/.local/bin/tcr)
 #
 # Two things here are deliberate, and both exist because of a specific incident.
 #
@@ -23,9 +23,28 @@
 #      rather than following it -- `cp` would write through the link and corrupt
 #      whatever it pointed at, which is how the 2026-08-06 burst reached the repo's
 #      own build output.
+#
+#   3. That same rename(2) property has a second, unwanted consequence, so the
+#      script refuses to run when the destination is a symlink. apps/macos/README.md
+#      documents the intended arrangement where ~/.local/bin/tcr is a SYMLINK into
+#      /Applications/TcrBar.app/Contents/MacOS/tcr, so the menu-bar app and the CLI
+#      are one artifact and only one thing ever needs updating. Because `mv -f`
+#      replaces a symlink instead of following it, running this installer over that
+#      link turns it back into an independent regular file -- silently, with no
+#      error -- and binary drift between the app and the CLI is back. Refusing is
+#      the only way that undoing is visible; TCR_INSTALL_FORCE=1 (or --force) is
+#      the deliberate override.
 set -euo pipefail
 
-DEST="${1:-$HOME/.local/bin/tcr}"
+FORCE="${TCR_INSTALL_FORCE:-0}"
+DEST=""
+for arg in "$@"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    *)       DEST="$arg" ;;
+  esac
+done
+DEST="${DEST:-$HOME/.local/bin/tcr}"
 
 fail() { printf '!! %s\n' "$1" >&2; exit 1; }
 
@@ -38,6 +57,22 @@ SRC="$TARGET_DIR/release/tcr"
 
 [ -f "$SRC" ] || fail "no release binary at $SRC -- build it first:  cargo build --release"
 [ -x "$SRC" ] || fail "$SRC is not executable"
+
+# See note 3 in the header: `mv -f` replaces a symlink destination rather than
+# following it, so installing over the app-bundle symlink would quietly split the
+# one shared binary back into two that drift apart.
+if [ -L "$DEST" ] && [ "$FORCE" != "1" ]; then
+  fail "$(printf '%s\n' \
+    "symlinked destination -- refusing to install" \
+    "  $DEST -> $(readlink "$DEST")" \
+    "It is a symlink, most likely the shared TcrBar.app binary documented in" \
+    "apps/macos/README.md. Installing here would replace the link with a regular" \
+    "file and reintroduce drift between the app and the CLI." \
+    "Instead:" \
+    "  update the bundle:  apps/macos/scripts/install.sh" \
+    "  or install elsewhere:  scripts/install-cli.sh /some/other/path/tcr" \
+    "  or override on purpose:  scripts/install-cli.sh --force  (TCR_INSTALL_FORCE=1)")"
+fi
 
 DEST_DIR="$(dirname "$DEST")"
 mkdir -p "$DEST_DIR"
