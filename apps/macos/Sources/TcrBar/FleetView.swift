@@ -358,8 +358,8 @@ struct FleetView: View {
 
     /// The alert names the real cost in plain language, defaults to Cancel, and
     /// styles the other button as destructive. Only on an explicit confirm does
-    /// this call `startTakingOverPort()`, which spawns `tcr server` without
-    /// `--no-replace` — the replacement is performed by `tcr`'s own singleton.
+    /// this call `startTakingOverPort()`, which spawns `tcr server --replace`
+    /// — the replacement is performed by `tcr`'s own singleton.
     /// TcrBar signals nothing it did not spawn.
     private func confirmTakeover() {
         let alert = NSAlert()

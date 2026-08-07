@@ -582,16 +582,35 @@ final class ServerControllerTests: XCTestCase {
         XCTAssertEqual(ServerController.serverArguments, ServerController.safeArguments)
     }
 
-    func testTakeoverOmitsNoReplace() {
-        // The takeover is expressed *only* by dropping `--no-replace`: tcr's own
-        // singleton then does the replacing.
-        XCTAssertFalse(ServerController.takeoverArguments.contains("--no-replace"))
+    func testTakeoverAsksForTheReplacementExplicitly() {
+        // The takeover is expressed by the *presence* of `--replace`: tcr's own
+        // singleton then does the replacing. Standing down is tcr's default now,
+        // so an argument set that merely drops `--no-replace` takes over nothing —
+        // which is why asserting the absence of `--no-replace` cannot stand alone.
+        // That assertion stayed green through the entire window in which this
+        // button was a silent no-op.
+        XCTAssertTrue(
+            ServerController.takeoverArguments.contains("--replace"),
+            "\(ServerController.takeoverArguments) asks tcr for nothing — the takeover button is a no-op"
+        )
+        // Still checked, for a different reason than before: when both flags are
+        // passed tcr lets the safe one win (`src/main.rs:486`), so `--no-replace`
+        // sneaking in here would cancel the `--replace` above.
+        XCTAssertFalse(
+            ServerController.takeoverArguments.contains("--no-replace"),
+            "\(ServerController.takeoverArguments) cancels its own --replace"
+        )
+        // And the safe set must never acquire the flag it exists to withhold.
+        XCTAssertFalse(
+            ServerController.safeArguments.contains("--replace"),
+            "the routine start would kill a healthy incumbent: \(ServerController.safeArguments)"
+        )
     }
 
     /// The regression that made every spawn path dead on arrival.
     ///
     /// Without `--headless`, `tcr server` runs its ratatui TUI
-    /// (`src/main.rs:590`) which calls `enable_raw_mode()?` on stdout
+    /// (`src/main.rs:615`) which calls `enable_raw_mode()?` on stdout
     /// (`src/tui.rs:47`). A GUI spawns with a `Pipe`, so there is no terminal, raw
     /// mode fails and the child exits at once — the server appeared for an instant
     /// and vanished.
@@ -610,7 +629,7 @@ final class ServerControllerTests: XCTestCase {
     }
 
     func testNeitherArgumentSetCarriesAnythingUnexpected() {
-        let known: Set<String> = ["server", "--no-replace", "--headless"]
+        let known: Set<String> = ["server", "--no-replace", "--replace", "--headless"]
         for arguments in [ServerController.safeArguments, ServerController.takeoverArguments] {
             XCTAssertEqual(arguments.first, "server", "both sets are `tcr server`")
             XCTAssertTrue(
@@ -632,6 +651,30 @@ final class ServerControllerTests: XCTestCase {
             return XCTFail("an already-running server must not be reported as an error")
         }
         XCTAssertFalse(state.isOurChild, "an incumbent we did not spawn is never ours to signal")
+    }
+
+    /// The wording above is what an *older* `tcr` printed. A current one stands
+    /// down by default and says so differently — and, unlike the refusal, it exits
+    /// **0**, because standing down is now the success path. So the classifier
+    /// cannot lean on a non-zero exit code: without a marker match this would
+    /// render "the server exited cleanly" for a server that never bound.
+    func testTheStandDownIsRecognisedEvenThoughItExitsZero() {
+        let stderr = "[tcr] another proxy holds :3456 (pid 123) and it is healthy — leaving it "
+            + "alone and exiting without binding. Replacing it would wipe its session→account "
+            + "pin map and cold-start every live session's prompt cache, the most expensive "
+            + "event in this system. Pass --replace to take the port over anyway."
+        guard case .incumbentHoldsPort = ServerController.classifyExit(
+            intent: .safeStart, exitCode: 0, stderr: stderr
+        ) else {
+            return XCTFail("a stand-down must read as an incumbent, not as a clean exit")
+        }
+        // Same text on the takeover path is the opposite verdict: the user asked
+        // for the port and did not get it.
+        guard case .takeoverRefused = ServerController.classifyExit(
+            intent: .takeover, exitCode: 0, stderr: stderr
+        ) else {
+            return XCTFail("a takeover that stood down has failed, however it exited")
+        }
     }
 
     func testBindFailureIsAlsoTreatedAsAlreadyRunning() {

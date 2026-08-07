@@ -7,12 +7,12 @@ import XCTest
 /// This is a regression test for a shipped bug. `classifyExit` was argument-blind:
 /// it matched an incumbent marker and returned the benign `incumbentHoldsPort` no
 /// matter why the spawn was made. So clicking "Take over port" — which runs
-/// `tcr server` *without* `--no-replace` — produced this sequence:
+/// `tcr server --replace` — produced this sequence:
 ///
 ///  1. `tcr`'s port singleton declined to replace the incumbent, because that
 ///     incumbent was a proxy hosted inside a `tcr run` process and
-///     `is_proxy_server` deliberately excludes those (`src/singleton.rs:27,52`,
-///     asserted at `:192`). Killing one would kill the Claude session running
+///     `is_proxy_server` deliberately excludes those (`src/singleton.rs:38,62`,
+///     asserted at `:257`). Killing one would kill the Claude session running
 ///     through it.
 ///  2. The subsequent bind failed: `failed to bind 127.0.0.1:3456`.
 ///  3. `classifyExit` matched `failed to bind`, reported "already running", and
@@ -36,7 +36,7 @@ final class TakeoverIntentTests: XCTestCase {
             intent: .safeStart, exitCode: 1, stderr: refusedBind
         )
         guard case .incumbentHoldsPort = state else {
-            return XCTFail("a --no-replace start finding an incumbent is expected, got \(state)")
+            return XCTFail("a start without --replace finding an incumbent is expected, got \(state)")
         }
     }
 
