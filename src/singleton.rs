@@ -3,9 +3,19 @@
 //! The recurring failure is two proxies — a leftover JS `teamclaude` and/or a
 //! `tcr` — both refreshing the same accounts. Each holds its own in-memory copy of
 //! the SINGLE-USE OAuth refresh tokens, so the first refresh by either revokes the
-//! other's copy and accounts flap to `error` (the "token war"). On startup we take
-//! over the configured port: if a recognized proxy already holds it, replace it,
-//! then bind.
+//! other's copy and accounts flap to `error` (the "token war"). On startup we
+//! resolve the configured port down to exactly ONE proxy.
+//!
+//! **Resolving it does not have to mean killing the incumbent, and by default it
+//! does not.** Both outcomes — replace, or attach-and-exit — leave one proxy
+//! running, so the token war is averted either way; the difference is only WHICH
+//! process survives. Killing the incumbent is by far the more expensive of the
+//! two: it wipes the in-memory session→account pin map, so every live session
+//! pays a full cold prompt prefix. Measured over 79.6h: 50 boots, 31 of the 49
+//! gaps between them under 120s — a bare `tcr` typed to "check on things" would
+//! silently take the port. So the default is now [`Takeover::IncumbentPresent`],
+//! which reports and exits without binding, and the kill lives behind an explicit
+//! `--replace`.
 //!
 //! Two safety properties, both load-bearing:
 //! - **Port-scoped.** Only the process listening on `127.0.0.1:<configured port>`
@@ -120,17 +130,49 @@ fn is_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
-/// Take over `port` for this server. If a recognized proxy already holds it,
-/// terminate it (SIGTERM, then SIGKILL a survivor after a grace) so this instance
-/// can bind. A non-proxy holder is reported and LEFT ALONE. When `no_replace` is
-/// set, an incumbent proxy is only warned about, not killed.
-pub fn takeover_port(port: u16, no_replace: bool) {
+/// What the caller must do after [`takeover_port`] has looked at the port.
+///
+/// The enum exists so the decision stays HERE — with the port-scoped,
+/// command-verified knowledge of who holds it — while the exit belongs to
+/// `main`, which owns the process's exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Takeover {
+    /// Nothing replaceable is in the way (the port is free, held only by a
+    /// non-proxy, or the incumbent was just replaced). Bind.
+    Proceed,
+    /// A recognized proxy incumbent holds the port and was deliberately left
+    /// running. The caller must NOT bind; it should exit 0.
+    IncumbentPresent(u32),
+}
+
+/// The pure decision: given the replaceable incumbents on the port and whether
+/// `--replace` was passed, do we bind or stand down?
+///
+/// Split out from the side effects for the same reason as [`pids_to_replace`] —
+/// and it is the single gate on the kill loop below, so a test that pins this
+/// function pins whether a live proxy gets signalled.
+pub fn takeover_decision(replaceable: &[u32], replace: bool) -> Takeover {
+    match replaceable.first() {
+        Some(&pid) if !replace => Takeover::IncumbentPresent(pid),
+        _ => Takeover::Proceed,
+    }
+}
+
+/// Resolve `port` down to one proxy for this server.
+///
+/// With `replace`, a recognized proxy incumbent is terminated (SIGTERM, then
+/// SIGKILL a survivor after a grace) so this instance can bind. Without it — the
+/// DEFAULT — the incumbent is reported and left running, and the caller is told
+/// to exit rather than bind. A non-proxy holder is reported and LEFT ALONE in
+/// both cases (the bind then fails loudly with EADDRINUSE).
+#[must_use = "the caller must exit instead of binding on IncumbentPresent"]
+pub fn takeover_port(port: u16, replace: bool) -> Takeover {
     let holders = port_listeners(port);
-    let replace = pids_to_replace(&holders, std::process::id(), process_command);
+    let replaceable = pids_to_replace(&holders, std::process::id(), process_command);
 
     // Surface a non-proxy holder (we won't kill it; the bind will fail).
     for &pid in &holders {
-        if pid != std::process::id() && !replace.contains(&pid) {
+        if pid != std::process::id() && !replaceable.contains(&pid) {
             let cmd = process_command(pid);
             if !cmd.is_empty() {
                 eprintln!(
@@ -140,13 +182,17 @@ pub fn takeover_port(port: u16, no_replace: bool) {
         }
     }
 
-    for pid in replace {
-        if no_replace {
-            eprintln!(
-                "[tcr] another proxy holds :{port} (pid {pid}) and --no-replace was set; two proxies refreshing the same single-use tokens will token-war. Not replacing."
-            );
-            continue;
-        }
+    if let Takeover::IncumbentPresent(pid) = takeover_decision(&replaceable, replace) {
+        // Only the pid and the instruction live here; `main` prints the build
+        // comparison, because THAT is the part a user typing `tcr` after a rebuild
+        // actually needs and it requires an async status read we must not do here.
+        eprintln!(
+            "[tcr] :{port} is already served by a tcr proxy (pid {pid}) — leaving it alone and exiting. Replacing it would wipe its session→account pin map and cold-start every live session's prompt cache. Pass --replace to take the port over anyway."
+        );
+        return Takeover::IncumbentPresent(pid);
+    }
+
+    for pid in replaceable {
         eprintln!(
             "[tcr] replacing existing proxy on :{port} (pid {pid}) — one proxy per port, or the two mutually invalidate each other's single-use refresh tokens (token war)."
         );
@@ -162,6 +208,7 @@ pub fn takeover_port(port: u16, no_replace: bool) {
             sleep(Duration::from_millis(300));
         }
     }
+    Takeover::Proceed
 }
 
 #[cfg(test)]
@@ -219,5 +266,43 @@ mod tests {
     fn pids_to_replace_never_includes_self_even_if_it_looks_like_a_proxy() {
         let command = |_pid: u32| "/x/tcr server".to_string();
         assert!(pids_to_replace(&[42], 42, command).is_empty());
+    }
+
+    /// THE DEFAULT, and the whole point of the enum: a healthy proxy incumbent is
+    /// left running and the caller is told to stand down. `Proceed` here would
+    /// reach the kill loop and cost every live session its prompt cache.
+    #[test]
+    fn a_healthy_incumbent_is_left_alone_by_default() {
+        assert_eq!(
+            takeover_decision(&[4242], false),
+            Takeover::IncumbentPresent(4242)
+        );
+    }
+
+    /// `--replace` is the ONLY way to reach the kill loop.
+    #[test]
+    fn replace_flag_proceeds_to_the_takeover() {
+        assert_eq!(takeover_decision(&[4242], true), Takeover::Proceed);
+    }
+
+    /// Nothing replaceable on the port — bind, with or without the flag. Covers
+    /// both the free port and the non-proxy holder, which `pids_to_replace` has
+    /// already filtered out by the time we get here (the bind then fails loudly,
+    /// which is the documented behaviour and must not change).
+    #[test]
+    fn an_empty_port_always_proceeds() {
+        assert_eq!(takeover_decision(&[], false), Takeover::Proceed);
+        assert_eq!(takeover_decision(&[], true), Takeover::Proceed);
+    }
+
+    /// Several incumbents (a leftover JS `teamclaude` beside a `tcr`) report the
+    /// first rather than collapsing to `Proceed` — one of them is enough to make
+    /// binding wrong.
+    #[test]
+    fn multiple_incumbents_still_stand_down_by_default() {
+        assert_eq!(
+            takeover_decision(&[111, 222], false),
+            Takeover::IncumbentPresent(111)
+        );
     }
 }

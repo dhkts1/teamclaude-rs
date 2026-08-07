@@ -178,9 +178,16 @@ struct ServerArgs {
     /// Run without the TUI, logging to stdout.
     #[arg(long)]
     headless: bool,
-    /// Do not replace an existing proxy already listening on the port. Default is
-    /// to take over the port (kill the incumbent proxy), since two proxies on the
-    /// same accounts mutually invalidate each other's single-use refresh tokens.
+    /// Take over the port: kill a proxy already listening on it, then bind. The
+    /// default is to leave a healthy incumbent alone and exit — replacing it wipes
+    /// its session→account pin map and cold-starts every live session's prompt
+    /// cache, which is the most expensive event in this system.
+    #[arg(long)]
+    replace: bool,
+    /// DEPRECATED and now a no-op: this is the default. Kept accepted so existing
+    /// scripts and launch agents that pass it keep working. Pass `--replace` for
+    /// the old default (take the port over); if both are given, this one wins,
+    /// since the safe outcome is the one that touches nothing.
     #[arg(long)]
     no_replace: bool,
 }
@@ -470,10 +477,27 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     init_tracing(args.headless);
 
-    // Take over the port BEFORE the Manager starts probing/refreshing, so our own
-    // startup can never token-war with the incumbent proxy we're replacing. Only a
-    // command-verified teamclaude/tcr server on THIS port is ever signalled.
-    singleton::takeover_port(port, args.no_replace);
+    // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
+    // so our own startup can never token-war with the incumbent. Only a
+    // command-verified teamclaude/tcr server on THIS port is ever signalled — and
+    // only under `--replace`. `--no-replace` is the default now, so passing it
+    // simply withholds `--replace`.
+    if let singleton::Takeover::IncumbentPresent(_pid) =
+        singleton::takeover_port(port, args.replace && !args.no_replace)
+    {
+        // Standing down is cheap and correct, but silent success here would mean
+        // `cargo build && tcr` exits 0 with the OLD build still serving — say which
+        // build actually holds the port before we go.
+        eprintln!(
+            "{}",
+            build_info::stand_down_build_line(
+                port,
+                &build_info::BuildInfo::current(),
+                cli::live_server_build(&config).await.as_ref(),
+            )
+        );
+        return Ok(());
+    }
 
     let manager = Manager::with_live_refresher(config, persist_path);
 
