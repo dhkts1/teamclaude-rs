@@ -659,15 +659,63 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
 }
 
 /// Why a live status read did not produce a payload.
+///
+/// The three variants are not interchangeable, and collapsing them is what made
+/// a wedged proxy unrecoverable: [`incumbent_liveness`] turns them into
+/// "is anything actually serving on this port", and that answer is the
+/// difference between "leave a working proxy alone" and "this process is holding
+/// the socket and answering nothing".
 enum LiveStatusError {
     /// Nothing is listening on the configured port — the ORDINARY case (`tcr
     /// status` with no server running). Falling back is expected, so it is
     /// reported by the `offline` label alone rather than by a warning.
     NoServer,
-    /// A server answered but the read was not usable. Always warned about: a
-    /// silently-swallowed rejection here would look exactly like "no server",
-    /// which is how an api-key typo becomes a mysterious all-zero status.
+    /// Something is listening but produced no response before the deadline: no
+    /// bytes back within the 2s connect / 5s total budget, or the connection
+    /// dropped mid-read. This is the WEDGED shape.
+    NoAnswer(String),
+    /// A server answered — an HTTP response came back — but the read was not
+    /// usable: a rejected api-key, an older tcr with no status route, a payload
+    /// that is not ours. The process is SERVING; we just cannot read it. Always
+    /// warned about: a silently-swallowed rejection here would look exactly like
+    /// "no server", which is how an api-key typo becomes a mysterious all-zero
+    /// status.
     Unusable(String),
+}
+
+impl LiveStatusError {
+    /// Did an HTTP response come back at all?
+    ///
+    /// The load-bearing distinction for the startup stand-down. A 401 or an
+    /// unparseable body is a process that ACCEPTED the connection, routed the
+    /// request and wrote a response — the opposite of wedged — while a timeout
+    /// means the listening socket is all that is left of it.
+    fn answered(&self) -> bool {
+        matches!(self, LiveStatusError::Unusable(_))
+    }
+
+    fn why(&self) -> String {
+        match self {
+            LiveStatusError::NoServer => "nothing is listening".to_string(),
+            LiveStatusError::NoAnswer(why) | LiveStatusError::Unusable(why) => why.clone(),
+        }
+    }
+}
+
+/// Whether the incumbent holding the port is actually serving anything.
+///
+/// Deliberately NOT `Option<BuildInfo>::is_none()`. That conflates four states,
+/// two of which are a perfectly healthy proxy: an api-key mismatch and an older
+/// `tcr` with no status route both answer, and killing either would be a
+/// takeover of a live server on the strength of a diagnostic read failing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Liveness {
+    /// It answered. Whatever else is true, it is serving requests.
+    Answering,
+    /// Nothing came back before the deadline. It holds the socket and serves
+    /// nothing; `why` is the probe's own account of what happened, for the
+    /// operator-facing line.
+    Silent { why: String },
 }
 
 /// Read the live fleet snapshot from the running proxy's [`crate::proxy::STATUS_PATH`].
@@ -702,11 +750,13 @@ async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusE
         Ok(r) => r,
         Err(e) if e.is_connect() => return Err(LiveStatusError::NoServer),
         Err(e) if e.is_timeout() => {
-            return Err(LiveStatusError::Unusable(
+            return Err(LiveStatusError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
             ))
         }
-        Err(e) => return Err(LiveStatusError::Unusable(e.to_string())),
+        // No response object came back, and it was neither a refused connect nor
+        // the deadline: a reset or a truncated read. Nothing was served.
+        Err(e) => return Err(LiveStatusError::NoAnswer(e.to_string())),
     };
 
     let status = response.status();
@@ -737,17 +787,39 @@ async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusE
     Ok(payload)
 }
 
-/// Best-effort read of the build the RUNNING proxy is executing.
+/// One probe of the incumbent on the port, answering BOTH questions the startup
+/// stand-down has to decide on.
 ///
-/// For the startup stand-down path in `main`: when a healthy incumbent holds the
-/// port we exit instead of replacing it, and the user needs to know whether the
-/// build they just compiled is the one serving. `None` on ANY failure — no
-/// server, a rejected key, an older tcr with no status route — because this is a
-/// diagnostic on a path that is already exiting, never a dependency of startup.
-/// Bounded by [`fetch_live_status`]'s own 2s connect / 5s total timeouts, so it
-/// cannot hang.
-pub async fn live_server_build(config: &Config) -> Option<BuildInfo> {
-    fetch_live_status(config).await.ok().map(|p| p.build)
+/// * `build` — which commit it is executing, so the user learns whether the
+///   binary they just compiled is the one serving. `None` on any failure to read
+///   it; this is a diagnostic on a path that is already exiting.
+/// * `liveness` — whether it responded AT ALL. Separate from `build` on purpose:
+///   `build == None` is true for a healthy proxy behind a rejected api-key and
+///   for one wedged solid, and the stand-down must not treat those alike.
+///
+/// One probe, not two, so the decision and the message can never disagree about
+/// what the incumbent did. Bounded by [`fetch_live_status`]'s own 2s connect /
+/// 5s total timeouts, so it cannot hang.
+pub struct IncumbentProbe {
+    pub build: Option<BuildInfo>,
+    pub liveness: Liveness,
+}
+
+pub async fn probe_incumbent(config: &Config) -> IncumbentProbe {
+    match fetch_live_status(config).await {
+        Ok(payload) => IncumbentProbe {
+            build: Some(payload.build),
+            liveness: Liveness::Answering,
+        },
+        Err(err) => IncumbentProbe {
+            build: None,
+            liveness: if err.answered() {
+                Liveness::Answering
+            } else {
+                Liveness::Silent { why: err.why() }
+            },
+        },
+    }
 }
 
 /// `tcr status [--json]` — render the fleet as greppable text or a JSON array,
@@ -778,7 +850,10 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             (StatusSource::Live, Some(build), snapshot, thresholds)
         }
         Err(reason) => {
-            if let LiveStatusError::Unusable(why) = reason {
+            // Both "it answered something unusable" and "it answered nothing"
+            // warn; only the ordinary no-server case stays quiet.
+            if !matches!(reason, LiveStatusError::NoServer) {
+                let why = reason.why();
                 eprintln!(
                     "[tcr] warning: could not read live status from the proxy on :{} ({why}) — falling back to an offline snapshot, whose serving counters are all zero.",
                     config.proxy.port
@@ -1319,7 +1394,7 @@ mod tests {
         let payload = match fetch_live_status(&config).await {
             Ok(p) => p,
             Err(LiveStatusError::NoServer) => panic!("the spawned server did not answer"),
-            Err(LiveStatusError::Unusable(why)) => panic!("live status unusable: {why}"),
+            Err(err) => panic!("live status unusable: {}", err.why()),
         };
         let build = payload.build.clone();
         let (snapshot, thresholds) = payload.into_snapshot();
@@ -1437,11 +1512,95 @@ mod tests {
 
         match fetch_live_status(&config).await {
             Err(LiveStatusError::NoServer) => {}
-            Err(LiveStatusError::Unusable(why)) => {
-                panic!("a dead port is the ordinary no-server case, not a warning: {why}")
-            }
+            Err(err) => panic!(
+                "a dead port is the ordinary no-server case, not a warning: {}",
+                err.why()
+            ),
             Ok(_) => panic!("nothing is listening on {port}"),
         }
+    }
+
+    // --- incumbent liveness -------------------------------------------------
+
+    /// THE CASE THAT MUST NOT BE A TAKEOVER. A healthy proxy whose api-key we do
+    /// not have answers `401` — it accepted the connection, routed the request
+    /// and wrote a response, which is the opposite of wedged. `build` is `None`
+    /// here exactly as it is for a wedged proxy, so a stand-down that decided on
+    /// `build.is_none()` would SIGKILL a server that is serving every request
+    /// fine. The liveness verdict is what separates them.
+    #[tokio::test]
+    async fn a_rejected_api_key_is_an_answering_incumbent_not_a_wedged_one() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut served = load_from(TWO_ACCOUNTS);
+        served.proxy.port = port;
+        served.proxy.api_key = Some("the-real-key".to_string());
+
+        let manager = Manager::with_live_refresher(served.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        // Same port, WRONG key — what an operator with a stale config has.
+        let mut probing = served.clone();
+        probing.proxy.api_key = Some("the-wrong-key".to_string());
+        let probe = probe_incumbent(&probing).await;
+
+        assert!(
+            probe.build.is_none(),
+            "the build read fails, which is precisely why it cannot be the liveness signal"
+        );
+        assert_eq!(
+            probe.liveness,
+            Liveness::Answering,
+            "a 401 is a serving process; taking its port would be a takeover of a healthy proxy"
+        );
+    }
+
+    /// The WEDGED shape: something holds the listening socket, the connect even
+    /// succeeds off the kernel backlog, and no response is ever written. This is
+    /// the state a deadlocked proxy leaves the port in, and the one the startup
+    /// stand-down has to be able to name — before this, `tcr` reported it as a
+    /// healthy incumbent and exited 0, and the port was unrecoverable.
+    ///
+    /// Costs the probe's own 5s deadline by construction: the assertion IS that
+    /// we wait for it and then call it silent.
+    #[tokio::test]
+    async fn a_listener_that_never_answers_is_silent_not_answering() {
+        // Bound and never accepted: connections queue in the backlog forever.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut config = load_from(TWO_ACCOUNTS);
+        config.proxy.port = port;
+
+        let probe = probe_incumbent(&config).await;
+        assert!(probe.build.is_none());
+        match probe.liveness {
+            Liveness::Silent { why } => assert!(
+                !why.is_empty(),
+                "the operator-facing line needs the probe's own account of what happened"
+            ),
+            Liveness::Answering => {
+                panic!("a socket that never wrote a byte is not an answering proxy")
+            }
+        }
+        drop(listener);
+    }
+
+    /// The classification the two tests above exercise, pinned directly so a
+    /// future variant cannot be added on the wrong side of it by accident.
+    #[test]
+    fn only_an_http_response_counts_as_answered() {
+        assert!(
+            !LiveStatusError::NoServer.answered(),
+            "nothing listening answered nothing"
+        );
+        assert!(
+            !LiveStatusError::NoAnswer("the server did not answer within 5s".into()).answered(),
+            "a deadline with no bytes back is the wedged shape"
+        );
+        assert!(
+            LiveStatusError::Unusable("HTTP 401 Unauthorized".into()).answered(),
+            "an HTTP response — any HTTP response — means the process is serving"
+        );
     }
 
     // --- no-persist guarantee ----------------------------------------------
