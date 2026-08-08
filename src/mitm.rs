@@ -309,13 +309,47 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-/// Run the hybrid listener until the task is aborted: accept, classify each
-/// connection (`CONNECT` → MITM, else base-URL), and serve it on its own task.
-/// `tls` is `None` only when TLS material could not be loaded at all — CONNECT
-/// then answers `503`, while base-URL mode keeps working.
+/// Run the hybrid listener forever: accept, classify each connection
+/// (`CONNECT` → MITM, else base-URL), and serve it on its own task. `tls` is
+/// `None` only when TLS material could not be loaded at all — CONNECT then
+/// answers `503`, while base-URL mode keeps working.
+///
+/// Never returns. A caller that needs to stop serving wants
+/// [`serve_with_shutdown`]; this is the shape the in-process tests use, where
+/// the loop dies with the test's runtime.
 pub async fn serve(listener: TcpListener, manager: Arc<Manager>, tls: Option<Arc<TlsAcceptor>>) {
+    serve_with_shutdown(listener, manager, tls, std::future::pending::<()>()).await;
+}
+
+/// [`serve`], plus a shutdown branch on the accept loop.
+///
+/// Returning drops the `listener`, so the port stops accepting the moment
+/// `shutdown` resolves — no `abort()` from outside, which is what a library
+/// caller could not rely on. Connections already accepted are NOT touched: each
+/// runs on its own detached task and a proxied response can be a long stream, so
+/// cutting one at shutdown would be strictly worse than letting it finish. Same
+/// property the old `server.abort()` had, now stated instead of incidental.
+///
+/// `biased` so a pending shutdown wins over a ready accept: under load an
+/// unbiased `select!` picks randomly, and shutdown must not be starved by
+/// traffic.
+pub async fn serve_with_shutdown(
+    listener: TcpListener,
+    manager: Arc<Manager>,
+    tls: Option<Arc<TlsAcceptor>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    let mut shutdown = std::pin::pin!(shutdown);
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            () = &mut shutdown => {
+                tracing::info!("accept loop shutting down; no longer accepting connections");
+                return;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
             Ok(pair) => pair,
             Err(err) => {
                 tracing::warn!(error = %err, "accept failed");
