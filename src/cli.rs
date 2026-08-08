@@ -1936,4 +1936,331 @@ mod tests {
             "5h exhausted + countdown: {line}"
         );
     }
+
+    // ---------------------------------------------------------------------
+    // The golden `tcr status --json` contract fixture.
+    // ---------------------------------------------------------------------
+
+    /// Path of the fixture BOTH sides read. One file, never a copy: the whole
+    /// point is that the Swift decoder and this renderer cannot drift apart, and
+    /// two files that must stay equal are the drift this exists to prevent.
+    /// `apps/macos/Tests/TcrBarTests/RealWorldDecodeTests.swift` reaches the same
+    /// path from `#filePath`.
+    fn status_contract_fixture_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/status-contract.json")
+    }
+
+    /// One fully-specified account row for the fixture.
+    ///
+    /// Every field is passed explicitly rather than defaulted, so a new field on
+    /// [`AccountSnapshot`] breaks this call site and forces a decision about what
+    /// the contract sample should say about it.
+    #[allow(clippy::too_many_arguments)]
+    fn contract_account(
+        name: &str,
+        priority: i64,
+        status: &str,
+        disabled: bool,
+        five_hour: Option<f64>,
+        five_hour_reset: Option<OffsetDateTime>,
+        seven_day: Option<f64>,
+        seven_day_reset: Option<OffsetDateTime>,
+        seven_day_oi: Option<f64>,
+        probe_status: crate::probe::ProbeStatus,
+        probe_error: Option<&str>,
+        quota_state: QuotaState,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            name: name.to_string(),
+            priority,
+            status: status.to_string(),
+            disabled,
+            five_hour,
+            five_hour_reset,
+            seven_day,
+            seven_day_reset,
+            seven_day_oi,
+            requests: if five_hour.is_some() { 102 } else { 0 },
+            input_tokens: if five_hour.is_some() { 8_000_000 } else { 0 },
+            output_tokens: if five_hour.is_some() { 31_860 } else { 0 },
+            cache_read_tokens: if five_hour.is_some() { 6_000_000 } else { 0 },
+            cache_creation_tokens: 0,
+            last_used: None,
+            rate_limited_until: None,
+            probe_status,
+            last_probe: None,
+            probe_error: probe_error.map(str::to_string),
+            quota_state,
+            gate: crate::stats::GateReason::Ok,
+            free_at: None,
+            stream_error_count: if five_hour.is_some() { 2 } else { 0 },
+            last_stream_error: if five_hour.is_some() {
+                Some("overloaded_error".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
+    /// A fixed instant in the PAST, so the two clock-derived fields render
+    /// deterministically.
+    ///
+    /// `minutesUntilReset` is `(reset - now).whole_minutes().max(0)` and
+    /// `secondsUntilFree` is dropped entirely once `free_at` has elapsed, so
+    /// every reset instant here is historical and both render as their clamped /
+    /// absent value. That buys a byte-for-byte comparison against raw renderer
+    /// output with **no normalisation layer** — and a normalisation layer is
+    /// exactly where a contract pin rots, because it is the one part of the
+    /// comparison nothing checks.
+    fn fixture_instant(unix_ms: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp_nanos(unix_ms as i128 * 1_000_000)
+            .expect("fixture instant is a valid timestamp")
+    }
+
+    /// The snapshot the fixture is rendered from. Obviously-fake data only —
+    /// this repository is public.
+    fn status_contract_snapshot() -> (StatsSnapshot, Vec<f64>) {
+        // 2026-01-01T00:00:00Z and 2026-01-02T00:00:00Z, both long past.
+        let five_hour_reset = fixture_instant(1_767_225_600_000);
+        let seven_day_reset = fixture_instant(1_767_312_000_000);
+
+        let accounts = vec![
+            // `ok`: probed, measured, in rotation — the ordinary row.
+            contract_account(
+                "alice@example.com",
+                0,
+                "active",
+                false,
+                Some(0.04),
+                Some(five_hour_reset),
+                Some(0.01),
+                Some(seven_day_reset),
+                Some(0.0),
+                crate::probe::ProbeStatus::Ok,
+                None,
+                QuotaState::Normal,
+            ),
+            // `near`: at threshold, so `held` carries a window — the only row
+            // that exercises the nested object.
+            contract_account(
+                "bob@example.com",
+                1,
+                "active",
+                false,
+                Some(0.95),
+                Some(five_hour_reset),
+                Some(0.91),
+                Some(seven_day_reset),
+                Some(0.10),
+                crate::probe::ProbeStatus::RateLimited,
+                None,
+                QuotaState::NearLimit,
+            ),
+            // `spent`: fully consumed, and carrying a probe error string.
+            contract_account(
+                "carol@example.com",
+                2,
+                "throttled",
+                false,
+                Some(1.0),
+                Some(five_hour_reset),
+                Some(1.0),
+                Some(seven_day_reset),
+                Some(0.5),
+                crate::probe::ProbeStatus::Error,
+                Some("probe failed: connection reset"),
+                QuotaState::Exhausted,
+            ),
+            // Never probed AND disabled: the four quota fractions and
+            // `cacheHitRatio` are all null. This row is the one that shipped a
+            // decode crash — `valueNotFound … Path: [2].quota`.
+            contract_account(
+                "dave@example.com",
+                3,
+                "active",
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::probe::ProbeStatus::Never,
+                None,
+                QuotaState::Normal,
+            ),
+        ];
+        let mut accounts = accounts;
+        // `freeAtMs` and `rateLimitedUntilMs` must be pinned as *numbers*
+        // somewhere in the sample, or the fixture would only ever prove they can
+        // be null — which a deleted key also looks like. Both instants are past,
+        // so `secondsUntilFree` (the one clock-derived companion) stays absent
+        // and the render stays deterministic.
+        accounts[2].free_at = Some(fixture_instant(1_767_312_000_000));
+        accounts[2].rate_limited_until = Some(fixture_instant(1_767_225_600_000));
+
+        let thresholds = vec![0.9; accounts.len()];
+        (
+            StatsSnapshot {
+                accounts,
+                current: Some(0),
+                recent: Vec::new(),
+                sessions: Vec::new(),
+            },
+            thresholds,
+        )
+    }
+
+    /// The exact bytes the fixture file must hold.
+    fn status_contract_rendered() -> String {
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let build = BuildInfo {
+            sha: "abc1234".to_string(),
+            dirty: Some(false),
+            built_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        // Trailing newline so the file is a well-formed text file; the renderer
+        // itself emits none.
+        format!(
+            "{}\n",
+            render_accounts_json(&snapshot, &thresholds, StatusSource::Live, Some(&build))
+        )
+    }
+
+    /// THE CROSS-LANGUAGE CONTRACT PIN.
+    ///
+    /// `tcr status --json` is decoded by TcrBar (`FleetStatus.swift`), and no
+    /// compiler checks that seam — the key names cross as strings. This test
+    /// asserts the renderer still produces the committed fixture byte-for-byte,
+    /// and `RealWorldDecodeTests.testCommittedContractFixtureDecodes` decodes
+    /// **that same file** through `Fleet.decode`.
+    ///
+    /// So a renamed key cannot land quietly: this test goes red first, and
+    /// regenerating the fixture to satisfy it (`TCR_UPDATE_FIXTURES=1 cargo test
+    /// status_contract_fixture_matches_committed`) turns the Swift side red in
+    /// the same breath. Both reds were observed before this was believed.
+    #[test]
+    fn status_contract_fixture_matches_committed() {
+        let path = status_contract_fixture_path();
+        let rendered = status_contract_rendered();
+
+        if std::env::var_os("TCR_UPDATE_FIXTURES").is_some() {
+            fs::create_dir_all(path.parent().expect("fixture dir")).expect("create fixture dir");
+            fs::write(&path, &rendered).expect("write fixture");
+            eprintln!("regenerated {}", path.display());
+            return;
+        }
+
+        let committed = fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read the committed contract fixture at {}: {e}. \
+                 Regenerate with TCR_UPDATE_FIXTURES=1 cargo test \
+                 status_contract_fixture_matches_committed",
+                path.display()
+            )
+        });
+
+        assert_eq!(
+            committed,
+            rendered,
+            "`tcr status --json` no longer renders the committed contract \
+             fixture at {}. If the change is intended, regenerate it with \
+             TCR_UPDATE_FIXTURES=1 and then run the Swift decode suite \
+             (apps/macos: swift test) — that is the half of the contract this \
+             process cannot check.",
+            path.display()
+        );
+    }
+
+    /// The fixture is only worth pinning if it is *representative*: a sample
+    /// covering one shape would pin one shape. Asserted against the committed
+    /// bytes rather than the renderer, so a fixture regenerated from a
+    /// narrowed snapshot fails here too.
+    #[test]
+    fn status_contract_fixture_covers_every_rendered_shape() {
+        let committed = fs::read_to_string(status_contract_fixture_path())
+            .expect("committed contract fixture is readable");
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&committed).expect("fixture is a bare JSON array");
+        assert_eq!(rows.len(), 4, "one row per covered shape");
+
+        let states: Vec<&str> = rows
+            .iter()
+            .map(|r| r["quotaState"].as_str().expect("quotaState is a string"))
+            .collect();
+        assert!(states.contains(&"ok"), "{states:?}");
+        assert!(states.contains(&"near"), "{states:?}");
+        assert!(states.contains(&"spent"), "{states:?}");
+
+        let probes: Vec<&str> = rows
+            .iter()
+            .map(|r| r["probeStatus"].as_str().expect("probeStatus is a string"))
+            .collect();
+        assert!(probes.contains(&"never"), "{probes:?}");
+        assert!(probes.contains(&"ok"), "{probes:?}");
+        assert!(probes.contains(&"rate-limited"), "{probes:?}");
+        assert!(probes.contains(&"error"), "{probes:?}");
+
+        // The never-probed row: every optional the Swift model types as
+        // optional really is null somewhere in this sample. `get`, not
+        // indexing — indexing a MISSING key also yields Null, which would let a
+        // deleted key pass as a null.
+        let never = rows
+            .iter()
+            .find(|r| r["probeStatus"] == "never")
+            .expect("a never-probed row");
+        for key in [
+            "quota",
+            "fiveHour",
+            "sevenDay",
+            "sevenDayOi",
+            "cacheHitRatio",
+        ] {
+            assert_eq!(
+                never.get(key),
+                Some(&serde_json::Value::Null),
+                "{key} is present AND null on the never-probed row: {never}"
+            );
+        }
+        assert_eq!(never["disabled"], serde_json::json!(true));
+
+        // At least one row carries a `held` window, one carries a probe error,
+        // and one carries a stream error — the three nested/optional shapes the
+        // panel renders differently.
+        assert!(
+            rows.iter()
+                .any(|r| !r["held"].as_array().expect("held is an array").is_empty()),
+            "some row is held: {committed}"
+        );
+        assert!(
+            rows.iter().any(|r| r["probeError"].is_string()),
+            "some row carries a probe error: {committed}"
+        );
+        assert!(
+            rows.iter().any(|r| r["lastStreamError"].is_string()),
+            "some row carries a stream error: {committed}"
+        );
+        assert!(
+            rows.iter().any(|r| r["freeAtMs"].is_i64()),
+            "some row pins freeAtMs as a number: {committed}"
+        );
+        assert!(
+            rows.iter().any(|r| r["rateLimitedUntilMs"].is_i64()),
+            "some row pins rateLimitedUntilMs as a number: {committed}"
+        );
+
+        // Public repo: the fixture carries no real account data. A positive
+        // control on the same probe — the fake domain really is present — so an
+        // empty match cannot read as "clean".
+        assert!(
+            committed.contains("@example.com"),
+            "positive control: the fixture uses example.com addresses"
+        );
+        for row in &rows {
+            let name = row["name"].as_str().expect("name is a string");
+            assert!(
+                name.ends_with("@example.com"),
+                "every fixture account is obviously fake: {name}"
+            );
+        }
+    }
 }
