@@ -1067,12 +1067,20 @@ mod tests {
         );
     }
 
-    /// UDP control: `listeners`' backends hard-code every UDP socket's state to
-    /// `SocketState::Unknown` (never `Listen`), so this passes today for that
-    /// reason rather than because of an explicit UDP exclusion — which is
-    /// exactly why it is worth having as a canary. The day upstream gives UDP a
-    /// real state, `Protocol::TCP` (not the state filter) is what keeps this
-    /// green; if this test ever goes red, that upstream change is why.
+    /// UDP canary. **This test cannot currently fail, and that is deliberate —
+    /// but it was previously documented as if a filter were holding it up.**
+    ///
+    /// Measured 2026-08-08 on macOS by removing each filter in turn and re-running:
+    /// it stays green with `SocketState::Listen` removed AND with `Protocol::TCP`
+    /// removed. So neither filter is what excludes our UDP socket; `get_all()`
+    /// never enumerates it in the first place on this platform. The previous
+    /// comment here claimed "`Protocol::TCP` (not the state filter) is what keeps
+    /// this green", which the mutations refute.
+    ///
+    /// It is kept as a pure upstream canary: if `listeners` ever starts reporting
+    /// UDP sockets, this goes red and tells us the protocol filter has become
+    /// load-bearing. Do not count it as evidence that either filter works — the
+    /// two tests above are, and both were watched failing under mutation.
     #[test]
     fn port_listeners_excludes_a_udp_socket_on_the_same_port() {
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding an ephemeral UDP port");
