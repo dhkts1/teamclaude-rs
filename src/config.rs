@@ -1156,6 +1156,7 @@ mod tests {
     /// A unique temp path per test — the suite runs tests in parallel threads of
     /// ONE process, so a pid-only name collides.
     fn tmp_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("tcr-{tag}-{}-{seq}.json", std::process::id()))
