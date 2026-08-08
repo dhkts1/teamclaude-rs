@@ -122,7 +122,7 @@ TURN2_TEXT="Turn 2: reply with the single word DONE."
 BODY1="$(build_body "$TURN1_TEXT")"
 BODY2="$(build_body "$TURN2_TEXT")"
 
-LOG_HINT="grep 'serving request' \"\${TMPDIR:-/tmp}/teamclaude-rs.log\" | tail"
+LOG_HINT="grep 'serving request' ~/.cache/teamclaude/logs/teamclaude-rs.log.* | tail"
 
 # ---- dry-run path -----------------------------------------------------------
 if [[ "$DRY_RUN" -eq 1 ]]; then

@@ -718,23 +718,133 @@ fn default_config() -> Config {
     serde_json::from_str("{}").expect("an empty JSON object is always a valid default config")
 }
 
-/// The one durable log both modes append to.
-fn log_file_path() -> std::path::PathBuf {
-    std::env::temp_dir().join("teamclaude-rs.log")
+/// Base cache directory: `$XDG_CACHE_HOME/teamclaude`, else `$HOME/.cache/teamclaude`.
+///
+/// Deliberately independent of [`affinity::default_path`] (same env-var
+/// resolution order, duplicated rather than shared) so that a bug or a test
+/// touching the log path can never brush the live session-affinity pin file's
+/// neighbourhood by construction — the two are computed by different code, not
+/// just used at different leaf paths under a shared helper.
+fn cache_base_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("teamclaude")
 }
 
-/// Open the durable log, append-mode and owner-only.
+/// The one shared, well-known, non-private directory both modes log into:
+/// `~/.cache/teamclaude/logs/` (or `$XDG_CACHE_HOME/teamclaude/logs/`).
 ///
-/// The log holds account emails + request paths, so it is created 0600 rather
-/// than at the umask default (typically world-readable 0644). Both the headless
-/// and TUI paths go through here — the mode is defined once, not per caller.
-fn open_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt as _;
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(log_path)
+/// The path is fixed for **human discoverability** — so `rg 'server started'
+/// ~/.cache/teamclaude/logs/*` always finds the right directory — not because
+/// any code depends on the literal string. Nothing in this codebase opens this
+/// path programmatically outside this module; see `open_log_appender` below and
+/// the doc-comment on `the_log_directory_is_the_shared_cache_location` for the
+/// census that established that.
+fn log_dir_path() -> std::path::PathBuf {
+    cache_base_dir().join("logs")
+}
+
+/// Open the durable, rotating log directory, injectable for tests so they never
+/// touch the real `~/.cache/teamclaude/logs/` — pass a unique temp dir instead
+/// of routing through [`log_dir_path`].
+///
+/// `tracing_appender::rolling` has no per-file `.mode()` hook (checked against
+/// its 0.2.5 source: `create_writer` in its `rolling.rs` opens with
+/// `OpenOptions::append(true).create(true)` only), so a rotating file cannot be
+/// made owner-only the way the old single file was. Confidentiality is enforced
+/// on the *directory* instead, and it is load-bearing on Linux CI targets, not
+/// belt-and-braces: the parent `~/.cache/teamclaude/` is `0755` (protects its
+/// existing contents by *file* mode — `session-affinity.json` is `0600`), so
+/// without an owner-only `logs/` subdirectory, files landing at the crate's
+/// default `0644` would be world-readable on any multi-user box. The mode is
+/// requested atomically at directory-creation time via `DirBuilder::mode`, not
+/// create-then-`chmod` — the latter leaves a TOCTOU window where the directory
+/// is briefly world-traversable while it starts to hold sensitive log content.
+///
+/// The 0700 mode is applied at directory creation and re-asserted once at
+/// process startup (below). It is **not** a standing invariant:
+/// `tracing_appender`'s own fallback (`rolling.rs:795`) recreates the
+/// directory with `create_dir_all` and no mode if it is removed externally —
+/// at construction and at every rotation — so a `logs/` deleted mid-run
+/// silently returns at 0755 for the life of the process. This function closes
+/// the pre-existing-directory case (a stale `mkdir -p`, a `tar` restore
+/// without `-p`, a baked container path); it cannot reach that crate-internal
+/// recreation path, which is not this function's to fix.
+///
+/// The mode is checked on the **resolved** target, not the path itself:
+/// `std::fs::metadata`/`set_permissions` both follow symlinks, and
+/// `DirBuilder` succeeds against an existing symlink-to-directory, so a
+/// symlinked `logs/` is validated by where it points, not by the link. That
+/// is deliberate, not an oversight: pointing the log directory at another
+/// volume is a legitimate operator setup, and refusing to start over a
+/// symlink would break a working configuration to close a hole that is not a
+/// privilege boundary anyway — planting such a symlink first requires write
+/// access to the 0755, user-owned `~/.cache/teamclaude/` parent, i.e. the
+/// user or root, who already has more reach than this would buy them.
+///
+/// `.recursive(true)` creates every missing path component, parents included,
+/// **carrying the same `0700` mode** — this is not confined to `logs/` itself.
+/// On a fresh install or in a container where `~/.cache/teamclaude/` (or even
+/// `~/.cache/`) does not yet exist, this call creates it at `0700`, changing a
+/// directory shared with every other application on the machine. That is
+/// invisible on a dev box where both already exist at `0755`, but it is real,
+/// measured behaviour of `DirBuilder::recursive`, not a hypothetical.
+///
+/// Rotation is `DAILY` with `max_log_files(5)`: measured against the live log
+/// (2026-08-08) at ~13.5 MiB/day, this bounds this directory's steady-state
+/// disk use to roughly 65-70 MiB instead of genuinely unbounded growth. That
+/// is **not** a wash against the old file: the pre-upgrade
+/// `$TMPDIR/teamclaude-rs.log` (~62 MiB, measured 2026-08-08) is left in
+/// place deliberately (deprecate, don't delete — nothing here removes an
+/// operator's existing evidence), so the true post-upgrade footprint is that
+/// ~62 MiB orphan **plus** the new 65-70 MiB, until an operator cleans the
+/// orphan up by hand. It is a wall-clock bound, not a byte-size bound: a single unusually
+/// verbose day can still exceed the per-file average before the next
+/// rotation, so this is a soft cap, not a hard one. Rotation also rolls on
+/// `Rotation::DAILY`'s UTC clock (`rolling.rs` uses `OffsetDateTime::now_utc`),
+/// not local midnight — for the stated goal of human discoverability, that
+/// means the daily boundary lands at 03:00 in Asia/Jerusalem, not midnight.
+fn open_log_appender(
+    log_dir: &std::path::Path,
+) -> std::io::Result<tracing_appender::rolling::RollingFileAppender> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(log_dir)?;
+
+    // `DirBuilder::mode` only governs directories it *creates* — a directory
+    // that already existed (operator `mkdir -p`, a `tar` restore without
+    // `-p`, a baked container path) is untouched by the call above and could
+    // be sitting at 0755 or worse. Re-assert here so every process start
+    // closes that window, not just a genuinely-fresh directory.
+    let mode = std::fs::metadata(log_dir)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(log_dir, std::fs::Permissions::from_mode(0o700))?;
+        let confirmed = std::fs::metadata(log_dir)?.permissions().mode() & 0o777;
+        if confirmed & 0o077 != 0 {
+            return Err(std::io::Error::other(format!(
+                "log directory {} is not owner-only after chmod (mode {confirmed:#o}); \
+                 refusing to log account emails into a world-readable directory",
+                log_dir.display()
+            )));
+        }
+    }
+
+    tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("teamclaude-rs.log")
+        .max_log_files(5)
+        .build(log_dir)
+        .map_err(std::io::Error::other)
 }
 
 /// Build the headless subscriber: every event goes to **both** `stdout_sink` and
@@ -749,9 +859,18 @@ fn open_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
 ///
 /// `file` is an `Option` on purpose: a logging failure must never take the proxy
 /// down, so a log that will not open degrades to stdout-only.
+///
+/// `RollingFileAppender` is used directly as the writer, never through
+/// `tracing_appender::non_blocking()`. `non_blocking()` returns a `WorkerGuard`
+/// that must live as long as logging should happen — drop it (as this
+/// function's `()` return type would force, if it owned one) and the
+/// background writer thread shuts down with no error and no warning: every
+/// event after that silently stops reaching disk while every gate stays green.
+/// `RollingFileAppender` itself implements `Write`/`MakeWriter` synchronously,
+/// so it needs no guard and no lifetime plumbing.
 fn headless_subscriber<W>(
     filter: tracing_subscriber::EnvFilter,
-    file: Option<std::fs::File>,
+    file: Option<tracing_appender::rolling::RollingFileAppender>,
     stdout_sink: W,
 ) -> impl tracing::Subscriber + Send + Sync
 where
@@ -777,13 +896,13 @@ fn init_tracing(headless: bool) {
     use tracing_subscriber::util::SubscriberInitExt as _;
     use tracing_subscriber::EnvFilter;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let log_path = log_file_path();
-    let file = match open_log_file(&log_path) {
+    let log_dir = log_dir_path();
+    let file = match open_log_appender(&log_dir) {
         Ok(file) => Some(file),
         Err(err) => {
             eprintln!(
-                "[tcr] could not open log file {}: {err}",
-                log_path.display()
+                "[tcr] could not open log directory {}: {err}",
+                log_dir.display()
             );
             None
         }
@@ -1023,30 +1142,83 @@ mod tests {
         }
     }
 
-    /// The TUI log file (account emails + request paths) must be created
-    /// owner-only. `.mode(0o600)` carries only owner bits, so it survives any
-    /// reasonable umask (0o022/0o077 clear group/other only).
-    #[test]
-    fn tui_log_is_created_owner_only() {
-        let path = std::env::temp_dir().join(format!(
-            "teamclaude-rs-perms-test-{}-{:?}.log",
+    /// A unique, test-only log directory keyed by pid + nanosecond timestamp.
+    /// Never the real `~/.cache/teamclaude/logs/` — tests must not touch the
+    /// live proxy's cache directory (`session-affinity.json` lives one level up
+    /// and is being written by a running process).
+    fn unique_log_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "teamclaude-rs-test-{tag}-{}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or_default()
-        ));
+        ))
+    }
+
+    /// The rotating log directory (account emails + request paths inside it)
+    /// must be created owner-only. `tracing_appender` has no per-file
+    /// `.mode()` hook (verified against its 0.2.5 source — `create_writer` in
+    /// `rolling.rs` opens with `OpenOptions::append(true).create(true)` only),
+    /// so confidentiality is enforced on the directory, not the file: `0700`
+    /// blocks traversal into the directory for everyone but the owner, even
+    /// though the files landing inside it carry whatever mode the process
+    /// umask gives a freshly `OpenOptions::create`d file (commonly `0644` —
+    /// world-readable in their *own* bits, but unreachable because nothing
+    /// outside the owner can resolve a path through a `0700` parent).
+    #[test]
+    fn log_directory_is_created_owner_only() {
+        let dir = unique_log_dir("dirmode");
         // Goes through the production opener: re-implementing the mode here
-        // would assert 0o600 == 0o600 and pass however `open_log_file` drifts.
-        let file = open_log_file(&path).expect("open temp log file");
-        let mode = file
-            .metadata()
-            .expect("stat temp log file")
+        // would assert 0o700 == 0o700 and pass however `open_log_appender`
+        // drifts.
+        let _appender = open_log_appender(&dir).expect("open temp log dir");
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("stat temp log dir")
             .permissions()
             .mode()
             & 0o777;
-        std::fs::remove_file(&path).ok();
-        assert_eq!(mode, 0o600, "log file must be owner-only (0600)");
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(dir_mode, 0o700, "log directory must be owner-only (0700)");
+    }
+
+    /// `DirBuilder::mode` only sets the mode of directories it *creates* — a
+    /// directory that already exists (operator `mkdir -p`, a `tar` restore
+    /// without `-p`, a baked container path) is left exactly as it was found.
+    /// `open_log_appender` must re-assert `0700` on an already-existing
+    /// directory, not merely request it at creation time, or a pre-existing
+    /// `0755` `logs/` silently ships every rotated file world-readable.
+    #[test]
+    fn log_directory_is_re_asserted_owner_only_when_it_already_exists() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = unique_log_dir("dirmode-preexisting");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .recursive(true)
+            .create(&dir)
+            .expect("pre-create the dir at 0755, simulating an external mkdir/restore");
+        let preexisting_mode = std::fs::metadata(&dir)
+            .expect("stat pre-created dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            preexisting_mode, 0o755,
+            "test setup sanity: the pre-created dir must actually be 0755"
+        );
+
+        let _appender = open_log_appender(&dir).expect("open pre-existing log dir");
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("stat temp log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            dir_mode, 0o700,
+            "a pre-existing, wrongly-permissioned log directory must be re-asserted to 0700"
+        );
     }
 
     /// A `MakeWriter` that keeps what was written, so a test can inspect the
@@ -1081,15 +1253,27 @@ mod tests {
         }
     }
 
-    fn unique_log_path(tag: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "teamclaude-rs-{tag}-{}-{:?}.log",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ))
+    /// Reads back whatever `open_log_appender` actually wrote inside `dir` —
+    /// there is exactly one matching file after a single, unrotated write.
+    /// This is the "it writes", not merely "it initialised", proof: a dropped
+    /// `WorkerGuard` (see `headless_subscriber`'s doc-comment) would make
+    /// `init_tracing`-style construction succeed while nothing ever lands here.
+    fn read_the_one_log_file(dir: &std::path::Path) -> String {
+        let mut matches: Vec<_> = std::fs::read_dir(dir)
+            .expect("read temp log dir")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("teamclaude-rs.log")
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "expected exactly one log file in {dir:?}, found {matches:?}"
+        );
+        std::fs::read_to_string(matches.pop().unwrap().path()).expect("read the log file")
     }
 
     /// HEADLESS MUST REACH DISK. TcrBar spawns `tcr server --headless` and throws
@@ -1100,22 +1284,22 @@ mod tests {
     /// everyone running it in a terminal.
     #[test]
     fn headless_logging_reaches_both_the_file_and_stdout() {
-        let path = unique_log_path("headless-test");
-        let file = open_log_file(&path).expect("open temp log file");
+        let dir = unique_log_dir("headless-test");
+        let appender = open_log_appender(&dir).expect("open temp log dir");
         let stdout = SharedBuf::default();
         let marker = format!("headless-sink-probe-{}", std::process::id());
 
         let subscriber = headless_subscriber(
             tracing_subscriber::EnvFilter::new("info"),
-            Some(file),
+            Some(appender),
             stdout.clone(),
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("{marker}");
         });
 
-        let on_disk = std::fs::read_to_string(&path).expect("read temp log file");
-        std::fs::remove_file(&path).ok();
+        let on_disk = read_the_one_log_file(&dir);
+        std::fs::remove_dir_all(&dir).ok();
         assert!(
             on_disk.contains(&marker),
             "headless event never reached the log file; file held: {on_disk:?}"
@@ -1153,13 +1337,93 @@ mod tests {
         );
     }
 
-    /// `init_tracing` must target the one shared log, not a private path — this
-    /// is what `tcr status` and every diagnostic already read.
+    /// `init_tracing` must target the one shared, well-known cache directory,
+    /// not a private/generated path — so a human running the documented
+    /// `rg 'server started' ~/.cache/teamclaude/logs/*` recipe can always find
+    /// it. This is **not** because any code reads it back (a census —
+    /// `rg -n 'teamclaude-rs\.log|log_file_path|log_dir_path' src/ scripts/
+    /// apps/`, repo-relevant scope, not `src/` alone: a `src/`-only census once
+    /// missed `scripts/validate-cache.sh`'s own copy of the old fixed path —
+    /// found no programmatic reader anywhere outside this module; the previous
+    /// version of this test justified itself with "this is what `tcr status`
+    /// and every diagnostic already read", which was false and is not
+    /// repeated here).
     #[test]
-    fn the_log_path_is_the_shared_tmpdir_log() {
-        assert_eq!(
-            log_file_path(),
-            std::env::temp_dir().join("teamclaude-rs.log")
+    fn the_log_directory_is_the_shared_cache_location() {
+        assert_eq!(log_dir_path(), cache_base_dir().join("logs"));
+        assert!(
+            log_dir_path().ends_with(std::path::Path::new("teamclaude").join("logs")),
+            "log directory must live under the shared teamclaude cache dir: {:?}",
+            log_dir_path()
         );
+    }
+
+    /// `max_log_files` pruning is real, not merely configured, AND it is the
+    /// production `open_log_appender`'s own hardcoded `max_log_files(5)`
+    /// being exercised — not a hand-rolled duplicate of the config, so a
+    /// regression that drops or weakens the production call is what this test
+    /// is sensitive to. Pre-creates 5 dated files (the `prefix.date` shape
+    /// `join_date()` produces for any non-`NEVER` rotation), each with a
+    /// distinct creation time, then calls the real production opener —
+    /// `prune_old_logs()` runs at *construction*, before the first new file is
+    /// created (verified against 0.2.5 source, `rolling.rs:615-617`), which is
+    /// what makes this deterministic: no wall-clock rotation boundary needs to
+    /// be crossed.
+    ///
+    /// This is portable across the two CI targets, not merely convenient on
+    /// one. `prune_old_logs()` sorts by `metadata.created()` where the
+    /// platform supports it, but explicitly falls back to parsing the date out
+    /// of the filename itself when it does not (`rolling.rs:689-696`,
+    /// `parse_date_from_filename`) — and this test's embedded dates
+    /// (`2020-02-01` .. `2020-02-05`) sort in the same order as their real
+    /// creation timestamps, so the assertions hold identically whichever path
+    /// the pruner takes. Verified directly against this repo's own targets:
+    /// macOS (APFS) supports `created()`; the crate's own filename-parsing
+    /// fallback exists specifically because ext4/most Linux filesystems (this
+    /// repo's `ci` job runs `ubuntu-latest`) commonly return
+    /// `ErrorKind::Unsupported` for it — an attempt to break this test via
+    /// that path does not succeed, because the fallback is exercised, not
+    /// skipped.
+    #[test]
+    fn old_log_files_are_pruned_at_max_log_files() {
+        let dir = unique_log_dir("pruning");
+        std::fs::create_dir_all(&dir).expect("create temp log dir");
+
+        // Five pre-existing dated files, oldest first, each with a distinct
+        // creation time (the pruner sorts by `metadata.created()`).
+        let oldest = "2020-02-01";
+        let survivors = ["2020-02-02", "2020-02-03", "2020-02-04", "2020-02-05"];
+        for date in std::iter::once(&oldest).chain(survivors.iter()) {
+            std::fs::write(dir.join(format!("teamclaude-rs.log.{date}")), b"old\n")
+                .expect("write stale log file");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // Production max_log_files(5): prune keeps (5 - 1) = 4 of the 5
+        // existing files, then the appender creates one new file for today —
+        // 5 total, with only the single oldest pre-existing file removed.
+        let _appender = open_log_appender(&dir).expect("open temp log dir");
+
+        let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .expect("read temp log dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert!(
+            remaining.len() >= 2,
+            "at least 2 files must survive pruning: {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&format!("teamclaude-rs.log.{oldest}")),
+            "the single oldest file must have been pruned: {remaining:?}"
+        );
+        for date in survivors {
+            assert!(
+                remaining.contains(&format!("teamclaude-rs.log.{date}")),
+                "pre-existing file {date} must survive pruning: {remaining:?}"
+            );
+        }
     }
 }

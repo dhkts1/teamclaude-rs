@@ -345,8 +345,10 @@ public final class ServerController: ObservableObject {
         // Only `standardError` gets a Pipe, and `ChildStderr` drains it
         // continuously — that is what makes it safe.
         //
-        // Nothing is lost: the server's durable log is `$TMPDIR/teamclaude-rs.log`,
-        // which is where `tcr status` and every diagnostic already read from.
+        // Nothing is lost: the server's durable log lives under
+        // `~/.cache/teamclaude/logs/` (daily-rotated, 5 files kept). Nothing in
+        // the codebase reads it back programmatically — the fixed location is
+        // for a human to find it, e.g. `rg 'server started' ~/.cache/teamclaude/logs/*`.
         //
         // Pairs with ce1cb27 (`--headless`, without which the child died instantly).
         // That fix let the server SURVIVE startup, which is precisely what let it
