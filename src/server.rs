@@ -463,8 +463,13 @@ impl ServerHandle {
         // reason. Taken (not just read) so a re-issued `shutdown` does not try
         // again — and a leftover file is harmless anyway: `singleton` re-checks the
         // pid against the live listeners before believing any claim.
+        //
+        // Removed only if it still names US: the listener was freed at the top of
+        // this function while the joins below it can take hundreds of milliseconds,
+        // so a successor may already have bound the port and written its own claim
+        // to this same port-named path. See `singleton::remove_owner_file_if_owned`.
         if let Some(path) = self.owner_path.take() {
-            singleton::remove_owner_file(&path);
+            singleton::remove_owner_file_if_owned(&path, std::process::id(), self.addr.port());
         }
 
         self.manager.persist_now();

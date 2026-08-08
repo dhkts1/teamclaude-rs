@@ -161,10 +161,50 @@ pub fn write_owner_file(path: &Path, owner: &ProxyOwner) -> Result<(), crate::co
     crate::config::write_atomic(path, &serde_json::to_string_pretty(owner)?)
 }
 
-/// Drop the claim. Best-effort by design: a file left behind by a crash cannot
-/// produce a false positive ([`verified_owner`] re-checks the pid against the
-/// live listeners), so failing to remove one costs nothing.
-pub fn remove_owner_file(path: &Path) {
+/// Withdraw the claim at `path` — but ONLY if it still names `pid` on `port`.
+///
+/// The check is the whole function. `proxy-owner-<port>.json` is shared state
+/// named after the PORT, not after the process, so a shutting-down proxy and its
+/// successor address the same file. A shutdown frees the listener first and then
+/// keeps joining background tasks (the affinity flusher does a blocking write, so
+/// hundreds of milliseconds); in that window a successor can bind the port and
+/// write its own claim. An unconditional unlink here would delete the SUCCESSOR's
+/// live claim, and for an embedded successor — whose command line identifies
+/// nothing — that means `live_proxy_server` returns `None`, `tcr login` stops
+/// refusing, and the boot-time single-use refresh tokens clobber the fresh ones.
+/// That is the exact failure the claim file exists to prevent, reintroduced by
+/// its own cleanup path.
+///
+/// Best-effort past the check: a claim left behind by a crash cannot produce a
+/// false positive ([`verified_owner`] re-checks the pid against the live
+/// listeners and the command line), so failing to remove one costs nothing.
+///
+/// A read-then-unlink still has a microsecond-wide TOCTOU window, which is not
+/// closable portably. It replaces a hundreds-of-milliseconds window with one
+/// bounded by two syscalls; the alternative — not checking — loses the file every
+/// time the race is entered at all.
+pub fn remove_owner_file_if_owned(path: &Path, pid: u32, port: u16) {
+    match read_owner_file(path) {
+        Some(owner) if owner.pid == pid && owner.port == port => {}
+        Some(owner) => {
+            tracing::info!(
+                path = %path.display(),
+                claim_pid = owner.pid,
+                claim_port = owner.port,
+                our_pid = pid,
+                our_port = port,
+                "not withdrawing the port claim: it names another proxy, so a successor \
+                 already took the port over"
+            );
+            return;
+        }
+        None => {
+            // Absent (already withdrawn) or unparseable — either way it is not
+            // this process's claim to delete, and a successor's write will
+            // replace it.
+            return;
+        }
+    }
     if let Err(err) = std::fs::remove_file(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -974,6 +1014,52 @@ mod tests {
             !message.contains("--replace to"),
             "must not offer an override that is refused for this kind: {message}"
         );
+    }
+
+    /// THE SUCCESSOR'S CLAIM SURVIVES OUR SHUTDOWN. The claim path is named after
+    /// the port, so a proxy shutting down and the proxy that just replaced it
+    /// address the same file — and the shutdown frees the listener BEFORE it gets
+    /// here (`server::ServerHandle::shutdown_within` joins background tasks in
+    /// between, including a blocking affinity write). An unconditional unlink
+    /// deletes the live successor's claim: for an embedded successor the name
+    /// matcher then recognizes nothing, `tcr login` stops refusing, and the
+    /// boot-time single-use refresh tokens overwrite the fresh ones.
+    #[test]
+    fn a_withdrawal_deletes_only_a_claim_this_process_still_owns() {
+        let dir = scratch_dir("withdraw");
+
+        // (1) The successor's claim — different pid, same port, same path.
+        let path = write_claim(&dir, 3456, 777, ProxyHost::Embedded);
+        remove_owner_file_if_owned(&path, 5150, 3456);
+        assert!(
+            path.exists(),
+            "withdrawing must not delete a claim written by another pid: {}",
+            path.display()
+        );
+        assert_eq!(
+            read_owner_file(&path).map(|owner| owner.pid),
+            Some(777),
+            "and it must be left byte-for-byte the successor's"
+        );
+
+        // (2) A claim for another port at this path is not ours either.
+        remove_owner_file_if_owned(&path, 777, 3457);
+        assert!(path.exists(), "the port must match too: {}", path.display());
+
+        // (3) The positive control: our OWN claim is withdrawn, so a shutdown
+        // still stops advertising a port it no longer listens on.
+        let ours = write_claim(&dir, 3457, 5150, ProxyHost::Cli);
+        remove_owner_file_if_owned(&ours, 5150, 3457);
+        assert!(
+            !ours.exists(),
+            "a proxy must withdraw its own claim on shutdown: {}",
+            ours.display()
+        );
+
+        // (4) Withdrawing twice (a re-issued shutdown) is quiet and harmless.
+        remove_owner_file_if_owned(&ours, 5150, 3457);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The claim file is named after the PORT, so two proxies on two ports never
