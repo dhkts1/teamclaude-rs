@@ -18,9 +18,11 @@
 //! `--replace`.
 //!
 //! Two safety properties, both load-bearing:
-//! - **Port-scoped.** Only the process listening on `127.0.0.1:<configured port>`
-//!   is a candidate — a proxy (or anything else) on another port is never touched,
-//!   so a test server on an ephemeral port is safe.
+//! - **Port-scoped, not address-scoped.** A candidate is any process listening on
+//!   `<configured port>` on ANY address — `127.0.0.1`, `0.0.0.0`, `[::1]`, or a LAN
+//!   IP all match, exactly as the old `lsof -iTCP:<port>` did — so a proxy (or
+//!   anything else) on another PORT is never touched, and a test server on an
+//!   ephemeral port is safe.
 //! - **Command-verified.** A candidate is signalled only if its command line is an
 //!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone (the bind
 //!   then fails loudly with EADDRINUSE) rather than killed. This is what makes the
@@ -54,6 +56,7 @@
 //!   which will never write one — are recognized exactly as before. Nothing has
 //!   to restart for this change to be safe.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::Duration;
@@ -441,9 +444,21 @@ fn process_command(pid: u32) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// PIDs listening on `127.0.0.1:port` (via [`listeners`], no subprocess). Empty on
-/// any failure — an erroring [`listeners::get_all`] degrades to "no takeover",
-/// never a false kill.
+/// PIDs listening on `:port` on any address (via [`listeners`], no subprocess),
+/// each pid appearing at most once. Empty on any failure — an erroring
+/// [`listeners::get_all`] degrades to no signal, and to binding anyway; it is
+/// not "no takeover" either: [`takeover_decision`]`(&[], _)` is
+/// `Takeover::Proceed`. That is safe for two of the three callers and not for
+/// the third. [`takeover_port`] and `server.rs`'s boot path both then actually
+/// BIND, so the kernel is the backstop — a second listener on a genuinely held
+/// port cannot come up, and the bind fails loudly with EADDRINUSE instead of us
+/// having signalled anything. `oauth::login`'s guard binds nothing, so it never
+/// meets that backstop: on an enumeration failure it proceeds beside a live
+/// server it failed to detect, and the server's next `persist_tokens` writes its
+/// boot-time tokens back over the ones the login just wrote, clobbering the
+/// single-use refresh tokens (observed live 2026-07-19, see `oauth.rs:788-793`).
+/// "Never a false kill" is true and load-bearing throughout; "no takeover" is
+/// only true where a bind stands behind it.
 ///
 /// Deliberately `listeners::get_all()` filtered to [`listeners::SocketState::Listen`]
 /// ourselves, NEVER [`listeners::get_process_by_port`]. That shortcut applies no
@@ -461,14 +476,41 @@ fn process_command(pid: u32) -> Vec<String> {
 /// The protocol filter is the same kind of parity restoration, made explicit
 /// rather than left to rest on an upstream implementation detail: the old
 /// `lsof -iTCP:{port}` excluded UDP outright. Today, both `listeners` backends
-/// hard-code every UDP entry's state to `SocketState::Unknown` (never `Listen`),
+/// hard-code every UDP entry's state to `SocketState::Unknown` (never `Listen`)
+/// (`platform/linux/proto_listener.rs:128,165`, `platform/macos/c_socket_fd_info.rs:32`),
 /// so the state filter above already excludes UDP as a side effect — but
 /// `SocketState` is a public enum upstream is still evolving (see issue #36),
 /// and a future release giving UDP a real state would silently start admitting
 /// UDP holders here with no line of code to blame. Filtering on
 /// `Protocol::TCP` directly keeps that guarantee independent of an
 /// undocumented invariant in a dependency.
+///
+/// **Dedup, order-preserving.** One process can hold several LISTEN sockets on
+/// the same port at once — the common case is a dual-stack bind,
+/// `127.0.0.1:<port>` plus `[::1]:<port>` from one `bind(0.0.0.0)`/`bind(::)`
+/// call, which is how a Node HTTP server (including the legacy JS proxy this
+/// module exists to migrate off of) listens by default. [`listeners::Listener`]
+/// derives `Hash`/`Eq` over `{process, socket, protocol, state}`, and `socket` is
+/// part of that key, so `get_all()`'s internal `HashSet` keeps both sockets as
+/// separate entries — the same pid then appears twice in this function's output.
+/// The old `lsof -t` collapsed that to one line per process; below reproduces
+/// that collapse explicitly, in FIRST-SEEN order, because callers
+/// ([`live_proxy_server`] via `.next()`, [`takeover_decision`] via `.find()`)
+/// read the first element as *the* incumbent to report, and reordering holders
+/// would change which one that is.
+///
+/// On Linux specifically there is also the opposite divergence, worth knowing
+/// even though it needs no fix here: `listeners`' Linux backend keys its
+/// inode→process map with plain last-writer-wins `HashMap::insert`
+/// (`platform/linux/helpers.rs:53-54`), so a listening fd shared across a FORK
+/// FAMILY collapses to whichever pid that scan visits last — never the multiple
+/// entries macOS produces by iterating per-pid × per-fd. Under `--replace` this
+/// can signal a worker and leave the parent holding the port, which then makes
+/// our own bind fail with EADDRINUSE despite having "replaced" the incumbent.
+/// CI cannot see this: the `ci` job runs on `ubuntu-latest`, the affected
+/// backend, but nothing in this crate forks a listening child to exercise it.
 fn port_listeners(port: u16) -> Vec<u32> {
+    let mut seen = HashSet::new();
     listeners::get_all()
         .unwrap_or_default()
         .into_iter()
@@ -476,6 +518,7 @@ fn port_listeners(port: u16) -> Vec<u32> {
         .filter(|listener| listener.state == listeners::SocketState::Listen)
         .filter(|listener| listener.socket.port() == port)
         .map(|listener| listener.process.pid)
+        .filter(|&pid| seen.insert(pid))
         .collect()
 }
 
@@ -547,9 +590,13 @@ pub fn live_proxy_server(port: u16) -> Option<Incumbent> {
         .next()
 }
 
-/// Is `pid` still alive? (Same [`sysinfo`] lookup `signal_pid` uses, minus the
-/// signal — a fresh snapshot per call so a reused pid cannot read as the
-/// process we just signalled.)
+/// Is `pid` still alive? Uses the same `refresh_processes_specifics` /
+/// `ProcessesToUpdate::Some` shape as [`signal_pid`] (both pass
+/// `ProcessRefreshKind::nothing()`, no `cmd`), minus the signal — a fresh
+/// snapshot per call so a reused pid cannot read as the process we just
+/// signalled. [`process_command`] is the odd one out: it refreshes the same way
+/// but additionally requests `.with_cmd(UpdateKind::Always)`, since it is the
+/// only one of the three that needs the command line.
 fn is_alive(pid: u32) -> bool {
     let mut sys = System::new();
     sys.refresh_processes_specifics(
@@ -873,6 +920,121 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    /// The real defect, end to end, not just the pure dedup helper in isolation:
+    /// bind `0.0.0.0:0` to get an OS-assigned port, then bind `[::]:<that same
+    /// port>` in the SAME process — the dual-stack pattern a default-configured
+    /// Node HTTP server (including the legacy JS proxy this module migrates off
+    /// of) produces from one `listen()` call. Both are genuine LISTEN sockets on
+    /// the same pid and port, so without the dedup this reports `[pid, pid]` and
+    /// callers that read the first element still get the right pid — but the
+    /// `takeover_port` signal loop iterates the WHOLE list, so the SIGTERM ->
+    /// sleep -> is_alive -> SIGKILL sequence would run twice against one process
+    /// with no fresh verification on the second pass. Port 0, in-process,
+    /// nothing signalled.
+    #[test]
+    fn port_listeners_collapses_a_dual_stack_bind_to_one_pid() {
+        let v4 = std::net::TcpListener::bind("0.0.0.0:0").expect("binding an ephemeral IPv4 port");
+        let port = v4
+            .local_addr()
+            .expect("a bound listener has a local address")
+            .port();
+
+        let Ok(v6) = std::net::TcpListener::bind(format!("[::]:{port}")) else {
+            // Some stacks refuse the v6 bind once v4 already holds the port (no
+            // dual-stack support, or `IPV6_V6ONLY` defaults differ locally).
+            // Falling back to the pure-helper check rather than failing the run
+            // — this asserts the same dedup logic `port_listeners` uses, just
+            // without a real second socket to prove the end-to-end case.
+            drop(v4);
+            let mut seen = HashSet::new();
+            let deduped: Vec<u32> = [4242_u32, 4242_u32, 7_u32]
+                .into_iter()
+                .filter(|&pid| seen.insert(pid))
+                .collect();
+            assert_eq!(
+                deduped,
+                vec![4242, 7],
+                "fallback: the dedup pattern itself should be order-preserving \
+                 (could not verify the real dual-stack bind on this machine)"
+            );
+            return;
+        };
+
+        let holders = port_listeners(port);
+        assert_eq!(
+            holders,
+            vec![std::process::id()],
+            "one process holding the port on two dual-stack sockets should report ONE pid \
+             (order-preserving dedup), got {holders:?}"
+        );
+
+        drop(v4);
+        drop(v6);
+    }
+
+    /// The negative control the `SocketState::Listen` filter never had: a test
+    /// proving a LISTEN socket IS found existed, nothing proved a non-LISTEN
+    /// socket is NOT. That filter is the issue-#36 guard on the kill path
+    /// (`replaceable_incumbents` -> `takeover_decision` -> the SIGTERM/SIGKILL
+    /// loop), so positive-only coverage means a regression that dropped the
+    /// filter would ship silently. Single process, port 0, no second proxy, no
+    /// root, nothing signalled.
+    #[test]
+    fn port_listeners_excludes_a_non_listening_socket_on_the_same_port() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        let port = server
+            .local_addr()
+            .expect("a bound listener has a local address")
+            .port();
+
+        // Positive control: the listener itself is still up.
+        let holders = port_listeners(port);
+        assert!(
+            holders.contains(&std::process::id()),
+            "the LISTEN socket on port {port} should be reported; got {holders:?}"
+        );
+
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("connecting to our own listener");
+        let (_accepted, _) = server.accept().expect("accepting the connection");
+        // `_accepted`'s LOCAL port is also `port`, but its state is ESTABLISHED,
+        // not LISTEN — it must never appear here.
+        drop(server);
+        // The LISTEN socket is gone; only the ESTABLISHED accepted socket still
+        // has local port `port`. Without the `SocketState::Listen` filter this
+        // would report this process's pid again and the assertion below fails.
+        let holders_after = port_listeners(port);
+        assert!(
+            holders_after.is_empty(),
+            "an ESTABLISHED socket on port {port} must not be reported as a LISTEN holder; \
+             got {holders_after:?}"
+        );
+    }
+
+    /// UDP control: `listeners`' backends hard-code every UDP socket's state to
+    /// `SocketState::Unknown` (never `Listen`), so this passes today for that
+    /// reason rather than because of an explicit UDP exclusion — which is
+    /// exactly why it is worth having as a canary. The day upstream gives UDP a
+    /// real state, `Protocol::TCP` (not the state filter) is what keeps this
+    /// green; if this test ever goes red, that upstream change is why.
+    #[test]
+    fn port_listeners_excludes_a_udp_socket_on_the_same_port() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding an ephemeral UDP port");
+        let port = udp
+            .local_addr()
+            .expect("a bound socket has a local address")
+            .port();
+
+        let holders = port_listeners(port);
+        assert!(
+            holders.is_empty(),
+            "a UDP socket on port {port} must never be reported as a TCP LISTEN holder; \
+             got {holders:?}"
+        );
+
+        drop(udp);
     }
 
     /// Proves `signal_pid` sends the SIGNAL ITSELF, not merely "some kill" — the
