@@ -103,6 +103,21 @@ pub enum ProxyHost {
     Cli,
     /// A proxy served from inside a host application.
     Embedded,
+    /// A host this build does not know about — a claim written by a NEWER `tcr`.
+    ///
+    /// The file is a cross-process, cross-BUILD contract: the `tcr` that reads it
+    /// may be older than the one that wrote it. Without this catch-all an unknown
+    /// `host` value fails the whole `ProxyOwner` parse, so a live proxy reads as
+    /// NO CLAIM AT ALL — the name matcher then sees the host program's `argv[0]`,
+    /// recognizes nothing, `tcr login` runs beside the live server and its fresh
+    /// single-use refresh tokens are overwritten, and `tcr server --replace`
+    /// SIGTERMs the process the claim existed to protect. Degrading to "a proxy is
+    /// there, do not signal it" is strictly safer than degrading to "nothing is
+    /// there", so this maps to [`ProxyKind::TcrEmbedded`].
+    ///
+    /// Only ever produced by DEserialization. Nothing in this crate writes it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ProxyHost {
@@ -110,7 +125,9 @@ impl ProxyHost {
     fn kind(self) -> ProxyKind {
         match self {
             ProxyHost::Cli => ProxyKind::Tcr,
-            ProxyHost::Embedded => ProxyKind::TcrEmbedded,
+            // An unrecognized host is treated as embedded: of the two, it is the
+            // kind that is never signalled. See [`ProxyHost::Unknown`].
+            ProxyHost::Embedded | ProxyHost::Unknown => ProxyKind::TcrEmbedded,
         }
     }
 }
@@ -143,15 +160,21 @@ pub fn owner_path_in(dir: &Path, port: u16) -> PathBuf {
     dir.join(format!("proxy-owner-{port}.json"))
 }
 
-/// Where the binary keeps the claim: beside the session-affinity pin cache, so
-/// the proxy's two pieces of cross-boot state live in one directory.
-pub fn default_owner_path(port: u16) -> PathBuf {
+/// The directory the binary keeps the claim in: beside the session-affinity pin
+/// cache, so the proxy's two pieces of cross-boot state live in one place.
+pub fn default_owner_dir() -> PathBuf {
     let cache = crate::affinity::default_path();
-    let dir = cache
+    cache
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    owner_path_in(&dir, port)
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Where the binary keeps the claim for `port`. Every reader resolves the claim
+/// through this function, which is why a writer must never be handed a free-form
+/// path: see [`crate::server::ServeOptions::owner_dir`].
+pub fn default_owner_path(port: u16) -> PathBuf {
+    owner_path_in(&default_owner_dir(), port)
 }
 
 /// Write the claim atomically (0600, temp + rename — the same
@@ -218,8 +241,31 @@ pub fn remove_owner_file_if_owned(path: &Path, pid: u32, port: u16) {
 
 /// Read a claim, or `None` for absent/unreadable/unparseable. A malformed file is
 /// simply not a claim — the name matcher still gets its turn.
+///
+/// Every failure that is not "the file is absent" is LOGGED, the read errors as
+/// well as the parse errors. The claim is written 0600, so a proxy started under
+/// another uid (launchd, `sudo`) leaves one a client cannot read: the read fails
+/// EACCES, identity silently falls back to the matcher that by construction
+/// cannot see an embedded proxy, and `tcr login` proceeds beside a live server
+/// whose next persist overwrites the fresh single-use refresh tokens. An
+/// unreadable claim and an absent one lead to the same fallback but they are not
+/// the same fact, and the operator needs the difference on the record.
 fn read_owner_file(path: &Path) -> Option<ProxyOwner> {
-    let data = std::fs::read_to_string(path).ok()?;
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "the proxy owner file exists but could not be READ (permissions? it is written \
+                 0600, so a proxy running under another uid leaves one a client cannot open); \
+                 falling back to command-line recognition, which does NOT recognize an embedded \
+                 proxy"
+            );
+            return None;
+        }
+    };
     match serde_json::from_str::<ProxyOwner>(&data) {
         Ok(owner) => Some(owner),
         Err(err) => {
@@ -1169,6 +1215,46 @@ mod tests {
             crate::affinity::default_path().parent(),
             "the claim belongs in the same directory as the pin cache"
         );
+    }
+
+    /// FORWARD COMPATIBILITY. The claim is read by a different BUILD of `tcr` than
+    /// the one that wrote it — an older one, on any machine where a newer proxy is
+    /// serving. A host value this build does not know must degrade to "a proxy is
+    /// there, do not signal it", never to "no claim at all": the latter drops the
+    /// reader back to the name matcher, which cannot see an embedded proxy, so
+    /// `tcr login` proceeds beside a live server and `--replace` SIGTERMs the
+    /// process the file existed to protect.
+    #[test]
+    fn a_host_this_build_does_not_know_is_still_a_proxy_worth_protecting() {
+        let dir = scratch_dir("future-host");
+        let path = owner_path_in(&dir, 3456);
+        std::fs::write(
+            &path,
+            br#"{"pid":900,"port":3456,"sha":"0000000","host":"sidecar"}"#,
+        )
+        .expect("scratch write");
+
+        let parsed: ProxyOwner =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("scratch read"))
+                .expect("an unknown host must not fail the whole parse");
+        assert_eq!(parsed.host, ProxyHost::Unknown);
+        assert_eq!(parsed.pid, 900, "the rest of the claim still parses");
+
+        // And it lands on the kind that is never signalled, whatever the host
+        // program's command line says.
+        let command = |_pid: u32| HOST_APP_COMMAND.to_string();
+        assert_eq!(
+            classify_port_owner(3456, &[900], &path, command),
+            Some(embedded(900)),
+            "an unrecognized host degrades to the protected kind, not to nothing"
+        );
+        assert_eq!(
+            incumbents_to_signal(&[embedded(900)], true),
+            vec![],
+            "and --replace still cannot signal it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The on-disk shape is a cross-process contract: the file a proxy writes is

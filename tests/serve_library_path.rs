@@ -62,11 +62,17 @@ fn scratch_affinity_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(unique).join("affinity.json")
 }
 
-/// A disposable path for the port claim, for the same reason as the pin cache
-/// above: the real claim is named after the live proxy's port and belongs to it,
-/// and `tcr login` reads it.
-fn scratch_owner_path(tag: &str) -> std::path::PathBuf {
-    scratch_affinity_path(tag).with_file_name("proxy-owner-scratch.json")
+/// A disposable DIRECTORY for the port claim, for the same reason as the pin
+/// cache above: the real claim lives beside the live proxy's pin cache, is named
+/// after its port, and `tcr login` reads it. The file name inside is `serve`'s to
+/// choose, never a caller's.
+fn scratch_owner_dir(tag: &str) -> std::path::PathBuf {
+    let dir = scratch_affinity_path(tag)
+        .parent()
+        .expect("the scratch affinity path has a parent directory")
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).expect("a scratch dir under the temp dir is creatable");
+    dir
 }
 
 fn options(tag: &str) -> ServeOptions {
@@ -85,10 +91,10 @@ fn options(tag: &str) -> ServeOptions {
         // all this file exercises, so do not touch it.
         tls: TlsSetup::Disabled,
         // A library caller, so the host is stated as such — but with no claim
-        // path this is recorded nowhere. The one test that DOES write a claim
-        // overrides both fields together.
+        // directory this is recorded nowhere. The one test that DOES write a
+        // claim overrides both fields together.
         host: ProxyHost::Cli,
-        owner_path: None,
+        owner_dir: None,
     }
 }
 
@@ -293,9 +299,9 @@ fn the_convenience_constructor_touches_nothing_outside_the_process() {
         "ServeOptions::new must not be able to signal whatever holds the port"
     );
     assert_eq!(
-        options.owner_path, None,
-        "ServeOptions::new must not claim a port on disk; the real claim path is \
-         shared state named after the live proxy's port"
+        options.owner_dir, None,
+        "ServeOptions::new must not claim a port on disk; the real claim directory \
+         is shared state holding the live proxy's own claim"
     );
 }
 
@@ -316,15 +322,10 @@ fn the_convenience_constructor_touches_nothing_outside_the_process() {
 /// identity there is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdown() {
-    let owner_path = scratch_owner_path("claim");
-    assert!(
-        !owner_path.exists(),
-        "the scratch claim path must start empty: {}",
-        owner_path.display()
-    );
+    let owner_dir = scratch_owner_dir("claim");
 
     let mut handle = serve(ServeOptions {
-        owner_path: Some(owner_path.clone()),
+        owner_dir: Some(owner_dir.clone()),
         host: ProxyHost::Embedded,
         ..options("claim")
     })
@@ -337,6 +338,18 @@ async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdow
         addr.port(),
         LIVE_PROXY_PORT,
         "a test must never bind the port a live proxy serves on"
+    );
+
+    // THE NAME IS THE CONTRACT, and this is the case that used to break it: the
+    // caller asked for port 0, so the port is only known after the bind. Every
+    // reader resolves `proxy-owner-<port>.json` for the port it is asking about,
+    // so a claim under any other name is consulted by nothing — silently. `serve`
+    // is handed a directory and derives the name from the port it bound.
+    let owner_path = teamclaude_rs::singleton::owner_path_in(&owner_dir, addr.port());
+    assert!(
+        owner_path.exists(),
+        "the claim must be named after the port actually bound: {}",
+        owner_path.display()
     );
 
     let written = std::fs::read_to_string(&owner_path).unwrap_or_else(|err| {

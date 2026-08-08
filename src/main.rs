@@ -532,11 +532,6 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     init_tracing(args.headless);
 
-    // The port `serve` will resolve to, computed the same way it does
-    // (`--port` overrides `config.proxy.port`) because the owner file is NAMED
-    // after the port and has to match the one that gets bound.
-    let resolved_port = args.port.unwrap_or(config.proxy.port);
-
     // Spelled out rather than built from `ServeOptions::new`, which is
     // deliberately inert: writing the config back, owning the shared pin cache
     // and signalling whatever holds the port are all things only the BINARY may
@@ -558,14 +553,15 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // has to come from the caller that knows.
         host: singleton::ProxyHost::Cli,
         // Claim the port for the next `tcr` (and for `tcr login`) to read. A
-        // binary-only side effect, like the pin cache above: it is a shared file
-        // named after the port, so a library caller must opt in with its own path.
+        // binary-only side effect, like the pin cache above: it is a shared
+        // directory, so a library caller must opt in with its own.
         //
-        // Except for `--port 0`, which asks the kernel for an ephemeral port: the
-        // name would say 0 while the contents said the real port, and nothing can
-        // look a claim up by a port number that was never bound. No claim is the
-        // honest answer there.
-        owner_path: (resolved_port != 0).then(|| singleton::default_owner_path(resolved_port)),
+        // The DIRECTORY, not a path: `serve` names the file after the port it
+        // actually binds. Re-deriving `--port unwrap_or config.proxy.port` here to
+        // build the name would be a second copy of a resolution rule that lives in
+        // `serve`, and the two silently disagreeing means a claim named for a port
+        // this process never bound — which every reader looks straight past.
+        owner_dir: Some(singleton::default_owner_dir()),
     };
 
     let handle = match server::serve(options).await? {

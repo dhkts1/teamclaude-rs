@@ -171,21 +171,32 @@ pub struct ServeOptions {
     /// that will then overwrite its fresh single-use refresh tokens.
     ///
     /// Recorded in the owner file, and only there — so it has no effect unless
-    /// [`Self::owner_path`] is set.
+    /// [`Self::owner_dir`] is set.
     pub host: singleton::ProxyHost,
-    /// Where to write `proxy-owner-<port>.json` claiming the port, or `None` to
-    /// write no claim at all.
+    /// The DIRECTORY to write the port claim in, or `None` to write no claim at
+    /// all. The file name inside it is not the caller's to choose: [`serve`]
+    /// derives it with [`singleton::owner_path_in`] from the port it actually
+    /// bound.
     ///
-    /// `None` is the default because the file is *shared state named after the
-    /// port*: a second process serving briefly would otherwise leave its own claim
-    /// where the live proxy's belongs. The binary passes
-    /// [`singleton::default_owner_path`]; a test points it somewhere disposable.
+    /// A directory rather than a path, because the NAME is a contract. Every
+    /// reader — [`singleton::live_proxy_server`], [`singleton::takeover_port`] —
+    /// looks the claim up as `proxy-owner-<port>.json`; a claim written under any
+    /// other name is consulted by nothing, with no error anywhere. Handing the
+    /// caller a free-form `owner_path` made that a one-typo failure, and worse, it
+    /// let the caller name the file after a port it did not bind: `port: Some(0)`
+    /// resolves to an ephemeral port at bind time, so the name and the contents
+    /// disagreed and the proxy stayed invisible while the write logged success.
+    ///
+    /// `None` is the default because the directory is *shared state*: a second
+    /// process serving briefly would otherwise leave its own claim where the live
+    /// proxy's belongs. The binary passes [`singleton::default_owner_dir`]; a test
+    /// points it somewhere disposable.
     ///
     /// Omitting it is safe, never silent: identity then falls back to the
     /// command-line matcher, which is what every `tcr` did before this file
     /// existed. It is only an *embedded* proxy that the matcher cannot see, and an
-    /// embedder must therefore pass a path.
-    pub owner_path: Option<PathBuf>,
+    /// embedder must therefore pass a directory.
+    pub owner_dir: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -206,12 +217,12 @@ impl ServeOptions {
             incumbent: IncumbentPolicy::never_signal(),
             affinity_path: None,
             tls: TlsSetup::Load,
-            // Inert, like every other field here: with no owner path, `host` is
+            // Inert, like every other field here: with no owner dir, `host` is
             // recorded nowhere and this value cannot be read by anyone. A caller
             // that DOES claim the port must state its host, and both callers that
             // write a file spell the pair out together.
             host: singleton::ProxyHost::Cli,
-            owner_path: None,
+            owner_dir: None,
         }
     }
 }
@@ -550,7 +561,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         affinity_path,
         tls,
         host,
-        owner_path,
+        owner_dir,
     } = options;
 
     if let Some(port) = port_override {
@@ -815,7 +826,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     //
     // A claim that could not be written is dropped from the handle: shutdown then
     // has nothing to remove, rather than deleting a path this process never owned.
-    let owner_path = owner_path.and_then(|path| {
+    //
+    // The file NAME is derived here, from the port actually bound, and not taken
+    // from the caller: every reader looks a claim up as `proxy-owner-<port>.json`
+    // for the port it is resolving, so a name that does not match is a claim
+    // nothing consults. With `port: Some(0)` a caller cannot know the name in
+    // advance — the kernel picks the port during this function — which is why the
+    // caller supplies a directory and `serve` supplies the name.
+    let owner_path = owner_dir.and_then(|dir| {
+        let path = singleton::owner_path_in(&dir, bound.port());
         let owner = singleton::ProxyOwner {
             pid: std::process::id(),
             port: bound.port(),
