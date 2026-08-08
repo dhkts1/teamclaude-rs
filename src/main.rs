@@ -1262,36 +1262,36 @@ mod tests {
         );
     }
 
-    /// `max_log_files` pruning is real, not merely configured. Pre-creates
-    /// several dated files (the `prefix.date` shape `join_date()` produces for
-    /// any non-`NEVER` rotation), then constructs the appender with
-    /// `max_log_files(2)` pointed at that directory — `prune_old_logs()` runs
-    /// at *construction*, before the first new file is created (verified
-    /// against 0.2.5 source, `rolling.rs:615-617`), which is what makes this
-    /// deterministic: no wall-clock rotation boundary needs to be crossed.
+    /// `max_log_files` pruning is real, not merely configured, AND it is the
+    /// production `open_log_appender`'s own hardcoded `max_log_files(5)`
+    /// being exercised — not a hand-rolled duplicate of the config, so a
+    /// regression that drops or weakens the production call is what this test
+    /// is sensitive to. Pre-creates 5 dated files (the `prefix.date` shape
+    /// `join_date()` produces for any non-`NEVER` rotation), each with a
+    /// distinct creation time, then calls the real production opener —
+    /// `prune_old_logs()` runs at *construction*, before the first new file is
+    /// created (verified against 0.2.5 source, `rolling.rs:615-617`), which is
+    /// what makes this deterministic: no wall-clock rotation boundary needs to
+    /// be crossed.
     #[test]
     fn old_log_files_are_pruned_at_max_log_files() {
         let dir = unique_log_dir("pruning");
         std::fs::create_dir_all(&dir).expect("create temp log dir");
 
-        // Four pre-existing dated files, oldest first, each with a distinct
+        // Five pre-existing dated files, oldest first, each with a distinct
         // creation time (the pruner sorts by `metadata.created()`).
-        let stale = ["2020-02-01", "2020-02-02", "2020-02-03"];
-        let newest_stale = "2020-02-04";
-        for date in stale.iter().chain(std::iter::once(&newest_stale)) {
+        let oldest = "2020-02-01";
+        let survivors = ["2020-02-02", "2020-02-03", "2020-02-04", "2020-02-05"];
+        for date in std::iter::once(&oldest).chain(survivors.iter()) {
             std::fs::write(dir.join(format!("teamclaude-rs.log.{date}")), b"old\n")
                 .expect("write stale log file");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
-        // max_log_files(2): prune keeps (2 - 1) = 1 of the existing files,
-        // then the appender creates one new file for today — 2 total.
-        let _appender = tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("teamclaude-rs.log")
-            .max_log_files(2)
-            .build(&dir)
-            .expect("build rolling appender");
+        // Production max_log_files(5): prune keeps (5 - 1) = 4 of the 5
+        // existing files, then the appender creates one new file for today —
+        // 5 total, with only the single oldest pre-existing file removed.
+        let _appender = open_log_appender(&dir).expect("open temp log dir");
 
         let remaining: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
             .expect("read temp log dir")
@@ -1302,17 +1302,17 @@ mod tests {
 
         assert!(
             remaining.len() >= 2,
-            "at least 2 files must survive (max_log_files(2)): {remaining:?}"
+            "at least 2 files must survive pruning: {remaining:?}"
         );
-        for date in stale {
+        assert!(
+            !remaining.contains(&format!("teamclaude-rs.log.{oldest}")),
+            "the single oldest file must have been pruned: {remaining:?}"
+        );
+        for date in survivors {
             assert!(
-                !remaining.contains(&format!("teamclaude-rs.log.{date}")),
-                "stale file {date} must have been pruned: {remaining:?}"
+                remaining.contains(&format!("teamclaude-rs.log.{date}")),
+                "pre-existing file {date} must survive pruning: {remaining:?}"
             );
         }
-        assert!(
-            remaining.contains(&format!("teamclaude-rs.log.{newest_stale}")),
-            "the newest pre-existing file must survive pruning: {remaining:?}"
-        );
     }
 }
