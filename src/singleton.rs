@@ -471,7 +471,13 @@ pub enum Takeover {
     Proceed,
     /// A recognized proxy incumbent holds the port and was deliberately left
     /// running. The caller must NOT bind; it should exit 0.
-    IncumbentPresent(u32),
+    ///
+    /// Carries the whole [`Incumbent`], not just its pid. The KIND decides what a
+    /// caller may tell the operator to do about it — a `tcr` peer can be signalled
+    /// and an embedded one must only be quit — and a caller handed a bare `u32`
+    /// has to re-scan the incumbent list to recover a fact this function already
+    /// looked up, which is exactly the kind of parallel predicate that drifts.
+    IncumbentPresent(Incumbent),
 }
 
 /// The pure decision: given the replaceable incumbents on the port and whether
@@ -492,12 +498,16 @@ pub enum Takeover {
 /// one kind `--replace` cannot override: the pid on the port belongs to the host
 /// application, so replacing it means SIGTERMing a GUI that installs no handler
 /// for it. See [`ProxyKind::TcrEmbedded`].
+///
+/// That stand-down decides only whether WE bind. It says nothing about the OTHER
+/// incumbents on the port — see [`incumbents_to_signal`], which partitions them by
+/// kind rather than reading this one verdict as "touch nothing".
 pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
     if let Some(embedded) = replaceable
         .iter()
         .find(|incumbent| incumbent.kind == ProxyKind::TcrEmbedded)
     {
-        return Takeover::IncumbentPresent(embedded.pid);
+        return Takeover::IncumbentPresent(*embedded);
     }
     if replace {
         return Takeover::Proceed;
@@ -506,7 +516,7 @@ pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
         .iter()
         .find(|incumbent| incumbent.kind == ProxyKind::Tcr)
     {
-        Some(peer) => Takeover::IncumbentPresent(peer.pid),
+        Some(peer) => Takeover::IncumbentPresent(*peer),
         None => Takeover::Proceed,
     }
 }
@@ -528,8 +538,30 @@ pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
 /// one kills a host application without its `applicationWillTerminate`, so the
 /// guarantee is worth stating twice rather than resting on a `!= Proceed` that a
 /// future edit to [`takeover_decision`] could relax by accident.
+///
+/// # The one stand-down that is not "touch nothing": `--replace` past an embedded
+///
+/// `port_listeners` filters by port, not by address, so a legacy JS
+/// `teamclaude server` on `[::1]:3456` and an embedded tcr on `127.0.0.1:3456`
+/// are both holders. Reading the embedded stand-down as "signal nothing" made
+/// that JS proxy undisplaceable on EVERY path — `--replace` included, since the
+/// embedded check precedes it — and the two proxies then token-war over the same
+/// single-use refresh tokens forever, which is the failure this module exists to
+/// end. So the kinds are partitioned rather than collapsed: the embedded
+/// incumbent is never signalled and still stands us down, while an explicit
+/// `--replace` still reaches the NON-embedded incumbents beside it. That is the
+/// escape hatch `takeover_decision`'s doc-comment promises for a `LegacyJs`
+/// incumbent, and it is the only way to honour both rules at once.
+///
+/// Without `--replace` a stand-down still signals nothing at all, embedded or
+/// not: the operator did not ask for a kill, and killing half the port's holders
+/// while refusing to bind is all cost and no benefit.
 fn incumbents_to_signal(replaceable: &[Incumbent], replace: bool) -> Vec<Incumbent> {
-    if takeover_decision(replaceable, replace) != Takeover::Proceed {
+    let embedded_present = replaceable
+        .iter()
+        .any(|incumbent| incumbent.kind == ProxyKind::TcrEmbedded);
+    let stood_down = takeover_decision(replaceable, replace) != Takeover::Proceed;
+    if stood_down && !(embedded_present && replace) {
         return Vec::new();
     }
     replaceable
@@ -614,21 +646,27 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         }
     }
 
-    if let Takeover::IncumbentPresent(pid) = takeover_decision(&replaceable, replace) {
+    let decision = takeover_decision(&replaceable, replace);
+    if let Takeover::IncumbentPresent(incumbent) = decision {
         // Only the pid and the instruction live here; `main` prints the build
         // comparison, because THAT is the part a user typing `tcr` after a rebuild
         // actually needs and it requires an async status read we must not do here.
-        let embedded = replaceable
-            .iter()
-            .any(|incumbent| incumbent.pid == pid && incumbent.kind == ProxyKind::TcrEmbedded);
-        if embedded {
-            eprintln!("{}", embedded_stand_down_message(port, pid));
+        //
+        // The kind comes from the decision itself rather than a second scan of
+        // `replaceable` for the same predicate: two copies of "is this one
+        // embedded?" is how the generic message — which offers `--replace` — ends
+        // up printed for the one kind `--replace` cannot take over.
+        if incumbent.kind == ProxyKind::TcrEmbedded {
+            eprintln!("{}", embedded_stand_down_message(port, incumbent.pid));
         } else {
-            eprintln!("{}", stand_down_message(port, pid));
+            eprintln!("{}", stand_down_message(port, incumbent.pid));
         }
-        return Takeover::IncumbentPresent(pid);
     }
 
+    // Not `else`: standing down for an EMBEDDED incumbent still lets an explicit
+    // `--replace` displace the non-embedded proxies sharing the port. See
+    // `incumbents_to_signal`; without it a legacy JS proxy co-resident with an
+    // embedded tcr is undisplaceable on every path.
     for Incumbent { pid, kind } in incumbents_to_signal(&replaceable, replace) {
         match kind {
             // Unreachable by construction — `incumbents_to_signal` filters this
@@ -662,7 +700,7 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
             sleep(Duration::from_millis(300));
         }
     }
-    Takeover::Proceed
+    decision
 }
 
 #[cfg(test)]
@@ -969,7 +1007,7 @@ mod tests {
         for replace in [false, true] {
             assert_eq!(
                 takeover_decision(&[embedded(777)], replace),
-                Takeover::IncumbentPresent(777),
+                Takeover::IncumbentPresent(embedded(777)),
                 "replace={replace} must not be able to take over an embedded proxy"
             );
         }
@@ -982,14 +1020,14 @@ mod tests {
         ] {
             assert_eq!(
                 takeover_decision(&holders, true),
-                Takeover::IncumbentPresent(777),
+                Takeover::IncumbentPresent(embedded(777)),
                 "{holders:?}"
             );
         }
     }
 
-    /// (c) Nothing is ever signalled for an embedded incumbent — the assertion
-    /// that stands between `--replace` and SIGTERM to a GUI process.
+    /// (c) The embedded incumbent ITSELF is never signalled — the assertion that
+    /// stands between `--replace` and SIGTERM to a GUI process.
     #[test]
     fn an_embedded_incumbent_is_never_signalled() {
         for replace in [false, true] {
@@ -998,12 +1036,57 @@ mod tests {
                 vec![],
                 "replace={replace}: an embedded proxy must never be signalled"
             );
-            assert_eq!(
-                incumbents_to_signal(&[embedded(777), legacy_js(111)], replace),
-                vec![],
-                "replace={replace}: nor its port-mates, since we stand down anyway"
+            assert!(
+                !incumbents_to_signal(&[embedded(777), legacy_js(111)], replace)
+                    .iter()
+                    .any(|incumbent| incumbent.kind == ProxyKind::TcrEmbedded),
+                "replace={replace}: not even beside another incumbent on the port"
             );
         }
+        // Without --replace nothing at all is signalled: the operator asked for no
+        // kill, and half-killing while refusing to bind is all cost, no benefit.
+        assert_eq!(
+            incumbents_to_signal(&[embedded(777), legacy_js(111)], false),
+            vec![]
+        );
+    }
+
+    /// THE ESCAPE HATCH, and the reason the embedded stand-down is not read as
+    /// "touch nothing": a legacy JS proxy sharing the port with an embedded tcr
+    /// must still be displaceable with `--replace`.
+    ///
+    /// `port_listeners` filters by port and not by address, so `node …/teamclaude
+    /// server` on `[::1]:3456` and an embedded tcr on `127.0.0.1:3456` are both
+    /// holders. Collapsing that to one kind-blind stand-down left the JS proxy
+    /// serving forever on every path — and `takeover_decision`'s own doc-comment
+    /// says that outcome is unacceptable, because the two then token-war over the
+    /// same single-use refresh tokens with no way out.
+    #[test]
+    fn replace_still_displaces_a_legacy_js_proxy_beside_an_embedded_incumbent() {
+        for holders in [
+            vec![legacy_js(111), embedded(777)],
+            vec![embedded(777), legacy_js(111)],
+        ] {
+            assert_eq!(
+                incumbents_to_signal(&holders, true),
+                vec![legacy_js(111)],
+                "--replace must still reach the JS proxy, and ONLY it: {holders:?}"
+            );
+            // We still do not bind: the embedded proxy legitimately holds the port
+            // and the stand-down is unchanged. Ending the token war and taking the
+            // port over are two different questions.
+            assert_eq!(
+                takeover_decision(&holders, true),
+                Takeover::IncumbentPresent(embedded(777)),
+                "{holders:?}"
+            );
+        }
+        // A `tcr` peer beside an embedded proxy is likewise reachable by an
+        // explicit --replace, and the embedded one still is not.
+        assert_eq!(
+            incumbents_to_signal(&[embedded(777), tcr(222)], true),
+            vec![tcr(222)]
+        );
     }
 
     /// The embedded stand-down still carries the marker TcrBar greps for, and does
@@ -1155,7 +1238,7 @@ mod tests {
     fn a_healthy_tcr_peer_is_left_alone_by_default() {
         assert_eq!(
             takeover_decision(&[tcr(4242)], false),
-            Takeover::IncumbentPresent(4242)
+            Takeover::IncumbentPresent(tcr(4242))
         );
         assert_eq!(
             incumbents_to_signal(&[tcr(4242)], false),
@@ -1252,7 +1335,7 @@ mod tests {
         ] {
             assert_eq!(
                 takeover_decision(&holders, false),
-                Takeover::IncumbentPresent(222),
+                Takeover::IncumbentPresent(tcr(222)),
                 "the protected peer is the one named: {holders:?}"
             );
             assert_eq!(

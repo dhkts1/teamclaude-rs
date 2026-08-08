@@ -633,6 +633,32 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How to recover from a WEDGED incumbent — the half of the not-answering warning
+/// that depends on which proxy is holding the port.
+///
+/// `--replace` is the recovery for a proxy this process may signal. It is not one
+/// for a [`singleton::ProxyKind::TcrEmbedded`] incumbent, and offering it there is
+/// worse than offering nothing: `takeover_decision` refuses that kind on every
+/// path, so the operator runs the suggested command, sees the same stand-down, and
+/// the advice that DOES work — quitting the host application — was never printed.
+/// An instruction that cannot succeed is a bug even when the code behind it is
+/// correct.
+fn wedged_incumbent_recovery(kind: singleton::ProxyKind) -> &'static str {
+    match kind {
+        singleton::ProxyKind::TcrEmbedded => {
+            "`tcr --replace` cannot take this one over: the pid belongs to the host application \
+             serving the proxy in-process, and signalling it would kill the app without its \
+             normal shutdown, losing the session→account pin map. Quit the host application and \
+             start it again to recover a wedged embedded proxy."
+        }
+        singleton::ProxyKind::Tcr | singleton::ProxyKind::LegacyJs => {
+            "Run `tcr --replace` to take the port over; that is the recovery for a wedged proxy, \
+             and it is not being done automatically because it also wipes the pin map of a proxy \
+             that was merely slow to answer."
+        }
+    }
+}
+
 /// Print the stand-down diagnosis and exit with the code it earned. Never returns.
 ///
 /// This is the half of the stand-down a *library* must not do, which is why
@@ -647,12 +673,11 @@ fn stand_down_exit(stand_down: &server::StandDown) -> ! {
     if let cli::Liveness::Silent { why } = &stand_down.probe.liveness {
         let port = stand_down.port;
         let pid = stand_down.pid;
+        let recovery = wedged_incumbent_recovery(stand_down.kind);
         eprintln!(
             "[tcr] WARNING incumbent-not-answering: port={port} pid={pid} probe={why:?} — the \
              process holding :{port} did not respond, so standing down leaves NOTHING serving \
-             on it. Run `tcr --replace` to take the port over; that is the recovery for a \
-             wedged proxy, and it is not being done automatically because it also wipes the \
-             pin map of a proxy that was merely slow to answer."
+             on it. {recovery}"
         );
     }
     std::process::exit(stand_down_exit_code(
@@ -792,6 +817,36 @@ mod tests {
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
             why: "the server did not answer within 5s".to_string(),
+        }
+    }
+
+    /// A WEDGED INCUMBENT MUST NOT BE OFFERED A RECOVERY THAT CANNOT WORK.
+    ///
+    /// `--replace` is refused for an embedded incumbent on every path in
+    /// `singleton::takeover_decision`, deliberately: the pid is the host
+    /// application's. Printing "Run `tcr --replace`" for that kind sends the
+    /// operator around a loop that ends in the same stand-down, while the
+    /// instruction that does work — quit the host application — never appears.
+    #[test]
+    fn a_wedged_embedded_incumbent_is_not_told_to_run_replace() {
+        let embedded = wedged_incumbent_recovery(singleton::ProxyKind::TcrEmbedded);
+        assert!(
+            !embedded.contains("Run `tcr --replace`"),
+            "must not prescribe an override that this kind refuses: {embedded}"
+        );
+        assert!(
+            embedded.contains("Quit the host application"),
+            "must name the recovery that works: {embedded}"
+        );
+        // The control: for the kinds `--replace` CAN take over, the prescription is
+        // unchanged — so the assertions above are about the kind, not about the
+        // advice having been dropped for everyone.
+        for kind in [singleton::ProxyKind::Tcr, singleton::ProxyKind::LegacyJs] {
+            let advice = wedged_incumbent_recovery(kind);
+            assert!(
+                advice.contains("Run `tcr --replace`"),
+                "{kind:?} is recoverable by --replace: {advice}"
+            );
         }
     }
 

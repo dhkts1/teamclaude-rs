@@ -226,6 +226,12 @@ pub struct StandDown {
     pub port: u16,
     /// The incumbent's pid, as `singleton` identified it.
     pub pid: u32,
+    /// WHICH proxy that pid is. Carried because it decides what a caller may tell
+    /// the operator to do about it: [`singleton::ProxyKind::TcrEmbedded`] means
+    /// the pid belongs to a host application, so neither a signal nor `--replace`
+    /// is an available recovery — advising either is advising the loss of the
+    /// app's shutdown and its final session→account pin write.
+    pub kind: singleton::ProxyKind,
     /// ONE probe of the incumbent: which build it runs, and whether it answers
     /// at all. Both halves are needed to pick an exit code.
     pub probe: cli::IncumbentProbe,
@@ -568,13 +574,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let takeover = match (port, incumbent.0) {
         (0, _) => singleton::Takeover::Proceed,
         (_, Signal::Never) => match singleton::live_proxy_server(port) {
-            Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent.pid),
+            Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent),
             None => singleton::Takeover::Proceed,
         },
         (_, Signal::LegacyJsOnly) => singleton::takeover_port(port, false),
         (_, Signal::Recognized) => singleton::takeover_port(port, true),
     };
-    if let singleton::Takeover::IncumbentPresent(pid) = takeover {
+    if let singleton::Takeover::IncumbentPresent(incumbent) = takeover {
         // ONE probe of the incumbent, answering two questions: which build it is
         // executing, and whether it is executing anything at all.
         let probe = cli::probe_incumbent(&config).await;
@@ -597,7 +603,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         );
         return Ok(ServeOutcome::StoodDown(StandDown {
             port,
-            pid,
+            pid: incumbent.pid,
+            kind: incumbent.kind,
             probe,
             report,
         }));
