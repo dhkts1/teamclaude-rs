@@ -153,8 +153,13 @@ public final class ServerController: ObservableObject {
     public nonisolated static let safeArguments = ["server", "--headless", "--no-replace"]
 
     /// Deliberately carries `--replace`, and deliberately never `--no-replace` —
-    /// when both are passed `tcr` lets the safe one win (`src/main.rs:486`), so a
-    /// takeover set containing both would silently do nothing. See
+    /// the two are a hard clap conflict (`src/main.rs:198`,
+    /// `#[arg(long, conflicts_with = "replace")]`), so a takeover set containing
+    /// both never reaches `tcr`'s own logic at all: clap rejects the pair by name
+    /// and exits 2 before the server starts. The rationale for making it an error
+    /// rather than a precedence rule is in that argument's own doc-comment
+    /// (`src/main.rs:191-197`): the previous wiring quietly discarded `--replace`,
+    /// which is the one outcome an operator cannot tell apart from success. See
     /// `safeArguments`. Keeps `--headless` for the same reason every other spawn
     /// does.
     public nonisolated static let takeoverArguments = ["server", "--headless", "--replace"]

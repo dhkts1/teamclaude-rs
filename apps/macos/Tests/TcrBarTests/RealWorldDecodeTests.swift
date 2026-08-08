@@ -215,4 +215,168 @@ final class RealWorldDecodeTests: XCTestCase {
             "control: the old priority-only sort would have led with the parked account"
         )
     }
+
+    // MARK: The committed cross-language contract fixture
+
+    /// `<repo>/tests/fixtures/status-contract.json` — the SAME file the Rust test
+    /// `cli::tests::status_contract_fixture_matches_committed` renders and
+    /// compares against, not a copy of it. Two copies that must stay equal are
+    /// precisely the drift this pair of tests exists to prevent.
+    ///
+    /// Located from `#filePath` rather than from a bundled resource: the fixture
+    /// lives outside the SwiftPM package (`apps/macos/`), so it cannot be
+    /// declared as a target resource without copying it into the package tree.
+    /// `#filePath` is this file's own absolute path at compile time, so five
+    /// `deletingLastPathComponent`s — the file, `TcrBarTests`, `Tests`, `macos`,
+    /// `apps` — land on the repository root.
+    static var contractFixtureURL: URL {
+        var url = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { url = url.deletingLastPathComponent() }
+        return url.appendingPathComponent("tests/fixtures/status-contract.json")
+    }
+
+    private func contractFixtureData() throws -> Data {
+        let url = Self.contractFixtureURL
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: url.path),
+            "the committed contract fixture must be reachable from the Swift package: \(url.path)"
+        )
+        return try Data(contentsOf: url)
+    }
+
+    /// THE OTHER HALF OF THE CONTRACT PIN.
+    ///
+    /// The Rust side proves the renderer still emits these exact bytes; this
+    /// proves this app can still read them. A key renamed in
+    /// `render_accounts_json` turns the Rust test red, and regenerating the
+    /// fixture to satisfy it turns this one red — which is the only arrangement
+    /// in which a silent rename is impossible.
+    func testCommittedContractFixtureDecodes() throws {
+        let fleet = try Fleet.decode(contractFixtureData())
+
+        XCTAssertTrue(
+            fleet.unreadable.isEmpty,
+            "every row of the committed contract must decode; unreadable: \(fleet.unreadable)"
+        )
+        XCTAssertEqual(fleet.accounts.count, 4)
+        XCTAssertEqual(
+            fleet.accounts.map(\.name),
+            [
+                "alice@example.com", "bob@example.com", "carol@example.com", "dave@example.com",
+            ]
+        )
+    }
+
+    /// The load-bearing fields, per row. A decode that succeeds while every
+    /// value lands as a default would still pass ``testCommittedContractFixtureDecodes``,
+    /// so each key the panel actually reads is checked for its value here.
+    func testCommittedContractFixtureCarriesTheFieldsThePanelReads() throws {
+        let fleet = try Fleet.decode(contractFixtureData())
+        let byName = Dictionary(uniqueKeysWithValues: fleet.accounts.map { ($0.name, $0) })
+
+        let ok = try XCTUnwrap(byName["alice@example.com"])
+        XCTAssertEqual(ok.quotaState, .ok)
+        XCTAssertEqual(ok.probeStatus, .ok)
+        XCTAssertEqual(ok.quota, 0.04)
+        XCTAssertEqual(ok.fiveHour, 0.04)
+        XCTAssertEqual(ok.sevenDay, 0.01)
+        XCTAssertEqual(ok.sevenDayOi, 0.0)
+        XCTAssertEqual(ok.cacheHitRatio, 0.75)
+        XCTAssertEqual(ok.requests, 102)
+        XCTAssertEqual(ok.inputTokens, 8_000_000)
+        XCTAssertEqual(ok.outputTokens, 31_860)
+        XCTAssertEqual(ok.cacheReadTokens, 6_000_000)
+        XCTAssertEqual(ok.streamErrorCount, 2)
+        XCTAssertEqual(ok.lastStreamError, "overloaded_error")
+        XCTAssertEqual(ok.priority, 0)
+        XCTAssertEqual(ok.status, "active")
+        XCTAssertFalse(ok.disabled)
+        XCTAssertEqual(ok.source, .live)
+        XCTAssertEqual(ok.serverSha, "abc1234")
+        XCTAssertEqual(ok.serverDirty, false)
+        XCTAssertTrue(ok.hasQuotaEvidence)
+        XCTAssertTrue(ok.isReady)
+        XCTAssertTrue(ok.held.isEmpty)
+
+        // `near`: the only shape carrying the nested `held` objects.
+        let near = try XCTUnwrap(byName["bob@example.com"])
+        XCTAssertEqual(near.quotaState, .near)
+        XCTAssertEqual(near.probeStatus, .rateLimited)
+        XCTAssertEqual(near.held.map(\.window), ["5h", "7d"])
+        let hold = try XCTUnwrap(near.soonestHold)
+        XCTAssertEqual(hold.resetAtMs, 1_767_225_600_000)
+        XCTAssertEqual(hold.minutesUntilReset, 0)
+        XCTAssertFalse(near.isReady, "a held account is not capacity")
+
+        // `spent`, and the only row carrying a probe error string.
+        let spent = try XCTUnwrap(byName["carol@example.com"])
+        XCTAssertEqual(spent.quotaState, .spent)
+        XCTAssertEqual(spent.probeStatus, .error)
+        XCTAssertEqual(spent.probeError, "probe failed: connection reset")
+        XCTAssertEqual(spent.status, "throttled")
+        XCTAssertTrue(spent.hasQuotaEvidence, "a failed probe keeps the last-learned bar")
+
+        // Never probed and disabled: five nulls, and none of them may render as
+        // a measured zero.
+        let never = try XCTUnwrap(byName["dave@example.com"])
+        XCTAssertEqual(never.probeStatus, .never)
+        XCTAssertTrue(never.disabled)
+        XCTAssertNil(never.quota)
+        XCTAssertNil(never.fiveHour)
+        XCTAssertNil(never.sevenDay)
+        XCTAssertNil(never.sevenDayOi)
+        XCTAssertNil(never.cacheHitRatio)
+        XCTAssertNil(never.lastStreamError)
+        XCTAssertNil(never.probeError)
+        XCTAssertEqual(never.quotaState, .ok, "the raw field says ok — it is a Rust default")
+        XCTAssertFalse(never.hasQuotaEvidence, "but nothing has ever probed it")
+
+        // The fleet aggregates the panel headline reads.
+        XCTAssertEqual(fleet.readyCount, 1)
+        XCTAssertEqual(fleet.enabledCount, 3)
+        XCTAssertEqual(fleet.unmeasuredCount, 0, "every ENABLED row here has been probed")
+        XCTAssertEqual(fleet.source, .live)
+        XCTAssertEqual(fleet.serverSha, "abc1234")
+    }
+
+    /// The `unknown` variant, which the committed fixture cannot contain.
+    ///
+    /// `quota_state_token` (src/cli.rs) emits exactly `ok` / `near` / `spent`,
+    /// so a genuine renderer output can never carry a fourth token — the whole
+    /// point of ``QuotaState/unknown(_:)`` is to survive a token a *future* Rust
+    /// build invents. That future is simulated by rewriting the committed
+    /// bytes, so the forward-compatibility rule is exercised against the real
+    /// contract rather than against a hand-written shape.
+    func testAFutureQuotaStateDegradesInsteadOfBlankingTheRow() throws {
+        let json = try XCTUnwrap(String(data: contractFixtureData(), encoding: .utf8))
+            .replacingOccurrences(of: "\"quotaState\": \"spent\"", with: "\"quotaState\": \"parked\"")
+        let fleet = try Fleet.decode(Data(json.utf8))
+
+        XCTAssertTrue(
+            fleet.unreadable.isEmpty,
+            "an unseen quotaState must never cost a row: \(fleet.unreadable)"
+        )
+        let future = try XCTUnwrap(fleet.accounts.first { $0.name == "carol@example.com" })
+        XCTAssertEqual(future.quotaState, .unknown("parked"))
+        XCTAssertEqual(future.quotaState.token, "parked", "the raw text stays displayable")
+        XCTAssertFalse(future.isReady, "an unnameable state is never counted as capacity")
+    }
+
+    /// The same rule for `probeStatus`, whose token set is owned by
+    /// `ProbeStatus::as_str` (src/probe.rs) and is the one the capacity summary
+    /// reads through ``ProbeState/hasBeenProbed``.
+    func testAFutureProbeStatusDegradesToNotEvidence() throws {
+        let json = try XCTUnwrap(String(data: contractFixtureData(), encoding: .utf8))
+            .replacingOccurrences(of: "\"probeStatus\": \"ok\"", with: "\"probeStatus\": \"queued\"")
+        let fleet = try Fleet.decode(Data(json.utf8))
+
+        XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+        let future = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
+        XCTAssertEqual(future.probeStatus, .unknown("queued"))
+        XCTAssertFalse(
+            future.probeStatus.hasBeenProbed,
+            "an unseen probe state is not evidence — understating capacity is the safe direction"
+        )
+        XCTAssertFalse(future.hasQuotaEvidence, "so the row stops counting as capacity")
+    }
 }

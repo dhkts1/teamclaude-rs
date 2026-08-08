@@ -593,12 +593,13 @@ final class ServerControllerTests: XCTestCase {
             ServerController.takeoverArguments.contains("--replace"),
             "\(ServerController.takeoverArguments) asks tcr for nothing — the takeover button is a no-op"
         )
-        // Still checked, for a different reason than before: when both flags are
-        // passed tcr lets the safe one win (`src/main.rs:486`), so `--no-replace`
-        // sneaking in here would cancel the `--replace` above.
+        // Still checked, for a different reason than before: the two flags are a
+        // hard clap conflict (`src/main.rs:198`), so `--no-replace` sneaking in
+        // here would not cancel the `--replace` above — it would make the spawn
+        // fail outright with a usage error and exit 2.
         XCTAssertFalse(
             ServerController.takeoverArguments.contains("--no-replace"),
-            "\(ServerController.takeoverArguments) cancels its own --replace"
+            "\(ServerController.takeoverArguments) is a clap conflict — the spawn exits 2"
         )
         // And the safe set must never acquire the flag it exists to withhold.
         XCTAssertFalse(
