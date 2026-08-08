@@ -781,9 +781,27 @@ mod tests {
     /// A manager with no accounts: nothing to probe, refresh or warm, and
     /// `config_path: None` so no file can be written.
     fn inert_manager() -> Arc<Manager> {
-        let config: Config = serde_json::from_str(r#"{"accounts": []}"#)
-            .expect("an empty account list is a valid config");
+        manager_with(r#"{"accounts": []}"#)
+    }
+
+    fn manager_with(config: &str) -> Arc<Manager> {
+        let config: Config = serde_json::from_str(config).expect("the inline test config parses");
         Manager::with_live_refresher(config, None)
+    }
+
+    /// A path under an existing REGULAR FILE, so any write to it fails. Never
+    /// near [`affinity::default_path`] — a test may not touch the live cache.
+    fn unwritable_path(tag: &str) -> PathBuf {
+        let blocker = std::env::temp_dir().join(format!(
+            "tcr-server-unit-{}-{tag}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("the scratch blocker file is writable");
+        blocker.join("affinity.json")
     }
 
     /// A handle owning `server` plus `background`, wired to `shutdown`, that can
@@ -793,13 +811,23 @@ mod tests {
         server: JoinHandle<()>,
         background: Vec<JoinHandle<()>>,
     ) -> ServerHandle {
+        handle_full(shutdown, server, background, inert_manager(), None)
+    }
+
+    fn handle_full(
+        shutdown: watch::Sender<bool>,
+        server: JoinHandle<()>,
+        background: Vec<JoinHandle<()>>,
+        manager: Arc<Manager>,
+        affinity_path: Option<PathBuf>,
+    ) -> ServerHandle {
         ServerHandle {
             addr: "127.0.0.1:0"
                 .parse()
                 .expect("a literal loopback addr parses"),
             shutdown,
-            manager: inert_manager(),
-            affinity_path: None,
+            manager,
+            affinity_path,
             tasks_joined: 0,
             tasks_aborted: 0,
             server: Some(server),
@@ -858,6 +886,145 @@ mod tests {
             ),
         }
         drop(keepalive);
+    }
+
+    /// `shutdown` must not be able to HANG on a task that will not stop.
+    ///
+    /// The affinity flusher writes with blocking `std::fs` inside async code, so
+    /// on a full or wedged filesystem it reaches no cancellation point; an
+    /// unbounded join there meant `tcr` quitting into a hang with the terminal
+    /// already restored, nothing serving, and `persist_now` never reached. A
+    /// `pending()` task is that condition with the filesystem left out of it.
+    ///
+    /// The outer `timeout` is the assertion: it is 30x the grace, so it can only
+    /// fire if the join is unbounded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_aborts_a_task_that_will_not_stop_instead_of_hanging() {
+        let (shutdown, _rx) = watch::channel(false);
+        let keepalive = shutdown.clone();
+        let wedged = tokio::spawn(std::future::pending::<()>());
+        let wedged_abort = wedged.abort_handle();
+        let mut handle =
+            handle_owning(shutdown, tokio::spawn(std::future::ready(())), vec![wedged]);
+
+        let grace = Duration::from_millis(100);
+        let report = tokio::time::timeout(grace * 30, handle.shutdown_within(grace))
+            .await
+            .expect("shutdown hung on a task that never stops");
+
+        assert_eq!(report.tasks_joined, 1, "the accept loop stopped on its own");
+        assert_eq!(
+            report.tasks_aborted, 1,
+            "the wedged task must be aborted, not waited for"
+        );
+        assert!(
+            wedged_abort.is_finished() || {
+                tokio::time::sleep(grace).await;
+                wedged_abort.is_finished()
+            },
+            "the wedged task was abandoned rather than aborted"
+        );
+        drop(keepalive);
+    }
+
+    /// `shutdown` must be cancel-safe and re-issuable.
+    ///
+    /// It used to consume `self`, so a caller bounding it with a deadline — the
+    /// pattern the integration test itself models — lost the handle along with
+    /// the future, skipping `persist_now` and the final pin write with nothing
+    /// left to retry. Here the first attempt is cancelled mid-join and the second
+    /// still accounts for every task.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_shutdown_can_be_re_issued_and_still_accounts_for_every_task() {
+        let (shutdown, _rx) = watch::channel(false);
+        let keepalive = shutdown.clone();
+        // Ignores the signal for 300ms, then stops: long enough for the first
+        // attempt to be cancelled while joining it.
+        let slow = || {
+            tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            })
+        };
+        let mut handle = handle_owning(shutdown, slow(), vec![slow(), slow()]);
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                handle.shutdown_within(Duration::from_secs(30))
+            )
+            .await
+            .is_err(),
+            "the first attempt was supposed to be cancelled mid-join"
+        );
+
+        // The handle survived the cancellation, and every task it still owns is
+        // joinable — nothing was dropped on the floor by the abandoned future.
+        let report = tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
+            .await
+            .expect("the re-issued shutdown must finish");
+        assert_eq!(
+            report.tasks_joined + report.tasks_aborted,
+            3,
+            "every task must be accounted for across the cancelled and re-issued \
+             attempts, saw {report:?}"
+        );
+        assert_eq!(
+            report.tasks_aborted, 0,
+            "the tasks stop well inside the grace, so none should need aborting: {report:?}"
+        );
+        drop(keepalive);
+    }
+
+    /// A FAILED final pin write must be distinguishable from affinity being off.
+    ///
+    /// Both were `affinity_pins_written: None`, and the difference lived only in
+    /// a `tracing::warn!` that a library caller — which installs no subscriber —
+    /// never sees. So total pin loss reported as a clean shutdown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_final_pin_write_is_reported_not_swallowed() {
+        let path = unwritable_path("flush-fails");
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(std::future::ready(())),
+            Vec::new(),
+            manager_with(r#"{"sessionAffinity": true, "accounts": []}"#),
+            Some(path.clone()),
+        );
+
+        let report = handle.shutdown().await;
+        assert!(
+            report.affinity.failed(),
+            "a pin write to {} cannot have succeeded; report said {:?}",
+            path.display(),
+            report.affinity
+        );
+        assert_eq!(
+            report.affinity.pins_written(),
+            None,
+            "a failed write wrote no pins"
+        );
+        assert_ne!(
+            report.affinity,
+            AffinityFlush::Disabled,
+            "a failed write must not read as 'affinity is off'"
+        );
+    }
+
+    /// With no pin cache path the shutdown flush must be a no-op, not a write to
+    /// some default — this is the guard on `affinity_path: None` meaning
+    /// "in memory only".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_pin_cache_path_means_no_final_write() {
+        let (shutdown, _rx) = watch::channel(false);
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(std::future::ready(())),
+            Vec::new(),
+            manager_with(r#"{"sessionAffinity": true, "accounts": []}"#),
+            None,
+        );
+        assert_eq!(handle.shutdown().await.affinity, AffinityFlush::Disabled);
     }
 
     /// `Drop` must also SIGNAL — the accept loop and every background loop stop
