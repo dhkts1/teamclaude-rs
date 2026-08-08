@@ -64,3 +64,8 @@ Thumbs.db
 # ── macOS app (TcrBar) build output ───────────────────────────
 apps/macos/.build/
 apps/macos/build/
+
+# Local denylist for the pre-commit disclosure gate. NEVER tracked: a public
+# list of private names discloses the names it exists to protect. Each clone
+# keeps its own; the gate is inert without it and says so on install.
+.githooks/private-names
