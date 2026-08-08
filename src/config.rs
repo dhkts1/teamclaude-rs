@@ -5,18 +5,13 @@
 //! `quotaProbeSeconds`, `warmupSeconds`, …). Every struct carries a flattened
 //! `extra` map so an unknown key survives a load→save round-trip untouched.
 
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-/// Monotonic counter making each [`save`] temp filename unique, so concurrent
-/// saves never collide on one temp path (finding #6).
-static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Typed config-layer errors: I/O vs malformed JSON stay distinguishable so a
 /// caller can tell "no config yet" from "config is corrupt".
@@ -291,27 +286,25 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // rotated refresh token. Fails loudly on a real perms error (finding #2).
     fs::create_dir_all(dir)?;
 
-    let file_name = path.file_name().map_or_else(
-        || "teamclaude.json".to_string(),
-        |f| f.to_string_lossy().into_owned(),
-    );
-    // A per-call unique temp name: two concurrent saves (e.g. `probe_all`
-    // refreshing several expired accounts at once) must not open and truncate the
-    // SAME temp file and interleave into a corrupt write (finding #6).
-    let seq = SAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{file_name}.{}.{seq}.tmp", std::process::id()));
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    // `tempfile_in`, never `NamedTempFile::new()`: the temp file MUST live in the
+    // destination's own directory. The system temp dir is routinely a different
+    // filesystem, and `rename(2)` across filesystems fails with `EXDEV` — which
+    // would silently cost us the atomic swap this function exists to provide.
+    //
+    // The unique temp name is now the crate's job (finding #6): it opens with
+    // `O_EXCL` and retries on collision, so two concurrent saves (e.g. `probe_all`
+    // refreshing several expired accounts at once) can never open and truncate the
+    // SAME temp file and interleave into a corrupt write. That is a stronger
+    // guarantee than the pid+counter name this replaced: exclusivity is enforced
+    // by the kernel at open time rather than by a naming scheme being right.
+    let mut file = tempfile::Builder::new().tempfile_in(dir)?;
     file.write_all(json.as_bytes())?;
-    file.sync_all()?;
-    drop(file);
+    // `persist` below is a bare `rename(2)` and NEVER fsyncs, so durability stays
+    // ours to enforce by hand. This file holds live OAuth tokens: a crash after
+    // the rename must not be able to expose it as empty or half-written.
+    file.as_file().sync_all()?;
 
-    fs::rename(&tmp, path)?;
+    file.persist(path).map_err(|e| e.error)?;
     // Re-assert perms after rename in case the destination pre-existed with a
     // looser mode (rename keeps the source inode, but be explicit).
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
@@ -1163,6 +1156,7 @@ mod tests {
     /// A unique temp path per test — the suite runs tests in parallel threads of
     /// ONE process, so a pid-only name collides.
     fn tmp_path(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("tcr-{tag}-{}-{seq}.json", std::process::id()))

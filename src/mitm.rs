@@ -537,9 +537,12 @@ where
             // Infallible, so no `.unwrap()` sits on the request hot path.
             router.clone().oneshot(req.map(axum::body::Body::new))
         });
-    if let Err(err) = hyper::server::conn::http1::Builder::new()
-        .serve_connection(hyper_util::rt::TokioIo::new(io), service)
-        .await
+    // Auto-negotiating builder (h1 or h2 via ALPN/prior-knowledge detection) so
+    // base-URL clients that support h2 aren't forced down to h1.
+    if let Err(err) =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+            .serve_connection(hyper_util::rt::TokioIo::new(io), service)
+            .await
     {
         tracing::debug!(error = %err, "http connection error");
     }
@@ -729,5 +732,104 @@ mod tests {
         assert!(build_acceptor(&cert_path, &key_path).is_ok());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `Manager` with one never-expiring dummy account and no proxy api-key,
+    /// so a loopback GET on `/_tcr/status` is answered locally with no upstream
+    /// call and no auth gate — the cheapest real route through `serve_http`'s
+    /// router to observe which HTTP version `serve_connection` negotiated.
+    fn dummy_manager() -> Arc<Manager> {
+        let config = crate::config::Config {
+            proxy: crate::config::ProxyConfig {
+                port: 0,
+                api_key: None,
+                extra: serde_json::Map::new(),
+            },
+            upstream: "http://127.0.0.1:1".to_string(),
+            switch_threshold: 0.90,
+            pacing: crate::config::PacingConfig::default(),
+            throttle: crate::config::ThrottleConfig::default(),
+            lock_account: None,
+            accounts: vec![crate::config::Account {
+                name: "dummy".to_string(),
+                account_type: "oauth".to_string(),
+                account_uuid: None,
+                org_uuid: None,
+                org_name: None,
+                access_token: "at-dummy".to_string(),
+                refresh_token: Some("rt-dummy".to_string()),
+                expires_at: Some(crate::now_ms() + 3_600_000),
+                priority: Some(0),
+                switch_threshold: None,
+                disabled: None,
+                extra: serde_json::Map::new(),
+            }],
+            extra: serde_json::Map::new(),
+        };
+        Manager::new(
+            config,
+            Arc::new(crate::oauth::NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// Start a base-URL-mode listener (`handle_conn`'s non-CONNECT branch, i.e.
+    /// `serve_http` over a raw TCP stream — the exact path this change touches)
+    /// and return its address.
+    async fn spawn_base_url_listener() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let manager = dummy_manager();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, peer)) = listener.accept().await else {
+                    break;
+                };
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    let _ = handle_conn(stream, peer, manager, None).await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Discriminating control: an ordinary h1 client must still work after the
+    /// swap to the auto-negotiating builder. If this regresses, the h2 test
+    /// below is measuring a broken server, not a real negotiation.
+    #[tokio::test]
+    async fn base_url_mode_still_serves_http1() {
+        let addr = spawn_base_url_listener().await;
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .get(format!("http://{addr}/_tcr/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.version(), reqwest::Version::HTTP_11);
+    }
+
+    /// The behavior this change exists to add: a base-URL client that speaks
+    /// h2 via cleartext prior knowledge (no ALPN/TLS involved — this is the
+    /// plain-TCP `serve_http` call site at `handle_conn`'s non-CONNECT branch)
+    /// negotiates HTTP/2 instead of being forced onto HTTP/1.1.
+    #[tokio::test]
+    async fn base_url_mode_negotiates_http2_prior_knowledge() {
+        let addr = spawn_base_url_listener().await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap();
+        let resp = client
+            .get(format!("http://{addr}/_tcr/status"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert_eq!(resp.version(), reqwest::Version::HTTP_2);
     }
 }
