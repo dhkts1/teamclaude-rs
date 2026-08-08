@@ -258,7 +258,7 @@ final class RealWorldDecodeTests: XCTestCase {
             fleet.unreadable.isEmpty,
             "every row of the committed contract must decode; unreadable: \(fleet.unreadable)"
         )
-        XCTAssertEqual(fleet.accounts.count, 4)
+        XCTAssertEqual(fleet.accounts.count, 5, "THROWAWAY: proves the macOS job can go red")
         XCTAssertEqual(
             fleet.accounts.map(\.name),
             [
