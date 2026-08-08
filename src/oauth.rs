@@ -744,16 +744,37 @@ fn login_target_port(config_path: &Path) -> u16 {
         .port
 }
 
-/// The pure login-guard DECISION: given the PID of any live proxy server detected
-/// on the port, the port, and the `--force` flag, return the one-line refusal
-/// message to abort with, or `None` to proceed. Split from the impure lsof-based
-/// detection ([`crate::singleton::live_proxy_server`]) so the refuse/allow logic is
+/// The pure login-guard DECISION: given any live proxy server detected on the
+/// port, the port, and the `--force` flag, return the one-line refusal message to
+/// abort with, or `None` to proceed. Split from the impure lsof-based detection
+/// ([`crate::singleton::live_proxy_server`]) so the refuse/allow logic is
 /// unit-testable, mirroring singleton's pure-decision / impure-executor split.
-fn login_guard_refusal(server_pid: Option<u32>, port: u16, force: bool) -> Option<String> {
-    match server_pid {
-        Some(pid) if !force => Some(format!(
-            "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — stop it (kill {pid}, or Ctrl-C in its terminal), run 'tcr login', then restart 'tcr server'. Re-run with --force to log in anyway."
-        )),
+///
+/// The incumbent's KIND decides the instruction, and it is not cosmetic. Since
+/// the owner file, detection reaches a proxy served INSIDE a host application,
+/// and the pid reported is then the HOST's. "kill {pid}" would SIGTERM a GUI
+/// process that installs no handler for it: no `applicationWillTerminate`, no
+/// final session→account pin write, and every live session cold-starts its
+/// prompt cache at the next boot. `takeover_decision` and `incumbents_to_signal`
+/// are both hardened against exactly that signal; a message that ADVISES it would
+/// walk around both. So an embedded incumbent is told to be quit, not killed.
+fn login_guard_refusal(
+    incumbent: Option<singleton::Incumbent>,
+    port: u16,
+    force: bool,
+) -> Option<String> {
+    match incumbent {
+        Some(incumbent) if !force => {
+            let pid = incumbent.pid;
+            Some(match incumbent.kind {
+                singleton::ProxyKind::TcrEmbedded => format!(
+                    "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — that pid is the HOST APPLICATION serving the proxy in-process, so do not signal it: quit the host application (killing it skips its shutdown and loses the session pin map), run 'tcr login', then start it again. Re-run with --force to log in anyway."
+                ),
+                singleton::ProxyKind::Tcr | singleton::ProxyKind::LegacyJs => format!(
+                    "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — stop it (kill {pid}, or Ctrl-C in its terminal), run 'tcr login', then restart 'tcr server'. Re-run with --force to log in anyway."
+                ),
+            })
+        }
         _ => None,
     }
 }
@@ -1212,9 +1233,15 @@ mod tests {
         );
     }
 
+    /// A live proxy of the given kind, as `singleton::live_proxy_server` reports
+    /// it — pid 4242 throughout, so a message assertion naming it is unambiguous.
+    fn incumbent(kind: singleton::ProxyKind) -> Option<singleton::Incumbent> {
+        Some(singleton::Incumbent { pid: 4242, kind })
+    }
+
     #[test]
     fn login_guard_refusal_message_carries_pid_and_stop_login_restart_sequence() {
-        let msg = login_guard_refusal(Some(4242), 3456, false)
+        let msg = login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), 3456, false)
             .expect("a live server without --force must refuse");
         // Actionable + greppable: names the port, the PID, and the escape hatch.
         assert!(msg.contains("3456"), "names the port: {msg}");
@@ -1243,9 +1270,52 @@ mod tests {
     #[test]
     fn login_guard_allows_with_force_or_no_server() {
         // --force is the deliberate escape hatch even when a server is live.
-        assert!(login_guard_refusal(Some(4242), 3456, true).is_none());
+        assert!(login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), 3456, true).is_none());
         // No server on the port → nothing to refuse.
         assert!(login_guard_refusal(None, 3456, false).is_none());
+    }
+
+    /// THE ADVICE MUST BE SURVIVABLE. `live_proxy_server` can now name the pid of
+    /// the host application that serves the proxy in-process, and telling the
+    /// operator to `kill` it is the one action `singleton` is hardened against
+    /// twice over: AppKit installs no SIGTERM handler, so the app dies without
+    /// `applicationWillTerminate` and the final session→account pin write is lost.
+    /// A guard that refuses correctly and then advises the destructive fix is worse
+    /// than no guard, because the operator does what the tool says.
+    #[test]
+    fn the_login_guard_never_tells_an_operator_to_kill_a_host_application() {
+        let msg = login_guard_refusal(incumbent(singleton::ProxyKind::TcrEmbedded), 3456, false)
+            .expect("an embedded server must still block a login");
+        assert!(
+            !msg.contains("kill 4242"),
+            "must not advise signalling the host application: {msg}"
+        );
+        assert!(
+            !msg.contains("Ctrl-C"),
+            "the host application is not a foreground process to interrupt: {msg}"
+        );
+        assert!(
+            msg.contains("quit the host application"),
+            "must name the one action that stops an embedded proxy safely: {msg}"
+        );
+        // Everything the CLI refusal is load-bearing for still holds: one line,
+        // names the port, the pid and the escape hatch.
+        assert!(
+            msg.contains("3456") && msg.contains("4242") && msg.contains("--force"),
+            "{msg}"
+        );
+        assert_eq!(
+            msg.lines().count(),
+            1,
+            "the refusal is a single line: {msg}"
+        );
+
+        // And the control: a plain CLI peer, which the operator CAN signal, still
+        // gets the kill instruction — so the assertions above are about the kind,
+        // not about the message having been softened for everyone.
+        let cli = login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), 3456, false)
+            .expect("a live CLI server must block a login");
+        assert!(cli.contains("kill 4242"), "{cli}");
     }
 
     #[test]
@@ -1255,8 +1325,14 @@ mod tests {
         // recognized tcr/teamclaude *server*. Compose the pure classifier with the
         // pure guard decision — refuse / refuse / allow.
         let refuses = |cmd: &str| {
-            let server_pid = is_proxy_server(cmd).then_some(4242u32);
-            login_guard_refusal(server_pid, 3456, false).is_some()
+            let server = singleton::classify_proxy_server(cmd)
+                .map(|kind| singleton::Incumbent { pid: 4242, kind });
+            assert_eq!(
+                server.is_some(),
+                is_proxy_server(cmd),
+                "the bool and the classifying form must agree: {cmd}"
+            );
+            login_guard_refusal(server, 3456, false).is_some()
         };
         assert!(
             refuses("/opt/teamclaude-rs/target/release/tcr server"),

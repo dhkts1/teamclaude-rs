@@ -159,6 +159,44 @@ pub struct ServeOptions {
     pub affinity_path: Option<PathBuf>,
     /// Where the MITM TLS material comes from.
     pub tls: TlsSetup,
+    /// What is hosting this proxy — a standalone `tcr` process
+    /// ([`singleton::ProxyHost::Cli`]) or an application serving it in-process
+    /// ([`singleton::ProxyHost::Embedded`]).
+    ///
+    /// **Every caller states this; the library never infers it.** Inferring it
+    /// from `argv[0]` is precisely the bug the owner file exists to fix (see
+    /// [`crate::singleton`]): an embedded proxy's `argv[0]` is the host
+    /// application's, which the name matcher does not recognize at all, and the
+    /// consequence is `tcr login` no longer refusing to run beside a live server
+    /// that will then overwrite its fresh single-use refresh tokens.
+    ///
+    /// Recorded in the owner file, and only there — so it has no effect unless
+    /// [`Self::owner_dir`] is set.
+    pub host: singleton::ProxyHost,
+    /// The DIRECTORY to write the port claim in, or `None` to write no claim at
+    /// all. The file name inside it is not the caller's to choose: [`serve`]
+    /// derives it with [`singleton::owner_path_in`] from the port it actually
+    /// bound.
+    ///
+    /// A directory rather than a path, because the NAME is a contract. Every
+    /// reader — [`singleton::live_proxy_server`], [`singleton::takeover_port`] —
+    /// looks the claim up as `proxy-owner-<port>.json`; a claim written under any
+    /// other name is consulted by nothing, with no error anywhere. Handing the
+    /// caller a free-form `owner_path` made that a one-typo failure, and worse, it
+    /// let the caller name the file after a port it did not bind: `port: Some(0)`
+    /// resolves to an ephemeral port at bind time, so the name and the contents
+    /// disagreed and the proxy stayed invisible while the write logged success.
+    ///
+    /// `None` is the default because the directory is *shared state*: a second
+    /// process serving briefly would otherwise leave its own claim where the live
+    /// proxy's belongs. The binary passes [`singleton::default_owner_dir`]; a test
+    /// points it somewhere disposable.
+    ///
+    /// Omitting it is safe, never silent: identity then falls back to the
+    /// command-line matcher, which is what every `tcr` did before this file
+    /// existed. It is only an *embedded* proxy that the matcher cannot see, and an
+    /// embedder must therefore pass a directory.
+    pub owner_dir: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -179,6 +217,12 @@ impl ServeOptions {
             incumbent: IncumbentPolicy::never_signal(),
             affinity_path: None,
             tls: TlsSetup::Load,
+            // Inert, like every other field here: with no owner dir, `host` is
+            // recorded nowhere and this value cannot be read by anyone. A caller
+            // that DOES claim the port must state its host, and both callers that
+            // write a file spell the pair out together.
+            host: singleton::ProxyHost::Cli,
+            owner_dir: None,
         }
     }
 }
@@ -193,6 +237,12 @@ pub struct StandDown {
     pub port: u16,
     /// The incumbent's pid, as `singleton` identified it.
     pub pid: u32,
+    /// WHICH proxy that pid is. Carried because it decides what a caller may tell
+    /// the operator to do about it: [`singleton::ProxyKind::TcrEmbedded`] means
+    /// the pid belongs to a host application, so neither a signal nor `--replace`
+    /// is an available recovery — advising either is advising the loss of the
+    /// app's shutdown and its final session→account pin write.
+    pub kind: singleton::ProxyKind,
     /// ONE probe of the incumbent: which build it runs, and whether it answers
     /// at all. Both halves are needed to pick an exit code.
     pub probe: cli::IncumbentProbe,
@@ -287,6 +337,10 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     manager: Arc<Manager>,
     affinity_path: Option<PathBuf>,
+    /// The port claim written after the bind, to be removed on shutdown. `None`
+    /// when the caller asked for no claim (or the write failed — a claim that was
+    /// never written is nothing to remove).
+    owner_path: Option<PathBuf>,
     /// Tasks joined and tasks aborted so far. Kept on the handle, not in a local,
     /// so a `shutdown` future that is dropped mid-join and re-issued reports the
     /// whole truth rather than only what the last attempt saw.
@@ -420,6 +474,21 @@ impl ServerHandle {
             self.background.pop();
         }
 
+        // Withdraw the port claim once the accept loop is done, so the next `tcr`
+        // does not read a claim for a proxy that has stopped listening. Ordered
+        // after the joins above and before the persists below for exactly that
+        // reason. Taken (not just read) so a re-issued `shutdown` does not try
+        // again — and a leftover file is harmless anyway: `singleton` re-checks the
+        // pid against the live listeners before believing any claim.
+        //
+        // Removed only if it still names US: the listener was freed at the top of
+        // this function while the joins below it can take hundreds of milliseconds,
+        // so a successor may already have bound the port and written its own claim
+        // to this same port-named path. See `singleton::remove_owner_file_if_owned`.
+        if let Some(path) = self.owner_path.take() {
+            singleton::remove_owner_file_if_owned(&path, std::process::id(), self.addr.port());
+        }
+
         self.manager.persist_now();
 
         // Final pin flush on a CLEAN shutdown, capturing whatever changed inside
@@ -491,6 +560,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         incumbent,
         affinity_path,
         tls,
+        host,
+        owner_dir,
     } = options;
 
     if let Some(port) = port_override {
@@ -514,13 +585,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let takeover = match (port, incumbent.0) {
         (0, _) => singleton::Takeover::Proceed,
         (_, Signal::Never) => match singleton::live_proxy_server(port) {
-            Some(pid) => singleton::Takeover::IncumbentPresent(pid),
+            Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent),
             None => singleton::Takeover::Proceed,
         },
         (_, Signal::LegacyJsOnly) => singleton::takeover_port(port, false),
         (_, Signal::Recognized) => singleton::takeover_port(port, true),
     };
-    if let singleton::Takeover::IncumbentPresent(pid) = takeover {
+    if let singleton::Takeover::IncumbentPresent(incumbent) = takeover {
         // ONE probe of the incumbent, answering two questions: which build it is
         // executing, and whether it is executing anything at all.
         let probe = cli::probe_incumbent(&config).await;
@@ -543,7 +614,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         );
         return Ok(ServeOutcome::StoodDown(StandDown {
             port,
-            pid,
+            pid: incumbent.pid,
+            kind: incumbent.kind,
             probe,
             report,
         }));
@@ -739,6 +811,59 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         "server started"
     );
 
+    // Claim the port by NAME-FREE identity, in the same place and for the same
+    // reason as the boot marker above: after the bind SUCCEEDED, so the file means
+    // "this pid is serving this port" rather than "this pid tried". A `tcr` in
+    // another terminal, and `tcr login`, then recognize this proxy whatever program
+    // is hosting it — see [`crate::singleton`] for the silent token loss that
+    // depends on it.
+    //
+    // A write failure is NOT fatal. The claim is an optimisation over the
+    // command-line matcher for the CLI host, and refusing to serve because a cache
+    // directory is unwritable would be a worse outcome than the matcher we had
+    // before. It is loud, because for an EMBEDDED host the matcher recognizes
+    // nothing and this file is the only identity there is.
+    //
+    // A claim that could not be written is dropped from the handle: shutdown then
+    // has nothing to remove, rather than deleting a path this process never owned.
+    //
+    // The file NAME is derived here, from the port actually bound, and not taken
+    // from the caller: every reader looks a claim up as `proxy-owner-<port>.json`
+    // for the port it is resolving, so a name that does not match is a claim
+    // nothing consults. With `port: Some(0)` a caller cannot know the name in
+    // advance — the kernel picks the port during this function — which is why the
+    // caller supplies a directory and `serve` supplies the name.
+    let owner_path = owner_dir.and_then(|dir| {
+        let path = singleton::owner_path_in(&dir, bound.port());
+        let owner = singleton::ProxyOwner {
+            pid: std::process::id(),
+            port: bound.port(),
+            sha: build_info::SHA.to_string(),
+            host,
+        };
+        match singleton::write_owner_file(&path, &owner) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    pid = owner.pid,
+                    port = owner.port,
+                    host = ?host,
+                    "proxy owner file written; this proxy is identifiable without its process name"
+                );
+                Some(path)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    host = ?host,
+                    "could not write the proxy owner file; identity falls back to command-line matching, which does NOT recognize an embedded proxy"
+                );
+                None
+            }
+        }
+    });
+
     let serve_manager = manager.clone();
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
@@ -753,6 +878,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         shutdown: shutdown_tx,
         manager,
         affinity_path,
+        owner_path,
         tasks_joined: 0,
         tasks_aborted: 0,
         server: Some(server),
@@ -828,6 +954,9 @@ mod tests {
             shutdown,
             manager,
             affinity_path,
+            // No claim: a hand-built handle in a unit test may not delete a file
+            // on shutdown, least of all one named after the live proxy's port.
+            owner_path: None,
             tasks_joined: 0,
             tasks_aborted: 0,
             server: Some(server),

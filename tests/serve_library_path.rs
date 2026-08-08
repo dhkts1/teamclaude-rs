@@ -22,6 +22,7 @@ use std::time::Duration;
 use teamclaude_rs::config::Config;
 use teamclaude_rs::proxy::STATUS_PATH;
 use teamclaude_rs::server::{serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup};
+use teamclaude_rs::singleton::{ProxyHost, ProxyOwner};
 
 /// The port `tcr` uses by default. Named here so the assertion below says what
 /// it is protecting rather than showing a bare number.
@@ -61,6 +62,19 @@ fn scratch_affinity_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(unique).join("affinity.json")
 }
 
+/// A disposable DIRECTORY for the port claim, for the same reason as the pin
+/// cache above: the real claim lives beside the live proxy's pin cache, is named
+/// after its port, and `tcr login` reads it. The file name inside is `serve`'s to
+/// choose, never a caller's.
+fn scratch_owner_dir(tag: &str) -> std::path::PathBuf {
+    let dir = scratch_affinity_path(tag)
+        .parent()
+        .expect("the scratch affinity path has a parent directory")
+        .to_path_buf();
+    std::fs::create_dir_all(&dir).expect("a scratch dir under the temp dir is creatable");
+    dir
+}
+
 fn options(tag: &str) -> ServeOptions {
     ServeOptions {
         config: test_config(),
@@ -76,6 +90,11 @@ fn options(tag: &str) -> ServeOptions {
         // Loading the MITM material mints/reads a CA on disk. Base-URL mode is
         // all this file exercises, so do not touch it.
         tls: TlsSetup::Disabled,
+        // A library caller, so the host is stated as such — but with no claim
+        // directory this is recorded nowhere. The one test that DOES write a
+        // claim overrides both fields together.
+        host: ProxyHost::Cli,
+        owner_dir: None,
     }
 }
 
@@ -278,6 +297,92 @@ fn the_convenience_constructor_touches_nothing_outside_the_process() {
     assert!(
         !options.incumbent.signals_anything(),
         "ServeOptions::new must not be able to signal whatever holds the port"
+    );
+    assert_eq!(
+        options.owner_dir, None,
+        "ServeOptions::new must not claim a port on disk; the real claim directory \
+         is shared state holding the live proxy's own claim"
+    );
+}
+
+/// THE PHASE 1 GATE, the half a unit test cannot reach: a **real** `serve` writes
+/// its port claim after the bind and withdraws it on shutdown.
+///
+/// The claim is what makes a proxy identifiable when its process name is not
+/// `tcr` — `teamclaude_rs::singleton` documents the silent OAuth token loss that
+/// depends on it (`tcr login` stops refusing to run beside a live server, whose
+/// next persist writes its boot-time single-use refresh tokens back over the fresh
+/// ones). The file existing is therefore the behaviour, not an implementation
+/// detail, and its CONTENTS are asserted field by field: a claim carrying the
+/// wrong pid or port is ignored by every reader, which would look exactly like no
+/// claim at all.
+///
+/// `host: Embedded` is used deliberately — that is the host the command-line
+/// matcher cannot recognize, so it is the case where this file is the only
+/// identity there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdown() {
+    let owner_dir = scratch_owner_dir("claim");
+
+    let mut handle = serve(ServeOptions {
+        owner_dir: Some(owner_dir.clone()),
+        host: ProxyHost::Embedded,
+        ..options("claim")
+    })
+    .await
+    .expect("binding an ephemeral port cannot fail")
+    .expect_started();
+
+    let addr = handle.addr();
+    assert_ne!(
+        addr.port(),
+        LIVE_PROXY_PORT,
+        "a test must never bind the port a live proxy serves on"
+    );
+
+    // THE NAME IS THE CONTRACT, and this is the case that used to break it: the
+    // caller asked for port 0, so the port is only known after the bind. Every
+    // reader resolves `proxy-owner-<port>.json` for the port it is asking about,
+    // so a claim under any other name is consulted by nothing — silently. `serve`
+    // is handed a directory and derives the name from the port it bound.
+    let owner_path = teamclaude_rs::singleton::owner_path_in(&owner_dir, addr.port());
+    assert!(
+        owner_path.exists(),
+        "the claim must be named after the port actually bound: {}",
+        owner_path.display()
+    );
+
+    let written = std::fs::read_to_string(&owner_path).unwrap_or_else(|err| {
+        panic!(
+            "no port claim at {} after a successful bind: {err}",
+            owner_path.display()
+        )
+    });
+    let owner: ProxyOwner = serde_json::from_str(&written)
+        .unwrap_or_else(|err| panic!("the claim is not a readable ProxyOwner: {err}: {written}"));
+    assert_eq!(
+        owner,
+        ProxyOwner {
+            pid: std::process::id(),
+            port: addr.port(),
+            sha: teamclaude_rs::build_info::SHA.to_string(),
+            host: ProxyHost::Embedded,
+        },
+        "the claim must name THIS process, the port actually bound, this build and \
+         the host the caller stated — a reader verifies pid and port before \
+         believing any of it"
+    );
+
+    let report = tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
+        .await
+        .expect("shutdown did not finish: a background task ignored the shutdown signal");
+    assert_eq!(report.tasks_aborted, 0, "clean shutdown");
+
+    assert!(
+        !owner_path.exists(),
+        "the claim must be withdrawn on shutdown; a proxy that has stopped \
+         listening must not still be advertising the port: {}",
+        owner_path.display()
     );
 }
 
