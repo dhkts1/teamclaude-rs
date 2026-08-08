@@ -1054,20 +1054,33 @@ mod tests {
         // The LISTEN socket is gone; only the ESTABLISHED accepted socket still
         // has local port `port`. Without the `SocketState::Listen` filter this
         // would report this process's pid again and the assertion below fails.
+        // Same narrowing as the UDP case below, for the same reason: once `server`
+        // is dropped the port is released, so an unrelated process can take it and
+        // be reported here legitimately. The claim under test is about OUR
+        // ESTABLISHED socket, and the inline positive control above already proved
+        // `port_listeners` reports this pid when a real LISTEN socket exists.
         let holders_after = port_listeners(port);
         assert!(
-            holders_after.is_empty(),
+            !holders_after.contains(&std::process::id()),
             "an ESTABLISHED socket on port {port} must not be reported as a LISTEN holder; \
              got {holders_after:?}"
         );
     }
 
-    /// UDP control: `listeners`' backends hard-code every UDP socket's state to
-    /// `SocketState::Unknown` (never `Listen`), so this passes today for that
-    /// reason rather than because of an explicit UDP exclusion — which is
-    /// exactly why it is worth having as a canary. The day upstream gives UDP a
-    /// real state, `Protocol::TCP` (not the state filter) is what keeps this
-    /// green; if this test ever goes red, that upstream change is why.
+    /// UDP canary. **This test cannot currently fail, and that is deliberate —
+    /// but it was previously documented as if a filter were holding it up.**
+    ///
+    /// Measured 2026-08-08 on macOS by removing each filter in turn and re-running:
+    /// it stays green with `SocketState::Listen` removed AND with `Protocol::TCP`
+    /// removed. So neither filter is what excludes our UDP socket; `get_all()`
+    /// never enumerates it in the first place on this platform. The previous
+    /// comment here claimed "`Protocol::TCP` (not the state filter) is what keeps
+    /// this green", which the mutations refute.
+    ///
+    /// It is kept as a pure upstream canary: if `listeners` ever starts reporting
+    /// UDP sockets, this goes red and tells us the protocol filter has become
+    /// load-bearing. Do not count it as evidence that either filter works — the
+    /// two tests above are, and both were watched failing under mutation.
     #[test]
     fn port_listeners_excludes_a_udp_socket_on_the_same_port() {
         let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding an ephemeral UDP port");
@@ -1076,9 +1089,19 @@ mod tests {
             .expect("a bound socket has a local address")
             .port();
 
+        // Assert on OUR pid, not on global emptiness. A UDP bind reserves a port
+        // in the UDP space only — the TCP space is independent, so an unrelated
+        // process may legitimately be TCP-LISTENing on this same number. Asserting
+        // `is_empty()` made this test depend on the whole machine's TCP usage, a
+        // precondition it never established, and it went red on a CI runner where
+        // pid 9460 held TCP on the port the kernel handed us for UDP.
+        //
+        // This cannot pass vacuously through a broken `port_listeners` that always
+        // returns empty: `port_listeners_finds_this_process_on_an_ephemeral_port`
+        // is the positive control for that, and would fail first.
         let holders = port_listeners(port);
         assert!(
-            holders.is_empty(),
+            !holders.contains(&std::process::id()),
             "a UDP socket on port {port} must never be reported as a TCP LISTEN holder; \
              got {holders:?}"
         );
