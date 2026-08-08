@@ -18,7 +18,7 @@ use clap::{Parser, Subcommand};
 
 use teamclaude_rs::cli::{self, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
-use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, server, tui, update};
+use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, server, singleton, tui, update};
 
 #[derive(Parser)]
 #[command(
@@ -532,6 +532,11 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     init_tracing(args.headless);
 
+    // The port `serve` will resolve to, computed the same way it does
+    // (`--port` overrides `config.proxy.port`) because the owner file is NAMED
+    // after the port and has to match the one that gets bound.
+    let resolved_port = args.port.unwrap_or(config.proxy.port);
+
     // Spelled out rather than built from `ServeOptions::new`, which is
     // deliberately inert: writing the config back, owning the shared pin cache
     // and signalling whatever holds the port are all things only the BINARY may
@@ -547,6 +552,20 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         },
         affinity_path: Some(affinity::default_path()),
         tls: server::TlsSetup::Load,
+        // This is a standalone `tcr` process, stated rather than sniffed from
+        // `argv[0]`: the owner file is what makes a proxy identifiable when its
+        // process name is NOT `tcr` (see `teamclaude_rs::singleton`), so the value
+        // has to come from the caller that knows.
+        host: singleton::ProxyHost::Cli,
+        // Claim the port for the next `tcr` (and for `tcr login`) to read. A
+        // binary-only side effect, like the pin cache above: it is a shared file
+        // named after the port, so a library caller must opt in with its own path.
+        //
+        // Except for `--port 0`, which asks the kernel for an ephemeral port: the
+        // name would say 0 while the contents said the real port, and nothing can
+        // look a claim up by a port number that was never bound. No claim is the
+        // honest answer there.
+        owner_path: (resolved_port != 0).then(|| singleton::default_owner_path(resolved_port)),
     };
 
     let handle = match server::serve(options).await? {

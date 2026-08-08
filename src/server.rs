@@ -159,6 +159,33 @@ pub struct ServeOptions {
     pub affinity_path: Option<PathBuf>,
     /// Where the MITM TLS material comes from.
     pub tls: TlsSetup,
+    /// What is hosting this proxy — a standalone `tcr` process
+    /// ([`singleton::ProxyHost::Cli`]) or an application serving it in-process
+    /// ([`singleton::ProxyHost::Embedded`]).
+    ///
+    /// **Every caller states this; the library never infers it.** Inferring it
+    /// from `argv[0]` is precisely the bug the owner file exists to fix (see
+    /// [`crate::singleton`]): an embedded proxy's `argv[0]` is the host
+    /// application's, which the name matcher does not recognize at all, and the
+    /// consequence is `tcr login` no longer refusing to run beside a live server
+    /// that will then overwrite its fresh single-use refresh tokens.
+    ///
+    /// Recorded in the owner file, and only there — so it has no effect unless
+    /// [`Self::owner_path`] is set.
+    pub host: singleton::ProxyHost,
+    /// Where to write `proxy-owner-<port>.json` claiming the port, or `None` to
+    /// write no claim at all.
+    ///
+    /// `None` is the default because the file is *shared state named after the
+    /// port*: a second process serving briefly would otherwise leave its own claim
+    /// where the live proxy's belongs. The binary passes
+    /// [`singleton::default_owner_path`]; a test points it somewhere disposable.
+    ///
+    /// Omitting it is safe, never silent: identity then falls back to the
+    /// command-line matcher, which is what every `tcr` did before this file
+    /// existed. It is only an *embedded* proxy that the matcher cannot see, and an
+    /// embedder must therefore pass a path.
+    pub owner_path: Option<PathBuf>,
 }
 
 impl ServeOptions {
@@ -179,6 +206,12 @@ impl ServeOptions {
             incumbent: IncumbentPolicy::never_signal(),
             affinity_path: None,
             tls: TlsSetup::Load,
+            // Inert, like every other field here: with no owner path, `host` is
+            // recorded nowhere and this value cannot be read by anyone. A caller
+            // that DOES claim the port must state its host, and both callers that
+            // write a file spell the pair out together.
+            host: singleton::ProxyHost::Cli,
+            owner_path: None,
         }
     }
 }
@@ -287,6 +320,10 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     manager: Arc<Manager>,
     affinity_path: Option<PathBuf>,
+    /// The port claim written after the bind, to be removed on shutdown. `None`
+    /// when the caller asked for no claim (or the write failed — a claim that was
+    /// never written is nothing to remove).
+    owner_path: Option<PathBuf>,
     /// Tasks joined and tasks aborted so far. Kept on the handle, not in a local,
     /// so a `shutdown` future that is dropped mid-join and re-issued reports the
     /// whole truth rather than only what the last attempt saw.
@@ -420,6 +457,16 @@ impl ServerHandle {
             self.background.pop();
         }
 
+        // Withdraw the port claim once the accept loop is done, so the next `tcr`
+        // does not read a claim for a proxy that has stopped listening. Ordered
+        // after the joins above and before the persists below for exactly that
+        // reason. Taken (not just read) so a re-issued `shutdown` does not try
+        // again — and a leftover file is harmless anyway: `singleton` re-checks the
+        // pid against the live listeners before believing any claim.
+        if let Some(path) = self.owner_path.take() {
+            singleton::remove_owner_file(&path);
+        }
+
         self.manager.persist_now();
 
         // Final pin flush on a CLEAN shutdown, capturing whatever changed inside
@@ -491,6 +538,8 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         incumbent,
         affinity_path,
         tls,
+        host,
+        owner_path,
     } = options;
 
     if let Some(port) = port_override {
@@ -739,6 +788,51 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         "server started"
     );
 
+    // Claim the port by NAME-FREE identity, in the same place and for the same
+    // reason as the boot marker above: after the bind SUCCEEDED, so the file means
+    // "this pid is serving this port" rather than "this pid tried". A `tcr` in
+    // another terminal, and `tcr login`, then recognize this proxy whatever program
+    // is hosting it — see [`crate::singleton`] for the silent token loss that
+    // depends on it.
+    //
+    // A write failure is NOT fatal. The claim is an optimisation over the
+    // command-line matcher for the CLI host, and refusing to serve because a cache
+    // directory is unwritable would be a worse outcome than the matcher we had
+    // before. It is loud, because for an EMBEDDED host the matcher recognizes
+    // nothing and this file is the only identity there is.
+    //
+    // A claim that could not be written is dropped from the handle: shutdown then
+    // has nothing to remove, rather than deleting a path this process never owned.
+    let owner_path = owner_path.and_then(|path| {
+        let owner = singleton::ProxyOwner {
+            pid: std::process::id(),
+            port: bound.port(),
+            sha: build_info::SHA.to_string(),
+            host,
+        };
+        match singleton::write_owner_file(&path, &owner) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    pid = owner.pid,
+                    port = owner.port,
+                    host = ?host,
+                    "proxy owner file written; this proxy is identifiable without its process name"
+                );
+                Some(path)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    host = ?host,
+                    "could not write the proxy owner file; identity falls back to command-line matching, which does NOT recognize an embedded proxy"
+                );
+                None
+            }
+        }
+    });
+
     let serve_manager = manager.clone();
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
@@ -753,6 +847,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         shutdown: shutdown_tx,
         manager,
         affinity_path,
+        owner_path,
         tasks_joined: 0,
         tasks_aborted: 0,
         server: Some(server),
@@ -828,6 +923,9 @@ mod tests {
             shutdown,
             manager,
             affinity_path,
+            // No claim: a hand-built handle in a unit test may not delete a file
+            // on shutdown, least of all one named after the live proxy's port.
+            owner_path: None,
             tasks_joined: 0,
             tasks_aborted: 0,
             server: Some(server),

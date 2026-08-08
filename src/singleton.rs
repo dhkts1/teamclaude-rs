@@ -25,10 +25,37 @@
 //!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone (the bind
 //!   then fails loudly with EADDRINUSE) rather than killed. This is what makes the
 //!   takeover safe against a reused PID or an unrelated process on the port.
+//!
+//! # Identity: the owner file, then the name matcher
+//!
+//! Recognition used to be *only* the name matcher — `argv[0]` ending in `/tcr`.
+//! That reads the HOST process, not the proxy: a proxy running inside another
+//! program (the menu-bar app) reports that program's path and matches nothing, so
+//! [`live_proxy_server`] returns `None`, `tcr login` stops refusing to run beside
+//! a live server, and the server's next `persist_tokens` writes its boot-time
+//! SINGLE-USE refresh tokens back over the fresh ones. That failure is silent
+//! until every account fails to refresh at the next boot.
+//!
+//! So a bound proxy now ADVERTISES itself: [`write_owner_file`] drops
+//! `proxy-owner-<port>.json` beside the affinity pin cache, and
+//! [`classify_port_owner`] is consulted BEFORE the name matcher. Identity becomes
+//! the proxy's own claim instead of an inference from someone else's `argv`.
+//!
+//! Two properties keep that from being a new way to get it wrong:
+//! - **A stale file proves nothing.** The pid it names must ALSO appear in
+//!   `port_listeners(port)` (and the port must match) or the claim is ignored
+//!   entirely — a crashed proxy, or anyone at all, can leave a file behind.
+//! - **The name matcher is RETAINED as the fallback**, so a `tcr` that predates
+//!   the owner file (including one serving right now) and a `LegacyJs` proxy —
+//!   which will never write one — are recognized exactly as before. Nothing has
+//!   to restart for this change to be safe.
 
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 /// Which proxy a recognized incumbent is. The distinction is load-bearing for
 /// [`takeover_decision`], not cosmetic: a `tcr` peer is a program that is doing
@@ -36,10 +63,157 @@ use std::time::Duration;
 /// leftover JS `teamclaude` is the thing this module was written to displace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProxyKind {
-    /// The Rust proxy — a peer of ours.
+    /// The Rust proxy running as its own process — a peer of ours.
     Tcr,
     /// The legacy JS proxy (`node …/teamclaude server`).
     LegacyJs,
+    /// The Rust proxy running **inside another program** (the menu-bar app),
+    /// which said so in its owner file ([`ProxyHost::Embedded`]).
+    ///
+    /// Never signalled, not even under `--replace`
+    /// ([`incumbents_to_signal`], [`takeover_decision`]). The pid on the port is
+    /// the HOST's, and `takeover_port` would SIGTERM it: AppKit installs no
+    /// SIGTERM handler, so the app dies without running
+    /// `applicationWillTerminate` — no graceful shutdown, no final session pin
+    /// write, and the operator's windows go with it. A CLI flag must not be able
+    /// to do that.
+    ///
+    /// This is not a new policy. `classify_proxy_server` already returns `None`
+    /// for `tcr run` (below), which is exactly why a proxy hosted inside a
+    /// `tcr run` process is never replaced either. Same shape, stronger reason.
+    /// Stopping an embedded proxy is the host application's job.
+    TcrEmbedded,
+}
+
+/// Which kind of process a proxy is running inside, as the proxy's **own claim**
+/// in its owner file — never sniffed from `argv[0]`.
+///
+/// [`crate::server::ServeOptions::host`] carries it, and each caller states it:
+/// the binary passes [`Self::Cli`], an in-process embedder passes
+/// [`Self::Embedded`]. The library does not guess, because guessing is the bug
+/// this whole mechanism replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyHost {
+    /// A standalone `tcr` process.
+    Cli,
+    /// A proxy served from inside a host application.
+    Embedded,
+}
+
+impl ProxyHost {
+    /// The incumbent kind a *verified* claim from this host means.
+    fn kind(self) -> ProxyKind {
+        match self {
+            ProxyHost::Cli => ProxyKind::Tcr,
+            ProxyHost::Embedded => ProxyKind::TcrEmbedded,
+        }
+    }
+}
+
+/// What a bound proxy writes to claim the port: `proxy-owner-<port>.json`.
+///
+/// Every field is load-bearing to a reader:
+/// - `pid` is what makes a stale file harmless — it must also be listening on
+///   `port` ([`verified_owner`]).
+/// - `port` guards against a file being read for the wrong port (a copied file,
+///   a caller passing a path that does not match its own port).
+/// - `sha` is which build is serving, so an operator reading the file gets the
+///   same fact the `server started` log line carries.
+/// - `host` is the whole point: it says whether SIGTERM is survivable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyOwner {
+    /// The pid holding the listener — the HOST process's pid when embedded.
+    pub pid: u32,
+    /// The port that pid bound.
+    pub port: u16,
+    /// The build the proxy is executing (`build_info::SHA`).
+    pub sha: String,
+    /// What is hosting the proxy.
+    pub host: ProxyHost,
+}
+
+/// `proxy-owner-<port>.json` inside `dir` — the file name is port-scoped so two
+/// proxies on two ports never overwrite each other's claim.
+pub fn owner_path_in(dir: &Path, port: u16) -> PathBuf {
+    dir.join(format!("proxy-owner-{port}.json"))
+}
+
+/// Where the binary keeps the claim: beside the session-affinity pin cache, so
+/// the proxy's two pieces of cross-boot state live in one directory.
+pub fn default_owner_path(port: u16) -> PathBuf {
+    let cache = crate::affinity::default_path();
+    let dir = cache
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    owner_path_in(&dir, port)
+}
+
+/// Write the claim atomically (0600, temp + rename — the same
+/// [`crate::config::write_atomic`] every other state file uses, so a reader can
+/// never see a half-written claim).
+pub fn write_owner_file(path: &Path, owner: &ProxyOwner) -> Result<(), crate::config::ConfigError> {
+    crate::config::write_atomic(path, &serde_json::to_string_pretty(owner)?)
+}
+
+/// Drop the claim. Best-effort by design: a file left behind by a crash cannot
+/// produce a false positive ([`verified_owner`] re-checks the pid against the
+/// live listeners), so failing to remove one costs nothing.
+pub fn remove_owner_file(path: &Path) {
+    if let Err(err) = std::fs::remove_file(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "could not remove the proxy owner file; a stale claim is harmless (its pid is re-checked against the live listeners)"
+            );
+        }
+    }
+}
+
+/// Read a claim, or `None` for absent/unreadable/unparseable. A malformed file is
+/// simply not a claim — the name matcher still gets its turn.
+fn read_owner_file(path: &Path) -> Option<ProxyOwner> {
+    let data = std::fs::read_to_string(path).ok()?;
+    match serde_json::from_str::<ProxyOwner>(&data) {
+        Ok(owner) => Some(owner),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "proxy owner file is unreadable; falling back to command-line recognition"
+            );
+            None
+        }
+    }
+}
+
+/// The claim's VERIFICATION, as a pure function: a claim counts only when it is
+/// for this `port` and its pid is one of the processes actually listening on it.
+///
+/// This is the check that makes the owner file safe to trust. Without it the file
+/// is a lie anyone can plant: any process could write `{"pid":<live proxy>,…}`
+/// and change what `tcr` does about the port, and every crashed proxy would leave
+/// behind a claim that outlives it and protects a pid the OS has since recycled
+/// onto something unrelated.
+fn verified_owner(owner: Option<&ProxyOwner>, port: u16, holders: &[u32]) -> Option<Incumbent> {
+    let owner = owner?;
+    (owner.port == port && holders.contains(&owner.pid)).then(|| Incumbent {
+        pid: owner.pid,
+        kind: owner.host.kind(),
+    })
+}
+
+/// The owner file at `owner_path`, verified against the processes actually
+/// holding `port`. `None` when there is no claim, the claim is for another port,
+/// or its pid is not listening — in every one of those cases the caller falls
+/// back to the name matcher.
+///
+/// `holders` and `owner_path` are parameters rather than read in here so this is
+/// testable against a real file without a real proxy.
+pub fn classify_port_owner(port: u16, holders: &[u32], owner_path: &Path) -> Option<Incumbent> {
+    verified_owner(read_owner_file(owner_path).as_ref(), port, holders)
 }
 
 /// A recognized, replaceable proxy holding the port.
@@ -121,16 +295,41 @@ fn port_listeners(port: u16) -> Vec<u32> {
 /// replaceable proxy incumbents, and which proxy is each? Excludes self and any
 /// non-proxy holder. Split out from the side-effecting kill so it is unit-testable
 /// with injected inputs.
+///
+/// Name matching only — [`replaceable_incumbents_with_owner`] is the version that
+/// takes a verified owner-file claim into account.
 pub fn replaceable_incumbents(
     holders: &[u32],
     self_pid: u32,
     command: impl Fn(u32) -> String,
 ) -> Vec<Incumbent> {
+    replaceable_incumbents_with_owner(holders, self_pid, command, None)
+}
+
+/// [`replaceable_incumbents`] with the port's **verified** owner-file claim
+/// (`classify_port_owner`) consulted FIRST.
+///
+/// Order matters: the claim is the proxy's own statement about what is hosting it,
+/// while the command line is an inference from the host process's `argv[0]` — and
+/// for an embedded proxy that inference is wrong in the dangerous direction (it
+/// recognizes nothing at all). Where both speak, the claim wins.
+///
+/// `owner` must already be verified against the live listeners; pass the result of
+/// [`classify_port_owner`], never a raw file read.
+pub fn replaceable_incumbents_with_owner(
+    holders: &[u32],
+    self_pid: u32,
+    command: impl Fn(u32) -> String,
+    owner: Option<Incumbent>,
+) -> Vec<Incumbent> {
     holders
         .iter()
         .copied()
         .filter(|&pid| pid != self_pid)
-        .filter_map(|pid| classify_proxy_server(&command(pid)).map(|kind| Incumbent { pid, kind }))
+        .filter_map(|pid| match owner.filter(|owner| owner.pid == pid) {
+            Some(claimed) => Some(claimed),
+            None => classify_proxy_server(&command(pid)).map(|kind| Incumbent { pid, kind }),
+        })
         .collect()
 }
 
@@ -144,7 +343,8 @@ pub fn replaceable_incumbents(
 /// port is free or held only by a non-proxy process.
 pub fn live_proxy_server(port: u16) -> Option<u32> {
     let holders = port_listeners(port);
-    replaceable_incumbents(&holders, std::process::id(), process_command)
+    let owner = classify_port_owner(port, &holders, &default_owner_path(port));
+    replaceable_incumbents_with_owner(&holders, std::process::id(), process_command, owner)
         .into_iter()
         .next()
         .map(|incumbent| incumbent.pid)
@@ -186,7 +386,18 @@ pub enum Takeover {
 /// the reason this module exists. Standing down for it would leave the JS proxy
 /// serving forever and make `tcr` unable to complete the migration it was
 /// installed for — and the two would token-war the moment tcr did bind elsewhere.
+///
+/// A [`ProxyKind::TcrEmbedded`] incumbent is checked BEFORE `replace`, and is the
+/// one kind `--replace` cannot override: the pid on the port belongs to the host
+/// application, so replacing it means SIGTERMing a GUI that installs no handler
+/// for it. See [`ProxyKind::TcrEmbedded`].
 pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
+    if let Some(embedded) = replaceable
+        .iter()
+        .find(|incumbent| incumbent.kind == ProxyKind::TcrEmbedded)
+    {
+        return Takeover::IncumbentPresent(embedded.pid);
+    }
     if replace {
         return Takeover::Proceed;
     }
@@ -210,6 +421,12 @@ pub fn takeover_decision(replaceable: &[Incumbent], replace: bool) -> Takeover {
 ///
 /// Past that gate: with `--replace`, every incumbent. Without it, only the legacy
 /// JS proxy, which is the one case that reaches `Proceed` unasked.
+///
+/// A [`ProxyKind::TcrEmbedded`] incumbent is filtered out unconditionally, on top
+/// of the stand-down gate that already covers it. Both, deliberately: signalling
+/// one kills a host application without its `applicationWillTerminate`, so the
+/// guarantee is worth stating twice rather than resting on a `!= Proceed` that a
+/// future edit to [`takeover_decision`] could relax by accident.
 fn incumbents_to_signal(replaceable: &[Incumbent], replace: bool) -> Vec<Incumbent> {
     if takeover_decision(replaceable, replace) != Takeover::Proceed {
         return Vec::new();
@@ -217,6 +434,7 @@ fn incumbents_to_signal(replaceable: &[Incumbent], replace: bool) -> Vec<Incumbe
     replaceable
         .iter()
         .copied()
+        .filter(|incumbent| incumbent.kind != ProxyKind::TcrEmbedded)
         .filter(|incumbent| replace || incumbent.kind == ProxyKind::LegacyJs)
         .collect()
 }
@@ -251,6 +469,23 @@ fn stand_down_message(port: u16, pid: u32) -> String {
     )
 }
 
+/// The stand-down message for an EMBEDDED incumbent — the one case `--replace`
+/// does not override, so the message must not offer it.
+///
+/// Carries the same [`INCUMBENT_MARKER`] the CLI message does, because TcrBar's
+/// `incumbentMarkers` scan is what turns this into a reported incumbent instead of
+/// a bare `exited(0)`; only the instruction differs, and it names the host
+/// application, which is the one place that can actually stop this proxy.
+fn embedded_stand_down_message(port: u16, pid: u32) -> String {
+    format!(
+        "[tcr] {INCUMBENT_MARKER} :{port} (pid {pid}) and it is served from inside its host \
+         application — leaving it alone and exiting without binding. --replace cannot take this \
+         one over: the pid is the app's, and signalling it would kill the app without its normal \
+         shutdown, losing the session→account pin map. Quit the host application to stop this \
+         proxy."
+    )
+}
+
 /// Resolve `port` down to one proxy for this server.
 ///
 /// With `replace`, a recognized proxy incumbent is terminated (SIGTERM, then
@@ -262,7 +497,9 @@ fn stand_down_message(port: u16, pid: u32) -> String {
 #[must_use = "the caller must exit instead of binding on IncumbentPresent"]
 pub fn takeover_port(port: u16, replace: bool) -> Takeover {
     let holders = port_listeners(port);
-    let replaceable = replaceable_incumbents(&holders, std::process::id(), process_command);
+    let owner = classify_port_owner(port, &holders, &default_owner_path(port));
+    let replaceable =
+        replaceable_incumbents_with_owner(&holders, std::process::id(), process_command, owner);
 
     // Surface a non-proxy holder (we won't kill it; the bind will fail).
     for &pid in &holders {
@@ -280,12 +517,31 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         // Only the pid and the instruction live here; `main` prints the build
         // comparison, because THAT is the part a user typing `tcr` after a rebuild
         // actually needs and it requires an async status read we must not do here.
-        eprintln!("{}", stand_down_message(port, pid));
+        let embedded = replaceable
+            .iter()
+            .any(|incumbent| incumbent.pid == pid && incumbent.kind == ProxyKind::TcrEmbedded);
+        if embedded {
+            eprintln!("{}", embedded_stand_down_message(port, pid));
+        } else {
+            eprintln!("{}", stand_down_message(port, pid));
+        }
         return Takeover::IncumbentPresent(pid);
     }
 
     for Incumbent { pid, kind } in incumbents_to_signal(&replaceable, replace) {
         match kind {
+            // Unreachable by construction — `incumbents_to_signal` filters this
+            // kind out twice. It is handled rather than `unreachable!()`d because
+            // the cost of being wrong is a SIGTERM to the operator's menu-bar app:
+            // skip and say so, never panic and never signal.
+            ProxyKind::TcrEmbedded => {
+                tracing::warn!(
+                    port,
+                    pid,
+                    "refusing to signal an embedded proxy: the pid belongs to its host application"
+                );
+                continue;
+            }
             ProxyKind::LegacyJs => eprintln!(
                 "[tcr] replacing the legacy JS teamclaude proxy on :{port} (pid {pid}) — migrating the port to tcr; leaving it running would token-war over the same single-use refresh tokens."
             ),
@@ -355,6 +611,297 @@ mod tests {
             pid,
             kind: ProxyKind::LegacyJs,
         }
+    }
+
+    fn embedded(pid: u32) -> Incumbent {
+        Incumbent {
+            pid,
+            kind: ProxyKind::TcrEmbedded,
+        }
+    }
+
+    /// A host application's command line: nothing in it matches the `tcr` name
+    /// matcher, which is the entire reason the owner file exists.
+    const HOST_APP_COMMAND: &str = "/Applications/TcrBar.app/Contents/MacOS/TcrBar";
+
+    /// A unique scratch dir for a claim file. Never [`default_owner_path`] — that
+    /// one is the live proxy's, and `tcr login` reads it.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-owner-test-{}-{tag}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch dir under the temp dir is creatable");
+        dir
+    }
+
+    fn write_claim(dir: &Path, port: u16, pid: u32, host: ProxyHost) -> PathBuf {
+        let path = owner_path_in(dir, port);
+        write_owner_file(
+            &path,
+            &ProxyOwner {
+                pid,
+                port,
+                sha: "0000000".to_string(),
+                host,
+            },
+        )
+        .expect("the scratch claim is writable");
+        path
+    }
+
+    /// (a) THE FALSE-POSITIVE CONTROL, and the one that makes the whole mechanism
+    /// safe to trust: a claim whose pid is **not** listening on the port is
+    /// IGNORED.
+    ///
+    /// Without this check the file is a lie anyone can plant — any process could
+    /// write `{"pid":<some pid>,"host":"embedded"}` and make `tcr` treat that pid
+    /// as an unreplaceable proxy, and every crashed proxy would leave behind a
+    /// claim protecting a pid the OS has since recycled onto something unrelated.
+    /// The file is a *claim*; `port_listeners` is what settles it.
+    #[test]
+    fn a_claim_whose_pid_is_not_listening_is_ignored() {
+        let dir = scratch_dir("stale");
+        let path = write_claim(&dir, 4444, 4242, ProxyHost::Embedded);
+
+        // The file is real, parses, and is for the right port — the ONLY defect is
+        // that its pid holds nothing.
+        assert!(path.exists());
+        assert_eq!(
+            classify_port_owner(4444, &[], &path),
+            None,
+            "a claim with no live listener at all must be ignored"
+        );
+        assert_eq!(
+            classify_port_owner(4444, &[9999, 8888], &path),
+            None,
+            "a claim whose pid is not among the port's listeners must be ignored"
+        );
+        // And the positive control, so the assertions above cannot be passing for
+        // the boring reason that this function always returns None.
+        assert_eq!(
+            classify_port_owner(4444, &[9999, 4242], &path),
+            Some(embedded(4242)),
+            "a claim whose pid IS listening is the one case that counts"
+        );
+        // A claim for a different port is not this port's claim either.
+        assert_eq!(
+            classify_port_owner(4445, &[4242], &path),
+            None,
+            "the port in the file must match the port being resolved"
+        );
+
+        // A stale claim does not even suppress the fallback: the name matcher
+        // still gets its turn, so a `tcr` predating the owner file is recognized.
+        let command = |_pid: u32| "/x/tcr server".to_string();
+        let owner = classify_port_owner(4444, &[7777], &path);
+        assert_eq!(
+            replaceable_incumbents_with_owner(&[7777], 1, command, owner),
+            vec![tcr(7777)],
+            "ignoring a stale claim must fall through to command-line recognition"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case the whole phase exists for: a proxy inside a host application is
+    /// invisible to the name matcher, and the claim is what makes it visible.
+    ///
+    /// The `assert!` on the matcher is not decoration — it is the bug being fixed,
+    /// stated as an executable fact. If it ever starts matching, `live_proxy_server`
+    /// stopped depending on the claim and this file's reason to exist changed.
+    #[test]
+    fn an_embedded_proxy_is_recognized_only_through_its_claim() {
+        assert_eq!(
+            classify_proxy_server(HOST_APP_COMMAND),
+            None,
+            "the name matcher cannot see a proxy hosted inside another program — \
+             that is the failure the claim file replaces"
+        );
+
+        let dir = scratch_dir("embedded");
+        let path = write_claim(&dir, 3456, 5150, ProxyHost::Embedded);
+        let owner = classify_port_owner(3456, &[5150], &path);
+        let command = |_pid: u32| HOST_APP_COMMAND.to_string();
+
+        assert_eq!(
+            replaceable_incumbents_with_owner(&[5150], 1, command, owner),
+            vec![embedded(5150)],
+            "the claim identifies the proxy the process name hides"
+        );
+        // Without the claim, the same holder is nothing at all — which is exactly
+        // what made `tcr login` stop refusing to run beside a live server.
+        assert!(replaceable_incumbents(&[5150], 1, command).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `host: "cli"` is a plain [`ProxyKind::Tcr`] — the claim adds identity, not a
+    /// new policy, for a proxy the matcher could already see.
+    #[test]
+    fn a_cli_claim_is_an_ordinary_tcr_peer() {
+        let dir = scratch_dir("cli");
+        let path = write_claim(&dir, 3456, 1234, ProxyHost::Cli);
+        assert_eq!(
+            classify_port_owner(3456, &[1234], &path),
+            Some(tcr(1234)),
+            "a CLI-hosted claim is the same kind the name matcher would produce"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BACKWARD COMPATIBILITY, and the reason this phase needs no restart: the
+    /// proxy serving right now wrote no claim, and it must still be recognized.
+    ///
+    /// A missing file, an empty one and a corrupt one all mean "no claim", never
+    /// "not a proxy" — a claim that cannot be read must not be able to *hide* an
+    /// incumbent the matcher would have found.
+    #[test]
+    fn a_proxy_that_wrote_no_claim_is_still_recognized() {
+        let dir = scratch_dir("absent");
+        let command = |_pid: u32| "/x/tcr server".to_string();
+
+        for (label, path) in [
+            ("absent", owner_path_in(&dir, 3456)),
+            ("empty", {
+                let p = dir.join("empty.json");
+                std::fs::write(&p, b"").expect("scratch write");
+                p
+            }),
+            ("corrupt", {
+                let p = dir.join("corrupt.json");
+                std::fs::write(&p, b"{not json").expect("scratch write");
+                p
+            }),
+            ("wrong-shape", {
+                let p = dir.join("wrong-shape.json");
+                std::fs::write(&p, br#"{"pid":222}"#).expect("scratch write");
+                p
+            }),
+        ] {
+            let owner = classify_port_owner(3456, &[222], &path);
+            assert_eq!(owner, None, "{label} is not a claim");
+            assert_eq!(
+                replaceable_incumbents_with_owner(&[222], 1, command, owner),
+                vec![tcr(222)],
+                "{label}: the retained name matcher must still recognize a running \
+                 proxy that never wrote a claim"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (b) An EMBEDDED incumbent stands the caller down even under `--replace`.
+    ///
+    /// The pid on the port belongs to the host application, and `takeover_port`
+    /// SIGTERMs it (see [`ProxyKind::TcrEmbedded`]): AppKit installs no SIGTERM
+    /// handler, so `--replace` would kill the app without its shutdown path — no
+    /// final session→account pin write, and the operator's app simply vanishes. A
+    /// CLI flag must not be able to do that.
+    #[test]
+    fn an_embedded_incumbent_stands_us_down_even_under_replace() {
+        for replace in [false, true] {
+            assert_eq!(
+                takeover_decision(&[embedded(777)], replace),
+                Takeover::IncumbentPresent(777),
+                "replace={replace} must not be able to take over an embedded proxy"
+            );
+        }
+        // And it wins over a legacy JS proxy sharing the port, in either order:
+        // proceeding for the JS proxy means SIGNALLING it, and this process would
+        // still refuse to bind afterwards.
+        for holders in [
+            vec![legacy_js(111), embedded(777)],
+            vec![embedded(777), legacy_js(111)],
+        ] {
+            assert_eq!(
+                takeover_decision(&holders, true),
+                Takeover::IncumbentPresent(777),
+                "{holders:?}"
+            );
+        }
+    }
+
+    /// (c) Nothing is ever signalled for an embedded incumbent — the assertion
+    /// that stands between `--replace` and SIGTERM to a GUI process.
+    #[test]
+    fn an_embedded_incumbent_is_never_signalled() {
+        for replace in [false, true] {
+            assert_eq!(
+                incumbents_to_signal(&[embedded(777)], replace),
+                vec![],
+                "replace={replace}: an embedded proxy must never be signalled"
+            );
+            assert_eq!(
+                incumbents_to_signal(&[embedded(777), legacy_js(111)], replace),
+                vec![],
+                "replace={replace}: nor its port-mates, since we stand down anyway"
+            );
+        }
+    }
+
+    /// The embedded stand-down still carries the marker TcrBar greps for, and does
+    /// NOT offer `--replace` — the one instruction that cannot work here.
+    #[test]
+    fn the_embedded_stand_down_message_reports_without_offering_replace() {
+        let message = embedded_stand_down_message(3456, 777);
+        assert!(
+            message.contains("another proxy holds"),
+            "apps/macos ServerController.incumbentMarkers greps for this: {message}"
+        );
+        assert!(message.contains("777"), "names the incumbent: {message}");
+        assert!(
+            !message.contains("--replace to"),
+            "must not offer an override that is refused for this kind: {message}"
+        );
+    }
+
+    /// The claim file is named after the PORT, so two proxies on two ports never
+    /// overwrite each other's identity, and it lives beside the pin cache rather
+    /// than anywhere a caller has to remember.
+    #[test]
+    fn the_claim_path_is_port_scoped_and_beside_the_pin_cache() {
+        assert_eq!(
+            owner_path_in(Path::new("/tmp/x"), 3456),
+            PathBuf::from("/tmp/x/proxy-owner-3456.json")
+        );
+        assert_ne!(
+            owner_path_in(Path::new("/tmp/x"), 3456),
+            owner_path_in(Path::new("/tmp/x"), 3457)
+        );
+        assert_eq!(
+            default_owner_path(3456).parent(),
+            crate::affinity::default_path().parent(),
+            "the claim belongs in the same directory as the pin cache"
+        );
+    }
+
+    /// The on-disk shape is a cross-process contract: the file a proxy writes is
+    /// read by a DIFFERENT `tcr` build, possibly older or newer. The key names are
+    /// spelled out here so a rename cannot happen silently.
+    #[test]
+    fn the_claim_is_the_documented_json_shape() {
+        let json = serde_json::to_string(&ProxyOwner {
+            pid: 42,
+            port: 3456,
+            sha: "abc1234".to_string(),
+            host: ProxyHost::Embedded,
+        })
+        .expect("a claim serializes");
+        assert_eq!(
+            json, r#"{"pid":42,"port":3456,"sha":"abc1234","host":"embedded"}"#,
+            "the claim's field names and the lowercase host values are read by \
+             other builds of tcr"
+        );
+        let parsed: ProxyOwner =
+            serde_json::from_str(r#"{"pid":7,"port":1,"sha":"s","host":"cli"}"#)
+                .expect("the documented shape parses");
+        assert_eq!(parsed.host, ProxyHost::Cli);
     }
 
     #[test]
