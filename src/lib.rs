@@ -28,6 +28,7 @@ pub mod oauth;
 pub mod probe;
 pub mod proxy;
 pub mod quota;
+pub mod server;
 pub mod singleton;
 pub mod stats;
 pub mod status;

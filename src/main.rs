@@ -1,21 +1,24 @@
 //! `tcr` — the teamclaude-rs binary.
 //!
-//! Boot sequence (DESIGN §main): load the drop-in config → build the [`Manager`]
-//! → spawn the axum proxy task and the background probe loop → run the TUI (or
-//! block in `--headless`) → flush the config on exit.
+//! Boot sequence (DESIGN §main): load the drop-in config → hand it to
+//! [`teamclaude_rs::server::serve`], which builds the [`Manager`], spawns the
+//! axum proxy task and the background loops, and binds → run the TUI (or block
+//! in `--headless`) → shut the handle down, which flushes on exit.
+//!
+//! What is left in THIS file is what only a binary may do: parse clap, install a
+//! logging subscriber, print operator diagnostics, and turn a stand-down into a
+//! process exit code. Everything reusable lives in the library.
+//!
+//! [`Manager`]: teamclaude_rs::manager::Manager
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
-use std::sync::Arc;
-
 use teamclaude_rs::cli::{self, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
-use teamclaude_rs::manager::Manager;
-use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, singleton, tui, update};
+use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, server, tui, update};
 
 #[derive(Parser)]
 #[command(
@@ -516,225 +519,42 @@ fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDown
     }
 }
 
+/// `tcr server` — the clap→[`server::ServeOptions`] adapter.
+///
+/// Everything that actually boots the proxy lives in [`teamclaude_rs::server`],
+/// which is usable from a test or any other embedder. What stays here is what
+/// only a *binary* may do: choose the logging subscriber, print the operator's
+/// stand-down diagnosis, turn that stand-down into a process exit code, and pick
+/// how to wait (the TUI, or a headless block on Ctrl-C).
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let (mut config, persist_path) = load_config(&config_path);
-    if let Some(port) = args.port {
-        config.proxy.port = port;
-    }
-    let port = config.proxy.port;
+    let (config, persist_path) = load_config(&config_path);
 
     init_tracing(args.headless);
 
-    // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
-    // so our own startup can never token-war with the incumbent. Only a
-    // command-verified teamclaude/tcr server on THIS port is ever signalled — a
-    // `tcr` peer only under `--replace`, a legacy JS `teamclaude` always, since
-    // displacing that one is what the takeover exists for. `--no-replace` is the
-    // default now, and clap rejects it alongside `--replace`.
-    if let singleton::Takeover::IncumbentPresent(pid) = singleton::takeover_port(port, args.replace)
-    {
-        // ONE probe of the incumbent, answering two questions: which build it is
-        // executing, and whether it is executing anything at all.
-        let probe = cli::probe_incumbent(&config).await;
-        // Read the checkout LIVE. The build stamps alone cannot see an edit made
-        // since the last commit (build.rs re-runs only when a git ref moves), so
-        // comparing two stamps would print "build in sync" for a proxy that
-        // predates the edit — see `build_info::stand_down_build_report`.
-        let checkout = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| build_info::find_tcr_checkout(&cwd))
-            .map(|root| build_info::read_checkout_state(&root, build_info::SHA));
-        // Standing down is cheap and correct, but silent success here would mean
-        // `cargo build && tcr` exits 0 with the OLD build still serving — say which
-        // build actually holds the port before we go.
-        let report = build_info::stand_down_build_report(
-            port,
-            &build_info::BuildInfo::current(),
-            probe.build.as_ref(),
-            checkout.as_ref(),
-        );
-        eprintln!("{}", report.line);
-        if let cli::Liveness::Silent { why } = &probe.liveness {
-            eprintln!(
-                "[tcr] WARNING incumbent-not-answering: port={port} pid={pid} probe={why:?} — the \
-                 process holding :{port} did not respond, so standing down leaves NOTHING serving \
-                 on it. Run `tcr --replace` to take the port over; that is the recovery for a \
-                 wedged proxy, and it is not being done automatically because it also wipes the \
-                 pin map of a proxy that was merely slow to answer."
-            );
-        }
-        std::process::exit(stand_down_exit_code(&probe.liveness, report.verdict));
-    }
-
-    let manager = Manager::with_live_refresher(config, persist_path);
-
-    // Session-affinity pins survive a restart via their own cache file (NOT the
-    // credential config — see `teamclaude_rs::affinity`). Restore before the
-    // listener binds, so the first request after a bounce already routes on its
-    // old pin instead of cold-starting the account's prompt cache.
-    //
-    // Only when affinity is enabled: with the feature off the map is never
-    // consulted, and a restore would put entries in it that nothing reads.
-    let affinity_path = affinity::default_path();
-    if manager.session_affinity_enabled() {
-        let report = manager.restore_affinity(&affinity_path, affinity::PIN_TTL_MS);
-        if let Some(reason) = &report.degraded {
-            // Never fatal: the pin file is a cache, so an unusable one costs the
-            // warm start it would have bought and nothing else.
-            tracing::warn!(
-                path = %affinity_path.display(),
-                reason = %reason,
-                "session-affinity pins ignored; starting with an empty pin map"
-            );
-        } else {
-            tracing::info!(
-                path = %affinity_path.display(),
-                restored = report.pins.len(),
-                expired = report.expired,
-                unresolved = report.unresolved,
-                ambiguous = report.ambiguous,
-                ttl_minutes = affinity::PIN_TTL_MS / 60_000,
-                "session-affinity pins restored"
-            );
-        }
-
-        // Debounced incremental flush. Shutdown-only would miss the case this
-        // exists to survive: `--replace` follows SIGTERM with SIGKILL, and a
-        // SIGKILL runs no shutdown path at all. A 5-second timer that writes only
-        // when the map actually changed bounds the loss to one interval while
-        // keeping a busy proxy to at most one small atomic write per interval;
-        // pins settle early in a session, so steady state is no writes.
-        let flusher = manager.clone();
-        let flush_path = affinity_path.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(5));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                if !flusher.take_affinity_dirty() {
-                    continue;
-                }
-                if let Err(err) = flusher.flush_affinity(&flush_path) {
-                    tracing::warn!(
-                        path = %flush_path.display(),
-                        error = %err,
-                        "could not write the session-affinity pin file; pins will not survive this restart"
-                    );
-                }
-            }
-        });
-    }
-
-    // Background probe loop: refresh every account's quota on the configured
-    // cadence (a value <= 0 in `quotaProbeSeconds` disables it). The first tick
-    // fires immediately, so the bars populate at startup rather than after a lag.
-    let probe_seconds = manager.probe_interval_seconds();
-    if probe_seconds > 0 {
-        let prober = manager.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(probe_seconds));
-            loop {
-                ticker.tick().await;
-                prober.probe_all().await;
-            }
-        });
-    }
-
-    // Opt-in keep-warm loop: periodically warm idle accounts so their 5h session
-    // window stays live. Ships DARK — `warmupSeconds` defaults to 0, and when it is
-    // absent/0 NO task is spawned here at all (unlike the probe, warming spends real
-    // quota). `MissedTickBehavior::Skip` drops a missed tick rather than bursting a
-    // catch-up warm after the process was suspended.
-    let warmup_seconds = manager.warmup_interval_seconds();
-    if warmup_seconds > 0 {
-        let m = manager.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(warmup_seconds));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                // Two things start a sweep: the configured cadence, and the probe
-                // reporting that it has READ an account's quota for the first time.
-                // The second is what keeps `warm_targets`' boot gate from being a
-                // kill switch — the ticker's immediate first tick necessarily finds
-                // no targets (no quota read yet) and `Skip` puts the next one a whole
-                // `warmupSeconds` away, so at 3600s a proxy restarted more often than
-                // hourly would otherwise warm nothing, ever. A wake arriving while
-                // this task is inside `warm_all` is stored as a permit by
-                // `notify_one` and consumed by the next `notified()`, so it is never
-                // lost; the flip fires at most once per account per process, so this
-                // cannot spin.
-                tokio::select! {
-                    _ = ticker.tick() => {}
-                    _ = m.warm_wake().notified() => {}
-                }
-                m.warm_all().await;
-            }
-        });
-    }
-
-    // Load the MITM TLS material (reuse the existing leaf, else mint one). A
-    // failure here is non-fatal: base-URL mode still serves; only CONNECT
-    // (forward-proxy) mode is unavailable until the cert issue is fixed.
-    let tls = match mitm::load_tls() {
-        Ok(assets) => {
-            if let Some(ca) = &assets.ca_path {
-                tracing::info!(ca = %ca.display(), "MITM: advertise this CA via NODE_EXTRA_CA_CERTS");
-            }
-            Some(Arc::new(assets.acceptor))
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "MITM disabled: could not load/generate TLS material (base-URL mode still works)");
-            None
-        }
+    let options = server::ServeOptions {
+        config,
+        persist_path,
+        port: args.port,
+        replace: args.replace,
+        affinity_path: affinity::default_path(),
+        tls: server::TlsSetup::Load,
     };
 
-    // Hybrid proxy server task: base-URL mode and HTTPS_PROXY/CONNECT mode on the
-    // same port. The listener peeks each connection and routes accordingly.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
-    let bound = listener.local_addr()?;
+    let handle = match server::serve(options).await? {
+        server::ServeOutcome::Started(handle) => handle,
+        // A binary may exit; the library returned this as a value.
+        server::ServeOutcome::StoodDown(stand_down) => stand_down_exit(&stand_down),
+    };
+    let bound = handle.addr();
 
-    // The boot marker. `$TMPDIR/teamclaude-rs.log` is appended forever and never
-    // rotated, so without this line a restart is invisible: request lines run
-    // unbroken across a bounce and the log cannot be sliced "since this boot".
-    // Emitted here deliberately — after `init_tracing` (else it goes nowhere) and
-    // after the bind SUCCEEDED — so one line means "this pid is live on this port",
-    // not "this pid tried". A restart also wipes the in-memory session→account pin
-    // map, the most expensive cache event in this system; counting these lines is
-    // how that cost becomes measurable:  rg 'server started' "$TMPDIR/teamclaude-rs.log"
-    //
-    // `version` alone could not tell two boots apart: it is `CARGO_PKG_VERSION`,
-    // the literal 0.1.0 from Cargo.toml, identical across every build ever made.
-    // The build stamp beside it is the field that actually identifies the code
-    // this pid is executing — the thing that used to need an `lsof -p <pid>`
-    // inode comparison to establish. See `build_info`.
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        sha = build_info::SHA,
-        dirty = build_info::DIRTY,
-        built_at = build_info::BUILT_AT,
-        pid = std::process::id(),
-        port = bound.port(),
-        "server started"
-    );
-
-    let serve_manager = manager.clone();
-    let mut server = tokio::spawn(async move {
-        mitm::serve(listener, serve_manager, tls).await;
-    });
-
+    let mut handle = handle;
     if args.headless {
         tracing::info!("teamclaude-rs listening on http://{bound} (headless)");
         // Block until Ctrl-C or the server task exits.
         tokio::select! {
             _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received"),
-            res = &mut server => {
-                if let Err(err) = res {
-                    tracing::error!(error = %err, "server task join error");
-                }
-            }
+            () = handle.serving_stopped() => {}
         }
     } else {
         // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
@@ -750,7 +570,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         if sigterm.is_none() {
             tracing::warn!("could not install SIGTERM handler; terminal may not restore if killed");
         }
-        let tui_fut = tui::run(manager.clone());
+        let tui_fut = tui::run(handle.manager().clone());
         tokio::pin!(tui_fut);
         tokio::select! {
             res = &mut tui_fut => {
@@ -771,28 +591,39 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Stop serving, then flush the config (refreshed tokens already persisted
-    // incrementally; this is the final belt-and-suspenders write).
-    server.abort();
-    manager.persist_now();
-    // Final pin flush on a CLEAN shutdown, capturing whatever changed inside the
-    // last flusher interval. Belt-and-braces only — the timer above is what makes
-    // the pins survive a SIGKILL, which is the case that actually matters.
-    if manager.session_affinity_enabled() {
-        match manager.flush_affinity(&affinity_path) {
-            Ok(count) => tracing::info!(
-                path = %affinity_path.display(),
-                pins = count,
-                "session-affinity pins written for the next boot"
-            ),
-            Err(err) => tracing::warn!(
-                path = %affinity_path.display(),
-                error = %err,
-                "final session-affinity pin write failed; pins will not survive this restart"
-            ),
-        }
-    }
+    // Stop serving, then flush the config and the affinity pins. The whole
+    // sequence — including the final pin write a clean shutdown owes the next
+    // boot — lives in `ServerHandle::shutdown`, so an embedder gets it too.
+    handle.shutdown().await;
     Ok(())
+}
+
+/// Print the stand-down diagnosis and exit with the code it earned. Never returns.
+///
+/// This is the half of the stand-down a *library* must not do, which is why
+/// [`server::serve`] hands the facts back as a [`server::StandDown`] instead.
+/// The wording is a cross-language contract: TcrBar scans this stderr, and
+/// `ServerController.StandDownExit` switches on the code.
+fn stand_down_exit(stand_down: &server::StandDown) -> ! {
+    // Standing down is cheap and correct, but silent success here would mean
+    // `cargo build && tcr` exits 0 with the OLD build still serving — say which
+    // build actually holds the port before we go.
+    eprintln!("{}", stand_down.report.line);
+    if let cli::Liveness::Silent { why } = &stand_down.probe.liveness {
+        let port = stand_down.port;
+        let pid = stand_down.pid;
+        eprintln!(
+            "[tcr] WARNING incumbent-not-answering: port={port} pid={pid} probe={why:?} — the \
+             process holding :{port} did not respond, so standing down leaves NOTHING serving \
+             on it. Run `tcr --replace` to take the port over; that is the recovery for a \
+             wedged proxy, and it is not being done automatically because it also wipes the \
+             pin map of a proxy that was merely slow to answer."
+        );
+    }
+    std::process::exit(stand_down_exit_code(
+        &stand_down.probe.liveness,
+        stand_down.report.verdict,
+    ));
 }
 
 /// Load the config, deciding what may be written back:
