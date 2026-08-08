@@ -31,6 +31,67 @@ else
   echo "pre-commit: gitleaks not installed — skipping secret scan (brew install gitleaks)." >&2
 fi
 
+# ── Public-repo disclosure gate ─────────────────────────────────────────────
+# The banner above says "do NOT commit ~/ paths". It was read past, and on
+# 2026-08-08 a design document naming a PRIVATE repository in a different org
+# was committed and pushed here — its structure, CI config, file line ranges and
+# the author's local paths. The tree was cleaned within minutes; removing it from
+# HISTORY needed a force-push to a protected branch, because a public repo's
+# history cannot be un-published. A reminder that can be read past is not a gate.
+#
+# Scans ADDED lines only, so pre-existing content can never block you.
+# Every grep is `|| true`: under `set -e` a no-match (exit 1) would otherwise
+# abort the hook, and `grep -q` in a pipe can invert on SIGPIPE. Both failure
+# modes report the wrong answer confidently, which is the defect this gate exists
+# to prevent, one level up.
+#
+# Deliberate exception:  git commit --no-verify
+added="$(git diff --cached -U0 --diff-filter=ACM -- . ':(exclude).githooks/private-names' \
+         | sed -n 's/^+//p' || true)"
+hits=""
+
+if [ -n "$added" ]; then
+  # 1. Private names — an editable list, so adding one needs no hook edit.
+  if [ -f .githooks/private-names ]; then
+    while IFS= read -r name || [ -n "$name" ]; do
+      case "$name" in ''|\#*) continue ;; esac
+      found="$(printf '%s\n' "$added" | grep -i -m3 -- "$name" || true)"
+      [ -n "$found" ] && hits="$hits
+  private name '$name':
+$(printf '%s\n' "$found" | sed 's/^/      /')"
+    done < .githooks/private-names
+  fi
+
+  # 2. Absolute home paths — they leak the machine layout and the operator's name.
+  #    Obviously-synthetic users are allowed so fixtures and docs still work.
+  found="$(printf '%s\n' "$added" \
+           | grep -E -m3 '/(Users|home)/[A-Za-z0-9._-]+/' \
+           | grep -v -E '/(Users|home)/(x|y|alice|bob|carol|test|example|runner|user)/' || true)"
+  [ -n "$found" ] && hits="$hits
+  absolute home path:
+$(printf '%s\n' "$found" | sed 's/^/      /')"
+
+  # 3. Real-looking email addresses (example.com and the GitHub noreply are fine).
+  found="$(printf '%s\n' "$added" \
+           | grep -E -o -m3 '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
+           | grep -v -E '@(example\.(com|org|net)|users\.noreply\.github\.com)$' || true)"
+  [ -n "$found" ] && hits="$hits
+  real-looking email address:
+$(printf '%s\n' "$found" | sed 's/^/      /')"
+fi
+
+if [ -n "$hits" ]; then
+  echo "" >&2
+  echo "pre-commit: BLOCKED — staged changes would publish private information." >&2
+  echo "$hits" >&2
+  echo "" >&2
+  echo "  This repository is PUBLIC. Once pushed, removing it requires rewriting" >&2
+  echo "  history on a protected branch, and forks keep their own copies." >&2
+  echo "  Fix the lines, add a name to .githooks/private-names, or if this is" >&2
+  echo "  genuinely fine:  git commit --no-verify" >&2
+  exit 1
+fi
+
 # ── Rust format gate ────────────────────────────────────────────────────────
 # Mirror CI's `cargo fmt --check` Format job so a formatting slip is caught here,
 # not after a push goes red. Only fires when the commit stages Rust files.
