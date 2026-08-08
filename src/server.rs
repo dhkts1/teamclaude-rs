@@ -939,13 +939,21 @@ mod tests {
         let (shutdown, _rx) = watch::channel(false);
         let keepalive = shutdown.clone();
         // Ignores the signal for 300ms, then stops: long enough for the first
-        // attempt to be cancelled while joining it.
+        // attempt to be cancelled while joining it. The accept loop is already
+        // finished, so the cancellation lands inside the BACKGROUND join — the
+        // loop whose bookkeeping is what cancel-safety is about. (Cancelling on
+        // the server join instead leaves the background vec untouched, which a
+        // consuming implementation would also survive.)
         let slow = || {
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             })
         };
-        let mut handle = handle_owning(shutdown, slow(), vec![slow(), slow()]);
+        let mut handle = handle_owning(
+            shutdown,
+            tokio::spawn(std::future::ready(())),
+            vec![slow(), slow()],
+        );
 
         assert!(
             tokio::time::timeout(
