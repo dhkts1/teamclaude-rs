@@ -308,16 +308,120 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // matters because `open(2)` applies its `mode` argument only on creation — the
     // old code's `.mode(0o600)` was silently ignored whenever the path already
     // existed (measured: a pre-existing 0666 file stays 0666).
+    //
+    // The name is prefixed rather than left as the crate's default. `tempfile`
+    // names a file `.tmpXXXXXX`, which carries no attribution at all: a SIGKILL
+    // between the create below and the `persist` further down strands a file
+    // holding EVERY account's OAuth access and refresh tokens in `~/.config`,
+    // and this proxy is SIGKILLed as documented operational reality. The old
+    // `.{name}.{pid}.{seq}.tmp` scheme at least left an orphan that was greppable
+    // and obviously ours; `.{name}.tcr-XXXXXX.tmp` restores that. Note this is
+    // attribution only — nothing in this crate reaps orphans (`rg 'read_dir' src/`
+    // finds none), and the random component means they no longer recycle the way
+    // a pid×seq space did, so they accumulate until an operator removes them.
+    let prefix = match path.file_name() {
+        Some(name) => format!(".{}.tcr-", name.to_string_lossy()),
+        None => ".tcr-".to_string(),
+    };
     let mut file = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o600))
+        .prefix(prefix.as_str())
+        .suffix(".tmp")
         .tempfile_in(dir)?;
     file.write_all(json.as_bytes())?;
-    // `persist` below is a bare `rename(2)` and NEVER fsyncs, so durability stays
-    // ours to enforce by hand. This file holds live OAuth tokens: a crash after
-    // the rename must not be able to expose it as empty or half-written.
+    // Make the temp file's DATA durable before the rename that publishes it, so a
+    // crash cannot expose the destination as empty or half-written. This is the
+    // only durability guarantee that holds unconditionally here; see the
+    // directory sync below for the part that does not.
     file.as_file().sync_all()?;
 
-    file.persist(path).map_err(|e| e.error)?;
+    match file.persist(path) {
+        // The returned `File` is the persisted handle; nothing here writes through
+        // it (every save is a fresh temp plus a rename), so it is dropped at once.
+        Ok(_) => {}
+        Err(tempfile::PersistError { error, file }) => {
+            // NEVER `map_err(|e| e.error)`. `PersistError` OWNS the temp file
+            // (`tempfile-3.27.0 src/file/mod.rs:516-521`) and `TempPath`'s `Drop` is
+            // `fs::remove_file` unless cleanup is disabled (`:402-408`), so
+            // discarding the struct to keep only its `io::Error` UNLINKS the
+            // complete, fsynced JSON that is sitting right there.
+            //
+            // This is defence in depth, not the only line of it, and the
+            // distinction is worth stating precisely. A rename failure here — full
+            // disk, EACCES on the destination, an immutable flag, a read-only
+            // remount — does not by itself lose the rotated single-use refresh
+            // token: `Manager::persist_tokens` keeps it in the in-memory snapshot
+            // on purpose for `persist_now` to flush at shutdown, and says so
+            // (`src/manager/mod.rs:862-866`). What the retained file adds is a
+            // SECOND, independent recovery artifact at a known path, which is what
+            // covers the conjunction — a failed rename AND a process that never
+            // reaches its shutdown flush. That conjunction is not hypothetical
+            // here: `persist_now` is skipped on a SIGKILL and on the
+            // never-served/early-cancel paths (`src/server.rs:1025`, `:1063`), and
+            // this proxy is SIGKILLed as documented operational reality. The
+            // `fs::rename` this replaced left exactly that artifact behind; the
+            // migration removed it.
+            //
+            // `keep()` disables the delete-on-drop and hands back the path. The path
+            // is logged (the contents are NOT — they are live OAuth tokens) because
+            // a preserved file whose location never reaches an operator is barely
+            // better than a deleted one.
+            match file.keep() {
+                Ok((_file, kept)) => tracing::warn!(
+                    path = %path.display(),
+                    retained = %kept.display(),
+                    error = %error,
+                    "could not rename the new state file into place; the fully-written temp file has been RETAINED at `retained` — move it over `path` by hand to recover"
+                ),
+                Err(keep_error) => tracing::error!(
+                    path = %path.display(),
+                    error = %error,
+                    keep_error = %keep_error,
+                    "could not rename the new state file into place, AND could not retain the temp file; its contents are lost"
+                ),
+            }
+            return Err(error.into());
+        }
+    }
+
+    // What is and is not durable, precisely. `sync_all` above makes the temp
+    // file's DATA durable. `persist` is a bare `rename(2)`, which dirties only the
+    // parent directory's inode — so without the sync below, a power loss seconds
+    // after a successful return can roll the directory entry back and leave the
+    // PREVIOUS contents in place. For `save_tokens` that means the previous
+    // refresh token, which Anthropic has already consumed: the same dead-account
+    // outcome, just by a different route. This gap predates the tempfile
+    // migration; it is closed here.
+    //
+    // Best-effort ON PURPOSE, and this is the one place in this function where a
+    // failure is not returned. The rename has ALREADY succeeded by this point —
+    // the new bytes are the ones a reader sees. Turning a directory-sync failure
+    // into an `Err` would tell `save_tokens` its write failed when it did not, and
+    // the caller's recovery for that is to treat the rotated token as unpersisted.
+    // A warn keeps the failure visible without inventing one. Portability is the
+    // second reason: directory `fsync` is well-defined on Linux, while on macOS
+    // `sync_all` issues `F_FULLFSYNC`, which a filesystem is free to refuse on a
+    // directory fd. Measured on APFS (macOS 25.6, the deployment target): it
+    // returns `Ok`, so the sync is real here and not a no-op — but that is one
+    // filesystem, not a guarantee, which is why the failure is tolerated.
+    //
+    // The cost is real and was measured, not assumed: it roughly DOUBLES this
+    // function (5.0 → 9.5 ms/write, N=200, APFS), because a second `F_FULLFSYNC`
+    // is a second barrier. That is affordable only because of the actual call
+    // rates. The affinity flusher is the hot caller and is the one that would hurt
+    // — it does a blocking `std::fs` write inside async code (`src/server.rs:425`)
+    // — but it is a dirty-gated 5-second ticker whose steady state is no writes at
+    // all (`src/server.rs:670-683`), so this adds ~4.5ms to a background task at
+    // most once per 5s. The credential writers run per token rotation. If a future
+    // caller writes at request rate, revisit this line before assuming it is free.
+    if let Err(e) = fs::File::open(dir).and_then(|d| d.sync_all()) {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "state file renamed into place, but the parent directory could not be fsynced; the rename may not survive a power loss"
+        );
+    }
+
     // NOT a guard against a looser pre-existing destination: `persist` is a
     // rename, so the destination's old inode — and its mode — are gone. This
     // cannot tighten anything.
@@ -1752,6 +1856,88 @@ mod tests {
             0o600
         );
         fs::remove_file(&path).ok();
+    }
+
+    // --- write_atomic's failure path ---------------------------------------
+
+    /// A destination that `rename(2)` cannot replace, in a directory we can still
+    /// write to. Renaming a non-directory onto a directory fails (`EISDIR`/
+    /// `ENOTDIR`) while `tempfile_in` on the parent still succeeds, which is
+    /// exactly the shape needed: the temp file gets created and fully written, and
+    /// only the final rename fails.
+    fn unrenamable_target(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = tmp_path(tag).with_extension("d");
+        let target = dir.join("teamclaude.json");
+        fs::create_dir_all(&target).expect("create the blocking directory");
+        (dir, target)
+    }
+
+    /// The recovery-artifact guard. `PersistError` owns the `NamedTempFile`, whose
+    /// `Drop` is `fs::remove_file`, so `map_err(|e| e.error)` unlinks the complete,
+    /// fsynced JSON on a rename failure. The rotated single-use token also lives in
+    /// the in-memory snapshot (`src/manager/mod.rs:862-866`), so this file is the
+    /// SECOND recovery path, not the only one — it is what covers a failed rename
+    /// on a process that then dies before its shutdown flush.
+    #[test]
+    fn a_failed_rename_retains_the_written_temp_file() {
+        let (dir, target) = unrenamable_target("persist-fail-retain");
+        let json = r#"{"accounts":[{"name":"acct-a","accessToken":"at-a"}]}"#;
+
+        let err = write_atomic(&target, json).expect_err("rename onto a directory must fail");
+        assert!(
+            matches!(err, ConfigError::Io(_)),
+            "a rename failure is an I/O error, got {err:?}"
+        );
+
+        let orphans: Vec<PathBuf> = fs::read_dir(&dir)
+            .expect("read the destination directory")
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert_eq!(
+            orphans.len(),
+            1,
+            "the written temp file must survive a failed rename, found {orphans:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&orphans[0]).expect("read the retained temp file"),
+            json,
+            "the retained file must hold the bytes we wrote"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Attribution for the orphan the test above proves exists — and for the one a
+    /// SIGKILL between create and rename strands. `tempfile`'s default `.tmpXXXXXX`
+    /// says nothing about who wrote it or which file it was becoming; in `~/.config`
+    /// that file holds every account's OAuth tokens.
+    #[test]
+    fn a_retained_temp_file_is_attributable_to_tcr_and_its_destination() {
+        let (dir, target) = unrenamable_target("persist-fail-name");
+        write_atomic(&target, "{}").expect_err("rename onto a directory must fail");
+
+        let orphan = fs::read_dir(&dir)
+            .expect("read the destination directory")
+            .map(|e| e.expect("dir entry").path())
+            .find(|p| p.is_file())
+            .expect("a retained temp file");
+        let name = orphan
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("a utf-8 temp file name")
+            .to_string();
+
+        assert!(
+            name.starts_with(".teamclaude.json.tcr-"),
+            "an orphan must name its owner and its destination, got {name}"
+        );
+        assert!(
+            name.ends_with(".tmp"),
+            "an orphan must be recognisable as a temp file, got {name}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     // --- save_disabled (the TUI's `d`/`e`, made durable) -------------------
