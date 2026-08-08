@@ -532,12 +532,20 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 
     init_tracing(args.headless);
 
+    // Spelled out rather than built from `ServeOptions::new`, which is
+    // deliberately inert: writing the config back, owning the shared pin cache
+    // and signalling whatever holds the port are all things only the BINARY may
+    // do, so the binary is the place they are written down.
     let options = server::ServeOptions {
         config,
         persist_path,
         port: args.port,
-        replace: args.replace,
-        affinity_path: affinity::default_path(),
+        incumbent: if args.replace {
+            server::IncumbentPolicy::kill_the_incumbent_proxy()
+        } else {
+            server::IncumbentPolicy::replace_legacy_js_only()
+        },
+        affinity_path: Some(affinity::default_path()),
         tls: server::TlsSetup::Load,
     };
 
@@ -594,7 +602,15 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     // Stop serving, then flush the config and the affinity pins. The whole
     // sequence — including the final pin write a clean shutdown owes the next
     // boot — lives in `ServerHandle::shutdown`, so an embedder gets it too.
-    handle.shutdown().await;
+    // Bounded there, so a wedged filesystem cannot turn quitting the TUI into a
+    // hang with the terminal already restored and nothing left serving.
+    let report = handle.shutdown().await;
+    if report.tasks_aborted > 0 {
+        tracing::warn!(
+            aborted = report.tasks_aborted,
+            "background task(s) did not stop within the shutdown grace and were aborted"
+        );
+    }
     Ok(())
 }
 

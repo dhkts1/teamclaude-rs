@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use teamclaude_rs::config::Config;
 use teamclaude_rs::proxy::STATUS_PATH;
-use teamclaude_rs::server::{serve, ServeOptions, TlsSetup};
+use teamclaude_rs::server::{serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup};
 
 /// The port `tcr` uses by default. Named here so the assertion below says what
 /// it is protecting rather than showing a bare number.
@@ -69,9 +69,10 @@ fn options(tag: &str) -> ServeOptions {
         // Belt and braces with the config's own 0 — whichever is read, it is not
         // the live proxy's port.
         port: Some(0),
-        // NEVER true here: `--replace` is what signals an incumbent.
-        replace: false,
-        affinity_path: scratch_affinity_path(tag),
+        // The default, and the only policy that signals nothing: a test that
+        // could reach `takeover_port` could SIGKILL the developer's live proxy.
+        incumbent: IncumbentPolicy::never_signal(),
+        affinity_path: Some(scratch_affinity_path(tag)),
         // Loading the MITM material mints/reads a CA on disk. Base-URL mode is
         // all this file exercises, so do not touch it.
         tls: TlsSetup::Disabled,
@@ -103,7 +104,7 @@ async fn port_refuses_within(port: u16, budget: Duration) -> bool {
 /// connection went through the production accept path and not some shortcut.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
-    let handle = serve(options("gate"))
+    let mut handle = serve(options("gate"))
         .await
         .expect("binding an ephemeral port cannot fail")
         .expect_started();
@@ -162,8 +163,12 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
         "the accept loop plus both background loops must be joined"
     );
     assert_eq!(
-        report.affinity_pins_written,
-        Some(0),
+        report.tasks_aborted, 0,
+        "no task should need the grace period's abort on a clean shutdown"
+    );
+    assert_eq!(
+        report.affinity,
+        AffinityFlush::Written(0),
         "a clean shutdown owes the next boot its final pin write, even when empty"
     );
 
@@ -176,19 +181,46 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
 }
 
-/// A library caller that simply DROPS the handle must not leak the accept loop.
+/// A library caller that simply DROPS the handle must not leak the accept loop
+/// **or any background loop**.
 ///
 /// `run_server` never needed this — the process exited — which is exactly why it
 /// could not be embedded. Dropping is the failure mode an embedder hits first
 /// (an early return, a panic, a `?`), so it gets its own test.
+///
+/// # What this test can and cannot prove
+///
+/// The port refusing is NOT evidence about `impl Drop for ServerHandle`: the
+/// handle owns the `watch::Sender`, so dropping it closes the channel and every
+/// loop's `stop.changed()` returns `Err` — the accept loop would stop with the
+/// `Drop` impl deleted entirely. What is added here is the *other* four fifths
+/// of the claim: every spawned task holds an `Arc<Manager>` clone, so watching
+/// the strong count fall back to the one this test holds proves the prober and
+/// the flusher are gone too, not just the listener.
+///
+/// The `Drop` impl itself is pinned by the unit tests in `src/server.rs`, which
+/// can hold a `Sender` clone (keeping the channel open) and so isolate `abort()`
+/// as the only thing that can stop a task. Deleting `impl Drop` turns those red;
+/// it cannot turn this one red, and pretending otherwise is what the first
+/// version of this test did.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn dropping_the_handle_stops_the_accept_loop() {
+async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
     let handle = serve(options("drop"))
         .await
         .expect("binding an ephemeral port cannot fail")
         .expect_started();
     let port = handle.addr().port();
     assert_ne!(port, LIVE_PROXY_PORT);
+    assert_eq!(handle.background_task_count(), 2);
+
+    // Every task `serve` spawned captured one of these.
+    let manager = handle.manager().clone();
+    let live_tasks = || std::sync::Arc::strong_count(&manager) - 1;
+    assert!(
+        live_tasks() >= 3,
+        "expected the accept loop and both background loops to hold a manager clone, saw {}",
+        live_tasks()
+    );
 
     // It is serving right now.
     assert!(
@@ -204,4 +236,60 @@ async fn dropping_the_handle_stops_the_accept_loop() {
         port_refuses_within(port, Duration::from_secs(5)).await,
         "the accept loop outlived its handle: :{port} is still accepting"
     );
+
+    // Polled: aborting is asynchronous — the task's future (and with it the
+    // manager clone) is dropped when the runtime next gets to it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while live_tasks() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        live_tasks(),
+        0,
+        "a task outlived the handle that owned it: {} manager clone(s) still held",
+        live_tasks()
+    );
+}
+
+/// The documented convenience constructor must not reach the binary's files.
+///
+/// `ServeOptions::new` used to point `affinity_path` at [the live proxy's shared
+/// pin cache], so an embedder following the docs would atomically replace the
+/// running proxy's session→account map with its own empty one at shutdown, and
+/// the next boot would cold-start every session's prompt cache. Nothing guarded
+/// it, because every test hand-built a scratch path instead.
+///
+/// Asserted as *values*, without serving: this test may not create a proxy that
+/// could write anywhere.
+///
+/// [the live proxy's shared pin cache]: teamclaude_rs::affinity::default_path
+#[test]
+fn the_convenience_constructor_touches_nothing_outside_the_process() {
+    let options = ServeOptions::new(test_config());
+
+    assert_eq!(
+        options.affinity_path, None,
+        "ServeOptions::new must not adopt the live proxy's shared pin cache"
+    );
+    assert_eq!(
+        options.persist_path, None,
+        "ServeOptions::new must not adopt a config file to write back"
+    );
+    assert!(
+        !options.incumbent.signals_anything(),
+        "ServeOptions::new must not be able to signal whatever holds the port"
+    );
+}
+
+/// The default incumbent policy — what `..Default::default()`, a struct literal
+/// with an omitted field, or a copied example gives you — signals nothing.
+///
+/// `replace: bool` made the SIGTERM-then-SIGKILL path one keystroke from every
+/// caller; only a named constructor reaches it now.
+#[test]
+fn the_default_incumbent_policy_cannot_signal_anything() {
+    assert!(!IncumbentPolicy::default().signals_anything());
+    assert!(!IncumbentPolicy::never_signal().signals_anything());
+    assert!(IncumbentPolicy::replace_legacy_js_only().signals_anything());
+    assert!(IncumbentPolicy::kill_the_incumbent_proxy().signals_anything());
 }

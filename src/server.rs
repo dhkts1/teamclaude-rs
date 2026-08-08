@@ -27,6 +27,12 @@ use crate::config::Config;
 use crate::manager::Manager;
 use crate::{affinity, build_info, cli, mitm, singleton};
 
+/// How long [`ServerHandle::shutdown`] waits for a task to stop before aborting
+/// it. Long enough for a loop to finish an iteration and an in-progress atomic
+/// write to land; short enough that quitting `tcr` on a wedged filesystem is a
+/// pause and not a hang.
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Where the MITM listener's TLS material comes from.
 ///
 /// `tcr` always uses [`TlsSetup::Load`], which is what `run_server` did inline.
@@ -43,7 +49,79 @@ pub enum TlsSetup {
     Disabled,
 }
 
+/// What [`serve`] may do to a process that already holds the port.
+///
+/// This was a `bool` named `replace`, which is how the most destructive
+/// operation in this system ended up one keystroke from every caller: setting it
+/// reaches [`singleton::takeover_port`], which SIGTERMs and then SIGKILLs a
+/// command-verified proxy holding the port, wiping its session→account pin map.
+/// Under the `--replace` flag that is the intended, operator-typed recovery.
+/// From an embedder or a test it is a catastrophe with the same spelling.
+///
+/// So the signalling choices are not values a caller can land on — they are
+/// *named constructors* that say what they do, and the private field means
+/// `Default`, struct-literal syntax and `..Default::default()` can only ever
+/// produce [`never_signal`](Self::never_signal). "Follow the docs and you cannot
+/// kill anything" is the property being bought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IncumbentPolicy(Signal);
+
+/// The private half of [`IncumbentPolicy`]. Deliberately unnameable outside this
+/// module so no caller can construct the signalling variants directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Signal {
+    /// Signal nothing, ever. A recognized incumbent means stand down.
+    #[default]
+    Never,
+    /// The binary's default (`--no-replace`): replace a legacy JS proxy, stand
+    /// down for a `tcr` peer.
+    LegacyJsOnly,
+    /// `--replace`: replace whichever recognized proxy holds the port.
+    Recognized,
+}
+
+impl IncumbentPolicy {
+    /// **The default.** Send no signal to any process under any circumstance; a
+    /// recognized proxy on the port produces [`ServeOutcome::StoodDown`].
+    ///
+    /// The only correct policy for a library caller or a test, which is why it
+    /// is what you get for free.
+    pub fn never_signal() -> Self {
+        Self(Signal::Never)
+    }
+
+    /// `tcr server` without `--replace`: SIGTERM/SIGKILL a **legacy JS**
+    /// `teamclaude` proxy on the port (displacing it is why the takeover exists,
+    /// and leaving it running would token-war over single-use refresh tokens),
+    /// but stand down for a `tcr` peer.
+    pub fn replace_legacy_js_only() -> Self {
+        Self(Signal::LegacyJsOnly)
+    }
+
+    /// `tcr server --replace`: **SIGTERM, then SIGKILL after 800ms**, whichever
+    /// recognized proxy holds the port — including a live `tcr` serving real
+    /// traffic. That wipes its in-memory session→account pin map and every live
+    /// session then pays a full cold prompt-cache prefix.
+    ///
+    /// Reserve this for an operator who typed `--replace`. Nothing in a test or
+    /// an embedder should call it.
+    pub fn kill_the_incumbent_proxy() -> Self {
+        Self(Signal::Recognized)
+    }
+
+    /// Whether this policy can signal a process at all — for a caller that wants
+    /// to assert it is holding the harmless one.
+    pub fn signals_anything(&self) -> bool {
+        !matches!(self.0, Signal::Never)
+    }
+}
+
 /// Everything [`serve`] needs, derived from what `run_server` actually read.
+///
+/// Every field that can reach outside this process — the config file, the pin
+/// cache, the incumbent on the port — defaults to the inert choice, so the
+/// *dangerous* configuration is the one you have to spell out. See
+/// [`ServeOptions::new`].
 ///
 /// Note what is NOT here. `--headless` is not a serving parameter: it selects
 /// the *logging subscriber* and *how the caller waits*, both of which stay with
@@ -55,29 +133,51 @@ pub struct ServeOptions {
     pub config: Config,
     /// Where the config may be written back, or `None` to make every persist a
     /// no-op (a corrupt file must never be clobbered with defaults).
+    ///
+    /// `None` also means **refreshed OAuth tokens are never written to disk**.
+    /// Anthropic's refresh tokens are single-use, so a long-lived embedder that
+    /// leaves this `None` while pointing at a real config leaves already-spent
+    /// tokens on disk and every account fails to refresh on the next boot. If
+    /// you serve from a real config, pass its path.
     pub persist_path: Option<PathBuf>,
     /// Overrides `config.proxy.port` when set — the `--port` flag. `Some(0)`
     /// binds an ephemeral port, which is how a test gets a real server without
     /// contending for the configured one.
     pub port: Option<u16>,
-    /// Take the port over from a recognized proxy incumbent (`--replace`).
-    pub replace: bool,
-    /// The session-affinity pin cache. Split out so a caller can point it
-    /// somewhere disposable; the binary passes [`affinity::default_path`].
-    pub affinity_path: PathBuf,
+    /// What to do about a recognized proxy already holding the port. Defaults to
+    /// [`IncumbentPolicy::never_signal`]; the binary maps `--replace` onto it.
+    pub incumbent: IncumbentPolicy,
+    /// The session-affinity pin cache, or `None` to keep pins **in memory only**
+    /// — nothing is read at boot and nothing is written at shutdown.
+    ///
+    /// `None` is the default because the binary's path ([`affinity::default_path`])
+    /// is one shared file: a second process that serves briefly and shuts down
+    /// atomically replaces the live proxy's pin map with its own (usually empty)
+    /// one, and the live proxy — whose flusher only writes when its map changed —
+    /// never repairs it. The next boot then cold-starts every session's prompt
+    /// cache. Point this somewhere disposable, or leave it `None`.
+    pub affinity_path: Option<PathBuf>,
     /// Where the MITM TLS material comes from.
     pub tls: TlsSetup,
 }
 
 impl ServeOptions {
-    /// The binary's defaults for everything but the config itself.
+    /// Serve this config while touching **nothing outside this process**: no
+    /// config write-back, no pin cache, no signal to whatever holds the port,
+    /// and (via [`TlsSetup::Load`]) the same TLS material the binary uses.
+    ///
+    /// This deliberately is NOT "the binary's defaults" — it used to say so
+    /// while defaulting `persist_path` to `None`, which is the opposite of what
+    /// the binary passes. The binary spells its own options out in
+    /// `main::run_server`, because every one of them is a decision about files
+    /// and processes a library caller must not make by accident.
     pub fn new(config: Config) -> Self {
         Self {
             config,
             persist_path: None,
             port: None,
-            replace: false,
-            affinity_path: affinity::default_path(),
+            incumbent: IncumbentPolicy::never_signal(),
+            affinity_path: None,
             tls: TlsSetup::Load,
         }
     }
@@ -125,16 +225,55 @@ impl ServeOutcome {
     }
 }
 
+/// What the final session-affinity pin write did.
+///
+/// Three states, not `Option<usize>`. "Affinity is off" and "the write FAILED
+/// and every pin is lost" are the same value in an `Option`, and the only place
+/// the difference survived was a `tracing::warn!` — which a library embedder,
+/// having installed no subscriber, never sees. A caller reading a clean report
+/// while the next boot cold-starts every session's prompt cache is exactly the
+/// silence this type exists to break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AffinityFlush {
+    /// Nothing to write: session affinity is off in the config, or no pin cache
+    /// path was configured ([`ServeOptions::affinity_path`] was `None`).
+    Disabled,
+    /// The pins were written for the next boot. Zero is a normal count.
+    Written(usize),
+    /// The write failed and the pins are **lost**. Carries the rendered error
+    /// because the caller may have no tracing subscriber to read the warning in.
+    Failed(String),
+}
+
+impl AffinityFlush {
+    /// The pin count when one was actually written, else `None`.
+    pub fn pins_written(&self) -> Option<usize> {
+        match self {
+            AffinityFlush::Written(count) => Some(*count),
+            _ => None,
+        }
+    }
+
+    /// Did a write that was supposed to happen fail? The one condition a caller
+    /// should surface even though shutdown is not fallible.
+    pub fn failed(&self) -> bool {
+        matches!(self, AffinityFlush::Failed(_))
+    }
+}
+
 /// What a clean [`ServerHandle::shutdown`] did, so a caller can assert on it
 /// instead of trusting that the function returned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShutdownReport {
     /// How many tasks the handle owned and joined: the accept loop plus every
     /// background loop that was actually spawned for this config.
     pub tasks_joined: usize,
-    /// Pins written by the final affinity flush, `None` when affinity is off or
-    /// the write failed (it is a cache; a failure is logged, never fatal).
-    pub affinity_pins_written: Option<usize>,
+    /// How many tasks did NOT stop inside the grace period and were aborted.
+    /// Non-zero means a loop was wedged — the flush below still ran, which is
+    /// the whole reason the grace exists.
+    pub tasks_aborted: usize,
+    /// What the final pin write did.
+    pub affinity: AffinityFlush,
 }
 
 /// A bound, running proxy — and the owner of every task [`serve`] spawned.
@@ -147,7 +286,12 @@ pub struct ServerHandle {
     addr: SocketAddr,
     shutdown: watch::Sender<bool>,
     manager: Arc<Manager>,
-    affinity_path: PathBuf,
+    affinity_path: Option<PathBuf>,
+    /// Tasks joined and tasks aborted so far. Kept on the handle, not in a local,
+    /// so a `shutdown` future that is dropped mid-join and re-issued reports the
+    /// whole truth rather than only what the last attempt saw.
+    tasks_joined: usize,
+    tasks_aborted: usize,
     /// The `mitm::serve` accept loop. `None` once [`Self::shutdown`] joined it.
     server: Option<JoinHandle<()>>,
     /// Whether that task has already been awaited to completion. A `JoinHandle`
@@ -209,19 +353,71 @@ impl ServerHandle {
     /// long stream and killing it mid-flight would be a behaviour change and a
     /// worse one. What stops immediately is *accepting new* connections — the
     /// listener is dropped with the accept loop, so the port refuses at once.
-    pub async fn shutdown(mut self) -> ShutdownReport {
+    ///
+    /// Bounded by [`DEFAULT_SHUTDOWN_GRACE`] and **cannot hang** — see
+    /// [`shutdown_within`](Self::shutdown_within) for why that is not optional.
+    pub async fn shutdown(&mut self) -> ShutdownReport {
+        self.shutdown_within(DEFAULT_SHUTDOWN_GRACE).await
+    }
+
+    /// [`shutdown`](Self::shutdown) with the join deadline spelled out.
+    ///
+    /// # Why there is a deadline at all
+    ///
+    /// `run_server` called `server.abort()` and flushed immediately; it could not
+    /// hang. Joining instead is better — a loop gets to finish its current
+    /// iteration — but only if the join is bounded, because the affinity flusher
+    /// performs a **blocking `std::fs` write inside async code**
+    /// (`flush_affinity` → `config::write_atomic`) and cancellation only lands at
+    /// an await point. On a full, slow or hung filesystem an unbounded join means
+    /// `tcr` quits into a hang with the terminal already restored, no listener
+    /// bound, no prompt — and `persist_now` never runs. So a task that has not
+    /// stopped within `grace` is aborted, counted in
+    /// [`ShutdownReport::tasks_aborted`], and left behind; the config persist and
+    /// the final pin write happen either way.
+    ///
+    /// # Cancel-safety
+    ///
+    /// Takes `&mut self`, and a task is removed from the handle only once it has
+    /// actually been joined. A caller that bounds this with its own deadline and
+    /// drops the future keeps a usable handle, keeps every un-joined task owned
+    /// (so `Drop` still aborts them), and may simply call it again — the counters
+    /// carry over and the flushes are idempotent.
+    pub async fn shutdown_within(&mut self, grace: Duration) -> ShutdownReport {
         let _ = self.shutdown.send(true);
-        let mut tasks_joined = 0usize;
-        if let Some(server) = self.server.take() {
-            if !self.server_finished {
-                let _ = server.await;
+        let deadline = tokio::time::Instant::now() + grace;
+
+        if let Some(server) = self.server.as_mut() {
+            // `&mut JoinHandle` polls the join without consuming it: losing the
+            // race to the caller's own timeout leaves the task owned here.
+            let stopped = self.server_finished
+                || match tokio::time::timeout_at(deadline, &mut *server).await {
+                    Ok(_) => true,
+                    Err(_) => {
+                        // NOT awaited after the abort: a task wedged in a
+                        // synchronous write never reaches a cancellation point,
+                        // so awaiting it back would reintroduce the hang.
+                        server.abort();
+                        false
+                    }
+                };
+            self.server = None;
+            if stopped {
                 self.server_finished = true;
+                self.tasks_joined += 1;
+            } else {
+                self.tasks_aborted += 1;
             }
-            tasks_joined += 1;
         }
-        for task in std::mem::take(&mut self.background) {
-            let _ = task.await;
-            tasks_joined += 1;
+        while let Some(task) = self.background.last_mut() {
+            match tokio::time::timeout_at(deadline, &mut *task).await {
+                Ok(_) => self.tasks_joined += 1,
+                Err(_) => {
+                    task.abort();
+                    self.tasks_aborted += 1;
+                }
+            }
+            self.background.pop();
         }
 
         self.manager.persist_now();
@@ -229,28 +425,41 @@ impl ServerHandle {
         // Final pin flush on a CLEAN shutdown, capturing whatever changed inside
         // the last flusher interval. Belt-and-braces only — the 5s timer is what
         // makes the pins survive a SIGKILL, which is the case that matters.
-        let mut affinity_pins_written = None;
-        if self.manager.session_affinity_enabled() {
-            match self.manager.flush_affinity(&self.affinity_path) {
-                Ok(count) => {
-                    tracing::info!(
-                        path = %self.affinity_path.display(),
-                        pins = count,
-                        "session-affinity pins written for the next boot"
-                    );
-                    affinity_pins_written = Some(count);
-                }
-                Err(err) => tracing::warn!(
-                    path = %self.affinity_path.display(),
-                    error = %err,
-                    "final session-affinity pin write failed; pins will not survive this restart"
-                ),
-            }
-        }
+        let affinity = self.flush_affinity_finally();
 
         ShutdownReport {
-            tasks_joined,
-            affinity_pins_written,
+            tasks_joined: self.tasks_joined,
+            tasks_aborted: self.tasks_aborted,
+            affinity,
+        }
+    }
+
+    /// The shutdown pin write, as a value. Logs as before for the binary's
+    /// operator, and returns the same fact for a caller with no subscriber.
+    fn flush_affinity_finally(&self) -> AffinityFlush {
+        let Some(path) = self.affinity_path.as_ref() else {
+            return AffinityFlush::Disabled;
+        };
+        if !self.manager.session_affinity_enabled() {
+            return AffinityFlush::Disabled;
+        }
+        match self.manager.flush_affinity(path) {
+            Ok(count) => {
+                tracing::info!(
+                    path = %path.display(),
+                    pins = count,
+                    "session-affinity pins written for the next boot"
+                );
+                AffinityFlush::Written(count)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "final session-affinity pin write failed; pins will not survive this restart"
+                );
+                AffinityFlush::Failed(err.to_string())
+            }
         }
     }
 }
@@ -279,7 +488,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         mut config,
         persist_path,
         port: port_override,
-        replace,
+        incumbent,
         affinity_path,
         tls,
     } = options;
@@ -295,7 +504,23 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // `tcr` peer only under `--replace`, a legacy JS `teamclaude` always, since
     // displacing that one is what the takeover exists for. `--no-replace` is the
     // default now, and clap rejects it alongside `--replace`.
-    if let singleton::Takeover::IncumbentPresent(pid) = singleton::takeover_port(port, replace) {
+    //
+    // Which of those a caller gets is [`IncumbentPolicy`], and the default sends
+    // no signal at all: it uses `live_proxy_server`, the detection-only half of
+    // the same port-scoped, command-verified decision, and stands down for
+    // anything it finds. Port 0 short-circuits the whole question — the kernel
+    // picks an ephemeral port, so no process can be "holding" it and there is
+    // nothing an ephemeral-port caller could possibly want signalled.
+    let takeover = match (port, incumbent.0) {
+        (0, _) => singleton::Takeover::Proceed,
+        (_, Signal::Never) => match singleton::live_proxy_server(port) {
+            Some(pid) => singleton::Takeover::IncumbentPresent(pid),
+            None => singleton::Takeover::Proceed,
+        },
+        (_, Signal::LegacyJsOnly) => singleton::takeover_port(port, false),
+        (_, Signal::Recognized) => singleton::takeover_port(port, true),
+    };
+    if let singleton::Takeover::IncumbentPresent(pid) = takeover {
         // ONE probe of the incumbent, answering two questions: which build it is
         // executing, and whether it is executing anything at all.
         let probe = cli::probe_incumbent(&config).await;
@@ -339,8 +564,12 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     //
     // Only when affinity is enabled: with the feature off the map is never
     // consulted, and a restore would put entries in it that nothing reads.
-    if manager.session_affinity_enabled() {
-        let report = manager.restore_affinity(&affinity_path, affinity::PIN_TTL_MS);
+    //
+    // And only when a pin cache path was given: with `affinity_path: None` the
+    // pins are an in-memory routing table for this process alone, so there is
+    // nothing to restore from and nothing to spawn a flusher for.
+    if let (true, Some(affinity_path)) = (manager.session_affinity_enabled(), &affinity_path) {
+        let report = manager.restore_affinity(affinity_path, affinity::PIN_TTL_MS);
         if let Some(reason) = &report.degraded {
             // Never fatal: the pin file is a cache, so an unusable one costs the
             // warm start it would have bought and nothing else.
@@ -524,8 +753,151 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         shutdown: shutdown_tx,
         manager,
         affinity_path,
+        tasks_joined: 0,
+        tasks_aborted: 0,
         server: Some(server),
         server_finished: false,
         background,
     }))
+}
+
+/// Unit tests for what only in-crate access can pin: [`Drop for ServerHandle`].
+///
+/// The integration test (`tests/serve_library_path.rs`) drops a real handle and
+/// watches the port refuse — which proves the loop stopped, but NOT that `Drop`
+/// stopped it: the handle owns the `watch::Sender`, so dropping it closes the
+/// channel and every `stop.changed()` returns `Err` on its own. That test stayed
+/// green with `impl Drop` deleted.
+///
+/// These build a `ServerHandle` by hand and hold a **`Sender` clone**, so the
+/// channel survives the drop and sender-close is off the table as an
+/// explanation. Each half of `Drop` then has exactly one thing that can satisfy
+/// it: `send(true)` for the tasks that watch the channel, `abort()` for the ones
+/// that do not.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A manager with no accounts: nothing to probe, refresh or warm, and
+    /// `config_path: None` so no file can be written.
+    fn inert_manager() -> Arc<Manager> {
+        let config: Config = serde_json::from_str(r#"{"accounts": []}"#)
+            .expect("an empty account list is a valid config");
+        Manager::with_live_refresher(config, None)
+    }
+
+    /// A handle owning `server` plus `background`, wired to `shutdown`, that can
+    /// touch nothing outside this process when dropped.
+    fn handle_owning(
+        shutdown: watch::Sender<bool>,
+        server: JoinHandle<()>,
+        background: Vec<JoinHandle<()>>,
+    ) -> ServerHandle {
+        ServerHandle {
+            addr: "127.0.0.1:0"
+                .parse()
+                .expect("a literal loopback addr parses"),
+            shutdown,
+            manager: inert_manager(),
+            affinity_path: None,
+            tasks_joined: 0,
+            tasks_aborted: 0,
+            server: Some(server),
+            server_finished: false,
+            background,
+        }
+    }
+
+    async fn all_finished_within(
+        aborts: &[tokio::task::AbortHandle],
+        budget: Duration,
+    ) -> Result<(), usize> {
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            let live = aborts.iter().filter(|a| !a.is_finished()).count();
+            if live == 0 {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(live);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// `Drop` must ABORT. Every task here ignores the shutdown channel entirely,
+    /// so nothing but `JoinHandle::abort` can end it — and a retained `Sender`
+    /// clone keeps the channel open, so closing it is not available either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_handle_aborts_tasks_that_ignore_the_shutdown_signal() {
+        let (shutdown, _rx) = watch::channel(false);
+        let keepalive = shutdown.clone();
+
+        let deaf = || tokio::spawn(std::future::pending::<()>());
+        let server = deaf();
+        let background: Vec<JoinHandle<()>> = (0..3).map(|_| deaf()).collect();
+        let aborts: Vec<tokio::task::AbortHandle> = std::iter::once(server.abort_handle())
+            .chain(background.iter().map(|task| task.abort_handle()))
+            .collect();
+
+        let handle = handle_owning(shutdown, server, background);
+        assert_eq!(
+            aborts.iter().filter(|a| a.is_finished()).count(),
+            0,
+            "the tasks must still be running before the handle is dropped"
+        );
+
+        drop(handle);
+
+        match all_finished_within(&aborts, Duration::from_secs(5)).await {
+            Ok(()) => {}
+            Err(live) => panic!(
+                "Drop leaked {live} of {} tasks: a task that ignores the shutdown \
+                 channel can only be stopped by `abort()`",
+                aborts.len()
+            ),
+        }
+        drop(keepalive);
+    }
+
+    /// `Drop` must also SIGNAL — the accept loop and every background loop stop
+    /// on `stop.changed()`, and the sender-close that currently masks this is
+    /// removed here by holding a `Sender` clone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_the_handle_signals_tasks_that_watch_the_shutdown_channel() {
+        let (shutdown, _rx) = watch::channel(false);
+        let keepalive = shutdown.clone();
+
+        // Ends only on a `true`: a bare close would leave `changed()` returning
+        // `Err` and this loop spinning back to `pending`, never finishing.
+        let watcher = |mut stop: watch::Receiver<bool>| {
+            tokio::spawn(async move {
+                loop {
+                    if stop.changed().await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                    if *stop.borrow_and_update() {
+                        return;
+                    }
+                }
+            })
+        };
+        let server = watcher(shutdown.subscribe());
+        let background: Vec<JoinHandle<()>> =
+            (0..2).map(|_| watcher(shutdown.subscribe())).collect();
+        let aborts: Vec<tokio::task::AbortHandle> = std::iter::once(server.abort_handle())
+            .chain(background.iter().map(|task| task.abort_handle()))
+            .collect();
+
+        drop(handle_owning(shutdown, server, background));
+
+        assert!(
+            *keepalive.borrow(),
+            "Drop must publish `true` on the shutdown channel, not merely close it"
+        );
+        if let Err(live) = all_finished_within(&aborts, Duration::from_secs(5)).await {
+            panic!("{live} task(s) never saw the shutdown signal");
+        }
+        drop(keepalive);
+    }
 }
