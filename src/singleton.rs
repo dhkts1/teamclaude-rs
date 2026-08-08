@@ -433,16 +433,22 @@ pub fn replaceable_incumbents_with_owner(
 /// [`takeover_port`] ([`replaceable_incumbents`]) but signals NOTHING — `tcr login` uses
 /// it to REFUSE to run beside a live server (the server reads config only at boot,
 /// and its next `persist_tokens` writes its boot-time TOKENS back over the file,
-/// clobbering the login's fresh ones). Returns the first replaceable proxy PID;
-/// `None` when the
-/// port is free or held only by a non-proxy process.
-pub fn live_proxy_server(port: u16) -> Option<u32> {
+/// clobbering the login's fresh ones). Returns the first replaceable
+/// [`Incumbent`]; `None` when the port is free or held only by a non-proxy
+/// process.
+///
+/// The KIND travels with the pid, and it has to. Since the owner file, this can
+/// return the pid of a HOST APPLICATION serving the proxy in-process, and a
+/// caller that renders "kill {pid}" would be telling the operator to SIGTERM a
+/// GUI that installs no handler for it — no `applicationWillTerminate`, no final
+/// session→account pin write. A bare `u32` cannot carry that distinction, so it
+/// is not returned as one; see `oauth::login_guard_refusal`.
+pub fn live_proxy_server(port: u16) -> Option<Incumbent> {
     let holders = port_listeners(port);
     let owner = classify_port_owner(port, &holders, &default_owner_path(port), process_command);
     replaceable_incumbents_with_owner(&holders, std::process::id(), process_command, owner)
         .into_iter()
         .next()
-        .map(|incumbent| incumbent.pid)
 }
 
 /// Is `pid` still alive? (`kill -0`.)

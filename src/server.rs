@@ -568,7 +568,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let takeover = match (port, incumbent.0) {
         (0, _) => singleton::Takeover::Proceed,
         (_, Signal::Never) => match singleton::live_proxy_server(port) {
-            Some(pid) => singleton::Takeover::IncumbentPresent(pid),
+            Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent.pid),
             None => singleton::Takeover::Proceed,
         },
         (_, Signal::LegacyJsOnly) => singleton::takeover_port(port, false),
