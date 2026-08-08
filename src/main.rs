@@ -764,26 +764,81 @@ fn log_dir_path() -> std::path::PathBuf {
 /// existing contents by *file* mode — `session-affinity.json` is `0600`), so
 /// without an owner-only `logs/` subdirectory, files landing at the crate's
 /// default `0644` would be world-readable on any multi-user box. The mode is
-/// set atomically at directory-creation time via `DirBuilder::mode`, not
+/// requested atomically at directory-creation time via `DirBuilder::mode`, not
 /// create-then-`chmod` — the latter leaves a TOCTOU window where the directory
 /// is briefly world-traversable while it starts to hold sensitive log content.
-/// The parent `~/.cache/teamclaude/` itself is never touched here — it is not
-/// this function's to modify, and the live proxy is using it.
+///
+/// The 0700 mode is applied at directory creation and re-asserted once at
+/// process startup (below). It is **not** a standing invariant:
+/// `tracing_appender`'s own fallback (`rolling.rs:795`) recreates the
+/// directory with `create_dir_all` and no mode if it is removed externally —
+/// at construction and at every rotation — so a `logs/` deleted mid-run
+/// silently returns at 0755 for the life of the process. This function closes
+/// the pre-existing-directory case (a stale `mkdir -p`, a `tar` restore
+/// without `-p`, a baked container path); it cannot reach that crate-internal
+/// recreation path, which is not this function's to fix.
+///
+/// The mode is checked on the **resolved** target, not the path itself:
+/// `std::fs::metadata`/`set_permissions` both follow symlinks, and
+/// `DirBuilder` succeeds against an existing symlink-to-directory, so a
+/// symlinked `logs/` is validated by where it points, not by the link. That
+/// is deliberate, not an oversight: pointing the log directory at another
+/// volume is a legitimate operator setup, and refusing to start over a
+/// symlink would break a working configuration to close a hole that is not a
+/// privilege boundary anyway — planting such a symlink first requires write
+/// access to the 0755, user-owned `~/.cache/teamclaude/` parent, i.e. the
+/// user or root, who already has more reach than this would buy them.
+///
+/// `.recursive(true)` creates every missing path component, parents included,
+/// **carrying the same `0700` mode** — this is not confined to `logs/` itself.
+/// On a fresh install or in a container where `~/.cache/teamclaude/` (or even
+/// `~/.cache/`) does not yet exist, this call creates it at `0700`, changing a
+/// directory shared with every other application on the machine. That is
+/// invisible on a dev box where both already exist at `0755`, but it is real,
+/// measured behaviour of `DirBuilder::recursive`, not a hypothetical.
 ///
 /// Rotation is `DAILY` with `max_log_files(5)`: measured against the live log
-/// (2026-08-08) at ~13.5 MiB/day, this bounds steady-state disk use to roughly
-/// 65-70 MiB — where the old unbounded file already sits today — instead of
-/// genuinely unbounded growth. It is a wall-clock bound, not a byte-size bound:
-/// a single unusually verbose day can still exceed the per-file average before
-/// the next rotation, so this is a soft cap, not a hard one.
+/// (2026-08-08) at ~13.5 MiB/day, this bounds this directory's steady-state
+/// disk use to roughly 65-70 MiB instead of genuinely unbounded growth. That
+/// is **not** a wash against the old file: the pre-upgrade
+/// `$TMPDIR/teamclaude-rs.log` (~62 MiB, measured 2026-08-08) is left in
+/// place deliberately (deprecate, don't delete — nothing here removes an
+/// operator's existing evidence), so the true post-upgrade footprint is that
+/// ~62 MiB orphan **plus** the new 65-70 MiB, until an operator cleans the
+/// orphan up by hand. It is a wall-clock bound, not a byte-size bound: a single unusually
+/// verbose day can still exceed the per-file average before the next
+/// rotation, so this is a soft cap, not a hard one. Rotation also rolls on
+/// `Rotation::DAILY`'s UTC clock (`rolling.rs` uses `OffsetDateTime::now_utc`),
+/// not local midnight — for the stated goal of human discoverability, that
+/// means the daily boundary lands at 03:00 in Asia/Jerusalem, not midnight.
 fn open_log_appender(
     log_dir: &std::path::Path,
 ) -> std::io::Result<tracing_appender::rolling::RollingFileAppender> {
     use std::os::unix::fs::DirBuilderExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     std::fs::DirBuilder::new()
         .mode(0o700)
         .recursive(true)
         .create(log_dir)?;
+
+    // `DirBuilder::mode` only governs directories it *creates* — a directory
+    // that already existed (operator `mkdir -p`, a `tar` restore without
+    // `-p`, a baked container path) is untouched by the call above and could
+    // be sitting at 0755 or worse. Re-assert here so every process start
+    // closes that window, not just a genuinely-fresh directory.
+    let mode = std::fs::metadata(log_dir)?.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        std::fs::set_permissions(log_dir, std::fs::Permissions::from_mode(0o700))?;
+        let confirmed = std::fs::metadata(log_dir)?.permissions().mode() & 0o777;
+        if confirmed & 0o077 != 0 {
+            return Err(std::io::Error::other(format!(
+                "log directory {} is not owner-only after chmod (mode {confirmed:#o}); \
+                 refusing to log account emails into a world-readable directory",
+                log_dir.display()
+            )));
+        }
+    }
+
     tracing_appender::rolling::Builder::new()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("teamclaude-rs.log")
@@ -1128,6 +1183,44 @@ mod tests {
         assert_eq!(dir_mode, 0o700, "log directory must be owner-only (0700)");
     }
 
+    /// `DirBuilder::mode` only sets the mode of directories it *creates* — a
+    /// directory that already exists (operator `mkdir -p`, a `tar` restore
+    /// without `-p`, a baked container path) is left exactly as it was found.
+    /// `open_log_appender` must re-assert `0700` on an already-existing
+    /// directory, not merely request it at creation time, or a pre-existing
+    /// `0755` `logs/` silently ships every rotated file world-readable.
+    #[test]
+    fn log_directory_is_re_asserted_owner_only_when_it_already_exists() {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let dir = unique_log_dir("dirmode-preexisting");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .recursive(true)
+            .create(&dir)
+            .expect("pre-create the dir at 0755, simulating an external mkdir/restore");
+        let preexisting_mode = std::fs::metadata(&dir)
+            .expect("stat pre-created dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            preexisting_mode, 0o755,
+            "test setup sanity: the pre-created dir must actually be 0755"
+        );
+
+        let _appender = open_log_appender(&dir).expect("open pre-existing log dir");
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("stat temp log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            dir_mode, 0o700,
+            "a pre-existing, wrongly-permissioned log directory must be re-asserted to 0700"
+        );
+    }
+
     /// A `MakeWriter` that keeps what was written, so a test can inspect the
     /// stdout sink without capturing the process's real stdout.
     #[derive(Clone, Default)]
@@ -1248,10 +1341,13 @@ mod tests {
     /// not a private/generated path — so a human running the documented
     /// `rg 'server started' ~/.cache/teamclaude/logs/*` recipe can always find
     /// it. This is **not** because any code reads it back (a census —
-    /// `rg -n 'teamclaude-rs\.log|log_file_path|log_dir_path' src/` — found no
-    /// programmatic reader anywhere outside this module; the previous version
-    /// of this test justified itself with "this is what `tcr status` and every
-    /// diagnostic already read", which was false and is not repeated here).
+    /// `rg -n 'teamclaude-rs\.log|log_file_path|log_dir_path' src/ scripts/
+    /// apps/`, repo-relevant scope, not `src/` alone: a `src/`-only census once
+    /// missed `scripts/validate-cache.sh`'s own copy of the old fixed path —
+    /// found no programmatic reader anywhere outside this module; the previous
+    /// version of this test justified itself with "this is what `tcr status`
+    /// and every diagnostic already read", which was false and is not
+    /// repeated here).
     #[test]
     fn the_log_directory_is_the_shared_cache_location() {
         assert_eq!(log_dir_path(), cache_base_dir().join("logs"));
@@ -1273,6 +1369,21 @@ mod tests {
     /// created (verified against 0.2.5 source, `rolling.rs:615-617`), which is
     /// what makes this deterministic: no wall-clock rotation boundary needs to
     /// be crossed.
+    ///
+    /// This is portable across the two CI targets, not merely convenient on
+    /// one. `prune_old_logs()` sorts by `metadata.created()` where the
+    /// platform supports it, but explicitly falls back to parsing the date out
+    /// of the filename itself when it does not (`rolling.rs:689-696`,
+    /// `parse_date_from_filename`) — and this test's embedded dates
+    /// (`2020-02-01` .. `2020-02-05`) sort in the same order as their real
+    /// creation timestamps, so the assertions hold identically whichever path
+    /// the pruner takes. Verified directly against this repo's own targets:
+    /// macOS (APFS) supports `created()`; the crate's own filename-parsing
+    /// fallback exists specifically because ext4/most Linux filesystems (this
+    /// repo's `ci` job runs `ubuntu-latest`) commonly return
+    /// `ErrorKind::Unsupported` for it — an attempt to break this test via
+    /// that path does not succeed, because the fallback is exercised, not
+    /// skipped.
     #[test]
     fn old_log_files_are_pruned_at_max_log_files() {
         let dir = unique_log_dir("pruning");
