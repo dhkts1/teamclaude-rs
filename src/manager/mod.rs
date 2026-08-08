@@ -447,10 +447,11 @@ pub struct Manager {
     /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
     /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
     locked_idx: Option<usize>,
-    /// GCRA theoretical-arrival-time (epoch ms) for the global outbound throttle.
-    /// Guarded by an async mutex held ONLY for the O(1) slot update, released
-    /// before any sleep so concurrent callers stagger and sleep concurrently.
-    throttle_tat_ms: AsyncMutex<i64>,
+    /// The `governor` GCRA engine backing the global outbound throttle (see
+    /// [`throttle::ThrottleLimiter`]). Lock-free: both the fleet-wide
+    /// `InMemoryState` and the keyed `DashMap` store use atomic CAS, so a
+    /// `check`/`check_key` call never holds a guard across the retry sleep.
+    throttle_limiter: throttle::ThrottleLimiter,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
     /// Monotonic counter handed out one tick at a time by [`Manager::select`] to
@@ -532,18 +533,6 @@ fn odt_to_ms(now: OffsetDateTime) -> i64 {
     (now.unix_timestamp_nanos() / 1_000_000) as i64
 }
 
-/// Pure GCRA slot computation for the global outbound throttle. Given the current
-/// theoretical-arrival-time `tat_ms`, the arrival `now_ms`, the emission interval
-/// `spacing_ms` (T) and bucket capacity `burst` (B), returns
-/// `(new_tat_ms, allow_at_ms)`. The caller advances the stored TAT to `new_tat_ms`
-/// and sleeps until `allow_at_ms` if it is in the future. `burst` requests admit
-/// instantly after idle (allow_at <= now), then one per T.
-fn throttle_slot(tat_ms: i64, now_ms: i64, spacing_ms: i64, burst: u32) -> (i64, i64) {
-    let tau = spacing_ms * (burst.max(1) as i64 - 1); // burst tolerance (B-1)*T
-    let base = tat_ms.max(now_ms); // can't schedule in the past
-    (base + spacing_ms, base - tau) // (new TAT, earliest allowed)
-}
-
 fn ms_to_odt(ms: i64) -> Option<OffsetDateTime> {
     OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok()
 }
@@ -592,6 +581,7 @@ impl Manager {
         let global_threshold = config.switch_threshold;
         let pacing = config.pacing.clone();
         let throttle = config.throttle.clone();
+        let throttle_limiter = throttle::ThrottleLimiter::from_config(&throttle);
 
         let locked_idx = config.lock_account.as_ref().and_then(|name| {
             let idx = accounts.iter().position(|a| a.name == *name);
@@ -653,7 +643,7 @@ impl Manager {
             pacing,
             throttle,
             locked_idx,
-            throttle_tat_ms: AsyncMutex::new(0),
+            throttle_limiter,
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
             select_seq: AtomicU64::new(1),
@@ -1090,41 +1080,6 @@ mod tests {
     /// silently turn a re-key test into a divert test.
     const LONG_HOLD_SECS: i64 = CACHE_WARM_HOLD_SECS + 60;
 
-    #[test]
-    fn throttle_slot_burst1_is_strict_spacing() {
-        // B=1 (tau=0): threading the TAT across 3 calls at a fixed `now` yields
-        // allow_at points spaced by exactly `spacing_ms`.
-        let now = 1000;
-        let spacing = 100;
-        let (tat1, allow1) = throttle_slot(0, now, spacing, 1);
-        assert_eq!(allow1, now); // first send: instant (allow_at == now)
-        let (tat2, allow2) = throttle_slot(tat1, now, spacing, 1);
-        assert_eq!(allow2, allow1 + spacing);
-        let (_tat3, allow3) = throttle_slot(tat2, now, spacing, 1);
-        assert_eq!(allow3, allow2 + spacing);
-    }
-
-    #[test]
-    fn throttle_slot_burst3_admits_then_paces() {
-        // B=3, now=1000, T=100 (tau=200): first 3 fire instantly (allow_at <= now),
-        // the 4th is paced to now + spacing_ms.
-        let now = 1000;
-        let spacing = 100;
-        let burst = 3;
-        let (tat1, allow1) = throttle_slot(0, now, spacing, burst);
-        assert_eq!((tat1, allow1), (1100, 800));
-        assert!(allow1 <= now);
-        let (tat2, allow2) = throttle_slot(tat1, now, spacing, burst);
-        assert_eq!((tat2, allow2), (1200, 900));
-        assert!(allow2 <= now);
-        let (tat3, allow3) = throttle_slot(tat2, now, spacing, burst);
-        assert_eq!((tat3, allow3), (1300, 1000));
-        assert!(allow3 <= now);
-        let (tat4, allow4) = throttle_slot(tat3, now, spacing, burst);
-        assert_eq!((tat4, allow4), (1400, 1100));
-        assert_eq!(allow4, now + spacing); // 4th is paced
-    }
-
     fn account(name: &str, priority: i64) -> Account {
         Account {
             name: name.to_string(),
@@ -1159,6 +1114,17 @@ mod tests {
     fn config_with_pacing(accounts: Vec<Account>, pacing: PacingConfig) -> Config {
         let mut config = config_with(accounts);
         config.pacing = pacing;
+        config
+    }
+
+    /// Like [`config_with`] but with the global outbound throttle configured
+    /// (for the throttle tests). `config_with` alone leaves
+    /// `throttle: ThrottleConfig::default()` — all-`None`, i.e. INERT — which
+    /// is deliberately NOT the shipped default (see [`config::default_throttle`]);
+    /// this helper is how the throttle tests turn it on.
+    fn config_with_throttle(accounts: Vec<Account>, throttle: ThrottleConfig) -> Config {
+        let mut config = config_with(accounts);
+        config.throttle = throttle;
         config
     }
 
@@ -3210,6 +3176,80 @@ mod tests {
             manager.select(&HashSet::new(), now, None, Some(9)),
             Some(b),
             "the pin must have migrated to the fallen-through account"
+        );
+    }
+
+    // ---- global outbound throttle (fleet-wide default; opt-in per-account) ----
+
+    /// The NEW-shape guarantee Gil's condition rests on: an unconfigured
+    /// `perAccount` knob (`None`, i.e. absent from the config file) must give
+    /// today's fleet-wide pacing — ONE bucket shared by the whole fleet, so
+    /// two DIFFERENT accounts still contend with each other. If this ever
+    /// silently became per-account by default, a cold multi-account fan-out
+    /// would stop being paced in aggregate — exactly the burst
+    /// `ThrottleConfig`'s doc-comment says the fleet-wide bucket exists to
+    /// damp.
+    #[tokio::test]
+    async fn throttle_absent_per_account_is_fleet_wide_and_still_paces_a_different_idx() {
+        let manager = build_manager(
+            config_with_throttle(
+                vec![account("a", 0), account("b", 0)],
+                ThrottleConfig {
+                    min_spacing_ms: Some(60),
+                    burst: Some(1),
+                    per_account: None, // absent from JSON → today's fleet-wide default
+                },
+            ),
+            pacing_refresher(),
+        );
+        let start = std::time::Instant::now();
+        manager.throttle_send(0).await; // idx 0: admits instantly (idle bucket)
+        manager.throttle_send(1).await; // idx 1 — a DIFFERENT account
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "perAccount absent must mean ONE shared bucket: a call from a different \
+             account index must still be paced by the fleet-wide spacing. elapsed={elapsed:?}"
+        );
+    }
+
+    /// The keyed capability this port exists to add: `perAccount: true` gives
+    /// each account index its OWN GCRA bucket, so a burst spread across
+    /// different accounts is not throttled as if it were one stream — while a
+    /// repeat call on the SAME account index is still paced by its own bucket.
+    #[tokio::test]
+    async fn throttle_per_account_true_gives_each_idx_its_own_bucket() {
+        let manager = build_manager(
+            config_with_throttle(
+                vec![account("a", 0), account("b", 0)],
+                ThrottleConfig {
+                    min_spacing_ms: Some(300),
+                    burst: Some(1),
+                    per_account: Some(true),
+                },
+            ),
+            pacing_refresher(),
+        );
+
+        let start = std::time::Instant::now();
+        manager.throttle_send(0).await; // idx 0's own bucket: admits instantly
+        manager.throttle_send(1).await; // idx 1's own bucket: ALSO admits instantly
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(150),
+            "perAccount:true must give idx 0 and idx 1 independent buckets — a 300ms \
+             fleet-wide spacing must not delay a DIFFERENT account's first send. \
+             elapsed={elapsed:?}"
+        );
+
+        // A second send on the SAME idx must still be paced by ITS bucket.
+        let start2 = std::time::Instant::now();
+        manager.throttle_send(0).await;
+        let elapsed2 = start2.elapsed();
+        assert!(
+            elapsed2 >= std::time::Duration::from_millis(250),
+            "a repeat send on the SAME account index must still be paced by that \
+             account's own bucket. elapsed={elapsed2:?}"
         );
     }
 

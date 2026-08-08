@@ -39,6 +39,15 @@ serde = { version = "1", features = ["derive"] }
 # a JSON container-stack state machine to find them.
 serde_json = { version = "1", features = ["raw_value"] }
 
+# Outbound throttle: GCRA token-bucket rate limiting for the global-egress send
+# site, fleet-wide (today's default) and, opt-in, keyed per-account. Default
+# features off: "quanta"/"jitter" pull in the quanta clock (governor issue #299,
+# "not monotonic") and rand/getrandom that we don't use — we pass
+# governor::clock::MonotonicClock explicitly instead. "std" is required for
+# MonotonicClock and the async until_ready()/until_key_ready() retry loop;
+# "dashmap" backs the keyed per-account state store (DefaultKeyedStateStore).
+governor = { version = "0.10.4", default-features = false, features = ["std", "dashmap"] }
+
 # OAuth PKCE login (browser flow): standard client for PKCE/CSRF/authorize-URL.
 # default-features off — we only use the URL/PKCE builders, not oauth2's own HTTP
 # client (Claude's token endpoint is non-standard JSON, exchanged manually below).

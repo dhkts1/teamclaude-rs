@@ -59,6 +59,7 @@ fn default_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(350),
         burst: Some(4),
+        per_account: None,
     }
 }
 fn default_account_type() -> String {
@@ -186,6 +187,18 @@ pub struct ThrottleConfig {
     /// interactive turns are never delayed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst: Option<u32>,
+    /// Opt-in: give each account its own GCRA bucket (same `minSpacingMs`/`burst`
+    /// quota, one instance per account) instead of one bucket shared by the whole
+    /// fleet. Absent/`false` → fleet-wide (today's default, unchanged). A cold
+    /// fan-out across N accounts under `perAccount: true` paces each account's
+    /// stream independently, so N accounts can each burst instead of contending
+    /// for one shared bucket — the opposite trade of the fleet-wide default, which
+    /// exists specifically to damp an aggregate cross-account burst. Choose
+    /// per-account only when the upstream limiter you're avoiding is keyed by
+    /// account (not by shared IP/client_id — see the module doc on
+    /// [`ThrottleConfig`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_account: Option<bool>,
 }
 
 impl ThrottleConfig {
@@ -206,6 +219,11 @@ impl ThrottleConfig {
     /// fully inert (see [`crate::manager::Manager::throttle_send`]).
     pub fn is_active(&self) -> bool {
         self.effective_min_spacing().is_some()
+    }
+    /// Whether the throttle keys its bucket per-account. Absent → `false` →
+    /// fleet-wide (today's default, unchanged).
+    pub fn effective_per_account(&self) -> bool {
+        self.per_account.unwrap_or(false)
     }
 }
 

@@ -1070,7 +1070,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // after account selection/token so only real sends consume a slot; both the
         // 401 force-refresh retry and the transient-429 retry loop back here, so
         // every retry is paced automatically.
-        manager.throttle_send().await;
+        manager.throttle_send(idx).await;
 
         let resp = match builder.send().await {
             Ok(resp) => resp,
