@@ -296,8 +296,14 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // refreshing several expired accounts at once) can never open and truncate the
     // SAME temp file and interleave into a corrupt write. That is a stronger
     // guarantee than the pid+counter name this replaced: exclusivity is enforced
-    // by the kernel at open time rather than by a naming scheme being right.
-    let mut file = tempfile::Builder::new().tempfile_in(dir)?;
+    // by the kernel at open time rather than by a naming scheme being right. The
+    // old scheme was in fact not right — a crash left `.teamclaude.json.<pid>.0.tmp`
+    // behind, and once that pid recycled the successor's counter restarted at 0
+    // and `create(true).truncate(true)` reopened the collided path happily. That
+    // is precisely the interleave finding #6 was written against.
+    let mut file = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o600))
+        .tempfile_in(dir)?;
     file.write_all(json.as_bytes())?;
     // `persist` below is a bare `rename(2)` and NEVER fsyncs, so durability stays
     // ours to enforce by hand. This file holds live OAuth tokens: a crash after
@@ -305,8 +311,14 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     file.as_file().sync_all()?;
 
     file.persist(path).map_err(|e| e.error)?;
-    // Re-assert perms after rename in case the destination pre-existed with a
-    // looser mode (rename keeps the source inode, but be explicit).
+    // NOT a guard against a looser pre-existing destination: `persist` is a
+    // rename, so the destination's old inode — and its mode — are gone. This
+    // cannot tighten anything.
+    //
+    // It is here because the create mode above is `0600 & ~umask`. Under a
+    // restrictive umask the file lands 0400, and a later `save_tokens` has to
+    // REOPEN this file for writing. Pinning the mode keeps that deterministic
+    // rather than umask-dependent.
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }

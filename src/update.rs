@@ -808,7 +808,8 @@ mod tests {
     use std::fs;
 
     /// A unique scratch dir under the system temp root, following the repo's
-    /// pid-suffixed convention (no `tempfile` dev-dependency).
+    /// pid-suffixed convention. `tempfile` is now a dependency and `TempDir`
+    /// would do this with auto-cleanup; this helper is simply not yet migrated.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "tcr-update-test-{}-{}-{tag}",
