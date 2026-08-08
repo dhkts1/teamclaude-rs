@@ -460,6 +460,24 @@ fn process_command(pid: u32) -> Vec<String> {
 /// "Never a false kill" is true and load-bearing throughout; "no takeover" is
 /// only true where a bind stands behind it.
 ///
+/// Empty-on-failure is parity with the old `lsof`-based implementation only on
+/// the `Err` path — `lsof` exiting 1 on a real failure and on an ordinary free
+/// port were indistinguishable, so the old code degraded to empty either way,
+/// exactly as the `Err` arm below does, and it is now LOGGED rather than
+/// silently discarded (see the `Err` arm). But `get_all()` has a second failure
+/// shape with no `lsof` analogue at all, because it never reaches this
+/// function's `Err` arm: on macOS, a listener whose process name cannot be read
+/// or is not valid UTF-8 is silently DROPPED from an otherwise-`Ok` result
+/// (`listeners-0.6.1/src/platform/macos/mod.rs:35`, gated on
+/// `proc_names_cache.get(pid)` returning `None`; the read itself can fail two
+/// ways in `proc_name.rs:27-29` and `:35-37`). `lsof -t` never looks at a
+/// process name, so it has no equivalent gap. This is upstream's to fix, not
+/// ours to work around here — documented so a future "why did this holder go
+/// unseen" investigation does not restart from zero. The axis where the new
+/// code is strictly better: the old path failed OPEN wherever `lsof` itself was
+/// absent, which is routine on Linux and in containers — that external-binary
+/// dependency is gone entirely.
+///
 /// Deliberately `listeners::get_all()` filtered to [`listeners::SocketState::Listen`]
 /// ourselves, NEVER [`listeners::get_process_by_port`]. That shortcut applies no
 /// socket-state filter at all (upstream `listeners` issue #36, open,
@@ -511,9 +529,18 @@ fn process_command(pid: u32) -> Vec<String> {
 /// backend, but nothing in this crate forks a listening child to exercise it.
 fn port_listeners(port: u16) -> Vec<u32> {
     let mut seen = HashSet::new();
-    listeners::get_all()
-        .unwrap_or_default()
-        .into_iter()
+    let all = match listeners::get_all() {
+        Ok(all) => all,
+        Err(error) => {
+            // No silent fallbacks: an enumeration failure still degrades to "no
+            // holders" (empty-on-failure is load-bearing, see the doc above),
+            // but that degradation must be visible, not invisible — this is the
+            // one signal `lsof`'s `Ok`/exit-1 conflation could never produce.
+            tracing::warn!(port, %error, "listeners::get_all failed; treating the port as unheld");
+            Default::default()
+        }
+    };
+    all.into_iter()
         .filter(|listener| listener.protocol == listeners::Protocol::TCP)
         .filter(|listener| listener.state == listeners::SocketState::Listen)
         .filter(|listener| listener.socket.port() == port)
