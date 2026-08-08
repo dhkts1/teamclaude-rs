@@ -454,26 +454,30 @@ fn process_command(pid: u32) -> Vec<String> {
 /// `Takeover::Proceed`. That is safe for two of the three callers and not for
 /// the third, and only PARTIALLY safe even there. [`takeover_port`] and
 /// `server.rs`'s boot path both then actually BIND, and `EADDRINUSE` is a
-/// property of the `(address, port)` PAIR, not the port: a second bind on the
-/// SAME address as a listening incumbent refuses with `EADDRINUSE`. On this
-/// machine, a bind on a DIFFERENT address against a WILDCARD incumbent
-/// (`0.0.0.0` or `::`) instead SUCCEEDED (`std::net::TcpListener::bind`, no
-/// `SO_REUSEADDR` set explicitly) — TODO: unverified whether that holds on
-/// every platform this crate ships to. So the backstop reliably catches only a
-/// loopback-bound incumbent — in practice another `tcr`, which hard-codes
-/// `127.0.0.1` (`server.rs:784`) — and its coverage of a wildcard-bound one,
-/// which this module's own doc (`:22`) already lists as a candidate, is not
-/// guaranteed. Against a wildcard incumbent that a bind does not collide
-/// with, an enumeration failure means we could end up bound ALONGSIDE it,
-/// silently, risking the two proxies token-war. This gap is inherited, not
-/// introduced by the dedup or logging above: neither the old `lsof` scan nor
-/// the new one filters by address, so a working scan already sees and
-/// handles a wildcard holder — only the failure-collapse path lets one slip
-/// past unbound-against. Empty on enumeration failure is unchanged by any of
-/// this — "never a false kill" is still true and load-bearing throughout —
-/// but "no takeover" is not a consequence of it, and where a bind fails to
-/// actually refuse depends on the incumbent's address, not merely on the
-/// port being held. `oauth::login`'s
+/// property of the `(address, port)` PAIR, not the port — and the platforms
+/// this crate ships to disagree on what that licenses (measured via
+/// `std::net::TcpListener::bind`, the same constructor as `server.rs:784`;
+/// see `scripts/FINDINGS-bind-overlap.md`): on Linux the backstop fires for
+/// every pairing measured, but on macOS it fires only against a SAME-address
+/// (loopback) incumbent — in practice another `tcr`, which hard-codes
+/// `127.0.0.1` — and coexists silently with a WILDCARD-bound one (`0.0.0.0`
+/// or `::`), which this module's own doc (`:22`) already lists as a
+/// candidate. Both platforms set `SO_REUSEADDR` (Rust std does so
+/// unconditionally on Unix); they disagree on whether it licenses overlap
+/// between a live wildcard and a live specific-address listener. On macOS,
+/// against a wildcard incumbent, an enumeration failure means we could end up
+/// bound ALONGSIDE it, silently, risking the two proxies token-war — the
+/// platform where this matters most, since `TcrBar.app` and the live proxy
+/// run there. This gap is inherited, not introduced by the dedup or logging
+/// above: neither the old `lsof` scan nor the new one filters by address, so
+/// a working scan already sees and handles a wildcard holder — only the
+/// failure-collapse path lets one slip past unbound-against. Empty on
+/// enumeration failure is unchanged by any of this — "never a false kill" is
+/// still true and load-bearing throughout — but "no takeover" is not a
+/// consequence of it, and where a bind fails to actually refuse depends on
+/// the incumbent's address AND the platform, not merely on the port being
+/// held. Whether the legacy JS proxy actually binds wildcard is a separate,
+/// unmeasured claim about node's defaults. `oauth::login`'s
 /// guard binds nothing at all, so no backstop of any strength applies to it:
 /// on an enumeration failure it proceeds beside a live server it failed to
 /// detect, and the server's next `persist_tokens` writes its boot-time tokens
