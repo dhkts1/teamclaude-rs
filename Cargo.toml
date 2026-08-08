@@ -15,11 +15,14 @@ path = "src/main.rs"
 # async runtime + HTTP
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 axum = { version = "0.8", features = ["http2"] }
-hyper = { version = "1", features = ["server", "http1"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
 # TokioIo: the only bridge from tokio AsyncRead/Write to hyper 1.x rt::Read/Write,
 # needed to serve the axum router over a raw/TLS stream in MITM mode. Already in
 # the tree transitively (via axum/reqwest); this just pins the glue we call directly.
-hyper-util = { version = "0.1", features = ["tokio"] }
+# "server-auto" pulls in the auto h1/h2-negotiating connection builder
+# (hyper_util::server::conn::auto::Builder) used in src/mitm.rs so base-URL/MITM
+# clients can negotiate h2 instead of being forced to h1.
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 reqwest = { version = "0.12", default-features = false, features = ["stream", "json", "rustls-tls", "http2"] }
 tower = "0.5"
 bytes = "1"
