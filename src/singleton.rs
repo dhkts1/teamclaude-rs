@@ -18,13 +18,18 @@
 //! `--replace`.
 //!
 //! Two safety properties, both load-bearing:
-//! - **Port-scoped.** Only the process listening on `127.0.0.1:<configured port>`
-//!   is a candidate — a proxy (or anything else) on another port is never touched,
-//!   so a test server on an ephemeral port is safe.
+//! - **Port-scoped, not address-scoped.** A candidate is any process listening on
+//!   `<configured port>` on ANY address — `127.0.0.1`, `0.0.0.0`, `[::1]`, or a LAN
+//!   IP all match, exactly as the old `lsof -iTCP:<port>` did — so a proxy (or
+//!   anything else) on another PORT is never touched, and a test server on an
+//!   ephemeral port is safe.
 //! - **Command-verified.** A candidate is signalled only if its command line is an
-//!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone (the bind
-//!   then fails loudly with EADDRINUSE) rather than killed. This is what makes the
-//!   takeover safe against a reused PID or an unrelated process on the port.
+//!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone rather
+//!   than killed — the bind then fails loudly with EADDRINUSE if that holder
+//!   shares our bind address (in practice, loopback), but not necessarily
+//!   otherwise; see [`port_listeners`]'s doc for the measured gap. This is what
+//!   makes the takeover safe against a reused PID or an unrelated process on
+//!   the port, whether or not the bind itself ends up refusing.
 //!
 //! # Identity: the owner file, then the name matcher
 //!
@@ -54,12 +59,13 @@
 //!   which will never write one — are recognized exactly as before. Nothing has
 //!   to restart for this change to be safe.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread::sleep;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, Signal, System, UpdateKind};
 
 /// Which proxy a recognized incumbent is. The distinction is load-bearing for
 /// [`takeover_decision`], not cosmetic: a `tcr` peer is a program that is doing
@@ -315,7 +321,7 @@ fn verified_owner(
     owner: Option<&ProxyOwner>,
     port: u16,
     holders: &[u32],
-    command: impl Fn(u32) -> String,
+    command: impl Fn(u32) -> Vec<String>,
 ) -> Option<Incumbent> {
     let owner = owner?;
     if owner.port != port || !holders.contains(&owner.pid) {
@@ -349,7 +355,7 @@ pub fn classify_port_owner(
     port: u16,
     holders: &[u32],
     owner_path: &Path,
-    command: impl Fn(u32) -> String,
+    command: impl Fn(u32) -> Vec<String>,
 ) -> Option<Incumbent> {
     verified_owner(read_owner_file(owner_path).as_ref(), port, holders, command)
 }
@@ -361,20 +367,31 @@ pub struct Incumbent {
     pub kind: ProxyKind,
 }
 
-/// Does this command line look like a teamclaude/tcr *server* — a process safe to
+/// Does this argv look like a teamclaude/tcr *server* — a process safe to
 /// replace as a proxy incumbent on the port? Recognizes the JS proxy
 /// (`node …/teamclaude server`) and the Rust proxy (`…/tcr` at argv0, with the
 /// `server` subcommand, no subcommand, or a flag — since bare `tcr` defaults to the
 /// server). Never matches a bare `grep`/editor/`tcr run`/`teamclaude run`/etc.
-pub fn is_proxy_server(cmd: &str) -> bool {
-    classify_proxy_server(cmd).is_some()
+///
+/// Takes pre-split argv (`&[String]`, as [`sysinfo::Process::cmd`] returns it —
+/// kernel-tokenized from `/proc/<pid>/cmdline` on Linux, `libproc` argv on macOS),
+/// never a joined command LINE. A joined line has to be re-split by whitespace to
+/// be examined, and that re-split mis-tokenizes any executable path containing a
+/// space: `"/Applications/My App/tcr server"` used to split into
+/// `["/Applications/My", "App/tcr", "server"]`, so `tokens[0]` never ended with
+/// `/tcr` and a REAL tcr server went unrecognized. Taking the kernel's own argv
+/// removes that defect class instead of patching the symptom — there is
+/// deliberately no `&str`/whitespace-splitting overload here, because a
+/// convenience wrapper that re-introduces the split is the same bug behind a
+/// fixed test case.
+pub fn is_proxy_server(argv: &[String]) -> bool {
+    classify_proxy_server(argv).is_some()
 }
 
 /// [`is_proxy_server`] plus WHICH proxy it is. Same recognition rules — the bool
 /// version delegates here, so the two can never drift apart.
-pub fn classify_proxy_server(cmd: &str) -> Option<ProxyKind> {
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    if tokens.is_empty() {
+pub fn classify_proxy_server(argv: &[String]) -> Option<ProxyKind> {
+    if argv.is_empty() {
         return None;
     }
     let is_node = |t: &str| t == "node" || t.ends_with("/node");
@@ -383,17 +400,17 @@ pub fn classify_proxy_server(cmd: &str) -> Option<ProxyKind> {
 
     // JS proxy: the teamclaude bin must be the executed program (argv0, or the arg
     // right after `node`) AND the subcommand must be `server`.
-    if let Some(i) = tokens.iter().position(|t| is_teamclaude(t)) {
-        let is_program = i == 0 || is_node(tokens[i - 1]);
-        if is_program && tokens.get(i + 1) == Some(&"server") {
+    if let Some(i) = argv.iter().position(|t| is_teamclaude(t)) {
+        let is_program = i == 0 || is_node(&argv[i - 1]);
+        if is_program && argv.get(i + 1).map(String::as_str) == Some("server") {
             return Some(ProxyKind::LegacyJs);
         }
     }
 
     // Rust proxy: `tcr` at argv0. A server unless the subcommand is a recognized
     // NON-server verb; bare `tcr`, `tcr server`, and `tcr --flag` are all servers.
-    if is_tcr(tokens[0]) {
-        return match tokens.get(1).copied() {
+    if is_tcr(&argv[0]) {
+        return match argv.get(1).map(String::as_str) {
             None => Some(ProxyKind::Tcr),
             Some(t) if t.starts_with('-') || t == "server" => Some(ProxyKind::Tcr),
             Some(_) => None, // `tcr run`, `tcr status`, `tcr accounts`, …
@@ -403,30 +420,152 @@ pub fn classify_proxy_server(cmd: &str) -> Option<ProxyKind> {
     None
 }
 
-/// The command line of `pid` (via `ps`); empty if the process is gone.
-fn process_command(pid: u32) -> String {
-    match Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "command="])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        _ => String::new(),
-    }
+/// The argv of `pid` (via [`sysinfo`], no subprocess); empty if the process is
+/// gone or its cmdline could not be read.
+///
+/// A fresh [`System`] is built per call rather than kept and re-refreshed,
+/// deliberately: `pid` is reused by the OS, and a stale snapshot could hand back
+/// a RECYCLED process's cmdline. `ProcessRefreshKind::nothing().with_cmd(Always)`
+/// is required — the crate's own `refresh_processes` convenience method does not
+/// populate `cmd` at all (its default `UpdateKind` for `cmd` is `Never`), so a
+/// caller reaching for that shortcut here would get an empty argv on every call
+/// and every proxy would silently stop being recognized.
+fn process_command(pid: u32) -> Vec<String> {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        false,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    sys.process(Pid::from_u32(pid))
+        .map(|p| {
+            p.cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// PIDs listening on `127.0.0.1:port` (via `lsof`). Empty on any failure — a
-/// missing/erroring `lsof` degrades to "no takeover", never a false kill.
+/// PIDs listening on `:port` on any address (via [`listeners`], no subprocess),
+/// each pid appearing at most once. Empty on any failure — an erroring
+/// [`listeners::get_all`] degrades to no signal, and to binding anyway; it is
+/// not "no takeover" either: [`takeover_decision`]`(&[], _)` is
+/// `Takeover::Proceed`. That is safe for two of the three callers and not for
+/// the third, and only PARTIALLY safe even there. [`takeover_port`] and
+/// `server.rs`'s boot path both then actually BIND, and `EADDRINUSE` is a
+/// property of the `(address, port)` PAIR, not the port — and the platforms
+/// this crate ships to disagree on what that licenses (measured via
+/// `std::net::TcpListener::bind`, the same constructor as `server.rs:784`;
+/// see `scripts/FINDINGS-bind-overlap.md`): on Linux the backstop fires for
+/// every pairing measured, but on macOS it fires only against a SAME-address
+/// (loopback) incumbent — in practice another `tcr`, which hard-codes
+/// `127.0.0.1` — and coexists silently with a WILDCARD-bound one (`0.0.0.0`
+/// or `::`), which this module's own doc (`:22`) already lists as a
+/// candidate. Both platforms set `SO_REUSEADDR` (Rust std does so
+/// unconditionally on Unix); they disagree on whether it licenses overlap
+/// between a live wildcard and a live specific-address listener. On macOS,
+/// against a wildcard incumbent, an enumeration failure means we could end up
+/// bound ALONGSIDE it, silently, risking the two proxies token-war — the
+/// platform where this matters most, since `TcrBar.app` and the live proxy
+/// run there. This gap is inherited, not introduced by the dedup or logging
+/// above: neither the old `lsof` scan nor the new one filters by address, so
+/// a working scan already sees and handles a wildcard holder — only the
+/// failure-collapse path lets one slip past unbound-against. Empty on
+/// enumeration failure is unchanged by any of this — "never a false kill" is
+/// still true and load-bearing throughout — but "no takeover" is not a
+/// consequence of it, and where a bind fails to actually refuse depends on
+/// the incumbent's address AND the platform, not merely on the port being
+/// held. Whether the legacy JS proxy actually binds wildcard is a separate,
+/// unmeasured claim about node's defaults. `oauth::login`'s
+/// guard binds nothing at all, so no backstop of any strength applies to it:
+/// on an enumeration failure it proceeds beside a live server it failed to
+/// detect, and the server's next `persist_tokens` writes its boot-time tokens
+/// back over the ones the login just wrote, clobbering the single-use refresh
+/// tokens (observed live 2026-07-19, see `oauth.rs:788-793`).
+///
+/// Empty-on-failure is parity with the old `lsof`-based implementation only on
+/// the `Err` path — `lsof` exiting 1 on a real failure and on an ordinary free
+/// port were indistinguishable, so the old code degraded to empty either way,
+/// exactly as the `Err` arm below does, and it is now LOGGED rather than
+/// silently discarded (see the `Err` arm). But `get_all()` has a second failure
+/// shape with no `lsof` analogue at all, because it never reaches this
+/// function's `Err` arm: on macOS, a listener whose process name cannot be read
+/// or is not valid UTF-8 is silently DROPPED from an otherwise-`Ok` result
+/// (`listeners-0.6.1/src/platform/macos/mod.rs:35`, gated on
+/// `proc_names_cache.get(pid)` returning `None`; the read itself can fail two
+/// ways in `proc_name.rs:27-29` and `:35-37`). `lsof -t` never looks at a
+/// process name, so it has no equivalent gap. This is upstream's to fix, not
+/// ours to work around here — documented so a future "why did this holder go
+/// unseen" investigation does not restart from zero. The axis where the new
+/// code is strictly better: the old path failed OPEN wherever `lsof` itself was
+/// absent, which is routine on Linux and in containers — that external-binary
+/// dependency is gone entirely.
+///
+/// Deliberately `listeners::get_all()` filtered to [`listeners::SocketState::Listen`]
+/// ourselves, NEVER [`listeners::get_process_by_port`]. That shortcut applies no
+/// socket-state filter at all (upstream `listeners` issue #36, open,
+/// maintainer-confirmed) and returns the FIRST socket matching the port —
+/// `sshd` LISTENing on 22 and `sshd-session` ESTABLISHED on the same local port
+/// both key to port 22, and the shortcut can hand back the child. Our old
+/// `lsof -sTCP:LISTEN` excluded non-listening sockets specifically so that a
+/// pid merely ESTABLISHED as a *client* of our port could never reach
+/// `replaceable_incumbents` and, under `--replace`, the SIGKILL loop. The
+/// explicit state filter below is what reproduces that guarantee. It also sides
+/// around `get_process_by_port`'s separate `port == 0` error, which we would
+/// otherwise have to special-case for the ephemeral-port test harness.
+///
+/// The protocol filter is the same kind of parity restoration, made explicit
+/// rather than left to rest on an upstream implementation detail: the old
+/// `lsof -iTCP:{port}` excluded UDP outright. Today, both `listeners` backends
+/// hard-code every UDP entry's state to `SocketState::Unknown` (never `Listen`)
+/// (`platform/linux/proto_listener.rs:128,165`, `platform/macos/c_socket_fd_info.rs:32`),
+/// so the state filter above already excludes UDP as a side effect — but
+/// `SocketState` is a public enum upstream is still evolving (see issue #36),
+/// and a future release giving UDP a real state would silently start admitting
+/// UDP holders here with no line of code to blame. Filtering on
+/// `Protocol::TCP` directly keeps that guarantee independent of an
+/// undocumented invariant in a dependency.
+///
+/// **Dedup, order-preserving.** One process can hold several LISTEN sockets on
+/// the same port at once — the common case is a dual-stack bind,
+/// `127.0.0.1:<port>` plus `[::1]:<port>` from one `bind(0.0.0.0)`/`bind(::)`
+/// call, which is how a Node HTTP server (including the legacy JS proxy this
+/// module exists to migrate off of) listens by default. [`listeners::Listener`]
+/// derives `Hash`/`Eq` over `{process, socket, protocol, state}`, and `socket` is
+/// part of that key, so `get_all()`'s internal `HashSet` keeps both sockets as
+/// separate entries — the same pid then appears twice in this function's output.
+/// The old `lsof -t` collapsed that to one line per process; below reproduces
+/// that collapse explicitly, in FIRST-SEEN order, because callers
+/// ([`live_proxy_server`] via `.next()`, [`takeover_decision`] via `.find()`)
+/// read the first element as *the* incumbent to report, and reordering holders
+/// would change which one that is.
+///
+/// Opposite divergence on Linux, needing no fix here: that backend's
+/// inode→process map uses last-writer-wins `HashMap::insert`
+/// (`platform/linux/helpers.rs:53-54`), so a listening fd shared across a fork
+/// family collapses to one pid rather than macOS's several — untested by CI
+/// despite running on `ubuntu-latest`, since nothing here forks a listener.
 fn port_listeners(port: u16) -> Vec<u32> {
-    match Command::new("lsof")
-        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter_map(|l| l.trim().parse::<u32>().ok())
-            .collect(),
-        _ => Vec::new(),
-    }
+    let mut seen = HashSet::new();
+    let all = match listeners::get_all() {
+        Ok(all) => all,
+        Err(error) => {
+            // No silent fallbacks: an enumeration failure still degrades to "no
+            // holders" (empty-on-failure is load-bearing, see the doc above),
+            // but that degradation must be visible, not invisible — this is the
+            // one signal `lsof`'s `Ok`/exit-1 conflation could never produce.
+            tracing::warn!(port, %error, "listeners::get_all failed; treating the port as unheld");
+            Default::default()
+        }
+    };
+    all.into_iter()
+        .filter(|listener| listener.protocol == listeners::Protocol::TCP)
+        .filter(|listener| listener.state == listeners::SocketState::Listen)
+        .filter(|listener| listener.socket.port() == port)
+        .map(|listener| listener.process.pid)
+        .filter(|&pid| seen.insert(pid))
+        .collect()
 }
 
 /// The pure takeover DECISION: of the processes holding the port, which are
@@ -439,7 +578,7 @@ fn port_listeners(port: u16) -> Vec<u32> {
 pub fn replaceable_incumbents(
     holders: &[u32],
     self_pid: u32,
-    command: impl Fn(u32) -> String,
+    command: impl Fn(u32) -> Vec<String>,
 ) -> Vec<Incumbent> {
     replaceable_incumbents_with_owner(holders, self_pid, command, None)
 }
@@ -460,7 +599,7 @@ pub fn replaceable_incumbents(
 pub fn replaceable_incumbents_with_owner(
     holders: &[u32],
     self_pid: u32,
-    command: impl Fn(u32) -> String,
+    command: impl Fn(u32) -> Vec<String>,
     owner: Option<Incumbent>,
 ) -> Vec<Incumbent> {
     holders
@@ -497,12 +636,56 @@ pub fn live_proxy_server(port: u16) -> Option<Incumbent> {
         .next()
 }
 
-/// Is `pid` still alive? (`kill -0`.)
+/// Is `pid` still alive? Uses the same `refresh_processes_specifics` /
+/// `ProcessesToUpdate::Some` shape as [`signal_pid`] (both pass
+/// `ProcessRefreshKind::nothing()`, no `cmd`), minus the signal — a fresh
+/// snapshot per call so a reused pid cannot read as the process we just
+/// signalled. [`process_command`] is the odd one out: it refreshes the same way
+/// but additionally requests `.with_cmd(UpdateKind::Always)`, since it is the
+/// only one of the three that needs the command line.
 fn is_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .status()
-        .is_ok_and(|s| s.success())
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    sys.process(Pid::from_u32(pid)).is_some()
+}
+
+/// Send `signal` to `pid` via [`sysinfo::Process::kill_with`] — never
+/// [`sysinfo::Process::kill`], which always sends `SIGKILL` regardless of what
+/// the caller asked for and would silently delete the graceful-shutdown window
+/// between the `Signal::Term` and `Signal::Kill` calls in [`takeover_port`].
+///
+/// `kill_with` returns `None` when `signal` is unsupported on the current
+/// platform — that case is logged, not swallowed, because a caller reading
+/// "we tried to signal it" from a `None` it never checked is exactly how a
+/// process that was never actually asked to stop ends up presumed dead.
+fn signal_pid(pid: u32, signal: Signal) {
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    let Some(process) = sys.process(Pid::from_u32(pid)) else {
+        // Already gone; nothing to signal.
+        return;
+    };
+    match process.kill_with(signal) {
+        Some(true) => {}
+        Some(false) => {
+            tracing::warn!(pid, ?signal, "failed to signal process");
+        }
+        None => {
+            tracing::warn!(
+                pid,
+                ?signal,
+                "this signal is not supported on the current platform; the process was NOT signalled"
+            );
+        }
+    }
 }
 
 /// What the caller must do after [`takeover_port`] has looked at the port.
@@ -672,7 +855,10 @@ fn embedded_stand_down_message(port: u16, pid: u32) -> String {
 /// DEFAULT — a `tcr` incumbent is reported and left running, and the caller is
 /// told to exit rather than bind; a LEGACY JS incumbent is still replaced, since
 /// displacing it is what this module is for. A non-proxy holder is reported and
-/// LEFT ALONE in every case (the bind then fails loudly with EADDRINUSE).
+/// LEFT ALONE in every case — the bind then fails loudly with EADDRINUSE if
+/// that holder shares our bind address (in practice, loopback); against a
+/// wildcard-bound holder the bind is not guaranteed to refuse, see
+/// [`port_listeners`]'s doc for the measured gap.
 #[must_use = "the caller must exit instead of binding on IncumbentPresent"]
 pub fn takeover_port(port: u16, replace: bool) -> Takeover {
     let holders = port_listeners(port);
@@ -686,7 +872,8 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
             let cmd = process_command(pid);
             if !cmd.is_empty() {
                 eprintln!(
-                    "[tcr] :{port} is held by a non-proxy process (pid {pid}): {cmd} — not replacing it; the bind will fail if it stays."
+                    "[tcr] :{port} is held by a non-proxy process (pid {pid}): {} — not replacing it; the bind will fail if it stays.",
+                    cmd.join(" ")
                 );
             }
         }
@@ -739,10 +926,14 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         // is the only place a takeover is recoverable. Pairs with "server started"
         // to turn "the server bounced" into "pid N was killed by pid M".
         tracing::info!(port, replaced_pid = pid, "replacing incumbent proxy");
-        let _ = Command::new("kill").arg(pid.to_string()).status();
+        // Graceful first: SIGTERM, then a grace window, then SIGKILL only if it
+        // survived. `signal_pid` calls `kill_with`, never `kill` (which always
+        // sends SIGKILL) — collapsing these two calls onto `kill` would delete
+        // this exact grace window and cost every live session its prompt cache.
+        signal_pid(pid, Signal::Term);
         sleep(Duration::from_millis(800));
         if is_alive(pid) {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            signal_pid(pid, Signal::Kill);
             sleep(Duration::from_millis(300));
         }
     }
@@ -753,35 +944,259 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
 mod tests {
     use super::*;
 
+    /// The `listeners` integration itself, not just the pure logic around it:
+    /// bind an ephemeral port IN-PROCESS (port 0 — never a literal port, and
+    /// never the live proxy's `127.0.0.1:3456`) and assert `port_listeners`
+    /// reports exactly THIS process's pid on the port the OS actually assigned.
+    /// `local_addr()` is required rather than querying port 0 directly:
+    /// `listeners::get_process_by_port` (which we deliberately do not call) even
+    /// errors outright on `port == 0`, and port 0 is not a real listener's port
+    /// in the socket table either way.
+    #[test]
+    fn port_listeners_finds_this_process_on_an_ephemeral_port() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        let port = listener
+            .local_addr()
+            .expect("a bound listener has a local address")
+            .port();
+
+        let holders = port_listeners(port);
+        assert!(
+            holders.contains(&std::process::id()),
+            "port {port} should be reported as held by this process (pid {}); got {holders:?}",
+            std::process::id()
+        );
+
+        drop(listener);
+    }
+
+    /// The real defect, end to end, not just the pure dedup helper in isolation:
+    /// bind `0.0.0.0:0` to get an OS-assigned port, then bind `[::]:<that same
+    /// port>` in the SAME process — the dual-stack pattern a default-configured
+    /// Node HTTP server (including the legacy JS proxy this module migrates off
+    /// of) produces from one `listen()` call. Both are genuine LISTEN sockets on
+    /// the same pid and port, so without the dedup this reports `[pid, pid]` and
+    /// callers that read the first element still get the right pid — but the
+    /// `takeover_port` signal loop iterates the WHOLE list, so the SIGTERM ->
+    /// sleep -> is_alive -> SIGKILL sequence would run twice against one process
+    /// with no fresh verification on the second pass. Port 0, in-process,
+    /// nothing signalled.
+    #[test]
+    fn port_listeners_collapses_a_dual_stack_bind_to_one_pid() {
+        let v4 = std::net::TcpListener::bind("0.0.0.0:0").expect("binding an ephemeral IPv4 port");
+        let port = v4
+            .local_addr()
+            .expect("a bound listener has a local address")
+            .port();
+
+        let Ok(v6) = std::net::TcpListener::bind(format!("[::]:{port}")) else {
+            // Some stacks refuse the v6 bind once v4 already holds the port (no
+            // dual-stack support, or `IPV6_V6ONLY` defaults differ locally).
+            // Falling back to the pure-helper check rather than failing the run
+            // — this asserts the same dedup logic `port_listeners` uses, just
+            // without a real second socket to prove the end-to-end case.
+            drop(v4);
+            let mut seen = HashSet::new();
+            let deduped: Vec<u32> = [4242_u32, 4242_u32, 7_u32]
+                .into_iter()
+                .filter(|&pid| seen.insert(pid))
+                .collect();
+            assert_eq!(
+                deduped,
+                vec![4242, 7],
+                "fallback: the dedup pattern itself should be order-preserving \
+                 (could not verify the real dual-stack bind on this machine)"
+            );
+            return;
+        };
+
+        let holders = port_listeners(port);
+        assert_eq!(
+            holders,
+            vec![std::process::id()],
+            "one process holding the port on two dual-stack sockets should report ONE pid \
+             (order-preserving dedup), got {holders:?}"
+        );
+
+        drop(v4);
+        drop(v6);
+    }
+
+    /// The negative control the `SocketState::Listen` filter never had: a test
+    /// proving a LISTEN socket IS found existed, nothing proved a non-LISTEN
+    /// socket is NOT. That filter is the issue-#36 guard on the kill path
+    /// (`replaceable_incumbents` -> `takeover_decision` -> the SIGTERM/SIGKILL
+    /// loop), so positive-only coverage means a regression that dropped the
+    /// filter would ship silently. Single process, port 0, no second proxy, no
+    /// root, nothing signalled.
+    #[test]
+    fn port_listeners_excludes_a_non_listening_socket_on_the_same_port() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral port");
+        let port = server
+            .local_addr()
+            .expect("a bound listener has a local address")
+            .port();
+
+        // Positive control: the listener itself is still up.
+        let holders = port_listeners(port);
+        assert!(
+            holders.contains(&std::process::id()),
+            "the LISTEN socket on port {port} should be reported; got {holders:?}"
+        );
+
+        let _client = std::net::TcpStream::connect(("127.0.0.1", port))
+            .expect("connecting to our own listener");
+        let (_accepted, _) = server.accept().expect("accepting the connection");
+        // `_accepted`'s LOCAL port is also `port`, but its state is ESTABLISHED,
+        // not LISTEN — it must never appear here.
+        drop(server);
+        // The LISTEN socket is gone; only the ESTABLISHED accepted socket still
+        // has local port `port`. Without the `SocketState::Listen` filter this
+        // would report this process's pid again and the assertion below fails.
+        let holders_after = port_listeners(port);
+        assert!(
+            holders_after.is_empty(),
+            "an ESTABLISHED socket on port {port} must not be reported as a LISTEN holder; \
+             got {holders_after:?}"
+        );
+    }
+
+    /// UDP control: `listeners`' backends hard-code every UDP socket's state to
+    /// `SocketState::Unknown` (never `Listen`), so this passes today for that
+    /// reason rather than because of an explicit UDP exclusion — which is
+    /// exactly why it is worth having as a canary. The day upstream gives UDP a
+    /// real state, `Protocol::TCP` (not the state filter) is what keeps this
+    /// green; if this test ever goes red, that upstream change is why.
+    #[test]
+    fn port_listeners_excludes_a_udp_socket_on_the_same_port() {
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding an ephemeral UDP port");
+        let port = udp
+            .local_addr()
+            .expect("a bound socket has a local address")
+            .port();
+
+        let holders = port_listeners(port);
+        assert!(
+            holders.is_empty(),
+            "a UDP socket on port {port} must never be reported as a TCP LISTEN holder; \
+             got {holders:?}"
+        );
+
+        drop(udp);
+    }
+
+    /// Proves `signal_pid` sends the SIGNAL ITSELF, not merely "some kill" — the
+    /// single most dangerous mistake available in this module
+    /// (`sysinfo::Process::kill()` always sends SIGKILL regardless of what a
+    /// caller asks for; `kill()` is `kill_with(Signal::Kill)` under the hood).
+    /// A green test suite that only checks the code path taken would pass
+    /// whether this sends SIGTERM or SIGKILL — so this reads the SIGNAL NUMBER
+    /// the OS actually delivered off the child's exit status.
+    ///
+    /// Spawns our OWN throwaway child (`sleep 30`) — this never signals any pid
+    /// the test did not itself spawn, and never comes near a real proxy or the
+    /// live pid 50152.
+    #[cfg(unix)]
+    #[test]
+    fn signal_pid_term_delivers_sigterm_not_sigkill() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning our own throwaway child");
+        let pid = child.id();
+
+        signal_pid(pid, Signal::Term);
+
+        let status = child.wait().expect("waiting on our own child");
+        assert_eq!(
+            status.signal(),
+            Some(15), // SIGTERM
+            "signal_pid(.., Signal::Term) must deliver SIGTERM (15), not SIGKILL (9) \
+             or any other signal -- this is the graceful-shutdown window the module \
+             exists to protect"
+        );
+    }
+
+    /// The other half of the same proof, for the survivor path: `Signal::Kill`
+    /// must deliver SIGKILL (9), not the graceful signal.
+    #[cfg(unix)]
+    #[test]
+    fn signal_pid_kill_delivers_sigkill_not_sigterm() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning our own throwaway child");
+        let pid = child.id();
+
+        signal_pid(pid, Signal::Kill);
+
+        let status = child.wait().expect("waiting on our own child");
+        assert_eq!(
+            status.signal(),
+            Some(9), // SIGKILL
+            "signal_pid(.., Signal::Kill) must deliver SIGKILL (9)"
+        );
+    }
+
+    /// Builds an argv `Vec<String>` from string-literal parts — matching what
+    /// [`sysinfo::Process::cmd`] returns (pre-tokenized, no shell/whitespace
+    /// splitting involved). Test-only stand-in for a real process's argv, kept
+    /// tight so no test has to hand-expand every literal into a `Vec`.
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn recognizes_js_teamclaude_server() {
-        assert!(is_proxy_server("node /opt/nvm/bin/teamclaude server"));
-        assert!(is_proxy_server("node /path/teamclaude server -r"));
-        assert!(is_proxy_server("/path/teamclaude server")); // shebang exec
+        assert!(is_proxy_server(&argv(&[
+            "node",
+            "/opt/nvm/bin/teamclaude",
+            "server"
+        ])));
+        assert!(is_proxy_server(&argv(&[
+            "node",
+            "/path/teamclaude",
+            "server",
+            "-r"
+        ])));
+        assert!(is_proxy_server(&argv(&["/path/teamclaude", "server"]))); // shebang exec
     }
 
     #[test]
     fn recognizes_tcr_server() {
-        assert!(is_proxy_server(
-            "/opt/teamclaude-rs/target/release/tcr server"
-        ));
-        assert!(is_proxy_server("tcr")); // bare = default server
-        assert!(is_proxy_server("/x/tcr --headless")); // default server + flag
-        assert!(is_proxy_server("tcr server --port 3456"));
+        assert!(is_proxy_server(&argv(&[
+            "/opt/teamclaude-rs/target/release/tcr",
+            "server"
+        ])));
+        assert!(is_proxy_server(&argv(&["tcr"]))); // bare = default server
+        assert!(is_proxy_server(&argv(&["/x/tcr", "--headless"]))); // default server + flag
+        assert!(is_proxy_server(&argv(&["tcr", "server", "--port", "3456"])));
     }
 
     #[test]
     fn rejects_non_servers() {
-        assert!(!is_proxy_server("node /path/teamclaude run"));
-        assert!(!is_proxy_server("node /path/teamclaude run -r"));
-        assert!(!is_proxy_server("/x/tcr run"));
-        assert!(!is_proxy_server("/x/tcr status"));
-        assert!(!is_proxy_server("/x/tcr accounts"));
-        assert!(!is_proxy_server("grep teamclaude server")); // teamclaude is a search term
-        assert!(!is_proxy_server("rg tcr server"));
-        assert!(!is_proxy_server("vim teamclaude-server.md"));
-        assert!(!is_proxy_server(""));
-        assert!(!is_proxy_server("node /path/other server"));
+        assert!(!is_proxy_server(&argv(&[
+            "node",
+            "/path/teamclaude",
+            "run"
+        ])));
+        assert!(!is_proxy_server(&argv(&[
+            "node",
+            "/path/teamclaude",
+            "run",
+            "-r"
+        ])));
+        assert!(!is_proxy_server(&argv(&["/x/tcr", "run"])));
+        assert!(!is_proxy_server(&argv(&["/x/tcr", "status"])));
+        assert!(!is_proxy_server(&argv(&["/x/tcr", "accounts"])));
+        assert!(!is_proxy_server(&argv(&["grep", "teamclaude", "server"]))); // teamclaude is a search term
+        assert!(!is_proxy_server(&argv(&["rg", "tcr", "server"])));
+        assert!(!is_proxy_server(&argv(&["vim", "teamclaude-server.md"])));
+        assert!(!is_proxy_server(&argv(&[])));
+        assert!(!is_proxy_server(&argv(&["node", "/path/other", "server"])));
     }
 
     fn tcr(pid: u32) -> Incumbent {
@@ -805,18 +1220,18 @@ mod tests {
         }
     }
 
-    /// A host application's command line: nothing in it matches the `tcr` name
-    /// matcher, which is the entire reason the owner file exists.
-    const HOST_APP_COMMAND: &str = "/Applications/TcrBar.app/Contents/MacOS/TcrBar";
+    /// A host application's argv: nothing in it matches the `tcr` name matcher,
+    /// which is the entire reason the owner file exists.
+    const HOST_APP_ARGV: &[&str] = &["/Applications/TcrBar.app/Contents/MacOS/TcrBar"];
 
     /// An unrelated program listening on the port — what a recycled pid actually
-    /// runs. Not a proxy by any reading of its command line.
-    const DEV_SERVER_COMMAND: &str = "/usr/local/bin/node /srv/app/dev-server.js";
+    /// runs. Not a proxy by any reading of its argv.
+    const DEV_SERVER_ARGV: &[&str] = &["/usr/local/bin/node", "/srv/app/dev-server.js"];
 
-    /// The command line of a real CLI-hosted proxy, for the tests that need the
-    /// claim's pid to survive the command check.
-    fn tcr_command(_pid: u32) -> String {
-        "/x/tcr server".to_string()
+    /// The argv of a real CLI-hosted proxy, for the tests that need the claim's
+    /// pid to survive the command check.
+    fn tcr_command(_pid: u32) -> Vec<String> {
+        argv(&["/x/tcr", "server"])
     }
 
     /// A unique scratch dir for a claim file. Never [`default_owner_path`] — that
@@ -892,7 +1307,7 @@ mod tests {
 
         // A stale claim does not even suppress the fallback: the name matcher
         // still gets its turn, so a `tcr` predating the owner file is recognized.
-        let command = |_pid: u32| "/x/tcr server".to_string();
+        let command = |_pid: u32| argv(&["/x/tcr", "server"]);
         let owner = classify_port_owner(4444, &[7777], &path, command);
         assert_eq!(
             replaceable_incumbents_with_owner(&[7777], 1, command, owner),
@@ -912,7 +1327,7 @@ mod tests {
     #[test]
     fn an_embedded_proxy_is_recognized_only_through_its_claim() {
         assert_eq!(
-            classify_proxy_server(HOST_APP_COMMAND),
+            classify_proxy_server(&argv(HOST_APP_ARGV)),
             None,
             "the name matcher cannot see a proxy hosted inside another program — \
              that is the failure the claim file replaces"
@@ -920,7 +1335,7 @@ mod tests {
 
         let dir = scratch_dir("embedded");
         let path = write_claim(&dir, 3456, 5150, ProxyHost::Embedded);
-        let command = |_pid: u32| HOST_APP_COMMAND.to_string();
+        let command = |_pid: u32| argv(HOST_APP_ARGV);
         let owner = classify_port_owner(3456, &[5150], &path, command);
 
         assert_eq!(
@@ -965,10 +1380,10 @@ mod tests {
     fn a_cli_claim_whose_listening_pid_is_not_a_proxy_is_ignored() {
         let dir = scratch_dir("recycled-pid");
         let path = write_claim(&dir, 3456, 5150, ProxyHost::Cli);
-        let dev_server = |_pid: u32| DEV_SERVER_COMMAND.to_string();
+        let dev_server = |_pid: u32| argv(DEV_SERVER_ARGV);
 
         assert_eq!(
-            classify_proxy_server(DEV_SERVER_COMMAND),
+            classify_proxy_server(&argv(DEV_SERVER_ARGV)),
             None,
             "the fixture is only meaningful if the command line is genuinely not a proxy"
         );
@@ -1008,7 +1423,7 @@ mod tests {
     #[test]
     fn a_proxy_that_wrote_no_claim_is_still_recognized() {
         let dir = scratch_dir("absent");
-        let command = |_pid: u32| "/x/tcr server".to_string();
+        let command = |_pid: u32| argv(&["/x/tcr", "server"]);
 
         for (label, path) in [
             ("absent", owner_path_in(&dir, 3456)),
@@ -1242,7 +1657,7 @@ mod tests {
 
         // And it lands on the kind that is never signalled, whatever the host
         // program's command line says.
-        let command = |_pid: u32| HOST_APP_COMMAND.to_string();
+        let command = |_pid: u32| argv(HOST_APP_ARGV);
         assert_eq!(
             classify_port_owner(3456, &[900], &path, command),
             Some(embedded(900)),
@@ -1280,29 +1695,50 @@ mod tests {
         assert_eq!(parsed.host, ProxyHost::Cli);
     }
 
+    /// THE INDEPENDENT ORACLE for this lane. This defect predates the argv
+    /// refactor: the OLD `&str` implementation did `cmd.split_whitespace()`,
+    /// which mis-tokenises any executable path containing a space —
+    /// `"/Applications/My App/tcr server"` split into
+    /// `["/Applications/My", "App/tcr", "server"]`, so `tokens[0]` never ended
+    /// with `/tcr` and a REAL tcr server went unrecognized (treated as a
+    /// non-proxy holder, or worse left un-killable under `--replace`, or
+    /// spuriously blocking `tcr login`). Verified failing against the `&str` API
+    /// before this refactor landed. Now expressed against the argv API this
+    /// module actually exposes: `sysinfo::Process::cmd()` hands back the
+    /// kernel's own tokenization, so the path's internal space never has to be
+    /// re-split at all — the defect class is gone by construction, not patched.
+    #[test]
+    fn recognizes_a_tcr_server_at_a_path_containing_a_space() {
+        assert_eq!(
+            classify_proxy_server(&argv(&["/Applications/My App/tcr", "server"])),
+            Some(ProxyKind::Tcr),
+            "a space in the executable's path must not hide a real tcr server"
+        );
+    }
+
     #[test]
     fn classify_names_which_proxy_it_found() {
         assert_eq!(
-            classify_proxy_server("node /opt/nvm/bin/teamclaude server"),
+            classify_proxy_server(&argv(&["node", "/opt/nvm/bin/teamclaude", "server"])),
             Some(ProxyKind::LegacyJs)
         );
         assert_eq!(
-            classify_proxy_server("/opt/teamclaude-rs/target/release/tcr server"),
+            classify_proxy_server(&argv(&["/opt/teamclaude-rs/target/release/tcr", "server"])),
             Some(ProxyKind::Tcr)
         );
-        assert_eq!(classify_proxy_server("tcr"), Some(ProxyKind::Tcr));
-        assert_eq!(classify_proxy_server("/x/tcr status"), None);
+        assert_eq!(classify_proxy_server(&argv(&["tcr"])), Some(ProxyKind::Tcr));
+        assert_eq!(classify_proxy_server(&argv(&["/x/tcr", "status"])), None);
     }
 
     #[test]
     fn replaceable_incumbents_filters_self_and_non_proxies() {
-        let command = |pid: u32| -> String {
+        let command = |pid: u32| -> Vec<String> {
             match pid {
-                111 => "node /x/teamclaude server".to_string(),
-                222 => "/x/tcr server".to_string(),
-                333 => "grep teamclaude server".to_string(), // non-proxy on the port
-                444 => "/x/tcr run".to_string(),
-                _ => String::new(),
+                111 => argv(&["node", "/x/teamclaude", "server"]),
+                222 => argv(&["/x/tcr", "server"]),
+                333 => argv(&["grep", "teamclaude", "server"]), // non-proxy on the port
+                444 => argv(&["/x/tcr", "run"]),
+                _ => Vec::new(),
             }
         };
         // 999 is self; 333/444 are non-proxies → only 111 and 222 survive, each
@@ -1313,7 +1749,7 @@ mod tests {
 
     #[test]
     fn replaceable_incumbents_never_includes_self_even_if_it_looks_like_a_proxy() {
-        let command = |_pid: u32| "/x/tcr server".to_string();
+        let command = |_pid: u32| argv(&["/x/tcr", "server"]);
         assert!(replaceable_incumbents(&[42], 42, command).is_empty());
     }
 
@@ -1362,7 +1798,9 @@ mod tests {
             incumbents_to_signal(&[legacy_js(111)], false),
             vec![legacy_js(111)],
             "proceeding past a JS incumbent means SIGNALLING it — leaving it \
-             running would land the bind on EADDRINUSE instead"
+             running risks the two proxies token-warring instead, not \
+             necessarily a loud EADDRINUSE; see `port_listeners`' doc on the \
+             wildcard gap"
         );
     }
 
