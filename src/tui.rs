@@ -14,16 +14,23 @@ use std::io::{self};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+// Everything crossterm-shaped comes from `ratatui::crossterm` so it is the SAME
+// copy ratatui's backend drives -- see the note on the `crossterm` dependency in
+// Cargo.toml. `EventStream` is the one exception: it needs the `event-stream`
+// feature, which ratatui does not pass through, so it comes from the direct dep.
+// That split is deliberate -- it turns a version drift between the two into a
+// compile error rather than a silently duplicated crate.
+use crossterm::event::EventStream;
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
+};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};

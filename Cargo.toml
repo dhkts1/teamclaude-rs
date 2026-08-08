@@ -49,7 +49,23 @@ form_urlencoded = "1"
 
 # TUI
 ratatui = "0.30"
-crossterm = { version = "0.28", features = ["event-stream"] }
+# MUST stay on whatever major `ratatui` re-exports as `ratatui::crossterm`
+# (0.30 -> ratatui-crossterm 0.1 -> crossterm 0.29). When it did not, cargo
+# built BOTH 0.28 and 0.29 -- two copies of the terminal library, each with its
+# own rustix, in one binary.
+#
+# Dropping this direct dep entirely does not work: `EventStream` lives behind
+# crossterm's `event-stream` feature and ratatui exposes no passthrough for it
+# (`event-stream` appears only in ratatui's own dev-dependencies), so the
+# re-export alone cannot give us the async event source `tui.rs` needs.
+#
+# What DOES make the drift un-silenceable is where `tui.rs` imports from: every
+# shared type comes from `ratatui::crossterm`, and only `EventStream` from here.
+# If these two versions ever separate again, the stream yields one crate's
+# `Event` while the match arms expect the other's, and it stops compiling --
+# instead of quietly compiling twice. The error reads `expected Event, found
+# Event`, which looks like a compiler bug and is really this line drifting.
+crossterm = { version = "0.29", features = ["event-stream"] }
 
 # CLI, errors, logging, time, paths
 clap = { version = "4", features = ["derive"] }
