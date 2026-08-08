@@ -296,9 +296,20 @@ fn generate_chain(hosts: &[&str]) -> anyhow::Result<(String, String, String)> {
     Ok((ca_cert.pem(), leaf_cert.pem(), leaf_key.serialize_pem()))
 }
 
+/// Write `data` to `path` at exactly `mode`, whether or not `path` already exists.
+///
+/// The `.mode()` on the open is what keeps a freshly-created key from ever being
+/// visible at a wider mode, even momentarily. It is NOT sufficient on its own:
+/// `OpenOptionsExt::mode()` applies only to the creating open and is ignored
+/// outright when the file already exists, so a stale `tcr-leaf.key` left at `0644`
+/// by an older build, an interrupted write, a restore, or a umask accident would
+/// survive regeneration world-readable — a readable MITM private key lets anything
+/// holding it impersonate every host this proxy intercepts. Hence the post-write
+/// re-assert, the same belt-and-braces `crate::config` uses on its token file.
 fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -306,6 +317,7 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
         .mode(mode)
         .open(path)?;
     file.write_all(data)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -580,6 +592,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `write_file`'s `mode` must be enforced when the destination ALREADY exists,
+    /// not only when it is created. `OpenOptionsExt::mode()` applies solely to the
+    /// creating open, so without a post-write `set_permissions` a pre-existing
+    /// `tcr-leaf.key` at `0644` — an older build, an interrupted write, a restore,
+    /// a umask accident — survives regeneration world-readable while the call site
+    /// reads as though it asked for `0600`. That file is the MITM leaf's private
+    /// key: anything that can read it can impersonate every intercepted host.
+    #[test]
+    fn write_file_enforces_mode_on_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-mitm-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tcr-leaf.key");
+
+        // Pre-create the destination at a looser mode, as a stale artifact would be.
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_file(&path, b"fresh key material", 0o600).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an overwritten private key must end up at 0600, got {mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh key material");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A minted chain must be reused on the next load. Re-minting silently
     /// invalidates the `NODE_EXTRA_CA_CERTS` the user exported after the first
