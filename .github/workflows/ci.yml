@@ -52,6 +52,56 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+  # The only job on a macOS runner, and the only place any Swift is compiled.
+  # Before this existed the app's Swift tests had never run in CI at all, so a
+  # Rust-side change could silently break TcrBar with every check green.
+  #
+  # Deliberately does NOT re-run fmt/clippy: those are platform-independent and
+  # already gated by `ci`. macOS runner minutes are billed at a multiple of
+  # Linux, so this job runs only what Linux cannot answer.
+  macos:
+    name: macos
+    runs-on: macos-latest
+    # macOS runners are slower than ubuntu-latest and this job compiles both
+    # toolchains; 20 (the `ci` budget) is too tight for a cold cache.
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Auto-keys on runner OS as well as Cargo.lock, so this shares nothing
+      # with the ubuntu jobs' caches.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Not a duplicate of the ubuntu `cargo test`: several modules take a
+      # different code path here. src/singleton.rs shells out to `ps`/`lsof`
+      # (BSD flags, different output columns), install placement relies on
+      # rename(2) semantics, and $TMPDIR is a per-user sandbox path on macOS
+      # rather than /tmp. macOS is also the only platform this app ships on.
+      - name: Test (rust)
+        run: cargo test --all --locked
+
+      # Recorded so a runner-image bump that changes the Swift language mode is
+      # attributable from the log rather than looking like a source regression.
+      - name: Swift toolchain version
+        run: swift --version
+
+      # No SwiftPM cache: the package declares zero external dependencies, so
+      # there is nothing to fetch, and .build artifacts key on the toolchain
+      # and every source file — it would miss on essentially every run.
+      - name: Build (swift)
+        working-directory: apps/macos
+        run: swift build
+
+      # Reads tests/fixtures/status-contract.json by walking up from #filePath,
+      # so it also proves the repo-relative fixture resolves on a clean checkout.
+      - name: Test (swift)
+        working-directory: apps/macos
+        run: swift test
+
   audit:
     name: audit
     runs-on: ubuntu-latest
