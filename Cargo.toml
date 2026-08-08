@@ -79,6 +79,17 @@ rustls = { version = "0.23.42", default-features = false, features = ["ring", "s
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.8"
 
+# Port-listener enumeration and process kill/argv (singleton.rs), replacing five
+# hand-rolled `ps`/`lsof`/`kill` subprocess spawns. `listeners` reads
+# /proc/net/{tcp,udp}{,6} + /proc/<pid>/fd (Linux, via rustix syscalls) or libproc
+# (macOS) -- no subprocess. `sysinfo`'s `system` feature is the only one we need:
+# `Process::cmd()`/`kill_with()` replace `ps`/`kill`. default-features off drops
+# `component`/`disk`/`network`/`user` (and the objc2-open-directory dep `user`
+# pulls in on macOS); `system` itself still needs `objc2-core-foundation` and
+# `objc2-io-kit` there, which is expected, not a regression to chase.
+listeners = "0.6"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

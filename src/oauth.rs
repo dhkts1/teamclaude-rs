@@ -1321,29 +1321,33 @@ mod tests {
     #[test]
     fn login_refuses_over_proxy_command_lines_but_allows_an_unrelated_holder() {
         use crate::singleton::is_proxy_server;
-        // The real chain: a port holder blocks login IFF its command line is a
+        // The real chain: a port holder blocks login IFF its argv is a
         // recognized tcr/teamclaude *server*. Compose the pure classifier with the
-        // pure guard decision — refuse / refuse / allow.
-        let refuses = |cmd: &str| {
-            let server = singleton::classify_proxy_server(cmd)
+        // pure guard decision — refuse / refuse / allow. Argv, not a joined
+        // command line: `singleton::classify_proxy_server` takes pre-split argv
+        // (as `sysinfo::Process::cmd()` returns it) so a space in an executable's
+        // path can never be re-split into the wrong tokens.
+        let refuses = |cmd: &[&str]| {
+            let argv: Vec<String> = cmd.iter().map(|s| s.to_string()).collect();
+            let server = singleton::classify_proxy_server(&argv)
                 .map(|kind| singleton::Incumbent { pid: 4242, kind });
             assert_eq!(
                 server.is_some(),
-                is_proxy_server(cmd),
-                "the bool and the classifying form must agree: {cmd}"
+                is_proxy_server(&argv),
+                "the bool and the classifying form must agree: {cmd:?}"
             );
             login_guard_refusal(server, 3456, false).is_some()
         };
         assert!(
-            refuses("/opt/teamclaude-rs/target/release/tcr server"),
+            refuses(&["/opt/teamclaude-rs/target/release/tcr", "server"]),
             "a live tcr server must block login"
         );
         assert!(
-            refuses("node /opt/nvm/bin/teamclaude server"),
+            refuses(&["node", "/opt/nvm/bin/teamclaude", "server"]),
             "a live JS teamclaude server must block login"
         );
         assert!(
-            !refuses("python3 -m http.server 3456"),
+            !refuses(&["python3", "-m", "http.server", "3456"]),
             "an unrelated process on the port must NOT block login"
         );
     }
