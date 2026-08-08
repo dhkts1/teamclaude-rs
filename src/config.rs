@@ -291,16 +291,23 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // filesystem, and `rename(2)` across filesystems fails with `EXDEV` — which
     // would silently cost us the atomic swap this function exists to provide.
     //
-    // The unique temp name is now the crate's job (finding #6): it opens with
-    // `O_EXCL` and retries on collision, so two concurrent saves (e.g. `probe_all`
-    // refreshing several expired accounts at once) can never open and truncate the
-    // SAME temp file and interleave into a corrupt write. That is a stronger
-    // guarantee than the pid+counter name this replaced: exclusivity is enforced
-    // by the kernel at open time rather than by a naming scheme being right. The
-    // old scheme was in fact not right — a crash left `.teamclaude.json.<pid>.0.tmp`
-    // behind, and once that pid recycled the successor's counter restarted at 0
-    // and `create(true).truncate(true)` reopened the collided path happily. That
-    // is precisely the interleave finding #6 was written against.
+    // The unique temp name is now the crate's job (finding #6): two concurrent
+    // saves (e.g. `probe_all` refreshing several expired accounts at once) must
+    // never open and truncate the SAME temp file and interleave into a corrupt
+    // write. The `.{name}.{pid}.{seq}.tmp` scheme this replaced was already sound
+    // for that — a live pid is unique and the counter is unique within it — so on
+    // the concurrency property alone this is a lateral move.
+    //
+    // What it genuinely buys is a different, previously undocumented property.
+    // The old open was `create(true).truncate(true)` — no `O_EXCL`, so it FOLLOWED
+    // SYMLINKS — on a fully predictable path. Anyone able to create a file in the
+    // config dir could pre-plant that path as a symlink and have a token refresh
+    // write live OAuth credentials into a file of their choosing. Measured: the
+    // old open succeeds and writes through the symlink; `create_new` (`O_EXCL`)
+    // refuses with AlreadyExists. `O_EXCL` also guarantees a FRESH inode, which
+    // matters because `open(2)` applies its `mode` argument only on creation — the
+    // old code's `.mode(0o600)` was silently ignored whenever the path already
+    // existed (measured: a pre-existing 0666 file stays 0666).
     let mut file = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o600))
         .tempfile_in(dir)?;
@@ -315,10 +322,16 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
     // rename, so the destination's old inode — and its mode — are gone. This
     // cannot tighten anything.
     //
-    // It is here because the create mode above is `0600 & ~umask`. Under a
-    // restrictive umask the file lands 0400, and a later `save_tokens` has to
-    // REOPEN this file for writing. Pinning the mode keeps that deterministic
-    // rather than umask-dependent.
+    // Nor is it needed for a later write: nothing here ever reopens a state file
+    // for writing — every save is a fresh temp plus a rename, and `rename(2)`
+    // needs permission on the DIRECTORY, not on the destination file. A 0400
+    // config is rewritten perfectly (measured).
+    //
+    // It survives as a NORMALISATION, not a guard: the create mode above is
+    // `0600 & ~umask`, so under a restrictive umask the file would land 0400 —
+    // still correct, but surprising for a file the user is invited to hand-edit
+    // when it goes corrupt. This keeps the mode from varying with the operator's
+    // umask.
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
