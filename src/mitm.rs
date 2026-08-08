@@ -8,7 +8,7 @@
 //!   1. A client sends `CONNECT <host>:<port>`. We peek the request line.
 //!   2. `api.anthropic.com` (+ the OAuth hosts) is MITM-terminated: we reply
 //!      `200 Connection Established`, TLS-accept with our leaf (a cert the client
-//!      already trusts via its CA), then serve HTTP/1.1 over the TLS stream
+//!      already trusts via its CA), then serve HTTP over the TLS stream
 //!      through the SAME axum router as base-URL mode — authenticate, select an
 //!      account, inject the pooled `Bearer`, forward to the real upstream.
 //!   3. Every OTHER host is **blind-tunneled**: a raw TCP byte-pipe to
@@ -296,9 +296,20 @@ fn generate_chain(hosts: &[&str]) -> anyhow::Result<(String, String, String)> {
     Ok((ca_cert.pem(), leaf_cert.pem(), leaf_key.serialize_pem()))
 }
 
+/// Write `data` to `path` at exactly `mode`, whether or not `path` already exists.
+///
+/// The `.mode()` on the open is what keeps a freshly-created key from ever being
+/// visible at a wider mode, even momentarily. It is NOT sufficient on its own:
+/// `OpenOptionsExt::mode()` applies only to the creating open and is ignored
+/// outright when the file already exists, so a stale `tcr-leaf.key` left at `0644`
+/// by an older build, an interrupted write, a restore, or a umask accident would
+/// survive regeneration world-readable — a readable MITM private key lets anything
+/// holding it impersonate every host this proxy intercepts. Hence the post-write
+/// re-assert, the same belt-and-braces `crate::config` uses on its token file.
 fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -306,6 +317,7 @@ fn write_file(path: &Path, data: &[u8], mode: u32) -> io::Result<()> {
         .mode(mode)
         .open(path)?;
     file.write_all(data)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(())
 }
 
@@ -378,7 +390,9 @@ async fn handle_conn(
     if peek_is_connect(&stream).await? {
         handle_connect(stream, peer, manager, tls).await
     } else {
-        // Base-URL mode: plain HTTP/1.1 straight through the router, unchanged.
+        // Base-URL mode: cleartext straight through the router. `serve_http`
+        // auto-negotiates, so an h2-prior-knowledge client is served as h2 here
+        // and everything else stays h1.
         serve_http(stream, peer, manager).await;
         Ok(())
     }
@@ -410,7 +424,10 @@ async fn peek_is_connect(stream: &TcpStream) -> io::Result<bool> {
 }
 
 /// Handle a `CONNECT`: read the request head, enforce the allowlist, reply `200`,
-/// TLS-accept, and serve the decrypted HTTP/1.1 through the router.
+/// TLS-accept, and serve the decrypted traffic through the router. `serve_http`
+/// auto-negotiates, but this path is h1 in practice: [`build_acceptor`]'s rustls
+/// `ServerConfig` advertises no ALPN protocols, so a client is never offered `h2`
+/// on this handshake.
 async fn handle_connect(
     mut stream: TcpStream,
     peer: SocketAddr,
@@ -502,16 +519,31 @@ async fn read_request_head(stream: &mut TcpStream) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Serve HTTP/1.1 over `io` (a raw TCP stream for base-URL mode, or a terminated
-/// TLS stream for MITM) through the existing axum router — same auth, rotation,
+/// Serve HTTP over `io` through the existing axum router — same auth, rotation,
 /// injection, and streaming for both entry points.
+///
+/// THE single serving function: both call sites land here — [`handle_conn`]'s
+/// base-URL branch with a raw TCP stream, and [`handle_connect`] with a
+/// TLS-terminated MITM stream. Anything changed here changes both paths.
+///
+/// The protocol is auto-negotiated (h1, or h2 via ALPN / cleartext prior
+/// knowledge), not fixed at HTTP/1.1. In practice the two paths differ:
+/// base-URL clients can reach h2 through prior knowledge, while MITM-terminated
+/// CONNECT traffic stays h1 because the rustls `ServerConfig` built in
+/// [`build_acceptor`] advertises no ALPN protocols, so `h2` is never offered on
+/// that handshake.
 async fn serve_http<I>(io: I, peer: SocketAddr, manager: Arc<Manager>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Session affinity (opt-in): when enabled, mint ONE session key for this whole
-    // connection (= one `claude` session, since the server is HTTP/1.1: one CONNECT
-    // tunnel is one process). The key's PRESENCE is what switches affinity on for
+    // connection (= one `claude` session: one CONNECT tunnel is one process). The
+    // "one connection is one session" premise used to rest on the server being
+    // HTTP/1.1; it now rests on the connection, which is the property that actually
+    // matters — every request multiplexed over one connection shares this key, on h1
+    // and h2 alike. The MITM path is h1 regardless (no ALPN advertised, see
+    // `build_acceptor`); a base-URL h2 client simply pins all its streams together.
+    // The key's PRESENCE is what switches affinity on for
     // this connection's requests; the routing key itself is always derived from a
     // stable client identity in `proxy::stable_session_key` (no stable identity →
     // the request routes unpinned). The affinity map is bounded by a size cap + LRU
@@ -539,6 +571,15 @@ where
         });
     // Auto-negotiating builder (h1 or h2 via ALPN/prior-knowledge detection) so
     // base-URL clients that support h2 aren't forced down to h1.
+    //
+    // Resource limit worth knowing about: the h2 half carries hyper's default
+    // `max_concurrent_streams: Some(200)` (hyper 1.11.0
+    // `src/proto/h2/server.rs:69`, applied at :143), which hyper-util's `auto`
+    // builder inherits by constructing a stock `http2::Builder`. So a single h2
+    // connection is capped at 200 concurrent streams — a ceiling the base-URL path
+    // did not have while it was h1-only, where concurrency was bounded by the
+    // client's connection count instead. Left at hyper's default deliberately;
+    // raise it with `.http2().max_concurrent_streams(n)` if a client ever hits it.
     if let Err(err) =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
             .serve_connection(hyper_util::rt::TokioIo::new(io), service)
@@ -551,6 +592,41 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `write_file`'s `mode` must be enforced when the destination ALREADY exists,
+    /// not only when it is created. `OpenOptionsExt::mode()` applies solely to the
+    /// creating open, so without a post-write `set_permissions` a pre-existing
+    /// `tcr-leaf.key` at `0644` — an older build, an interrupted write, a restore,
+    /// a umask accident — survives regeneration world-readable while the call site
+    /// reads as though it asked for `0600`. That file is the MITM leaf's private
+    /// key: anything that can read it can impersonate every intercepted host.
+    #[test]
+    fn write_file_enforces_mode_on_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-mitm-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tcr-leaf.key");
+
+        // Pre-create the destination at a looser mode, as a stale artifact would be.
+        std::fs::write(&path, b"stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_file(&path, b"fresh key material", 0o600).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "an overwritten private key must end up at 0600, got {mode:o}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"fresh key material");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A minted chain must be reused on the next load. Re-minting silently
     /// invalidates the `NODE_EXTRA_CA_CERTS` the user exported after the first
@@ -789,7 +865,14 @@ mod tests {
                 };
                 let manager = manager.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, peer, manager, None).await;
+                    // Same shape as the production accept loop in
+                    // `serve_with_shutdown`: a connection error is non-fatal but is
+                    // never swallowed silently, so a test that fails because the
+                    // connection died has the reason in the captured log rather
+                    // than presenting as an unexplained client-side error.
+                    if let Err(err) = handle_conn(stream, peer, manager, None).await {
+                        tracing::debug!(error = %err, "connection ended with error");
+                    }
                 });
             }
         });
