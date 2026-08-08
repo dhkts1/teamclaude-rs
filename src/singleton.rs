@@ -41,10 +41,14 @@
 //! [`classify_port_owner`] is consulted BEFORE the name matcher. Identity becomes
 //! the proxy's own claim instead of an inference from someone else's `argv`.
 //!
-//! Two properties keep that from being a new way to get it wrong:
+//! Three properties keep that from being a new way to get it wrong:
 //! - **A stale file proves nothing.** The pid it names must ALSO appear in
 //!   `port_listeners(port)` (and the port must match) or the claim is ignored
 //!   entirely — a crashed proxy, or anyone at all, can leave a file behind.
+//! - **A claim SUPPLEMENTS the command check, it never replaces it.** A `cli`
+//!   claim is believed only when the command line ALSO says its pid is a proxy,
+//!   so "command-verified" above still holds on the claim path; a pid the OS
+//!   recycled onto an unrelated listener is not signalled. See [`verified_owner`].
 //! - **The name matcher is RETAINED as the fallback**, so a `tcr` that predates
 //!   the owner file (including one serving right now) and a `LegacyJs` proxy —
 //!   which will never write one — are recognized exactly as before. Nothing has
@@ -190,30 +194,78 @@ fn read_owner_file(path: &Path) -> Option<ProxyOwner> {
 }
 
 /// The claim's VERIFICATION, as a pure function: a claim counts only when it is
-/// for this `port` and its pid is one of the processes actually listening on it.
+/// for this `port`, its pid is one of the processes actually listening on it,
+/// AND — for a claim that says it is CLI-hosted — that pid's command line is
+/// still a proxy server.
 ///
 /// This is the check that makes the owner file safe to trust. Without it the file
 /// is a lie anyone can plant: any process could write `{"pid":<live proxy>,…}`
 /// and change what `tcr` does about the port, and every crashed proxy would leave
 /// behind a claim that outlives it and protects a pid the OS has since recycled
 /// onto something unrelated.
-fn verified_owner(owner: Option<&ProxyOwner>, port: u16, holders: &[u32]) -> Option<Incumbent> {
+///
+/// # A claim SUPPLEMENTS the command check; it never replaces it
+///
+/// The pid check alone is not enough, and the difference is a killed process. A
+/// crashed `tcr` leaves `{"pid":5150,"host":"cli"}` behind; months later pid 5150
+/// is someone's dev server listening on the same port. `pid ∈ holders` holds, so
+/// a claim-trusting reader calls it a `tcr` peer and `tcr --replace` SIGTERMs it,
+/// then SIGKILLs it 800ms later. The module's "command-verified" property (see the
+/// module doc) has to hold on the claim path too, so a `cli` claim is believed
+/// only when [`classify_proxy_server`] ALSO recognizes the pid. The claim's job is
+/// to say WHICH proxy it is and that it is ours; only the command line can say
+/// that the pid is still a proxy at all.
+///
+/// # The one asymmetry, and why it is safe
+///
+/// An `embedded` claim cannot be command-verified — by construction: the pid is
+/// the HOST application's and its `argv[0]` matches nothing, which is the entire
+/// reason this file exists. So an embedded claim is believed on the pid check
+/// alone, and that is deliberate: a false positive there can only ever make this
+/// process STAND DOWN (an embedded incumbent is never signalled, on any path —
+/// [`incumbents_to_signal`]), while a false positive on a CLI claim is a kill. The
+/// unverifiable case is the one whose worst outcome is refusing to act.
+fn verified_owner(
+    owner: Option<&ProxyOwner>,
+    port: u16,
+    holders: &[u32],
+    command: impl Fn(u32) -> String,
+) -> Option<Incumbent> {
     let owner = owner?;
-    (owner.port == port && holders.contains(&owner.pid)).then(|| Incumbent {
+    if owner.port != port || !holders.contains(&owner.pid) {
+        return None;
+    }
+    let kind = owner.host.kind();
+    if owner.host == ProxyHost::Cli && classify_proxy_server(&command(owner.pid)).is_none() {
+        tracing::warn!(
+            pid = owner.pid,
+            port,
+            "ignoring a cli-hosted port claim whose pid is not running a proxy: the claim is \
+             stale and the OS has recycled that pid onto something else"
+        );
+        return None;
+    }
+    Some(Incumbent {
         pid: owner.pid,
-        kind: owner.host.kind(),
+        kind,
     })
 }
 
 /// The owner file at `owner_path`, verified against the processes actually
-/// holding `port`. `None` when there is no claim, the claim is for another port,
-/// or its pid is not listening — in every one of those cases the caller falls
-/// back to the name matcher.
+/// holding `port` and against the claimed pid's command line. `None` when there is
+/// no claim, the claim is for another port, its pid is not listening, or a
+/// CLI-hosted claim names a pid that is not a proxy — in every one of those cases
+/// the caller falls back to the name matcher.
 ///
-/// `holders` and `owner_path` are parameters rather than read in here so this is
-/// testable against a real file without a real proxy.
-pub fn classify_port_owner(port: u16, holders: &[u32], owner_path: &Path) -> Option<Incumbent> {
-    verified_owner(read_owner_file(owner_path).as_ref(), port, holders)
+/// `holders`, `owner_path` and `command` are parameters rather than read in here
+/// so this is testable against a real file without a real proxy.
+pub fn classify_port_owner(
+    port: u16,
+    holders: &[u32],
+    owner_path: &Path,
+    command: impl Fn(u32) -> String,
+) -> Option<Incumbent> {
+    verified_owner(read_owner_file(owner_path).as_ref(), port, holders, command)
 }
 
 /// A recognized, replaceable proxy holding the port.
@@ -314,8 +366,11 @@ pub fn replaceable_incumbents(
 /// for an embedded proxy that inference is wrong in the dangerous direction (it
 /// recognizes nothing at all). Where both speak, the claim wins.
 ///
-/// `owner` must already be verified against the live listeners; pass the result of
-/// [`classify_port_owner`], never a raw file read.
+/// `owner` must already be verified against the live listeners AND (for a `cli`
+/// claim) against the pid's command line; pass the result of
+/// [`classify_port_owner`], never a raw file read. That is what keeps this
+/// short-circuit from being a way around the command check — by the time a claim
+/// arrives here, the command check has already had its say.
 pub fn replaceable_incumbents_with_owner(
     holders: &[u32],
     self_pid: u32,
@@ -343,7 +398,7 @@ pub fn replaceable_incumbents_with_owner(
 /// port is free or held only by a non-proxy process.
 pub fn live_proxy_server(port: u16) -> Option<u32> {
     let holders = port_listeners(port);
-    let owner = classify_port_owner(port, &holders, &default_owner_path(port));
+    let owner = classify_port_owner(port, &holders, &default_owner_path(port), process_command);
     replaceable_incumbents_with_owner(&holders, std::process::id(), process_command, owner)
         .into_iter()
         .next()
@@ -497,7 +552,7 @@ fn embedded_stand_down_message(port: u16, pid: u32) -> String {
 #[must_use = "the caller must exit instead of binding on IncumbentPresent"]
 pub fn takeover_port(port: u16, replace: bool) -> Takeover {
     let holders = port_listeners(port);
-    let owner = classify_port_owner(port, &holders, &default_owner_path(port));
+    let owner = classify_port_owner(port, &holders, &default_owner_path(port), process_command);
     let replaceable =
         replaceable_incumbents_with_owner(&holders, std::process::id(), process_command, owner);
 
@@ -624,6 +679,16 @@ mod tests {
     /// matcher, which is the entire reason the owner file exists.
     const HOST_APP_COMMAND: &str = "/Applications/TcrBar.app/Contents/MacOS/TcrBar";
 
+    /// An unrelated program listening on the port — what a recycled pid actually
+    /// runs. Not a proxy by any reading of its command line.
+    const DEV_SERVER_COMMAND: &str = "/usr/local/bin/node /srv/app/dev-server.js";
+
+    /// The command line of a real CLI-hosted proxy, for the tests that need the
+    /// claim's pid to survive the command check.
+    fn tcr_command(_pid: u32) -> String {
+        "/x/tcr server".to_string()
+    }
+
     /// A unique scratch dir for a claim file. Never [`default_owner_path`] — that
     /// one is the live proxy's, and `tcr login` reads it.
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -672,25 +737,25 @@ mod tests {
         // that its pid holds nothing.
         assert!(path.exists());
         assert_eq!(
-            classify_port_owner(4444, &[], &path),
+            classify_port_owner(4444, &[], &path, tcr_command),
             None,
             "a claim with no live listener at all must be ignored"
         );
         assert_eq!(
-            classify_port_owner(4444, &[9999, 8888], &path),
+            classify_port_owner(4444, &[9999, 8888], &path, tcr_command),
             None,
             "a claim whose pid is not among the port's listeners must be ignored"
         );
         // And the positive control, so the assertions above cannot be passing for
         // the boring reason that this function always returns None.
         assert_eq!(
-            classify_port_owner(4444, &[9999, 4242], &path),
+            classify_port_owner(4444, &[9999, 4242], &path, tcr_command),
             Some(embedded(4242)),
             "a claim whose pid IS listening is the one case that counts"
         );
         // A claim for a different port is not this port's claim either.
         assert_eq!(
-            classify_port_owner(4445, &[4242], &path),
+            classify_port_owner(4445, &[4242], &path, tcr_command),
             None,
             "the port in the file must match the port being resolved"
         );
@@ -698,7 +763,7 @@ mod tests {
         // A stale claim does not even suppress the fallback: the name matcher
         // still gets its turn, so a `tcr` predating the owner file is recognized.
         let command = |_pid: u32| "/x/tcr server".to_string();
-        let owner = classify_port_owner(4444, &[7777], &path);
+        let owner = classify_port_owner(4444, &[7777], &path, command);
         assert_eq!(
             replaceable_incumbents_with_owner(&[7777], 1, command, owner),
             vec![tcr(7777)],
@@ -725,8 +790,8 @@ mod tests {
 
         let dir = scratch_dir("embedded");
         let path = write_claim(&dir, 3456, 5150, ProxyHost::Embedded);
-        let owner = classify_port_owner(3456, &[5150], &path);
         let command = |_pid: u32| HOST_APP_COMMAND.to_string();
+        let owner = classify_port_owner(3456, &[5150], &path, command);
 
         assert_eq!(
             replaceable_incumbents_with_owner(&[5150], 1, command, owner),
@@ -747,10 +812,60 @@ mod tests {
         let dir = scratch_dir("cli");
         let path = write_claim(&dir, 3456, 1234, ProxyHost::Cli);
         assert_eq!(
-            classify_port_owner(3456, &[1234], &path),
+            classify_port_owner(3456, &[1234], &path, tcr_command),
             Some(tcr(1234)),
             "a CLI-hosted claim is the same kind the name matcher would produce"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE SECOND FALSE-POSITIVE CONTROL, and the one that stands between a stale
+    /// claim and a SIGKILL to an innocent process: the claimed pid IS listening on
+    /// the port — it is simply not a proxy.
+    ///
+    /// The stale-file test above only covers "the pid is not listening", which a
+    /// recycled pid passes trivially. The scenario that costs someone their unsaved
+    /// state is the other one: `tcr` is SIGKILLed leaving a `cli` claim behind,
+    /// months later that pid is a dev server on the same port, and a reader that
+    /// treats the claim as sufficient hands it to the kill loop. `verified_owner`
+    /// must ask `ps` before believing a `cli` claim, and the pid must then survive
+    /// to the very end of the chain unrecognized — `replaceable_incumbents_with_owner`
+    /// is what `takeover_port` iterates to choose whom to signal.
+    #[test]
+    fn a_cli_claim_whose_listening_pid_is_not_a_proxy_is_ignored() {
+        let dir = scratch_dir("recycled-pid");
+        let path = write_claim(&dir, 3456, 5150, ProxyHost::Cli);
+        let dev_server = |_pid: u32| DEV_SERVER_COMMAND.to_string();
+
+        assert_eq!(
+            classify_proxy_server(DEV_SERVER_COMMAND),
+            None,
+            "the fixture is only meaningful if the command line is genuinely not a proxy"
+        );
+        assert_eq!(
+            classify_port_owner(3456, &[5150], &path, dev_server),
+            None,
+            "a cli claim naming a pid that is not running a proxy is a stale claim on a \
+             recycled pid, not an incumbent"
+        );
+        // The positive control: the SAME claim, same pid, same holders — only the
+        // command line differs. So the None above is the command check, not the
+        // function refusing everything.
+        assert_eq!(
+            classify_port_owner(3456, &[5150], &path, tcr_command),
+            Some(tcr(5150)),
+            "the same claim IS believed when the pid is still running a proxy"
+        );
+
+        // End to end: the pid reaches the takeover chain as nothing at all, so
+        // there is no incumbent for --replace to SIGTERM.
+        let owner = classify_port_owner(3456, &[5150], &path, dev_server);
+        assert_eq!(
+            replaceable_incumbents_with_owner(&[5150], 1, dev_server, owner),
+            vec![],
+            "an unrelated listener on the port must never become a replaceable incumbent"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -783,7 +898,7 @@ mod tests {
                 p
             }),
         ] {
-            let owner = classify_port_owner(3456, &[222], &path);
+            let owner = classify_port_owner(3456, &[222], &path, command);
             assert_eq!(owner, None, "{label} is not a claim");
             assert_eq!(
                 replaceable_incumbents_with_owner(&[222], 1, command, owner),
