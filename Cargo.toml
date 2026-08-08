@@ -81,6 +81,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2.2.0"
 rcgen = "0.14.8"
+tracing-appender = "0.2.5"
 tempfile = "3.27"
 
 [profile.release]

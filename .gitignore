@@ -31,6 +31,15 @@ ca.*
 
 # ── Logs & runtime captures ──────────────────────────────────
 *.log
+# `*.log` alone does not match tracing-appender's rotated shape, which
+# suffixes rather than extends the name: `teamclaude-rs.log.2026-08-08` ends
+# in the date, not `.log`, and account emails + request paths live in it. The
+# trailing dot below is deliberate: `teamclaude-rs.log.*` matches only names
+# that continue PAST `.log` (the rotated date suffixes) and leaves the bare
+# `teamclaude-rs.log` to the pre-existing `*.log` rule above — a bare `*`
+# here would also swallow an unrelated future source file like
+# `teamclaude-rs.logic.rs`, which must never be silently ignored.
+teamclaude-rs.log.*
 *.jsonl
 tcr-capture*
 /tmp-capture/
