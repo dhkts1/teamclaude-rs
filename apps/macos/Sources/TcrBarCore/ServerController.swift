@@ -560,6 +560,39 @@ public final class ServerController: ObservableObject {
 final class ChildStderr: @unchecked Sendable {
     private let handle: FileHandle
     private let buffer = LockedString()
+    private let streaming: Bool
+
+    /// Signalled by the streaming callback when it reaches EOF, and waited on by
+    /// ``finish()``. Draining the pipe is not enough on its own: the callback that
+    /// took the child's bytes out of the pipe runs on Foundation's queue, and
+    /// `readabilityHandler = nil` does not wait for a callback already inside its
+    /// body. A callback that has returned from `availableData` but not yet reached
+    /// `buffer.append` holds the entire message in a local — invisible to both the
+    /// buffer and the pipe. `finish()` then drains an empty pipe and returns an
+    /// empty buffer while the bytes are in flight, which is why the loss is
+    /// all-or-nothing rather than a truncated tail.
+    ///
+    /// Measured on this machine, unchanged test, 1000 spawns: 9 empty. With a 50ms
+    /// delay inserted between `availableData` and `append` — which only widens the
+    /// window, it does not create it — 19 of 20 empty. With this wait: 0 of 2000,
+    /// and 0 of 20 under the same 50ms delay.
+    ///
+    /// Foundation serialises one handle's readability callbacks, so the EOF
+    /// callback cannot overtake the data callback that precedes it. Waiting for
+    /// EOF therefore happens-after every `append`. That ordering is what makes this
+    /// a fix rather than a narrower window.
+    private let drained = DispatchSemaphore(value: 0)
+
+    /// How long ``finish()`` will wait for that EOF before giving up.
+    ///
+    /// Bounded, because EOF needs every writer to close: a child that forked a
+    /// grandchild holding the inherited write end would never produce one, and an
+    /// unbounded wait would hang `terminationHandler` — trading lost stderr for a
+    /// UI that never leaves `.supervising`. On expiry the behaviour degrades to
+    /// exactly what it was before this wait existed, never worse. `tcr server`
+    /// forks nothing, so the timeout is a backstop, not a code path: the wait
+    /// measured at most 12ms over 2000 spawns.
+    private static let eofWait: DispatchTimeInterval = .seconds(2)
 
     /// - Parameter installReadabilityHandler: false only in tests. It reproduces,
     ///   deterministically, the state the race produces by accident — bytes in the
@@ -567,10 +600,18 @@ final class ChildStderr: @unchecked Sendable {
     ///   here fails every run rather than one run in forty.
     init(reading pipe: Pipe, installReadabilityHandler: Bool = true) {
         handle = pipe.fileHandleForReading
+        streaming = installReadabilityHandler
         guard installReadabilityHandler else { return }
-        handle.readabilityHandler = { [buffer] handle in
+        handle.readabilityHandler = { [buffer, drained] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            // Empty means EOF: the child exited and every writer has closed. It is
+            // delivered after the callbacks carrying the data, so signalling here
+            // tells `finish()` that nothing is still in flight.
+            guard !data.isEmpty else {
+                drained.signal()
+                return
+            }
+            guard let text = String(data: data, encoding: .utf8) else { return }
             buffer.append(text)
         }
     }
@@ -583,6 +624,10 @@ final class ChildStderr: @unchecked Sendable {
     /// principle interleave two chunks out of order; every consumer of this string
     /// is a substring match, so ordering is not load-bearing.
     func finish() -> String {
+        // Let the streaming reader finish handing over what it already took out of
+        // the pipe. Without this the drain below can run while the child's only
+        // chunk sits in a callback local, and this returns "". See ``drained``.
+        if streaming { _ = drained.wait(timeout: .now() + Self.eofWait) }
         handle.readabilityHandler = nil
         if let tail = try? handle.readToEnd(), !tail.isEmpty,
             let text = String(data: tail, encoding: .utf8)
