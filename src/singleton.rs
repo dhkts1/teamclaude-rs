@@ -24,9 +24,12 @@
 //!   anything else) on another PORT is never touched, and a test server on an
 //!   ephemeral port is safe.
 //! - **Command-verified.** A candidate is signalled only if its command line is an
-//!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone (the bind
-//!   then fails loudly with EADDRINUSE) rather than killed. This is what makes the
-//!   takeover safe against a reused PID or an unrelated process on the port.
+//!   actual `teamclaude`/`tcr` *server*. A non-proxy holder is left alone rather
+//!   than killed — the bind then fails loudly with EADDRINUSE if that holder
+//!   shares our bind address (in practice, loopback), but not necessarily
+//!   otherwise; see [`port_listeners`]'s doc for the measured gap. This is what
+//!   makes the takeover safe against a reused PID or an unrelated process on
+//!   the port, whether or not the bind itself ends up refusing.
 //!
 //! # Identity: the owner file, then the name matcher
 //!
@@ -449,16 +452,33 @@ fn process_command(pid: u32) -> Vec<String> {
 /// [`listeners::get_all`] degrades to no signal, and to binding anyway; it is
 /// not "no takeover" either: [`takeover_decision`]`(&[], _)` is
 /// `Takeover::Proceed`. That is safe for two of the three callers and not for
-/// the third. [`takeover_port`] and `server.rs`'s boot path both then actually
-/// BIND, so the kernel is the backstop — a second listener on a genuinely held
-/// port cannot come up, and the bind fails loudly with EADDRINUSE instead of us
-/// having signalled anything. `oauth::login`'s guard binds nothing, so it never
-/// meets that backstop: on an enumeration failure it proceeds beside a live
-/// server it failed to detect, and the server's next `persist_tokens` writes its
-/// boot-time tokens back over the ones the login just wrote, clobbering the
-/// single-use refresh tokens (observed live 2026-07-19, see `oauth.rs:788-793`).
-/// "Never a false kill" is true and load-bearing throughout; "no takeover" is
-/// only true where a bind stands behind it.
+/// the third, and only PARTIALLY safe even there. [`takeover_port`] and
+/// `server.rs`'s boot path both then actually BIND, and `EADDRINUSE` is a
+/// property of the `(address, port)` PAIR, not the port: a second bind on the
+/// SAME address as a listening incumbent refuses with `EADDRINUSE`. On this
+/// machine, a bind on a DIFFERENT address against a WILDCARD incumbent
+/// (`0.0.0.0` or `::`) instead SUCCEEDED (`std::net::TcpListener::bind`, no
+/// `SO_REUSEADDR` set explicitly) — TODO: unverified whether that holds on
+/// every platform this crate ships to. So the backstop reliably catches only a
+/// loopback-bound incumbent — in practice another `tcr`, which hard-codes
+/// `127.0.0.1` (`server.rs:784`) — and its coverage of a wildcard-bound one,
+/// which this module's own doc (`:22`) already lists as a candidate, is not
+/// guaranteed. Against a wildcard incumbent that a bind does not collide
+/// with, an enumeration failure means we could end up bound ALONGSIDE it,
+/// silently, risking the two proxies token-war. This gap is inherited, not
+/// introduced by the dedup or logging above: neither the old `lsof` scan nor
+/// the new one filters by address, so a working scan already sees and
+/// handles a wildcard holder — only the failure-collapse path lets one slip
+/// past unbound-against. Empty on enumeration failure is unchanged by any of
+/// this — "never a false kill" is still true and load-bearing throughout —
+/// but "no takeover" is not a consequence of it, and where a bind fails to
+/// actually refuse depends on the incumbent's address, not merely on the
+/// port being held. `oauth::login`'s
+/// guard binds nothing at all, so no backstop of any strength applies to it:
+/// on an enumeration failure it proceeds beside a live server it failed to
+/// detect, and the server's next `persist_tokens` writes its boot-time tokens
+/// back over the ones the login just wrote, clobbering the single-use refresh
+/// tokens (observed live 2026-07-19, see `oauth.rs:788-793`).
 ///
 /// Empty-on-failure is parity with the old `lsof`-based implementation only on
 /// the `Err` path — `lsof` exiting 1 on a real failure and on an ordinary free
@@ -517,16 +537,11 @@ fn process_command(pid: u32) -> Vec<String> {
 /// read the first element as *the* incumbent to report, and reordering holders
 /// would change which one that is.
 ///
-/// On Linux specifically there is also the opposite divergence, worth knowing
-/// even though it needs no fix here: `listeners`' Linux backend keys its
-/// inode→process map with plain last-writer-wins `HashMap::insert`
-/// (`platform/linux/helpers.rs:53-54`), so a listening fd shared across a FORK
-/// FAMILY collapses to whichever pid that scan visits last — never the multiple
-/// entries macOS produces by iterating per-pid × per-fd. Under `--replace` this
-/// can signal a worker and leave the parent holding the port, which then makes
-/// our own bind fail with EADDRINUSE despite having "replaced" the incumbent.
-/// CI cannot see this: the `ci` job runs on `ubuntu-latest`, the affected
-/// backend, but nothing in this crate forks a listening child to exercise it.
+/// Opposite divergence on Linux, needing no fix here: that backend's
+/// inode→process map uses last-writer-wins `HashMap::insert`
+/// (`platform/linux/helpers.rs:53-54`), so a listening fd shared across a fork
+/// family collapses to one pid rather than macOS's several — untested by CI
+/// despite running on `ubuntu-latest`, since nothing here forks a listener.
 fn port_listeners(port: u16) -> Vec<u32> {
     let mut seen = HashSet::new();
     let all = match listeners::get_all() {
@@ -836,7 +851,10 @@ fn embedded_stand_down_message(port: u16, pid: u32) -> String {
 /// DEFAULT — a `tcr` incumbent is reported and left running, and the caller is
 /// told to exit rather than bind; a LEGACY JS incumbent is still replaced, since
 /// displacing it is what this module is for. A non-proxy holder is reported and
-/// LEFT ALONE in every case (the bind then fails loudly with EADDRINUSE).
+/// LEFT ALONE in every case — the bind then fails loudly with EADDRINUSE if
+/// that holder shares our bind address (in practice, loopback); against a
+/// wildcard-bound holder the bind is not guaranteed to refuse, see
+/// [`port_listeners`]'s doc for the measured gap.
 #[must_use = "the caller must exit instead of binding on IncumbentPresent"]
 pub fn takeover_port(port: u16, replace: bool) -> Takeover {
     let holders = port_listeners(port);
@@ -1776,7 +1794,9 @@ mod tests {
             incumbents_to_signal(&[legacy_js(111)], false),
             vec![legacy_js(111)],
             "proceeding past a JS incumbent means SIGNALLING it — leaving it \
-             running would land the bind on EADDRINUSE instead"
+             running risks the two proxies token-warring instead, not \
+             necessarily a loud EADDRINUSE; see `port_listeners`' doc on the \
+             wildcard gap"
         );
     }
 
