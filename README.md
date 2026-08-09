@@ -86,6 +86,91 @@ tcr run -- <args>   # launch `claude` already pointed at the proxy
 
 Then either export `ANTHROPIC_BASE_URL` / `HTTPS_PROXY` as above, or use `tcr run`.
 
+## TcrBar — the menu bar app (macOS)
+
+`apps/macos` is a native front end over the same `tcr status --json` the TUI
+reads. The menu-bar item is the whole app — no Dock icon, no window
+(`LSUIElement`). The glyph carries fleet capacity at a glance; the dropdown
+carries the detail: per-account quota bars, whether each account is in the
+rotation, the countdown to the next reset on a held account, and probe health.
+
+It polls every 3 seconds and never renders a blank list. `tcr` missing, the poll
+failing (usually: no server), and an offline read whose counters are
+structurally zero are three different facts, and each gets its own banner — an
+operator who cannot tell them apart will misread the panel.
+
+It can also supervise the proxy. "Start server at launch" runs
+`tcr server --no-replace`, so a proxy that is already serving is never
+disturbed; the flip side is that quitting TcrBar then stops the server it
+started, which the footer says before you tick the box. "Take over port…" is the
+deliberate exception — it replaces an incumbent proxy, which wipes the
+session-to-account pin map — so it sits below its own rule, away from the row
+your hand is already in, and asks first.
+
+```sh
+apps/macos/scripts/install.sh     # build, sign, install to /Applications, launch
+apps/macos/scripts/uninstall.sh   # remove it
+```
+
+To try a local build without losing the one you use, install it as a separate
+app:
+
+```sh
+TCRBAR_DEV_BUILD=1 apps/macos/scripts/install.sh   # -> /Applications/TcrBar Dev.app
+```
+
+That gives the dev build its own bundle id as well as its own path, and both
+matter: macOS keys the menu-bar status item on the bundle id, and two processes
+registering the same one get that id blacklisted by ControlCenter — permanently,
+across reboots.
+
+### Design tokens
+
+The palette is generated, not picked by eye. `scripts/tcrbar-palette.py` authors
+it in OKLCH, converts to sRGB, rejects anything out of gamut, and measures WCAG
+contrast against the surface each colour is actually drawn on — in all four
+appearances (light, dark, and an increased-contrast variant of each). A token
+that fails is a build error rather than a matter of taste.
+
+The same generator emits the palette for anything designed outside the app:
+
+```sh
+python3 scripts/tcrbar-palette.py \
+  --emit-css apps/macos/design-tokens/tokens.css \
+  --emit-json apps/macos/design-tokens/tokens.json
+```
+
+Colour comes from the generator; the spacing ramp, radii and type sizes are read
+out of `Tokens.swift`, where they are authored. Neither is copied, so neither
+can drift. Committing a stale copy is blocked by the pre-commit hook.
+
+## Updating
+
+The CLI and the app update by different mechanisms, and only one of them is
+automatic.
+
+TcrBar self-updates through [Sparkle](https://sparkle-project.org). Use
+**Check for Updates…** in the panel footer, or `open tcrbar://check-for-updates`
+— the CLI can trigger the same user-initiated check that way. Background checks
+stay quiet when there is nothing to install; a check you asked for reports
+either way. The feed is the `appcast.xml` published on the latest GitHub
+release, and Sparkle orders releases on `CFBundleVersion`, which this project
+derives from the commit count.
+
+A build can only *install* an update if it was built with the Sparkle public key
+in its `Info.plist`. Local builds omit it unless you say otherwise, and then
+Sparkle will check the feed and refuse to install what it downloads — that is
+deliberate, since a placeholder key would fail the same way while looking
+configured. If you want a local build that can still self-update:
+
+```sh
+export TCRBAR_SPARKLE_PUBLIC_KEY=1WZWEwzSEijRarey7qE0a+n4AO/+7e4Fj/nW8Y8ZKMM=
+```
+
+Publishing that key is the point of it — it verifies downloads, it does not sign
+them. Cutting a release is a separate, local, credentialled process; see
+[`docs/RELEASING.md`](docs/RELEASING.md).
+
 ## Feature status
 
 Everything the Node original did (and a couple it didn't) is implemented: OAuth
