@@ -8,7 +8,14 @@
 set -euo pipefail
 
 APP_NAME="TcrBar"
-BUNDLE_ID="com.github.dhkts1.tcrbar"
+BUNDLE_ID="io.github.dhkts1.tcrbar"
+# The id TcrBar shipped under until 2026-08-09, when ControlCenter's runtime
+# blocked list — keyed on bundle id — swallowed it and forced a new identity.
+# An uninstall that leaves the old prefs domain and the old LaunchServices
+# registration behind is not an uninstall: `open -b` can still resolve a stale
+# copy, and the abandoned domain keeps the hidden-status-item defaults alive
+# across a reinstall.
+LEGACY_BUNDLE_ID="com.github.dhkts1.tcrbar"
 DEST="/Applications/${APP_NAME}.app"
 
 if pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
@@ -31,6 +38,29 @@ if [ -d "$DEST" ]; then
   rm -rf "$DEST"
 else
   echo "==> Nothing installed at ${DEST}."
+fi
+
+# Legacy identity cleanup. Unregister by PATH, because `lsregister` takes a
+# bundle path and not an id — so ask Spotlight which bundles still claim the old
+# id first. A machine that never ran the old build finds nothing and prints
+# nothing, which is the intended no-op.
+legacy_copies="$(/usr/bin/mdfind "kMDItemCFBundleIdentifier == '${LEGACY_BUNDLE_ID}'" 2>/dev/null || true)"
+if [ -n "$legacy_copies" ]; then
+  echo "==> Unregistering copies still claiming ${LEGACY_BUNDLE_ID}…"
+  echo "$legacy_copies" | while IFS= read -r legacy_app; do
+    [ -n "$legacy_app" ] || continue
+    echo "    $legacy_app"
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+      -u "$legacy_app" >/dev/null 2>&1 || true
+  done
+fi
+
+# The old domain is unconditionally dead — no build will ever read it again —
+# so unlike the current one it is deleted rather than merely reported. Leaving
+# it behind is how a hidden-status-item default outlives a reinstall.
+if /usr/bin/defaults read "${LEGACY_BUNDLE_ID}" >/dev/null 2>&1; then
+  echo "==> Removing stale preferences for ${LEGACY_BUNDLE_ID}…"
+  /usr/bin/defaults delete "${LEGACY_BUNDLE_ID}" >/dev/null 2>&1 || true
 fi
 
 echo

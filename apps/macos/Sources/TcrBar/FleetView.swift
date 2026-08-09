@@ -138,7 +138,7 @@ struct FleetView: View {
                 icon: Tok.unreadableGlyph,
                 title: "tcr is not on PATH",
                 detail: "Searched \(searched.count) locations. Set it with "
-                    + "`defaults write com.github.dhkts1.tcrbar \(TcrTool.overrideDefaultsKey) <path>`.",
+                    + "`defaults write io.github.dhkts1.tcrbar \(TcrTool.overrideDefaultsKey) <path>`.",
                 tint: Tok.spent
             )
         case .commandFailed(let code, let message):

@@ -282,7 +282,7 @@ fn run_ui() -> anyhow::Result<()> {
     use anyhow::Context;
 
     let status = std::process::Command::new("open")
-        .args(["-b", "com.github.dhkts1.tcrbar"])
+        .args(["-b", "io.github.dhkts1.tcrbar"])
         .status()
         .context("failed to run `open`")?;
 

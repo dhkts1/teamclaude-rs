@@ -76,7 +76,7 @@ final class MenuBarShell {
         // a crash or a log line: the app launches, polls, holds its assertions
         // and draws nothing a human can see.
         //
-        // Both `com.github.dhkts1.tcrbar` (the bundled app) and `TcrBar` (what
+        // Both `io.github.dhkts1.tcrbar` (the bundled app) and `TcrBar` (what
         // an unbundled `swift build` binary uses) were observed holding `0`.
         // How it got there is *not* established — it could predate this work or
         // have been written during it — so nothing here claims a history, and

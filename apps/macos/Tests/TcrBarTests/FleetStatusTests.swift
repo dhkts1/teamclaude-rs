@@ -780,7 +780,7 @@ final class TcrToolTests: XCTestCase {
         let bundle = URL(fileURLWithPath: "/nonexistent-bundle", isDirectory: true)
         let result = TcrTool.resolve(
             environment: ["PATH": "/nonexistent-dir"],
-            defaults: UserDefaults(suiteName: "com.github.dhkts1.tcrbar.tests")!,
+            defaults: UserDefaults(suiteName: "io.github.dhkts1.tcrbar.tests")!,
             home: URL(fileURLWithPath: "/nonexistent-home", isDirectory: true),
             bundle: bundle
         )
@@ -809,7 +809,7 @@ final class TcrToolTests: XCTestCase {
     }
 
     private var scratchDefaults: UserDefaults {
-        let defaults = UserDefaults(suiteName: "com.github.dhkts1.tcrbar.tests")!
+        let defaults = UserDefaults(suiteName: "io.github.dhkts1.tcrbar.tests")!
         defaults.removeObject(forKey: TcrTool.overrideDefaultsKey)
         return defaults
     }

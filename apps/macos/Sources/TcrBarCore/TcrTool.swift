@@ -9,7 +9,7 @@ import Foundation
 /// also never reads the tcr config file.
 public enum TcrTool {
     /// User-facing override, e.g.
-    /// `defaults write com.github.dhkts1.tcrbar TcrExecutablePath <path>`.
+    /// `defaults write io.github.dhkts1.tcrbar TcrExecutablePath <path>`.
     public static let overrideDefaultsKey = "TcrExecutablePath"
     /// Environment override, useful when launched from a shell.
     public static let overrideEnvKey = "TCR_BIN"
