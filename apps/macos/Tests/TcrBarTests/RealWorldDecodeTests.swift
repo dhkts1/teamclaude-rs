@@ -23,87 +23,87 @@ final class RealWorldDecodeTests: XCTestCase {
     /// Three real shapes: a populated account, the never-probed account whose four
     /// quota fractions are all null, and one holding a `7d` window.
     private let realWorldFixture = #"""
-    [
-      {
-        "cacheHitRatio": 0.8434839920081313,
-        "cacheReadTokens": 7407414,
-        "disabled": false,
-        "fiveHour": 0.04,
-        "held": [],
-        "inputTokens": 8781926,
-        "lastStreamError": null,
-        "name": "alice@example.com",
-        "outputTokens": 31860,
-        "priority": 0,
-        "probeError": null,
-        "probeStatus": "ok",
-        "quota": 0.04,
-        "quotaState": "ok",
-        "requests": 102,
-        "serverDirty": false,
-        "serverSha": "bd60839",
-        "sevenDay": 0.01,
-        "sevenDayOi": 0.0,
-        "source": "live",
-        "status": "active",
-        "streamErrorCount": 0
-      },
-      {
-        "cacheHitRatio": null,
-        "cacheReadTokens": 0,
-        "disabled": true,
-        "fiveHour": null,
-        "held": [],
-        "inputTokens": 0,
-        "lastStreamError": null,
-        "name": "bob@example.com",
-        "outputTokens": 0,
-        "priority": 10,
-        "probeError": null,
-        "probeStatus": "never",
-        "quota": null,
-        "quotaState": "ok",
-        "requests": 0,
-        "serverDirty": false,
-        "serverSha": "bd60839",
-        "sevenDay": null,
-        "sevenDayOi": null,
-        "source": "live",
-        "status": "active",
-        "streamErrorCount": 0
-      },
-      {
-        "cacheHitRatio": null,
-        "cacheReadTokens": 0,
-        "disabled": false,
-        "fiveHour": 0.0,
-        "held": [
+        [
           {
-            "minutesUntilReset": 6498,
-            "resetAtMs": 1786406400224,
-            "window": "7d"
+            "cacheHitRatio": 0.8434839920081313,
+            "cacheReadTokens": 7407414,
+            "disabled": false,
+            "fiveHour": 0.04,
+            "held": [],
+            "inputTokens": 8781926,
+            "lastStreamError": null,
+            "name": "alice@example.com",
+            "outputTokens": 31860,
+            "priority": 0,
+            "probeError": null,
+            "probeStatus": "ok",
+            "quota": 0.04,
+            "quotaState": "ok",
+            "requests": 102,
+            "serverDirty": false,
+            "serverSha": "bd60839",
+            "sevenDay": 0.01,
+            "sevenDayOi": 0.0,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0
+          },
+          {
+            "cacheHitRatio": null,
+            "cacheReadTokens": 0,
+            "disabled": true,
+            "fiveHour": null,
+            "held": [],
+            "inputTokens": 0,
+            "lastStreamError": null,
+            "name": "bob@example.com",
+            "outputTokens": 0,
+            "priority": 10,
+            "probeError": null,
+            "probeStatus": "never",
+            "quota": null,
+            "quotaState": "ok",
+            "requests": 0,
+            "serverDirty": false,
+            "serverSha": "bd60839",
+            "sevenDay": null,
+            "sevenDayOi": null,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0
+          },
+          {
+            "cacheHitRatio": null,
+            "cacheReadTokens": 0,
+            "disabled": false,
+            "fiveHour": 0.0,
+            "held": [
+              {
+                "minutesUntilReset": 6498,
+                "resetAtMs": 1786406400224,
+                "window": "7d"
+              }
+            ],
+            "inputTokens": 0,
+            "lastStreamError": null,
+            "name": "carol@example.com",
+            "outputTokens": 0,
+            "priority": 0,
+            "probeError": null,
+            "probeStatus": "ok",
+            "quota": 0.99,
+            "quotaState": "near",
+            "requests": 0,
+            "serverDirty": false,
+            "serverSha": "bd60839",
+            "sevenDay": 0.99,
+            "sevenDayOi": 0.0,
+            "source": "live",
+            "status": "active",
+            "streamErrorCount": 0
           }
-        ],
-        "inputTokens": 0,
-        "lastStreamError": null,
-        "name": "carol@example.com",
-        "outputTokens": 0,
-        "priority": 0,
-        "probeError": null,
-        "probeStatus": "ok",
-        "quota": 0.99,
-        "quotaState": "near",
-        "requests": 0,
-        "serverDirty": false,
-        "serverSha": "bd60839",
-        "sevenDay": 0.99,
-        "sevenDayOi": 0.0,
-        "source": "live",
-        "status": "active",
-        "streamErrorCount": 0
-      }
-    ]
-    """#
+        ]
+        """#
 
     private func fleet() throws -> Fleet {
         try Fleet.decode(Data(realWorldFixture.utf8))
@@ -169,7 +169,8 @@ final class RealWorldDecodeTests: XCTestCase {
     /// The never-probed row with `disabled` flipped to `false` — the exact state the
     /// panel's enable button puts it in.
     private func enabledNeverProbedFleet() throws -> Fleet {
-        let json = realWorldFixture
+        let json =
+            realWorldFixture
             .replacingOccurrences(of: "\"disabled\": true", with: "\"disabled\": false")
         let all = try Fleet.decode(Data(json.utf8))
         let neverProbed = try XCTUnwrap(all.accounts.first { $0.probeStatus == .never })
