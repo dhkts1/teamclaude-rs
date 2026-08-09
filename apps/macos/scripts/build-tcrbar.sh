@@ -2,9 +2,9 @@
 # Assemble TcrBar.app by hand — no Xcode project, no .xcodeproj to keep in sync.
 #
 # Output: apps/macos/build/TcrBar.app, signed with the best certificate present on
-# the machine (see the signing ladder below). Notarization, stapling, DMGs and
-# Sparkle are deliberately out of scope: this is a local operator tool, not a
-# distributed product.
+# the machine (see the signing ladder below), with Sparkle.framework embedded and
+# the update feed configured. Notarization, stapling and DMGs are still out of
+# scope here — the release pipeline owns those.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,6 +16,17 @@ bundle_id="com.github.dhkts1.tcrbar"
 build_dir="$pkg_dir/build"
 app_dir="$build_dir/$app_name.app"
 macos_dir="$app_dir/Contents/MacOS"
+frameworks_dir="$app_dir/Contents/Frameworks"
+
+# The one URL the app answers, and the CLI's half of the contract. `tcr` opens
+# this to ask a running TcrBar to check for updates; `AppDelegate.application(_:open:)`
+# handles it. Changing either string without the other silently breaks the hand-off,
+# so both live here beside the CFBundleURLTypes entry that registers the scheme.
+url_scheme="tcrbar"
+
+# Where the appcast lives. Sparkle reads this out of Info.plist at runtime, so it
+# is written once here rather than compiled into the app.
+feed_url="https://github.com/dhkts1/teamclaude-rs/releases/latest/download/appcast.xml"
 
 # Build stamp. A missing or unreadable .git must never fail the build.
 #
@@ -102,12 +113,35 @@ fi
 
 echo "==> swift build -c release --product $app_name"
 swift build --package-path "$pkg_dir" -c release --product "$app_name"
-binary="$(swift build --package-path "$pkg_dir" -c release --product "$app_name" --show-bin-path)/$app_name"
+bin_path="$(swift build --package-path "$pkg_dir" -c release --product "$app_name" --show-bin-path)"
+binary="$bin_path/$app_name"
 
 echo "==> assembling $app_dir"
 rm -rf "$app_dir"
 mkdir -p "$macos_dir"
 cp "$binary" "$macos_dir/$app_name"
+
+# Embed Sparkle.
+#
+# SPM builds Sparkle as a VERSIONED framework (Versions/B plus a Current symlink)
+# whose payload includes an Updater.app and two XPC services. `ditto` is used
+# rather than `cp -R` because it preserves the symlink layout and the extended
+# attributes a signed bundle carries; a framework whose Current symlink is
+# flattened into a copy is not a valid framework and `codesign --deep` says so.
+#
+# The executable finds it through an `@executable_path/../Frameworks` rpath that
+# `Package.swift` adds explicitly — SPM only emits `@loader_path`, which resolves
+# inside `.build` and not inside this bundle.
+sparkle_framework="$bin_path/Sparkle.framework"
+if [ ! -d "$sparkle_framework" ]; then
+  echo "ERROR: $sparkle_framework is missing — the app links Sparkle and would" >&2
+  echo "ERROR: fail to launch with a dyld 'Library not loaded' error." >&2
+  exit 1
+fi
+mkdir -p "$frameworks_dir"
+rm -rf "$frameworks_dir/Sparkle.framework"
+ditto "$sparkle_framework" "$frameworks_dir/Sparkle.framework"
+echo "    Sparkle: embedded from $sparkle_framework"
 
 # Bundle the `tcr` server binary alongside the app.
 #
@@ -176,6 +210,33 @@ else
 fi
 rm -rf "$(dirname "$iconset")"
 
+# Sparkle's EdDSA public key — OMITTED when unset, never a placeholder.
+#
+# Sparkle refuses any update whose signature does not verify against this key.
+# A placeholder or a stale key therefore rejects every real update, and the error
+# it produces reads like a corrupted download rather than a misconfigured build —
+# so a wrong key is strictly worse than no key. With the key absent Sparkle
+# reports that the update cannot be verified, which names the actual problem.
+#
+# It is read from the environment rather than written down because the private
+# half signs releases: only the release pipeline should have to know it, and this
+# repository is public.
+sparkle_public_key_entry=""
+if [ -n "${TCRBAR_SPARKLE_PUBLIC_KEY:-}" ]; then
+  sparkle_public_key_entry="	<key>SUPublicEDKey</key>
+	<string>$TCRBAR_SPARKLE_PUBLIC_KEY</string>"
+else
+  {
+    echo
+    echo "WARNING: TCRBAR_SPARKLE_PUBLIC_KEY is not set, so SUPublicEDKey is OMITTED."
+    echo "WARNING: this build can check the feed but cannot verify a downloaded"
+    echo "WARNING: update, so Sparkle will refuse to install one. That is deliberate:"
+    echo "WARNING: a placeholder key would fail the same way while looking configured."
+    echo "WARNING: Fix: export TCRBAR_SPARKLE_PUBLIC_KEY=<the EdDSA public key> and rebuild."
+    echo
+  } >&2
+fi
+
 cat >"$app_dir/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -203,6 +264,22 @@ cat >"$app_dir/Contents/Info.plist" <<PLIST
 	<true/>
 	<key>TcrGitSHA</key>
 	<string>$git_sha</string>
+	<key>SUFeedURL</key>
+	<string>$feed_url</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+$sparkle_public_key_entry
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$bundle_id</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$url_scheme</string>
+			</array>
+		</dict>
+	</array>
 </dict>
 </plist>
 PLIST
@@ -247,15 +324,51 @@ done
 # `codesign -v --deep --strict` on the finished bundle is what proves the order
 # is right, and per the note above an invalid signature is not cosmetic: it
 # silently breaks "Launch at login" and every permission grant.
+#
+# Sparkle makes that ordering deeper rather than different. The framework is not
+# one Mach-O: it contains an Updater.app, an Autoupdate helper and two XPC
+# services, each of which is code in its own right. Code signs INSIDE-OUT, so the
+# order is xpc → Updater.app → Autoupdate → the framework version → the app's own
+# `tcr` → the bundle. Signing the framework after the bundle would invalidate the
+# bundle's seal, and signing the framework without its nested payload leaves the
+# framework's own seal invalid — `--deep --strict` catches both.
+#
+# `--preserve-metadata=entitlements` on the nested code is not optional: Sparkle's
+# installer XPC service ships entitlements it needs, and a plain re-sign drops
+# them silently.
 if [ -n "$sign_identity" ]; then
-  echo "==> codesign ($sign_tier)"
-  codesign -s "$sign_identity" --force "$macos_dir/tcr"
-  codesign -s "$sign_identity" --force "$app_dir"
+  sign_key="$sign_identity"
 else
   sign_tier="ad-hoc"
-  echo "==> codesign (ad-hoc)"
-  codesign -s - --force "$macos_dir/tcr"
-  codesign -s - --force "$app_dir"
+  sign_key="-"
+fi
+
+# Hardened runtime and a trusted timestamp are what notarization requires, and
+# they are only meaningful with a real certificate behind them — an ad-hoc or
+# development signature is never notarized, and `--timestamp` on one is a network
+# round trip that buys nothing. So this rides the Developer ID tier alone.
+codesign_flags="--force"
+if [ "$sign_tier" = "Developer ID Application" ]; then
+  codesign_flags="--force --options runtime --timestamp"
+fi
+
+echo "==> codesign ($sign_tier)"
+sparkle_version_dir="$frameworks_dir/Sparkle.framework/Versions/B"
+for nested in "$sparkle_version_dir/XPCServices/"*.xpc \
+  "$sparkle_version_dir/Updater.app" \
+  "$sparkle_version_dir/Autoupdate"; do
+  [ -e "$nested" ] || continue
+  # shellcheck disable=SC2086  # $codesign_flags is a deliberate word list.
+  codesign -s "$sign_key" $codesign_flags --preserve-metadata=entitlements "$nested"
+done
+# shellcheck disable=SC2086
+codesign -s "$sign_key" $codesign_flags "$sparkle_version_dir"
+# shellcheck disable=SC2086
+codesign -s "$sign_key" $codesign_flags "$macos_dir/tcr"
+# shellcheck disable=SC2086
+codesign -s "$sign_key" $codesign_flags "$app_dir"
+
+if [ -z "$sign_identity" ]; then
   {
     echo
     echo "WARNING: no codesigning certificate found — signed ad-hoc."

@@ -36,6 +36,7 @@ struct TcrBarApp: App {
     @StateObject private var server = ServerController()
     @StateObject private var loginItem = LoginItem()
     @StateObject private var accounts = AccountController()
+    @StateObject private var updater = Updater()
 
     /// Bring the proxy up when the app starts.
     ///
@@ -61,6 +62,7 @@ struct TcrBarApp: App {
                 server: server,
                 loginItem: loginItem,
                 accounts: accounts,
+                updater: updater,
                 startServerAtLaunch: $startServerAtLaunch
             )
             .onAppear {
@@ -76,12 +78,23 @@ struct TcrBarApp: App {
             }
         } label: {
             MenuBarLabel(state: poller.state)
+                // Deliberately on the LABEL, not on the panel content.
+                //
+                // The delegate is what receives `tcrbar://check-for-updates`,
+                // and the updater is owned by the app, so the delegate has to be
+                // handed a reference before any URL can arrive. The panel's
+                // `onAppear` fires only when someone opens the menu — a URL sent
+                // to an app whose panel has never been opened would then find a
+                // nil updater and do nothing. The label is drawn at launch,
+                // which is the moment the app becomes reachable at all.
+                .onAppear { delegate.updater = updater }
         }
         .menuBarExtraStyle(.window)
     }
 }
 
-/// Exists for one reason: a child process TcrBar spawned must not outlive it.
+/// Two jobs: a child process TcrBar spawned must not outlive it, and the app's
+/// `tcrbar://` URLs land here.
 ///
 /// `terminateSupervisedChildOnQuit()` is a no-op unless *this app* spawned the
 /// server — an incumbent proxy is never signalled.
@@ -89,8 +102,62 @@ struct TcrBarApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var server: ServerController?
 
+    /// Handed over by `TcrBarApp` when the menu-bar label first appears, which is
+    /// at launch. Optional because the delegate is constructed by AppKit before
+    /// any SwiftUI scene exists, not because it is expected to stay nil.
+    ///
+    /// A URL that arrives before that hand-off is REMEMBERED rather than dropped:
+    /// launching the app *with* `tcrbar://check-for-updates` is the ordinary case
+    /// — that is what happens when the app was not already running — and the URL
+    /// event beats the first scene by a few milliseconds.
+    var updater: Updater? {
+        didSet {
+            guard checkIsPending, let updater else { return }
+            checkIsPending = false
+            NSLog("TcrBar: running the update check that arrived before launch finished")
+            updater.checkForUpdates()
+        }
+    }
+    private var checkIsPending = false
+
     func applicationWillTerminate(_ notification: Notification) {
         server?.terminateSupervisedChildOnQuit()
+    }
+
+    /// The URL contract with the `tcr` CLI: `tcrbar://check-for-updates` runs the
+    /// same user-initiated check the panel's button runs.
+    ///
+    /// The scheme is declared in `CFBundleURLTypes` by `scripts/build-tcrbar.sh`;
+    /// a bundle built any other way is not registered with LaunchServices and no
+    /// URL will ever reach here. `LSUIElement` does not change that — an accessory
+    /// app is a perfectly ordinary URL handler.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            handle(url)
+        }
+    }
+
+    /// Host-based, not path-based: `URL(string:)` parses `tcrbar://check-for-updates`
+    /// with `host == "check-for-updates"` and an empty path. An unrecognised URL is
+    /// logged rather than silently dropped, because a mistyped scheme call that
+    /// does nothing is indistinguishable from a broken updater.
+    private func handle(_ url: URL) {
+        guard url.scheme == "tcrbar" else {
+            NSLog("TcrBar: ignoring URL with unexpected scheme: %@", url.absoluteString)
+            return
+        }
+        switch url.host {
+        case "check-for-updates":
+            NSLog("TcrBar: tcrbar://check-for-updates received")
+            guard let updater else {
+                NSLog("TcrBar: no updater yet — the check is queued until launch completes")
+                checkIsPending = true
+                return
+            }
+            updater.checkForUpdates()
+        default:
+            NSLog("TcrBar: unhandled tcrbar URL: %@", url.absoluteString)
+        }
     }
 }
 
