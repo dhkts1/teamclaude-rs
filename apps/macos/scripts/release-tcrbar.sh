@@ -290,16 +290,36 @@ XML
 # </channel>". Sparkle reads items newest-first, and an insertion point derived
 # by pattern-matching the surrounding XML silently moves the day someone
 # reformats the file. A missing marker aborts instead of guessing.
+#
+# The item arrives through a FILE, not `awk -v item=...`. BSD awk (the one on
+# macOS) rejects a literal newline inside a -v assignment — `awk: newline in
+# string` — and the item is a multi-line <item> block, so -v aborted awk before
+# it read a single input line. That wrote an EMPTY tmp file over the appcast:
+# exit status 0, a feed with no items and no marker, and Sparkle telling every
+# user they are up to date forever. Hence also the post-insert assert below: a
+# silent, well-formed, wrong result is the failure mode this function has.
 appcast_insert() {
-  local item="$1" tmp
+  local item="$1" tmp itemfile before after
   grep -qF "$appcast_marker" "$appcast_path" \
     || die "$appcast_path has no insertion marker. Restore this line inside <channel>:" \
            "  $appcast_marker"
+  before="$(grep -c '<item>' "$appcast_path" || true)"
   tmp="$(mktemp)"
-  awk -v marker="$appcast_marker" -v item="$item" '
+  itemfile="$(mktemp)"
+  printf '%s\n' "$item" >"$itemfile"
+  awk -v marker="$appcast_marker" -v itemfile="$itemfile" '
     { print }
-    index($0, marker) && !done { print item; done = 1 }
-  ' "$appcast_path" >"$tmp"
+    index($0, marker) && !done {
+      while ((getline line < itemfile) > 0) print line
+      close(itemfile)
+      done = 1
+    }
+  ' "$appcast_path" >"$tmp" || { rm -f "$tmp" "$itemfile"; die "appcast: awk failed to insert the item."; }
+  rm -f "$itemfile"
+  after="$(grep -c '<item>' "$tmp" || true)"
+  [ "$after" -eq $((before + 1)) ] \
+    || { rm -f "$tmp"; die "appcast: insert produced $after <item> elements, expected $((before + 1))." \
+                           "Refusing to publish a feed that lost or duplicated a release."; }
   mv "$tmp" "$appcast_path"
 }
 
