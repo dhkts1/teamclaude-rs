@@ -9,23 +9,31 @@ import AppKit
 /// appearance, which strips whatever tint the view asked for. `isTemplate =
 /// false` is the documented opt-out, and it is a property of `NSImage` — there
 /// is nowhere to set it on a SwiftUI `Image(systemName:)`. So the mark is built
-/// here and handed over as `Image(nsImage:)`.
+/// here.
+///
+/// Handing the result to SwiftUI was not enough, and that is measured: a
+/// `MenuBarExtra` flattens its label to monochrome whatever the image says, for
+/// every construction that was tried. ``MenuBarMark`` carries the table and is
+/// what composes this cup into the image the app now sets on the status button
+/// itself. It calls this function from inside its drawing handler, so a dynamic
+/// `tint` resolves against the appearance current at draw time.
 ///
 /// ## What is measured, and what is not
 ///
-/// `AwakeControllerTests` rasterises the returned image and asserts two facts
-/// about it: `isTemplate == false`, and that a pixel inside the glyph actually
-/// carries the tint that was asked for. That proves the image **this app hands
-/// to the status item** carries colour, which is the half that is checkable
-/// without a screen.
+/// `KeepAwakeGlyphTests` rasterises what this function returns and asserts that
+/// `isTemplate == false` and that a pixel inside the glyph really carries the
+/// tint. `MenuBarMarkTests` asserts the same of the composed image, with the OFF
+/// mark as its negative control. `TcrBar --shell-probe` goes one step further: it
+/// rasterises the real `NSStatusBarButton` and counts cyan pixels there, with
+/// the OFF state as a negative control.
 ///
-/// It does not prove the status item honours it, and nothing available here
-/// can: reading back the real menu bar needs `screencapture`, which needs
-/// Screen Recording, which is not granted on the machine this was written on.
-/// That last step is a human looking at their own menu bar.
+/// Neither reaches the window server's final composite of the menu bar —
+/// reading that back needs `screencapture`, which needs Screen Recording, which
+/// is not granted on the machine this was written on. That last step is a human
+/// looking at their own menu bar.
 ///
 /// Which is the reason colour is the *second* channel and not the only one —
-/// see `MenuBarLabel`. If the tint is lost, a glyph that is present or absent
+/// see ``MenuBarMark``. If the tint is lost, a glyph that is present or absent
 /// still says whether the mode is on.
 ///
 /// ## Why it lives in `TcrBarCore`

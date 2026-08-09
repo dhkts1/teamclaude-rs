@@ -194,10 +194,47 @@ Three states look similar and are not:
 Package.swift
 Sources/TcrBarCore/   FleetStatus.swift  StatusPoller.swift  ServerController.swift
                       AccountControl.swift  LoginItem.swift  TcrTool.swift
-Sources/TcrBar/       TcrBarApp.swift  FleetView.swift  Tokens.swift
+                      AwakeController.swift  KeepAwakeGlyph.swift  KeepAwakeProbe.swift
+                      MenuBarMark.swift  LaunchPreference.swift
+Sources/TcrBar/       TcrBarApp.swift  MenuBarShell.swift  ShellProbe.swift
+                      FleetView.swift  Tokens.swift  RenderStates.swift  AppIcon.swift
 Tests/TcrBarTests/    FleetStatusTests.swift
 scripts/build-tcrbar.sh
 ```
 
 The logic lives in the `TcrBarCore` library so it can be tested without linking a
-test bundle against an `@main` executable; `TcrBar` is the SwiftUI shell.
+test bundle against an `@main` executable; `TcrBar` is the shell.
+
+## Why the shell is AppKit and not `MenuBarExtra`
+
+It was a SwiftUI `MenuBarExtra`, and a `MenuBarExtra` renders its label
+**monochrome no matter what the image says**. Six label constructions were each
+hosted in a real one and rasterised off the real `NSStatusBarButton`:
+`Image(nsImage:)` with `isTemplate = false`, the same with
+`.renderingMode(.original)`, a coloured `Text("●")`, and a symbol pre-flattened
+to a plain bitmap all came back with **0 coloured pixels**; an emoji managed 14.
+Setting `button.image` directly on the button gave **533 of 533**.
+
+So the app owns an `NSStatusItem`, composes the menu-bar image itself
+(`MenuBarMark`), and hosts the same unchanged `FleetView` in an `NSPopover`.
+Three things `MenuBarExtra` did for free are now explicit, and each is a silent
+regression if it is dropped: the popover is told the panel's preferred size, the
+login-item bit is re-read on every open rather than only on the first, and the
+app is activated before the panel is shown so text selection works.
+
+### Proving the shell, without a screenshot
+
+```sh
+BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
+"$BIN" --shell-probe        # one line per assertion, non-zero if any failed
+```
+
+It builds the real shell in-process and checks nine things, including that the
+ON mark rasterises to cyan pixels off the real status button **and** that the OFF
+mark rasterises to none — the negative control, without which the first
+assertion passes on a mark that is cyan in both states. Every one of the nine was
+broken on purpose and watched go red.
+
+What it does not cover: the window server's final composite of the menu bar, a
+real mouse click, and anything about a signed bundle. Those are still a human's
+eyes.

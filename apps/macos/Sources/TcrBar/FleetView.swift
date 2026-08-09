@@ -13,9 +13,12 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
-    /// Owned by the app, for the same reason the poller is: this panel is torn
-    /// down every time the menu closes, and an assertion released at that moment
-    /// would be a keep-awake control that keeps nothing awake.
+    /// Owned by the app, for the same reason the poller is: the panel is a view
+    /// and the mode is not, and an assertion released when the view went away
+    /// would be a keep-awake control that keeps nothing awake. Under
+    /// `MenuBarExtra` that teardown happened on every close; hosted in a popover
+    /// it need not — which changes when that bug would bite, not whether it
+    /// would.
     @ObservedObject var awake: AwakeController
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
@@ -40,11 +43,16 @@ struct FleetView: View {
 
     /// Measured height of the account rows.
     ///
-    /// A `ScrollView` has a flexible ideal height, and the `MenuBarExtra` window
-    /// sizes itself to its content's *ideal* height — so a scroll view carrying
-    /// only a `maxHeight` collapses to roughly one row no matter how many
-    /// accounts the fleet has. Measuring the rows and giving the scroll view a
-    /// concrete height is what makes the panel grow with the fleet.
+    /// A `ScrollView` has a flexible ideal height, and the window this panel
+    /// lives in sizes itself to its content's *ideal* height — so a scroll view
+    /// carrying only a `maxHeight` collapses to roughly one row no matter how
+    /// many accounts the fleet has. Measuring the rows and giving the scroll
+    /// view a concrete height is what makes the panel grow with the fleet.
+    ///
+    /// That was true of the `MenuBarExtra` window this panel used to live in and
+    /// is equally true of the `NSPopover` it lives in now, whose hosting
+    /// controller is set to `sizingOptions = [.preferredContentSize]`
+    /// (`MenuBarShell.swift`) for exactly this reason.
     @State private var rowsHeight: CGFloat = 0
 
     var body: some View {

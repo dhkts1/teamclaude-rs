@@ -19,7 +19,7 @@ import Foundation
 ///     pmset -g assertions | grep TcrBar     # PreventUserIdleSystemSleep
 ///
 /// Like `--render-states` and `--render-icon` it is handled in
-/// `TcrBarEntry.main()` and exits before `TcrBarApp.main()`, so no menu-bar item
+/// `TcrBarEntry.main()` and exits before the shell is built, so no menu-bar item
 /// appears and no `tcr` subprocess is spawned. Unlike those two it draws
 /// nothing, so it does not even need an `NSApplication`.
 public enum KeepAwakeProbe {
