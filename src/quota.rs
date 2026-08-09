@@ -268,8 +268,15 @@ impl Quota {
     }
 
     /// Fold a background probe's usage into the tracked windows. Only fields the
-    /// probe actually reported overwrite existing values (a `None` utilization or
-    /// reset leaves the prior value intact — matches the JS `applyUsageData`).
+    /// probe actually reported overwrite existing values. There are three cases,
+    /// and the third is the one an earlier `unwrap_or(0.0)` got wrong:
+    ///  - the probe reported a utilization → it overwrites the tracked one;
+    ///  - it reported `None` and a prior window exists → the prior utilization
+    ///    (and, via [`resolve_reset`], the prior reset) is left intact — this is
+    ///    the JS `applyUsageData` behaviour;
+    ///  - it reported `None` and there is NO prior → the window stays **absent**.
+    ///    "We could not read this" is not "this is at 0%", and a fabricated `0.0`
+    ///    is byte-identical to a genuine one. See [`apply_bucket`].
     pub fn apply_usage(&mut self, usage: &crate::probe::Usage) {
         apply_bucket(&mut self.five_hour, usage.five_hour, FIVE_HOUR);
         apply_bucket(&mut self.seven_day, usage.seven_day, SEVEN_DAY);
@@ -296,6 +303,44 @@ impl Quota {
 /// a live window — and it is invisible to routing, because
 /// [`QuotaWindow::effective`] returns `0.0` for a zero bucket under both the
 /// `Some(reset)` and `None` arms.
+///
+/// **Exception — an UNREADABLE utilization with no prior leaves the window
+/// absent.** The bucket being present says only that the endpoint mentioned this
+/// dimension; if its utilization did not parse (key missing, `null`, a
+/// non-numeric string) and no prior reading exists, we have no measurement. This
+/// used to `unwrap_or(0.0)` and commit `Some(QuotaWindow { utilization: 0.0 })`,
+/// byte-identical to a genuine 0%. Three things read that fabrication differently
+/// from an absent window — and because the bucket's reported reset rode along
+/// with it (see below), the first two need only that reset:
+///  - [`crate::manager::Manager::warm_targets`] reads
+///    `five_hour.live_reset(now).is_some()` as "already warm — skip", so a
+///    fabricated window carrying a reset suppresses keep-warm for an account we
+///    have measured nothing about. This is the strongest of the three;
+///  - [`Quota::governing_weekly_reset`] then answers `Some(reset)` rather than
+///    `None` on `seven_day`, and rotation ordering sorts a `None` first
+///    (`select.rs` maps it to `i128::MIN`, "unknown quota → probe it"), so the
+///    fabrication moves the account out of the probe-me-first position;
+///  - the rendered value is a confident `0%` bar instead of "unmeasured".
+///
+/// It does NOT bias utilization-based routing. [`Quota::max_utilization`] folds
+/// only over the windows that are present, starting from `0.0`, so `Some(0.0)`
+/// and an absent window are arithmetically identical there; and every gate built
+/// on it is `effective(now) >= threshold`, which a zero never trips.
+///
+/// Absent is the truthful state and the wire already carries it: `snapshot.rs`
+/// maps a `None` window to a `None` utilization, which survives `stats.rs` →
+/// `status.rs` → `cli.rs` as JSON `null` and renders in TcrBar as a dashed bar
+/// with an `unmeasured` pill.
+///
+/// The defect is **latent, not firing**. One read of the live payload showed a
+/// numeric percentage on every `limits[]` entry it returned — one payload at one
+/// moment, which is not a property of the endpoint.
+///
+/// The bucket's reported **reset is discarded** along with it. `QuotaWindow` has
+/// no representation for "a reset with no utilization" (`utilization` is a plain
+/// `f64`), and inventing one would be the same fabrication in the other field —
+/// the `warm_targets` suppression above, which is precisely the failure the
+/// zero-utilization exception was written for.
 fn apply_bucket(
     window: &mut Option<QuotaWindow>,
     bucket: Option<crate::probe::UsageBucket>,
@@ -306,10 +351,12 @@ fn apply_bucket(
     };
     let now = OffsetDateTime::now_utc();
     let prior = *window;
-    let utilization = bucket
-        .utilization
-        .or_else(|| prior.map(|w| w.utilization))
-        .unwrap_or(0.0);
+    let Some(utilization) = bucket.utilization.or_else(|| prior.map(|w| w.utilization)) else {
+        // No reading, and nothing prior to keep. Leave the window absent rather
+        // than fabricating a 0.0 — see the exception above. `prior` is `None` on
+        // this arm by construction, so this destroys nothing.
+        return;
+    };
     let reported = bucket
         .reset_at_ms
         .and_then(|ms| OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).ok());
@@ -563,6 +610,133 @@ mod tests {
         assert!(
             !quota.is_near(0.90, now + Duration::hours(6)),
             "clearing after one bounded window, never pinning forever"
+        );
+    }
+
+    /// A bucket the endpoint mentions but whose utilization does not parse, with
+    /// no prior reading, must stay ABSENT — not be committed as a fabricated
+    /// `0.0`. A fabricated zero carries the bucket's reset with it, which reads to
+    /// `warm_targets` as "already warm — skip" and to `governing_weekly_reset` as
+    /// a known window; and it renders as a confident `0%` bar. Absent reaches the
+    /// wire as `null` and renders as "unmeasured".
+    #[test]
+    fn unreadable_utilization_with_no_prior_stays_absent() {
+        let mut quota = Quota::default();
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: None,
+                reset_at_ms: Some(crate::now_ms() + 3_600_000),
+            }),
+            ..Default::default()
+        });
+
+        assert!(
+            quota.five_hour.is_none(),
+            "an unreadable utilization with no prior must not fabricate a window"
+        );
+        // And the reported reset goes with it: a reset with no measurement behind
+        // it would read as "already warm" to `warm_targets` and suppress keep-warm.
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            quota.five_hour.and_then(|w| w.live_reset(now)),
+            None,
+            "no window means no live reset to suppress keep-warm with"
+        );
+        // Nothing to report upward — this is the `None` the snapshot maps to JSON
+        // `null`. `max_utilization` reads the same either way (an absent window and
+        // a `Some(0.0)` both leave the fold at `0.0`); the difference is on the
+        // wire and in the reset-derived signals asserted above.
+        assert_eq!(quota.max_utilization(now, false), 0.0);
+    }
+
+    /// The same unreadable bucket must still PRESERVE a prior reading — that half
+    /// of the merge (the JS `applyUsageData` behaviour) is not what was broken.
+    ///
+    /// The probe here reports a NEW reset alongside the unreadable utilization,
+    /// which is what makes this test able to fail: skipping the merge entirely on
+    /// an unreadable utilization would also preserve the prior utilization (by not
+    /// writing at all) and would be indistinguishable — except that the freshly
+    /// reported reset would be dropped on the floor.
+    #[test]
+    fn unreadable_utilization_preserves_a_prior_reading() {
+        let now = OffsetDateTime::now_utc();
+        let prior_reset = now + Duration::hours(3);
+        let reported_reset = now + Duration::hours(4);
+        let mut quota = Quota {
+            five_hour: Some(QuotaWindow {
+                utilization: 0.77,
+                reset: Some(prior_reset),
+            }),
+            ..Quota::default()
+        };
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: None,
+                reset_at_ms: Some((reported_reset.unix_timestamp_nanos() / 1_000_000) as i64),
+            }),
+            ..Default::default()
+        });
+
+        let window = quota.five_hour.expect("the prior window must survive");
+        assert_eq!(window.utilization, 0.77, "prior utilization kept");
+        assert_eq!(
+            window.reset.map(|r| r.unix_timestamp()),
+            Some(reported_reset.unix_timestamp()),
+            "and the freshly reported reset is still adopted"
+        );
+        // With no reported reset the still-future prior reset is inherited instead.
+        let mut quota = Quota {
+            five_hour: Some(QuotaWindow {
+                utilization: 0.77,
+                reset: Some(prior_reset),
+            }),
+            ..Quota::default()
+        };
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: None,
+                reset_at_ms: None,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            quota.five_hour.map(|w| (w.utilization, w.reset)),
+            Some((0.77, Some(prior_reset))),
+            "prior utilization and prior reset both intact"
+        );
+    }
+
+    /// The guard above must not swing the error the other way: a GENUINE numeric
+    /// zero is a reading, and must stay a present `0.0` window rather than
+    /// collapsing into "unmeasured". This is the test that pins the two apart.
+    #[test]
+    fn a_genuine_zero_utilization_is_a_reading_not_an_absence() {
+        let mut quota = Quota::default();
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: Some(0.0),
+                reset_at_ms: None,
+            }),
+            ..Default::default()
+        });
+
+        let window = quota
+            .five_hour
+            .expect("a genuine 0% is a measurement — the window must be present");
+        assert_eq!(window.utilization, 0.0);
+        // A later unreadable probe then falls into the prior-preserving arm, so
+        // the measured zero survives instead of blanking the bar.
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: Some(crate::probe::UsageBucket {
+                utilization: None,
+                reset_at_ms: None,
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            quota.five_hour.map(|w| w.utilization),
+            Some(0.0),
+            "a measured zero is not re-classified as unmeasured by later silence"
         );
     }
 
