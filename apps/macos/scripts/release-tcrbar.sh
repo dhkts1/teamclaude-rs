@@ -127,7 +127,7 @@ assert_developer_id() {
     echo "ERROR:   2. '+' -> Software -> 'Developer ID Application'"
     echo "ERROR:      NOT 'Developer ID Installer' (that signs .pkg, we ship a DMG)"
     echo "ERROR:      NOT 'Apple Distribution'     (Mac App Store only)"
-    echo "ERROR:      NOT 'Apple Development'      (what this machine has now)"
+    echo "ERROR:      NOT 'Apple Development'      (a local development cert)"
     echo "ERROR:   3. requires the Account Holder role on the Apple Developer team"
     echo "ERROR:   4. upload a CSR from Keychain Access ->"
     echo "ERROR:      Certificate Assistant -> Request a Certificate From a"
@@ -190,12 +190,20 @@ resign_hardened() {
 }
 
 assert_hardened_runtime() {
-  local bundle="$1"
+  local bundle="$1" desc
   codesign --verify --deep --strict --verbose=2 "$bundle" >/dev/null 2>&1 \
     || die "codesign --verify --deep --strict failed on $bundle."
-  codesign -dvv "$bundle" 2>&1 | grep -q 'flags=.*runtime' \
-    || die "$bundle is not signed with the hardened runtime (--options runtime)." \
-           "notarytool would reject it without naming this as the cause."
+  # Captured, then matched — NOT `codesign ... | grep -q`. Under `set -o
+  # pipefail` a `grep -q` that finds its match exits immediately, SIGPIPEs
+  # codesign, and the pipeline reports 141: the check fails precisely when it
+  # succeeds. This assert did exactly that on its first run against a correctly
+  # hardened bundle.
+  desc="$(codesign -dvv "$bundle" 2>&1)"
+  case "$desc" in
+    *"flags="*"runtime"*) ;;
+    *) die "$bundle is not signed with the hardened runtime (--options runtime)." \
+           "notarytool would reject it without naming this as the cause." ;;
+  esac
   note "hardened runtime: present, signature verifies --deep --strict"
 }
 
@@ -211,8 +219,10 @@ find_sign_update() {
   fi
   # Sparkle ships sign_update inside its SPM artifact bundle, which lands under
   # .build/artifacts once the package has been resolved and built.
+  # `|| true`: `head` closing the pipe SIGPIPEs `find`, and under pipefail that
+  # non-zero status would abort the script on the normal path.
   local found
-  found="$(find "$pkg_dir/.build/artifacts" -type f -name sign_update -perm -u+x 2>/dev/null | head -n 1)"
+  found="$(find "$pkg_dir/.build/artifacts" -type f -name sign_update -perm -u+x 2>/dev/null | head -n 1 || true)"
   [ -n "$found" ] || die \
     "could not find Sparkle's sign_update under $pkg_dir/.build/artifacts." \
     "It ships in the Sparkle SPM artifact bundle — build the package first," \
@@ -220,11 +230,20 @@ find_sign_update() {
   printf '%s\n' "$found"
 }
 
-# Prints `sparkle:edSignature="..." length="..."`, which is exactly the
-# attribute pair the appcast <enclosure> needs.
+# Sets `sparkle_sig_attrs` to `sparkle:edSignature="..." length="..."`, exactly
+# the attribute pair the appcast <enclosure> needs.
+#
+# It sets a variable instead of printing, and the caller must NOT wrap it in
+# `$(...)`. A `die` inside a command substitution exits only that subshell: the
+# first version of this printed its signing-tool-not-found error and then
+# carried straight on into the fallback branch, reporting a SECOND failure for a
+# stage that should already have aborted. An abort that does not abort is worse
+# than no check.
+sparkle_sig_attrs=""
 sparkle_sign() {
   local dmg="$1" tool sig keyfile
-  tool="$(find_sign_update)"
+  tool="$(find_sign_update)" || exit 1
+  [ -n "$tool" ] || exit 1
   if [ -n "${SPARKLE_ED_PRIVATE_KEY:-}" ]; then
     # A 0600 file, not `-s <key>`: process arguments are readable by every user
     # on the machine via `ps`, and a CI runner is a machine like any other.
@@ -242,7 +261,7 @@ sparkle_sign() {
              "or export it with: generate_keys -x -"
   fi
   [ -n "$sig" ] || die "sign_update produced an empty signature."
-  printf '%s\n' "$sig"
+  sparkle_sig_attrs="$sig"
 }
 
 # ---------------------------------------------------------------------------
@@ -399,8 +418,8 @@ main() {
 
   # ---- stage 7: Sparkle signature -----------------------------------------
   stage "stage 7/9  Sparkle EdDSA signature"
-  local sig_attrs
-  sig_attrs="$(sparkle_sign "$dmg")"
+  # Deliberately not `$(sparkle_sign ...)` — see the note on that function.
+  sparkle_sign "$dmg"
   note "sign_update: ok (signature withheld from this log)"
 
   # ---- stage 8: appcast ---------------------------------------------------
@@ -421,7 +440,7 @@ main() {
       <sparkle:shortVersionString>$version</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
       <pubDate>$pubdate</pubDate>
-      <enclosure url=\"$url\" type=\"application/octet-stream\" $sig_attrs />
+      <enclosure url=\"$url\" type=\"application/octet-stream\" $sparkle_sig_attrs />
     </item>"
   appcast_insert "$item"
   note "appcast: added $version ($build_number) -> $appcast_path"
