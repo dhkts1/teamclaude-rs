@@ -585,11 +585,16 @@ struct AccountRow: View {
         // both: silence is not a state, and a VoiceOver user has even less to
         // infer it from than a sighted one.
         parts.append(account.disabled ? "parked, out of rotation" : "rotating")
-        parts.append(
-            account.hasQuotaEvidence
-                ? "\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used"
-                : "never probed, quota unknown"
-        )
+        // Mirrors the pill's three cases. A VoiceOver user hearing "never
+        // probed" about an account whose probe errored is told the same wrong
+        // cause a sighted user was, with less to correct it from.
+        if account.hasQuotaEvidence {
+            parts.append("\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used")
+        } else if account.probeStatus.isFailure {
+            parts.append("quota probe \(account.probeStatus.token), quota unknown")
+        } else {
+            parts.append("never probed, quota unknown")
+        }
         if let hold = account.soonestHold { parts.append(hold.countdownLabel) }
         if let failure = accounts.failure(for: account.name) {
             parts.append("last action failed: \(failure.summary)")
@@ -626,8 +631,29 @@ struct AccountRow: View {
                 // A never-probed account's `quotaState` is Rust's default, not a
                 // reading. Printing `ok` on it would be the panel asserting
                 // something nothing has ever checked.
+                //
+                // Three cases, not two. "No quota reading" has two causes and
+                // they are not interchangeable: nothing has asked yet, or the
+                // asking failed. Both used to render UNMEASURED, so an account
+                // whose probe errored was labelled with the one word this
+                // palette reserves for *never probed* — telling the operator to
+                // wait for a sweep that had already run and failed. Observed
+                // live: a row reading UNMEASURED beside a status of `error`.
                 if account.hasQuotaEvidence {
                     StatusPill(account.quotaState.token, tint: quotaTint)
+                } else if account.probeStatus.isFailure {
+                    // The probe's own word, so the row names the cause rather
+                    // than a category. Still `Tok.unmeasured`: "we have no
+                    // reading" is the true part and stays in the cool,
+                    // off-the-traffic-light hue — a failed probe is not a
+                    // measured exhaustion and must not read as one.
+                    StatusPill(account.probeStatus.token, tint: Tok.unmeasured)
+                        .help(
+                            account.probeError.map { "Quota probe failed: \($0)" }
+                                ?? "The quota probe ran and failed "
+                                    + "(\(account.probeStatus.token)) — this account's "
+                                    + "quota is unknown."
+                        )
                 } else {
                     StatusPill("unmeasured", tint: quotaTint)
                         .help("Never probed — this account's quota is unknown, not zero.")
@@ -702,7 +728,18 @@ struct AccountRow: View {
                 }
             }
         }
-        .buttonStyle(.borderless)
+        // `.bordered`, not `.borderless`. Borderless draws the label as bare
+        // text, so the ONE actionable control in the row looked exactly like
+        // the two informational pills beside it — thirteen rows of a word that
+        // reads as a status and is actually a button. It survived review
+        // because `ImageRenderer` cannot draw AppKit controls at all: every
+        // `--render-states` PNG shows a placeholder here, so no snapshot could
+        // have caught it. It took a screenshot of the running app.
+        //
+        // `.small` keeps the added chrome from competing with the account name,
+        // which is still the thing being scanned for.
+        .buttonStyle(.bordered)
+        .controlSize(.small)
         .font(Tok.detailFont)
         .disabled(pending)
         // Thirteen rows otherwise render thirteen controls whose entire

@@ -55,7 +55,36 @@ set -euo pipefail
 MACOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="TcrBar"
 SRC="$MACOS_DIR/build/${APP_NAME}.app"
-DEST="/Applications/${APP_NAME}.app"
+
+# TCRBAR_DEV_BUILD=1 installs BESIDE the shipping app instead of over it.
+#
+# `build-tcrbar.sh` already honours this variable, but only for the bundle id
+# (`io.github.dhkts1.tcrbar.dev`), which is what keeps a dev build from being
+# the second process in the ControlCenter status-item race. The install path was
+# still hardcoded, so a dev build was given its own identity and then written
+# straight over /Applications/TcrBar.app anyway — the one thing the flag exists
+# to prevent. Testing a local build therefore cost you the installed one, which
+# is how a working release install was replaced by a build that could not
+# self-update.
+#
+# Two bundles may share CFBundleName: LaunchServices, the login item and the
+# status-item registration all key on the bundle id, and those already differ.
+# The on-disk name differs so a human can tell them apart in /Applications.
+if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
+  DEST="/Applications/${APP_NAME} Dev.app"
+else
+  DEST="/Applications/${APP_NAME}.app"
+fi
+
+# Match the process by its DESTINATION path, not by APP_NAME.
+#
+# The pattern has to distinguish the two installs, and "TcrBar.app/Contents/..."
+# matches only the shipping one -- so on the dev path the running dev app would
+# not be stopped before its bundle was swapped, and on the shipping path a
+# running dev app is correctly left alone. Deriving it from $DEST gets both
+# right, and keeps the original property that `pkill -f TcrBar` would not have:
+# an editor with the name in its window title is never matched.
+RUNNING_PATTERN="$DEST/Contents/MacOS/${APP_NAME}"
 
 echo "==> Building ${APP_NAME}…"
 bash "$MACOS_DIR/scripts/build-tcrbar.sh"
@@ -123,9 +152,9 @@ fi
 # Stop only OUR app, and only the copy being replaced. `pkill -f TcrBar` would
 # also match an editor with the name in its title or a grep for it. This happens
 # after verification so a bad build never costs you the running app.
-if pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
-  echo "==> Stopping the running ${APP_NAME}…"
-  pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" || true
+if pgrep -f "$RUNNING_PATTERN" >/dev/null 2>&1; then
+  echo "==> Stopping the running $(basename "$DEST" .app)…"
+  pkill -f "$RUNNING_PATTERN" || true
   STOPPED_APP=1
   # Give the supervised child, if any, a moment to be reaped cleanly.
   sleep 1

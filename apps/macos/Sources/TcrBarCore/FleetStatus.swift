@@ -170,6 +170,27 @@ public enum ProbeState: Equatable, Sendable {
         case .ok, .error, .timeout, .rateLimited: return true
         }
     }
+
+    /// The probe ran and came back without a usable reading.
+    ///
+    /// A strict subset of ``hasBeenProbed``, which is also true for `.ok`. The
+    /// panel needs the distinction because "no quota reading" has two causes
+    /// with two different remedies, and only one of them is what the UNMEASURED
+    /// pill means. `Tok.unmeasured` is documented as *never probed* — the remedy
+    /// is to wait for the first sweep. A probe that ran and errored is a
+    /// different fact, and its remedy is to look at why; labelling it
+    /// "unmeasured" tells the operator to wait for something that already
+    /// happened.
+    ///
+    /// `.unknown` is deliberately NOT a failure. An unrecognised token is a
+    /// state this build cannot name — which is what `Tok.unknown` exists for —
+    /// and calling it a failure would assert an observation nobody made.
+    public var isFailure: Bool {
+        switch self {
+        case .error, .timeout, .rateLimited: return true
+        case .never, .ok, .unknown: return false
+        }
+    }
 }
 
 extension ProbeState: Decodable {
