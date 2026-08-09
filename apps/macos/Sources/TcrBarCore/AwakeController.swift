@@ -14,10 +14,6 @@ import Foundation
 /// line from a shell, and it is the gate: this claim is checkable in about
 /// fifteen seconds and should be re-checked rather than believed.
 ///
-/// `caffeinate` with no flags actually holds *three* assertions
-/// (`PreventUserIdleSystemSleep`, `PreventSystemSleep`, `PreventDiskIdle`).
-/// This holds one, deliberately — the `-i` one.
-///
 /// ## Deliberate scope
 ///
 /// **Idle *system* sleep only, never display sleep.** The job is "a long run

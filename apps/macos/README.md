@@ -90,22 +90,43 @@ is:
 
 ```sh
 BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
-"$BIN" --keep-awake-probe 10 &
+
+# Positive control, started HERE so the gate generates its own: a bare
+# `caffeinate` holds exactly one assertion, PreventUserIdleSystemSleep.
+caffeinate -t 15 &
+CAFF=$!
+
+"$BIN" --keep-awake-probe 6 &
+PROBE=$!
+
 sleep 3
-pmset -g assertions | grep TcrBar        # PreventUserIdleSystemSleep, named
-pmset -g assertions | grep -ci caffeinate # positive control: the grep can see assertions
-wait
+pmset -g assertions | grep -c "pid $CAFF"   # control: 1 — the grep can see assertions
+pmset -g assertions | grep TcrBar           # held:    PreventUserIdleSystemSleep, named
+
+sleep 4                                      # past the release, inside the linger
+ps -p "$PROBE" >/dev/null && echo "probe still alive"
+pmset -g assertions | grep -c TcrBar        # released: 0, while the process still runs
+
+wait "$PROBE"; kill "$CAFF" 2>/dev/null
 ```
 
 The flag holds the assertion for the given number of seconds and exits; like
 `--render-states` it is handled before the app starts, so no menu-bar item
 appears and no `tcr` subprocess is spawned.
 
-It stays alive for three seconds *after* releasing, and that linger is the point
-of the gate rather than politeness: an assertion also disappears when its process
-dies, so a reading taken after the probe exits would pass whether or not the
-release ever happened. Sampling while the process is still running is what makes
-the result attributable.
+Both samples are load-bearing, and the second one is the reason the probe stays
+alive for three seconds *after* releasing. An assertion also disappears when its
+process dies, so a reading taken after the probe exits would pass whether or not
+`endActivity` ever ran — it would be consistent with the release working and
+with the kernel cleaning up after a probe that never released. Sampling while
+`ps` still shows the pid is what separates those two, so a gate that only ever
+samples the hold proves half of what the linger was built for.
+
+The control obeys the same rule. `pmset -g assertions | grep -ci caffeinate`
+looks like a check that the grep can see assertions, but on a machine with no
+`caffeinate` running it prints `0` and scrolls past looking like a result — its
+outcome depends on ambient state rather than on anything the snippet did. So the
+snippet starts one itself and greps for that pid.
 
 ## Build and run
 

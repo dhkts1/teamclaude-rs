@@ -301,8 +301,15 @@ struct FleetView: View {
     ///
     /// The detail line is not decoration. "Keep this Mac awake" over-promises by
     /// exactly the two cases an operator will hit, and hitting either means
-    /// coming back to a dead run and blaming the proxy. It carries `Tok.near`
-    /// because it is a caveat, the same as the other two toggles' detail lines.
+    /// coming back to a dead run and blaming the proxy.
+    ///
+    /// It carries `Tok.awake`, NOT `Tok.near`. Amber is this palette's "close to
+    /// a gating limit", and it is what the login-item error directly above uses;
+    /// an informational note about a mode the operator just turned on is not
+    /// that, and rendering it in the alarm colour made a footer with one note
+    /// read as a footer with two problems. `Tok.awake` is the mode's own token —
+    /// the same one the menu-bar mark uses — so the line reads as belonging to
+    /// the thing that is on, which is what it is.
     ///
     /// `.tint(Tok.awake)` asks for the mark to be the same token the menu bar
     /// draws, so the two surfaces cannot disagree about what "on" looks like.
@@ -328,13 +335,10 @@ struct FleetView: View {
                     + "you untick it or quit TcrBar."
             )
             if awake.isOn {
-                Text(
-                    "The display can still sleep, and closing the lid still sleeps "
-                        + "the Mac — no power assertion prevents that."
-                )
-                .font(Tok.detailFont)
-                .foregroundStyle(Tok.near)
-                .fixedSize(horizontal: false, vertical: true)
+                Text("The display still sleeps, and closing the lid still sleeps the Mac.")
+                    .font(Tok.detailFont)
+                    .foregroundStyle(Tok.awake)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -489,6 +493,38 @@ struct AccountRow: View {
         account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
     }
 
+    /// Whether this account is in the rotation, said in BOTH directions.
+    ///
+    /// This row used to render a pill only when `disabled` was true, so "in
+    /// rotation" was signalled by the absence of anything — and the only nearby
+    /// text was a button reading "Disable", which names what a click would DO.
+    /// That is not a null state, it is a legible one: Gil read the button as a
+    /// status and concluded the proxy was routing traffic to a disabled account.
+    /// It was not; `disabled` was false. A row that can be misread as its own
+    /// opposite is a defect regardless of which fact happens to be true.
+    ///
+    /// "rotating" rather than "enabled" on purpose. The button's label is the
+    /// verb (`tcr enable` / `tcr disable`, and it should stay a verb), so an
+    /// "ENABLED" pill next to a "Disable" button puts two words with the same
+    /// stem beside each other and asks the reader to notice which is a state.
+    /// Rotation is the vocabulary nothing else in the row uses, and it names the
+    /// consequence the operator actually cares about: whether requests land here.
+    ///
+    /// The in-rotation case is drawn in `Tok.inkFaint` rather than a status hue:
+    /// it is the normal state of twelve of thirteen rows, and colouring the
+    /// unremarkable case would spend the panel's colour budget on it. Colour
+    /// stays with quota, which is the thing worth scanning for.
+    @ViewBuilder
+    private var rotationPill: some View {
+        if account.disabled {
+            StatusPill("parked", tint: Tok.disabled)
+                .help("Out of the rotation — `tcr` sends this account no traffic.")
+        } else {
+            StatusPill("rotating", tint: Tok.inkFaint)
+                .help("In the rotation — this account can be picked for traffic.")
+        }
+    }
+
     /// One utterance for the whole row.
     ///
     /// Without this, VoiceOver walks roughly eight separate elements per account
@@ -498,7 +534,10 @@ struct AccountRow: View {
     /// actionable.
     private var rowAccessibilityLabel: String {
         var parts = [account.name]
-        if account.disabled { parts.append("disabled") }
+        // Spoken in both directions, for the same reason the pill is drawn in
+        // both: silence is not a state, and a VoiceOver user has even less to
+        // infer it from than a sighted one.
+        parts.append(account.disabled ? "parked, out of rotation" : "rotating")
         parts.append(
             account.hasQuotaEvidence
                 ? "\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used"
@@ -536,7 +575,7 @@ struct AccountRow: View {
                     .help(account.name)
                     .textSelection(.enabled)
                 Spacer(minLength: Tok.tightSpacing)
-                if account.disabled { StatusPill("disabled", tint: Tok.disabled) }
+                rotationPill
                 // A never-probed account's `quotaState` is Rust's default, not a
                 // reading. Printing `ok` on it would be the panel asserting
                 // something nothing has ever checked.
@@ -561,10 +600,10 @@ struct AccountRow: View {
                 Spacer()
                 // `status` is the account's own field and it keeps saying
                 // "active" while `disabled` is true — verified against live
-                // output, not just a fixture. Printing it next to a DISABLED
-                // pill puts "disabled" and "active" in one line and makes the
-                // row argue with itself, so the pill speaks for a parked
-                // account and the raw status only shows when it can be true.
+                // output, not just a fixture. Printing it next to a PARKED pill
+                // puts "parked" and "active" in one line and makes the row argue
+                // with itself, so the pill speaks for a parked account and the
+                // raw status only shows when it can be true.
                 if !account.disabled {
                     Text(account.status)
                         .font(Tok.secondaryFont)

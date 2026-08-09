@@ -159,13 +159,28 @@ LIGHT_STATUS = {
 # "nearly exhausted" when it means "this Mac will not idle sleep". Hue 195 is
 # the open slot between ready (150) and unmeasured (230).
 #
-# Both values came out of a search over this file's own constraint set rather
-# than off a colour picker: highest chroma that stays in the sRGB gamut, clears
-# the contrast floor on BOTH the panel and a raised row, and holds >= 1.25:1
-# luminance separation from `unmeasured` -- the one other cool token, and so the
-# only one it could be confused with in greyscale.
+# The constraint set both values were searched against is this file's own:
+# stay in the sRGB gamut, clear the contrast floor on BOTH the panel and a
+# raised row, and hold >= 1.25:1 luminance separation from `unmeasured` -- the
+# one other cool token, and so the only one it could be confused with in
+# greyscale. The two values sit differently against it, and saying so matters
+# more than a tidier sentence would:
 #
-# Two things that search taught, both of which are in the numbers above:
+#  - LIGHT, oklch(0.500 0.085 195) -> #017272, is the constrained maximum. At
+#    L=0.500 the gamut runs out at C=0.085, so the shipped value is the most
+#    chroma the constraint set allows at that lightness, to the digit.
+#  - DARK, oklch(0.830 0.120 195) -> #51dfdf, is NOT. Nothing gated here binds
+#    at C=0.120: at L=0.830 every constraint above still passes at C=0.141
+#    (#12e3e3, 11.31:1 on panel, 1.32:1 from `unmeasured`), and letting L move
+#    too reaches oklch(0.905 0.150 195). The shipped value was chosen BELOW
+#    that ceiling for restraint, not derived: at C=0.120 `awake` is the least
+#    chromatic of the four coloured tokens (near 0.130, ready 0.150, spent
+#    0.180), so a mode indicator never out-shouts a quota status beside it.
+#    That is a taste judgement and this script does not measure it -- what is
+#    gated is the floor the colour clears, never the ceiling it declines. Do
+#    not "fix" the value to the maximum; it is deliberate.
+#
+# Two things the search taught, both of which are in the numbers above:
 #
 #  - Maximising chroma alone is the wrong objective. Unconstrained, it returns
 #    oklch(0.665 0.295 330) -> #ed17e6, a neon magenta at twice the chroma of

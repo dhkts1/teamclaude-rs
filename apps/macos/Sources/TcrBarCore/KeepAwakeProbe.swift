@@ -91,14 +91,18 @@ public enum KeepAwakeProbe {
             let controller = AwakeController()
             controller.setOn(true)
 
-            // A probe that reports success without holding anything would be
-            // worse than no probe: every later `pmset` reading would be read as
-            // evidence about the mechanism when it was evidence about this bug.
-            guard controller.isOn else {
-                write(to: FileHandle.standardError, "TcrBar: the activity did not start\n")
-                exit(1)
-            }
-
+            // There is deliberately no `guard controller.isOn` here, and its
+            // absence is the honest shape.
+            //
+            // `beginActivity` returns a non-optional, so `begin()` always
+            // stores a token and `isOn` is always true on the next line. A
+            // guard there cannot fail: it would read as a check on whether the
+            // assertion was really taken while checking nothing at all, which
+            // is worse than no check, because the next reader trusts it. What
+            // it purported to catch — a probe reporting success while holding
+            // nothing — is not observable in this process at all; only `pmset`
+            // can see a power assertion, and that reading is the gate in
+            // `apps/macos/README.md`.
             let pid = ProcessInfo.processInfo.processIdentifier
             write(
                 to: FileHandle.standardOutput,
