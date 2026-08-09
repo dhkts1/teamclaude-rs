@@ -69,12 +69,16 @@ final class MenuBarShell {
         // a crash or a log line: the app launches, polls, holds its assertions
         // and draws nothing a human can see.
         //
-        // Both `com.github.dhkts1.tcrbar` and `TcrBar` currently hold `0` in
-        // that key. How it got there is *not* established — it could predate
-        // this work or have been written during it — so nothing here claims a
-        // history. Setting it explicitly at creation is correct under either
-        // one, which is the point: the shipped behaviour must not be a function
-        // of what is in `defaults`.
+        // Both `com.github.dhkts1.tcrbar` (the bundled app) and `TcrBar` (what
+        // an unbundled `swift build` binary uses) were observed holding `0`.
+        // How it got there is *not* established — it could predate this work or
+        // have been written during it — so nothing here claims a history, and
+        // nothing here claims a current value either: AppKit writes the key
+        // back on every run, so it was measured flipping to `1` and back within
+        // minutes. That is the whole argument for this line. Setting it
+        // explicitly at creation is correct under every history and every
+        // stored value, which is the point: the shipped behaviour must not be a
+        // function of what is in `defaults`.
         //
         // No `autosaveName`. It would only move the same persisted flag to a
         // differently-named key with the identical failure mode; the
