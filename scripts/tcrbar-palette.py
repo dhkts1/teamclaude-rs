@@ -97,6 +97,7 @@ STATUS = {
     "spent":      (0.655, 0.180,  25),   # red    - exhausted
     "unmeasured": (0.760, 0.070, 230),   # slate  - never probed, NOT zero
     "disabled":   (0.660, 0.004, 255),   # grey   - operator parked it
+    "awake":      (0.830, 0.120, 195),   # cyan   - keep-awake mode is held
 }
 
 WASH_ALPHA, LINE_ALPHA = 0.14, 0.34
@@ -150,7 +151,54 @@ LIGHT_STATUS = {
     "spent":      (0.510, 0.205,  25),
     "unmeasured": (0.580, 0.070, 230),
     "disabled":   (0.600, 0.004, 255),
+    "awake":      (0.500, 0.085, 195),
 }
+
+# `awake` -- keep-awake mode is held -- is NOT on the traffic-light scale, and
+# that is the point: reusing ready/near/spent would make the menu bar say
+# "nearly exhausted" when it means "this Mac will not idle sleep". Hue 195 is
+# the open slot between ready (150) and unmeasured (230).
+#
+# The constraint set both values were searched against is this file's own:
+# stay in the sRGB gamut, clear the contrast floor on BOTH the panel and a
+# raised row, and hold >= 1.25:1 luminance separation from `unmeasured` -- the
+# one other cool token, and so the only one it could be confused with in
+# greyscale. The two values sit differently against it, and saying so matters
+# more than a tidier sentence would:
+#
+#  - LIGHT, oklch(0.500 0.085 195) -> #017272, is the constrained maximum. At
+#    L=0.500 the gamut runs out at C=0.085, so the shipped value is the most
+#    chroma the constraint set allows at that lightness, to the digit.
+#  - DARK, oklch(0.830 0.120 195) -> #51dfdf, is NOT. Nothing gated here binds
+#    at C=0.120: at L=0.830 every constraint above still passes at C=0.141
+#    (#12e3e3, 11.31:1 on panel, 1.32:1 from `unmeasured`), and letting L move
+#    too reaches oklch(0.905 0.150 195). The shipped value was chosen BELOW
+#    that ceiling for restraint, not derived: at C=0.120 `awake` is the least
+#    chromatic of the four coloured tokens (near 0.130, ready 0.150, spent
+#    0.180), so a mode indicator never out-shouts a quota status beside it.
+#    That is a taste judgement and this script does not measure it -- what is
+#    gated is the floor the colour clears, never the ceiling it declines. Do
+#    not "fix" the value to the maximum; it is deliberate.
+#
+# Two things the search taught, both of which are in the numbers above:
+#
+#  - Maximising chroma alone is the wrong objective. Unconstrained, it returns
+#    oklch(0.665 0.295 330) -> #ed17e6, a neon magenta at twice the chroma of
+#    any shipped token, which also collides with `unknown` (#c69bdd).
+#  - Requiring separation from ALL FIVE existing statuses returns nothing at
+#    all in this hue range -- and that constraint is not this palette's: the
+#    shipped tokens do not meet it either (unmeasured vs ready is 1.02:1,
+#    disabled vs spent is 1.00:1). What is gated here is four NAMED pairs, and
+#    tokens off the traffic-light scale are separated by hue and by context.
+#
+# Known gap, deliberately not closed here: `unknown` (Tokens.swift, #c69bdd /
+# #7d4d96) is shipped but absent from this file, so it is the one token nothing
+# measures. It was left out rather than added because its dark value does not
+# round-trip -- the nearest OKLCH, (0.752 0.103 314), emits #c69bdc, one bit of
+# blue off what the app draws. Adding it would make this script authoritative
+# for a colour it does not actually reproduce, which is worse than the gap:
+# silent drift beats a known hole. Closing it properly means re-deriving that
+# token and changing what the app draws, which is its own change.
 
 # Increased Contrast: ink goes to the extremes, status hues gain lightness
 # separation from the panel.
@@ -242,6 +290,9 @@ def main():
         ("ready", "near"),
         ("near", "spent"),
         ("unmeasured", "disabled"),
+        # Both cool, both off the traffic-light scale: the pair that would
+        # collapse in greyscale if either drifted.
+        ("awake", "unmeasured"),
     ]
     for a, b in pairs:
         r = contrast(STATUS[a], STATUS[b])
@@ -263,7 +314,8 @@ def main():
               LIGHT_SURFACES, HC_LIGHT_INK, {}, failures, min_ratio=7.0)
 
     print("\nLIGHT-MODE DISCRIMINATION (the CVD pair must hold in both appearances)")
-    for a, b in [("ready", "spent"), ("ready", "near"), ("near", "spent")]:
+    for a, b in [("ready", "spent"), ("ready", "near"), ("near", "spent"),
+                 ("awake", "unmeasured")]:
         r = contrast(LIGHT_STATUS[a], LIGHT_STATUS[b])
         ok = r >= 1.25
         if not ok:

@@ -1,17 +1,28 @@
 import AppKit
-import SwiftUI
 import TcrBarCore
 
 /// The real entry point.
 ///
-/// `TcrBarApp` cannot carry `@main` itself, because the render harness has to run
-/// and exit BEFORE SwiftUI installs a menu-bar item or the poller starts. Doing it
-/// from `applicationDidFinishLaunching` would flash an icon in the menu bar and
-/// fire a `tcr` subprocess on a machine that only asked for PNGs.
+/// Every harness flag runs and exits BEFORE any UI exists. Doing it from
+/// `applicationDidFinishLaunching` would flash an icon in the menu bar and fire a
+/// `tcr` subprocess on a machine that only asked for PNGs. That ordering is
+/// load-bearing: none of these four paths may create a status item, poll `tcr`,
+/// or spawn a server.
 @main
 enum TcrBarEntry {
+
+    /// `NSApplication.delegate` is a **weak** reference, so a delegate that only
+    /// exists as a local in ``main()`` is deallocated before the first callback
+    /// and the app comes up with no menu-bar item at all.
+    @MainActor private static var delegate: AppDelegate?
+
     @MainActor
     static func main() {
+        // First, and the only one of the four that needs no AppKit at all: it
+        // draws nothing, it holds a power assertion and prints.
+        if let probe = KeepAwakeProbe.request() {
+            KeepAwakeProbe.run(probe)  // exits
+        }
         if let directory = RenderStates.requestedDirectory() {
             // AppKit needs to exist before anything can be rasterised, but the
             // app is never activated and no window or status item is created.
@@ -22,106 +33,88 @@ enum TcrBarEntry {
             _ = NSApplication.shared
             AppIcon.writeIconSet(to: directory)  // exits
         }
-        TcrBarApp.main()
-    }
-}
-
-/// TcrBar — a menu-bar accessory for the `tcr` rotating proxy.
-///
-/// `LSUIElement` is set in the bundle's Info.plist, so there is no Dock icon and
-/// no main window: the whole app is the `MenuBarExtra`.
-struct TcrBarApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var poller = StatusPoller()
-    @StateObject private var server = ServerController()
-    @StateObject private var loginItem = LoginItem()
-    @StateObject private var accounts = AccountController()
-    @StateObject private var updater = Updater()
-
-    /// Bring the proxy up when the app starts.
-    ///
-    /// Opt-in, and deliberately not default-on. Paired with "Launch at login" it
-    /// means the proxy is simply always up — but it also makes Quit expensive,
-    /// because once TcrBar supervises the server, quitting stops it. Turning that
-    /// on should be a decision the operator made, not a surprise on first launch.
-    ///
-    /// Safe by construction: this is `start()`, which passes `--no-replace`, so a
-    /// proxy that is already serving is never disturbed. If one is, the spawn
-    /// reports "already running" and nothing happens.
-    @AppStorage("startServerAtLaunch") private var startServerAtLaunch = false
-
-    /// Fires once per process, not once per panel open. `onAppear` on the
-    /// `MenuBarExtra` content runs every time the menu is opened, so without this
-    /// the app would attempt a spawn on every click.
-    @State private var didAttemptLaunchStart = false
-
-    var body: some Scene {
-        MenuBarExtra {
-            FleetView(
-                poller: poller,
-                server: server,
-                loginItem: loginItem,
-                accounts: accounts,
-                updater: updater,
-                startServerAtLaunch: $startServerAtLaunch
-            )
-            .onAppear {
-                poller.start()
-                delegate.server = server
-                // macOS owns the login-item bit; re-read it every time the
-                // panel opens so a revocation in System Settings shows up.
-                loginItem.refresh()
-                if startServerAtLaunch, !didAttemptLaunchStart {
-                    didAttemptLaunchStart = true
-                    server.start()
-                }
-            }
-        } label: {
-            MenuBarLabel(state: poller.state)
-                // Deliberately on the LABEL, not on the panel content.
-                //
-                // The delegate is what receives `tcrbar://check-for-updates`,
-                // and the updater is owned by the app, so the delegate has to be
-                // handed a reference before any URL can arrive. The panel's
-                // `onAppear` fires only when someone opens the menu — a URL sent
-                // to an app whose panel has never been opened would then find a
-                // nil updater and do nothing. The label is drawn at launch,
-                // which is the moment the app becomes reachable at all.
-                .onAppear { delegate.updater = updater }
+        // The one flag that does build a status item — it has to, it is the gate
+        // on the shell. It builds its own, from a pinned poller, an inert
+        // keep-awake and an unstarted updater, and never reaches the delegate
+        // below.
+        if ShellProbe.requested() {
+            ShellProbe.run()  // exits
         }
-        .menuBarExtraStyle(.window)
+
+        let app = NSApplication.shared
+        // The bundle already sets `LSUIElement`, so this matches what the app
+        // already is: no Dock icon, no main window, no menu bar of its own.
+        // Setting it here as well is what makes an unbundled `swift build`
+        // binary behave the same way.
+        app.setActivationPolicy(.accessory)
+        let delegate = AppDelegate()
+        Self.delegate = delegate
+        app.delegate = delegate
+        app.run()
+        exit(0)
     }
 }
 
-/// Two jobs: a child process TcrBar spawned must not outlive it, and the app's
-/// `tcrbar://` URLs land here.
+/// Owns the shell, makes sure nothing TcrBar started outlives it — a child
+/// process, and a power assertion — and is where the app's `tcrbar://` URLs land.
 ///
 /// `terminateSupervisedChildOnQuit()` is a no-op unless *this app* spawned the
-/// server — an incumbent proxy is never signalled.
+/// server; an incumbent proxy is never signalled. Both controllers are owned
+/// outright now rather than handed over from the panel's `onAppear`, so there is
+/// no window in which a quit could find them nil.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var server: ServerController?
-
-    /// Handed over by `TcrBarApp` when the menu-bar label first appears, which is
-    /// at launch. Optional because the delegate is constructed by AppKit before
-    /// any SwiftUI scene exists, not because it is expected to stay nil.
+    /// Built in ``applicationDidFinishLaunching(_:)``, and the owner of
+    /// everything the app runs on — including the ``Updater`` the `tcrbar://`
+    /// handler below reaches for.
     ///
-    /// A URL that arrives before that hand-off is REMEMBERED rather than dropped:
-    /// launching the app *with* `tcrbar://check-for-updates` is the ordinary case
-    /// — that is what happens when the app was not already running — and the URL
-    /// event beats the first scene by a few milliseconds.
-    var updater: Updater? {
+    /// A URL that arrives before the shell exists is REMEMBERED rather than
+    /// dropped: launching the app *with* `tcrbar://check-for-updates` is the
+    /// ordinary case — that is what happens when the app was not already running
+    /// — and the URL event beats the delegate's launch callback. Under the
+    /// SwiftUI scene this guard hung off a `var updater: Updater?` handed over
+    /// when the menu-bar label first appeared; the shell owns the updater now, so
+    /// the same guard hangs off the shell, and it covers the same window.
+    private var shell: MenuBarShell? {
         didSet {
-            guard checkIsPending, let updater else { return }
+            guard checkIsPending, let shell else { return }
             checkIsPending = false
             NSLog("TcrBar: running the update check that arrived before launch finished")
-            updater.checkForUpdates()
+            shell.updater.checkForUpdates()
         }
     }
     private var checkIsPending = false
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        let shell = MenuBarShell()
+        self.shell = shell
+        // Was `FleetView.onAppear`, which under `MenuBarExtra` meant the fleet
+        // was not polled until the panel had been opened once — the menu-bar
+        // glyph sat at its `.pending` gauge until then.
+        shell.poller.start()
+        // One attempt, once per process.
+        //
+        // This used to need a `didAttemptLaunchStart` flag because `onAppear`
+        // fires on every panel open, so without it the app attempted a spawn on
+        // every click. `applicationDidFinishLaunching` fires exactly once, so
+        // the guard is now structural rather than a variable — the reasoning is
+        // kept here because deleting the flag would otherwise delete the reason
+        // it existed with it.
+        //
+        // Safe by construction either way: this is `start()`, which passes
+        // `--no-replace`, so a proxy that is already serving is never disturbed.
+        if shell.preference.startServerAtLaunch {
+            shell.server.start()
+        }
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        server?.terminateSupervisedChildOnQuit()
+        shell?.server.terminateSupervisedChildOnQuit()
+        // The kernel drops every power assertion a process holds when it dies,
+        // so this line is not what lets the Mac sleep again. It is here so that
+        // "quitting TcrBar releases it" is something this app does rather than
+        // something it gets away with.
+        shell?.awake.releaseOnQuit()
     }
 
     /// The URL contract with the `tcr` CLI: `tcrbar://check-for-updates` runs the
@@ -149,37 +142,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch url.host {
         case "check-for-updates":
             NSLog("TcrBar: tcrbar://check-for-updates received")
-            guard let updater else {
+            guard let shell else {
                 NSLog("TcrBar: no updater yet — the check is queued until launch completes")
                 checkIsPending = true
                 return
             }
-            updater.checkForUpdates()
+            shell.updater.checkForUpdates()
         default:
             NSLog("TcrBar: unhandled tcrbar URL: %@", url.absoluteString)
-        }
-    }
-}
-
-/// The glyph in the menu bar: fleet *capacity*, not the worst account.
-///
-/// It answers one question — can I work right now — and it is deliberately not
-/// worst-account-wins. In a rotating pool spent accounts are the mechanism
-/// working, so a worst-wins glyph pinned itself to the alarm state whenever any
-/// one of thirteen accounts was spent, which is nearly always. The mapping lives
-/// in `Fleet.capacityGlyphState`; this view does no logic. A failed read shows a
-/// warning glyph rather than a healthy-looking gauge.
-struct MenuBarLabel: View {
-    let state: PollState
-
-    var body: some View {
-        switch state {
-        case .loaded(let fleet):
-            Image(systemName: Tok.glyph(for: fleet.capacityGlyphState))
-        case .pending:
-            Image(systemName: "gauge.with.dots.needle.33percent")
-        case .toolMissing, .commandFailed, .undecodable:
-            Image(systemName: Tok.unreadableGlyph)
         }
     }
 }

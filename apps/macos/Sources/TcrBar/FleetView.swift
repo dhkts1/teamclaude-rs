@@ -13,6 +13,13 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    /// Owned by the app, for the same reason the poller is: the panel is a view
+    /// and the mode is not, and an assertion released when the view went away
+    /// would be a keep-awake control that keeps nothing awake. Under
+    /// `MenuBarExtra` that teardown happened on every close; hosted in a popover
+    /// it need not — which changes when that bug would bite, not whether it
+    /// would.
+    @ObservedObject var awake: AwakeController
     @ObservedObject var updater: Updater
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
@@ -37,11 +44,16 @@ struct FleetView: View {
 
     /// Measured height of the account rows.
     ///
-    /// A `ScrollView` has a flexible ideal height, and the `MenuBarExtra` window
-    /// sizes itself to its content's *ideal* height — so a scroll view carrying
-    /// only a `maxHeight` collapses to roughly one row no matter how many
-    /// accounts the fleet has. Measuring the rows and giving the scroll view a
-    /// concrete height is what makes the panel grow with the fleet.
+    /// A `ScrollView` has a flexible ideal height, and the window this panel
+    /// lives in sizes itself to its content's *ideal* height — so a scroll view
+    /// carrying only a `maxHeight` collapses to roughly one row no matter how
+    /// many accounts the fleet has. Measuring the rows and giving the scroll
+    /// view a concrete height is what makes the panel grow with the fleet.
+    ///
+    /// That was true of the `MenuBarExtra` window this panel used to live in and
+    /// is equally true of the `NSPopover` it lives in now, whose hosting
+    /// controller is set to `sizingOptions = [.preferredContentSize]`
+    /// (`MenuBarShell.swift`) for exactly this reason.
     @State private var rowsHeight: CGFloat = 0
 
     var body: some View {
@@ -260,6 +272,7 @@ struct FleetView: View {
 
             launchAtLogin
             startServerToggle
+            keepAwakeToggle
 
             dangerZone
         }
@@ -284,6 +297,56 @@ struct FleetView: View {
                 Text("TcrBar supervises the server, so quitting TcrBar stops it.")
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.near)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Keep the Mac from idle-sleeping, for as long as the box is ticked.
+    ///
+    /// A checkbox rather than a fifth button: the button row above is already
+    /// four wide inside a 380pt panel, and this belongs with the other two
+    /// toggles anyway — all three are modes, not actions.
+    ///
+    /// The detail line is not decoration. "Keep this Mac awake" over-promises by
+    /// exactly the two cases an operator will hit, and hitting either means
+    /// coming back to a dead run and blaming the proxy.
+    ///
+    /// It carries `Tok.awake`, NOT `Tok.near`. Amber is this palette's "close to
+    /// a gating limit", and it is what the login-item error directly above uses;
+    /// an informational note about a mode the operator just turned on is not
+    /// that, and rendering it in the alarm colour made a footer with one note
+    /// read as a footer with two problems. `Tok.awake` is the mode's own token —
+    /// the same one the menu-bar mark uses — so the line reads as belonging to
+    /// the thing that is on, which is what it is.
+    ///
+    /// `.tint(Tok.awake)` asks for the mark to be the same token the menu bar
+    /// draws, so the two surfaces cannot disagree about what "on" looks like.
+    /// **That one line is unverified**, and it is the only thing here that is: a
+    /// `.checkbox` toggle is an AppKit control, `ImageRenderer` does not draw
+    /// those at all (`--render-states` shows a placeholder for this toggle and
+    /// for the two above it, all three the same), and reading the real control
+    /// back needs a screenshot. On macOS a checkbox may well follow the system
+    /// accent colour and ignore the tint outright. The state is carried by the
+    /// checkbox being *ticked*, which is not a colour, so nothing depends on it.
+    private var keepAwakeToggle: some View {
+        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            Toggle(
+                "Keep this Mac awake",
+                isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
+            )
+            .toggleStyle(.checkbox)
+            .font(Tok.secondaryFont)
+            .tint(Tok.awake)
+            .help(
+                "Holds an idle-system-sleep power assertion for as long as this "
+                    + "is on — the same thing `caffeinate -i` does. Released when "
+                    + "you untick it or quit TcrBar."
+            )
+            if awake.isOn {
+                Text("The display still sleeps, and closing the lid still sleeps the Mac.")
+                    .font(Tok.detailFont)
+                    .foregroundStyle(Tok.awake)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -439,6 +502,39 @@ struct AccountRow: View {
         account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
     }
 
+    /// Whether this account is in the rotation, said in BOTH directions.
+    ///
+    /// This row used to render a pill only when `disabled` was true, so "in
+    /// rotation" was signalled by the absence of anything — and the only nearby
+    /// text was a button reading "Disable", which names what a click would DO.
+    /// That is not a null state, it is a legible one: the button's verb was read
+    /// as a status, and the reader concluded from it that the proxy was routing
+    /// traffic to a disabled account. It was not; `disabled` was false. A row
+    /// that can be misread as its own opposite is a defect regardless of which
+    /// fact happens to be true.
+    ///
+    /// "rotating" rather than "enabled" on purpose. The button's label is the
+    /// verb (`tcr enable` / `tcr disable`, and it should stay a verb), so an
+    /// "ENABLED" pill next to a "Disable" button puts two words with the same
+    /// stem beside each other and asks the reader to notice which is a state.
+    /// Rotation is the vocabulary nothing else in the row uses, and it names the
+    /// consequence the operator actually cares about: whether requests land here.
+    ///
+    /// The in-rotation case is drawn in `Tok.inkFaint` rather than a status hue:
+    /// it is the normal state of twelve of thirteen rows, and colouring the
+    /// unremarkable case would spend the panel's colour budget on it. Colour
+    /// stays with quota, which is the thing worth scanning for.
+    @ViewBuilder
+    private var rotationPill: some View {
+        if account.disabled {
+            StatusPill("parked", tint: Tok.disabled)
+                .help("Out of the rotation — `tcr` sends this account no traffic.")
+        } else {
+            StatusPill("rotating", tint: Tok.inkFaint)
+                .help("In the rotation — this account can be picked for traffic.")
+        }
+    }
+
     /// One utterance for the whole row.
     ///
     /// Without this, VoiceOver walks roughly eight separate elements per account
@@ -448,7 +544,10 @@ struct AccountRow: View {
     /// actionable.
     private var rowAccessibilityLabel: String {
         var parts = [account.name]
-        if account.disabled { parts.append("disabled") }
+        // Spoken in both directions, for the same reason the pill is drawn in
+        // both: silence is not a state, and a VoiceOver user has even less to
+        // infer it from than a sighted one.
+        parts.append(account.disabled ? "parked, out of rotation" : "rotating")
         parts.append(
             account.hasQuotaEvidence
                 ? "\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used"
@@ -486,7 +585,7 @@ struct AccountRow: View {
                     .help(account.name)
                     .textSelection(.enabled)
                 Spacer(minLength: Tok.tightSpacing)
-                if account.disabled { StatusPill("disabled", tint: Tok.disabled) }
+                rotationPill
                 // A never-probed account's `quotaState` is Rust's default, not a
                 // reading. Printing `ok` on it would be the panel asserting
                 // something nothing has ever checked.
@@ -511,10 +610,10 @@ struct AccountRow: View {
                 Spacer()
                 // `status` is the account's own field and it keeps saying
                 // "active" while `disabled` is true — verified against live
-                // output, not just a fixture. Printing it next to a DISABLED
-                // pill puts "disabled" and "active" in one line and makes the
-                // row argue with itself, so the pill speaks for a parked
-                // account and the raw status only shows when it can be true.
+                // output, not just a fixture. Printing it next to a PARKED pill
+                // puts "parked" and "active" in one line and makes the row argue
+                // with itself, so the pill speaks for a parked account and the
+                // raw status only shows when it can be true.
                 if !account.disabled {
                     Text(account.status)
                         .font(Tok.secondaryFont)
@@ -598,11 +697,12 @@ struct AccountRow: View {
 ///
 /// `fraction` is optional because a never-probed account has no reading at all.
 /// A nil renders as a DASHED outline rather than an unfilled bar: an unfilled bar
-/// is pixel-identical to `0`, so drawing one would make the panel assert
-/// "exhausted" about an account nothing has ever measured. Keeping unknown
-/// distinct from empty at the last rendering step is the whole point of the
-/// optional model — collapsing it here would undo it after the decoder,
-/// `readyCount` and the pill all took care to preserve it.
+/// is pixel-identical to `0`, and since the fraction is utilization, drawing one
+/// would make the panel assert "nothing spent, full headroom" about an account
+/// nothing has ever measured. Keeping unknown distinct from empty at the last
+/// rendering step is the whole point of the optional model — collapsing it here
+/// would undo it after the decoder, `readyCount` and the pill all took care to
+/// preserve it.
 struct QuotaBar: View {
     let fraction: Double?
     let tint: Color
@@ -617,7 +717,7 @@ struct QuotaBar: View {
     /// important number is invisible to VoiceOver — and worse, the nil-vs-zero
     /// distinction that the decoder, `readyCount` and the pill all take care to
     /// preserve would survive only as a dashed outline. "Never measured" and
-    /// "exhausted" would be identical again, which is the exact defect the
+    /// "nothing spent" would be identical again, which is the exact defect the
     /// optional model exists to prevent.
     private var spokenValue: String {
         guard let fraction else { return "not measured" }

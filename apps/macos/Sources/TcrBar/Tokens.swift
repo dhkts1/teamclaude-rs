@@ -39,31 +39,44 @@ public enum Tok {
 
     /// A colour that answers to the current appearance *and* the Increased
     /// Contrast setting, the way a system semantic colour does.
+    ///
+    /// Split from ``dyn`` because one token is needed as an `NSColor` as well:
+    /// the menu-bar mark is built as an `NSImage` so it can opt out of template
+    /// rendering, and a symbol configuration takes `NSColor`. Deriving the
+    /// `Color` from the `NSColor` rather than writing the hexes twice is what
+    /// stops the panel and the menu bar drifting apart.
+    private static func dynNS(
+        dark: String,
+        light: String,
+        darkHC: String? = nil,
+        lightHC: String? = nil
+    ) -> NSColor {
+        NSColor(name: nil) { appearance in
+            let matched = appearance.bestMatch(from: [
+                .aqua, .darkAqua,
+                .accessibilityHighContrastAqua,
+                .accessibilityHighContrastDarkAqua,
+            ])
+            switch matched {
+            case .accessibilityHighContrastDarkAqua:
+                return NSColor(tokenHex: darkHC ?? dark)
+            case .accessibilityHighContrastAqua:
+                return NSColor(tokenHex: lightHC ?? light)
+            case .darkAqua:
+                return NSColor(tokenHex: dark)
+            default:
+                return NSColor(tokenHex: light)
+            }
+        }
+    }
+
     private static func dyn(
         dark: String,
         light: String,
         darkHC: String? = nil,
         lightHC: String? = nil
     ) -> Color {
-        Color(
-            nsColor: NSColor(name: nil) { appearance in
-                let matched = appearance.bestMatch(from: [
-                    .aqua, .darkAqua,
-                    .accessibilityHighContrastAqua,
-                    .accessibilityHighContrastDarkAqua,
-                ])
-                switch matched {
-                case .accessibilityHighContrastDarkAqua:
-                    return NSColor(tokenHex: darkHC ?? dark)
-                case .accessibilityHighContrastAqua:
-                    return NSColor(tokenHex: lightHC ?? light)
-                case .darkAqua:
-                    return NSColor(tokenHex: dark)
-                default:
-                    return NSColor(tokenHex: light)
-                }
-            }
-        )
+        Color(nsColor: dynNS(dark: dark, light: light, darkHC: darkHC, lightHC: lightHC))
     }
 
     // MARK: - Surfaces
@@ -131,6 +144,31 @@ public enum Tok {
     public static let unknown = dyn(dark: "#c69bdd", light: "#7d4d96")
     /// Numbers that are structurally zero rather than measured.
     public static let offline = inkFaint
+
+    /// Keep-awake mode is held.
+    ///
+    /// Its own hue, and specifically NOT `ok` / `near` / `spent`: those three
+    /// are quota semantics, so an amber menu-bar mark would read as "the fleet
+    /// is nearly exhausted" while actually meaning "this Mac will not idle
+    /// sleep". Cyan is the open slot — hue 195, between `ok` at 150 and
+    /// `unmeasured` at 230.
+    ///
+    /// Generated and gated like the rest of the palette
+    /// (`scripts/tcrbar-palette.py`): dark `oklch(0.830 0.120 195)` measures
+    /// **11.22:1** on the panel and **10.06:1** on a raised row; light
+    /// `oklch(0.500 0.085 195)` measures **5.20:1** and **4.75:1**. Both clear
+    /// their floor (4.5:1 dark, 3:1 light for a non-text element) and neither
+    /// clips the sRGB gamut. It is held **1.31:1** dark / **1.37:1** light apart
+    /// in luminance from `unmeasured`, the only other cool token, so the two do
+    /// not collapse in greyscale.
+    ///
+    /// Every one of those figures is measured **against the panel**. The
+    /// menu-bar mark is drawn on the wallpaper, where no contrast ratio can be
+    /// guaranteed against anything — which is exactly why the menu bar carries
+    /// this state as a glyph that is *present or absent* and uses colour only as
+    /// a second channel. See `KeepAwakeGlyph`.
+    public static let awakeNSColor = dynNS(dark: "#51dfdf", light: "#017272")
+    public static let awake = Color(nsColor: awakeNSColor)
 
     /// The tint behind a status pill, and the hairline around it.
     public static func wash(_ tint: Color) -> Color { tint.opacity(0.14) }

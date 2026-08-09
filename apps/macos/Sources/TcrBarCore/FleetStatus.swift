@@ -205,8 +205,9 @@ public enum QuotaFormat {
     /// itself, so the rule that matters — a nil fraction is *never* the same
     /// drawing as `0.0` — is a property of the model and can be tested. A
     /// zero-width fill and an unmeasured account look identical on screen, and
-    /// they mean opposite things: one account is exhausted, the other has
-    /// simply never been asked.
+    /// they mean opposite things. The fraction is *utilization*, so a zero-width
+    /// fill is the most headroom there is — nothing spent — while the other
+    /// account has simply never been asked.
     public enum BarFill: Equatable, Sendable {
         /// A real reading, clamped to `0...1` for drawing. The numeric label
         /// beside the bar still shows the unclamped figure.

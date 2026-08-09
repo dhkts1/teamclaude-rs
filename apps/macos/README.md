@@ -61,6 +61,73 @@ A rotating pool is *supposed* to contain spent accounts — that is the mechanis
 working. A worst-account-wins glyph sat at its most alarming setting permanently
 and therefore meant nothing.
 
+## Keeping the Mac awake
+
+"Keep this Mac awake" in the panel holds an idle-system-sleep power assertion —
+the same thing `caffeinate -i` does — for as long as the box is ticked. While it
+is on, a second tinted mark appears beside the capacity gauge in the menu bar.
+
+Three things it deliberately does not do:
+
+- **It does not keep the display awake.** The job is "a long run keeps running",
+  and a dark screen does not stop a run. Holding the backlight on all night is a
+  cost nobody asked for.
+- **It does not survive closing the lid.** No assertion of this class does. The
+  panel says so while the mode is on, because an operator who believes otherwise
+  comes back to a dead run and blames the proxy.
+- **It does not persist across launches.** A Mac that silently never sleeps
+  because of a box ticked last week is a worse bug than having to tick it again;
+  the symptom (a laptop cooking in a bag) is nowhere near the cause.
+
+Untick it, or quit TcrBar, and the assertion is released.
+
+### Proving it, without a screenshot
+
+The control is a checkbox, and nothing on the machine can click it for you.
+`screencapture` needs Screen Recording, which a build machine or a headless
+agent may not have, so "look at the menu bar" is not available as a gate. This
+is:
+
+```sh
+BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
+
+# Positive control, started HERE so the gate generates its own: a bare
+# `caffeinate` holds exactly one assertion, PreventUserIdleSystemSleep.
+caffeinate -t 15 &
+CAFF=$!
+
+"$BIN" --keep-awake-probe 6 &
+PROBE=$!
+
+sleep 3
+pmset -g assertions | grep -c "pid $CAFF"   # control: 1 — the grep can see assertions
+pmset -g assertions | grep TcrBar           # held:    PreventUserIdleSystemSleep, named
+
+sleep 4                                      # past the release, inside the linger
+ps -p "$PROBE" >/dev/null && echo "probe still alive"
+pmset -g assertions | grep -c TcrBar        # released: 0, while the process still runs
+
+wait "$PROBE"; kill "$CAFF" 2>/dev/null
+```
+
+The flag holds the assertion for the given number of seconds and exits; like
+`--render-states` it is handled before the app starts, so no menu-bar item
+appears and no `tcr` subprocess is spawned.
+
+Both samples are load-bearing, and the second one is the reason the probe stays
+alive for three seconds *after* releasing. An assertion also disappears when its
+process dies, so a reading taken after the probe exits would pass whether or not
+`endActivity` ever ran — it would be consistent with the release working and
+with the kernel cleaning up after a probe that never released. Sampling while
+`ps` still shows the pid is what separates those two, so a gate that only ever
+samples the hold proves half of what the linger was built for.
+
+The control obeys the same rule. `pmset -g assertions | grep -ci caffeinate`
+looks like a check that the grep can see assertions, but on a machine with no
+`caffeinate` running it prints `0` and scrolls past looking like a result — its
+outcome depends on ambient state rather than on anything the snippet did. So the
+snippet starts one itself and greps for that pid.
+
 ## Build and run
 
 ```sh
@@ -148,10 +215,47 @@ Three states look similar and are not:
 Package.swift
 Sources/TcrBarCore/   FleetStatus.swift  StatusPoller.swift  ServerController.swift
                       AccountControl.swift  LoginItem.swift  TcrTool.swift
-Sources/TcrBar/       TcrBarApp.swift  FleetView.swift  Tokens.swift
+                      AwakeController.swift  KeepAwakeGlyph.swift  KeepAwakeProbe.swift
+                      MenuBarMark.swift  LaunchPreference.swift
+Sources/TcrBar/       TcrBarApp.swift  MenuBarShell.swift  ShellProbe.swift
+                      FleetView.swift  Tokens.swift  RenderStates.swift  AppIcon.swift
 Tests/TcrBarTests/    FleetStatusTests.swift
 scripts/build-tcrbar.sh
 ```
 
 The logic lives in the `TcrBarCore` library so it can be tested without linking a
-test bundle against an `@main` executable; `TcrBar` is the SwiftUI shell.
+test bundle against an `@main` executable; `TcrBar` is the shell.
+
+## Why the shell is AppKit and not `MenuBarExtra`
+
+It was a SwiftUI `MenuBarExtra`, and a `MenuBarExtra` renders its label
+**monochrome no matter what the image says**. Six label constructions were each
+hosted in a real one and rasterised off the real `NSStatusBarButton`:
+`Image(nsImage:)` with `isTemplate = false`, the same with
+`.renderingMode(.original)`, a coloured `Text("●")`, and a symbol pre-flattened
+to a plain bitmap all came back with **0 coloured pixels**; an emoji managed 14.
+Setting `button.image` directly on the button gave **533 of 533**.
+
+So the app owns an `NSStatusItem`, composes the menu-bar image itself
+(`MenuBarMark`), and hosts the same unchanged `FleetView` in an `NSPopover`.
+Three things `MenuBarExtra` did for free are now explicit, and each is a silent
+regression if it is dropped: the popover is told the panel's preferred size, the
+login-item bit is re-read on every open rather than only on the first, and the
+app is activated before the panel is shown so text selection works.
+
+### Proving the shell, without a screenshot
+
+```sh
+BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
+"$BIN" --shell-probe        # one line per assertion, non-zero if any failed
+```
+
+It builds the real shell in-process and checks nine things, including that the
+ON mark rasterises to cyan pixels off the real status button **and** that the OFF
+mark rasterises to none — the negative control, without which the first
+assertion passes on a mark that is cyan in both states. Every one of the nine was
+broken on purpose and watched go red.
+
+What it does not cover: the window server's final composite of the menu bar, a
+real mouse click, and anything about a signed bundle. Those are still a human's
+eyes.

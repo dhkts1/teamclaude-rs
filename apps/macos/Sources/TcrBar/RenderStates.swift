@@ -38,19 +38,42 @@ enum RenderStates {
     }
 
     /// Every state worth looking at, with the name its PNG gets.
-    private static var scenes: [(name: String, state: PollState)] {
+    ///
+    /// `awake` is a per-scene flag rather than a twelfth state because it is
+    /// orthogonal to the poll: the mode can be on under any fleet at all. One
+    /// scene carries it, and what that scene reviews is narrower than "the ON
+    /// appearance" — it is the caveat line under the checkbox, and the footer
+    /// moving down to make room for it. Nothing more:
+    ///
+    ///  - The tinted mark is drawn on the status item (``MenuBarShell``), which
+    ///    is not part of this view, so no scene here renders it.
+    ///  - The tick is not rendered either. `ImageRenderer` draws a `.checkbox`
+    ///    toggle as the same placeholder in both states, which
+    ///    `FleetView.keepAwakeToggle` already says.
+    ///
+    /// Measured rather than assumed: a band diff of `01-healthy-dark` against
+    /// `12-keeping-awake-dark` (max channel delta > 8) differs on 85 of the 897
+    /// rows they share, in ONE contiguous band, `y=812..896` — the caveat line
+    /// and everything the extra line pushes down. Every row above `y=812`,
+    /// checkbox included, is pixel-identical. Scene 12 is also 34px taller,
+    /// which is that same line and nothing else.
+    ///
+    /// Those figures move whenever the footer's wording or spacing does; if they
+    /// look stale, re-measure rather than trusting them.
+    private static var scenes: [(name: String, state: PollState, awake: Bool)] {
         [
-            ("01-healthy", .loaded(fleet(healthyJSON))),
-            ("02-mixed-thirteen", .loaded(fleet(mixedJSON))),
-            ("03-zero-capacity", .loaded(fleet(exhaustedJSON))),
-            ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON))),
-            ("05-unreadable-row", .loaded(partiallyUnreadableFleet())),
-            ("06-offline-source", .loaded(fleet(offlineJSON))),
-            ("07-empty-fleet", .loaded(fleet("[]"))),
-            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"])),
-            ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused")),
-            ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota")),
-            ("11-pending", .pending),
+            ("01-healthy", .loaded(fleet(healthyJSON)), false),
+            ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false),
+            ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false),
+            ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false),
+            ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false),
+            ("06-offline-source", .loaded(fleet(offlineJSON)), false),
+            ("07-empty-fleet", .loaded(fleet("[]")), false),
+            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]), false),
+            ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused"), false),
+            ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false),
+            ("11-pending", .pending, false),
+            ("12-keeping-awake", .loaded(fleet(healthyJSON)), true),
         ]
     }
 
@@ -91,7 +114,7 @@ enum RenderStates {
 
     @MainActor
     private static func render(
-        _ scene: (name: String, state: PollState),
+        _ scene: (name: String, state: PollState, awake: Bool),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
@@ -102,12 +125,20 @@ enum RenderStates {
         NSAppearance.current = appearance.nsAppearance
         defer { NSAppearance.current = previous }
 
+        // `.inert`, never the real activity: drawing a checkbox in its ON state
+        // must not actually stop this machine sleeping. A harness with a side
+        // effect on the operator's power settings would be a worse bug than
+        // anything it could catch.
+        let awake = AwakeController(activity: .inert)
+        awake.setOn(scene.awake)
+
         let view =
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: referenceDate),
                 server: ServerController(),
                 loginItem: LoginItem(),
                 accounts: AccountController(),
+                awake: awake,
                 // `startingUpdater: false`: this process was asked for PNGs. A
                 // started updater schedules background checks and can put a
                 // window on screen, neither of which belongs in a render run.
