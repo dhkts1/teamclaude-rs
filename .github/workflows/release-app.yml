@@ -26,7 +26,99 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Releases are currently cut LOCALLY (see docs/RELEASING.md), so none of the
+  # signing secrets are set on this repository. Without this job every `v*` tag
+  # would start `release-app`, which would fail at the certificate import — a
+  # red release run on every tag, forever, for a repository that has
+  # deliberately not been given an Apple signing key.
+  #
+  # The check has to be a separate job because the `secrets` context is NOT
+  # available in a job-level `if:`. Per GitHub's context-availability table,
+  # `jobs.<job_id>.if` accepts only `github`, `needs`, `vars` and `inputs`;
+  # `secrets` is readable in a step `env:`, which is what this job does. It
+  # emits only the literal `true` or `false` — never the value, never a length.
+  check-signing-secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      have-secrets: ${{ steps.probe.outputs.have-secrets }}
+    steps:
+      - name: Probe for the signing secrets without revealing them
+        id: probe
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          # No `set -x` here, and nothing below prints a secret's value or its
+          # length: `[ -n ... ]` is the only thing ever done with one. Secret
+          # NAMES are not secret, so reporting which are missing is safe.
+          set -euo pipefail
+          missing=()
+          for name in \
+            MACOS_CERT_P12_BASE64 MACOS_CERT_PASSWORD KEYCHAIN_PASSWORD \
+            APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID \
+            SPARKLE_ED_PRIVATE_KEY
+          do
+            if [ -z "${!name:-}" ]; then
+              missing+=("$name")
+            fi
+          done
+
+          if [ "${#missing[@]}" -eq 0 ]; then
+            echo "have-secrets=true" >> "$GITHUB_OUTPUT"
+            echo "All signing secrets are set; the signing job will run."
+            exit 0
+          fi
+
+          echo "have-secrets=false" >> "$GITHUB_OUTPUT"
+
+          # A PARTIAL set is a misconfiguration, not a deliberate opt-out, and
+          # failing loudly beats silently shipping no app for a tag someone
+          # believed was signed. Only a completely empty set skips cleanly.
+          if [ "${#missing[@]}" -ne 7 ]; then
+            {
+              echo "## Release app: FAILED — signing secrets are incomplete"
+              echo
+              echo "Some signing secrets are set but these are missing:"
+              echo
+              for name in "${missing[@]}"; do echo "- \`$name\`"; done
+              echo
+              echo "Set the missing secrets, or unset them all to skip signing in CI."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "ERROR: incomplete signing secret set; missing: ${missing[*]}" >&2
+            exit 1
+          fi
+
+          {
+            # A quoted heredoc so the backticks stay literal markdown.
+            cat <<'MD'
+          ## Release app: SKIPPED — signing secrets are not set
+
+          None of the seven macOS signing secrets exist on this repository, so
+          there is nothing to sign with and the signing job was skipped rather
+          than failed.
+
+          This is the intended configuration: releases are cut LOCALLY with
+          `apps/macos/scripts/release-tcrbar.sh`, and the Apple signing key is
+          deliberately not stored in GitHub.
+
+          See `docs/RELEASING.md`. To sign in CI instead, set all of:
+
+          MD
+            for name in "${missing[@]}"; do echo "- $name"; done
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "SKIPPING: no signing secrets are set on this repository."
+          echo "Releases are cut locally with apps/macos/scripts/release-tcrbar.sh."
+          echo "See docs/RELEASING.md."
+
   release-app:
+    needs: check-signing-secrets
+    if: needs.check-signing-secrets.outputs.have-secrets == 'true'
     runs-on: macos-14
     timeout-minutes: 60
     steps:

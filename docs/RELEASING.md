@@ -94,6 +94,16 @@ Flags:
 never gain a `pull_request` trigger: it holds three private keys, and a fork PR would get all of
 them.
 
+**None of these secrets are set today, and that is deliberate** — the Apple signing key is not
+stored in GitHub, and releases are cut locally with `apps/macos/scripts/release-tcrbar.sh`. So a
+`v*` tag reaches a `check-signing-secrets` job which finds all seven unset, writes a job summary
+saying so, and the signing job is **skipped** rather than failed. Setting all seven turns CI
+signing on with no further change. Setting only *some* is treated as a misconfiguration and fails
+loudly, naming the missing ones — a half-configured release is likelier to be a mistake than an
+intent to skip. The check must be its own job because the `secrets` context is unavailable in a
+job-level `if:` (GitHub's context-availability table allows only `github`, `needs`, `vars` and
+`inputs` there).
+
 | secret | how to produce it |
 |---|---|
 | `MACOS_CERT_P12_BASE64` | Keychain Access → login → My Certificates → the Developer ID Application entry → right-click → Export → `.p12` (**include the private key** — export the certificate row with its disclosure triangle, not the bare key). Then `base64 -i cert.p12 \| pbcopy`. |
