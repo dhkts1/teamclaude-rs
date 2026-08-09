@@ -224,3 +224,65 @@ if [ -n "$staged_shippable" ]; then
     exit 1
   fi
 fi
+
+# ── Design-token staleness gate ─────────────────────────────────────────────
+# apps/macos/design-tokens/ is GENERATED from two sources: colour from
+# scripts/tcrbar-palette.py, geometry read out of Tokens.swift. Committing a
+# generated artifact without a check on its inputs is how generated files rot —
+# the palette moves, nobody re-runs the generator, and the stylesheet keeps
+# publishing the old hex under the generator's authority, past a contrast gate
+# it no longer reflects.
+#
+# A warning would not do here. This file already says a reminder that can be
+# read past is not a gate, and a stale token file is precisely the thing nobody
+# notices: it is valid CSS, it is just wrong.
+#
+# Regenerating is one command, so the block is cheap to satisfy. python3 absent
+# warns and skips, matching gitleaks and swift-format above: a missing tool must
+# not block every commit, and must not pretend the check passed either.
+#
+# Deliberate exception:  git commit --no-verify
+token_inputs="$(git diff --cached --name-only --diff-filter=ACMR -- \
+                scripts/tcrbar-palette.py \
+                apps/macos/Sources/TcrBar/Tokens.swift || true)"
+
+if [ -n "$token_inputs" ] && [ -d apps/macos/design-tokens ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    # Regenerate to a scratch dir and diff. Never write over the checked-in
+    # copy from a hook: a hook that edits the tree mid-commit stages nothing
+    # and leaves the author with changes they did not make.
+    scratch="$(mktemp -d)"
+    trap 'rm -rf "$scratch"' EXIT
+    if python3 scripts/tcrbar-palette.py \
+         --emit-css "$scratch/tokens.css" \
+         --emit-json "$scratch/tokens.json" >/dev/null 2>&1; then
+      if ! diff -q "$scratch/tokens.css" apps/macos/design-tokens/tokens.css >/dev/null 2>&1 \
+         || ! diff -q "$scratch/tokens.json" apps/macos/design-tokens/tokens.json >/dev/null 2>&1; then
+        echo "" >&2
+        echo "pre-commit: BLOCKED — design tokens are stale." >&2
+        echo "" >&2
+        echo "  You staged a change to a token SOURCE:" >&2
+        printf '%s\n' "$token_inputs" | sed 's/^/      /' >&2
+        echo "" >&2
+        echo "  but apps/macos/design-tokens/ does not match what the generator" >&2
+        echo "  now produces. Regenerate and stage the result:" >&2
+        echo "" >&2
+        echo "      python3 scripts/tcrbar-palette.py \\" >&2
+        echo "        --emit-css apps/macos/design-tokens/tokens.css \\" >&2
+        echo "        --emit-json apps/macos/design-tokens/tokens.json" >&2
+        echo "      git add apps/macos/design-tokens" >&2
+        exit 1
+      fi
+    else
+      # The generator exited non-zero, which means the palette failed its own
+      # contrast gate. Say that rather than reporting stale tokens: the tokens
+      # are not the problem and regenerating will not fix it.
+      echo "" >&2
+      echo "pre-commit: BLOCKED — the palette generator failed its contrast gate." >&2
+      echo "  Run it to see which token: python3 scripts/tcrbar-palette.py" >&2
+      exit 1
+    fi
+  else
+    echo "pre-commit: python3 not found — design-token staleness check SKIPPED." >&2
+  fi
+fi
