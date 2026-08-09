@@ -12,7 +12,27 @@ pkg_dir="$(dirname "$here")"
 repo_root="$(cd "$pkg_dir/../.." && pwd)"
 
 app_name="TcrBar"
-bundle_id="com.github.dhkts1.tcrbar"
+
+# The bundle id, and why it is not the obvious one.
+#
+# macOS ControlCenter draws every third-party menu bar icon, and it keeps a
+# runtime blocked list keyed on BUNDLE ID. On 2026-08-09 at 14:02:53 two TcrBar
+# processes registered the same status item slot at the same instant and
+# `com.github.dhkts1.tcrbar` landed on that list. Every launch afterwards was
+# blocked ~12ms after registering: the app ran, polled and held its assertions,
+# and drew nothing clickable. The block survives relaunch, `killall
+# ControlCenter` and a reboot, and renaming the status item's `autosaveName`
+# does NOT clear it — measured; the key follows the bundle id. The only exit was
+# a new identity, which is why this reads `io.` and not `com.`.
+#
+# TCRBAR_DEV_BUILD=1 gives a non-shipping build its own identity so it can never
+# be the second process in that race again. Unset means the shipping id: a dev
+# bundle must be an explicit choice, and the build echoes which one it used.
+bundle_id="io.github.dhkts1.tcrbar"
+if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
+  bundle_id="$bundle_id.dev"
+fi
+
 build_dir="$pkg_dir/build"
 app_dir="$build_dir/$app_name.app"
 macos_dir="$app_dir/Contents/MacOS"
@@ -109,6 +129,12 @@ if [ "$(git -C "$repo_root" rev-parse --is-shallow-repository 2>/dev/null || ech
     echo "ERROR: Fix:  git -C \"\$repo_root\" fetch --unshallow"
   } >&2
   exit 1
+fi
+
+if [ "${TCRBAR_DEV_BUILD:-0}" = "1" ]; then
+  echo "==> bundle id: $bundle_id  (DEV build — will not replace the installed app)"
+else
+  echo "==> bundle id: $bundle_id  (shipping identity)"
 fi
 
 echo "==> swift build -c release --product $app_name"

@@ -191,7 +191,7 @@ whatever happens to be on `PATH`, or bundling buys nothing. Override explicitly
 with either:
 
 ```sh
-defaults write com.github.dhkts1.tcrbar TcrExecutablePath /path/to/tcr
+defaults write io.github.dhkts1.tcrbar TcrExecutablePath /path/to/tcr
 TCR_BIN=/path/to/tcr open build/TcrBar.app     # env override, shell launches
 ```
 

@@ -683,7 +683,7 @@ fn update_installed(force: bool) -> anyhow::Result<()> {
 /// resolves a URL scheme to whatever app claims it, so a bundle that is not
 /// TcrBar gets the instructional message instead of a request we cannot reason
 /// about.
-const TCRBAR_BUNDLE_ID: &str = "com.github.dhkts1.tcrbar";
+const TCRBAR_BUNDLE_ID: &str = "io.github.dhkts1.tcrbar";
 
 /// The URL TcrBar registers for "check for updates now". Fixed contract; the
 /// URL carries no arguments.
@@ -1293,7 +1293,7 @@ mod tests {
     #[test]
     fn the_handoff_contract_matches_the_app() {
         assert_eq!(TCRBAR_UPDATE_URL, "tcrbar://check-for-updates");
-        assert_eq!(TCRBAR_BUNDLE_ID, "com.github.dhkts1.tcrbar");
+        assert_eq!(TCRBAR_BUNDLE_ID, "io.github.dhkts1.tcrbar");
         // `-g` first: the request must not steal focus from the terminal.
         assert_eq!(open_handoff_argv(), ["-g", "tcrbar://check-for-updates"]);
     }
@@ -1377,6 +1377,13 @@ mod tests {
             AppBundleAction::Instruct(HandoffRefusal::UnreadableIdentity)
         );
         for foreign in [
+            // The id TcrBar shipped under before the 2026-08-09 ControlCenter
+            // block forced a new identity. A stale copy still installed under it
+            // is somebody else's bundle now, and must not receive the handoff.
+            "com.github.dhkts1.tcrbar",
+            // A suffix extension of the *live* id is the near miss that matters
+            // now that the id changed; the `com.` one below guards the old one.
+            "io.github.dhkts1.tcrbar.helper",
             "com.github.dhkts1.tcrbar.helper",
             "com.github.dhkts1.TcrBar",
             "com.example.tcrbar",
