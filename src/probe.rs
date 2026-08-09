@@ -125,6 +125,21 @@ pub fn normalize_usage_bucket(bucket: Option<&Value>) -> Option<UsageBucket> {
 /// Pull a per-model weekly limit out of the payload's `limits[]` array (where
 /// the endpoint now reports model-scoped quota as a `weekly` entry carrying
 /// `scope.model.display_name`). Returns a synthesized bucket-shaped value.
+///
+/// Note the endpoint's naming asymmetry, which is why this translation exists at
+/// all: a top-level bucket (`five_hour`, `seven_day`) reports its fraction under
+/// one of three candidate keys led by `used_percentage`, while a `limits[]` entry
+/// reports the same quantity only as `percent`. [`normalize_usage_bucket`] knows
+/// the former set, so the entry is re-keyed to `utilization` here.
+///
+/// A key whose source value is missing **or `null` is omitted, never emitted as
+/// null**. `serde_json::json!` renders an absent `entry.get(..)` as
+/// `Value::Null`, so building the object unconditionally produced
+/// `{"utilization": null}` — an object that is *present* and therefore passes
+/// [`normalize_usage_bucket`]'s absent-check, carrying a hole downstream disguised
+/// as a reading. The distinction is load-bearing in [`crate::quota::apply_bucket`]
+/// and only stays honest if "we did not read it" is expressed as absence at every
+/// hop.
 pub fn find_scoped_weekly_limit(data: &Value, needle: &str) -> Option<Value> {
     let needle = needle.to_lowercase();
     let entry = data.get("limits")?.as_array()?.iter().find(|l| {
@@ -135,10 +150,16 @@ pub fn find_scoped_weekly_limit(data: &Value, needle: &str) -> Option<Value> {
                 .and_then(Value::as_str)
                 .is_some_and(|name| name.to_lowercase().contains(&needle))
     })?;
-    Some(serde_json::json!({
-        "utilization": entry.get("percent"),
-        "resets_at": entry.get("resets_at"),
-    }))
+    let mut bucket = serde_json::Map::new();
+    for (src, dst) in [("percent", "utilization"), ("resets_at", "resets_at")] {
+        match entry.get(src) {
+            Some(v) if !v.is_null() => {
+                bucket.insert(dst.to_string(), v.clone());
+            }
+            _ => {}
+        }
+    }
+    Some(Value::Object(bucket))
 }
 
 /// Turn a parsed usage-endpoint payload into normalized buckets.
@@ -306,6 +327,68 @@ mod tests {
         let usage = usage_from_payload(&data);
         let oi = usage.seven_day_oi.unwrap();
         assert_eq!(oi.utilization, Some(0.55));
+    }
+
+    /// A `limits[]` entry with no `percent` must not be re-keyed into a
+    /// `{"utilization": null}` object. That object is *present*, so it sails past
+    /// `normalize_usage_bucket`'s absent-check and lands on `apply_bucket` looking
+    /// like a bucket that was read — which is how a hole became a `0.0`.
+    #[test]
+    fn scoped_weekly_limit_missing_percent_omits_the_key() {
+        let data = serde_json::json!({
+            "limits": [
+                { "group": "weekly", "scope": { "model": { "display_name": "Claude Fable 5" } }, "resets_at": 1_893_456_000 }
+            ]
+        });
+        let synthesized = find_scoped_weekly_limit(&data, "fable").expect("the entry matched");
+        assert!(
+            synthesized.get("utilization").is_none(),
+            "an unread percent must be omitted, not emitted as null: {synthesized}"
+        );
+        assert!(
+            synthesized.get("resets_at").is_some(),
+            "the reset it DID report is still carried"
+        );
+
+        // End to end: the hole stays a hole all the way into the tracked window.
+        let usage = usage_from_payload(&data);
+        assert_eq!(
+            usage.seven_day_oi.expect("bucket present").utilization,
+            None
+        );
+        let mut quota = crate::quota::Quota::default();
+        quota.apply_usage(&usage);
+        assert!(
+            quota.seven_day_oi.is_none(),
+            "an unreadable percent must reach the wire as absent, never as 0.0"
+        );
+    }
+
+    /// Today's live payload shape — every weekly entry carrying an integer
+    /// `percent` — must be completely unaffected by the omission rule above.
+    #[test]
+    fn scoped_weekly_limit_with_a_numeric_percent_is_unchanged() {
+        let data = serde_json::json!({
+            "limits": [
+                { "group": "weekly", "scope": { "model": { "display_name": "Claude Fable 5" } }, "percent": 0, "resets_at": 1_893_456_000 }
+            ]
+        });
+        let usage = usage_from_payload(&data);
+        let oi = usage.seven_day_oi.expect("bucket present");
+        assert_eq!(
+            oi.utilization,
+            Some(0.0),
+            "a reported 0 percent is a reading and stays one"
+        );
+        assert_eq!(oi.reset_at_ms, Some(1_893_456_000_000));
+
+        let mut quota = crate::quota::Quota::default();
+        quota.apply_usage(&usage);
+        assert_eq!(
+            quota.seven_day_oi.map(|w| w.utilization),
+            Some(0.0),
+            "a genuine 0% weekly still renders as a measured empty bar"
+        );
     }
 
     #[test]
