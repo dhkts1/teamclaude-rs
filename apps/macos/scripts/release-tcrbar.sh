@@ -471,8 +471,45 @@ main() {
     note "would upload $(basename "$dmg") and appcast.xml to $repo release $tag"
   else
     stage "stage 9/9  publish to the GitHub Release"
-    # --clobber: the release already exists (the CLI workflow creates it from
-    # the same tag), and a re-run must replace its assets rather than fail.
+
+    # WAIT for the release to exist. It is a race, not a given.
+    #
+    # This used to upload immediately, on the reasoning that "the release
+    # already exists (the CLI workflow creates it from the same tag)". The
+    # workflow does create it — asynchronously, off the tag push, after
+    # building every CLI target. So the release exists *eventually*, and
+    # RELEASING.md tells you to push the tag and then run this script, which is
+    # exactly the order that loses the race.
+    #
+    # Measured on v0.2.1: notarization finished, the ticket stapled, the appcast
+    # entry was written, and stage 9 died on `release not found` while the
+    # Release workflow was still in_progress. Everything expensive had already
+    # succeeded; only the upload was lost, and re-running meant notarizing a
+    # second time.
+    #
+    # Waiting rather than creating is deliberate. `gh release create` here would
+    # race the workflow the other way and can leave TWO releases on one tag —
+    # which happened on v0.2.0, and made `releases/latest/download/appcast.xml`
+    # resolve to the wrong one and 404 the update feed.
+    release_wait_seconds="${TCRBAR_RELEASE_WAIT:-600}"
+    waited=0
+    until gh release view "$tag" --repo "$repo" >/dev/null 2>&1; do
+      if [ "$waited" -ge "$release_wait_seconds" ]; then
+        die "release $tag still does not exist after ${release_wait_seconds}s." \
+            "  The tag-triggered Release workflow creates it; check:" \
+            "    gh run list --repo $repo --branch $tag" \
+            "  The DMG is built, notarized and stapled at:" \
+            "    $dmg" \
+            "  Re-run with --verify-only, or upload by hand once it appears:" \
+            "    gh release upload $tag '$dmg' '$appcast_path' --clobber --repo $repo"
+      fi
+      [ "$waited" = 0 ] && note "waiting for the tag-triggered Release workflow to create $tag…"
+      sleep 10
+      waited=$((waited + 10))
+    done
+    [ "$waited" -gt 0 ] && note "release appeared after ${waited}s"
+
+    # --clobber so a re-run replaces its assets rather than failing.
     gh release upload "$tag" "$dmg" "$appcast_path" --clobber --repo "$repo" \
       || die "gh release upload failed for $tag."
     note "uploaded to https://github.com/$repo/releases/tag/$tag"
