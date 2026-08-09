@@ -498,10 +498,11 @@ struct AccountRow: View {
     /// This row used to render a pill only when `disabled` was true, so "in
     /// rotation" was signalled by the absence of anything — and the only nearby
     /// text was a button reading "Disable", which names what a click would DO.
-    /// That is not a null state, it is a legible one: Gil read the button as a
-    /// status and concluded the proxy was routing traffic to a disabled account.
-    /// It was not; `disabled` was false. A row that can be misread as its own
-    /// opposite is a defect regardless of which fact happens to be true.
+    /// That is not a null state, it is a legible one: the button's verb was read
+    /// as a status, and the reader concluded from it that the proxy was routing
+    /// traffic to a disabled account. It was not; `disabled` was false. A row
+    /// that can be misread as its own opposite is a defect regardless of which
+    /// fact happens to be true.
     ///
     /// "rotating" rather than "enabled" on purpose. The button's label is the
     /// verb (`tcr enable` / `tcr disable`, and it should stay a verb), so an
@@ -687,11 +688,12 @@ struct AccountRow: View {
 ///
 /// `fraction` is optional because a never-probed account has no reading at all.
 /// A nil renders as a DASHED outline rather than an unfilled bar: an unfilled bar
-/// is pixel-identical to `0`, so drawing one would make the panel assert
-/// "exhausted" about an account nothing has ever measured. Keeping unknown
-/// distinct from empty at the last rendering step is the whole point of the
-/// optional model — collapsing it here would undo it after the decoder,
-/// `readyCount` and the pill all took care to preserve it.
+/// is pixel-identical to `0`, and since the fraction is utilization, drawing one
+/// would make the panel assert "nothing spent, full headroom" about an account
+/// nothing has ever measured. Keeping unknown distinct from empty at the last
+/// rendering step is the whole point of the optional model — collapsing it here
+/// would undo it after the decoder, `readyCount` and the pill all took care to
+/// preserve it.
 struct QuotaBar: View {
     let fraction: Double?
     let tint: Color
@@ -706,7 +708,7 @@ struct QuotaBar: View {
     /// important number is invisible to VoiceOver — and worse, the nil-vs-zero
     /// distinction that the decoder, `readyCount` and the pill all take care to
     /// preserve would survive only as a dashed outline. "Never measured" and
-    /// "exhausted" would be identical again, which is the exact defect the
+    /// "nothing spent" would be identical again, which is the exact defect the
     /// optional model exists to prevent.
     private var spokenValue: String {
         guard let fraction else { return "not measured" }
