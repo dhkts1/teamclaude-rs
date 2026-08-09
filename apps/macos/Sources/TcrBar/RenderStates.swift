@@ -38,19 +38,26 @@ enum RenderStates {
     }
 
     /// Every state worth looking at, with the name its PNG gets.
-    private static var scenes: [(name: String, state: PollState)] {
+    ///
+    /// `awake` is a per-scene flag rather than a twelfth state because it is
+    /// orthogonal to the poll: the mode can be on under any fleet at all. One
+    /// scene carries it, which is what makes the new control's ON appearance —
+    /// the tinted mark and the caveat line — reviewable, since the real menu bar
+    /// cannot be screenshotted here.
+    private static var scenes: [(name: String, state: PollState, awake: Bool)] {
         [
-            ("01-healthy", .loaded(fleet(healthyJSON))),
-            ("02-mixed-thirteen", .loaded(fleet(mixedJSON))),
-            ("03-zero-capacity", .loaded(fleet(exhaustedJSON))),
-            ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON))),
-            ("05-unreadable-row", .loaded(partiallyUnreadableFleet())),
-            ("06-offline-source", .loaded(fleet(offlineJSON))),
-            ("07-empty-fleet", .loaded(fleet("[]"))),
-            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"])),
-            ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused")),
-            ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota")),
-            ("11-pending", .pending),
+            ("01-healthy", .loaded(fleet(healthyJSON)), false),
+            ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false),
+            ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false),
+            ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false),
+            ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false),
+            ("06-offline-source", .loaded(fleet(offlineJSON)), false),
+            ("07-empty-fleet", .loaded(fleet("[]")), false),
+            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]), false),
+            ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused"), false),
+            ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false),
+            ("11-pending", .pending, false),
+            ("12-keeping-awake", .loaded(fleet(healthyJSON)), true),
         ]
     }
 
@@ -91,7 +98,7 @@ enum RenderStates {
 
     @MainActor
     private static func render(
-        _ scene: (name: String, state: PollState),
+        _ scene: (name: String, state: PollState, awake: Bool),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
@@ -102,12 +109,20 @@ enum RenderStates {
         NSAppearance.current = appearance.nsAppearance
         defer { NSAppearance.current = previous }
 
+        // `.inert`, never the real activity: drawing a checkbox in its ON state
+        // must not actually stop this machine sleeping. A harness with a side
+        // effect on the operator's power settings would be a worse bug than
+        // anything it could catch.
+        let awake = AwakeController(activity: .inert)
+        awake.setOn(scene.awake)
+
         let view =
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: referenceDate),
                 server: ServerController(),
                 loginItem: LoginItem(),
                 accounts: AccountController(),
+                awake: awake,
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true
             )

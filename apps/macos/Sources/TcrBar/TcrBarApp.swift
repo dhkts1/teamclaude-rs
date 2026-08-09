@@ -12,6 +12,11 @@ import TcrBarCore
 enum TcrBarEntry {
     @MainActor
     static func main() {
+        // First, and the only one of the three that needs no AppKit at all: it
+        // draws nothing, it holds a power assertion and prints.
+        if let probe = KeepAwakeProbe.request() {
+            KeepAwakeProbe.run(probe)  // exits
+        }
         if let directory = RenderStates.requestedDirectory() {
             // AppKit needs to exist before anything can be rasterised, but the
             // app is never activated and no window or status item is created.
@@ -36,6 +41,10 @@ struct TcrBarApp: App {
     @StateObject private var server = ServerController()
     @StateObject private var loginItem = LoginItem()
     @StateObject private var accounts = AccountController()
+    /// Owned here, not by the panel: the panel is destroyed and rebuilt every
+    /// time the menu closes, and an assertion that ended when the menu closed
+    /// would be a keep-awake control that keeps nothing awake.
+    @StateObject private var awake = AwakeController()
 
     /// Bring the proxy up when the app starts.
     ///
@@ -61,11 +70,13 @@ struct TcrBarApp: App {
                 server: server,
                 loginItem: loginItem,
                 accounts: accounts,
+                awake: awake,
                 startServerAtLaunch: $startServerAtLaunch
             )
             .onAppear {
                 poller.start()
                 delegate.server = server
+                delegate.awake = awake
                 // macOS owns the login-item bit; re-read it every time the
                 // panel opens so a revocation in System Settings shows up.
                 loginItem.refresh()
@@ -75,22 +86,36 @@ struct TcrBarApp: App {
                 }
             }
         } label: {
-            MenuBarLabel(state: poller.state)
+            MenuBarLabel(state: poller.state, awake: awake)
         }
         .menuBarExtraStyle(.window)
     }
 }
 
-/// Exists for one reason: a child process TcrBar spawned must not outlive it.
+/// Exists so that nothing TcrBar started outlives it — a child process, and a
+/// power assertion.
 ///
 /// `terminateSupervisedChildOnQuit()` is a no-op unless *this app* spawned the
 /// server — an incumbent proxy is never signalled.
+///
+/// Both references are handed over from `FleetView.onAppear`, which first runs
+/// when the panel is opened. Late, but never too late for either: a server can
+/// only be started from that panel or from `startServerAtLaunch` (whose spawn
+/// happens in the same `onAppear`), and the keep-awake activity can only be
+/// started from that panel too. A `nil` here therefore means there is nothing
+/// to release.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var server: ServerController?
+    var awake: AwakeController?
 
     func applicationWillTerminate(_ notification: Notification) {
         server?.terminateSupervisedChildOnQuit()
+        // The kernel drops every power assertion a process holds when it dies,
+        // so this line is not what lets the Mac sleep again. It is here so that
+        // "quitting TcrBar releases it" is something this app does rather than
+        // something it gets away with.
+        awake?.releaseOnQuit()
     }
 }
 
@@ -102,10 +127,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// one of thirteen accounts was spent, which is nearly always. The mapping lives
 /// in `Fleet.capacityGlyphState`; this view does no logic. A failed read shows a
 /// warning glyph rather than a healthy-looking gauge.
+///
+/// Keep-awake is a SECOND, independent mark beside it, and the two never merge.
+/// The gauge answers "can I work right now"; keep-awake answers "will this Mac
+/// stay up while I do", and recolouring the gauge to say the second thing would
+/// destroy the first.
+///
+/// The mode is signalled on two channels at once, deliberately:
+///
+///  - **Shape** — an extra glyph that is either there or not. This is the
+///    primary channel, because it is the only one that cannot be taken away: it
+///    survives greyscale, a red-green colour vision deficiency, and a status
+///    item that decides to template the image after all. `Tokens.swift` records
+///    this project already rejecting a palette where two states differed in hue
+///    alone.
+///  - **Colour** — what was actually asked for, and a genuine improvement when
+///    it works. It needs a non-template `NSImage`; see `KeepAwakeGlyph` for
+///    what was measured about that and what was not.
 struct MenuBarLabel: View {
     let state: PollState
+    @ObservedObject var awake: AwakeController
 
     var body: some View {
+        HStack(spacing: Tok.space1) {
+            capacityGauge
+            if awake.isOn { keepAwakeMark }
+        }
+    }
+
+    @ViewBuilder
+    private var capacityGauge: some View {
         switch state {
         case .loaded(let fleet):
             Image(systemName: Tok.glyph(for: fleet.capacityGlyphState))
@@ -113,6 +164,20 @@ struct MenuBarLabel: View {
             Image(systemName: "gauge.with.dots.needle.33percent")
         case .toolMissing, .commandFailed, .undecodable:
             Image(systemName: Tok.unreadableGlyph)
+        }
+    }
+
+    /// Falls back to the plain template symbol if the tinted image cannot be
+    /// built. Losing the tint costs one channel; drawing nothing would cost the
+    /// signal, and the shape is the channel that matters.
+    @ViewBuilder
+    private var keepAwakeMark: some View {
+        if let tinted = KeepAwakeGlyph.image(tint: Tok.awakeNSColor) {
+            Image(nsImage: tinted)
+                .accessibilityLabel(KeepAwakeGlyph.accessibilityDescription)
+        } else {
+            Image(systemName: KeepAwakeGlyph.symbolName)
+                .accessibilityLabel(KeepAwakeGlyph.accessibilityDescription)
         }
     }
 }

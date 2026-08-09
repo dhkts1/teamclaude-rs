@@ -61,6 +61,52 @@ A rotating pool is *supposed* to contain spent accounts — that is the mechanis
 working. A worst-account-wins glyph sat at its most alarming setting permanently
 and therefore meant nothing.
 
+## Keeping the Mac awake
+
+"Keep this Mac awake" in the panel holds an idle-system-sleep power assertion —
+the same thing `caffeinate -i` does — for as long as the box is ticked. While it
+is on, a second tinted mark appears beside the capacity gauge in the menu bar.
+
+Three things it deliberately does not do:
+
+- **It does not keep the display awake.** The job is "a long run keeps running",
+  and a dark screen does not stop a run. Holding the backlight on all night is a
+  cost nobody asked for.
+- **It does not survive closing the lid.** No assertion of this class does. The
+  panel says so while the mode is on, because an operator who believes otherwise
+  comes back to a dead run and blames the proxy.
+- **It does not persist across launches.** A Mac that silently never sleeps
+  because of a box ticked last week is a worse bug than having to tick it again;
+  the symptom (a laptop cooking in a bag) is nowhere near the cause.
+
+Untick it, or quit TcrBar, and the assertion is released.
+
+### Proving it, without a screenshot
+
+The control is a checkbox, and nothing on the machine can click it for you.
+`screencapture` needs Screen Recording, which a build machine or a headless
+agent may not have, so "look at the menu bar" is not available as a gate. This
+is:
+
+```sh
+BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
+"$BIN" --keep-awake-probe 10 &
+sleep 3
+pmset -g assertions | grep TcrBar        # PreventUserIdleSystemSleep, named
+pmset -g assertions | grep -ci caffeinate # positive control: the grep can see assertions
+wait
+```
+
+The flag holds the assertion for the given number of seconds and exits; like
+`--render-states` it is handled before the app starts, so no menu-bar item
+appears and no `tcr` subprocess is spawned.
+
+It stays alive for three seconds *after* releasing, and that linger is the point
+of the gate rather than politeness: an assertion also disappears when its process
+dies, so a reading taken after the probe exits would pass whether or not the
+release ever happened. Sampling while the process is still running is what makes
+the result attributable.
+
 ## Build and run
 
 ```sh

@@ -97,6 +97,7 @@ STATUS = {
     "spent":      (0.655, 0.180,  25),   # red    - exhausted
     "unmeasured": (0.760, 0.070, 230),   # slate  - never probed, NOT zero
     "disabled":   (0.660, 0.004, 255),   # grey   - operator parked it
+    "awake":      (0.830, 0.120, 195),   # cyan   - keep-awake mode is held
 }
 
 WASH_ALPHA, LINE_ALPHA = 0.14, 0.34
@@ -150,7 +151,39 @@ LIGHT_STATUS = {
     "spent":      (0.510, 0.205,  25),
     "unmeasured": (0.580, 0.070, 230),
     "disabled":   (0.600, 0.004, 255),
+    "awake":      (0.500, 0.085, 195),
 }
+
+# `awake` -- keep-awake mode is held -- is NOT on the traffic-light scale, and
+# that is the point: reusing ready/near/spent would make the menu bar say
+# "nearly exhausted" when it means "this Mac will not idle sleep". Hue 195 is
+# the open slot between ready (150) and unmeasured (230).
+#
+# Both values came out of a search over this file's own constraint set rather
+# than off a colour picker: highest chroma that stays in the sRGB gamut, clears
+# the contrast floor on BOTH the panel and a raised row, and holds >= 1.25:1
+# luminance separation from `unmeasured` -- the one other cool token, and so the
+# only one it could be confused with in greyscale.
+#
+# Two things that search taught, both of which are in the numbers above:
+#
+#  - Maximising chroma alone is the wrong objective. Unconstrained, it returns
+#    oklch(0.665 0.295 330) -> #ed17e6, a neon magenta at twice the chroma of
+#    any shipped token, which also collides with `unknown` (#c69bdd).
+#  - Requiring separation from ALL FIVE existing statuses returns nothing at
+#    all in this hue range -- and that constraint is not this palette's: the
+#    shipped tokens do not meet it either (unmeasured vs ready is 1.02:1,
+#    disabled vs spent is 1.00:1). What is gated here is four NAMED pairs, and
+#    tokens off the traffic-light scale are separated by hue and by context.
+#
+# Known gap, deliberately not closed here: `unknown` (Tokens.swift, #c69bdd /
+# #7d4d96) is shipped but absent from this file, so it is the one token nothing
+# measures. It was left out rather than added because its dark value does not
+# round-trip -- the nearest OKLCH, (0.752 0.103 314), emits #c69bdc, one bit of
+# blue off what the app draws. Adding it would make this script authoritative
+# for a colour it does not actually reproduce, which is worse than the gap:
+# silent drift beats a known hole. Closing it properly means re-deriving that
+# token and changing what the app draws, which is its own change.
 
 # Increased Contrast: ink goes to the extremes, status hues gain lightness
 # separation from the panel.
@@ -242,6 +275,9 @@ def main():
         ("ready", "near"),
         ("near", "spent"),
         ("unmeasured", "disabled"),
+        # Both cool, both off the traffic-light scale: the pair that would
+        # collapse in greyscale if either drifted.
+        ("awake", "unmeasured"),
     ]
     for a, b in pairs:
         r = contrast(STATUS[a], STATUS[b])
@@ -263,7 +299,8 @@ def main():
               LIGHT_SURFACES, HC_LIGHT_INK, {}, failures, min_ratio=7.0)
 
     print("\nLIGHT-MODE DISCRIMINATION (the CVD pair must hold in both appearances)")
-    for a, b in [("ready", "spent"), ("ready", "near"), ("near", "spent")]:
+    for a, b in [("ready", "spent"), ("ready", "near"), ("near", "spent"),
+                 ("awake", "unmeasured")]:
         r = contrast(LIGHT_STATUS[a], LIGHT_STATUS[b])
         ok = r >= 1.25
         if not ok:

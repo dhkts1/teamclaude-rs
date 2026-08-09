@@ -13,6 +13,10 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    /// Owned by the app, for the same reason the poller is: this panel is torn
+    /// down every time the menu closes, and an assertion released at that moment
+    /// would be a keep-awake control that keeps nothing awake.
+    @ObservedObject var awake: AwakeController
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -251,6 +255,7 @@ struct FleetView: View {
 
             launchAtLogin
             startServerToggle
+            keepAwakeToggle
 
             dangerZone
         }
@@ -276,6 +281,52 @@ struct FleetView: View {
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.near)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// Keep the Mac from idle-sleeping, for as long as the box is ticked.
+    ///
+    /// A checkbox rather than a fifth button: the button row above is already
+    /// four wide inside a 380pt panel, and this belongs with the other two
+    /// toggles anyway — all three are modes, not actions.
+    ///
+    /// The detail line is not decoration. "Keep this Mac awake" over-promises by
+    /// exactly the two cases an operator will hit, and hitting either means
+    /// coming back to a dead run and blaming the proxy. It carries `Tok.near`
+    /// because it is a caveat, the same as the other two toggles' detail lines.
+    ///
+    /// `.tint(Tok.awake)` asks for the mark to be the same token the menu bar
+    /// draws, so the two surfaces cannot disagree about what "on" looks like.
+    /// **That one line is unverified**, and it is the only thing here that is: a
+    /// `.checkbox` toggle is an AppKit control, `ImageRenderer` does not draw
+    /// those at all (`--render-states` shows a placeholder for this toggle and
+    /// for the two above it, all three the same), and reading the real control
+    /// back needs a screenshot. On macOS a checkbox may well follow the system
+    /// accent colour and ignore the tint outright. The state is carried by the
+    /// checkbox being *ticked*, which is not a colour, so nothing depends on it.
+    private var keepAwakeToggle: some View {
+        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            Toggle(
+                "Keep this Mac awake",
+                isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
+            )
+            .toggleStyle(.checkbox)
+            .font(Tok.secondaryFont)
+            .tint(Tok.awake)
+            .help(
+                "Holds an idle-system-sleep power assertion for as long as this "
+                    + "is on — the same thing `caffeinate -i` does. Released when "
+                    + "you untick it or quit TcrBar."
+            )
+            if awake.isOn {
+                Text(
+                    "The display can still sleep, and closing the lid still sleeps "
+                        + "the Mac — no power assertion prevents that."
+                )
+                .font(Tok.detailFont)
+                .foregroundStyle(Tok.near)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
