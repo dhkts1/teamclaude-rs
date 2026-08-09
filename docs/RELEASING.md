@@ -4,9 +4,9 @@ How a signed, notarized, self-updating `TcrBar.app` gets from this repository on
 Mac. The CLI (`tcr`) is released separately by `.github/workflows/release.yml`, which cargo-dist
 generates; this document is only about the app.
 
-Everything below is executed by `apps/macos/scripts/release-tcrbar.sh`, either on a laptop or from
-`.github/workflows/release-app.yml`. Read the script if you want the detail — this is the operator's
-view.
+Everything below is executed by `apps/macos/scripts/release-tcrbar.sh`. **Releases are cut locally,
+from the Mac that holds the signing keys** — not from CI. Read the script if you want the detail;
+this is the operator's view.
 
 ## The certificate
 
@@ -44,7 +44,22 @@ Every `codesign` call in the release path passes `--timestamp` for that reason: 
 signature stays valid after its certificate expires, an untimestamped one is retroactively invalid
 on every machine that already installed the app.
 
-## Cutting a release from a laptop
+## Cutting a release
+
+One command, from the Mac that holds the keys:
+
+```sh
+apps/macos/scripts/release-local.sh v0.2.0
+```
+
+`release-local.sh` is a credential wrapper and nothing else. It reads the App Store Connect API key
+out of 1Password, materialises the `.p8` as a 0600 file in a private temp dir — `notarytool` takes
+`--key <path>`, there is no form of the flag that accepts the key material as a value — removes it
+on a `trap` so an aborted build does not leave a private key in `/tmp`, and then `exec`s
+`release-tcrbar.sh --tag`. The certificate and the Sparkle private key it does *not* pass: those are
+read straight from the login keychain by `release-tcrbar.sh`.
+
+Before that, in order:
 
 ```sh
 # 1. bump the version — Cargo.toml is the single source of truth. The app's
@@ -56,12 +71,17 @@ $EDITOR Cargo.toml && cargo check          # refresh Cargo.lock
 #    certificate.
 apps/macos/scripts/release-tcrbar.sh --dry-run
 
-# 3. tag and push. Both release workflows fire on the tag.
+# 3. tag and push. `--tag` must agree with Cargo.toml or the release aborts.
 git tag v0.2.0 && git push origin v0.2.0
 ```
 
-To do the whole thing locally instead of in CI, export the notarization variables (below) and run
-`release-tcrbar.sh` with no flags.
+The tag push is a separate, deliberate step: a repository ruleset named **"Protect release tags"**
+restricts creating, updating and deleting `v*` tags to admins. A collaborator with push cannot
+mint a version tag, which is the point — see below.
+
+`TCRBAR_OP_ITEM` overrides the 1Password item reference (default
+`op://Employee/TcrBar Release Signing`); extra arguments after the tag are passed through to
+`release-tcrbar.sh`, so `release-local.sh v0.2.0 --dry-run` works.
 
 Flags:
 
@@ -88,46 +108,76 @@ Flags:
 8. **Appcast** — a new `<item>` is inserted at the marker comment in `apps/macos/appcast.xml`.
 9. **Publish** — `gh release upload` puts the DMG and `appcast.xml` on the release for the tag.
 
-## CI secrets
+## Why there are no signing secrets in GitHub
 
-`.github/workflows/release-app.yml` runs on `macos-14` and fires **only** on `v*` tags. It must
-never gain a `pull_request` trigger: it holds three private keys, and a fork PR would get all of
-them.
+**All seven signing secrets were removed from this repository on 2026-08-09, deliberately.** Not as
+cleanup, and not pending a fix — the release path is local and is meant to stay local. Three facts
+compose into the reason:
 
-**None of these secrets are set today, and that is deliberate** — the Apple signing key is not
-stored in GitHub, and releases are cut locally with `apps/macos/scripts/release-tcrbar.sh`. So a
-`v*` tag reaches a `check-signing-secrets` job which finds all seven unset, writes a job summary
-saying so, and the signing job is **skipped** rather than failed. Setting all seven turns CI
-signing on with no further change. Setting only *some* is treated as a misconfiguration and fails
-loudly, naming the missing ones — a half-configured release is likelier to be a mistake than an
-intent to skip. The check must be its own job because the `secrets` context is unavailable in a
-job-level `if:` (GitHub's context-availability table allows only `github`, `needs`, `vars` and
-`inputs` there).
+- the repository is **public**, and non-admin collaborators hold **push**;
+- a tag-triggered workflow executes **the workflow file as it exists on the tagged commit**, so
+  whoever can reach a `v*` tag chooses the code that runs with the secrets attached;
+- Sparkle's private key signs the payload that **every existing install auto-trusts**. It is not a
+  key that protects a build artifact; it is the key that decides what already-installed copies will
+  execute.
 
-| secret | how to produce it |
-|---|---|
-| `MACOS_CERT_P12_BASE64` | Keychain Access → login → My Certificates → the Developer ID Application entry → right-click → Export → `.p12` (**include the private key** — export the certificate row with its disclosure triangle, not the bare key). Then `base64 -i cert.p12 \| pbcopy`. |
-| `MACOS_CERT_PASSWORD` | the password chosen during that export |
-| `KEYCHAIN_PASSWORD` | any random string, e.g. `openssl rand -base64 24`. It only scopes the ephemeral keychain the job creates and deletes. |
-| `APPLE_API_KEY_P8` | App Store Connect → Users and Access → Integrations → App Store Connect API → **+**, role **Developer**. The `.p8` downloads **once and only once**; paste its whole contents, `-----BEGIN PRIVATE KEY-----` line included. |
-| `APPLE_API_KEY_ID` | the Key ID shown beside that key |
-| `APPLE_API_ISSUER_ID` | the Issuer ID shown at the top of that page |
-| `SPARKLE_ED_PRIVATE_KEY` | Sparkle's `generate_keys` stores the key in the **login keychain**, not in a file. Export it for CI with `generate_keys -x -` and paste the output. |
+Nothing stored is nothing stolen. The keys exist on one Mac and in one 1Password item, so a GitHub
+compromise — a leaked token, a mis-scoped collaborator, a workflow edited on a branch — reaches no
+signing material at all.
 
-Plus one repository **variable** (not a secret):
+The tag itself is defended separately, because the argument above turns on who can create one: a
+repository ruleset named **"Protect release tags"** restricts creating, updating and deleting `v*`
+tags to admins. A collaborator with push can land code; they cannot mint the tag that would make CI
+sign it.
+
+### Where each credential lives now
+
+1Password, vault **Employee**, item **TcrBar Release Signing**:
+
+| field | also in the login keychain? | notes |
+|---|---|---|
+| `APPLE_API_KEY_P8` | no | **1Password is the only copy.** Apple lets you download the `.p8` exactly once; it cannot be re-downloaded, only revoked and reissued. |
+| `APPLE_API_KEY_ID` | no | the Key ID shown beside that key |
+| `APPLE_API_ISSUER_ID` | no | the Issuer ID at the top of the App Store Connect API page |
+| `APPLE_TEAM_ID` | — | not a secret; embedded in every signature we ship |
+| `SPARKLE_ED_PRIVATE_KEY` | yes | `generate_keys` stores it in the login keychain and that is what signs. **1Password is the only backup**; lose both and no future build can update an installed copy. |
+| `SPARKLE_ED_PUBLIC_KEY` | — | public by design, see below |
+| `MACOS_CERT_P12_BASE64` | yes (as the cert + key) | `.p12` export of the Developer ID Application identity |
+| `MACOS_CERT_PASSWORD` | — | the password chosen during that export |
+
+The Developer ID certificate and the Sparkle key are used **from the login keychain** during a
+local release; the 1Password copies are backups and the machine-rebuild path. The two that have no
+other home — the `.p8` and the Sparkle private key — are the ones worth checking are still readable
+before you need them.
+
+One repository **variable** (not a secret) remains set, and should:
 
 | variable | value |
 |---|---|
-| `TCRBAR_SPARKLE_PUBLIC_KEY` | the public key `generate_keys` prints. It goes into `Info.plist` so an installed app can verify what it downloads. Publishing it is the point. |
+| `TCRBAR_SPARKLE_PUBLIC_KEY` | `1WZWEwzSEijRarey7qE0a+n4AO/+7e4Fj/nW8Y8ZKMM=` — the public key `generate_keys` prints. It goes into `Info.plist` so an installed app can verify what it downloads. Publishing it is the point. |
 
-The workflow imports the `.p12` into a keychain it creates in `$RUNNER_TEMP` and deletes in an
-`if: always()` step — never the login keychain — and runs `security set-key-partition-list` so
-`codesign` can use the key without a UI prompt. Omitting that call is the most common CI signing
-defect: the job hangs until its timeout instead of failing.
+### The workflow still exists, and a tag run is not broken
 
-Nothing in the workflow echoes a secret. GitHub's log masking does not reliably cover base64
-fragments or substrings, so the certificate import step prints a *count* of matching identities
-rather than the identity, which contains a person's name and the team id.
+`.github/workflows/release-app.yml` runs on `macos-14` and still fires on `v*` tags. **Do not
+"fix" it when a tag run shows a skipped signing job — that is the designed outcome.** A tag reaches
+a `check-signing-secrets` job, which finds all seven unset, writes a job summary saying so, and the
+signing job is **skipped** rather than failed. Setting only *some* of the seven is treated as a
+misconfiguration and fails loudly, naming the missing ones: a half-configured release is likelier
+to be a mistake than an intent to skip. The check must be its own job because the `secrets` context
+is unavailable in a job-level `if:` (GitHub's context-availability table allows only `github`,
+`needs`, `vars` and `inputs` there).
+
+Restoring CI signing would mean setting all seven again, which re-creates exactly the exposure
+described above. It must never gain a `pull_request` trigger for the same reason — it would hand
+three private keys to a fork PR.
+
+Two defences in the workflow are worth keeping if it is ever re-enabled. It imports the `.p12` into
+a keychain it creates in `$RUNNER_TEMP` and deletes in an `if: always()` step — never the login
+keychain — and runs `security set-key-partition-list` so `codesign` can use the key without a UI
+prompt; omitting that call is the most common CI signing defect, and the job hangs until its
+timeout instead of failing. And nothing in it echoes a secret: GitHub's log masking does not
+reliably cover base64 fragments or substrings, so the certificate import step prints a *count* of
+matching identities rather than the identity, which contains a person's name and the team id.
 
 ## Verifying a release actually installs
 
@@ -155,7 +205,8 @@ with the wrong certificate class and step 2 of the pipeline did not run.
 
 ## Known-unverified
 
-Notarization and stapling (stages 5 and 6) have not been exercised — no App Store Connect API key
-exists for this project yet. They are written from Apple's documented interface, not from a
-successful run. The first real release is the first test of those two stages; run it with a
-throwaway patch version before announcing anything.
+An App Store Connect API key now exists (2026-08-09) and `release-local.sh` supplies it, so the
+blocker on stages 5 and 6 is gone. What has **not** happened is a completed notarized run: those two
+stages are still written from Apple's documented interface rather than from a success. The first
+real release is the first test of them. Run it with `--dry-run` first, and verify the result with
+the section above from the downloaded DMG rather than from `build/`.
