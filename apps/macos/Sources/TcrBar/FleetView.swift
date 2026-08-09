@@ -286,11 +286,33 @@ struct FleetView: View {
                 Button("Start server") { server.start() }
             }
             Button("Refresh") { Task { await poller.pollOnce() } }
+            // Disabled while a proxy is serving, for the same reason
+            // "Take over port…" is disabled while we supervise one: the click
+            // cannot succeed, so offering it is a promise the panel cannot keep.
+            //
+            // `tcr login` refuses outright when something holds the port — the
+            // server's next token refresh would overwrite the credentials the
+            // login just wrote. That refusal is correct. What was wrong is that
+            // the panel offered the button anyway, with the reason in a `.help`
+            // tooltip nobody hovers before clicking, so the flow was: click,
+            // watch a Terminal open, read an error, work out the remedy
+            // yourself. Reported from live use, which is the only way it
+            // surfaces — the button renders identically either way, so no
+            // screenshot and no `--render-states` scene could show it.
+            //
+            // The remedy is two clicks away and both are in this footer, so the
+            // help names them rather than describing the failure.
             Button("Add account…") { addAccount() }
+                .disabled(proxyHoldsThePort)
                 .help(
-                    "Opens `tcr login` in a Terminal window. It needs one: it "
-                        + "prompts for a name, may ask for a pasted code, and "
-                        + "refuses while a proxy is holding the port."
+                    proxyHoldsThePort
+                        ? "A proxy is serving on the port. `tcr login` refuses "
+                            + "while that is true, because the server's next token "
+                            + "refresh would overwrite the new credentials. Stop "
+                            + "the server, add the account, then start it again."
+                        : "Opens `tcr login` in a Terminal window. It needs one: it "
+                            + "prompts for a name, may ask for a pasted code, and "
+                            + "refuses while a proxy is holding the port."
                 )
             Spacer()
         }
@@ -387,6 +409,22 @@ struct FleetView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    /// True when a proxy is actually serving the port — the condition under
+    /// which `tcr login` refuses.
+    ///
+    /// The case alone is NOT the test. An offline read also decodes to
+    /// ``PollState/loaded(_:)``: `tcr status` answers from config with no
+    /// server up, which is precisely the state where adding an account
+    /// *works*. Keying on `.loaded` would disable the button exactly when it is
+    /// usable, and the panel already distinguishes the two — `source` is why
+    /// `offlineNotice` exists.
+    private var proxyHoldsThePort: Bool {
+        if case .loaded(let fleet) = poller.state {
+            return !fleet.source.countersAreStructural
+        }
+        return false
     }
 
     /// Hand `tcr login` to a Terminal window.
