@@ -49,10 +49,23 @@ final class TerminationPolicyTests: XCTestCase {
         XCTAssertTrue(policy.allowsTermination(externalQuitRequest: false))
     }
 
-    /// Every quit request from OUTSIDE the process — `osascript`, the Dock, Cmd-Q
-    /// through the standard menu — arrives as a `kAEQuitApplication` Apple event
-    /// and runs none of our code first, so it can never have authorized itself.
-    /// It is allowed on the strength of the event alone.
+    /// `osascript -e 'quit app id "…"'` and a logout's quit both arrive as a
+    /// `kAEQuitApplication` Apple event, which the app handles itself and
+    /// authorizes before terminating.
+    ///
+    /// This case is the one that was measured BROKEN. The first version relied on
+    /// reading `NSAppleEventManager.currentAppleEvent` inside
+    /// `applicationShouldTerminate`; it returned no event, the refusal stood, and
+    /// the quit timed out after 25 s with the app still running. Authorizing from
+    /// the app's own quit handler does not depend on that timing.
+    func testAQuitAppleEventIsAllowed() {
+        let policy = TerminationPolicy()
+        policy.authorize(.quitEventReceived)
+        XCTAssertTrue(policy.allowsTermination(externalQuitRequest: false))
+    }
+
+    /// The belt that survived that measurement: if AppKit ever does report the
+    /// quit event as current, that alone is enough, with no prior authorization.
     func testAnExternalQuitRequestIsAllowedWithoutPriorAuthorization() {
         let policy = TerminationPolicy()
         XCTAssertNil(policy.authorization)

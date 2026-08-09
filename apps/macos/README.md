@@ -153,17 +153,36 @@ back: that runs `open -b <bundle id>`, which reaches
 `applicationShouldHandleReopen` and re-inserts the item. The hidden state is
 never persisted, so relaunching also restores it.
 
-Reproduce the failure with:
+Both halves were measured separately rather than assumed. Against a reproduction
+that kills the unfixed app instantly, a build carrying only the delegate survived
+60s, and so did a build carrying only the `isInserted:` binding — each prevents
+the death on its own. The redundancy is kept deliberately: they fail for
+different reasons, since the binding relies on SwiftUI keeping a
+declared-but-absent scene alive, which is undocumented, while the delegate relies
+only on AppKit asking before it quits.
+
+To reproduce the failure, run the executable directly instead of through `open`:
+
+```sh
+apps/macos/build/TcrBar.app/Contents/MacOS/TcrBar; echo "exit=$?"
+```
+
+A build without the fix exits 0 within a second with no output — the reported
+signature exactly. A fixed build stays up. Launching this way denies the process
+a status item for the same reason a hidden icon does, so it reaches the same
+teardown without involving Control Center.
+
+`TcrHideMenuBarItemForTesting` is the other reproduction, driving the teardown
+from inside a normally launched app:
 
 ```sh
 defaults write com.github.dhkts1.tcrbar.dev TcrHideMenuBarItemForTesting -bool true
 ```
 
-The app then removes its own menu-bar item three seconds after launch, which is
-the same teardown Control Center causes. This key exists because the real trigger
-cannot be scripted: Control Center owns the visibility in memory and ignores
-`defaults write com.apple.controlcenter "NSStatusItem Visible Item-0"` entirely —
-measured, the app mirrored `1` straight back over a `0` written seconds earlier.
+Neither goes through Control Center itself, because that cannot be scripted: it
+owns the visibility in memory and ignores `defaults write
+com.apple.controlcenter "NSStatusItem Visible Item-0"` entirely — measured, the
+app mirrored `1` straight back over a `0` written seconds earlier.
 
 ## Reading the panel honestly
 

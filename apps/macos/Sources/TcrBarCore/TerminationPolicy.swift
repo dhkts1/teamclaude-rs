@@ -28,18 +28,27 @@ import Foundation
 /// disease, because an app that cannot be quit is a worse bug than one that quits
 /// too easily. There are two ways in:
 ///
-///  * `authorize(_:)`, called by the code that is *about* to terminate the app —
-///    the panel's Quit button, the power-off notification (a logout or shutdown
-///    must not be blocked by an accessory app), and Sparkle immediately before it
-///    relaunches into a new version.
+///  * `authorize(_:)`, called by the code that is *about* to terminate the app.
+///    Every deliberate quit runs one of these first, by construction: the panel's
+///    Quit button, the `Cmd-Q` menu command (which the app replaces with its own),
+///    the app's own `kAEQuitApplication` handler (which likewise replaces
+///    AppKit's, and covers `osascript -e 'quit app id "…"'` and a logout's quit),
+///    the power-off notification, and Sparkle before it relaunches.
 ///  * `externalQuitRequest`, passed by `AppDelegate` when the terminate arrived
-///    as a `kAEQuitApplication` Apple event. That covers every quit request from
-///    *outside* the process — `osascript -e 'quit app id "…"'`, the Dock, Cmd-Q
-///    routed through the standard menu — none of which run any of our code first
-///    and so cannot have called `authorize(_:)`.
+///    as a `kAEQuitApplication` Apple event.
 ///
-/// The scene teardown above matches neither: it is an in-process `terminate:` with
-/// no Apple event behind it, which is exactly the signal that separates it from
+/// That second one is a BELT, not the mechanism, and it is documented here
+/// because it was measured FAILING. Reading
+/// `NSAppleEventManager.shared().currentAppleEvent` from inside
+/// `applicationShouldTerminate` yielded no event for an
+/// `osascript -e 'quit app id "…"'`: the refusal stood, the quit timed out after
+/// 25 s, and the app was still running — an app that cannot be quit, which is
+/// exactly the failure mode that is worse than the bug. AppKit does not still
+/// consider the quit event current by the time it asks. Hence the handlers above,
+/// which do not depend on that timing.
+///
+/// The scene teardown matches none of them: it is an in-process `terminate:` that
+/// runs no quit handler and authorizes nothing, which is what separates it from
 /// every deliberate quit.
 ///
 /// # Thread safety
@@ -60,6 +69,9 @@ public final class TerminationPolicy: @unchecked Sendable {
         case systemIsPoweringOff
         /// Sparkle is about to install an update and relaunch.
         case updateWillRelaunch
+        /// A `kAEQuitApplication` Apple event reached our own handler: an
+        /// `osascript -e 'quit app …'`, a logout's quit, the Dock's Quit.
+        case quitEventReceived
     }
 
     /// One process, one answer to "may I exit". A singleton because the question

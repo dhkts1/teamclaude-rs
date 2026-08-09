@@ -104,6 +104,22 @@ struct TcrBarApp: App {
                 .onAppear { delegate.updater = updater }
         }
         .menuBarExtraStyle(.window)
+        // Cmd-Q has to authorize too.
+        //
+        // The standard termination command sends a bare `terminate:`, which
+        // `applicationShouldTerminate` now refuses — so leaving it in place would
+        // ship a keyboard shortcut that silently does nothing. Replacing it keeps
+        // the shortcut and the menu item exactly where a user expects them, and
+        // routes them through the one door that is allowed to open.
+        .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit TcrBar") {
+                    TerminationPolicy.shared.authorize(.userChoseQuit)
+                    NSApplication.shared.terminate(nil)
+                }
+                .keyboardShortcut("q")
+            }
+        }
     }
 }
 
@@ -120,7 +136,7 @@ final class MenuBarPresence: ObservableObject {
 
     @Published var isInserted = true
 
-    /// Reproduce a hidden menu-bar icon on demand.
+    /// Replay a Control Center hide on demand.
     ///
     ///     defaults write com.github.dhkts1.tcrbar.dev \
     ///       TcrHideMenuBarItemForTesting -bool true
@@ -130,29 +146,50 @@ final class MenuBarPresence: ObservableObject {
     /// `com.apple.controlcenter "NSStatusItem Visible Item-0"` is simply ignored
     /// by the running process — measured 2026-08-09, the launched app mirrored
     /// `1` straight back over a `0` written seconds earlier. Only the Control
-    /// Center UI, or restarting it, moves that state. So without this key the fix
-    /// could only ever be argued for, never demonstrated: the failure it prevents
-    /// would have no reproduction, and a fix with no reproduction is a claim.
+    /// Center UI, or restarting it, moves that state. Without this key the fix
+    /// could only be argued for, never demonstrated, and a fix with no
+    /// reproduction is a claim.
     ///
-    /// It reproduces the TEARDOWN specifically, which is what the unified-log
-    /// trace shows — the scene is created and then destroyed a moment later —
-    /// rather than starting with no item, so the code path under test is the one
-    /// that actually fired. A defaults key rather than an environment variable
-    /// because `open` does not forward the environment to the app it launches,
-    /// and this project already overrides behaviour that way (`TcrExecutablePath`).
+    /// It replays BOTH steps of the traced sequence, in order, because the first
+    /// one alone turned out to be survivable:
+    ///
+    ///  1. the status item is removed — the `NSStatusItemChangeVisibilityAction`
+    ///     and the scene teardown behind it;
+    ///  2. an unrequested in-process `terminate:` with no Apple event behind it —
+    ///     the very next line in the log, and the thing that actually killed the
+    ///     app, because AppKit's default reply to it is YES.
+    ///
+    /// Step 1 on its own is not the failure: measured, a build carrying step 1 and
+    /// NO `applicationShouldTerminate` survived 60 s, because binding
+    /// `isInserted:` keeps the scene declared and nothing ever asks to terminate.
+    /// A harness that stopped there would have gone green against a build with the
+    /// fix removed — a probe that cannot fail, proving nothing.
+    ///
+    /// A defaults key rather than an environment variable because `open` does not
+    /// forward the environment to the app it launches, and this project already
+    /// overrides behaviour that way (`TcrExecutablePath`).
     static let hideForTestingDefaultsKey = "TcrHideMenuBarItemForTesting"
 
-    private init() {
+    /// Called from `applicationDidFinishLaunching`, and that timing is not
+    /// incidental. Scheduling this from `init` instead does not work: the
+    /// singleton is built while the `App` struct's properties initialize, which is
+    /// before `NSApplication` runs, and a `Task { @MainActor in … }` enqueued at
+    /// that point never resumes — measured, the "is set" line below printed and
+    /// neither replay step ever did, 30 s later. `DispatchQueue.main.asyncAfter`
+    /// from a launch callback is serviced by the run loop that is by then running.
+    func beginHideReplayIfRequested() {
         guard UserDefaults.standard.bool(forKey: Self.hideForTestingDefaultsKey) else { return }
         NSLog(
-            "TcrBar: %@ is set — the menu-bar item will be removed shortly to "
-                + "simulate Control Center hiding it.",
+            "TcrBar: %@ is set — replaying a Control Center hide shortly.",
             Self.hideForTestingDefaultsKey
         )
-        Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
-            NSLog("TcrBar: simulating a Control Center hide — removing the menu-bar item")
-            self.isInserted = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [self] in
+            NSLog("TcrBar: replay step 1 — removing the menu-bar item")
+            isInserted = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                NSLog("TcrBar: replay step 2 — unrequested terminate: (nothing authorized this)")
+                NSApplication.shared.terminate(nil)
+            }
         }
     }
 
@@ -209,12 +246,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { _ in
             TerminationPolicy.shared.authorize(.systemIsPoweringOff)
         }
+        // Take over the quit Apple event from AppKit.
+        //
+        // AppKit's own handler calls `terminate:` without telling us anything, and
+        // by the time `applicationShouldTerminate` runs the event is no longer
+        // "current" — measured, `currentAppleEvent` was nil for an
+        // `osascript -e 'quit app id "…"'`, so the refusal stood and the quit
+        // timed out after 25 s with the app still alive. Handling the event here
+        // authorizes FIRST and then terminates, which cannot race that timing.
+        // This is the path a logout's quit takes too.
+        NSAppleEventManager.shared().setEventHandler(
+            self,
+            andSelector: #selector(handleQuitAppleEvent(_:withReplyEvent:)),
+            forEventClass: AEEventClass(kCoreEventClass),
+            andEventID: AEEventID(kAEQuitApplication)
+        )
+
+        MenuBarPresence.shared.beginHideReplayIfRequested()
     }
 
-    /// The whole fix. AppKit's default answer is YES, and that default is what
-    /// turned a hidden menu-bar icon into an app that could not be launched — see
-    /// `TerminationPolicy` for the trace. Termination is now refused unless
-    /// something identifiable asked for it.
+    @objc private func handleQuitAppleEvent(
+        _ event: NSAppleEventDescriptor,
+        withReplyEvent reply: NSAppleEventDescriptor
+    ) {
+        NSLog("TcrBar: quit Apple event received — terminating")
+        TerminationPolicy.shared.authorize(.quitEventReceived)
+        NSApplication.shared.terminate(nil)
+    }
+
+    /// Half the fix, and measured to be sufficient on its own. AppKit's default
+    /// answer is YES, and that default is what turned a hidden menu-bar icon into
+    /// an app that could not be launched — see `TerminationPolicy` for the trace.
+    /// Termination is now refused unless something identifiable asked for it.
+    ///
+    /// The other half is binding `MenuBarExtra(isInserted:)`, and the two were
+    /// separated and measured rather than assumed. Against a reproduction that
+    /// kills the unfixed app instantly (exit 0, empty output), a build carrying
+    /// ONLY this method survived 60 s, and so did a build carrying only the
+    /// binding. Each prevents the death by itself; neither is dead weight, and
+    /// the redundancy is deliberate because they fail for different reasons — the
+    /// binding depends on SwiftUI keeping a declared-but-absent scene alive, which
+    /// is undocumented behaviour, while this depends only on AppKit asking before
+    /// it quits.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let external = Self.currentEventIsAQuitRequest()
         guard TerminationPolicy.shared.allowsTermination(externalQuitRequest: external) else {
