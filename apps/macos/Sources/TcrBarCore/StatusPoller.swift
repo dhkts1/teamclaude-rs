@@ -37,7 +37,8 @@ public enum PollState: Equatable {
             if n == 0, let unreadable = fleet.unreadableNotice {
                 return "no account decoded — \(unreadable)"
             }
-            let base = fleet.source.countersAreStructural
+            let base =
+                fleet.source.countersAreStructural
                 ? "\(n) \(noun) — offline read, counters are structurally zero"
                 : "\(n) \(noun) — live"
             guard let unreadable = fleet.unreadableNotice else { return base }

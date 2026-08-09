@@ -31,6 +31,11 @@ final class MenuBarShell {
     /// control that keeps nothing awake.
     let awake: AwakeController
     let preference: LaunchPreference
+    /// Owned here for the same reason as the rest, plus one of its own: the
+    /// delegate's `tcrbar://check-for-updates` handler reaches through the shell
+    /// to find it, so an updater that only existed while the panel was open would
+    /// make the CLI's call do nothing on an app nobody had clicked.
+    let updater: Updater
 
     let statusItem: NSStatusItem
     let popover: NSPopover
@@ -40,15 +45,16 @@ final class MenuBarShell {
     /// `nil` means "the real one". A default argument is evaluated in a
     /// *nonisolated* context, and every controller here is `@MainActor`, so
     /// `poller: StatusPoller = StatusPoller()` does not compile — the optionals
-    /// are what let the probe substitute a pinned poller and an inert keep-awake
-    /// while the app passes nothing at all.
+    /// are what let the probe substitute a pinned poller, an inert keep-awake and
+    /// an unstarted updater while the app passes nothing at all.
     init(
         poller: StatusPoller? = nil,
         server: ServerController? = nil,
         loginItem: LoginItem? = nil,
         accounts: AccountController? = nil,
         awake: AwakeController? = nil,
-        preference: LaunchPreference? = nil
+        preference: LaunchPreference? = nil,
+        updater: Updater? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -56,6 +62,7 @@ final class MenuBarShell {
         self.accounts = accounts ?? AccountController()
         self.awake = awake ?? AwakeController()
         self.preference = preference ?? LaunchPreference()
+        self.updater = updater ?? Updater()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -90,7 +97,8 @@ final class MenuBarShell {
         let hosting = NSHostingController(
             rootView: FleetPanel(
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
-                accounts: self.accounts, awake: self.awake, preference: self.preference))
+                accounts: self.accounts, awake: self.awake, preference: self.preference,
+                updater: self.updater))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -218,6 +226,7 @@ struct FleetPanel: View {
     @ObservedObject var accounts: AccountController
     @ObservedObject var awake: AwakeController
     @ObservedObject var preference: LaunchPreference
+    @ObservedObject var updater: Updater
 
     var body: some View {
         FleetView(
@@ -226,6 +235,7 @@ struct FleetPanel: View {
             loginItem: loginItem,
             accounts: accounts,
             awake: awake,
+            updater: updater,
             startServerAtLaunch: $preference.startServerAtLaunch
         )
     }

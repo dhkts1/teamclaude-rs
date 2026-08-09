@@ -62,8 +62,9 @@ public enum KeepAwakeGlyph {
                 accessibilityDescription: accessibilityDescription)
         else { return nil }
 
-        let tinted = symbol.withSymbolConfiguration(
-            NSImage.SymbolConfiguration(paletteColors: [tint])) ?? symbol
+        let tinted =
+            symbol.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(paletteColors: [tint])) ?? symbol
         tinted.isTemplate = false
         // `withSymbolConfiguration` returns a new image; carry the description
         // across rather than assuming it was copied.

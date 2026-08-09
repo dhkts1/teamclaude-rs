@@ -95,10 +95,15 @@ enum ShellProbe {
     private static func exercise() async -> Never {
         // A pinned poller: no timer, no `tcr` subprocess, and a fleet big enough
         // that a collapsed scroll view is numerically obvious. An inert
-        // keep-awake: rasterising a cup must not stop this machine sleeping.
+        // keep-awake: rasterising a cup must not stop this machine sleeping. An
+        // unstarted updater for the same reason both of those are substituted: a
+        // started one schedules background checks and can put an update window
+        // on screen, and a probe that is measuring popover geometry must not have
+        // Sparkle opening its own window underneath the measurement.
         let shell = MenuBarShell(
             poller: StatusPoller(pinnedState: .loaded(probeFleet())),
-            awake: AwakeController(activity: .inert))
+            awake: AwakeController(activity: .inert),
+            updater: Updater(startingUpdater: false))
 
         var checks: [Check] = []
         var notes: [String] = []

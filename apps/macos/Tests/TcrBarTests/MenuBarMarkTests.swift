@@ -165,7 +165,9 @@ final class MenuBarMarkTests: XCTestCase {
                     colour.alphaComponent > 0.35
                 else { continue }
                 scan.opaque += 1
-                let r = colour.redComponent, g = colour.greenComponent, b = colour.blueComponent
+                let r = colour.redComponent
+                let g = colour.greenComponent
+                let b = colour.blueComponent
                 // `loudTint` is pure red, so "carries the tint" is "much more red
                 // than green or blue" — a predicate a grey or a white cannot
                 // satisfy however bright it is.

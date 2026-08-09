@@ -107,3 +107,43 @@ if git diff --cached --name-only --diff-filter=ACM | grep -q '\.rs$'; then
     echo "pre-commit: cargo not found — skipping rustfmt check." >&2
   fi
 fi
+
+# ── Swift format gate ───────────────────────────────────────────────────────
+# Mirror CI's `Format (swift)` step, the same way the block above mirrors
+# `cargo fmt --check`. Scoped to the staged .swift files rather than the whole
+# tree: a full-tree check on every commit is slow enough that people turn the
+# hook off, and a hook that is off gates nothing.
+#
+# The pathspec matches CI's scope exactly. Sources/TcrBar is excluded there
+# while a large change is in flight; if it were checked here but not there, the
+# hook would block commits that CI is happy with, which is how a local gate
+# earns a reputation for lying and gets bypassed.
+#
+# No pipe into `grep -q` here — see the note at the top of the disclosure gate:
+# `grep -q` exits on its first match, and under `pipefail` the SIGPIPE'd
+# producer turns the whole pipeline non-zero, silently skipping the check.
+staged_swift="$(git diff --cached --name-only --diff-filter=ACM \
+                -- 'apps/macos/Sources/TcrBarCore/*.swift' 'apps/macos/Tests/*.swift' || true)"
+if [ -n "$staged_swift" ]; then
+  # xcrun, not PATH: swift-format ships inside the Xcode toolchain and is not on
+  # a default PATH even on a machine that has it.
+  swift_format="$(xcrun --find swift-format 2>/dev/null || true)"
+  if [ -z "$swift_format" ] && command -v swift-format >/dev/null 2>&1; then
+    swift_format="$(command -v swift-format)"
+  fi
+  if [ -n "$swift_format" ]; then
+    # Word-splitting on the newline-separated list is intended here.
+    # shellcheck disable=SC2086
+    if ! "$swift_format" lint --strict $staged_swift >&2; then
+      echo "" >&2
+      echo "pre-commit: BLOCKED — swift-format lint failed; CI's Format (swift) step would go red." >&2
+      echo "  Fix it:  \$(xcrun --find swift-format) format -i $(printf '%s ' $staged_swift)" >&2
+      echo "  then re-stage and commit." >&2
+      exit 1
+    fi
+  else
+    # Warn only, for the same reason gitleaks does: a missing tool must not
+    # block every commit, and must not pretend the check passed either.
+    echo "pre-commit: swift-format not found — skipping Swift format check (install Xcode)." >&2
+  fi
+fi

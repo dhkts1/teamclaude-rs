@@ -34,8 +34,9 @@ enum TcrBarEntry {
             AppIcon.writeIconSet(to: directory)  // exits
         }
         // The one flag that does build a status item — it has to, it is the gate
-        // on the shell. It builds its own, from a pinned poller and an inert
-        // keep-awake, and never reaches the delegate below.
+        // on the shell. It builds its own, from a pinned poller, an inert
+        // keep-awake and an unstarted updater, and never reaches the delegate
+        // below.
         if ShellProbe.requested() {
             ShellProbe.run()  // exits
         }
@@ -54,8 +55,8 @@ enum TcrBarEntry {
     }
 }
 
-/// Owns the shell, and makes sure nothing TcrBar started outlives it — a child
-/// process, and a power assertion.
+/// Owns the shell, makes sure nothing TcrBar started outlives it — a child
+/// process, and a power assertion — and is where the app's `tcrbar://` URLs land.
 ///
 /// `terminateSupervisedChildOnQuit()` is a no-op unless *this app* spawned the
 /// server; an incumbent proxy is never signalled. Both controllers are owned
@@ -63,7 +64,26 @@ enum TcrBarEntry {
 /// no window in which a quit could find them nil.
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var shell: MenuBarShell?
+    /// Built in ``applicationDidFinishLaunching(_:)``, and the owner of
+    /// everything the app runs on — including the ``Updater`` the `tcrbar://`
+    /// handler below reaches for.
+    ///
+    /// A URL that arrives before the shell exists is REMEMBERED rather than
+    /// dropped: launching the app *with* `tcrbar://check-for-updates` is the
+    /// ordinary case — that is what happens when the app was not already running
+    /// — and the URL event beats the delegate's launch callback. Under the
+    /// SwiftUI scene this guard hung off a `var updater: Updater?` handed over
+    /// when the menu-bar label first appeared; the shell owns the updater now, so
+    /// the same guard hangs off the shell, and it covers the same window.
+    private var shell: MenuBarShell? {
+        didSet {
+            guard checkIsPending, let shell else { return }
+            checkIsPending = false
+            NSLog("TcrBar: running the update check that arrived before launch finished")
+            shell.updater.checkForUpdates()
+        }
+    }
+    private var checkIsPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let shell = MenuBarShell()
@@ -95,5 +115,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // "quitting TcrBar releases it" is something this app does rather than
         // something it gets away with.
         shell?.awake.releaseOnQuit()
+    }
+
+    /// The URL contract with the `tcr` CLI: `tcrbar://check-for-updates` runs the
+    /// same user-initiated check the panel's button runs.
+    ///
+    /// The scheme is declared in `CFBundleURLTypes` by `scripts/build-tcrbar.sh`;
+    /// a bundle built any other way is not registered with LaunchServices and no
+    /// URL will ever reach here. `LSUIElement` does not change that — an accessory
+    /// app is a perfectly ordinary URL handler.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            handle(url)
+        }
+    }
+
+    /// Host-based, not path-based: `URL(string:)` parses `tcrbar://check-for-updates`
+    /// with `host == "check-for-updates"` and an empty path. An unrecognised URL is
+    /// logged rather than silently dropped, because a mistyped scheme call that
+    /// does nothing is indistinguishable from a broken updater.
+    private func handle(_ url: URL) {
+        guard url.scheme == "tcrbar" else {
+            NSLog("TcrBar: ignoring URL with unexpected scheme: %@", url.absoluteString)
+            return
+        }
+        switch url.host {
+        case "check-for-updates":
+            NSLog("TcrBar: tcrbar://check-for-updates received")
+            guard let shell else {
+                NSLog("TcrBar: no updater yet — the check is queued until launch completes")
+                checkIsPending = true
+                return
+            }
+            shell.updater.checkForUpdates()
+        default:
+            NSLog("TcrBar: unhandled tcrbar URL: %@", url.absoluteString)
+        }
     }
 }

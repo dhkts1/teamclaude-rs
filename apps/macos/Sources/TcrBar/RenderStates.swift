@@ -139,6 +139,10 @@ enum RenderStates {
                 loginItem: LoginItem(),
                 accounts: AccountController(),
                 awake: awake,
+                // `startingUpdater: false`: this process was asked for PNGs. A
+                // started updater schedules background checks and can put a
+                // window on screen, neither of which belongs in a render run.
+                updater: Updater(startingUpdater: false),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true
             )

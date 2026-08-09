@@ -89,6 +89,24 @@ jobs:
       - name: Swift toolchain version
         run: swift --version
 
+      # The Swift half of the `Format` job above. It lives here and not in `ci`
+      # because swift-format ships inside the Xcode toolchain, which only the
+      # macOS runner has — that is exactly the "only what Linux cannot answer"
+      # rule in the comment above this job, not an exception to it.
+      #
+      # Resolved through xcrun rather than assumed on PATH: the toolchain binary
+      # is not on a bare runner's PATH, and a bare `swift-format` would resolve
+      # to whatever a future image happens to install instead.
+      #
+      # Scope is TcrBarCore + Tests, not all of Sources: Sources/TcrBar has a
+      # large change in flight and is swept in a follow-up, at which point this
+      # widens to `apps/macos/Sources`.
+      - name: Format (swift)
+        run: |
+          swift_format="$(xcrun --find swift-format)"
+          "$swift_format" --version
+          "$swift_format" lint --strict -r apps/macos/Sources/TcrBarCore apps/macos/Tests
+
       # No SwiftPM cache: the package declares zero external dependencies, so
       # there is nothing to fetch, and .build artifacts key on the toolchain
       # and every source file — it would miss on essentially every run.

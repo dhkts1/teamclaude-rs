@@ -5,90 +5,90 @@ import XCTest
 /// Fixtures use obviously-fake account names only. Real account emails never
 /// enter this repository — see CLAUDE.md.
 private let liveFixture = """
-[
-  {
-    "source": "live",
-    "serverSha": "abc1234",
-    "serverDirty": false,
-    "name": "alice@example.com",
-    "priority": 1,
-    "status": "active",
-    "disabled": false,
-    "quota": 0.42,
-    "quotaState": "ok",
-    "fiveHour": 0.11,
-    "sevenDay": 0.42,
-    "sevenDayOi": 0.05,
-    "held": [],
-    "requests": 128,
-    "inputTokens": 4096,
-    "outputTokens": 512,
-    "cacheReadTokens": 2048,
-    "cacheHitRatio": 0.5,
-    "probeStatus": "ok",
-    "probeError": null,
-    "lastStreamError": null,
-    "streamErrorCount": 0
-  },
-  {
-    "source": "live",
-    "serverSha": "abc1234",
-    "serverDirty": false,
-    "name": "bob@example.com",
-    "priority": 2,
-    "status": "held",
-    "disabled": false,
-    "quota": 1.0,
-    "quotaState": "spent",
-    "fiveHour": 1.0,
-    "sevenDay": 1.0,
-    "sevenDayOi": 0.9,
-    "held": [
-      {"window": "7d", "minutesUntilReset": 1528, "resetAtMs": 1000000000000},
-      {"window": "5h", "minutesUntilReset": 93, "resetAtMs": 999000000000}
-    ],
-    "requests": 0,
-    "inputTokens": 0,
-    "outputTokens": 0,
-    "cacheReadTokens": 0,
-    "cacheHitRatio": null,
-    "probeStatus": "ok",
-    "probeError": null,
-    "lastStreamError": "overloaded_error",
-    "streamErrorCount": 3
-  }
-]
-"""
+    [
+      {
+        "source": "live",
+        "serverSha": "abc1234",
+        "serverDirty": false,
+        "name": "alice@example.com",
+        "priority": 1,
+        "status": "active",
+        "disabled": false,
+        "quota": 0.42,
+        "quotaState": "ok",
+        "fiveHour": 0.11,
+        "sevenDay": 0.42,
+        "sevenDayOi": 0.05,
+        "held": [],
+        "requests": 128,
+        "inputTokens": 4096,
+        "outputTokens": 512,
+        "cacheReadTokens": 2048,
+        "cacheHitRatio": 0.5,
+        "probeStatus": "ok",
+        "probeError": null,
+        "lastStreamError": null,
+        "streamErrorCount": 0
+      },
+      {
+        "source": "live",
+        "serverSha": "abc1234",
+        "serverDirty": false,
+        "name": "bob@example.com",
+        "priority": 2,
+        "status": "held",
+        "disabled": false,
+        "quota": 1.0,
+        "quotaState": "spent",
+        "fiveHour": 1.0,
+        "sevenDay": 1.0,
+        "sevenDayOi": 0.9,
+        "held": [
+          {"window": "7d", "minutesUntilReset": 1528, "resetAtMs": 1000000000000},
+          {"window": "5h", "minutesUntilReset": 93, "resetAtMs": 999000000000}
+        ],
+        "requests": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "cacheHitRatio": null,
+        "probeStatus": "ok",
+        "probeError": null,
+        "lastStreamError": "overloaded_error",
+        "streamErrorCount": 3
+      }
+    ]
+    """
 
 /// Same shape, `source: offline` and a `quotaState` this build has never seen.
 private let offlineUnknownFixture = """
-[
-  {
-    "source": "offline",
-    "serverSha": null,
-    "serverDirty": null,
-    "name": "carol@example.com",
-    "priority": 3,
-    "status": "active",
-    "disabled": true,
-    "quota": 0.0,
-    "quotaState": "brand-new-variant",
-    "fiveHour": 0.0,
-    "sevenDay": 0.0,
-    "sevenDayOi": 0.0,
-    "held": [],
-    "requests": 0,
-    "inputTokens": 0,
-    "outputTokens": 0,
-    "cacheReadTokens": 0,
-    "cacheHitRatio": null,
-    "probeStatus": "skipped",
-    "probeError": "no server",
-    "lastStreamError": null,
-    "streamErrorCount": 0
-  }
-]
-"""
+    [
+      {
+        "source": "offline",
+        "serverSha": null,
+        "serverDirty": null,
+        "name": "carol@example.com",
+        "priority": 3,
+        "status": "active",
+        "disabled": true,
+        "quota": 0.0,
+        "quotaState": "brand-new-variant",
+        "fiveHour": 0.0,
+        "sevenDay": 0.0,
+        "sevenDayOi": 0.0,
+        "held": [],
+        "requests": 0,
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadTokens": 0,
+        "cacheHitRatio": null,
+        "probeStatus": "skipped",
+        "probeError": "no server",
+        "lastStreamError": null,
+        "streamErrorCount": 0
+      }
+    ]
+    """
 
 final class FleetStatusTests: XCTestCase {
     private func fleet(_ json: String) throws -> Fleet {
@@ -422,10 +422,11 @@ final class FleetCapacityGlyphTests: XCTestCase {
     }
 
     func testAnyReadyAccountIsGreenEvenBesideSpentOnes() {
-        let fleet = Fleet(accounts: [
-            account("ok1@example.com", state: .ok),
-            account("near1@example.com", state: .near, held: held(166)),
-        ] + (1...11).map { account("spent\($0)@example.com", state: .spent, held: held(6526)) })
+        let fleet = Fleet(
+            accounts: [
+                account("ok1@example.com", state: .ok),
+                account("near1@example.com", state: .near, held: held(166)),
+            ] + (1...11).map { account("spent\($0)@example.com", state: .spent, held: held(6526)) })
         XCTAssertEqual(fleet.readyCount, 1)
         XCTAssertEqual(fleet.capacityGlyphState, .ok, "one ready account is capacity")
     }
@@ -440,9 +441,10 @@ final class FleetCapacityGlyphTests: XCTestCase {
     }
 
     func testNoneReadyAndNoneNearIsRed() {
-        let fleet = Fleet(accounts: (1...3).map {
-            account("spent\($0)@example.com", state: .spent, held: held(6526))
-        })
+        let fleet = Fleet(
+            accounts: (1...3).map {
+                account("spent\($0)@example.com", state: .spent, held: held(6526))
+            })
         XCTAssertEqual(fleet.capacityGlyphState, .spent)
     }
 
@@ -467,9 +469,10 @@ final class FleetCapacityGlyphTests: XCTestCase {
     }
 
     func testAnAllDisabledFleetIsUnknownNotAnAlarm() {
-        let fleet = Fleet(accounts: (1...3).map {
-            account("off\($0)@example.com", state: .ok, disabled: true)
-        })
+        let fleet = Fleet(
+            accounts: (1...3).map {
+                account("off\($0)@example.com", state: .ok, disabled: true)
+            })
         XCTAssertTrue(fleet.enabledAccounts.isEmpty)
         XCTAssertEqual(fleet.capacityGlyphState, .unknown("empty"))
         XCTAssertEqual(fleet.capacityGlyphState, fleet.capacityState, "the two agree on an empty fleet")
@@ -645,7 +648,8 @@ final class ServerControllerTests: XCTestCase {
     }
 
     func testIncumbentIsSuccessNotFailure() {
-        let stderr = "[tcr] another proxy holds :3456 (pid 123) and --no-replace was set; "
+        let stderr =
+            "[tcr] another proxy holds :3456 (pid 123) and --no-replace was set; "
             + "two proxies refreshing the same single-use tokens will token-war. Not replacing."
         let state = ServerController.classifyExit(exitCode: 1, stderr: stderr)
         guard case .incumbentHoldsPort = state else {
@@ -660,20 +664,25 @@ final class ServerControllerTests: XCTestCase {
     /// cannot lean on a non-zero exit code: without a marker match this would
     /// render "the server exited cleanly" for a server that never bound.
     func testTheStandDownIsRecognisedEvenThoughItExitsZero() {
-        let stderr = "[tcr] another proxy holds :3456 (pid 123) and it is still listening — "
+        let stderr =
+            "[tcr] another proxy holds :3456 (pid 123) and it is still listening — "
             + "leaving it alone and exiting without binding. Replacing it would wipe its "
             + "session→account pin map and cold-start every live session's prompt cache, the "
             + "most expensive event in this system. Pass --replace to take the port over anyway."
-        guard case .incumbentHoldsPort = ServerController.classifyExit(
-            intent: .safeStart, exitCode: 0, stderr: stderr
-        ) else {
+        guard
+            case .incumbentHoldsPort = ServerController.classifyExit(
+                intent: .safeStart, exitCode: 0, stderr: stderr
+            )
+        else {
             return XCTFail("a stand-down must read as an incumbent, not as a clean exit")
         }
         // Same text on the takeover path is the opposite verdict: the user asked
         // for the port and did not get it.
-        guard case .takeoverRefused = ServerController.classifyExit(
-            intent: .takeover, exitCode: 0, stderr: stderr
-        ) else {
+        guard
+            case .takeoverRefused = ServerController.classifyExit(
+                intent: .takeover, exitCode: 0, stderr: stderr
+            )
+        else {
             return XCTFail("a takeover that stood down has failed, however it exited")
         }
     }
