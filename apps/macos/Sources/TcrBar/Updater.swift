@@ -1,6 +1,29 @@
 import Combine
 import Sparkle
 import SwiftUI
+import TcrBarCore
+
+/// Tells the app that the termination Sparkle is about to perform was asked for.
+///
+/// Installing an update ends with Sparkle terminating this process and relaunching
+/// the new one. `applicationShouldTerminate` refuses terminations nobody asked for
+/// — which is what makes the app survive a hidden menu-bar icon — so without this
+/// hook that refusal would land on Sparkle and updates would silently never
+/// install. Both hooks are implemented because Sparkle can install on quit as well
+/// as install-and-relaunch, and only one of the two fires in each case.
+///
+/// Not `@MainActor`: Sparkle may call these from its own thread and terminates
+/// immediately afterwards, so the authorization has to be recorded before the call
+/// returns. `TerminationPolicy` is lock-guarded for exactly this.
+private final class UpdaterTerminationDelegate: NSObject, SPUUpdaterDelegate {
+    func updaterWillRelaunchApplication(_ updater: SPUUpdater) {
+        TerminationPolicy.shared.authorize(.updateWillRelaunch)
+    }
+
+    func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) {
+        TerminationPolicy.shared.authorize(.updateWillRelaunch)
+    }
+}
 
 /// Self-update, owned by the app the same way `poller` / `server` / `loginItem` /
 /// `accounts` are: one instance created in `TcrBarApp` and handed down. Not a
@@ -28,13 +51,22 @@ final class Updater: ObservableObject {
     private let controller: SPUStandardUpdaterController
     private var observation: AnyCancellable?
 
+    /// Sparkle holds its delegate WEAKLY, so this reference is what keeps the
+    /// object alive. Dropped, the update-authorization hooks above would simply
+    /// never fire and an update would be refused termination with no error.
+    private let terminationDelegate: UpdaterTerminationDelegate
+
     /// `startingUpdater: false` exists for the render harness. Starting the
     /// updater schedules background checks and can put UI on screen; a process
     /// invoked with `--render-states` must do neither.
     init(startingUpdater: Bool = true) {
+        // Built locally first: `self` is not usable as an argument until every
+        // stored property is initialized, and `controller` is one of them.
+        let terminationDelegate = UpdaterTerminationDelegate()
+        self.terminationDelegate = terminationDelegate
         controller = SPUStandardUpdaterController(
             startingUpdater: startingUpdater,
-            updaterDelegate: nil,
+            updaterDelegate: terminationDelegate,
             userDriverDelegate: nil
         )
         observation = controller.updater.publisher(for: \.canCheckForUpdates)

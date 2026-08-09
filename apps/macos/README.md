@@ -131,6 +131,40 @@ TCR_BIN=/path/to/tcr open build/TcrBar.app     # env override, shell launches
 If nothing is found the panel says so and names how many locations it searched —
 the bundle path included — it never shows an empty list.
 
+## A hidden menu-bar icon does not quit the app
+
+The whole UI is one `MenuBarExtra`, so the app declares exactly one scene. When
+Control Center hides the status item, SwiftUI tears that scene down — and a
+SwiftUI `App` left with zero scenes terminates itself. AppKit's default answer to
+`applicationShouldTerminate` is *yes*, so the app agreed: every launch exited 0
+within seconds, with no output and no crash report, which reads as a broken build
+rather than a quit. It cost a full day of no menu-bar app on 2026-08-09.
+
+`AppDelegate.applicationShouldTerminate` now REFUSES any termination nobody
+asked for, and `TerminationPolicy` holds the list of things that legitimately
+ask: the panel's Quit button, a logout or shutdown, Sparkle relaunching into a
+new version, and any quit request that arrives as an Apple event (`osascript`,
+the Dock, Cmd-Q). The status-item teardown matches none of them. The item is also
+bound through `MenuBarExtra(isInserted:)`, so a hide becomes observable state
+rather than a scene that vanishes.
+
+If the icon is hidden and the panel is therefore unclickable, `tcr ui` brings it
+back: that runs `open -b <bundle id>`, which reaches
+`applicationShouldHandleReopen` and re-inserts the item. The hidden state is
+never persisted, so relaunching also restores it.
+
+Reproduce the failure with:
+
+```sh
+defaults write com.github.dhkts1.tcrbar.dev TcrHideMenuBarItemForTesting -bool true
+```
+
+The app then removes its own menu-bar item three seconds after launch, which is
+the same teardown Control Center causes. This key exists because the real trigger
+cannot be scripted: Control Center owns the visibility in memory and ignores
+`defaults write com.apple.controlcenter "NSStatusItem Visible Item-0"` entirely —
+measured, the app mirrored `1` straight back over a `0` written seconds earlier.
+
 ## Reading the panel honestly
 
 Three states look similar and are not:
@@ -148,7 +182,8 @@ Three states look similar and are not:
 Package.swift
 Sources/TcrBarCore/   FleetStatus.swift  StatusPoller.swift  ServerController.swift
                       AccountControl.swift  LoginItem.swift  TcrTool.swift
-Sources/TcrBar/       TcrBarApp.swift  FleetView.swift  Tokens.swift
+                      TerminationPolicy.swift
+Sources/TcrBar/       TcrBarApp.swift  FleetView.swift  Tokens.swift  Updater.swift
 Tests/TcrBarTests/    FleetStatusTests.swift
 scripts/build-tcrbar.sh
 ```

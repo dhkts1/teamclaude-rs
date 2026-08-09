@@ -247,7 +247,15 @@ struct FleetView: View {
                         "Ask the release feed whether a newer TcrBar exists. "
                             + "Also reachable as `tcrbar://check-for-updates`."
                     )
-                Button("Quit") { NSApplication.shared.terminate(nil) }
+                // The authorization is not optional and not decoration.
+                // `applicationShouldTerminate` refuses every termination nobody
+                // asked for — that is what keeps a hidden menu-bar icon from
+                // quitting the app — so Quit has to say that it is the one asking
+                // BEFORE it terminates, or this button silently does nothing.
+                Button("Quit") {
+                    TerminationPolicy.shared.authorize(.userChoseQuit)
+                    NSApplication.shared.terminate(nil)
+                }
             }
             .buttonStyle(.bordered)
 

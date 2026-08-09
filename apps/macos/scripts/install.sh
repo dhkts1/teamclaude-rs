@@ -58,7 +58,13 @@ SRC="$MACOS_DIR/build/${APP_NAME}.app"
 DEST="/Applications/${APP_NAME}.app"
 
 echo "==> Building ${APP_NAME}…"
-bash "$MACOS_DIR/scripts/build-tcrbar.sh"
+# This is a SHIPPING build: it lands in /Applications and becomes *the* installed
+# TcrBar, so it must carry the published bundle id. `build-tcrbar.sh` defaults to
+# a `.dev` id precisely so that an ordinary local build cannot write into this
+# app's preferences, Sparkle state or menu-bar slot; installing is the one local
+# path where the real identity is correct. See the comment beside `bundle_id`
+# there for what the four pieces of shared state are.
+TCRBAR_SHIPPING_BUILD=1 bash "$MACOS_DIR/scripts/build-tcrbar.sh"
 
 [ -d "$SRC" ] || { echo "build produced no bundle at $SRC" >&2; exit 1; }
 

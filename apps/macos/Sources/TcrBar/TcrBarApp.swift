@@ -55,8 +55,22 @@ struct TcrBarApp: App {
     /// the app would attempt a spawn on every click.
     @State private var didAttemptLaunchStart = false
 
+    /// Whether the status item is in the menu bar right now.
+    ///
+    /// Binding this turns a hide into OBSERVABLE STATE instead of a scene
+    /// teardown: with `isInserted:` bound, SwiftUI writes `false` here when
+    /// Control Center hides the item, and the scene stays declared. Unbound, the
+    /// scene is simply removed — and an `App` with no scenes left terminates
+    /// itself, which is the bug (`TerminationPolicy`).
+    ///
+    /// Deliberately NOT persisted. An `@AppStorage`-backed value would remember
+    /// "hidden" across launches, so the next launch would come up with no icon and
+    /// no panel — a running app that looks dead, which is worse than the failure
+    /// being fixed. Starting at `true` every launch makes relaunch the recovery.
+    @StateObject private var presence = MenuBarPresence.shared
+
     var body: some Scene {
-        MenuBarExtra {
+        MenuBarExtra(isInserted: $presence.isInserted) {
             FleetView(
                 poller: poller,
                 server: server,
@@ -93,8 +107,68 @@ struct TcrBarApp: App {
     }
 }
 
-/// Two jobs: a child process TcrBar spawned must not outlive it, and the app's
-/// `tcrbar://` URLs land here.
+/// Is the status item in the menu bar? Owned here rather than by the `App` struct
+/// because `AppDelegate` has to reach it, and the delegate exists before any scene
+/// does — a hand-off through a view's `onAppear` would never happen on the launch
+/// that matters, the one where the icon is hidden and no view ever appears.
+///
+/// A singleton for that reason alone. Unlike `Updater`, holding one `Bool` starts
+/// nothing, so the render harness pays nothing for it.
+@MainActor
+final class MenuBarPresence: ObservableObject {
+    static let shared = MenuBarPresence()
+
+    @Published var isInserted = true
+
+    /// Reproduce a hidden menu-bar icon on demand.
+    ///
+    ///     defaults write com.github.dhkts1.tcrbar.dev \
+    ///       TcrHideMenuBarItemForTesting -bool true
+    ///
+    /// This exists because the real trigger cannot be driven from a script.
+    /// Control Center owns the visibility and holds it in memory: writing
+    /// `com.apple.controlcenter "NSStatusItem Visible Item-0"` is simply ignored
+    /// by the running process — measured 2026-08-09, the launched app mirrored
+    /// `1` straight back over a `0` written seconds earlier. Only the Control
+    /// Center UI, or restarting it, moves that state. So without this key the fix
+    /// could only ever be argued for, never demonstrated: the failure it prevents
+    /// would have no reproduction, and a fix with no reproduction is a claim.
+    ///
+    /// It reproduces the TEARDOWN specifically, which is what the unified-log
+    /// trace shows — the scene is created and then destroyed a moment later —
+    /// rather than starting with no item, so the code path under test is the one
+    /// that actually fired. A defaults key rather than an environment variable
+    /// because `open` does not forward the environment to the app it launches,
+    /// and this project already overrides behaviour that way (`TcrExecutablePath`).
+    static let hideForTestingDefaultsKey = "TcrHideMenuBarItemForTesting"
+
+    private init() {
+        guard UserDefaults.standard.bool(forKey: Self.hideForTestingDefaultsKey) else { return }
+        NSLog(
+            "TcrBar: %@ is set — the menu-bar item will be removed shortly to "
+                + "simulate Control Center hiding it.",
+            Self.hideForTestingDefaultsKey
+        )
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            NSLog("TcrBar: simulating a Control Center hide — removing the menu-bar item")
+            self.isInserted = false
+        }
+    }
+
+    /// Put the icon back. Reachable from `applicationShouldHandleReopen`, so
+    /// `open -b <bundle id>` — which is exactly what `tcr ui` runs — is the
+    /// recovery when the icon is hidden and the panel cannot be clicked.
+    func show() {
+        guard !isInserted else { return }
+        NSLog("TcrBar: re-inserting the menu-bar item after a reopen request")
+        isInserted = true
+    }
+}
+
+/// Three jobs: a child process TcrBar spawned must not outlive it, the app's
+/// `tcrbar://` URLs land here, and — the reason the app survives a hidden icon at
+/// all — every termination request is adjudicated here.
 ///
 /// `terminateSupervisedChildOnQuit()` is a no-op unless *this app* spawned the
 /// server — an incumbent proxy is never signalled.
@@ -119,6 +193,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     private var checkIsPending = false
+
+    /// A logout, restart or shutdown must not be blocked by an accessory app.
+    ///
+    /// `applicationShouldTerminate` refuses anything unaccounted for, and macOS
+    /// asks every app before powering off — so without this the first shutdown
+    /// after the fix would stall on a menu-bar utility and blame the user for it.
+    /// `willPowerOffNotification` is delivered before those terminate requests go
+    /// out, which is what makes recording it here sufficient.
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willPowerOffNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            TerminationPolicy.shared.authorize(.systemIsPoweringOff)
+        }
+    }
+
+    /// The whole fix. AppKit's default answer is YES, and that default is what
+    /// turned a hidden menu-bar icon into an app that could not be launched — see
+    /// `TerminationPolicy` for the trace. Termination is now refused unless
+    /// something identifiable asked for it.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let external = Self.currentEventIsAQuitRequest()
+        guard TerminationPolicy.shared.allowsTermination(externalQuitRequest: external) else {
+            NSLog(
+                "TcrBar: refusing a termination nobody requested — this is what a hidden "
+                    + "menu-bar icon looks like. The app stays running; re-show the icon in "
+                    + "Control Center, or run `tcr ui` to put it back."
+            )
+            return .terminateCancel
+        }
+        let reason = TerminationPolicy.shared.authorization?.rawValue ?? "externalQuitRequest"
+        NSLog("TcrBar: terminating (%@)", reason)
+        return .terminateNow
+    }
+
+    /// Did the terminate currently being handled arrive as a quit Apple event?
+    ///
+    /// This is the discriminator, and it is what makes the fix safe. Every quit
+    /// request from OUTSIDE the process carries one — `osascript -e 'quit app …'`,
+    /// the Dock's Quit, Cmd-Q through the standard menu — and none of them run any
+    /// of our code first, so none of them could have called `authorize(_:)`. The
+    /// status-item teardown carries no Apple event: it is a bare in-process
+    /// `terminate:`, so it is the one case that falls through to a refusal.
+    private static func currentEventIsAQuitRequest() -> Bool {
+        guard let event = NSAppleEventManager.shared().currentAppleEvent else { return false }
+        return event.eventClass == AEEventClass(kCoreEventClass)
+            && event.eventID == AEEventID(kAEQuitApplication)
+    }
+
+    /// `open -b com.github.dhkts1.tcrbar` on an already-running copy — which is
+    /// what `tcr ui` does — arrives here. Putting the icon back makes that the
+    /// recovery from a hide, without having to kill a perfectly healthy app.
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows: Bool
+    ) -> Bool {
+        MenuBarPresence.shared.show()
+        return true
+    }
 
     func applicationWillTerminate(_ notification: Notification) {
         server?.terminateSupervisedChildOnQuit()

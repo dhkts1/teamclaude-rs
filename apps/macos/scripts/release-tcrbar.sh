@@ -67,9 +67,35 @@ appcast_path="$pkg_dir/appcast.xml"
 # installers, which we do not ship). See docs/RELEASING.md.
 readonly required_cert_class="Developer ID Application"
 
+# The PUBLISHED bundle id, and the one thing about a release that can never
+# change. Sparkle matches an update against the id the installed copy already
+# carries, and LaunchServices resolves `open -b` and `tcrbar://` through it, so a
+# release shipping any other id would silently orphan every existing install.
+#
+# `build-tcrbar.sh` deliberately defaults to `<id>.dev` so that an ordinary local
+# build cannot write into an installed app's preferences, Sparkle state or
+# menu-bar slot. A release opts back in with TCRBAR_SHIPPING_BUILD=1 — and then
+# this value is asserted against what actually landed, because an env var that
+# failed to take effect must not be discoverable only by users.
+readonly release_bundle_id="com.github.dhkts1.tcrbar"
+
 die() { printf 'ERROR: %s\n' "$@" >&2; exit 1; }
 stage() { printf '\n==> %s\n' "$1"; }
 note() { printf '    %s\n' "$1"; }
+
+# Assert the built bundle carries the published identity.
+assert_release_bundle_id() {
+  local bundle="$1" id
+  [ -d "$bundle" ] || die "no bundle at $bundle — did the build stage run?"
+  id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' \
+    "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  [ "$id" = "$release_bundle_id" ] || die \
+    "$bundle declares CFBundleIdentifier '${id:-<unreadable>}', not '$release_bundle_id'." \
+    "A release under any other id orphans every existing install: Sparkle would" \
+    "never offer it as an update and 'open -b' would not resolve to it." \
+    "This usually means TCRBAR_SHIPPING_BUILD=1 did not reach build-tcrbar.sh."
+  note "bundle id: $release_bundle_id"
+}
 
 # ---------------------------------------------------------------------------
 # Stage 2 — the Developer ID assert
@@ -346,7 +372,14 @@ main() {
 
   # ---- stage 1: build -----------------------------------------------------
   stage "stage 1/9  build (apps/macos/scripts/build-tcrbar.sh)"
-  "$here/build-tcrbar.sh"
+  # The DISTRIBUTION identity, and it must be exact. `build-tcrbar.sh` defaults to
+  # a `.dev` bundle id so a local build cannot poison an installed app's
+  # preferences, Sparkle state or menu-bar slot; a release is the case that has to
+  # opt back in. Shipping the `.dev` id would orphan every existing install and
+  # break Sparkle, which matches updates against the id already published — so
+  # the id that actually LANDED is asserted below rather than this line trusted.
+  TCRBAR_SHIPPING_BUILD=1 "$here/build-tcrbar.sh"
+  assert_release_bundle_id "$app_dir"
 
   # ---- stage 2: Developer ID assert ---------------------------------------
   stage "stage 2/9  assert the bundle is signed for distribution"

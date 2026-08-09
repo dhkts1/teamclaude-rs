@@ -12,7 +12,46 @@ pkg_dir="$(dirname "$here")"
 repo_root="$(cd "$pkg_dir/../.." && pwd)"
 
 app_name="TcrBar"
-bundle_id="com.github.dhkts1.tcrbar"
+
+# A DEV BUILD MUST NOT SHARE THE INSTALLED APP'S IDENTITY.
+#
+# The bundle id is not just a name. macOS keys four separate pieces of durable,
+# per-user state off it, and every one of them is state the installed app in
+# /Applications depends on:
+#
+#   1. The preferences domain — `~/Library/Preferences/<id>.plist`. That is where
+#      `@AppStorage` lives (startServerAtLaunch, TcrExecutablePath) AND where
+#      Sparkle records its update state (last check date, skipped version).
+#   2. Sparkle's update bookkeeping, per the above.
+#   3. Control Center's menu-bar autosave slot, which is what decides whether the
+#      status item is shown or hidden.
+#   4. The LaunchServices record — what `open -b <id>` and `tcrbar://` resolve to.
+#
+# With one shared id, every checkout, every worktree, every DMG copy and every
+# throwaway debug build is the SAME app as far as macOS is concerned. That is not
+# hypothetical: on 2026-08-09 a worker's debug build wrote Sparkle keys straight
+# into the installed app's preferences, and `open -b` became a coin flip over
+# which bundle LaunchServices had seen last.
+#
+# So non-shipping builds get their own id and their own display name, and are
+# thereby unable to touch any of the four. The SHIPPING id is unchanged and
+# exact — changing it would orphan every existing install and break Sparkle,
+# which matches updates against the id it already published.
+#
+# Opt IN, never opt out: the default is the safe one. `install.sh` and
+# `release-tcrbar.sh` — the two scripts that produce an artifact a user actually
+# runs — set TCRBAR_SHIPPING_BUILD=1 themselves.
+release_bundle_id="com.github.dhkts1.tcrbar"
+if [ "${TCRBAR_SHIPPING_BUILD:-0}" = "1" ]; then
+  bundle_id="$release_bundle_id"
+  bundle_name="$app_name"
+  build_channel="shipping"
+else
+  bundle_id="$release_bundle_id.dev"
+  bundle_name="$app_name (dev)"
+  build_channel="dev"
+fi
+
 build_dir="$pkg_dir/build"
 app_dir="$build_dir/$app_name.app"
 macos_dir="$app_dir/Contents/MacOS"
@@ -251,7 +290,7 @@ cat >"$app_dir/Contents/Info.plist" <<PLIST
 	<key>CFBundleIconName</key>
 	<string>AppIcon</string>
 	<key>CFBundleName</key>
-	<string>$app_name</string>
+	<string>$bundle_name</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -386,3 +425,9 @@ if [ -z "$sign_identity" ]; then
 fi
 
 echo "built $app_dir  version=$short_version build=$build_number sha=$git_sha signing=$sign_tier"
+echo "  channel=$build_channel  bundle id=$bundle_id"
+if [ "$build_channel" = "dev" ]; then
+  echo "  (a dev build: its preferences, Sparkle state, menu-bar slot and"
+  echo "   LaunchServices record are its own. Set TCRBAR_SHIPPING_BUILD=1 to"
+  echo "   build with the shipping identity — install.sh and release-tcrbar.sh do.)"
+fi
