@@ -21,9 +21,22 @@ Assume every line you commit is world-readable, because it is.
 
 A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sessions pointing at it.
 
-- **Never restart, kill or signal it** without being asked. A restart wipes the in-memory
-  session→account pin map, and Anthropic's prompt cache is per-account, so every live session pays a
-  full cold prefix. It is the most expensive event in this system.
+- **Never restart, kill or signal it** without being asked. Anthropic's prompt cache is per-account,
+  so a session that comes back on a different account pays a full cold prefix. It is still the most
+  expensive event in this system.
+  A restart is no longer *automatic* total loss, though, and this line used to say it was. Session
+  affinity persists its pins to `~/.cache/teamclaude/session-affinity.json` and restores them at
+  boot: measured 2026-08-09, three restarts restored 7, 5 and 7 pins. The real limit is the TTL
+  (`affinity::PIN_TTL_MS`, 15 minutes) — a restart inside it keeps most sessions warm, and one after
+  it restores nothing at all (`restored=0 expired=27`, same log). None of that applies with
+  `sessionAffinity` off, which is the default in a fresh config. Read the log line the server prints
+  at boot rather than assuming either outcome.
+- **You cannot replace `/Applications/TcrBar.app` while the proxy is running.** TcrBar resolves the
+  *bundled* `tcr` ahead of `PATH` (`TcrTool.swift:69-82`) and supervises it as a child, so
+  `Contents/MacOS/tcr` is an executing image inside the very bundle being swapped. Finder and Sparkle
+  both refuse with "the item TcrBar is in use". Quitting TcrBar clears it — `applicationWillTerminate`
+  stops the child — which is why every TcrBar update also restarts the proxy and spends the
+  cold-prefix cost above. Plan the update for a quiet moment; it is not a free background operation.
 - **`cargo build --release` is safe while it is running.** Cargo writes a new file and renames, so the
   live process keeps its own inode and its own bytes (measured 2026-08-07, N=5 — a fresh `exec` during
   the build exits 0). The real hazard is overwriting a binary *in place*: `cp` onto a path something is
@@ -43,8 +56,8 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 ## Branching
 
 - **The primary checkout stays on `main`.** This is a convention, not something the repo checks — the
-  pre-commit hook in `.githooks/` runs a `gitleaks` secret scan and a `cargo fmt --check` gate, and
-  looks at no branch. Keeping to it is on you. Do feature work in a worktree:
+  pre-commit hook in `.githooks/` runs a secret scan, a private-disclosure scan, format gates and a
+  release-version gate, and looks at no branch. Keeping to it is on you. Do feature work in a worktree:
   `git worktree add ~/worktrees/<name> -b <branch> main`.
 - Branch **before** you start editing. Making changes in the primary checkout and then wanting a branch
   is a trap — a fresh worktree branches from `HEAD` without your uncommitted work, and any shared file

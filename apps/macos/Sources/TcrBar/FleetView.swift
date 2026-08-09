@@ -237,31 +237,8 @@ struct FleetView: View {
                 .font(Tok.secondaryFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            HStack {
-                if server.state.isOurChild {
-                    Button("Stop server") { server.stop() }
-                } else {
-                    Button("Start server") { server.start() }
-                }
-                Button("Refresh") { Task { await poller.pollOnce() } }
-                Button("Add account…") { addAccount() }
-                    .help(
-                        "Opens `tcr login` in a Terminal window. It needs one: it "
-                            + "prompts for a name, may ask for a pasted code, and "
-                            + "refuses while a proxy is holding the port."
-                    )
-                Spacer()
-                // Disabled rather than silently no-op while Sparkle already has
-                // a check in flight — the same rule "Take over port…" follows.
-                Button("Check for Updates…") { updater.checkForUpdates() }
-                    .disabled(!updater.canCheckForUpdates)
-                    .help(
-                        "Ask the release feed whether a newer TcrBar exists. "
-                            + "Also reachable as `tcrbar://check-for-updates`."
-                    )
-                Button("Quit") { NSApplication.shared.terminate(nil) }
-            }
-            .buttonStyle(.bordered)
+            fleetActions
+            appActions
 
             if let loginError {
                 Text(loginError)
@@ -276,6 +253,66 @@ struct FleetView: View {
 
             dangerZone
         }
+    }
+
+    /// Actions that act on the FLEET: the proxy, the poll, the account list.
+    ///
+    /// Split from ``appActions`` because five bordered buttons do not fit.
+    ///
+    /// This was one row. The panel is `Tok.panelWidth` (380) wide with a
+    /// `Tok.gutter` (12) on each side, so a row has **356pt**, and the five
+    /// labels plus their bordered padding want roughly 460 — AppKit resolved
+    /// that by truncating, and the row rendered as
+    /// `Start se… · Refresh · Add ac… · Check fo… · Quit`. Three of the five no
+    /// longer named their own action, and "Start se…" is not even unambiguous
+    /// about its noun. A button whose label is cut is a button you have to click
+    /// to identify.
+    ///
+    /// Note this was invisible to every test and to VoiceOver: SwiftUI truncates
+    /// the DRAWN label and hands the full string to the accessibility layer, so
+    /// the bug existed only for people looking at it. `--render-states` is what
+    /// showed it, which is the harness working as intended.
+    ///
+    /// The split is by SCOPE, not by "what happened to fit". These three are
+    /// about the fleet this panel monitors; the two below are about TcrBar
+    /// itself — a distinction the footer already makes further down, where
+    /// `launchAtLogin` is documented as living beside Quit precisely because it
+    /// "is about TcrBar, not about the fleet".
+    private var fleetActions: some View {
+        HStack {
+            if server.state.isOurChild {
+                Button("Stop server") { server.stop() }
+            } else {
+                Button("Start server") { server.start() }
+            }
+            Button("Refresh") { Task { await poller.pollOnce() } }
+            Button("Add account…") { addAccount() }
+                .help(
+                    "Opens `tcr login` in a Terminal window. It needs one: it "
+                        + "prompts for a name, may ask for a pasted code, and "
+                        + "refuses while a proxy is holding the port."
+                )
+            Spacer()
+        }
+        .buttonStyle(.bordered)
+    }
+
+    /// Actions that act on the APP, trailing-aligned so they read as a separate
+    /// group from the fleet row above without needing a rule between them.
+    private var appActions: some View {
+        HStack {
+            Spacer()
+            // Disabled rather than silently no-op while Sparkle already has
+            // a check in flight — the same rule "Take over port…" follows.
+            Button("Check for Updates…") { updater.checkForUpdates() }
+                .disabled(!updater.canCheckForUpdates)
+                .help(
+                    "Ask the release feed whether a newer TcrBar exists. "
+                        + "Also reachable as `tcrbar://check-for-updates`."
+                )
+            Button("Quit") { NSApplication.shared.terminate(nil) }
+        }
+        .buttonStyle(.bordered)
     }
 
     /// Bring the proxy up when TcrBar starts. Pairs with "Launch at login" to
