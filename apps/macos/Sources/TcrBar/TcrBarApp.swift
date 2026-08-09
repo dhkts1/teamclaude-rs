@@ -101,10 +101,24 @@ struct TcrBarApp: App {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var server: ServerController?
+
     /// Handed over by `TcrBarApp` when the menu-bar label first appears, which is
     /// at launch. Optional because the delegate is constructed by AppKit before
     /// any SwiftUI scene exists, not because it is expected to stay nil.
-    var updater: Updater?
+    ///
+    /// A URL that arrives before that hand-off is REMEMBERED rather than dropped:
+    /// launching the app *with* `tcrbar://check-for-updates` is the ordinary case
+    /// — that is what happens when the app was not already running — and the URL
+    /// event beats the first scene by a few milliseconds.
+    var updater: Updater? {
+        didSet {
+            guard checkIsPending, let updater else { return }
+            checkIsPending = false
+            NSLog("TcrBar: running the update check that arrived before launch finished")
+            updater.checkForUpdates()
+        }
+    }
+    private var checkIsPending = false
 
     func applicationWillTerminate(_ notification: Notification) {
         server?.terminateSupervisedChildOnQuit()
@@ -115,30 +129,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// The scheme is declared in `CFBundleURLTypes` by `scripts/build-tcrbar.sh`;
     /// a bundle built any other way is not registered with LaunchServices and no
-    /// URL will ever reach this method. `LSUIElement` does not change that —
-    /// an accessory app is a perfectly ordinary URL handler.
-    ///
-    /// Host-based, not path-based: `URL(string:)` parses `tcrbar://check-for-updates`
-    /// with `host == "check-for-updates"` and an empty path. An unrecognised URL
-    /// is logged rather than silently dropped, because a typo'd scheme call that
-    /// does nothing is indistinguishable from a broken updater.
+    /// URL will ever reach here. `LSUIElement` does not change that — an accessory
+    /// app is a perfectly ordinary URL handler.
     func application(_ application: NSApplication, open urls: [URL]) {
         for url in urls {
-            guard url.scheme == "tcrbar" else {
-                NSLog("TcrBar: ignoring URL with unexpected scheme: %@", url.absoluteString)
-                continue
+            handle(url)
+        }
+    }
+
+    /// Host-based, not path-based: `URL(string:)` parses `tcrbar://check-for-updates`
+    /// with `host == "check-for-updates"` and an empty path. An unrecognised URL is
+    /// logged rather than silently dropped, because a mistyped scheme call that
+    /// does nothing is indistinguishable from a broken updater.
+    private func handle(_ url: URL) {
+        guard url.scheme == "tcrbar" else {
+            NSLog("TcrBar: ignoring URL with unexpected scheme: %@", url.absoluteString)
+            return
+        }
+        switch url.host {
+        case "check-for-updates":
+            NSLog("TcrBar: tcrbar://check-for-updates received")
+            guard let updater else {
+                NSLog("TcrBar: no updater yet — the check is queued until launch completes")
+                checkIsPending = true
+                return
             }
-            switch url.host {
-            case "check-for-updates":
-                NSLog("TcrBar: tcrbar://check-for-updates received")
-                guard let updater else {
-                    NSLog("TcrBar: no updater is available yet — check ignored")
-                    continue
-                }
-                updater.checkForUpdates()
-            default:
-                NSLog("TcrBar: unhandled tcrbar URL: %@", url.absoluteString)
-            }
+            updater.checkForUpdates()
+        default:
+            NSLog("TcrBar: unhandled tcrbar URL: %@", url.absoluteString)
         }
     }
 }
