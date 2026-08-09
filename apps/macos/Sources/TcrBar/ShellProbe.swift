@@ -30,6 +30,15 @@ import TcrBarCore
 ///    target/action wiring survives a real click.
 ///  - It says nothing about a *bundled* run: no `LSUIElement`, no code signature,
 ///    no login item. `scripts/build-tcrbar.sh` and a human's eyes still own that.
+///  - It does not exercise the **animated** dismissal. The probe sets
+///    `popover.animates = false` before it closes anything, for the reason given
+///    at that line, so the code path a human sees — the panel fading out — is
+///    reported and not asserted here.
+///
+/// What still needs human eyes, in the menu bar of a machine that is awake and
+/// unlocked: the icon is actually there and is the right colour in both states,
+/// a real click opens the panel, and **open the panel and watch it animate
+/// away** — that last one is the part this file deliberately stops measuring.
 ///
 /// It is not invisible while it runs: a status item appears in the real menu bar
 /// for a couple of seconds, and `openPanel()` activates the app and shows a real
@@ -54,7 +63,13 @@ enum ShellProbe {
     /// Nothing here should take a second. If the run loop wedges — a popover that
     /// never opens, a status bar that never vends a button — the probe has to
     /// fail rather than hang a CI step forever.
-    private static let deadline: TimeInterval = 30
+    ///
+    /// It has to clear the sum of everything below it, or a single failing
+    /// assertion is replaced by "nothing concluded", which is a strictly worse
+    /// diagnostic. Four `waitUntil` calls at 5s each is 20s of worst case, plus
+    /// about 2.5s of `settle`, so 30s left barely 7s of headroom and one more
+    /// waiting assertion would have eaten it.
+    private static let deadline: TimeInterval = 60
 
     @MainActor
     static func run() -> Never {
@@ -86,41 +101,56 @@ enum ShellProbe {
             awake: AwakeController(activity: .inert))
 
         var checks: [Check] = []
+        var notes: [String] = []
+        var occlusionAtOpen = "not reached"
         await settle()
 
-        // 1 — the status item exists and its button does something when clicked.
+        // 1 — the status item exists, is visible, and its button does something
+        //     when clicked.
         //
-        //     Two obvious clauses are deliberately reported and NOT asserted,
-        //     because both were tried and neither can fail:
+        //     **`isVisible` is asserted, and an earlier version of this comment
+        //     was wrong to excuse it.** It claimed the flag "reads false for this
+        //     probe in a normal, working run" and that asserting it "fails a
+        //     correct shell". It does not. `isVisible` is persisted per status
+        //     item in the app's defaults domain, and it read false here because
+        //     the domain held a stale `"NSStatusItem VisibleCC Item-0" = 0` —
+        //     which is the shipped bug, not probe noise. Control: five status
+        //     items created in the same locked session (bare, title-only,
+        //     template-image, image-set-after-a-run-loop-turn, and one built
+        //     exactly as `MenuBarShell` builds its own at 32x29) all read
+        //     `isVisible=true`, because they were in a domain without the key.
+        //     The de-assertion papered over a true positive, and a status item
+        //     that draws 754 opaque pixels into a bitmap while being hidden from
+        //     the menu bar is precisely the failure a human reports as "the app
+        //     did not launch". `MenuBarShell` now sets it at creation.
         //
-        //      - **bounds.** `NSStatusBar.system.statusItem(...)` vends a
-        //        non-nil `NSStatusBarButton` with a live frame even at
-        //        `withLength: 0`, with `isVisible` false, and with no image or
-        //        title ever set — measured 32x29, 32x29 and 16x22 respectively.
-        //      - **`isVisible`.** It reads `false` for this probe in a normal,
-        //        working run, while the button rasterises 754 opaque pixels one
-        //        line later. Asserting on it fails a correct shell, which is
-        //        worse than not checking: the first version of this check did
-        //        exactly that.
+        //     **bounds** stays reported and not asserted, because it genuinely
+        //     cannot fail: `NSStatusBar.system.statusItem(...)` vends a non-nil
+        //     `NSStatusBarButton` with a live frame even at `withLength: 0`,
+        //     with `isVisible` false, and with no image or title ever set —
+        //     measured 32x29, 32x29 and 16x22 respectively.
         //
-        //     What is left is what the shell genuinely owns: a status bar button
-        //     of the right class whose target/action pair points back here. An
+        //     The rest is what the shell genuinely owns: a status bar button of
+        //     the right class whose target/action pair points back here. An
         //     unwired button is an item that ignores every click, which is the
         //     one failure at this layer that a later assertion would not catch.
         let button = shell.statusItem.button
         let buttonClass = button.map { String(describing: type(of: $0)) } ?? "nil"
         let bounds = button?.bounds ?? .zero
         let wired = button.map { $0.target as AnyObject? === shell && $0.action != nil } ?? false
+        let visible = shell.statusItem.isVisible
         checks.append(
             Check(
-                1, "status item vends an NSStatusBarButton wired to the shell",
-                passed: button != nil && buttonClass.contains("StatusBarButton") && wired,
-                detail: "class=\(buttonClass) wired=\(wired) "
-                    + "bounds=\(Int(bounds.width))x\(Int(bounds.height)) "
-                    + "(reported, not asserted: isVisible=\(shell.statusItem.isVisible))"))
+                1, "status item is visible and vends an NSStatusBarButton wired to the shell",
+                passed: button != nil && buttonClass.contains("StatusBarButton") && wired
+                    && visible,
+                detail: "class=\(buttonClass) wired=\(wired) isVisible=\(visible) "
+                    + "(reported, not asserted: "
+                    + "bounds=\(Int(bounds.width))x\(Int(bounds.height)))"))
 
         guard let button else {
-            report(checks)
+            report(checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
+                notes: notes)
             exit(1)
         }
 
@@ -163,24 +193,59 @@ enum ShellProbe {
         //     the things that used to ride on the panel being rebuilt per open
         //     are exercised rather than assumed.
         shell.openPanel()
-        _ = await waitUntil { shell.popover.isShown && shell.popover.contentSize.height > 300 }
+        let opened = await waitUntil {
+            shell.popover.isShown && shell.popover.contentSize.height > 300
+        }
+        occlusionAtOpen = occlusion(of: shell)
         let size = shell.popover.contentSize
         checks.append(
             Check(
                 5, "open: isShown, contentSize is \(Int(Tok.panelWidth))pt wide and > 300pt tall",
                 passed: shell.popover.isShown && abs(size.width - Tok.panelWidth) < 1
                     && size.height > 300,
-                detail: "isShown=\(shell.popover.isShown) "
+                detail: "isShown=\(shell.popover.isShown) timedOut=\(!opened) "
                     + "contentSize=\(Int(size.width))x\(Int(size.height))"))
 
         // 6 — and it closes again.
+        //
+        //     `animates = false` first, and this is a substitution in the probe
+        //     rather than a change to the app, the same way the pinned poller
+        //     and the inert `AwakeController` above are. `popover` is a `let`,
+        //     so nothing in `MenuBarShell` moves. **Do not "fix" this assertion
+        //     by changing `closePanel()`** — `performClose(nil)` is correct.
+        //
+        //     Measured, 8 variants under a real `NSApplication.run()`: the sole
+        //     discriminator is `animates`. Every `animates = true` variant was
+        //     still `isShown == true` six seconds later — `performClose` *and*
+        //     `close()`, across `.transient`, `.semitransient` and
+        //     `.applicationDefined`, with and without `NSApp.activate()`. Both
+        //     `animates = false` variants closed in under 0.1s. A mechanism
+        //     probe in the same process narrowed it: an empty
+        //     `NSAnimationContext` group completes in 0.1s and a raw
+        //     `CATransaction` on the popover's layer in 0.3s, but an alpha
+        //     animation on the popover's `_NSPopoverWindow` — and on an ordinary
+        //     `NSWindow` — never completes in 3s. `NSPopover` flips `isShown`
+        //     inside that window-animation completion, so with nothing being
+        //     composited (screen locked, display asleep, `occlusionState`
+        //     without `.visible`) it never flips.
+        //
+        //     So the animated variant of this assertion is not a check that
+        //     cannot fail; it is the more dangerous inverse — one that goes red
+        //     on a correct app whenever the machine is not drawing, and whose
+        //     obvious fix is a regression. The environment line at the bottom of
+        //     the report is what makes that adjudicable next time.
+        shell.popover.animates = false
         shell.closePanel()
-        _ = await waitUntil { !shell.popover.isShown }
+        let closed = await waitUntil { !shell.popover.isShown }
         checks.append(
             Check(
                 6, "close: isShown == false",
                 passed: !shell.popover.isShown,
-                detail: "isShown=\(shell.popover.isShown)"))
+                detail: "isShown=\(shell.popover.isShown) timedOut=\(!closed)"))
+        notes.append(
+            "the animated dismissal was NOT exercised — `popover.animates` was set false before "
+                + "assertion 6, because the window animation it waits on does not complete when "
+                + "nothing is being composited. Open the panel and watch it animate away.")
 
         // 9 — the login-item re-read, measured on the SECOND open, which is the
         //     only place it means anything.
@@ -194,27 +259,40 @@ enum ShellProbe {
         //     shell's refresh deleted. It fires once, because one popover keeps
         //     one hosting controller — which is precisely the regression this
         //     assertion exists for, so the second open is where to look.
+        //
+        //     It is gated on assertion 6's close having actually happened, and
+        //     that gate is not decoration. `show(relativeTo:)` on a popover that
+        //     is already shown re-anchors it; it does not open it. So whenever
+        //     the close silently failed, the "SECOND open" this assertion is
+        //     named for never occurred — and it passed anyway, because
+        //     `openPanel()` calls `loginItem.refresh()` unconditionally and
+        //     `@Published` fires on every assignment. A green line that is green
+        //     for a different reason than its own comment gives is worse than a
+        //     red one, because the next reader believes the comment.
         let loginReads = Counter()
         let watch = shell.loginItem.$status.dropFirst().sink { _ in loginReads.value += 1 }
         shell.openPanel()
-        _ = await waitUntil { shell.popover.isShown }
+        let reopened = await waitUntil { shell.popover.isShown }
         await settle(0.5)
         let reopenReads = loginReads.value
         watch.cancel()
         checks.append(
             Check(
                 9, "re-open: the login-item bit is read again (macOS owns it; a cache is a lie)",
-                passed: reopenReads > 0,
-                detail: "LoginItem.status emissions on the second open=\(reopenReads)"))
+                passed: closed && reopenReads > 0,
+                detail: "LoginItem.status emissions on the second open=\(reopenReads) "
+                    + "precedingCloseSucceeded=\(closed) timedOut=\(!reopened)"))
         shell.closePanel()
-        _ = await waitUntil { !shell.popover.isShown }
+        let closedAgain = await waitUntil { !shell.popover.isShown }
+        notes.append("teardown close: isShown=\(shell.popover.isShown) timedOut=\(!closedAgain)")
 
         // 7 — the claim the ON image rests on: `NSColor.labelColor` inside the
         //     drawing handler resolves in the appearance current at DRAW time,
         //     so the gauge is right in both while the cup stays cyan in both.
         checks.append(appearanceCheck())
 
-        report(checks)
+        report(checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
+            notes: notes)
         exit(checks.allSatisfy(\.passed) ? 0 : 1)
     }
 
@@ -372,12 +450,49 @@ enum ShellProbe {
         }
     }
 
+    /// The state of the machine the run happened on, printed every run whether
+    /// or not anything failed.
+    ///
+    /// This file is otherwise scrupulous about what it measures, and the
+    /// environment was the one input it took on faith. That cost most of a day:
+    /// two runs of the same binary disagreed about assertion 6 and there was
+    /// nothing in either output to adjudicate between them. The three values
+    /// here are the ones that actually decide whether AppKit will run a window
+    /// animation to completion.
+    @MainActor
+    private static func environment(_ shell: MenuBarShell, occlusionAtOpen: String) -> String {
+        let session = CGSessionCopyCurrentDictionary() as? [String: Any]
+        let locked: String
+        switch session?["CGSSessionScreenIsLocked"] {
+        case let flag as Bool: locked = String(flag)
+        case let flag as Int: locked = String(flag != 0)
+        default: locked = "absent"
+        }
+        return "screenLocked=\(locked) appActive=\(NSApp.isActive) "
+            + "popoverWindowOcclusion(atOpen)=\(occlusionAtOpen) "
+            + "popoverWindowOcclusion(now)=\(occlusion(of: shell))"
+    }
+
+    /// `.visible` on the popover's own window. Sampled while the panel is open,
+    /// because the window goes away with it.
+    @MainActor
+    private static func occlusion(of shell: MenuBarShell) -> String {
+        guard let window = shell.popover.contentViewController?.view.window else {
+            return "no-window"
+        }
+        return window.occlusionState.contains(.visible) ? "visible" : "not-visible"
+    }
+
     /// One line per assertion, and the verdict grep-able on its own line.
-    private static func report(_ checks: [Check]) {
+    private static func report(_ checks: [Check], environment: String, notes: [String]) {
         for check in checks.sorted(by: { $0.number < $1.number }) {
             print("shell-probe: \(check.passed ? "PASS" : "FAIL") \(check.number). "
                 + "\(check.name) — \(check.detail)")
         }
+        for note in notes {
+            print("shell-probe: NOTE \(note)")
+        }
+        print("shell-probe: env \(environment)")
         let failed = checks.filter { !$0.passed }
         print(
             "shell-probe: \(checks.count - failed.count)/\(checks.count) passed"

@@ -58,6 +58,29 @@ final class MenuBarShell {
         self.preference = preference ?? LaunchPreference()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // An `NSStatusItem`'s visibility is *persisted*, and the app must never
+        // depend on the persisted value.
+        //
+        // AppKit stores it per status item in this app's defaults domain, under
+        // `"NSStatusItem VisibleCC Item-0"`. A single ⌘-drag of the icon out of
+        // the menu bar writes `0` there, and every status item this app creates
+        // afterwards is born hidden — permanently, silently, and across
+        // reinstalls, because the value outlives the binary. The symptom is not
+        // a crash or a log line: the app launches, polls, holds its assertions
+        // and draws nothing a human can see.
+        //
+        // Both `com.github.dhkts1.tcrbar` and `TcrBar` currently hold `0` in
+        // that key. How it got there is *not* established — it could predate
+        // this work or have been written during it — so nothing here claims a
+        // history. Setting it explicitly at creation is correct under either
+        // one, which is the point: the shipped behaviour must not be a function
+        // of what is in `defaults`.
+        //
+        // No `autosaveName`. It would only move the same persisted flag to a
+        // differently-named key with the identical failure mode; the
+        // unconditional assignment below is what makes the stored value
+        // irrelevant, and `--shell-probe` assertion 1 asserts the result.
+        statusItem.isVisible = true
         popover = NSPopover()
 
         let hosting = NSHostingController(
