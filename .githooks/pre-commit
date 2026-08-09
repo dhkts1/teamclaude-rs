@@ -147,3 +147,80 @@ if [ -n "$staged_swift" ]; then
     echo "pre-commit: swift-format not found — skipping Swift format check (install Xcode)." >&2
   fi
 fi
+
+# ── Release-version gate ────────────────────────────────────────────────────
+# Refuse a commit that ships code under a version that has ALREADY been released.
+#
+# The incident (2026-08-09): v0.2.0 was tagged and published, then six further
+# commits landed on main with `version = "0.2.0"` still in Cargo.toml. The tree
+# had moved past the release while continuing to call itself the release. Two
+# separate things broke off that one fact:
+#
+#   - A SECOND GitHub release was created for the same v0.2.0 tag (one
+#     published, one left as a draft). `releases/latest/download/<asset>` then
+#     resolved to the wrong release, so TcrBar's Sparkle feed 404'd. Self-update
+#     was dead, and the only place that said so was a log line nobody reads.
+#   - `build-tcrbar.sh` reads CFBundleShortVersionString straight out of
+#     Cargo.toml, so every one of those builds called itself 0.2.0. Only
+#     CFBundleVersion (the commit count) kept moving. The builds stayed
+#     orderable by macOS and became indistinguishable to a human, which is the
+#     worse half.
+#
+# The rule is deliberately SELF-CLEARING: it fires on the first commit after a
+# release and goes quiet the moment the version is bumped. It is not a
+# bump-on-every-commit tax, and it needs no state of its own — the git tags
+# already are the state.
+#
+# This is a VALIDATING hook, never a mutating one. `build-tcrbar.sh:94-98`
+# rejects the pre-push variant that EDITS a version file, because git resolves
+# the refs to push before pre-push runs, so that edit can never land in the push
+# it fired for. Checking a number a human already set has no such ordering
+# problem, which is why this gate can exist where that one could not.
+#
+# Documentation-only commits are exempt: they change nothing a user installs.
+#
+# Deliberate exception:  git commit --no-verify
+staged_shippable="$(git diff --cached --name-only --diff-filter=ACMR -- . \
+                    ':(exclude)*.md' \
+                    ':(exclude)docs/**' \
+                    ':(exclude)assets/**' \
+                    ':(exclude).github/**' || true)"
+
+if [ -n "$staged_shippable" ]; then
+  # Read the INDEX (`:Cargo.toml`), not the working tree: that is what this
+  # commit will actually contain, and it falls back to HEAD's copy when
+  # Cargo.toml is not staged — which is precisely the case this gate catches.
+  #
+  # The sed is character-for-character the one in `build-tcrbar.sh:98`. Two
+  # copies of one expression is a real cost, but the alternative is this hook
+  # and the build script disagreeing about what the version IS, and a gate that
+  # reads a different number than the thing it guards is worse than no gate.
+  staged_version="$(git show :Cargo.toml 2>/dev/null \
+                    | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9][^"]*\)".*/\1/p' \
+                    | head -1 || true)"
+
+  if [ -z "$staged_version" ]; then
+    # Say so rather than pass silently. A gate that cannot read its input has
+    # not checked anything, and must not look like it did.
+    echo "pre-commit: could not read a version from the staged Cargo.toml — release-version gate SKIPPED." >&2
+  elif git rev-parse -q --verify "refs/tags/v$staged_version" >/dev/null 2>&1; then
+    echo "" >&2
+    echo "pre-commit: BLOCKED — v$staged_version is already a released tag." >&2
+    echo "" >&2
+    echo "  This commit changes shipped files but leaves Cargo.toml at $staged_version," >&2
+    echo "  a version that has already been tagged and published. Everything built" >&2
+    echo "  from here would claim to be $staged_version while not being it." >&2
+    echo "" >&2
+    echo "  Bump the version in Cargo.toml, stage it, and commit again:" >&2
+    echo "" >&2
+    echo "      \$EDITOR Cargo.toml    # version = \"$staged_version\"  ->  the next one" >&2
+    echo "      git add Cargo.toml" >&2
+    echo "" >&2
+    echo "  Staged files that triggered this:" >&2
+    printf '%s\n' "$staged_shippable" | sed 's/^/      /' >&2
+    echo "" >&2
+    echo "  Documentation-only commits (*.md, docs/, assets/, .github/) are exempt." >&2
+    echo "  If this genuinely should ship under $staged_version:  git commit --no-verify" >&2
+    exit 1
+  fi
+fi
