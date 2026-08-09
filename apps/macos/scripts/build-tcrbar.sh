@@ -185,31 +185,6 @@ else
   exit 1
 fi
 
-# The icon is DRAWN BY THE APP, not committed as a binary asset.
-#
-# `AppIcon.swift` renders it from the same `Tok` values the panel uses, so the
-# mark cannot drift from the palette the way a checked-in .icns silently does.
-# That is why this runs after the binary is copied: the binary is the generator.
-#
-# Non-fatal on purpose. A missing icon costs a generic placeholder in Finder; it
-# is not worth failing a build that is otherwise fine, and a hard failure here
-# would block `swift build` working on a machine without `iconutil`.
-iconset="$(mktemp -d)/AppIcon.iconset"
-if "$macos_dir/$app_name" --render-icon "$iconset" >/dev/null 2>&1 \
-    && command -v iconutil >/dev/null 2>&1 \
-    && iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns" 2>/dev/null; then
-  echo "    icon: generated"
-else
-  mkdir -p "$app_dir/Contents/Resources"
-  if "$macos_dir/$app_name" --render-icon "$iconset" >/dev/null 2>&1 \
-      && iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns" 2>/dev/null; then
-    echo "    icon: generated"
-  else
-    echo "    WARNING: could not generate the app icon — Finder will show a placeholder." >&2
-  fi
-fi
-rm -rf "$(dirname "$iconset")"
-
 # Sparkle's EdDSA public key — OMITTED when unset, never a placeholder.
 #
 # Sparkle refuses any update whose signature does not verify against this key.
@@ -329,13 +304,28 @@ done
 # one Mach-O: it contains an Updater.app, an Autoupdate helper and two XPC
 # services, each of which is code in its own right. Code signs INSIDE-OUT, so the
 # order is xpc → Updater.app → Autoupdate → the framework version → the app's own
-# `tcr` → the bundle. Signing the framework after the bundle would invalidate the
-# bundle's seal, and signing the framework without its nested payload leaves the
-# framework's own seal invalid — `--deep --strict` catches both.
+# `tcr` → its own executable → the bundle. Signing the framework after the bundle
+# would invalidate the bundle's seal, and signing the framework without its nested
+# payload leaves the framework's own seal invalid — `--deep --strict` catches both.
 #
 # `--preserve-metadata=entitlements` on the nested code is not optional: Sparkle's
 # installer XPC service ships entitlements it needs, and a plain re-sign drops
 # them silently.
+#
+# The icon step sits INSIDE this section, between the nested signatures and the
+# bundle's, and that placement is the whole point. The icon is rendered by
+# EXECUTING the app's own binary, and it used to run before any signing at all:
+# the kernel saw a main executable with no CMS blob and an ad-hoc Sparkle, and
+# refused to load them — `AMFI: ... has no CMS blob?` / `Sparkle ... is adhoc
+# signed`. It appeared to work only because a developer-tool exemption let the
+# process run anyway, and the icon fallback is deliberately non-fatal, so on a
+# machine without that exemption the build silently shipped a placeholder icon
+# and still reported success.
+#
+# So the order is: sign every nested binary AND the app's own executable, then
+# render the icon, then seal the bundle. The seal has to come last because it
+# covers `Contents/Resources/AppIcon.icns` — writing the icon after signing the
+# bundle would invalidate the signature that was just applied.
 if [ -n "$sign_identity" ]; then
   sign_key="$sign_identity"
 else
@@ -365,6 +355,41 @@ done
 codesign -s "$sign_key" $codesign_flags "$sparkle_version_dir"
 # shellcheck disable=SC2086
 codesign -s "$sign_key" $codesign_flags "$macos_dir/tcr"
+# The app's own executable is signed HERE, as a plain Mach-O, because the icon
+# step below runs it. The bundle signature further down re-signs it in place with
+# the same key and flags, which is what gives it the bundle identity; this earlier
+# pass exists only so the kernel will load it at all.
+# shellcheck disable=SC2086
+codesign -s "$sign_key" $codesign_flags "$macos_dir/$app_name"
+
+# The icon is DRAWN BY THE APP, not committed as a binary asset.
+#
+# `AppIcon.swift` renders it from the same `Tok` values the panel uses, so the
+# mark cannot drift from the palette the way a checked-in .icns silently does.
+# That is why this runs after the binary is copied and signed: the binary is the
+# generator, and an unsigned generator is one the kernel refuses to execute.
+#
+# Non-fatal on purpose. A missing icon costs a generic placeholder in Finder; it
+# is not worth failing a build that is otherwise fine, and a hard failure here
+# would block `swift build` working on a machine without `iconutil`.
+iconset="$(mktemp -d)/AppIcon.iconset"
+if "$macos_dir/$app_name" --render-icon "$iconset" >/dev/null 2>&1 \
+    && command -v iconutil >/dev/null 2>&1 \
+    && iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+  echo "    icon: generated"
+else
+  mkdir -p "$app_dir/Contents/Resources"
+  if "$macos_dir/$app_name" --render-icon "$iconset" >/dev/null 2>&1 \
+      && iconutil -c icns "$iconset" -o "$app_dir/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+    echo "    icon: generated"
+  else
+    echo "    WARNING: could not generate the app icon — Finder will show a placeholder." >&2
+  fi
+fi
+rm -rf "$(dirname "$iconset")"
+
+# The bundle is sealed LAST — after AppIcon.icns has been written into
+# Contents/Resources, which this signature covers.
 # shellcheck disable=SC2086
 codesign -s "$sign_key" $codesign_flags "$app_dir"
 
