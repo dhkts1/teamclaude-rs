@@ -95,19 +95,22 @@ jobs:
           fi
 
           {
-            echo "## Release app: SKIPPED — signing secrets are not set"
-            echo
-            echo "None of the seven macOS signing secrets exist on this"
-            echo "repository, so there is nothing to build with and the signing"
-            echo "job was skipped rather than failed."
-            echo
-            echo "This is the intended configuration: releases are cut LOCALLY"
-            echo 'with `apps/macos/scripts/release-tcrbar.sh`, and the Apple'
-            echo "signing key is deliberately not stored in GitHub."
-            echo
-            echo 'See `docs/RELEASING.md`. To sign in CI instead, set all of:'
-            echo
-            for name in "${missing[@]}"; do echo "- \`$name\`"; done
+            # A quoted heredoc so the backticks stay literal markdown.
+            cat <<'MD'
+          ## Release app: SKIPPED — signing secrets are not set
+
+          None of the seven macOS signing secrets exist on this repository, so
+          there is nothing to sign with and the signing job was skipped rather
+          than failed.
+
+          This is the intended configuration: releases are cut LOCALLY with
+          `apps/macos/scripts/release-tcrbar.sh`, and the Apple signing key is
+          deliberately not stored in GitHub.
+
+          See `docs/RELEASING.md`. To sign in CI instead, set all of:
+
+          MD
+            for name in "${missing[@]}"; do echo "- $name"; done
           } >> "$GITHUB_STEP_SUMMARY"
           echo "SKIPPING: no signing secrets are set on this repository."
           echo "Releases are cut locally with apps/macos/scripts/release-tcrbar.sh."
