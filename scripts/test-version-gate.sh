@@ -17,9 +17,16 @@ original_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9][^"]*\)".
 pass=0
 fail=0
 
+# Unstage FIRST, then restore from HEAD.
+#
+# `git checkout -- <file>` copies the INDEX over the worktree, so on a file
+# this script has just staged it restores the staged modification rather than
+# reverting it -- the test then leaves the tree dirty and the residue rides
+# along in whatever someone commits next. Caught exactly that way: a stray
+# newline on README.md blocked a rebase.
 restore() {
-  git checkout -- Cargo.toml 2>/dev/null
   git reset -q 2>/dev/null
+  git checkout HEAD -- Cargo.toml README.md 2>/dev/null
 }
 trap restore EXIT
 
@@ -47,9 +54,24 @@ echo "  tag v$original_version exists: $(git rev-parse -q --verify "refs/tags/v$
 echo
 
 # 1. POSITIVE CONTROL — shipped code staged at an already-released version.
-git reset -q
-git add apps/macos/Sources/TcrBar/FleetView.swift 2>/dev/null
-check "code staged at released version -> BLOCK" yes
+#
+# CONSTRUCT the condition; do not depend on the checked-in version happening
+# to equal a tag. The first draft did, and it passed only because the tree was
+# still sitting on the released version -- the moment the version was bumped
+# (the normal state for a repo between releases) the control stopped being
+# able to fire, and a control that cannot fire proves nothing about the gate.
+released="$(git tag --list 'v*' --sort=-v:refname | head -1 | sed 's/^v//')"
+if [ -z "$released" ]; then
+  printf '  SKIP  %-46s (no v* tag exists to test against)\n' "code staged at released version -> BLOCK"
+else
+  git reset -q
+  # ^version anchors to column 0, so this hits the [package] version and never
+  # an indented dependency version.
+  sed -i '' "s/^version = \".*\"/version = \"$released\"/" Cargo.toml
+  git add Cargo.toml apps/macos/Sources/TcrBar/FleetView.swift 2>/dev/null
+  check "code staged at released version -> BLOCK" yes
+  git reset -q && git checkout HEAD -- Cargo.toml
+fi
 
 # 2. NEGATIVE CONTROL — same staged code, version bumped past the tag.
 #    If this does not pass, the gate is blocking unconditionally and control 1
@@ -57,14 +79,14 @@ check "code staged at released version -> BLOCK" yes
 sed -i '' "s/^version = \"$original_version\"/version = \"$original_version-gatetest\"/" Cargo.toml
 git add Cargo.toml apps/macos/Sources/TcrBar/FleetView.swift 2>/dev/null
 check "version bumped past the tag -> ALLOW" no
-git checkout -- Cargo.toml
+git reset -q && git checkout HEAD -- Cargo.toml
 
 # 3. NEGATIVE CONTROL — docs-only commit at a released version is exempt.
 git reset -q
 printf '\n' >>README.md
 git add README.md
 check "docs-only at released version -> ALLOW" no
-git checkout -- README.md
+git reset -q && git checkout HEAD -- README.md
 
 # 4. NEGATIVE CONTROL — nothing staged at all.
 git reset -q
