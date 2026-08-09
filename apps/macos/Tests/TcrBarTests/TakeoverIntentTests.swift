@@ -162,7 +162,8 @@ final class StandDownExitCodeTests: XCTestCase {
 
     /// Verbatim from `singleton::stand_down_message` — the line every stand-down
     /// prints, regardless of which of the three it is.
-    private let standDown = "[tcr] another proxy holds :3456 (pid 123) and it is still "
+    private let standDown =
+        "[tcr] another proxy holds :3456 (pid 123) and it is still "
         + "listening — leaving it alone and exiting without binding. Replacing it would wipe "
         + "its session→account pin map and cold-start every live session's prompt cache, the "
         + "most expensive event in this system. Pass --replace to take the port over anyway."
@@ -221,14 +222,18 @@ final class StandDownExitCodeTests: XCTestCase {
     /// panel's text actually comes from, against the same literals rather than
     /// through the constants.
     func testTheLiteralCodesReachTheStatesTheyAreDefinedFor() {
-        guard case .incumbentIsStale = ServerController.classifyExit(
-            intent: .safeStart, exitCode: 3, stderr: standDown
-        ) else {
+        guard
+            case .incumbentIsStale = ServerController.classifyExit(
+                intent: .safeStart, exitCode: 3, stderr: standDown
+            )
+        else {
             return XCTFail("literal 3 must classify as a stale incumbent")
         }
-        guard case .incumbentNotAnswering = ServerController.classifyExit(
-            intent: .safeStart, exitCode: 4, stderr: standDown
-        ) else {
+        guard
+            case .incumbentNotAnswering = ServerController.classifyExit(
+                intent: .safeStart, exitCode: 4, stderr: standDown
+            )
+        else {
             return XCTFail("literal 4 must classify as a wedged incumbent")
         }
     }
@@ -292,14 +297,18 @@ final class StandDownExitCodeTests: XCTestCase {
     /// That is not hypothetical — the pipe race this file also tests could drop
     /// the whole message, and a lost stand-down used to read as a clean exit.
     func testTheVerdictSurvivesAnEmptyStderr() {
-        guard case .incumbentNotAnswering = ServerController.classifyExit(
-            intent: .safeStart, exitCode: 4, stderr: ""
-        ) else {
+        guard
+            case .incumbentNotAnswering = ServerController.classifyExit(
+                intent: .safeStart, exitCode: 4, stderr: ""
+            )
+        else {
             return XCTFail("the exit code alone must carry a wedged incumbent")
         }
-        guard case .incumbentIsStale = ServerController.classifyExit(
-            intent: .safeStart, exitCode: 3, stderr: ""
-        ) else {
+        guard
+            case .incumbentIsStale = ServerController.classifyExit(
+                intent: .safeStart, exitCode: 3, stderr: ""
+            )
+        else {
             return XCTFail("the exit code alone must carry a stale incumbent")
         }
     }
@@ -324,14 +333,18 @@ final class StandDownExitCodeTests: XCTestCase {
     /// benign outcome on a safe start and a failure on a takeover, exactly as
     /// before the exit codes existed.
     func testAnAnsweringIncumbentKeepsTheOldBehaviourOnBothPaths() {
-        guard case .incumbentHoldsPort = ServerController.classifyExit(
-            intent: .safeStart, exitCode: 0, stderr: standDown
-        ) else {
+        guard
+            case .incumbentHoldsPort = ServerController.classifyExit(
+                intent: .safeStart, exitCode: 0, stderr: standDown
+            )
+        else {
             return XCTFail("exit 0 on a safe start is still the benign outcome")
         }
-        guard case .takeoverRefused = ServerController.classifyExit(
-            intent: .takeover, exitCode: 0, stderr: standDown
-        ) else {
+        guard
+            case .takeoverRefused = ServerController.classifyExit(
+                intent: .takeover, exitCode: 0, stderr: standDown
+            )
+        else {
             return XCTFail("exit 0 on a takeover is still a failure")
         }
     }
@@ -583,7 +596,8 @@ final class ChildStderrTests: XCTestCase {
     func testADroppedStandDownWouldReadAsACleanExit() throws {
         let pipe = Pipe()
         let stderr = ChildStderr(reading: pipe, installReadabilityHandler: false)
-        let standDown = "[tcr] another proxy holds :3456 (pid 123) and it is still listening — "
+        let standDown =
+            "[tcr] another proxy holds :3456 (pid 123) and it is still listening — "
             + "leaving it alone and exiting without binding."
         try pipe.fileHandleForWriting.write(contentsOf: Data(standDown.utf8))
         try pipe.fileHandleForWriting.close()

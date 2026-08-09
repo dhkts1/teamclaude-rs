@@ -675,6 +675,224 @@ fn update_installed(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `.app` copies: hand the update to the app's own Sparkle updater.
+// ---------------------------------------------------------------------------
+
+/// The bundle identifier TcrBar ships under. The handoff is gated on it: `open`
+/// resolves a URL scheme to whatever app claims it, so a bundle that is not
+/// TcrBar gets the instructional message instead of a request we cannot reason
+/// about.
+const TCRBAR_BUNDLE_ID: &str = "com.github.dhkts1.tcrbar";
+
+/// The URL TcrBar registers for "check for updates now". Fixed contract; the
+/// URL carries no arguments.
+const TCRBAR_UPDATE_URL: &str = "tcrbar://check-for-updates";
+
+/// `open`, by absolute path rather than by name. Nothing about this invocation
+/// should be reachable from the caller's `PATH`, and `/usr/bin/open` is part of
+/// the OS on every macOS install (asserted by
+/// `the_open_binary_the_handoff_spawns_exists`). macOS-only, like the spawn
+/// that uses it: this file also compiles for the musl targets in
+/// `dist-workspace.toml`, where an unused private const is a `dead_code`
+/// warning and `-D warnings` turns that into a failed build.
+#[cfg(target_os = "macos")]
+const OPEN_BIN: &str = "/usr/bin/open";
+
+/// Pure argv for the handoff — asserted in tests without spawning anything.
+/// `-g` keeps the request in the background so `tcr update` does not steal
+/// focus; `open` launches TcrBar first if it is not already running.
+pub fn open_handoff_argv() -> [&'static str; 2] {
+    ["-g", TCRBAR_UPDATE_URL]
+}
+
+/// Why a bundle did NOT get the handoff. Carried rather than discarded: a
+/// fallback that does not say what it fell back FROM reads as the old
+/// notify-only behaviour and hides a broken install.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandoffRefusal {
+    /// `Contents/Info.plist` is missing, unreadable, in the binary plist
+    /// format, or declares no `CFBundleIdentifier`.
+    UnreadableIdentity,
+    /// The bundle declares a DIFFERENT identifier — some other application is
+    /// shipping this `tcr`, and its updater is not ours to drive.
+    ForeignBundle(String),
+}
+
+impl HandoffRefusal {
+    /// One sentence naming what was checked and what was found, for printing.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::UnreadableIdentity => format!(
+                "its Contents/Info.plist declares no readable CFBundleIdentifier, so it cannot \
+                 be confirmed to be TcrBar ({TCRBAR_BUNDLE_ID})"
+            ),
+            Self::ForeignBundle(id) => format!(
+                "it declares CFBundleIdentifier {id:?}, not TcrBar's ({TCRBAR_BUNDLE_ID}) — \
+                 that application's updater is not this one's to drive"
+            ),
+        }
+    }
+}
+
+/// What to do with an `.app` install, decided from the bundle's declared
+/// identifier alone so it is unit-testable without a filesystem or a spawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppBundleAction {
+    /// Confirmed TcrBar — ask its Sparkle updater to check.
+    HandOff,
+    /// Not confirmed — print the manual instructions, plus the reason.
+    Instruct(HandoffRefusal),
+}
+
+/// Extract `CFBundleIdentifier` from an XML `Info.plist`.
+///
+/// A deliberately small text scan rather than a plist dependency: this decides
+/// only whether to send one URL, and a `None` here is not a failure mode that
+/// costs anything — it falls back to the instructions. A binary-format
+/// `Info.plist` (`bplist00…`) therefore reads as `None`, which is the honest
+/// answer for a parser that cannot read it, not a silent match.
+pub fn parse_bundle_identifier(plist: &str) -> Option<&str> {
+    let after_key = plist.split_once("<key>CFBundleIdentifier</key>")?.1;
+    let value = after_key
+        .split_once("<string>")?
+        .1
+        .split_once("</string>")?
+        .0;
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
+}
+
+/// [`parse_bundle_identifier`] against a bundle on disk. `None` covers every
+/// read failure, which the caller turns into [`HandoffRefusal`] rather than a
+/// silent skip. macOS-only for the same reason as [`OPEN_BIN`].
+#[cfg(target_os = "macos")]
+fn read_bundle_identifier(bundle: &Path) -> Option<String> {
+    let plist = std::fs::read_to_string(bundle.join("Contents").join("Info.plist")).ok()?;
+    parse_bundle_identifier(&plist).map(str::to_owned)
+}
+
+/// Hand off only to a bundle that says it is TcrBar.
+pub fn decide_app_bundle_handoff(identifier: Option<&str>) -> AppBundleAction {
+    match identifier {
+        Some(id) if id == TCRBAR_BUNDLE_ID => AppBundleAction::HandOff,
+        Some(other) => AppBundleAction::Instruct(HandoffRefusal::ForeignBundle(other.to_string())),
+        None => AppBundleAction::Instruct(HandoffRefusal::UnreadableIdentity),
+    }
+}
+
+/// Send the check-for-updates request. Errors are returned, never swallowed:
+/// `open` being absent and `open` exiting non-zero are both "the handoff did
+/// not happen", and the caller says so before falling back.
+#[cfg(target_os = "macos")]
+fn spawn_update_handoff() -> anyhow::Result<()> {
+    let argv = open_handoff_argv();
+    let status = Command::new(OPEN_BIN)
+        .args(argv)
+        .status()
+        .with_context(|| format!("failed to run `{OPEN_BIN} {}`", argv.join(" ")))?;
+    if !status.success() {
+        bail!(
+            "`{OPEN_BIN} {}` exited with {status} — TcrBar never received the request. That is \
+             what happens when no installed application claims the {TCRBAR_UPDATE_URL} scheme \
+             (an app built before the updater shipped, or a bundle Launch Services has not \
+             registered).",
+            argv.join(" ")
+        );
+    }
+    Ok(())
+}
+
+/// The manual fallback, unchanged from when it was this arm's only behaviour.
+fn print_manual_app_instructions(bundle: &Path) {
+    println!(
+        "tcr is running from the copy bundled inside {}, so it can't self-update.\n\
+         Rebuild and reinstall the app from the source tree:\n\
+         \n    git -C <teamclaude-rs> pull --ff-only && <teamclaude-rs>/apps/macos/scripts/install.sh\n\
+         \nDo NOT `cargo install --path` here: that writes ~/.cargo/bin/tcr, a third copy \
+         competing with the bundled one and with anything already on your PATH.",
+        bundle.display()
+    );
+}
+
+/// Update an `.app` copy by asking the app's own Sparkle updater to check.
+///
+/// This arm deliberately does NOT become a fourth download path. Sparkle
+/// verifies an EdDSA signature over the archive it installs and the app is
+/// notarized; the [`InstallKind::Installed`] arm above is protected by "TLS and
+/// nothing else" (see the module doc). Handing the app channel to the code that
+/// owns it is therefore strictly stronger than re-implementing a download here,
+/// and it is the reason this is a handoff rather than a download.
+///
+/// **`--force` is accepted and ignored, with a printed reason.** The contract
+/// with the app is one fixed URL that carries no arguments, so there is nothing
+/// to pass through — Sparkle applies its own version comparison, and the CLI
+/// cannot make it reinstall a build it considers current. Silently accepting
+/// the flag would imply an effect it does not have.
+///
+/// Nothing here claims a live update, for the same reason the checkout arm does
+/// not (module doc, "the running process keeps executing the OLD binary"). What
+/// this returns from is a *request*: Sparkle may find nothing, may prompt, and
+/// when it does install it replaces the `tcr` inside the bundle **on disk** and
+/// relaunches the app. This process goes on running the bytes it started with.
+fn update_app_bundle(bundle: &Path, force: bool) -> anyhow::Result<()> {
+    if force {
+        println!(
+            "tcr: --force has no effect on an .app install — the handoff is the fixed URL \
+             {TCRBAR_UPDATE_URL}, which takes no arguments, and Sparkle applies its own version \
+             check. To reinstall a build Sparkle considers current, reinstall the app itself."
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    match decide_app_bundle_handoff(read_bundle_identifier(bundle).as_deref()) {
+        AppBundleAction::HandOff => {
+            println!(
+                "tcr: asking TcrBar ({}) to check for updates — `{OPEN_BIN} {}`",
+                bundle.display(),
+                open_handoff_argv().join(" ")
+            );
+            match spawn_update_handoff() {
+                Ok(()) => {
+                    println!(
+                        "tcr: TcrBar's updater has the request. Sparkle verifies the download's \
+                         EdDSA signature and installs it; this process downloaded nothing.\n\
+                         tcr: nothing is updated yet, and this process keeps running the OLD \
+                         binary either way — Sparkle replaces the tcr inside {} on disk and \
+                         relaunches the app. Restart tcr afterwards.",
+                        bundle.display()
+                    );
+                    return Ok(());
+                }
+                // Not swallowed and not fatal: the instructions below are still
+                // a route the user can take, but they are told the handoff was
+                // attempted and why it did not work.
+                Err(err) => eprintln!(
+                    "tcr: the update handoff to TcrBar was attempted and FAILED: {err:#}\n\
+                     tcr: falling back to manual instructions."
+                ),
+            }
+        }
+        AppBundleAction::Instruct(refusal) => eprintln!(
+            "tcr: not handing off to TcrBar's updater — {}.\n\
+             tcr: falling back to manual instructions.",
+            refusal.reason()
+        ),
+    }
+
+    // `AppBundle` cannot be produced off macOS in practice, but this file
+    // compiles for the musl targets in dist-workspace.toml, where there is no
+    // `open` and no Sparkle.
+    #[cfg(not(target_os = "macos"))]
+    eprintln!(
+        "tcr: an .app install is updated through TcrBar's own updater, which exists only on \
+         macOS.\ntcr: falling back to manual instructions."
+    );
+
+    print_manual_app_instructions(bundle);
+    Ok(())
+}
+
 /// `tcr update [--force]` — self-update entry point.
 pub fn run_update(force: bool) -> anyhow::Result<()> {
     run_update_with(classify_install(), force)
@@ -685,17 +903,14 @@ pub fn run_update(force: bool) -> anyhow::Result<()> {
 pub fn run_update_with(kind: InstallKind, force: bool) -> anyhow::Result<()> {
     match kind {
         InstallKind::GitCheckout(root) => update_checkout(&root, force),
-        InstallKind::AppBundle(bundle) => {
-            println!(
-                "tcr is running from the copy bundled inside {}, so it can't self-update.\n\
-                 Rebuild and reinstall the app from the source tree:\n\
-                 \n    git -C <teamclaude-rs> pull --ff-only && <teamclaude-rs>/apps/macos/scripts/install.sh\n\
-                 \nDo NOT `cargo install --path` here: that writes ~/.cargo/bin/tcr, a third copy \
-                 competing with the bundled one and with anything already on your PATH.",
-                bundle.display()
-            );
-            Ok(())
-        }
+        // An `.app` copy updates through the APP's updater. This arm used to be
+        // a dead end that told the user to rebuild from a source tree — advice
+        // that assumes a checkout and a Swift toolchain, which someone who
+        // installed the `.app` from a release does not have. That is the same
+        // defect the `Installed` arm below was rewritten to fix. It now hands
+        // the request to Sparkle, which owns the app channel, and only falls
+        // back to those instructions when the handoff cannot be made.
+        InstallKind::AppBundle(bundle) => update_app_bundle(&bundle, force),
         // An installed copy updates from the PUBLISHED RELEASE, not from a
         // source tree it has no reason to have. This arm used to print reinstall
         // instructions that assumed a checkout on the machine — for anyone who
@@ -1028,11 +1243,158 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// Write a minimal XML `Info.plist` declaring `id` into a scratch bundle.
+    fn bundle_with_identifier(dir: &Path, id: &str) -> PathBuf {
+        let bundle = dir.join("Some.app");
+        let contents = bundle.join("Contents");
+        fs::create_dir_all(contents.join("MacOS")).unwrap();
+        fs::write(
+            contents.join("Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <plist version=\"1.0\"><dict>\n\
+                 <key>CFBundleName</key><string>TcrBar</string>\n\
+                 <key>CFBundleIdentifier</key><string>{id}</string>\n\
+                 </dict></plist>\n"
+            ),
+        )
+        .unwrap();
+        bundle
+    }
+
+    /// The `AppBundle` arm must not spawn anything when the bundle cannot be
+    /// confirmed to be TcrBar — it prints the manual instructions instead.
+    ///
+    /// The path is a scratch bundle rather than `/Applications/TcrBar.app` on
+    /// purpose: that path may EXIST on the machine running the suite, and with
+    /// the Sparkle handoff in place this test would then launch the real app
+    /// out of `cargo test`.
     #[test]
     fn run_update_app_bundle_notifies_without_spawning() {
-        let kind = InstallKind::AppBundle(PathBuf::from("/Applications/TcrBar.app"));
+        let base = scratch("handoff-no-spawn");
+        // No Info.plist at all → UnreadableIdentity → instructions, no `open`.
+        let bare = base.join("Bare.app");
+        fs::create_dir_all(bare.join("Contents").join("MacOS")).unwrap();
+        let kind = InstallKind::AppBundle(bare);
         assert!(run_update_with(kind.clone(), false).is_ok());
         assert!(run_update_with(kind, true).is_ok());
+
+        // A bundle belonging to some other application likewise gets the
+        // instructions, never a request to its updater.
+        let foreign = bundle_with_identifier(&base, "com.example.someoneelse");
+        assert!(run_update_with(InstallKind::AppBundle(foreign), false).is_ok());
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The contract with the app, pinned exactly. TcrBar registers this scheme
+    /// and this bundle id; a typo here is an `open` that silently resolves to
+    /// nothing (or to some other app) rather than a compile error.
+    #[test]
+    fn the_handoff_contract_matches_the_app() {
+        assert_eq!(TCRBAR_UPDATE_URL, "tcrbar://check-for-updates");
+        assert_eq!(TCRBAR_BUNDLE_ID, "com.github.dhkts1.tcrbar");
+        // `-g` first: the request must not steal focus from the terminal.
+        assert_eq!(open_handoff_argv(), ["-g", "tcrbar://check-for-updates"]);
+    }
+
+    /// If we print a command, the binary it names has to be there — the same
+    /// rule `the_recommended_app_installer_script_exists` enforces for the
+    /// installer path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_open_binary_the_handoff_spawns_exists() {
+        assert!(
+            Path::new(OPEN_BIN).is_file(),
+            "the handoff spawns {OPEN_BIN}, which does not exist"
+        );
+    }
+
+    /// The disk half: a real TcrBar `Info.plist` on disk resolves to the
+    /// identifier the handoff is gated on, and a bundle that is not there reads
+    /// as unknown rather than erroring out of the update.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_bundle_identifier_confirms_a_tcrbar_bundle() {
+        let base = scratch("bundle-identity-disk");
+        let bundle = bundle_with_identifier(&base, TCRBAR_BUNDLE_ID);
+        assert_eq!(
+            read_bundle_identifier(&bundle).as_deref(),
+            Some(TCRBAR_BUNDLE_ID)
+        );
+        assert_eq!(
+            decide_app_bundle_handoff(read_bundle_identifier(&bundle).as_deref()),
+            AppBundleAction::HandOff
+        );
+        assert_eq!(read_bundle_identifier(&base.join("Nope.app")), None);
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn parse_bundle_identifier_reads_cfbundleidentifier() {
+        let base = scratch("bundle-identity");
+        let bundle = bundle_with_identifier(&base, TCRBAR_BUNDLE_ID);
+        // A real-shaped Info.plist, read off disk and parsed. `CFBundleName`
+        // comes FIRST in it deliberately: a scan that took the first `<string>`
+        // in the file would return "TcrBar" here and match nothing.
+        let plist = fs::read_to_string(bundle.join("Contents").join("Info.plist")).unwrap();
+        assert_eq!(parse_bundle_identifier(&plist), Some(TCRBAR_BUNDLE_ID));
+        // Whitespace around the value, as `plutil` and Xcode both emit.
+        assert_eq!(
+            parse_bundle_identifier(
+                "<key>CFBundleIdentifier</key>\n\t<string>\n  com.x.y\n  </string>"
+            ),
+            Some("com.x.y")
+        );
+        // A missing key, an empty value, and the BINARY plist format all read
+        // as unknown — never as a match we would then hand a URL to.
+        assert_eq!(
+            parse_bundle_identifier("<key>CFBundleName</key><string>x</string>"),
+            None
+        );
+        assert_eq!(
+            parse_bundle_identifier("<key>CFBundleIdentifier</key><string>  </string>"),
+            None
+        );
+        assert_eq!(parse_bundle_identifier("bplist00\u{0}\u{1}"), None);
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// `open` resolves a URL scheme to whatever app claims it, so the handoff
+    /// is gated on the bundle actually being TcrBar. Every other answer keeps
+    /// its reason, because a fallback that does not say what it fell back from
+    /// is indistinguishable from the old notify-only dead end.
+    #[test]
+    fn decide_app_bundle_handoff_only_hands_off_to_tcrbar() {
+        assert_eq!(
+            decide_app_bundle_handoff(Some(TCRBAR_BUNDLE_ID)),
+            AppBundleAction::HandOff
+        );
+        assert_eq!(
+            decide_app_bundle_handoff(None),
+            AppBundleAction::Instruct(HandoffRefusal::UnreadableIdentity)
+        );
+        for foreign in [
+            "com.github.dhkts1.tcrbar.helper",
+            "com.github.dhkts1.TcrBar",
+            "com.example.tcrbar",
+            "",
+        ] {
+            assert_eq!(
+                decide_app_bundle_handoff(Some(foreign)),
+                AppBundleAction::Instruct(HandoffRefusal::ForeignBundle(foreign.to_string())),
+                "{foreign:?} is not TcrBar and must not receive the handoff"
+            );
+        }
+        // Both refusals name what was checked, so the printed fallback says why.
+        assert!(HandoffRefusal::UnreadableIdentity
+            .reason()
+            .contains(TCRBAR_BUNDLE_ID));
+        assert!(HandoffRefusal::ForeignBundle("com.example.x".into())
+            .reason()
+            .contains("com.example.x"));
     }
 
     /// The whole point of defect #1: with `CARGO_TARGET_DIR` set, cargo writes

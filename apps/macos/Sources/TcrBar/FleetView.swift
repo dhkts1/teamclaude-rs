@@ -13,6 +13,7 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    @ObservedObject var updater: Updater
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -238,6 +239,14 @@ struct FleetView: View {
                             + "refuses while a proxy is holding the port."
                     )
                 Spacer()
+                // Disabled rather than silently no-op while Sparkle already has
+                // a check in flight — the same rule "Take over port…" follows.
+                Button("Check for Updates…") { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
+                    .help(
+                        "Ask the release feed whether a newer TcrBar exists. "
+                            + "Also reachable as `tcrbar://check-for-updates`."
+                    )
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
             .buttonStyle(.bordered)
