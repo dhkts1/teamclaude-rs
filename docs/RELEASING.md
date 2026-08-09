@@ -79,9 +79,17 @@ The tag push is a separate, deliberate step: a repository ruleset named **"Prote
 restricts creating, updating and deleting `v*` tags to admins. A collaborator with push cannot
 mint a version tag, which is the point — see below.
 
-`TCRBAR_OP_ITEM` overrides the 1Password item reference (default
-`op://Employee/TcrBar Release Signing`); extra arguments after the tag are passed through to
-`release-tcrbar.sh`, so `release-local.sh v0.2.0 --dry-run` works.
+`TCRBAR_OP_ITEM` is **required** and names the 1Password item holding the signing fields, in the
+form `op://<vault>/<item>`. There is deliberately no default: this repository is public, and a
+default would publish an operator's private vault layout. Set it to your own reference from a shell
+profile or a local config kept outside the repository —
+
+```sh
+export TCRBAR_OP_ITEM='op://<vault>/<item>'
+```
+
+— and `release-local.sh` exits non-zero naming the variable if it is unset. Extra arguments after
+the tag are passed through to `release-tcrbar.sh`, so `release-local.sh v0.2.0 --dry-run` works.
 
 Flags:
 
@@ -132,7 +140,8 @@ sign it.
 
 ### Where each credential lives now
 
-1Password, vault **Employee**, item **TcrBar Release Signing**:
+One 1Password item, named by `TCRBAR_OP_ITEM` (`op://<vault>/<item>` — the operator picks it; the
+repository does not record which vault or item any particular person uses), holding these fields:
 
 | field | also in the login keychain? | notes |
 |---|---|---|
