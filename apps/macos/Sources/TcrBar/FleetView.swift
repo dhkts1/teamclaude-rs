@@ -554,8 +554,12 @@ private struct RowsHeightKey: PreferenceKey {
 /// never touches `~/.config/teamclaude.json`, which holds credentials. The row
 /// does not optimistically flip its own `disabled` — on success it asks for a
 /// fresh poll and renders whatever `tcr status` then reports, so a call that
-/// matched the wrong account (the query is a substring match) shows up as the
-/// wrong row changing rather than as a lie. A non-zero exit is rendered in place.
+/// resolved to some other account shows up as the wrong row changing rather than
+/// as a lie. That is a backstop, not the expectation: resolution is an exact
+/// name match falling back to an exact email match, case-sensitive both times
+/// (`src/identity.rs`, `match_accounts`), and two accounts sharing an email
+/// across orgs come back ambiguous rather than resolved. A non-zero exit is
+/// rendered in place.
 ///
 /// This row no longer lets a toggle succeed silently. `tcr` rewrites the config
 /// and exits 0; a proxy that read `disabled` once at boot keeps reporting the old
@@ -788,6 +792,11 @@ struct AccountRow: View {
         case .confirmed: return "checkmark.circle"
         case .notHonoured: return Tok.unreadableGlyph
         case .unverified: return "questionmark.circle"
+        // A `tcr` notice never wears the tick, whatever it qualifies — including a
+        // confirmation. `checkmark.circle` beside "the fleet now reports parked"
+        // would put the glyph an operator scans for on a park that may not survive
+        // a restart, which is the whole defect.
+        case .spokeUp: return Tok.unreadableGlyph
         }
     }
 
@@ -796,6 +805,11 @@ struct AccountRow: View {
         case .confirmed: return Tok.ok
         case .notHonoured: return Tok.near
         case .unverified: return Tok.unmeasured
+        // `Tok.near`, sharing the not-honoured hue for the same reason: nothing
+        // failed — `tcr` exited 0 — so it must not take the error colour already
+        // spoken for by the verbatim failure line above, and it must not take
+        // `Tok.ok`, which is the clean case's alone.
+        case .spokeUp: return Tok.near
         }
     }
 
@@ -811,15 +825,25 @@ struct AccountRow: View {
         let title = pending ? (enabling ? "Enabling…" : "Disabling…") : verb
         return Button(title) {
             Task {
-                if await accounts.setEnabled(enabling, account: account.name) {
-                    // Exit 0 is not the outcome — it is permission to go and find
-                    // out what the outcome was. The refresh's own result is
-                    // compared against what was asked, and the row says which of
-                    // the three things happened.
-                    let readback = await onChanged()
-                    accounts.record(
-                        readback: readback, requestedEnabled: enabling, account: account.name)
-                }
+                // Exit 0 is not the outcome — it is permission to go and find out
+                // what the outcome was. The refresh's own result is compared
+                // against what was asked, and the row says which thing happened.
+                //
+                // `notice` is threaded through rather than dropped: `tcr` reports
+                // half-done work (a park the config cannot persist, a proxy too old
+                // for the route) on stderr while exiting 0, and the read-back
+                // cannot see it — `disabled` flipped, so the comparison confirms.
+                // Losing it here is what let the row stamp `parked ✓` on a change
+                // that would not survive a restart.
+                let attempt = await accounts.setEnabled(enabling, account: account.name)
+                guard case .accepted(let notice) = attempt else { return }
+                let readback = await onChanged()
+                accounts.record(
+                    readback: readback,
+                    requestedEnabled: enabling,
+                    account: account.name,
+                    notice: notice
+                )
             }
         }
         // `.bordered`, not `.borderless`. Borderless draws the label as bare

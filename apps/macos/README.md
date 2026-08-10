@@ -36,16 +36,25 @@ Each row has an Enable/Disable button. It shells out to `tcr enable <name>` /
 `tcr disable <name>` and nothing else — TcrBar never writes
 `~/.config/teamclaude.json`, because that file holds credentials and `tcr` owns it.
 
-`tcr`'s account query is a *case-insensitive substring* match, so even passing the
-exact configured name is not a guarantee of a unique hit. The exit code and stderr
-are therefore captured and the CLI's own words are rendered in the row on failure;
-a toggle that did not happen never looks like one that did. On success the panel
-re-polls rather than flipping its own copy of `disabled`, so what you see is
-always what `tcr status` reports.
+`tcr`'s account query is an *exact* match — the configured name, else the email
+parsed out of it — and it is case-sensitive and untrimmed. It is not a substring
+match, which this file claimed until 0.2.3: for an account named
+`alice@example.com`, the queries `alice`, `alice@`, `example`, the same address
+spelled in capitals, and the address with a trailing space all resolve to nothing. Two accounts sharing one name string are refused as ambiguous
+rather than resolved, so a toggle cannot land on a row you did not name.
 
-That is a statement about the *config*. Whether a proxy that is already running
-picks the change up without a restart is not something this app verifies, in
-either direction, and it does not claim to.
+The exit code and both streams are captured. A non-zero exit renders the CLI's own
+words in the row; a *zero* exit that still wrote to stderr is not treated as a
+clean success either, because that is how `tcr` says a change was applied but not
+saved. On success the panel re-polls and compares what the fleet then reports
+against what was asked, rather than flipping its own copy of `disabled` — so a
+change the running proxy did not honour reads as exactly that, not as a tick.
+
+Since 0.2.3 the change also reaches a **running** proxy: `tcr enable`/`disable`
+ask the live server first (`POST /_tcr/accounts/disabled`, loopback-only, api-key
+required when one is configured, JSON content-type required) and fall back to
+writing the config only when no server answers. A proxy too old for that route
+still gets a config write, and the row says so instead of showing a tick.
 
 Disabling is reversible, so there is no confirmation dialog.
 

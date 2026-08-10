@@ -503,15 +503,46 @@ main() {
             "  Re-run with --verify-only, or upload by hand once it appears:" \
             "    gh release upload $tag '$dmg' '$appcast_path' --clobber --repo $repo"
       fi
-      [ "$waited" = 0 ] && note "waiting for the tag-triggered Release workflow to create $tag…"
+      # `${tag}`, braced. A bare `$tag` here was followed directly by the UTF-8
+      # ellipsis, and the shell read that character's leading byte as part of the
+      # variable NAME — so under `set -u` this line aborted the whole script with
+      # `tag?: unbound variable`. It fired on the FIRST iteration, i.e. on every
+      # release where the workflow had not finished yet, which is all of them:
+      # v0.2.2 notarized, stapled, signed and wrote its appcast entry, then died
+      # here without uploading anything. Braces around any variable that touches
+      # a non-ASCII character.
+      [ "$waited" = 0 ] && note "waiting for the tag-triggered Release workflow to create ${tag}…"
       sleep 10
       waited=$((waited + 10))
     done
     [ "$waited" -gt 0 ] && note "release appeared after ${waited}s"
 
+    # HIDE the release while it has no appcast, then reveal it once it does.
+    #
+    # Sparkle's feed is `releases/latest/download/appcast.xml`, so "latest" and
+    # "has an appcast" must become true in that order. The tag-triggered workflow
+    # publishes a normal (latest) release carrying only CLI tarballs, which leaves
+    # a window where the feed URL resolves to a release with no appcast.xml — and
+    # GitHub's CDN caches that 404 against the exact URL Sparkle requests. Measured
+    # on v0.2.2: the bare URL returned 404 while the same URL with `?cb=1` returned
+    # 200, for about two minutes, i.e. every installed copy's update check failed
+    # while the release looked fine in the UI.
+    #
+    # Marking it prerelease first keeps "latest" on the previous good release for
+    # the whole upload, so the window never exists.
+    gh release edit "$tag" --prerelease --repo "$repo" >/dev/null \
+      || die "could not mark $tag prerelease before uploading." \
+             "  Uploading anyway would leave the update feed 404ing on a cached miss."
+
     # --clobber so a re-run replaces its assets rather than failing.
     gh release upload "$tag" "$dmg" "$appcast_path" --clobber --repo "$repo" \
       || die "gh release upload failed for $tag."
+
+    # Only now is it safe to be the newest thing Sparkle looks at.
+    gh release edit "$tag" --prerelease=false --latest --repo "$repo" >/dev/null \
+      || die "assets uploaded, but $tag is still marked prerelease — Sparkle will never offer it." \
+             "  Flip it by hand:" \
+             "    gh release edit $tag --prerelease=false --latest --repo $repo"
     note "uploaded to https://github.com/$repo/releases/tag/$tag"
   fi
 

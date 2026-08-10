@@ -499,8 +499,9 @@ final class AccountCommandTests: XCTestCase {
     }
 
     func testTheNameIsNeverTruncatedOrFlagged() {
-        // `query` is a case-insensitive substring match on the Rust side, so an
-        // abbreviated name could silently hit a different account. Pass it whole.
+        // `query` resolves by exact name, then exact email (`src/identity.rs`,
+        // `match_accounts`) — an abbreviated name matches nothing at all. Pass it
+        // whole; the row already knows the exact value.
         let name = "alice+tag@example.com"
         let arguments = AccountCommand.arguments(enabled: false, name: name)
         XCTAssertEqual(arguments.count, 2, "no flags, no --org, nothing else")
@@ -516,33 +517,58 @@ final class AccountCommandTests: XCTestCase {
         XCTAssertEqual(Set([enable[0], disable[0]]), ["enable", "disable"])
     }
 
-    func testExitZeroIsSuccess() {
-        XCTAssertNil(AccountCommand.classify(enabling: true, exitCode: 0, stderr: ""))
-        XCTAssertNil(
+    func testExitZeroWithASilentStderrIsTheOnlyCleanSuccess() {
+        XCTAssertEqual(AccountCommand.classify(enabling: true, exitCode: 0, stderr: ""), .clean)
+        // Whitespace is not output.
+        XCTAssertEqual(AccountCommand.classify(enabling: true, exitCode: 0, stderr: " \n"), .clean)
+    }
+
+    /// This test used to assert the opposite — "exit code decides, not stderr
+    /// chatter" — and that sentence was the bug. `tcr` reports a park it could not
+    /// persist by exiting 0 and warning on stderr (`src/cli.rs`), so exit 0 with
+    /// output means *accepted, with something still to do*, and dropping the text
+    /// here stamped `parked ✓` on a change that would not survive a restart.
+    ///
+    /// The rule is structural: ANY output, no phrase matched. A keyword list would
+    /// pass every warning added to `tcr` after the day it was written.
+    func testExitZeroWithAnythingOnStderrIsNotClean() {
+        XCTAssertEqual(
             AccountCommand.classify(enabling: false, exitCode: 0, stderr: "some chatter"),
-            "exit code decides, not stderr chatter"
+            .spoke(notice: "some chatter")
+        )
+        let notSaved =
+            "[tcr] warning: NOT SAVED: no config entry matches this account "
+            + "— it returns to rotation on restart"
+        XCTAssertEqual(
+            AccountCommand.classify(enabling: false, exitCode: 0, stderr: "\(notSaved)\n"),
+            .spoke(notice: notSaved),
+            "trimmed at the ends, otherwise verbatim — this app does not paraphrase tcr"
         )
     }
 
     func testAnAmbiguousQueryIsSurfacedVerbatim() {
-        // The realistic failure: one configured name is a substring of another.
-        let failure = AccountCommand.classify(
-            enabling: false,
-            exitCode: 1,
-            stderr: "  no unique account matches \"alice\" (2 candidates)\n"
-        )
-        XCTAssertEqual(failure?.exitCode, 1)
-        XCTAssertEqual(failure?.message, "no unique account matches \"alice\" (2 candidates)")
+        // The realistic failure: two accounts share an email across two orgs, so
+        // the email fallback resolves to both and `tcr` refuses rather than picking.
+        guard
+            case .failed(let failure) = AccountCommand.classify(
+                enabling: false,
+                exitCode: 1,
+                stderr: "  no unique account matches \"alice@example.com\" (2 candidates)\n"
+            )
+        else { return XCTFail("a non-zero exit must classify as failed") }
+        XCTAssertEqual(failure.exitCode, 1)
+        XCTAssertEqual(failure.message, "no unique account matches \"alice@example.com\" (2 candidates)")
         XCTAssertEqual(
-            failure?.summary,
-            "disable failed (exit 1): no unique account matches \"alice\" (2 candidates)"
+            failure.summary,
+            "disable failed (exit 1): no unique account matches \"alice@example.com\" (2 candidates)"
         )
     }
 
     func testASilentFailureStillSaysSomething() {
-        let failure = AccountCommand.classify(enabling: true, exitCode: 2, stderr: "")
-        XCTAssertEqual(failure?.summary, "enable failed (exit 2): no output")
-        XCTAssertFalse(failure?.summary.isEmpty ?? true)
+        guard case .failed(let failure) = AccountCommand.classify(enabling: true, exitCode: 2, stderr: "")
+        else { return XCTFail("a non-zero exit must classify as failed") }
+        XCTAssertEqual(failure.summary, "enable failed (exit 2): no output")
+        XCTAssertFalse(failure.summary.isEmpty)
     }
 }
 
