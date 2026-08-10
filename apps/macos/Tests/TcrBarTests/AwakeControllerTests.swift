@@ -156,6 +156,46 @@ final class AwakeControllerTests: XCTestCase {
         XCTAssertTrue(AwakeController.reason.contains("TcrBar"), AwakeController.reason)
     }
 
+    /// The set is the point of the class: `caffeinate -i -m -s`, not `-i` alone.
+    ///
+    /// Spelled as literals rather than re-derived from the same constants the
+    /// production code uses, because a test that reads its expectation out of
+    /// the thing under test agrees with any change to it. These three strings
+    /// are what `pmset -g assertions` prints and what the README's gate counts.
+    func testTheThreeAssertionTypesAreTheOnesCaffeinateHolds() {
+        XCTAssertEqual(
+            AwakeController.assertionTypes,
+            ["PreventUserIdleSystemSleep", "PreventSystemSleep", "PreventDiskIdle"])
+    }
+
+    /// A take that fails reports OFF, not partially ON.
+    ///
+    /// `IOPMAssertionCreateWithName` returns an `IOReturn` and can fail, which
+    /// `beginActivity` could not. A controller that showed ON having taken some
+    /// smaller set than it promised would be the panel lying about the state of
+    /// the machine — the defect the single-token shape exists to prevent.
+    func testAFailedTakeLeavesTheControlOffAndRetryable() {
+        var attempts = 0
+        var ended = 0
+        let activity = AwakeController.Activity(
+            begin: { _ in
+                attempts += 1
+                return nil
+            },
+            end: { _ in ended += 1 })
+        let controller = AwakeController(activity: activity)
+
+        controller.setOn(true)
+        XCTAssertFalse(controller.isOn, "nothing was taken, so the control must read OFF")
+        XCTAssertEqual(ended, 0, "there is nothing to end")
+
+        // Not latched into a broken state: the next tick tries again, and the
+        // idempotence guard does not mistake a failed take for a live one.
+        controller.setOn(true)
+        XCTAssertEqual(attempts, 2)
+        XCTAssertFalse(controller.isOn)
+    }
+
     /// The harness pair must hold nothing. If `.inert` ever became the real one,
     /// rendering PNGs would stop the machine sleeping.
     func testInertActivityIsSafeForTheRenderHarness() {

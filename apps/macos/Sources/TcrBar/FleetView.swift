@@ -368,8 +368,11 @@ struct FleetView: View {
     /// toggles anyway — all three are modes, not actions.
     ///
     /// The detail line is not decoration. "Keep this Mac awake" over-promises by
-    /// exactly the two cases an operator will hit, and hitting either means
-    /// coming back to a dead run and blaming the proxy.
+    /// exactly the two cases an operator will hit — a dark screen, and a laptop
+    /// on battery, where the `PreventSystemSleep` half of the hold is inert per
+    /// `man caffeinate` — and hitting either means coming back to a dead run and
+    /// blaming the proxy. It says nothing about a closed lid in either
+    /// direction, because nothing here has measured that.
     ///
     /// It carries `Tok.awake`, NOT `Tok.near`. Amber is this palette's "close to
     /// a gating limit", and it is what the login-item error directly above uses;
@@ -398,12 +401,12 @@ struct FleetView: View {
             .font(Tok.secondaryFont)
             .tint(Tok.awake)
             .help(
-                "Holds an idle-system-sleep power assertion for as long as this "
-                    + "is on — the same thing `caffeinate -i` does. Released when "
-                    + "you untick it or quit TcrBar."
+                "Holds the three power assertions `caffeinate -i -m -s` holds, for "
+                    + "as long as this is on. Released when you untick it or quit "
+                    + "TcrBar."
             )
             if awake.isOn {
-                Text("The display still sleeps, and closing the lid still sleeps the Mac.")
+                Text("The display still sleeps. Sleep itself is only held off on AC power.")
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.awake)
                     .fixedSize(horizontal: false, vertical: true)
