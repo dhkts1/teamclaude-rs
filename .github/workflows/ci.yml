@@ -52,6 +52,32 @@ jobs:
       - name: Build (release)
         run: cargo build --release --locked
 
+      # Tokens.swift says a failing design token is a build error. Until this
+      # step existed that was not true anywhere: build-tcrbar.sh never invokes
+      # the generator, and the only real check was .githooks/pre-commit — which
+      # fires only when a token SOURCE is staged, skips silently without
+      # python3, and yields to --no-verify.
+      #
+      # It lives in `ci` and not `macos` even though the palette is the app's:
+      # the script is stdlib-only Python and reads the geometry scale out of
+      # Tokens.swift as TEXT, so it needs no Swift toolchain. Putting it on the
+      # macOS runner would spend minutes billed at a multiple of Linux to answer
+      # a question Linux can answer — the same rule the `macos` job's own
+      # comment states. `ci` is likewise a required check on main, so the gate
+      # blocks a merge either way.
+      #
+      # Emitting to a scratch dir and diffing catches the second half: a palette
+      # edit that passes contrast but was never regenerated leaves the checked-in
+      # stylesheet publishing the old hex under the generator's authority. The
+      # generator writes nothing when it fails, so the diff cannot mask it.
+      - name: Design tokens (contrast + freshness)
+        run: |
+          python3 scripts/tcrbar-palette.py \
+            --emit-css "$RUNNER_TEMP/tokens.css" \
+            --emit-json "$RUNNER_TEMP/tokens.json"
+          diff -u apps/macos/design-tokens/tokens.css "$RUNNER_TEMP/tokens.css"
+          diff -u apps/macos/design-tokens/tokens.json "$RUNNER_TEMP/tokens.json"
+
   # The only job on a macOS runner, and the only place any Swift is compiled.
   # Before this existed the app's Swift tests had never run in CI at all, so a
   # Rust-side change could silently break TcrBar with every check green.
