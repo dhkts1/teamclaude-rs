@@ -18,6 +18,25 @@ printf '%s\n' \
 
 # ── Secret scan (gitleaks) ──────────────────────────────────────────────────
 # git runs hooks from the repo root, so cwd already holds .gitleaks.toml.
+#
+# A MISSING gitleaks is a hard failure, not a warning. This block used to warn
+# and exit 0, on the reasoning that "a missing tool must not block every commit"
+# — the rule the format gates below still follow, correctly. It does not
+# transfer here, and the difference is what the gate GUARDS:
+#
+#   - A missing formatter costs a red CI job. Recoverable, and visible.
+#   - A missing secret scanner costs a PUBLISHED credential. This repository is
+#     public, and the machine it is developed on holds live OAuth tokens in
+#     ~/.config/teamclaude.json. Once a token is pushed it is public forever;
+#     forks and clones keep their own copies of the history you rewrite.
+#
+# The warning also made README's promise — that this hook means no secret
+# reaches a commit — false on any machine without gitleaks, and false SILENTLY:
+# the commit succeeded, so nothing ever suggested the scan had not run. A gate
+# that does not run must not look like a gate that passed.
+#
+# Escapable by intent, never by accident: TCR_ALLOW_MISSING_GITLEAKS=1 (or
+# --no-verify) is the deliberate opt-out, and it announces itself.
 if command -v gitleaks >/dev/null 2>&1; then
   if ! gitleaks git --staged --no-banner --redact; then
     echo "" >&2
@@ -25,10 +44,27 @@ if command -v gitleaks >/dev/null 2>&1; then
     echo "  Remove it, or (if it's a genuine false positive) allowlist it in .gitleaks.toml." >&2
     exit 1
   fi
+elif [ "${TCR_ALLOW_MISSING_GITLEAKS:-0}" = "1" ]; then
+  echo "pre-commit: gitleaks not installed — secret scan SKIPPED by TCR_ALLOW_MISSING_GITLEAKS=1." >&2
+  echo "  Nothing has scanned these staged changes for credentials. Re-check them by eye." >&2
 else
-  # Warn only — a missing tool must not block every commit. Do NOT exit here,
-  # or the rustfmt gate below becomes dead code on gitleaks-less machines.
-  echo "pre-commit: gitleaks not installed — skipping secret scan (brew install gitleaks)." >&2
+  echo "" >&2
+  echo "pre-commit: BLOCKED — gitleaks is not installed, so the secret scan cannot run." >&2
+  echo "" >&2
+  echo "  This repository is PUBLIC. Committing without the scan is how a token" >&2
+  echo "  reaches a place it can never be removed from." >&2
+  echo "" >&2
+  echo "  Install it (macOS):   brew install gitleaks" >&2
+  echo "  Other platforms:      https://github.com/gitleaks/gitleaks#installing" >&2
+  echo "" >&2
+  echo "  If you have it but this hook cannot see it, gitleaks is not on the PATH" >&2
+  echo "  your git client uses (GUI clients often do not read your shell profile)." >&2
+  echo "" >&2
+  echo "  Deliberate bypass, if you have checked the diff yourself:" >&2
+  echo "" >&2
+  echo "      TCR_ALLOW_MISSING_GITLEAKS=1 git commit ..." >&2
+  echo "" >&2
+  exit 1
 fi
 
 # ── Public-repo disclosure gate ─────────────────────────────────────────────
@@ -52,6 +88,24 @@ hits=""
 
 if [ -n "$added" ]; then
   # 1. Private names — an editable list, so adding one needs no hook edit.
+  #
+  #    A MISSING list is a hard failure, for the same reason a missing gitleaks
+  #    is: this is a disclosure gate, and the file is tracked, so its absence
+  #    means the checkout is damaged or somebody deleted it — not that there is
+  #    nothing to check. Skipping silently would leave the other two checks
+  #    (home paths, emails) running and the whole gate looking healthy while the
+  #    one check that knows the actual private names had been switched off.
+  if [ ! -f .githooks/private-names ] && [ "${TCR_ALLOW_MISSING_PRIVATE_NAMES:-0}" != "1" ]; then
+    echo "" >&2
+    echo "pre-commit: BLOCKED — .githooks/private-names is missing, so the private-name" >&2
+    echo "  half of the disclosure scan cannot run. It is a tracked file; restore it:" >&2
+    echo "" >&2
+    echo "      git checkout -- .githooks/private-names" >&2
+    echo "" >&2
+    echo "  Deliberate bypass:  TCR_ALLOW_MISSING_PRIVATE_NAMES=1 git commit ..." >&2
+    echo "" >&2
+    exit 1
+  fi
   if [ -f .githooks/private-names ]; then
     while IFS= read -r name || [ -n "$name" ]; do
       case "$name" in ''|\#*) continue ;; esac
@@ -180,11 +234,19 @@ fi
 # Documentation-only commits are exempt: they change nothing a user installs.
 #
 # Deliberate exception:  git commit --no-verify
+# .githooks/** is exempt for exactly the reason .github/** already is, and the
+# omission was an oversight rather than a decision: both are developer-side
+# tooling that no user installs and no artifact contains. A pre-commit hook is
+# not in the binary, not in the app bundle, and not read by build-tcrbar.sh, so
+# editing one cannot make anything "claim to be 0.2.3 while not being it" —
+# which is the entire failure this gate exists to stop. Without this, hardening
+# a hook forced a version bump that shipped nothing.
 staged_shippable="$(git diff --cached --name-only --diff-filter=ACMR -- . \
                     ':(exclude)*.md' \
                     ':(exclude)docs/**' \
                     ':(exclude)assets/**' \
-                    ':(exclude).github/**' || true)"
+                    ':(exclude).github/**' \
+                    ':(exclude).githooks/**' || true)"
 
 if [ -n "$staged_shippable" ]; then
   # Read the INDEX (`:Cargo.toml`), not the working tree: that is what this
@@ -219,7 +281,7 @@ if [ -n "$staged_shippable" ]; then
     echo "  Staged files that triggered this:" >&2
     printf '%s\n' "$staged_shippable" | sed 's/^/      /' >&2
     echo "" >&2
-    echo "  Documentation-only commits (*.md, docs/, assets/, .github/) are exempt." >&2
+    echo "  Commits that install nothing (*.md, docs/, assets/, .github/, .githooks/) are exempt." >&2
     echo "  If this genuinely should ship under $staged_version:  git commit --no-verify" >&2
     exit 1
   fi
