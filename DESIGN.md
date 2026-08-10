@@ -10,7 +10,7 @@ Read the SAME file the JS proxy uses. serde structs (camelCase via `#[serde(rena
 
 ```
 Config { proxy: {port:u16=3456, apiKey:Option<String>}, upstream:String="https://api.anthropic.com",
-         switchThreshold:f64=0.90, accounts: Vec<Account> }
+         switchThreshold:f64=0.95, accounts: Vec<Account> }
 Account { name:String, r#type:String="oauth", accountUuid:Option, orgUuid:Option, orgName:Option,
           accessToken:String, refreshToken:Option<String>, expiresAt:Option<i64/*epoch ms*/>,
           priority:Option<i64>=0, switchThreshold:Option<f64>, disabled:Option<bool>=false }

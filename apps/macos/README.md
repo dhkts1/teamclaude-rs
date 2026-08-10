@@ -18,9 +18,20 @@ never handles a token and never sends an `Authorization` header.
 ## The one safety property
 
 `tcr`'s port singleton can take the port over: a starting server may kill a proxy
-already holding it, which wipes the session→account pin map and costs every live
-session a full cold prompt-cache prefix. That kill is now behind an explicit
-`--replace`; the default is to stand down and exit without binding.
+already holding it, costing every live session a full cold prompt-cache prefix.
+That is the worst case, not the rule, and this file used to state it as the rule.
+Session affinity persists the session→account pins to
+`~/.cache/teamclaude/session-affinity.json` — flushed every 5s while the map is
+dirty (`src/server.rs:674-690`) and restored at boot (`src/server.rs:643`) — so a
+takeover *inside* the pin TTL (`affinity::PIN_TTL_MS`, 15 minutes,
+`src/affinity.rs:71`) keeps most sessions warm, while one after it restores
+nothing at all. That the flush is incremental rather than shutdown-only is
+exactly because of this path: `--replace` follows SIGTERM with SIGKILL, and no
+shutdown hook runs for a SIGKILL (`src/affinity.rs:29-37`). None of it applies
+with `sessionAffinity` off, which is the default (`src/manager/state.rs:33-46`).
+
+That kill is now behind an explicit `--replace`; the default is to stand down and
+exit without binding.
 
 TcrBar therefore always spawns `tcr server --no-replace` on the routine path, and
 reaches for `--replace` only from "Take over port…", behind a confirmation. (The
