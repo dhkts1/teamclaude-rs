@@ -12,9 +12,9 @@ the SHA of the build that is actually serving; check it before concluding a chan
 ## Where the logs are
 
 `tcr server --headless` writes to stdout *and* to a daily-rotating file under the cache
-directory. The file is the half that survives supervision — anything running the proxy as a
-background child, TcrBar included, discards its stdout — so that file is where to look when
-a supervised proxy misbehaves. The exact path, the permissions it enforces, and the
+directory. The file is the half that survives supervision, because anything running the
+proxy as a background child, TcrBar included, discards its stdout. That file is where to
+look when a supervised proxy misbehaves. The exact path, the permissions it enforces, and the
 environment variable that relocates it are in [Where the logs actually
 go](cli.md#where-the-logs-actually-go).
 
@@ -26,7 +26,7 @@ refresh by either revokes the other's. `tcr server --replace` takes the port del
 Prefer standing down: a restart costs every live session its prompt cache, which is
 per-account at Anthropic's end and the most expensive event in this system.
 
-The stand-down's exit code tells you which case you are in — a healthy peer, an incumbent
+The stand-down's exit code tells you which case you are in: a healthy peer, an incumbent
 running a different commit, or a wedged process holding the socket without answering. See
 [Taking over the port](cli.md#taking-over-the-port).
 
@@ -34,7 +34,7 @@ running a different commit, or a wedged process holding the socket without answe
 
 With `sessionAffinity` on, pins are persisted continuously and restored at boot within a
 TTL; a restart inside that window keeps most sessions warm, and one outside it restores
-nothing at all. The server logs how many pins it restored at boot — read that line rather
+nothing at all. The server logs how many pins it restored at boot; read that line rather
 than assuming either outcome. With `sessionAffinity` off, which is the default, there are no
 pins to restore. The TTL and the reasoning are in [Session-affinity pins survive a
 restart](architecture.md#session-affinity-pins-survive-a-restart).
@@ -54,13 +54,13 @@ upstream for a local fault.
 ## `tcr login` refuses to run
 
 A proxy is holding the port and its next token refresh would overwrite what the login
-writes. Stop it, log in, start it again — or use `--force`.
+writes. Stop it, log in, start it again, or use `--force`.
 
 ## `tcr ui` or a TcrBar update will not replace the app
 
 You cannot replace `/Applications/TcrBar.app` while the proxy is running: TcrBar supervises
 the bundled `tcr` as a child, so macOS sees an executing image inside the bundle being
-swapped and Finder and Sparkle both refuse. Quitting TcrBar clears it — which means every
+swapped and Finder and Sparkle both refuse. Quitting TcrBar clears it, which means every
 app update also restarts the proxy, with the prompt-cache cost above. Plan it for a quiet
 moment.
 

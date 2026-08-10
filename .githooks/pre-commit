@@ -120,15 +120,19 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
   #    Obviously-synthetic users are allowed so fixtures and docs still work.
   found="$(printf '%s\n' "$added" \
            | grep -E -m3 '/(Users|home)/[A-Za-z0-9._-]+/' \
-           | grep -v -E '/(Users|home)/(x|y|alice|bob|carol|test|example|runner|user)/' || true)"
+           | grep -v -i -E '/(Users|home)/(x|y|alice|bob|carol|test|example|runner|user)/' || true)"
   [ -n "$found" ] && hits="$hits
   absolute home path:
 $(printf '%s\n' "$found" | sed 's/^/      /')"
 
   # 3. Real-looking email addresses (example.com and the GitHub noreply are fine).
+  #    Matched case-insensitively: example.com is RFC 2606 reserved, so ALICE@EXAMPLE.COM
+  #    is no more real than the lowercase form. Docs demonstrating case-sensitive account
+  #    resolution legitimately write the uppercase one, and a case-sensitive allowlist
+  #    blocked exactly that.
   found="$(printf '%s\n' "$added" \
            | grep -E -o -m3 '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
-           | grep -v -E '@(example\.(com|org|net)|users\.noreply\.github\.com)$' || true)"
+           | grep -v -i -E '@(example\.(com|org|net)|users\.noreply\.github\.com)$' || true)"
   [ -n "$found" ] && hits="$hits
   real-looking email address:
 $(printf '%s\n' "$found" | sed 's/^/      /')"

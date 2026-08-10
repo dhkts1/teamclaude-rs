@@ -4,7 +4,7 @@ Every subcommand and flag the `tcr` binary accepts, with the behaviour behind it
 [the README](../README.md); the config file those commands read and write is documented in
 [configuration.md](configuration.md).
 
-All argument parsing lives in one file, `src/main.rs` — `src/cli.rs` is the *implementation*
+All argument parsing lives in one file, `src/main.rs`; `src/cli.rs` is the *implementation*
 of the account subcommands, not the definitions. There are twelve subcommands plus the bare
 `tcr` form, and twenty-five flags between them. No flag has a single-dash short form, an
 alias, an environment-variable binding or a clap-level default value; every default below is
@@ -38,14 +38,14 @@ form exists so you can name it in a script or a launch agent.
 ### Taking over the port
 
 By default, starting a second `tcr` while one is already serving does **not** disturb the
-incumbent — the new process stands down and exits. That is the safe direction: replacing a
+incumbent: the new process stands down and exits. That is the safe direction, because replacing a
 live proxy wipes its session-to-account pin map and cold-starts every live session's prompt
 cache, which is the most expensive event in this system. `--replace` opts into doing it
 anyway.
 
 The stand-down carries information in its exit code (`src/main.rs:488-503`). `0` means a
 peer proxy holds the port and is serving code you have no reason to doubt. `3` means the
-incumbent is serving a *different commit* than the binary you just ran — so
+incumbent is serving a *different commit* than the binary you just ran, so
 `cargo build && tcr` stops instead of proceeding as though your new build were live. `4`
 means the incumbent holds the listening socket and never answered the liveness probe, which
 is the wedged shape and the case where `--replace` is a recovery rather than an upgrade.
@@ -62,7 +62,7 @@ name as a hard `ArgumentConflict` (`src/main.rs:205`). The previous wiring made
 `--no-replace` a silent veto over `--replace`, so an operator adding `--replace` to force a
 rebuilt binary onto the port got a stand-down and exit 0 while `--help` told them the flag
 they had left in place did nothing. The conflict error is the only outcome that cannot be
-misread — but it does mean an invocation that used to "work" now fails loudly.
+misread, but it does mean an invocation that used to "work" now fails loudly.
 
 ### Where the logs actually go
 
@@ -73,7 +73,7 @@ with the TUI running, tracing goes to the file *only*, because writing events to
 would corrupt the alternate screen.
 
 The file is the sink that matters in practice. Anything launching the proxy as a background
-child — TcrBar included — discards its stdout, so the log file is the only place those
+child (TcrBar included) discards its stdout, so the log file is the only place those
 events survive. The directory is created `0700` and re-asserted owner-only at every process
 start, because log lines can carry account emails (`src/main.rs:820-847`); if it cannot be
 made owner-only, `tcr` refuses to log there rather than writing into a world-readable
@@ -95,11 +95,11 @@ Trailing args are captured with `trailing_var_arg` and `allow_hyphen_values`, so
 
 If the proxy is not listening, `tcr run` launches `claude` **untouched** and says so on
 stderr, so a stopped proxy never breaks the shell alias. When the proxy is up, the child
-gets the routing environment and nothing else — in particular **no `ANTHROPIC_API_KEY`**,
+gets the routing environment and nothing else, in particular **no `ANTHROPIC_API_KEY`**,
 even when `proxy.apiKey` is set. It used to get one, and that broke Claude Code: an
 `ANTHROPIC_API_KEY` outranks claude's own claude.ai login as an auth source, which
 **disables every claude.ai connector**, announced in one startup line that scrolls away,
-after which the tools are simply absent. It bought nothing in exchange — the proxy's
+after which the tools are simply absent. It bought nothing in exchange: the proxy's
 `x-api-key` gate exempts loopback clients and the server binds `127.0.0.1` only, so a
 `tcr run` child was always exempt. When a key is configured, `tcr run` prints a line on
 stderr saying it is deliberately withholding it (`src/main.rs:329-334`; the reason is the
@@ -122,12 +122,12 @@ Runs the browser OAuth flow and writes the resulting account into the config.
 
 **It refuses while a proxy is running on the configured port.** The refusal is not caution:
 the server reads the config at boot and its next token refresh writes its *boot-time* tokens
-back over the file, silently clobbering the ones a fresh login just wrote — observed live
+back over the file, silently clobbering the ones a fresh login just wrote, observed live
 (`src/oauth.rs:782-797`). The message names the port, the pid, and the ordered remedy: stop
 the server, run `tcr login`, then start it again.
 
 If the pid it names belongs to a host application serving the proxy in-process (TcrBar), the
-message says so and tells you to quit the application rather than kill the pid — killing it
+message says so and tells you to quit the application rather than kill the pid. Killing it
 skips shutdown and loses the session pin map.
 
 `--force` is the deliberate escape hatch, and it is genuinely unsafe: the login succeeds and
@@ -140,14 +140,14 @@ The callback server binds a random loopback port, and tokens are never printed o
 
 ## `tcr accounts`
 
-Lists the configured accounts. Offline by construction — it builds its own view from the
+Lists the configured accounts. Offline by construction: it builds its own view from the
 file and never asks the server, so its serving counters render as unmeasured rather than as
 zeroes (`src/cli.rs:862-882`).
 
 | flag | type | default | effect |
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to list |
-| `--probe` | bool | `false` | refresh each account's live quota first — a real network call per account (`src/main.rs:67-75`) |
+| `--probe` | bool | `false` | refresh each account's live quota first, a real network call per account (`src/main.rs:67-75`) |
 
 ---
 
@@ -156,20 +156,20 @@ zeroes (`src/cli.rs:862-882`).
 These four take a positional `<query>` naming one account, and they all resolve it the same
 way (`src/identity.rs:169-197`).
 
-The rule is: **exact `name`, and if nothing matched, exact email** — where "email" means the
+The rule is: **exact `name`, and if nothing matched, exact email**, where "email" means the
 name with a trailing ` (Org)` suffix stripped (`src/identity.rs:129-137`). Both comparisons
 are `==` on the raw string. That means resolution is **case-sensitive and never a
 substring**. Given an account named `alice@example.com (Acme)`:
 
 ```
-tcr disable "alice@example.com (Acme)"   # matches — exact name
-tcr disable alice@example.com            # matches — exact email, org suffix stripped
-tcr disable alice                        # NO MATCH — not a substring
-tcr disable alice@                       # NO MATCH — not a prefix
-tcr disable ALICE@EXAMPLE.COM            # NO MATCH — case-sensitive
+tcr disable "alice@example.com (Acme)"   # matches: exact name
+tcr disable alice@example.com            # matches: exact email, org suffix stripped
+tcr disable alice                        # NO MATCH: not a substring
+tcr disable alice@                       # NO MATCH: not a prefix
+tcr disable ALICE@EXAMPLE.COM            # NO MATCH: case-sensitive
 ```
 
-A query matching nothing is an error and the config is left byte-identical — resolution runs
+A query matching nothing is an error and the config is left byte-identical: resolution runs
 before any mutation, so there is no partial write (`src/cli.rs:125-133`). A query matching
 two or more accounts is also an error, and it lists the candidates and tells you to narrow
 with `--org`.
@@ -184,7 +184,7 @@ Deletes the account from the config. Flags: `--config`, `--org`.
 This is destructive and there is no confirmation prompt. The entry is removed and the file
 is rewritten in place; the access and refresh tokens go with it, so recovering the account
 means running `tcr login` again, not editing anything back. It is also a file-only
-operation — a running proxy keeps the account in its in-memory fleet until it is restarted,
+operation: a running proxy keeps the account in its in-memory fleet until it is restarted,
 so removing an account is not a way to stop traffic going to it. Use `tcr disable` for that.
 
 ### `tcr priority <query> [N]`
@@ -212,7 +212,7 @@ file-only write; it does not reach a running proxy.
 `--org`.
 
 **These act on the running proxy first, not on the file.** A file-only write was the
-original bug: the proxy reads `disabled` from the config once, at startup, and never again —
+original bug: the proxy reads `disabled` from the config once, at startup, and never again,
 so `tcr disable alice@example.com` exited 0, printed a confident line, and the proxy kept
 handing that account live traffic while every surface reported it benched
 (`src/cli.rs:201-217`). The command now POSTs to the proxy's `/_tcr/accounts/disabled`
@@ -221,7 +221,7 @@ control route and only touches the file when it has to.
 The four outcomes (`src/cli.rs:227-268`):
 
 - **The proxy applied it.** Done. Any caveat the proxy returned is printed as a warning.
-- **Nothing is listening.** The quiet, historical case — the file is written, and there is no
+- **Nothing is listening.** The quiet, historical case: the file is written, and there is no
   live rotation to disagree with it.
 - **The proxy rejected the key.** `proxy.apiKey` did not match. The command changes
   *nothing* and exits non-zero, on purpose: writing the file here would put the old lie in a
@@ -230,7 +230,7 @@ The four outcomes (`src/cli.rs:227-268`):
 - **The route is missing.** An older `tcr` is serving. The file gets written, and the command
   says loudly that this is only half a disable.
 
-If you have set `proxy.apiKey`, these two commands need it — they go through the same
+If you have set `proxy.apiKey`, these two commands need it; they go through the same
 loopback-plus-key gate as every other `/_tcr/` route, with no loopback exemption. See
 [configuration.md](configuration.md#proxyapikey-is-a-security-control-not-a-convenience).
 
@@ -253,7 +253,7 @@ measurement.
 
 ## `tcr update`
 
-Self-update. One flag: `--force` — rebuild or reinstall even when the source reports it is
+Self-update. One flag, `--force`: rebuild or reinstall even when the source reports it is
 already up to date (`src/main.rs:148-153`).
 
 What it does depends on how `tcr` was installed, which it classifies at runtime
@@ -283,7 +283,7 @@ screenshots are produced. It touches no real config and makes no network calls.
 Takes no flags. Opens TcrBar, the macOS menu-bar app, by asking LaunchServices for the
 bundle id `io.github.dhkts1.tcrbar` (`src/main.rs:291`).
 
-It exists for discoverability, not capability — `open -a TcrBar` already worked. Without the
+It exists for discoverability, since `open -a TcrBar` already worked. Without the
 subcommand, nothing in `tcr --help` reveals that a UI exists at all, so the app was only
 findable by already knowing about it (`src/main.rs:276-285`). It deliberately does not build
 the app or know where your checkout is; when the bundle id is not registered it says TcrBar

@@ -2,7 +2,8 @@
 
 The request path, the two entry modes, how an account gets picked, and how quota is kept
 fresh. Every tunable named here has its type, default and source citation in
-[`configuration.md`](configuration.md) — this document describes mechanism, not values.
+[`configuration.md`](configuration.md); this document describes the mechanism rather than
+the values.
 
 ## One listener, two entry modes
 
@@ -10,7 +11,7 @@ One TCP listener on `127.0.0.1:<port>` serves both entry modes. Which one you ge
 decided by a non-destructive peek at the first eight bytes of each connection.
 
 ```
-client                      tcr — ONE listener on 127.0.0.1:<port>
+client                      tcr: ONE listener on 127.0.0.1:<port>
   |
   |-- peek first 8 bytes: "CONNECT "?
   |     no  -> BASE-URL MODE (cleartext h1 or h2 prior-knowledge) ---+
@@ -40,7 +41,7 @@ ROTATION LOOP (bounded)
 **Base-URL mode** is plain HTTP to the listener. **Forward-proxy mode** terminates TLS for
 Anthropic's own API hosts using a locally generated leaf, which is why the client needs
 your CA in `NODE_EXTRA_CA_CERTS`. Every other host is copied through as raw bytes and is
-never decrypted — that is what keeps Claude Code's other endpoints working through a single
+never decrypted. That is what keeps Claude Code's other endpoints working through a single
 `HTTPS_PROXY`, and it is also a real property to understand before you run it; see
 [Security](../README.md#security).
 
@@ -60,8 +61,8 @@ served even over the utilization threshold, the pacing fallback ranks in-flight 
 priority, and `revalidationServe` (on by default) serves the least-utilized survivor rather
 than returning an error when the whole fleet reads over the soft threshold.
 
-Each of those keys — `lockAccount`, `sessionAffinity`, `pacing`, `revalidationServe`, and
-the switch threshold itself — is documented with its default in
+Each of those keys (`lockAccount`, `sessionAffinity`, `pacing`, `revalidationServe`, and
+the switch threshold itself) is documented with its default in
 [`configuration.md`](configuration.md).
 
 ### Session-affinity pins survive a restart
@@ -70,7 +71,7 @@ With `sessionAffinity` on, the session-to-account pin map is flushed to disk con
 and reloaded at boot, so a restart does not automatically cold-start every conversation's
 prompt cache. Pins expire against `affinity::PIN_TTL_MS`, **15 minutes**: a restart inside
 that window restores most of the fleet's pins, and one outside it restores none. The server
-logs how many it restored — read that line rather than assuming either outcome. With
+logs how many it restored; read that line rather than assuming either outcome. With
 `sessionAffinity` off, which is the default, there are no pins to restore.
 
 ## Keeping the quota bars fresh
@@ -82,13 +83,12 @@ messages.
 **Each account is probed on its own randomly drawn schedule, not a fleet sweep.** Boot does
 one whole-fleet pass so the bars populate immediately, and from then on every account
 sleeps for an independently drawn interval, centred on the configured cadence, before its
-own next probe — with a random initial offset so a restart re-scatters the fleet instead of
-re-aligning it. Nothing shares an instant, nothing runs on an exact period. This replaced a
-75-second fleet-wide sweep that touched every account inside the same window, on the dot,
-forever.
+own next probe, with a random initial offset so a restart re-scatters the fleet instead of
+re-aligning it. This replaced a 75-second fleet-wide sweep that touched every account
+inside the same window, on the dot.
 
 Keep-warm (`warmupSeconds`) got the same treatment; it is the opposite of the probe and is
-off by default — it really does post messages, and spends quota to do it.
+off by default: it really does post messages, and spends quota to do it.
 
 The distributions, the bounds each draw actually produces, and the generator behind them
 are in [Both cadences are random per account, not a fleet

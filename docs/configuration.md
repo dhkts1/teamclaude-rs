@@ -10,7 +10,7 @@ relative to the repository root.
 ## The minimum viable config
 
 Two keys are hard-required in the whole document, and both live on an account: `name` and
-`accessToken` (`src/config.rs:95`, `:104` — neither carries a `#[serde(default)]`, so a
+`accessToken` (`src/config.rs:95`, `:104`; neither carries a `#[serde(default)]`, so a
 missing one is a parse error). Everything else has a default.
 
 ```json
@@ -32,18 +32,18 @@ writes the account for you. Hand-editing is for the *settings* keys below.
 The document deserializes into `Config` (`src/config.rs:213-247`) with
 `#[serde(rename_all = "camelCase")]`, so every key is camelCase. Unmodelled keys are
 preserved verbatim across a load→save round trip rather than dropped
-(`src/config.rs:245-246`) — but five of them are also *read*, and are documented in their
+(`src/config.rs:245-246`), but five of them are also *read*, and are documented in their
 own section below.
 
 ## Top level
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `proxy` | object | `{}` (all sub-defaults) | no | listener settings — see below (`src/config.rs:216-217`) |
+| `proxy` | object | `{}` (all sub-defaults) | no | listener settings, see below (`src/config.rs:216-217`) |
 | `upstream` | string | `"https://api.anthropic.com"` | no | API base URL every rotated request is sent to (`src/config.rs:218-219`, default at `:29-31`) |
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account (`src/config.rs:220-221`, default at `:32-34`) |
-| `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing — see below (`src/config.rs:228-229`) |
-| `throttle` | object | `{minSpacingMs: 350, burst: 4}` → **ON** | no | fleet-wide egress rate limiter — see below (`src/config.rs:233-234`) |
+| `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below (`src/config.rs:228-229`) |
+| `throttle` | object | `{minSpacingMs: 350, burst: 4}` → **ON** | no | fleet-wide egress rate limiter, see below (`src/config.rs:233-234`) |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` (`src/config.rs:240-241`) |
 | `accounts` | array | `[]` | no | the rotatable accounts (`src/config.rs:242-243`) |
 
@@ -60,13 +60,13 @@ said 0.90, which was never the shipped value.
 
 `--port` beats the file. `tcr server --port 9000` overrides `proxy.port` at runtime; the
 flag is threaded into `ServeOptions.port` at `src/main.rs:548` and wins wherever it is
-`Some`. The config value is the fallback, not the authority.
+`Some`.
 
 ### `proxy.apiKey` is a security control, not a convenience
 
 When it is set, it is **required on every request to the `/_tcr/` control routes, with no
 loopback exemption**. That is deliberate and stricter than the request path: the doc
-comment on `local_endpoint_gate` (`src/proxy.rs:810-852`) spells out why — the ordinary
+comment on `local_endpoint_gate` (`src/proxy.rs:810-852`) spells out why. The ordinary
 proxy path exempts loopback because `claude` authenticates with its own OAuth and never
 sends the proxy key, but nothing on the machine has any business reading or steering the
 fleet without the operator's secret, so `/_tcr/status` and `/_tcr/accounts/disabled` cost
@@ -75,30 +75,30 @@ the same secret that using the proxy does. The check is a constant-time compare 
 
 Binding to loopback is not authorization. `127.0.0.1` is reachable by every process and
 every container on the host, which is exactly the reasoning in that comment. If you set
-`proxy.apiKey`, `tcr enable` and `tcr disable` need it too — they reach the running proxy
+`proxy.apiKey`, `tcr enable` and `tcr disable` need it too; they reach the running proxy
 through the same gate, and a rejected key makes them refuse rather than silently fall back
 to a file write (`src/cli.rs:246-252`).
 
 **`tcr run` does not give this value to `claude`.** It used to export it as
 `ANTHROPIC_API_KEY`, and that made Claude Code take an API key as its auth source ahead of
-its claude.ai login, which **disables every claude.ai connector** — announced in one
+its claude.ai login, which **disables every claude.ai connector**, announced in one
 startup line that scrolls away, after which the tools are simply absent. It bought nothing:
 the request path exempts loopback clients from this key, so the child was always exempt
 anyway. When a key is configured, `tcr run` says on stderr that it is withholding it
 (`src/main.rs:329-334`, reasoning at `:387-408`); a value the caller exported is inherited
-untouched. So the key's whole job is the `/_tcr/` gate above — it is not a credential
+untouched. So the key's whole job is the `/_tcr/` gate above; it is not a credential
 anything downstream of the proxy needs.
 
 ## `accounts[]`
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `name` | string | — | **yes** | display name; `tcr login` writes the account email here (`src/config.rs:95`) |
+| `name` | string | n/a | **yes** | display name; `tcr login` writes the account email here (`src/config.rs:95`) |
 | `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; anything else is a static-key account (`src/config.rs:96-97`, default at `:64-66`) |
 | `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token (`src/config.rs:98-99`) |
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry (`src/config.rs:100-101`) |
 | `orgName` | string | absent | no | organization display name; also what `--org` matches against (`src/config.rs:102-103`) |
-| `accessToken` | string | — | **yes** | the OAuth access token (`src/config.rs:104`) |
+| `accessToken` | string | n/a | **yes** | the OAuth access token (`src/config.rs:104`) |
 | `refreshToken` | string | absent | no | used to mint a new access token before expiry (`src/config.rs:105-106`) |
 | `expiresAt` | i64 | absent | no | access-token expiry as **epoch milliseconds** (`src/config.rs:107-109`) |
 | `priority` | i64 | absent → `0` | no | rotation order, **lower value = preferred** (`src/config.rs:110-111`; the `unwrap_or(0)` at `src/manager/mod.rs:313`) |
@@ -108,18 +108,18 @@ anything downstream of the proxy needs.
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
 keep-warm; any other value is treated as a static key.
 
-Per-account keys the proxy does not model — `models`, `upstream`, `sx`, anything inherited
-from the older Node proxy — parse fine and survive a load→save round trip untouched
+Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
+from the older Node proxy) parse fine and survive a load→save round trip untouched
 (`src/config.rs:117-118`), but nothing reads them.
 
-## `pacing.*` — opt-in, ships OFF
+## `pacing.*`: opt-in, ships OFF
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `pacing.maxInFlightPerAccount` | u32 | unset → no cap | no | an account at or over this many concurrent requests is skipped in selection (`src/config.rs:132-133`) |
 | `pacing.minSpacingMs` | u64 | unset → no spacing | no | minimum gap between two selects of the *same* account (`src/config.rs:136-137`) |
 
-An absent `pacing` key and a literal `"pacing": {}` are identical — both inert. A
+An absent `pacing` key and a literal `"pacing": {}` are identical, and both are inert. A
 configured `0` for the cap is normalised back to "unset" (`src/config.rs:147-152`);
 `Some(0)` would make `in_flight >= 0` true for every account and hold out the entire
 fleet permanently.
@@ -127,10 +127,10 @@ fleet permanently.
 It ships off on purpose. The doc comment at `src/config.rs:35-49` gives the reason: a
 per-account concurrency cap trades prompt-cache locality for load spread, and on a
 single-user proxy the cache is the scarce resource while the accounts are not. Turning it
-off leaves per-account concurrency genuinely unbounded — the global throttle below is a
+off leaves per-account concurrency genuinely unbounded; the global throttle below is a
 *rate* limiter and is explicitly not a substitute for a concurrency bound.
 
-## `throttle.*` — ships ON
+## `throttle.*`: ships ON
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
@@ -156,7 +156,7 @@ upstream send site, four requests admitted instantly after idle and then one per
 across the entire fleet. 350ms mirrors the measured probe-path aggregate rate; burst 4
 covers a normal within-turn fan-out untaxed while staying below a cold-start fan-out so the
 throttle actually engages on the burst. Inside a present `throttle` object an unset `burst`
-is clamped to `1` — strict spacing — not to 4 (`src/config.rs:200-203`).
+is clamped to `1` (strict spacing), not to 4 (`src/config.rs:200-203`).
 
 ## Keys read from the unmodelled map
 
@@ -166,7 +166,7 @@ boot or request path, not compatibility leftovers.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence — the CENTRE of a per-account random draw, not a fleet period; `<= 0` disables probing (`src/manager/state.rs:9-17`, constant at `src/probe.rs:30`) |
+| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence, the CENTRE of a per-account random draw, not a fleet period; `<= 0` disables probing (`src/manager/state.rs:9-17`, constant at `src/probe.rs:30`) |
 | `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task (`src/manager/state.rs:23-31`) |
 
 ### Both cadences are random per account, not a fleet sweep
@@ -183,12 +183,12 @@ Consequences worth knowing before you tune either number:
 
 - Two accounts do not share a probe instant, and a restart re-draws every offset rather
   than re-anchoring the fleet's phase on boot time.
-- A single account's gap between probes is never the number you configured — it is a fresh
+- A single account's gap between probes is never the number you configured; it is a fresh
   draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
 - The probe (not keep-warm) still does ONE whole-fleet sweep at boot, spaced 350 ms, so the
   bars populate immediately instead of after a random offset.
 - Randomness is drawn from a SplitMix64 generator seeded once from the boot clock. There is
-  no `rand` dependency, and per-account draws are decorrelated by construction — re-reading
+  no `rand` dependency, and per-account draws are decorrelated by construction; re-reading
   the clock per account in a tight loop would not have been.
 | `sessionAffinity` | bool | **`false`** (OFF) | no | pin a session to the account it started on (`src/manager/state.rs:38-46`) |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold (`src/manager/state.rs:53-61`) |
@@ -211,23 +211,22 @@ the target account. The reasoning is at `src/manager/state.rs:63-73`.
 ### `warmupSeconds` spends real quota
 
 Keep-warm is not a free health check. It issues actual upstream requests on your accounts
-on a timer, and that consumption counts against the same quota your sessions draw on —
-which is exactly why it defaults to `0` while the probe defaults to `75`. The doc comment
+on a timer, and that consumption counts against the same quota your sessions draw on,
+which is exactly why it defaults to `0` while the probe defaults to `300`. The doc comment
 says it outright: it "spends real quota, so it ships dark and is only ever running when
 explicitly enabled" (`src/manager/state.rs:20-22`). Set it only when you have measured that
 a cold prefix costs you more than the warming requests do.
 
-## `lockAccount` — read this before setting it
+## `lockAccount`: read this before setting it
 
 `lockAccount` pins **all** traffic to the single account whose `name` it names. LRU
 rotation, session affinity and load-balancing migration are all bypassed
 (`src/config.rs:235-239`).
 
 The part that bites: a locked account has **no failover**. If it is throttled, disabled or
-down, requests fail — the proxy does not rotate away from it, because rotating away is the
+down, requests fail: the proxy does not rotate away from it, because rotating away is the
 behaviour you turned off. On a fleet of one that is no loss; on a fleet you built for
-resilience it removes the resilience entirely. Treat it as a debugging tool, not a
-configuration.
+resilience it removes the resilience entirely. Treat it as a debugging tool.
 
 A name matching no account is not a startup failure: the proxy logs an error naming the
 available accounts and runs **unlocked** (`src/manager/mod.rs:637-647`). So a typo'd
@@ -240,10 +239,10 @@ The config holds live OAuth access and refresh tokens for every account. It is w
 mode `0o600` before any bytes are written (`src/config.rs:326-327`), and after the atomic
 rename an explicit `set_permissions` normalises the mode so a restrictive umask cannot
 leave it somewhere unexpected (`src/config.rs:434-439`). Every write path funnels through
-that one function — `save`, `save_tokens`, `save_disabled`, and by extension `tcr login`
+that one function: `save`, `save_tokens`, `save_disabled`, and by extension `tcr login`
 and the CLI mutators. The session-affinity pin file and the singleton owner file get the
 same treatment.
 
 Never commit this file, never paste its contents into an issue, a PR or a chat, and never
-copy it into a repository checkout — including this one, which is public. Tests in this
+copy it into a repository checkout, including this one, which is public. Tests in this
 repo write their own temporary configs with obviously fake values; do the same.
