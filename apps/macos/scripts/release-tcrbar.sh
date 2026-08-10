@@ -449,10 +449,6 @@ main() {
   pubdate="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
   url="https://github.com/$repo/releases/download/$tag/$(basename "$dmg")"
   ensure_appcast
-  if grep -q "sparkle:shortVersionString=\"$version\"" "$appcast_path"; then
-    die "$appcast_path already has an item for version $version." \
-        "Bump the version in Cargo.toml rather than republishing one."
-  fi
   item="    <item>
       <title>$app_name $version</title>
       <link>https://github.com/$repo/releases/tag/$tag</link>
@@ -462,6 +458,34 @@ main() {
       <pubDate>$pubdate</pubDate>
       <enclosure url=\"$url\" type=\"application/octet-stream\" $sparkle_sig_attrs />
     </item>"
+
+  # The duplicate-item guard, derived from the bytes we are ABOUT TO WRITE.
+  #
+  # It used to be `grep -q "sparkle:shortVersionString=\"$version\""` — the
+  # ATTRIBUTE form — sitting four lines above the `item` block that writes the
+  # ELEMENT form. No item this script has ever produced could match it, so the
+  # guard was dead from the day it was written and the "dies at stage 8" it
+  # promises never once happened. That matters because a `--dry-run` writes the
+  # entry too: the documented failure mode is a real run aborting here AFTER
+  # notarizing, and instead it would have appended a second item for the same
+  # version.
+  #
+  # Restating the shape in a second place is what allowed the drift, so this no
+  # longer restates it. The needle is extracted from `$item` itself, matched with
+  # grep -F, and the extraction is asserted non-empty — if the item's field names
+  # ever change, this fails loudly rather than silently matching nothing.
+  local version_needle
+  version_needle="$(printf '%s\n' "$item" \
+    | grep -o '<sparkle:shortVersionString>[^<]*</sparkle:shortVersionString>')"
+  [ -n "$version_needle" ] \
+    || die "internal: could not derive the version line from the appcast item." \
+           "The item template changed; update the guard in stage 8."
+  if grep -qF "$version_needle" "$appcast_path"; then
+    die "$appcast_path already has an item for version $version." \
+        "Bump the version in Cargo.toml rather than republishing one." \
+        "A --dry-run also writes this entry; drop it before a real run."
+  fi
+
   appcast_insert "$item"
   note "appcast: added $version ($build_number) -> $appcast_path"
 
