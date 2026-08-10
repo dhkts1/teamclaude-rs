@@ -16,7 +16,12 @@ import Foundation
 ///
 ///     TcrBar --keep-awake-probe 10 &
 ///     sleep 3
-///     pmset -g assertions | grep TcrBar     # PreventUserIdleSystemSleep
+///     pmset -g assertions | grep -c 'pid <pid>'   # 3, one line per assertion
+///
+/// The count is the point. ``AwakeController`` holds three assertions —
+/// `PreventUserIdleSystemSleep`, `PreventSystemSleep`, `PreventDiskIdle` — and a
+/// gate that greps for one of them passes just as happily on a controller that
+/// dropped the other two.
 ///
 /// Like `--render-states` and `--render-icon` it is handled in
 /// `TcrBarEntry.main()` and exits before the shell is built, so no menu-bar item
@@ -29,8 +34,9 @@ public enum KeepAwakeProbe {
     ///
     /// Without this window the gate cannot attribute the release. A power
     /// assertion also disappears when its process dies, so a `pmset` reading
-    /// taken after the probe exits is equally consistent with "`endActivity`
-    /// released it" and with "it was never released and the kernel cleaned up" —
+    /// taken after the probe exits is equally consistent with
+    /// "`IOPMAssertionRelease` released it" and with "it was never released and
+    /// the kernel cleaned up" —
     /// the check would pass either way, which makes it not a check.
     ///
     /// Sampling inside this window separates them, and that separation was
@@ -78,7 +84,7 @@ public enum KeepAwakeProbe {
 
                 usage: TcrBar \(flag) <seconds>
 
-                Holds an idle-system-sleep assertion for <seconds>, releases it,
+                Holds \(AwakeController.assertionTypes.count) power assertions for <seconds>, releases them,
                 then lingers \(Int(lingerAfterRelease))s so the release is observable while this
                 process is still alive. Prove it with:
 
@@ -91,25 +97,35 @@ public enum KeepAwakeProbe {
             let controller = AwakeController()
             controller.setOn(true)
 
-            // There is deliberately no `guard controller.isOn` here, and its
-            // absence is the honest shape.
+            // This guard can fail, and that is why it is here.
             //
-            // `beginActivity` returns a non-optional, so `begin()` always
-            // stores a token and `isOn` is always true on the next line. A
-            // guard there cannot fail: it would read as a check on whether the
-            // assertion was really taken while checking nothing at all, which
-            // is worse than no check, because the next reader trusts it. What
-            // it purported to catch — a probe reporting success while holding
-            // nothing — is not observable in this process at all; only `pmset`
-            // can see a power assertion, and that reading is the gate in
+            // Under `beginActivity` it could not: the API returned a
+            // non-optional, so a check on it would have read as a check while
+            // checking nothing. `IOPMAssertionCreateWithName` returns an
+            // `IOReturn`, and ``AwakeController`` reports OFF unless all three
+            // assertions were taken — so `isOn` is now a real answer to "did
+            // the take succeed", and a probe that printed `holding` while
+            // holding nothing would make the gate below pass for the wrong
+            // reason. What the guard still cannot see is whether the kernel
+            // agrees; only `pmset` can, and that reading is the gate in
             // `apps/macos/README.md`.
             let pid = ProcessInfo.processInfo.processIdentifier
+            guard controller.isOn else {
+                write(
+                    to: FileHandle.standardError,
+                    """
+                    TcrBar: could not take the keep-awake assertions (pid \(pid))
+
+                    """)
+                exit(1)
+            }
             write(
                 to: FileHandle.standardOutput,
                 """
                 holding  pid \(pid)  for \(seconds)s
+                assertions: \(AwakeController.assertionTypes.joined(separator: ", "))
                 assertion name: \(AwakeController.reason)
-                check it:  pmset -g assertions | grep 'pid \(pid)'
+                check it:  pmset -g assertions | grep -c 'pid \(pid)'   # \(AwakeController.assertionTypes.count)
 
                 """)
             Thread.sleep(forTimeInterval: seconds)
@@ -119,7 +135,7 @@ public enum KeepAwakeProbe {
                 to: FileHandle.standardOutput,
                 """
                 released pid \(pid)  (staying alive \(Int(lingerAfterRelease))s so the release is \
-                attributable to endActivity, not to this process exiting)
+                attributable to IOPMAssertionRelease, not to this process exiting)
 
                 """)
             Thread.sleep(forTimeInterval: lingerAfterRelease)
