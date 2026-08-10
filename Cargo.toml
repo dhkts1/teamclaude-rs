@@ -10,6 +10,13 @@ description = "Lean single-user rotating Anthropic proxy with a live TUI — a R
 repository = "https://github.com/dhkts1/teamclaude-rs"
 homepage = "https://github.com/dhkts1/teamclaude-rs"
 
+# `publish = false` above hides this package from cargo-dist, which reads it to
+# decide what is distributable, so v0.2.4's release job failed with "This
+# workspace doesn't have anything for dist to Release!". This opts the binary
+# back in without opting the crate back into crates.io.
+[package.metadata.dist]
+dist = true
+
 [[bin]]
 name = "tcr"
 path = "src/main.rs"
