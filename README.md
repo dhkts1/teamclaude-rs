@@ -140,10 +140,18 @@ priority, and `revalidationServe` (on by default) serves the least-utilized surv
 than returning an error when the whole fleet reads over the soft threshold.
 
 Between requests, a quota probe keeps the bars fresh: one plain `GET` per account against
-Anthropic's OAuth usage endpoint, every 75 seconds by default, sequentially with 350 ms
-spacing. It issues no `/v1/messages` call, so it creates no messages. Keep-warm
-(`warmupSeconds`) is the opposite and is off by default — it really does post messages, and
-spends quota to do it.
+Anthropic's OAuth usage endpoint. It issues no `/v1/messages` call, so it creates no
+messages.
+
+**Each account is probed on its own randomly drawn schedule, not a fleet sweep.** Boot does
+one whole-fleet pass so the bars populate immediately (sequentially, 350 ms apart), and from
+then on every account sleeps a random 210-390 seconds — uniform around the
+`quotaProbeSeconds` default of 300, plus or minus 30% — before its own next probe, with a
+random initial offset drawn from `0..=300s` so a restart re-scatters the fleet instead of
+re-aligning it. Nothing shares an instant, nothing runs on an exact period. This replaced a
+75-second fleet-wide sweep that touched every account inside the same window, on the dot,
+forever. Keep-warm (`warmupSeconds`) got the same treatment; it is the opposite of the probe
+and is off by default — it really does post messages, and spends quota to do it.
 
 ## TcrBar (macOS)
 
@@ -238,7 +246,7 @@ so tokens are refreshed instead of expiring on you. A fuller shape:
 {
   "proxy": { "port": 3456 },
   "switchThreshold": 0.95,
-  "quotaProbeSeconds": 75,
+  "quotaProbeSeconds": 300,
   "accounts": [
     {
       "name": "alice@example.com",
@@ -265,7 +273,7 @@ appears in a config you have not edited:
 |---|---|---|
 | `throttle` | `{"minSpacingMs": 350, "burst": 4}` | A fleet-wide rate limiter on the single upstream send site. |
 | `revalidationServe` | `true` | When every account reads over the soft threshold, serve the least-utilized one instead of failing. |
-| `quotaProbeSeconds` | `75` | Probe cadence; `0` or less disables probing entirely. |
+| `quotaProbeSeconds` | `300` | Probe cadence — the CENTRE of a per-account random draw (`+/-30%`), not a fleet period; `0` or less disables probing entirely. |
 
 `throttle` has an inversion nobody guesses: **an absent `throttle` key means ON, and
 `"throttle": {}` means OFF.** The empty object is the documented escape hatch. This is the

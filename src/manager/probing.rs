@@ -36,7 +36,7 @@ impl Manager {
                 ProbeStatus::Error | ProbeStatus::Timeout | ProbeStatus::RateLimited => {
                     account.consecutive_probe_failures =
                         account.consecutive_probe_failures.saturating_add(1);
-                    // The CROSSING sweep only, so a probe that stays broken logs
+                    // The CROSSING probe only, so a probe that stays broken logs
                     // once rather than every cadence. An account whose quota we did
                     // read has nothing to give up on.
                     !account.quota_known
@@ -50,8 +50,8 @@ impl Manager {
             tracing::warn!(
                 account = %name,
                 index = idx,
-                failed_sweeps = PROBE_FAILURES_BEFORE_WARMING_UNPROBED,
-                "keep-warm: proceeding without quota evidence — the probe has failed every sweep and absence of evidence is not evidence of a live 5h window"
+                failed_probes = PROBE_FAILURES_BEFORE_WARMING_UNPROBED,
+                "keep-warm: proceeding without quota evidence — this account's probe has failed every time and absence of evidence is not evidence of a live 5h window"
             );
             // Same edge-triggered wake `apply_usage` fires when the gate opens the
             // other way: without it the account waits out a whole `warmupSeconds`
@@ -80,7 +80,7 @@ impl Manager {
     /// Excluding them outright made `Error` a life sentence: nothing probes or selects
     /// an errored row, and only a refresh clears it — so one transient rejection
     /// sidelined a healthy account until restart (observed live 2026-07-17).
-    pub(super) fn probeable_indices(&self) -> Vec<usize> {
+    pub fn probeable_indices(&self) -> Vec<usize> {
         let now_ms = crate::now_ms();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         accounts
@@ -97,8 +97,17 @@ impl Manager {
             .collect()
     }
 
-    /// Probe **every** OAuth account's quota concurrently. Refreshes all rows,
-    /// not just the serving one — that is the whole point of the background probe.
+    /// Probe **every** OAuth account's quota once, sequentially, spaced
+    /// [`crate::probe::PROBE_SPACING`] apart.
+    ///
+    /// This is the ONE-SHOT "refresh everything now" sweep, and it is still what
+    /// `tcr accounts --probe` / `tcr status`'s offline fallback need: a caller
+    /// with no server behind it wants every row filled before it renders, not a
+    /// schedule. The *background* refresh no longer goes through here — since
+    /// every account fired inside one `N * 350ms` window on an exact period,
+    /// which is the fleet synchronization [`crate::schedule`] exists to remove.
+    /// The server drives [`Self::probe_account`] per account on independent
+    /// random schedules instead.
     pub async fn probe_all(&self) {
         let idxs = self.probeable_indices();
         let last = idxs.len().saturating_sub(1);

@@ -1056,7 +1056,8 @@ pub async fn probe_incumbent(config: &Config) -> IncumbentProbe {
 /// it is, so a zero counter can never again pass for a measurement.
 ///
 /// The live path deliberately does NOT probe. Quota there comes from the server's
-/// own probe loop (every `quotaProbeSeconds`, 75s by default), which is both
+/// own probe loop (per account, on a random schedule centred on
+/// `quotaProbeSeconds`, 300s by default), which is both
 /// fresher in practice than a cold one-shot probe and one fewer caller hitting the
 /// usage endpoint — that endpoint rate-limits, and a second prober racing the
 /// server's is what makes a whole fleet read `probe=rate-limited`. Only the

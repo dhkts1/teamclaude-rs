@@ -104,13 +104,29 @@ const ERROR_REPROBE_CAP_MS: i64 = 30 * 60_000;
 /// TUI both read as enabled. That is the worse failure — an unbounded wait is a
 /// kill switch, a bounded one costs a few minutes.
 ///
-/// Three, from the probe cadence. One failed sweep proves nothing: the fleet-wide
+/// Three, from the probe cadence. One failed probe proves nothing: the fleet-wide
 /// false error `probing.rs` documents (a bursted sweep 429ing itself) is exactly a
 /// one-sweep event, and lifting on it would hand the boot burst straight back.
-/// Three failures are three separate sweeps a full cadence apart, which at the
-/// default [`crate::probe::DEFAULT_PROBE_SECONDS`] (75s) is ~2.5 minutes — a
-/// persistent condition, and a small fraction of any sane `warmupSeconds`. The
-/// wait is bounded by three probe cadences no matter how long the warm interval is.
+///
+/// **What the three count, since the probe went per-account.** The counter always
+/// lived on the account and was always bumped per PROBE by
+/// [`Manager::record_probe`]; when the background refresh was a fleet sweep, one
+/// sweep was one probe per account, so "three sweeps" and "three of this
+/// account's probes" were the same number. Only the first phrasing has stopped
+/// being true. The semantics are deliberately unchanged: three consecutive failed
+/// probes *of this account*, which is still exactly the "a probe failing once is a
+/// hiccup, three times is a condition" test it was chosen for — and it is now
+/// genuinely per-account, so one account with a dead credential no longer has its
+/// failures interleaved with a fleet-wide notion of a sweep.
+///
+/// What DID change is the wall clock, and only because the cadence moved. Three
+/// failures are three of this account's own randomly drawn intervals, so at the
+/// default [`crate::probe::DEFAULT_PROBE_SECONDS`] (300s, drawn `+/-30%`) the
+/// bound is 10.5-19.5 minutes rather than the old ~2.5. That is longer but still
+/// bounded, still a fraction of any sane `warmupSeconds` (3600s is the usual
+/// value), and it is only ever paid when the probe is genuinely broken — a
+/// working probe latches `quota_known` on its first success and never reaches
+/// here at all.
 const PROBE_FAILURES_BEFORE_WARMING_UNPROBED: u32 = 3;
 
 /// Decay window for [`AccountRuntime::stream_error_times_ms`] — how far back a
@@ -196,7 +212,7 @@ pub struct AccountRuntime {
     /// responses never carry a 5h bucket would become permanently warm-INELIGIBLE —
     /// a dark feature that reads as enabled.
     pub quota_known: bool,
-    /// Probe sweeps that have failed CONSECUTIVELY without reading this account's
+    /// Probes of THIS account that have failed CONSECUTIVELY without reading its
     /// quota. Bumped by [`Manager::record_probe`] on every terminal failure and
     /// reset to `0` by a success.
     ///
@@ -1642,7 +1658,7 @@ mod tests {
     ///
     /// `warm_targets` skips an account whose quota was never read while probing is
     /// enabled (blank quota is unknown, not known-cold), and `config_with` leaves
-    /// `quotaProbeSeconds` at its default 75 — so without this, every keep-warm test
+    /// `quotaProbeSeconds` at its default (nonzero) — so without this, every keep-warm test
     /// below would be measuring the boot gate instead of the predicate it is
     /// actually about.
     ///

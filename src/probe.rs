@@ -27,12 +27,30 @@ pub const OAUTH_USAGE_BETA: &str = "oauth-2025-04-20";
 /// Per-probe wall-clock ceiling; a probe that outlives it reads as a timeout.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Default probe cadence when `quotaProbeSeconds` is absent from the config.
-pub const DEFAULT_PROBE_SECONDS: u64 = 75;
-/// Delay between sequential per-account probes in one sweep. Probing every
+///
+/// This is the CENTRE of a per-account random draw, not a fleet-wide period: the
+/// background scheduler ([`crate::schedule`]) draws each account's next probe
+/// uniformly from `cadence +/- 30%` and gives each a random initial offset, so N
+/// accounts never share an instant and a restart re-scatters them. Raised from
+/// 75s to 300s together with that change — a synchronized 75s fleet sweep was
+/// both the loudest and the most fingerprintable thing this proxy did, and the
+/// bars do not need refreshing four times a minute.
+pub const DEFAULT_PROBE_SECONDS: u64 = 300;
+/// Delay between sequential per-account probes in one *sweep*. Probing every
 /// account concurrently bursts the usage endpoint and trips *its* 429 rate limit
 /// — which used to surface as a false "error" on every row. Spacing the calls
 /// keeps a full sweep well inside the cadence while staying under the endpoint's
 /// burst limit.
+///
+/// Still load-bearing, and still the aggregate-rate bound the throttle default
+/// mirrors ([`crate::config::ThrottleConfig`]). It applies to the two remaining
+/// places that touch several accounts in a row: the one-shot sweeps
+/// ([`crate::manager::Manager::probe_all`], `tcr accounts --probe`,
+/// [`crate::manager::Manager::warm_all`]) and the rare case of two randomly
+/// scheduled accounts coming due together. The background scheduler is strictly
+/// *less* aggressive than the sweep it replaced — the same N calls are spread
+/// across a whole cadence instead of packed into one `N * 350ms` run — so
+/// nothing about the bound is weakened by it.
 pub const PROBE_SPACING: Duration = Duration::from_millis(350);
 
 /// One normalized usage window: fractional utilization (`0.0..=1.0+`) and the

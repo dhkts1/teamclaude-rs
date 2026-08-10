@@ -159,8 +159,30 @@ boot or request path, not compatibility leftovers.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `quotaProbeSeconds` | i64 seconds | **`75`** | no | quota probe cadence; `<= 0` disables probing (`src/manager/state.rs:9-17`, constant at `src/probe.rs:30`) |
-| `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence; `<= 0` spawns no warm task (`src/manager/state.rs:23-31`) |
+| `quotaProbeSeconds` | i64 seconds | **`300`** | no | quota probe cadence — the CENTRE of a per-account random draw, not a fleet period; `<= 0` disables probing (`src/manager/state.rs:9-17`, constant at `src/probe.rs:30`) |
+| `warmupSeconds` | i64 seconds | **`0`** (OFF) | no | keep-warm cadence, drawn the same per-account random way; `<= 0` spawns no warm task (`src/manager/state.rs:23-31`) |
+
+### Both cadences are random per account, not a fleet sweep
+
+Neither `quotaProbeSeconds` nor `warmupSeconds` is a period the fleet fires on. Each is the
+**centre of an independent random draw per account** (`src/schedule.rs`):
+
+| draw | distribution | at the 300s default |
+|---|---|---|
+| initial offset (first fire after boot, and whenever an account becomes eligible) | uniform over `[0, cadence]` seconds | `0..=300s` |
+| every subsequent interval | uniform over `[cadence - 30%, cadence + 30%]` seconds, floored at 1s | `210..=390s`, 181 distinct values |
+
+Consequences worth knowing before you tune either number:
+
+- Two accounts do not share a probe instant, and a restart re-draws every offset rather
+  than re-anchoring the fleet's phase on boot time.
+- A single account's gap between probes is never the number you configured — it is a fresh
+  draw each time, centred on it. Halving `quotaProbeSeconds` halves the centre, not a period.
+- The probe (not keep-warm) still does ONE whole-fleet sweep at boot, spaced 350 ms, so the
+  bars populate immediately instead of after a random offset.
+- Randomness is drawn from a SplitMix64 generator seeded once from the boot clock. There is
+  no `rand` dependency, and per-account draws are decorrelated by construction — re-reading
+  the clock per account in a tight loop would not have been.
 | `sessionAffinity` | bool | **`false`** (OFF) | no | pin a session to the account it started on (`src/manager/state.rs:38-46`) |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold (`src/manager/state.rs:53-61`) |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts (`src/manager/state.rs:74-82`) |
