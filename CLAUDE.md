@@ -5,7 +5,10 @@ the expensive way, not a style preference.
 
 ## This repository is public
 
-Assume every line you commit is world-readable, because it is.
+Assume every line you commit is world-readable, because it is. This rule is kept in full here, and
+not behind a link, because an agent must obey it without reading anything else; the same rule with
+its full rationale is [`CONTRIBUTING.md`](CONTRIBUTING.md) § "The two things to read before your
+first commit".
 
 - **No real account data.** Account emails, organization UUIDs, account UUIDs and workspace names never
   go into fixtures, tests, commit messages, PR titles or PR bodies. Use obviously-fake values
@@ -39,38 +42,39 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
   cold-prefix cost above. Plan the update for a quiet moment; it is not a free background operation.
 - **`cargo build --release` is safe while it is running.** Cargo writes a new file and renames, so the
   live process keeps its own inode and its own bytes (measured 2026-08-07, N=5 — a fresh `exec` during
-  the build exits 0). The real hazard is overwriting a binary *in place*: `cp` onto a path something is
-  executing rewrites the **same inode**, and macOS then SIGKILLs every later `exec` of it with
-  `Code Signature Invalid`. That killed 25 processes on 2026-08-06. `codesign -v` returns 0 on the
-  corrupted file — the artifact is fine, the kernel's cached signature is stale — so it cannot detect
-  this class. Place a binary with `scripts/install-cli.sh` (stage in the destination dir, then
-  `rename(2)`), never `cp`.
+  the build exits 0). **Placing** a binary is the unsafe part: never `cp`, always
+  `scripts/install-cli.sh` — the reason, and the 25 processes it killed, are in
+  [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Installing it onto your PATH".
 - **The build probably does not land in `target/`.** `CARGO_TARGET_DIR` redirects it and every agent
-  session here sets it, so `<repo>/target/release/tcr` is usually a stale orphan from before that
-  variable existed. Resolve the real path from `cargo metadata --format-version 1 --no-deps`
-  (`.target_directory`) rather than writing it down.
+  session here sets it. Resolve the real path from `cargo metadata` rather than writing it down —
+  command and rationale in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Finding the binary you just built".
 - The running process can be several commits behind the source. `tcr status --json` reports the running
   build's SHA — check it before concluding a fix is live. "The fix is in `main`" and "the fix is in the
-  process serving traffic" are routinely different facts.
+  process serving traffic" are routinely different facts. (Kept in full here rather than as a link,
+  because it is the check that stops a false "it's live" claim; also in
+  [`docs/cli.md`](docs/cli.md) § `tcr status`.)
 
 ## Branching
 
 - **The primary checkout stays on `main`.** This is a convention, not something the repo checks — the
-  pre-commit hook in `.githooks/` runs a secret scan, a private-disclosure scan, format gates and a
-  release-version gate, and looks at no branch. Keeping to it is on you. Do feature work in a worktree:
-  `git worktree add ~/worktrees/<name> -b <branch> main`.
+  pre-commit hook in `.githooks/` runs six gates (secret scan, public-repo disclosure scan, Rust
+  format, Swift format, release-version, design-token staleness) and looks at no branch. Keeping to it
+  is on you. Do feature work in a worktree:
+  `git worktree add ~/worktrees/<name> -b <branch> main`. What each gate blocks on, and which two are
+  hard failures when their tool or input is missing, is in [`CONTRIBUTING.md`](CONTRIBUTING.md)
+  § "Git hooks".
 - Branch **before** you start editing. Making changes in the primary checkout and then wanting a branch
   is a trap — a fresh worktree branches from `HEAD` without your uncommitted work, and any shared file
   (`Cargo.toml`) blocks a clean move.
-- `main` requires a pull request, one approval, and the `ci` and `audit` checks. An admin exemption
-  exists; using it is a deliberate decision, not a shortcut, and GitHub records it as
-  `Bypassed rule violations` in the push output. Read that output — a push can succeed *and* have
-  bypassed the rules.
+- `main` requires a pull request, one approval, and the `ci` and `audit` checks; an admin bypass exists
+  and is a deliberate decision, never a shortcut. The CI job table and how a bypass shows up in the
+  push output are in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Pull requests and CI".
 
 ## Commits
 
-Conventional commits, **bare type only** — `fix:`, `feat:`, `docs:`, `refactor:`, `chore:`, `test:`.
-A parenthesised scope (`fix(quota):`) is rejected by the commit gates. Put the scope in the body.
+Conventional commits, **bare type only** — a parenthesised scope (`fix(quota):`) is rejected by the
+commit gates; put the scope in the body. Allowed types and examples:
+[`CONTRIBUTING.md`](CONTRIBUTING.md) § "Commits".
 
 ## Verifying a change
 
