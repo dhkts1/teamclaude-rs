@@ -326,8 +326,11 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
     cmd.args(&args.args);
 
     if cli::proxy_is_up(port) {
-        if let Some(key) = config.proxy.api_key.as_deref() {
-            cmd.env("ANTHROPIC_API_KEY", key);
+        if let Some(notice) = withheld_api_key_notice(
+            config.proxy.api_key.is_some(),
+            std::env::var_os("ANTHROPIC_API_KEY").is_some(),
+        ) {
+            eprintln!("{notice}");
         }
         // Two ways to route claude at ourselves, and they are NOT equivalent to
         // Claude Code — see `apply_see_through_env` for why we prefer the first.
@@ -379,6 +382,29 @@ fn see_through_ca() -> Option<PathBuf> {
             None
         }
     }
+}
+
+/// Why `tcr run` does NOT hand the configured proxy key to `claude` as
+/// `ANTHROPIC_API_KEY`, and says so.
+///
+/// It used to. Setting that variable makes Claude Code treat an API key as its auth
+/// source AHEAD of the claude.ai login, and that **disables every claude.ai
+/// connector** — announced once, in one startup line that scrolls away, after which
+/// the tools are simply absent. It bought nothing in exchange: the `x-api-key` gate
+/// exempts loopback clients (see `proxy::handle`), and the server binds 127.0.0.1
+/// only, so a `tcr run` child is always exempt. Measured with the variable absent:
+/// `/v1/messages` served and rotated across accounts, and every connector loaded.
+///
+/// A value the CALLER exported is inherited untouched — an explicit choice wins, and
+/// it is the escape hatch for a `claude` with no claude.ai login of its own, which
+/// does need some credential to start.
+fn withheld_api_key_notice(configured: bool, caller_set: bool) -> Option<&'static str> {
+    (configured && !caller_set).then_some(
+        "[tcr] not exporting ANTHROPIC_API_KEY from proxy.apiKey: it would outrank claude's \
+         claude.ai login and disable every claude.ai connector. The proxy does not need it — \
+         its api-key gate exempts loopback clients. Export it yourself if this `claude` has no \
+         claude.ai login of its own.",
+    )
 }
 
 /// SEE-THROUGH mode — the preferred route. `claude` keeps the REAL first-party
@@ -938,6 +964,57 @@ mod tests {
     fn silent() -> cli::Liveness {
         cli::Liveness::Silent {
             why: "the server did not answer within 5s".to_string(),
+        }
+    }
+
+    /// Pins that a configured proxy key is withheld from `claude`, and says why.
+    #[test]
+    fn the_proxy_key_is_withheld_from_claude_with_the_reason() {
+        let notice = withheld_api_key_notice(true, false).expect("a configured key is withheld");
+        assert!(
+            notice.contains("connector"),
+            "the notice must name what exporting it costs: {notice}"
+        );
+        assert!(
+            notice.contains("Export it yourself"),
+            "the notice must name the escape hatch: {notice}"
+        );
+
+        assert_eq!(
+            withheld_api_key_notice(false, false),
+            None,
+            "nothing is withheld when no proxy key is configured"
+        );
+        assert_eq!(
+            withheld_api_key_notice(true, true),
+            None,
+            "a key the caller exported is their choice — we neither replace it nor comment"
+        );
+    }
+
+    /// Neither routing mode may hand `claude` an `ANTHROPIC_API_KEY`.
+    #[test]
+    fn no_routing_mode_gives_claude_an_api_key() {
+        for (label, apply) in [
+            (
+                "see-through",
+                &(|cmd: &mut std::process::Command| {
+                    apply_see_through_env(cmd, 3456, Path::new("/tmp/ca.pem"))
+                }) as &dyn Fn(&mut std::process::Command),
+            ),
+            (
+                "base-URL",
+                &(|cmd: &mut std::process::Command| apply_base_url_env(cmd, 3456)),
+            ),
+        ] {
+            let mut cmd = std::process::Command::new("claude");
+            apply(&mut cmd);
+            assert!(
+                !cmd.get_envs()
+                    .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_some()),
+                "{label} mode must not set ANTHROPIC_API_KEY — it outranks the claude.ai \
+                 login and disables every claude.ai connector"
+            );
         }
     }
 
