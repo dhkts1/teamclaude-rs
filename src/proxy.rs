@@ -127,6 +127,24 @@ const RETRY_529_MAX_BACKOFF_SECS: i64 = 4;
 /// request would do it too.
 const MAX_529_FAILOVERS_PER_REQUEST: u32 = 2;
 
+/// How many times ONE client request may wait in place for name resolution to
+/// come back before it gives up and answers `503`.
+///
+/// Per-REQUEST, not per-account, and deliberately small. A DNS failure is a
+/// statement about the MACHINE, so there is no fleet to walk and nothing to be
+/// gained by spending more of the attempt budget on it — the only question is
+/// whether the outage is short enough to ride out without the client noticing.
+/// With [`OFFLINE_WAIT_SECS`] this bounds the added latency at 6s per request.
+const MAX_OFFLINE_WAITS_PER_REQUEST: u32 = 3;
+/// Pause between the in-place retries counted by [`MAX_OFFLINE_WAITS_PER_REQUEST`].
+/// Short: a lid-wake resolver comes back within a couple of seconds or not at
+/// all, and the per-account in-flight slot is held across the wait.
+const OFFLINE_WAIT_SECS: u64 = 2;
+/// `retry-after` handed to the client with the offline `503`. The condition is
+/// recoverable and usually short — measured 2026-08-10, DNS was back within
+/// seconds of each full wake — so this is a nudge to come back, not a park.
+const OFFLINE_RETRY_AFTER_SECS: i64 = 5;
+
 /// Backoff (seconds) before the `retried`-th in-place retry of a `529 Overloaded`.
 ///
 /// The ladder is exponential from [`RETRY_529_BASE_BACKOFF_SECS`] — 1s, 2s — so a
@@ -241,6 +259,53 @@ fn soft_wait_secs(soonest_free_secs: i64, already_waited: bool) -> Option<u64> {
     }
 }
 
+/// Frames in a transport error's `source()` chain that name a NAME-RESOLUTION
+/// failure. Matched case-insensitively as substrings of each frame's `Display`.
+///
+/// The first is hyper-util's own label for the connector's DNS phase
+/// (`ConnectError::new("dns error", ..)`); the rest are the operating system's
+/// `getaddrinfo` texts that `std` wraps into an `io::Error` whose `ErrorKind` is
+/// `Uncategorized` — a kind that cannot be matched on stable Rust, which is why
+/// this is a string match and not a `downcast_ref` + kind comparison.
+const DNS_FAILURE_MARKERS: [&str; 4] = [
+    "dns error",
+    "failed to lookup address information",
+    "nodename nor servname provided",
+    "temporary failure in name resolution",
+];
+
+/// Is this transport failure the machine being OFFLINE rather than a bad route
+/// to one upstream?
+///
+/// Why it is not `err.is_connect()`: `is_connect()` is true for a DNS failure
+/// AND for a refused/blackholed connection to a host that resolves fine. Only
+/// the first is machine-level. Every account in the fleet resolves the SAME
+/// hostname, so a resolver failure is not evidence about any account — answering
+/// it by rotating walks all thirteen accounts in under a second, unpins the
+/// session (a re-pin costs a full cold prefix, the most expensive event here) and
+/// hands the client a 502. Measured 2026-08-10: 57 client-visible 502s, all
+/// inside one lid-close/dark-wake window, 39-159 resolver failures per minute.
+/// A refused connection to a reachable host IS real evidence about a route, so
+/// it must keep taking the rotate arm.
+///
+/// The chain must be WALKED. `reqwest::Error`'s `Display` prints only its own top
+/// frame and never recurses (the same property that forces `?err` over `%err` at
+/// the log site below), so the resolver text lives strictly in a `source()`.
+fn is_offline_error(err: &reqwest::Error) -> bool {
+    let mut frame: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = frame {
+        let rendered = cause.to_string().to_ascii_lowercase();
+        if DNS_FAILURE_MARKERS
+            .iter()
+            .any(|marker| rendered.contains(marker))
+        {
+            return true;
+        }
+        frame = cause.source();
+    }
+    false
+}
+
 /// The most upstream sends ONE account can absorb inside a single client
 /// request, derived from the per-account ladders rather than guessed.
 ///
@@ -278,10 +343,16 @@ const MAX_SENDS_PER_ACCOUNT: usize =
 /// `overloaded_529_failover_worst_case_latency_is_bounded` and
 /// `the_mixed_transport_and_529_ladder_fits_the_attempt_budget` bind THIS
 /// formula instead of a copy of it that could silently drift from it.
+///
+/// [`MAX_OFFLINE_WAITS_PER_REQUEST`] is added on top because the offline arm's
+/// in-place retries are bounded per REQUEST, not per account, so they are not
+/// expressible in [`MAX_SENDS_PER_ACCOUNT`]. Without the term a request that
+/// rides out a resolver blip could be truncated mid-walk — the exact silent
+/// failure the `2n + 4` formula caused.
 fn max_attempts_for(account_count: usize) -> usize {
     account_count
         .saturating_mul(MAX_SENDS_PER_ACCOUNT)
-        .saturating_add(4)
+        .saturating_add(4 + MAX_OFFLINE_WAITS_PER_REQUEST as usize)
         .max(1)
 }
 
@@ -843,7 +914,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // reset when the account changes.
     let mut failovers_529 = 0u32;
     // Distinguishes "no account available" (429) from "every attempt hit a
-    // transport failure" (502) once the loop can no longer make progress.
+    // transport failure" once the loop can no longer make progress. The latter is
+    // a 502 — EXCEPT when `offline_failures` below says the transport failures
+    // were this machine's resolver, which is a 503.
     //
     // These were ONE BOOL, and that was the bug: any single `send()` failure
     // latched it for the rest of the request, and the check sits BEFORE both the
@@ -891,10 +964,30 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // fresh one. Bounded to one per account per request: the second failure IS
     // evidence about the account, and `tried.insert` then behaves exactly as before.
     //
-    // Gated on the error KIND at the arm below: that rationale is about a pooled
-    // connection dying, so it does not hold for a CONNECT failure, where there was
-    // no connection to evict and the retry only pays a second connect timeout.
+    // Gated on the error KIND. The transport-failure branch below is THREE arms,
+    // evaluated in this order — read them as narrowing scope, machine → connection
+    // → account:
+    //
+    //  1. OFFLINE (`is_offline_error`): name resolution failed, so the fault is
+    //     the MACHINE. Every account resolves the same hostname, so there is
+    //     nothing to bench and nowhere to rotate to. Holds the pin, waits, retries
+    //     the same account, and after `MAX_OFFLINE_WAITS_PER_REQUEST` answers 503.
+    //  2. SAME-ACCOUNT RETRY (this set): a non-CONNECT failure, i.e. a pooled
+    //     CONNECTION died. One retry per account per request, per the rationale
+    //     above. Deliberately not taken for a CONNECT failure — there was no
+    //     connection to evict, nothing is refreshed by trying again, and the retry
+    //     only buys a second connect timeout on a route already not answering.
+    //  3. ROTATE: everything else — a route to a resolvable host that is refused,
+    //     blackholed or timing out. That IS evidence about this route, so bench the
+    //     account and let the rotation do its job.
     let mut transport_retried: HashSet<usize> = HashSet::new();
+    // In-place waits this request has spent on a name-resolution failure, and how
+    // many such failures it saw at all. Per-REQUEST: an offline machine is one
+    // condition shared by every account, so there is nothing to count per account.
+    // `offline_failures` outlives the waits so the terminal answer can be the
+    // honest 503 even if the request later rotates for an unrelated reason.
+    let mut offline_waits = 0u32;
+    let mut offline_failures = 0usize;
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
@@ -904,6 +997,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 Some(idx) => idx,
                 None => {
                     if every_attempt_transport_failed(transport_failures, upstream_responses) {
+                        // Nothing reached an upstream — but WHY decides the status.
+                        // If any attempt died in the resolver, the honest answer is
+                        // the recoverable 503, not a 502 asserting the upstream is
+                        // unreachable when it is this machine that is off the
+                        // network. Reachable here only if the offline arm's own
+                        // bound was not what ended the walk (a mixed request that
+                        // rotated for another reason first).
+                        if offline_failures > 0 {
+                            return offline_unavailable(offline_failures);
+                        }
                         return bad_gateway(transport_failures);
                     }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
@@ -1075,8 +1178,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         let resp = match builder.send().await {
             Ok(resp) => resp,
             Err(err) => {
-                // Transport failure is not proof of a bad credential — fail this
-                // request over to another account, keep this one eligible. The
+                // Transport failure is not proof of a bad credential, so nothing
+                // here ever disables an account — the three arms differ only in
+                // whether this request retries in place, rotates, or gives up.
+                // Their order and rationale are at `transport_retried` above. The
                 // `reqwest::Error` used to be discarded by a `let Ok(..) else`,
                 // so a 502 assembled out of these failures had no line anywhere to
                 // attribute it to; `is_connect` / `is_timeout` separate "never
@@ -1099,6 +1204,31 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // 8-account fleet — while each request holds its per-account
                 // in-flight slot for the whole of it. Bench the account and let
                 // the rotation do its job.
+                // FIRST arm, ahead of both of the account-level ones: a resolver
+                // failure is a fact about this MACHINE, not about the account that
+                // happened to be selected. Every account resolves the same
+                // hostname, so neither benching this one nor moving to the next can
+                // possibly help — it only unpins the session and burns the fleet.
+                // Hold the pin, wait briefly, retry the SAME account.
+                if is_offline_error(&err) {
+                    offline_failures += 1;
+                    if offline_waits < MAX_OFFLINE_WAITS_PER_REQUEST {
+                        offline_waits += 1;
+                        tracing::warn!(
+                            account_index = idx,
+                            account = account_name.as_deref().unwrap_or("?"),
+                            offline_wait = offline_waits,
+                            max_offline_waits = MAX_OFFLINE_WAITS_PER_REQUEST,
+                            error = ?err,
+                            "name resolution failed — this machine is offline; \
+                             holding the pinned account and waiting"
+                        );
+                        next_idx = Some(idx);
+                        tokio::time::sleep(Duration::from_secs(OFFLINE_WAIT_SECS)).await;
+                        continue;
+                    }
+                    return offline_unavailable(offline_failures);
+                }
                 if !err.is_connect() && transport_retried.insert(idx) {
                     // First blip on this account this request: retry it on a fresh
                     // connection rather than benching an account that is probably fine.
@@ -2097,6 +2227,32 @@ fn bad_gateway(transport_failures: usize) -> Response {
         "proxy_error",
         &format!("Upstream unreachable: all {transport_failures} attempt(s) failed in transport."),
         None,
+    )
+}
+
+/// `503 + Retry-After` when name resolution kept failing: this machine is off the
+/// network, which is recoverable and says nothing about any account.
+///
+/// Deliberately not [`bad_gateway`]. A 502 asserts "every attempt failed in
+/// transport, none reached an upstream" — true, but it points the client at the
+/// upstream when the fault is local, and it carries no `retry-after`, so a client
+/// has no guidance beyond "give up". The account pool is NOT rotated on this path
+/// and the session keeps its pin.
+fn offline_unavailable(dns_failures: usize) -> Response {
+    tracing::warn!(
+        dns_failures,
+        retry_after = OFFLINE_RETRY_AFTER_SECS,
+        "returning 503 to client — name resolution is failing, this machine is offline; \
+         the account pool was NOT rotated"
+    );
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "proxy_error",
+        &format!(
+            "Name resolution failed on {dns_failures} attempt(s) — this machine appears to be \
+             offline. No account was rotated. Retry in {OFFLINE_RETRY_AFTER_SECS}s."
+        ),
+        Some(OFFLINE_RETRY_AFTER_SECS),
     )
 }
 
@@ -5624,6 +5780,115 @@ mod tests {
         assert!(
             !every_attempt_transport_failed(0, 0),
             "no attempt made → exhausted, not unreachable"
+        );
+    }
+
+    /// Issue a real request that cannot succeed and hand back the real
+    /// `reqwest::Error`. A hand-built stub would prove nothing here: the whole
+    /// question is what the LIVE error's `source()` chain looks like.
+    async fn transport_error_for(url: &str) -> reqwest::Error {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client builds")
+            .get(url)
+            .send()
+            .await
+            .expect_err("this request cannot succeed")
+    }
+
+    /// A port nothing is listening on: bind it, read it back, release it.
+    fn closed_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        port
+    }
+
+    /// The two-sided gate on [`is_offline_error`]. One side alone is worthless —
+    /// a classifier that answers `true` to everything passes the offline half and
+    /// would then hold every dead route on its pinned account forever.
+    ///
+    /// Both errors below are `is_connect() == true`, which is precisely why the
+    /// arm cannot be gated on `is_connect()`: that is the bug being fixed.
+    #[tokio::test]
+    async fn is_offline_error_separates_a_dead_resolver_from_a_dead_route() {
+        // TRUE case: `.invalid` is reserved by RFC 2606 to never resolve.
+        let dns = transport_error_for("http://offline-probe.invalid/v1/messages").await;
+        println!(
+            "offline case: is_offline={} is_connect={} err={dns:?}",
+            is_offline_error(&dns),
+            dns.is_connect()
+        );
+        assert!(
+            dns.is_connect(),
+            "precondition: a resolver failure is is_connect, so is_connect cannot discriminate"
+        );
+        assert!(
+            is_offline_error(&dns),
+            "a name-resolution failure must classify as offline: {dns:?}"
+        );
+
+        // FALSE case: the host resolves and answers with an RST. That IS evidence
+        // about the route, so it must keep taking the rotate arm.
+        let url = format!("http://127.0.0.1:{}/v1/messages", closed_loopback_port());
+        let refused = transport_error_for(&url).await;
+        println!(
+            "refused case: is_offline={} is_connect={} err={refused:?}",
+            is_offline_error(&refused),
+            refused.is_connect()
+        );
+        assert!(
+            refused.is_connect(),
+            "precondition: a refused connection is is_connect too"
+        );
+        assert!(
+            !is_offline_error(&refused),
+            "connection refused to a resolvable host is a ROUTE failure, not an offline \
+             machine — classifying it offline would pin a request to a dead account: {refused:?}"
+        );
+    }
+
+    /// End to end: an upstream whose hostname cannot resolve must answer `503`
+    /// with a `retry-after`, never the `502` this branch used to produce.
+    #[tokio::test]
+    async fn an_unresolvable_upstream_answers_503_with_retry_after_not_502() {
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, "http://offline-probe.invalid"), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app(manager)).await;
+        });
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/messages"))
+            .json(&serde_json::json!({"model": "claude-3-5-sonnet", "messages": []}))
+            .send()
+            .await
+            .expect("the proxy itself is reachable");
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "an offline machine is a recoverable local condition, not a bad gateway"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok()),
+            Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "the 503 must tell the client when to come back"
+        );
+    }
+
+    /// The per-request wait bound must stay inside the loop's total attempt
+    /// budget, for the smallest fleet there can be — otherwise a request that
+    /// rides out a resolver blip is truncated mid-walk.
+    #[test]
+    fn the_offline_wait_bound_fits_the_attempt_budget() {
+        assert!(
+            (MAX_OFFLINE_WAITS_PER_REQUEST as usize) < max_attempts_for(1),
+            "offline waits ({MAX_OFFLINE_WAITS_PER_REQUEST}) must not exhaust the attempt budget"
         );
     }
 
