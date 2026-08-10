@@ -212,8 +212,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args),
         Some(Command::Priority(args)) => run_priority(args),
-        Some(Command::Enable(args)) => run_enable(args),
-        Some(Command::Disable(args)) => run_disable(args),
+        Some(Command::Enable(args)) => run_enable(args).await,
+        Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
@@ -249,16 +249,18 @@ fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     cli::set_priority(&config_path, &args.query, priority, args.org.as_deref())
 }
 
-/// `tcr enable <query> [--org]` — clear an account's `disabled` flag.
-fn run_enable(args: EnableArgs) -> anyhow::Result<()> {
+/// `tcr enable <query> [--org]` — clear an account's `disabled` flag, in the
+/// RUNNING proxy where there is one (async for that reason alone).
+async fn run_enable(args: EnableArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::set_enabled(&config_path, &args.query, args.org.as_deref(), false)
+    cli::set_enabled(&config_path, &args.query, args.org.as_deref(), false).await
 }
 
-/// `tcr disable <query> [--org]` — hold an account out of rotation.
-fn run_disable(args: DisableArgs) -> anyhow::Result<()> {
+/// `tcr disable <query> [--org]` — hold an account out of rotation, in the RUNNING
+/// proxy where there is one.
+async fn run_disable(args: DisableArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::set_enabled(&config_path, &args.query, args.org.as_deref(), true)
+    cli::set_enabled(&config_path, &args.query, args.org.as_deref(), true).await
 }
 
 /// `tcr status [--json]` — probe every account's live quota and print it.

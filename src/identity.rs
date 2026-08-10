@@ -136,34 +136,94 @@ pub fn email_of(name: &str) -> &str {
     name
 }
 
+/// The three fields a user-supplied account query is matched against.
+///
+/// It exists so ONE resolution rule runs over both representations of the fleet:
+/// the config file's [`Account`] records (what the CLI edits) and the running
+/// proxy's in-memory rotation slots (`manager::AccountRuntime`, what the live
+/// control endpoint mutates). Duplicating the rule instead is how a CLI and an
+/// endpoint come to disagree about which account `disable alice` names — and the
+/// endpoint's index is a rotation slot, so disagreeing there benches the wrong
+/// account.
+pub trait Queryable {
+    fn query_name(&self) -> &str;
+    fn query_org_name(&self) -> Option<&str>;
+    fn query_org_uuid(&self) -> Option<&str>;
+}
+
+impl Queryable for Account {
+    fn query_name(&self) -> &str {
+        &self.name
+    }
+    fn query_org_name(&self) -> Option<&str> {
+        self.org_name.as_deref()
+    }
+    fn query_org_uuid(&self) -> Option<&str> {
+        self.org_uuid.as_deref()
+    }
+}
+
 /// Indices of accounts matching `query` (exact name, else email), narrowed by
 /// `org_filter` (org name exact, or org uuid exact/prefix). Caller decides on
 /// 0/1/many.
-pub fn match_accounts(accounts: &[Account], query: &str, org_filter: Option<&str>) -> Vec<usize> {
+pub fn match_accounts<T: Queryable>(
+    accounts: &[T],
+    query: &str,
+    org_filter: Option<&str>,
+) -> Vec<usize> {
     let mut matches: Vec<usize> = accounts
         .iter()
         .enumerate()
-        .filter(|(_, a)| a.name == query)
+        .filter(|(_, a)| a.query_name() == query)
         .map(|(i, _)| i)
         .collect();
     if matches.is_empty() {
         matches = accounts
             .iter()
             .enumerate()
-            .filter(|(_, a)| email_of(&a.name) == query)
+            .filter(|(_, a)| email_of(a.query_name()) == query)
             .map(|(i, _)| i)
             .collect();
     }
     if let Some(f) = org_filter {
         matches.retain(|&i| {
             let a = &accounts[i];
-            a.org_name.as_deref().is_some_and(|n| n == f)
-                || a.org_uuid
-                    .as_deref()
+            a.query_org_name().is_some_and(|n| n == f)
+                || a.query_org_uuid()
                     .is_some_and(|u| u == f || u.starts_with(f))
         });
     }
     matches
+}
+
+/// What a user-supplied `(query, org)` resolved to.
+///
+/// Separate from [`Resolved`], which resolves a stored IDENTITY against records.
+/// This one resolves a human's argument, so its ambiguous arm carries the
+/// candidate NAMES: every caller has to put them in front of the person who
+/// typed the query, or `--org` is unusable advice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Match {
+    /// Exactly one account matched, at this index.
+    One(usize),
+    /// Nothing matched.
+    None,
+    /// Two or more matched; these are their names, in fleet order.
+    Ambiguous(Vec<String>),
+}
+
+/// [`match_accounts`] collapsed to the 0 / 1 / many decision every caller makes.
+pub fn match_one<T: Queryable>(accounts: &[T], query: &str, org_filter: Option<&str>) -> Match {
+    let candidates = match_accounts(accounts, query, org_filter);
+    match candidates.as_slice() {
+        [] => Match::None,
+        [only] => Match::One(*only),
+        many => Match::Ambiguous(
+            many.iter()
+                .map(|&i| accounts[i].query_name().to_string())
+                .collect(),
+        ),
+    }
 }
 
 /// Build a lightweight probe [`Account`] carrying only the identity fields, for

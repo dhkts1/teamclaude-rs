@@ -261,6 +261,40 @@ pub struct AccountRuntime {
     pub last_stream_error: Option<String>,
 }
 
+/// A rotation slot answers a user's account query by the same three fields a
+/// config record does, so [`Manager::set_disabled_by_query`] can run the CLI's
+/// own resolution rule over the LIVE fleet.
+impl crate::identity::Queryable for AccountRuntime {
+    fn query_name(&self) -> &str {
+        &self.name
+    }
+    fn query_org_name(&self) -> Option<&str> {
+        self.org_name.as_deref()
+    }
+    fn query_org_uuid(&self) -> Option<&str> {
+        self.org_uuid.as_deref()
+    }
+}
+
+/// What [`Manager::set_disabled_by_query`] did.
+///
+/// `Applied` carries the RESOLVED name (the caller's query may have been a
+/// substring, and the answer has to name what was actually parked) plus the
+/// durable half's fate, which the caller must surface — see
+/// [`DisablePersist::warning`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetDisabledOutcome {
+    Applied {
+        name: String,
+        persist: DisablePersist,
+    },
+    /// The query named no account in the live rotation.
+    NoMatch,
+    /// The query named more than one, listed here so the caller can tell the user
+    /// what to pass `--org` for.
+    Ambiguous(Vec<String>),
+}
+
 impl AccountRuntime {
     fn from_config(account: &config::Account) -> Self {
         Self {
@@ -1061,6 +1095,42 @@ impl Manager {
             )
         };
         self.persist_disabled(idx, &target, disabled)
+    }
+
+    /// Resolve a user-supplied `(query, org)` against the LIVE rotation and apply
+    /// `disabled` to whatever it names — the whole operation the control endpoint
+    /// performs, kept here so no caller outside this module has to know that a
+    /// rotation index is what [`Self::set_disabled`] takes.
+    ///
+    /// Resolution runs over `self.accounts` — the rotation slots themselves — and
+    /// NOT over the boot-time config snapshot, so the index handed to
+    /// `set_disabled` is a slot by construction. Matching the config's vector and
+    /// then indexing the runtime one would be correct only while the two stay the
+    /// same length in the same order forever, which is not a property anything
+    /// here enforces.
+    ///
+    /// The read guard is released before `set_disabled` takes its write guard —
+    /// `RwLock` is not reentrant, so holding it across the call would deadlock.
+    pub fn set_disabled_by_query(
+        &self,
+        query: &str,
+        org: Option<&str>,
+        disabled: bool,
+    ) -> SetDisabledOutcome {
+        let (idx, name) = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            match crate::identity::match_one(&accounts[..], query, org) {
+                crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
+                crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
+                crate::identity::Match::Ambiguous(names) => {
+                    return SetDisabledOutcome::Ambiguous(names)
+                }
+            }
+        };
+        SetDisabledOutcome::Applied {
+            name,
+            persist: self.set_disabled(idx, disabled),
+        }
     }
 
     /// Record which account actually served the most recent request.

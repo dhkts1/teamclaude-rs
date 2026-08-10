@@ -37,7 +37,7 @@ use futures::StreamExt;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::manager::{AccountStatus, Manager};
+use crate::manager::{AccountStatus, DisablePersist, Manager, SetDisabledOutcome};
 use crate::stats::{RequestLogEntry, SessionKind};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -375,6 +375,42 @@ fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>)
 /// ever answers locally belongs under this prefix.
 pub const STATUS_PATH: &str = "/_tcr/status";
 
+/// Path of the live account-control endpoint [`set_disabled_handler`] serves —
+/// `POST` only, the one route on this process that MUTATES rotation.
+///
+/// It exists because `disabled` was, until now, a boot-time read: `tcr disable`
+/// wrote the config file and the running proxy never re-read it, so an account the
+/// operator had parked kept being handed live traffic while every surface reported
+/// it benched. The TUI's `d` key was the only correct path, and a `--headless`
+/// proxy has no TUI.
+///
+/// Under [`LOCAL_PREFIX`] for the reason given there, which matters more for a
+/// mutating verb than for the read next door: registered as a real route it is
+/// matched BEFORE the catch-all, so a `POST` here can never be rewritten onto
+/// api.anthropic.com carrying a pooled OAuth Bearer.
+pub const DISABLED_PATH: &str = "/_tcr/accounts/disabled";
+
+/// Marks every response produced by the account-control route itself, so a caller
+/// can tell "this proxy has no such route" from "the route answered and said no".
+///
+/// Both are a 404: a tcr too old to have the route hits the [`LOCAL_PREFIX`]
+/// catch-all guard (or, older still, gets Anthropic's own 404 back), and a query
+/// naming no account is a 404 from the handler. The CLI's two reactions are
+/// opposite — write the file and warn loudly that the live proxy is stale, versus
+/// report a bad query — so the distinction cannot rest on matching an error
+/// string. This header is the structural discriminator. It is a response header,
+/// never a request one, so it authorizes nothing.
+pub const ENDPOINT_HEADER: &str = "x-tcr-endpoint";
+
+/// The [`ENDPOINT_HEADER`] value the account-control route stamps.
+pub const DISABLED_ENDPOINT: &str = "accounts-disabled";
+
+/// Body cap for the local control route: a JSON object with three short fields.
+/// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
+/// route buffers into memory in a credential-holding process, and nothing
+/// legitimate here is larger than a line.
+const CONTROL_BODY_LIMIT: usize = 8 * 1024;
+
 /// The path segment [`STATUS_PATH`] lives under. Every path beneath it belongs to
 /// the PROXY, never to Anthropic, so anything under it that is not a registered
 /// route is answered with a LOCAL 404 (see the guard in [`handle`]) instead of
@@ -549,8 +585,73 @@ pub fn app(manager: Arc<Manager>) -> Router {
             STATUS_PATH,
             axum::routing::get(status_handler).fallback(status_method_not_allowed),
         )
+        // The one MUTATING local route. Same reasoning as above, and the method
+        // fallback matters more here: an unregistered method must answer a local
+        // 405, never fall through to `handle` and be forwarded upstream.
+        .route(
+            DISABLED_PATH,
+            axum::routing::post(set_disabled_handler).fallback(disabled_method_not_allowed),
+        )
         .fallback(handle)
         .with_state(manager)
+}
+
+/// The two gates every locally-answered `/_tcr/…` route passes, or the refusal to
+/// return. `Some(response)` means REFUSED; `None` means proceed.
+///
+/// ONE implementation, deliberately: these routes live on a process holding every
+/// account's OAuth access and refresh token, and the gate is the whole of their
+/// authorization. Two copies of it drift, and the copy that drifts is the one on
+/// whichever route was added later — which is also the more dangerous route,
+/// since the second one added mutates rotation.
+///
+/// 1. **Origin.** The peer must be loopback, proven by the [`ClientAddr`]
+///    extension the hybrid listener injects from the real socket address (the
+///    same extension the auth gate in [`handle`] uses). It is not a header, so a
+///    client cannot forge it. Absent — a request that did not arrive through the
+///    listener — we fail CLOSED. Bind scope is not authorization: `127.0.0.1` is
+///    reachable by every process and every container on this host, so "we only
+///    bind loopback" is not a claim about who is calling.
+/// 2. **Key.** When a proxy api-key is configured it is REQUIRED here, with no
+///    loopback exemption — deliberately stricter than [`handle`], which exempts
+///    loopback because `claude` authenticates with its own OAuth and never sends
+///    the proxy key. Nothing on this host needs to read or steer the fleet without
+///    the operator's secret, so doing either costs the same secret that using the
+///    proxy does. The compare is [`key_matches`] (constant-time, length-safe).
+///
+/// `endpoint` names the route in the 403 body only. It is not a capability: no
+/// value of it weakens either check.
+fn local_endpoint_gate(
+    parts: &axum::http::request::Parts,
+    manager: &Manager,
+    endpoint: &str,
+) -> Option<Response> {
+    let client_is_loopback = parts
+        .extensions
+        .get::<ClientAddr>()
+        .is_some_and(|a| a.0.ip().is_loopback());
+    if !client_is_loopback {
+        return Some(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!("The tcr {endpoint} endpoint is loopback-only."),
+            None,
+        ));
+    }
+
+    if let Some(expected) = manager.proxy_api_key() {
+        let provided = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok());
+        if !key_matches(provided, expected) {
+            return Some(error_response(
+                StatusCode::UNAUTHORIZED,
+                "authentication_error",
+                "Missing or invalid x-api-key.",
+                None,
+            ));
+        }
+    }
+
+    None
 }
 
 /// A non-`GET` on [`STATUS_PATH`]. Answered locally with 405 so the request is
@@ -567,23 +668,10 @@ async fn status_method_not_allowed() -> Response {
 
 /// `GET /_tcr/status` — the live fleet snapshot, for `tcr status`.
 ///
-/// This is a **new attack surface on a process holding every account's OAuth
-/// access and refresh token**, so it is gated twice and reads nothing but state
-/// that is already on screen in the TUI:
-///
-/// 1. **Origin.** The peer must be loopback, proven by the [`ClientAddr`]
-///    extension the hybrid listener injects from the real socket address (the
-///    same extension the auth gate in [`handle`] uses). It is not a header, so a
-///    client cannot forge it. Absent — a request that did not arrive through the
-///    listener — we fail CLOSED. Bind scope is not authorization: `127.0.0.1` is
-///    reachable by every process and every container on this host, so "we only
-///    bind loopback" is not a claim about who is calling.
-/// 2. **Key.** When a proxy api-key is configured it is REQUIRED here, with no
-///    loopback exemption — deliberately stricter than [`handle`], which exempts
-///    loopback because `claude` authenticates with its own OAuth and never sends
-///    the proxy key. Nothing on this host needs to read the fleet's state without
-///    the operator's secret, so reading it costs the same secret that using the
-///    proxy does. The compare is [`key_matches`] (constant-time, length-safe).
+/// This is an **attack surface on a process holding every account's OAuth access
+/// and refresh token**, so it is gated twice — origin and key, see
+/// [`local_endpoint_gate`] for both and for why bind scope is not authorization —
+/// and reads nothing but state that is already on screen in the TUI.
 ///
 /// It takes only [`Parts`](axum::http::request::Parts), so the request body is
 /// never read; it touches no `&mut` state, triggers no probe, no token refresh
@@ -594,29 +682,8 @@ async fn status_handler(
     State(manager): State<Arc<Manager>>,
     parts: axum::http::request::Parts,
 ) -> Response {
-    let client_is_loopback = parts
-        .extensions
-        .get::<ClientAddr>()
-        .is_some_and(|a| a.0.ip().is_loopback());
-    if !client_is_loopback {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "permission_error",
-            "The tcr status endpoint is loopback-only.",
-            None,
-        );
-    }
-
-    if let Some(expected) = manager.proxy_api_key() {
-        let provided = parts.headers.get("x-api-key").and_then(|v| v.to_str().ok());
-        if !key_matches(provided, expected) {
-            return error_response(
-                StatusCode::UNAUTHORIZED,
-                "authentication_error",
-                "Missing or invalid x-api-key.",
-                None,
-            );
-        }
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "status") {
+        return refusal;
     }
 
     let now = OffsetDateTime::now_utc();
@@ -639,6 +706,151 @@ async fn status_handler(
     // credential-holding process — never store it anywhere.
     headers.insert("cache-control", HeaderValue::from_static("no-store"));
     response
+}
+
+/// A non-`POST` on [`DISABLED_PATH`]. Answered locally with 405 — the route is a
+/// command, and a command has exactly one verb. Stamped with [`ENDPOINT_HEADER`]
+/// so a caller can tell this 405 (the route exists, wrong verb) from the local 404
+/// a tcr without the route returns.
+async fn disabled_method_not_allowed() -> Response {
+    stamp_endpoint(error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr account-control endpoint takes POST.",
+        None,
+    ))
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the account-control route produced.
+fn stamp_endpoint(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(ENDPOINT_HEADER, HeaderValue::from_static(DISABLED_ENDPOINT));
+    response
+}
+
+/// The request body of [`DISABLED_PATH`].
+///
+/// `query` and `disabled` are `Option` rather than required fields so a body that
+/// omits either is a 400 naming the field, instead of axum's own rejection text:
+/// this route is what a person reaches for when the fleet is already misbehaving,
+/// and an unhelpful 400 there is its own outage.
+#[derive(serde::Deserialize)]
+struct SetDisabledRequest {
+    query: Option<String>,
+    #[serde(default)]
+    org: Option<String>,
+    disabled: Option<bool>,
+}
+
+/// The 200 body of [`DISABLED_PATH`]. Deserializable too — `tcr enable`/`disable`
+/// read it, and both halves of the wire contract belong to one type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SetDisabledResponse {
+    /// The RESOLVED account name. The query may have been an email or a partial,
+    /// so the answer names what was actually parked.
+    pub name: String,
+    /// The state now in force in the live rotation.
+    pub disabled: bool,
+    /// Whether the config file also carries it. `false` with a `warning` is a
+    /// change that is live but will not survive a restart.
+    pub persisted: bool,
+    /// [`crate::manager::DisablePersist::warning`], verbatim, or `null`.
+    pub warning: Option<String>,
+}
+
+/// `POST /_tcr/accounts/disabled` — park or unpark an account IN THE LIVE
+/// ROTATION, for `tcr disable` / `tcr enable`.
+///
+/// The endpoint exists because the flag was previously only ever read at boot:
+/// see [`DISABLED_PATH`] for the defect. This is the only route on the proxy that
+/// changes what the next request is routed to, so it is gated exactly as
+/// [`status_handler`] is — [`local_endpoint_gate`], no weaker for being a write —
+/// and it does the work through [`Manager::set_disabled_by_query`], which is the
+/// same call the TUI's `d` key makes. It does not invent a resolution rule: the
+/// CLI's own [`crate::identity::match_one`] runs against the server's live
+/// rotation slots, so the two cannot disagree about which account a query names.
+///
+/// The durable half is NOT swallowed. `persisted: false` plus a `warning` is a
+/// change that is in force right now and will vanish on restart, which is
+/// precisely the state the old code left the operator in silently.
+async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-control") {
+        // NOT stamped: a refusal must not confirm the route exists to a caller
+        // that failed the gate, and the CLI never needs the discriminator on a
+        // 401/403 — both are terminal for it.
+        return refusal;
+    }
+
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return stamp_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+            None,
+        ));
+    };
+    let Ok(parsed) = serde_json::from_slice::<SetDisabledRequest>(&bytes) else {
+        return stamp_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object: {\"query\": \"<account>\", \"org\": null, \"disabled\": true}.",
+            None,
+        ));
+    };
+    let (Some(query), Some(disabled)) = (parsed.query, parsed.disabled) else {
+        return stamp_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Both \"query\" (string) and \"disabled\" (bool) are required.",
+            None,
+        ));
+    };
+    if query.trim().is_empty() {
+        return stamp_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "\"query\" must not be empty.",
+            None,
+        ));
+    }
+
+    match manager.set_disabled_by_query(&query, parsed.org.as_deref(), disabled) {
+        SetDisabledOutcome::NoMatch => stamp_endpoint(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!("No account in the live rotation matches '{query}'."),
+            None,
+        )),
+        SetDisabledOutcome::Ambiguous(names) => stamp_endpoint(error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &crate::cli::ambiguous_query_message(&query, &names),
+            None,
+        )),
+        SetDisabledOutcome::Applied { name, persist } => {
+            let payload = SetDisabledResponse {
+                name,
+                disabled,
+                persisted: matches!(persist, DisablePersist::Persisted),
+                warning: persist.warning(disabled).map(str::to_string),
+            };
+            let Ok(body) = serde_json::to_string(&payload) else {
+                return stamp_endpoint(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Could not serialize the account-control result.",
+                    None,
+                ));
+            };
+            let mut response = Response::new(Body::from(body));
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert("cache-control", HeaderValue::from_static("no-store"));
+            stamp_endpoint(response)
+        }
+    }
 }
 
 /// The catch-all proxy handler.
@@ -2904,6 +3116,544 @@ mod tests {
         }
     }
 
+    // --- POST /_tcr/accounts/disabled ---------------------------------------
+
+    /// A two-account config with distinct orgs, written to `path` so the manager
+    /// that boots from it has a real durable half to write back to.
+    ///
+    /// Obviously-fake identities only: this repository is public.
+    fn two_account_config(api_key: Option<&str>) -> Config {
+        let account = |name: &str, org: &str, uuid: &str, priority: i64| Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: Some(uuid.to_string()),
+            org_uuid: Some(format!("11111111-1111-1111-1111-{org}")),
+            org_name: Some(format!("Org {org}")),
+            access_token: format!("at-{org}"),
+            refresh_token: Some(format!("rt-{org}")),
+            // Not expired, so booting triggers no token refresh.
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(priority),
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        Config {
+            accounts: vec![
+                account("alice@example.com", "aaaaaaaaaaaa", "22222222-a", 0),
+                account("bob@example.com", "bbbbbbbbbbbb", "33333333-b", 1),
+            ],
+            ..dummy_config(api_key, "http://127.0.0.1:1")
+        }
+    }
+
+    fn control_config_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tcr-control-test-{tag}-{}-{}.json",
+            std::process::id(),
+            crate::now_ms()
+        ))
+    }
+
+    /// A manager booted from a config that is ALSO on disk, so both halves of a
+    /// `disabled` change are observable: `manager.snapshot()` for the live rotation
+    /// and the file for the durable flag.
+    fn control_manager(tag: &str, api_key: Option<&str>) -> (Arc<Manager>, std::path::PathBuf) {
+        let path = control_config_path(tag);
+        let config = two_account_config(api_key);
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        (manager, path)
+    }
+
+    /// Drive the router with a `ClientAddr` we control, like [`status_request`].
+    /// `body` is sent verbatim so a malformed one is testable.
+    async fn control_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(DISABLED_PATH);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, bytes)
+    }
+
+    fn disabled_in_file(path: &std::path::Path, index: usize) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(path).expect("read the test config");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        doc["accounts"][index].get("disabled").cloned()
+    }
+
+    /// THE BITING TEST for the whole change: after the endpoint answers, the
+    /// account is parked **in the process that will serve the next request**, and
+    /// the config file carries it too.
+    ///
+    /// Pre-change there was no route at all, and `tcr disable` wrote only the file
+    /// — so the running rotation kept the account. Asserting HTTP 200 alone would
+    /// re-create exactly that defect at a new altitude: the in-memory assertion is
+    /// the one that fails against a handler that answers politely and changes
+    /// nothing.
+    #[tokio::test]
+    async fn control_endpoint_parks_the_account_in_memory_and_on_disk() {
+        let (manager, path) = control_manager("apply", None);
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(!before.accounts[0].disabled, "alice starts in rotation");
+
+        let (status, headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","org":null,"disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(DISABLED_ENDPOINT),
+            "the route stamps itself so a caller can tell it from a missing route"
+        );
+
+        let payload: SetDisabledResponse =
+            serde_json::from_slice(&body).expect("an account-control payload");
+        assert_eq!(payload.name, "alice@example.com", "the RESOLVED name");
+        assert!(payload.disabled);
+        assert!(payload.persisted, "the durable half succeeded");
+        assert_eq!(payload.warning, None, "so there is nothing to warn about");
+
+        // 1. THE LIVE ROTATION — the assertion that catches the original bug.
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(
+            after.accounts[0].disabled,
+            "alice is out of the LIVE rotation, not merely acknowledged"
+        );
+        assert!(
+            !after.accounts[1].disabled,
+            "and only the resolved account moved"
+        );
+
+        // 2. …AND the file, so the bench survives a restart.
+        assert_eq!(disabled_in_file(&path, 0), Some(serde_json::json!(true)));
+        assert_eq!(disabled_in_file(&path, 1), None, "bob's row is untouched");
+
+        // Re-enabling drops the key rather than writing `false`, matching the CLI's
+        // long-standing file contract.
+        let (status, _headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","disabled":false}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(
+            !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+            "re-enable reaches the live rotation"
+        );
+        assert_eq!(
+            disabled_in_file(&path, 0),
+            None,
+            "re-enable DROPS the key, never writes false"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SECURITY GUARD 1 — origin, on the MUTATING route. A non-loopback peer and an
+    /// absent `ClientAddr` (a request that never came through the listener, so its
+    /// origin is unprovable) are both refused, and neither may change rotation.
+    #[tokio::test]
+    async fn control_endpoint_rejects_a_non_loopback_client() {
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let (manager, path) = control_manager("origin", None);
+            let (status, _headers, _body) = control_request(
+                Arc::clone(&manager),
+                Method::POST,
+                peer,
+                None,
+                r#"{"query":"alice@example.com","disabled":true}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} must be refused, got {status}"
+            );
+            assert!(
+                !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{label}: a refused caller changed the live rotation"
+            );
+            assert_eq!(
+                disabled_in_file(&path, 0),
+                None,
+                "{label}: a refused caller wrote the config"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// SECURITY GUARD 2 — the key, on the MUTATING route. Every case is a LOOPBACK
+    /// peer, so what is asserted is precisely that loopback alone does not license
+    /// steering the rotation of a process holding every account's tokens.
+    #[tokio::test]
+    async fn control_endpoint_rejects_a_bad_api_key() {
+        for (label, provided) in [
+            ("no key at all", None),
+            ("a wrong key", Some("wrong-key")),
+            ("a prefix of the key", Some("secret")),
+            ("an empty key", Some("")),
+        ] {
+            let (manager, path) = control_manager("key", Some("secret-key"));
+            let (status, _headers, _body) = control_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                provided,
+                r#"{"query":"alice@example.com","disabled":true}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{label} must be refused, got {status}"
+            );
+            assert!(
+                !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{label}: an unauthenticated caller changed the live rotation"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+
+        // …and the right key, from loopback, is served.
+        let (manager, path) = control_manager("key-ok", Some("secret-key"));
+        let (status, _headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            Some("secret-key"),
+            r#"{"query":"alice@example.com","disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert!(manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The bad-request table. Each row is a body a caller can realistically send,
+    /// and none of them may half-apply anything.
+    #[tokio::test]
+    async fn control_endpoint_rejects_malformed_bodies() {
+        for (label, body) in [
+            ("an empty body", ""),
+            ("not json", "disable alice"),
+            ("a json array", r#"["alice@example.com", true]"#),
+            ("no disabled field", r#"{"query":"alice@example.com"}"#),
+            ("no query field", r#"{"disabled":true}"#),
+            ("an empty query", r#"{"query":"   ","disabled":true}"#),
+            (
+                "disabled as a string",
+                r#"{"query":"alice@example.com","disabled":"true"}"#,
+            ),
+        ] {
+            let (manager, path) = control_manager("badbody", None);
+            let (status, headers, response) = control_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                None,
+                body,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{label} must be a 400, got {status}: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_eq!(
+                headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+                Some(DISABLED_ENDPOINT),
+                "{label}: a 400 still identifies the route that produced it"
+            );
+            assert!(
+                !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{label}: a rejected body still changed the rotation"
+            );
+            assert_eq!(
+                disabled_in_file(&path, 0),
+                None,
+                "{label}: and wrote the file"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// A query naming no live account is a 404 **from the route** (stamped), which
+    /// is what lets the CLI tell it from the local 404 an older tcr returns for a
+    /// path it does not serve. Same status, opposite reactions.
+    #[tokio::test]
+    async fn control_endpoint_404s_an_unknown_account_and_names_itself() {
+        let (manager, path) = control_manager("nomatch", None);
+        let (status, headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"nobody@example.com","disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(DISABLED_ENDPOINT),
+            "without this stamp the CLI cannot tell this from a missing route"
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("nobody@example.com"), "{text}");
+        assert!(
+            !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled
+                && !manager.snapshot(OffsetDateTime::now_utc()).accounts[1].disabled,
+            "a miss parks nobody"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An ambiguous query is a 409 that NAMES the candidates — otherwise `--org` is
+    /// advice the caller cannot act on. Refusing is not pedantry: guessing would
+    /// bench an account the operator did not ask about.
+    #[tokio::test]
+    async fn control_endpoint_409s_an_ambiguous_query_naming_the_candidates() {
+        let path = control_config_path("ambiguous");
+        let mut config = two_account_config(None);
+        // The same person in two orgs: one email, two rows, `--org` the only fix.
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+
+        let (status, headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(DISABLED_ENDPOINT)
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("ambiguous") && text.contains("--org"),
+            "the 409 says what to do about it: {text}"
+        );
+        let live = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(
+            !live.accounts[0].disabled && !live.accounts[1].disabled,
+            "an unbreakable tie parks NEITHER row"
+        );
+        assert_eq!(disabled_in_file(&path, 0), None);
+        assert_eq!(disabled_in_file(&path, 1), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `--org` narrows the same ambiguous fleet to exactly one row, and it is the
+    /// row named — the resolution rule is the CLI's own
+    /// [`crate::identity::match_one`], run against the LIVE rotation slots.
+    #[tokio::test]
+    async fn control_endpoint_org_narrows_to_one_account() {
+        let path = control_config_path("org");
+        let mut config = two_account_config(None);
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+
+        let (status, _headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","org":"Org bbbbbbbbbbbb","disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let live = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(
+            !live.accounts[0].disabled && live.accounts[1].disabled,
+            "the SECOND row — the one whose org was named — is the one parked"
+        );
+        assert_eq!(disabled_in_file(&path, 0), None);
+        assert_eq!(disabled_in_file(&path, 1), Some(serde_json::json!(true)));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A manager with no `config_path` (`tcr demo`, `tcr status --probe`, tests)
+    /// applies the change LIVE and has nothing to persist to. That is reported
+    /// honestly — `persisted: false` — and, per
+    /// [`crate::manager::DisablePersist::warning`], it needs no warning: there is
+    /// no file that was supposed to carry it.
+    #[tokio::test]
+    async fn control_endpoint_reports_an_unpersisted_change_honestly() {
+        let manager = Manager::with_live_refresher(two_account_config(None), None);
+        let (status, _headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let payload: SetDisabledResponse = serde_json::from_slice(&body).expect("payload");
+        assert!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+            "the live change still happened"
+        );
+        assert!(
+            !payload.persisted,
+            "…and the answer does not claim it is durable"
+        );
+        assert_eq!(
+            payload.warning, None,
+            "memory-only by design, not a failure"
+        );
+    }
+
+    /// A `DisablePersist` arm that changed memory but NOT the file is surfaced, not
+    /// swallowed: the change is in force now and dies on restart, which is the exact
+    /// state the old file-only code left operators in silently. Here the config file
+    /// does not exist at all, so the write fails.
+    #[tokio::test]
+    async fn control_endpoint_surfaces_a_failed_persist() {
+        let path = control_config_path("nofile");
+        std::fs::remove_file(&path).ok();
+        let manager = Manager::with_live_refresher(two_account_config(None), Some(path.clone()));
+
+        let (status, _headers, body) = control_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","disabled":true}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the LIVE half succeeded");
+        let payload: SetDisabledResponse = serde_json::from_slice(&body).expect("payload");
+        assert!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+            "the account is parked in the live rotation"
+        );
+        assert!(!payload.persisted, "but the file does not carry it");
+        let warning = payload.warning.expect("a not-saved warning, never silence");
+        assert!(
+            warning.contains("NOT SAVED") && warning.contains("returns to rotation on restart"),
+            "the warning is DisablePersist::warning verbatim, direction included: {warning}"
+        );
+    }
+
+    /// The OTHER half of the discriminator, and the half that is easy to get wrong:
+    /// a path this proxy does not serve answers 404 **without** the stamp.
+    ///
+    /// This is what `tcr` reads as "the running proxy is too old to accept live
+    /// account control", which makes it write the file and warn loudly. If the
+    /// catch-all ever started stamping, that arm would silently become the
+    /// route-refused arm and the CLI would report a bad query instead of a stale
+    /// proxy — the original invisible-failure shape, restored.
+    #[tokio::test]
+    async fn an_unrouted_local_path_is_not_stamped_as_the_control_route() {
+        use tower::ServiceExt as _;
+        for uri in [
+            "/_tcr/accounts",
+            "/_tcr/accounts/disable",
+            "/_tcr/accounts/disabled/extra",
+        ] {
+            let (manager, path) = control_manager("unstamped", None);
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::from(
+                    r#"{"query":"alice@example.com","disabled":true}"#,
+                ))
+                .expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback_peer()));
+            let response = app(Arc::clone(&manager))
+                .oneshot(req)
+                .await
+                .expect("router response");
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert!(
+                response.headers().get(ENDPOINT_HEADER).is_none(),
+                "{uri} must not claim to be the account-control route"
+            );
+            assert!(
+                !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{uri} changed nothing"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The route is `POST`-only, and a wrong method is answered LOCALLY — never
+    /// forwarded, and never able to mutate. The stamp distinguishes this 405 (route
+    /// exists) from an older tcr's 404 (route absent).
+    #[tokio::test]
+    async fn control_endpoint_refuses_other_methods_locally() {
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+            let (manager, path) = control_manager("method", None);
+            let (status, headers, _body) = control_request(
+                Arc::clone(&manager),
+                method.clone(),
+                Some(loopback_peer()),
+                None,
+                r#"{"query":"alice@example.com","disabled":true}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on the control path is refused locally"
+            );
+            assert_ne!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{method} must never fall through to the upstream forwarder"
+            );
+            assert_eq!(
+                headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+                Some(DISABLED_ENDPOINT),
+                "{method}: the 405 identifies the route, so a caller does not read \
+                 it as a proxy too old to have one"
+            );
+            assert!(
+                !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{method} changed the rotation"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
     // --- rotation-bypassing relays -----------------------------------------
 
     /// What a fake upstream saw — one of these per request it received.
@@ -3396,6 +4146,15 @@ mod tests {
             (Method::GET, "/_tcr/"),
             (Method::GET, "/_tcr"),
             (Method::GET, "/_tcr/status?x=1&y=2/../nope"),
+            // Near-misses of the account-control route. The mutating verb makes
+            // these the rows that matter most: a `POST` that fell through the
+            // catch-all would be rewritten onto api.anthropic.com carrying a pooled
+            // OAuth Bearer, which is the shape that burned an account.
+            (Method::POST, "/_tcr/accounts"),
+            (Method::POST, "/_tcr/accounts/"),
+            (Method::POST, "/_tcr/accounts/disable"),
+            (Method::POST, "/_tcr/accounts/disabled/extra"),
+            (Method::POST, "/_tcr/accounts/priority"),
         ] {
             let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
             let (status, body) = drive(
