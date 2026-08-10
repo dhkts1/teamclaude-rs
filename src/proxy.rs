@@ -525,17 +525,30 @@ const LOCAL_PREFIX: &str = "/_tcr";
 ///   file uploaded from claude.ai belongs to the paired identity, so fetching it
 ///   with a pooled token 403s and **Claude Code silently drops the image from the
 ///   message** — nothing surfaces the failure, the turn just loses its attachment.
+/// - `/v1/mcp_servers` is the claude.ai connector list. The ids it returns are scoped
+///   to the identity that asked, and the MCP traffic that follows them goes to
+///   `mcp-proxy.anthropic.com` — a host the CONNECT path blind-tunnels, so it carries
+///   the CLIENT's own token. A pooled list therefore hands the client ids its own
+///   identity cannot resolve.
 ///
 /// Measured on the live log while every one of these still went through rotation:
 /// 13 of 57 sessionless requests came back 404 (22.8%), against 0 of 1556 pinned ones.
+/// The connector list was measured the same way, one `claude mcp list` per pooled
+/// account: served by the wrong one, all 9 connectors reported
+/// `not_found_error: "Server not found"`; served by the client's own identity, every
+/// one connected. That is why this reads as intermittent — it tracks rotation.
 ///
 /// Written WITHOUT trailing slashes and matched by [`path_is_under`] — an entry
 /// matches the exact path or that path followed by `/`, never a longer identifier.
 /// Both edges of a raw `starts_with` were live defects: `"/api/oauth/file_upload"`
 /// (no terminator) also relayed `/api/oauth/file_upload_v2`, and `"/v1/code/"`
 /// (with one) missed the bare `/v1/code`.
-const CLIENT_CREDENTIAL_PREFIXES: [&str; 3] =
-    ["/v1/code", "/api/oauth/files", "/api/oauth/file_upload"];
+const CLIENT_CREDENTIAL_PREFIXES: [&str; 4] = [
+    "/v1/code",
+    "/api/oauth/files",
+    "/api/oauth/file_upload",
+    "/v1/mcp_servers",
+];
 
 /// The CLIENT's own OAuth token refresh. Relayed raw — no auth header at all,
 /// because a refresh carries its credentials in the BODY. The proxy manages its own
@@ -4574,6 +4587,7 @@ mod tests {
             "/v1/code/session/abc",
             "/api/oauth/files/file_0123",
             "/api/oauth/file_upload",
+            "/v1/mcp_servers",
         ] {
             assert_eq!(
                 relay_mode(&Method::POST, path),
@@ -4611,7 +4625,12 @@ mod tests {
     #[test]
     fn relay_mode_matches_whole_segments_at_both_edges() {
         // Bare, with no trailing slash: a real route, previously missed by `/v1/code/`.
-        for path in ["/v1/code", "/api/oauth/files", "/api/oauth/file_upload"] {
+        for path in [
+            "/v1/code",
+            "/api/oauth/files",
+            "/api/oauth/file_upload",
+            "/v1/mcp_servers",
+        ] {
             assert_eq!(
                 relay_mode(&Method::POST, path),
                 Some(RelayMode::ClientCredential),
@@ -4647,6 +4666,30 @@ mod tests {
             None,
             "a longer identifier is not the token endpoint"
         );
+    }
+
+    /// Pins the claude.ai connector list onto the client's own credential.
+    #[test]
+    fn the_connector_list_never_takes_a_pooled_token() {
+        for method in [Method::GET, Method::POST] {
+            assert_eq!(
+                relay_mode(&method, "/v1/mcp_servers"),
+                Some(RelayMode::ClientCredential),
+                "{method} /v1/mcp_servers must not be re-credentialled"
+            );
+        }
+        assert_eq!(
+            relay_mode(&Method::GET, "/v1/mcp_servers/srv_0123"),
+            Some(RelayMode::ClientCredential),
+            "one connector is the same route as the collection"
+        );
+        for path in ["/v1/mcp_servers_v2", "/v1/mcp_serversX"] {
+            assert_eq!(
+                relay_mode(&Method::GET, path),
+                None,
+                "{path} only shares a prefix — it is not the route"
+            );
+        }
     }
 
     /// `path_is_under` in isolation — the single rule every prefix decision uses.
@@ -4733,11 +4776,13 @@ mod tests {
     #[tokio::test]
     async fn client_credential_paths_forward_the_clients_own_credential() {
         let (upstream, hits) = spawn_echo_upstream().await;
-        for path in [
+        let paths = [
             "/v1/code/session/abc",
             "/api/oauth/files/file_0123",
             "/api/oauth/file_upload",
-        ] {
+            "/v1/mcp_servers",
+        ];
+        for path in paths {
             let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
             let (status, body) = drive(
                 manager,
@@ -4765,7 +4810,11 @@ mod tests {
                 "{path} must never carry the pooled account token"
             );
         }
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            paths.len(),
+            "one upstream hit per relayed path"
+        );
     }
 
     /// The proxy's own gate credential never leaves this process. An `x-api-key`
