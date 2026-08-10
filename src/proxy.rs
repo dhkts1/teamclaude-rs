@@ -455,10 +455,14 @@ pub const STATUS_PATH: &str = "/_tcr/status";
 /// it benched. The TUI's `d` key was the only correct path, and a `--headless`
 /// proxy has no TUI.
 ///
-/// Under [`LOCAL_PREFIX`] for the reason given there, which matters more for a
-/// mutating verb than for the read next door: registered as a real route it is
-/// matched BEFORE the catch-all, so a `POST` here can never be rewritten onto
-/// api.anthropic.com carrying a pooled OAuth Bearer.
+/// Under [`LOCAL_PREFIX`] for the reason given there — but what protects a
+/// MUTATING verb is not the prefix guard, whose reach is only the exact spelling.
+/// It is that this path is REGISTERED as a real route, so axum matches it exactly
+/// and matches it BEFORE the catch-all: a `POST` here can never be rewritten onto
+/// api.anthropic.com carrying a pooled OAuth Bearer, and a near-miss spelling can
+/// never land ON the handler. What authorizes the mutation itself is
+/// [`local_endpoint_gate`] plus the `application/json` requirement in
+/// [`set_disabled_handler`], neither of which the path shape has any part in.
 pub const DISABLED_PATH: &str = "/_tcr/accounts/disabled";
 
 /// Marks every response produced by the account-control route itself, so a caller
@@ -491,7 +495,21 @@ const CONTROL_BODY_LIMIT: usize = 8 * 1024;
 /// upstream route could ever answer.
 ///
 /// Stored WITHOUT a trailing slash and matched by [`path_is_under`], so the bare
-/// `/_tcr` has no unguarded edge.
+/// `/_tcr` is covered along with everything beneath it — but the guard is a
+/// BYTE-EXACT, case-sensitive compare on the raw request target, and that is the
+/// whole of what it covers. Three spellings a URL parser would fold onto this
+/// prefix are NOT under it and are forwarded upstream (measured): `//_tcr/…`
+/// (empty first segment), `/_TCR/…` (case) and `/%5ftcr/…` (percent-encoded `_`,
+/// which `uri.path()` hands over undecoded).
+///
+/// That is a wart, not a hole, and it is deliberately left alone here: those
+/// spellings reach Anthropic with a pooled Bearer and come back 404 — the
+/// account-burn shape this guard exists to stop, at the cost of one 404 rather
+/// than a mutation. They cannot mutate anything, because the local routes are
+/// matched by their EXACT paths ([`STATUS_PATH`], [`DISABLED_PATH`]) before this
+/// catch-all, so a spelling that misses the prefix misses the routes too. Do not
+/// read this comment as "nothing unguarded gets past" — read it as "what gets past
+/// is a forwarded 404".
 const LOCAL_PREFIX: &str = "/_tcr";
 
 /// Paths whose upstream call must carry the **client's own** credential and which
@@ -617,6 +635,115 @@ fn path_is_ambiguous(path: &str) -> bool {
     path.contains('\\') || path.split('/').any(is_dot_segment)
 }
 
+/// The host this request was ADDRESSED to, or `None` when nothing says.
+///
+/// Absolute-form / forward-proxy request lines carry an authority in the target
+/// itself, which wins; otherwise it is the `Host` header minus any `:port`. `None`
+/// is a real answer, not a failure: an origin-form base-URL request with no `Host`
+/// (every direct-axum caller, and HTTP/1.0) names no host at all.
+///
+/// ONE derivation, shared by the forwarding path's misroute guard and by
+/// [`local_endpoint_gate`], so "which host did the client mean" cannot come out
+/// two different ways on the two paths. Pure — unit-tested.
+fn target_host<'a>(uri: &'a axum::http::Uri, headers: &'a HeaderMap) -> Option<&'a str> {
+    uri.host().or_else(|| {
+        headers
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(strip_port)
+    })
+}
+
+/// `authority` without its `:port`, if it has one.
+///
+/// A bracketed IPv6 literal is why this is not one `rsplit_once(':')`: the last
+/// colon in `[::1]` is INSIDE the address, so splitting on it yields `[:` — a host
+/// that matches nothing, which turned an IPv6 loopback client into a misroute. The
+/// port, when present, always follows the `]`.
+fn strip_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return authority.split_inclusive(']').next().unwrap_or(authority);
+    }
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+}
+
+/// Is `host` a name for THIS machine's loopback interface?
+///
+/// The `IpAddr::is_loopback` primitive the client-peer checks use, plus the one
+/// name that is loopback without being an IP literal. `[::1]` arrives bracketed in
+/// a `Host` header, and the brackets are not part of the address, so they are
+/// stripped before parsing — without that, the v6 loopback fails a check the v4
+/// one passes. Pure — unit-tested.
+fn host_is_loopback(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+        || host.eq_ignore_ascii_case("localhost")
+}
+
+/// Is this `content-type` `application/json`?
+///
+/// The mutating local route's whole browser defence, and the reason it is a
+/// content-type check rather than something cleverer: `text/plain`,
+/// `application/x-www-form-urlencoded` and `multipart/form-data` are the three
+/// CORS **simple** media types, so a cross-origin POST carrying one is sent with
+/// NO preflight. `application/json` is not simple, and this process answers no
+/// `OPTIONS` and emits no `Access-Control-*` header — so requiring it means a
+/// browser's preflight fails and the POST is never sent at all.
+///
+/// Measured on the route as merged (#71), from a loopback peer with no proxy
+/// api-key configured, which is a fresh install: `text/plain` and
+/// `application/x-www-form-urlencoded` both returned **200 and parked a live
+/// account**. That the page cannot read the reply is irrelevant — the entire
+/// payoff of a mutating route IS the side effect.
+///
+/// ABSENT is a refusal too: a request with no `content-type` is simple as well.
+/// Only the media type is compared, case-insensitively — RFC 9110 makes the type
+/// case-insensitive and a `; charset=utf-8` parameter legitimate, and a check that
+/// rejected either would break real callers while closing nothing.
+fn is_json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value.split(';').next().is_some_and(|media_type| {
+                media_type.trim().eq_ignore_ascii_case("application/json")
+            })
+        })
+}
+
+/// Does this request carry positive evidence that a BROWSER initiated it on
+/// behalf of some other site?
+///
+/// Two independent signals, either of which is disqualifying:
+/// - an `Origin` header. A cross-origin POST always carries one, and this process
+///   serves no HTML, so there is no page whose same-origin `Origin` we would need
+///   to allow — any value at all means a browser context we do not own.
+/// - `Sec-Fetch-Site` anything other than `same-origin` or `none` — the browser
+///   stating the relationship itself. `none` is a user-initiated request (typed
+///   URL, bookmark), not a site's.
+///
+/// A non-browser caller sends neither, so this costs `tcr disable` nothing. It is
+/// deliberately additive to [`is_json_content_type`] rather than a replacement:
+/// the content-type check is what closes the no-preflight class, and this is what
+/// keeps a future local route that is NOT JSON from reopening it. Neither closes
+/// DNS rebinding, where the page is genuinely same-origin — that is
+/// [`host_is_loopback`]'s job.
+fn is_cross_site_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return true;
+    }
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|site| !matches!(site.trim(), "same-origin" | "none"))
+}
+
 /// Classify a request as one of the rotation-bypassing relays, or `None` for the
 /// normal pooled-credential forwarding path. Takes the path WITHOUT its query, so
 /// a `?…` can never smuggle a path past the match. Pure — unit-tested.
@@ -689,9 +816,27 @@ pub fn app(manager: Arc<Manager>) -> Router {
 ///    the proxy key. Nothing on this host needs to read or steer the fleet without
 ///    the operator's secret, so doing either costs the same secret that using the
 ///    proxy does. The compare is [`key_matches`] (constant-time, length-safe).
+/// 3. **Addressed to us.** The host the request names ([`target_host`]) must be
+///    loopback, or absent. This is the DNS-rebinding check, and it is the only one
+///    of the four that closes it: a page served from a name resolving to 127.0.0.1
+///    is genuinely SAME-ORIGIN with this process, so it sends no `Origin`, needs no
+///    preflight, and may use any content type — the one thing that still gives it
+///    away is the name it addressed us by. It also refuses an absolute-form
+///    (forward-proxy) request line, which is never how a caller reaches a route
+///    that only exists here.
+/// 4. **Not cross-site.** [`is_cross_site_request`] — belt-and-braces for a
+///    browser that did preflight, or a future local route that is not JSON.
+///
+/// Checks 3 and 4 were added after the FIRST mutating route shipped under this
+/// gate: a read that a page cannot read is harmless, but the account-control route
+/// is the first one whose entire payoff is the side effect, and a browser on this
+/// host is a loopback caller. They live here, on the shared gate, rather than on
+/// the mutating handler — see the paragraph above about which copy drifts. What
+/// stays route-local is the `application/json` requirement
+/// ([`is_json_content_type`]), because a GET has no body to type.
 ///
 /// `endpoint` names the route in the 403 body only. It is not a capability: no
-/// value of it weakens either check.
+/// value of it weakens any check.
 fn local_endpoint_gate(
     parts: &axum::http::request::Parts,
     manager: &Manager,
@@ -720,6 +865,34 @@ fn local_endpoint_gate(
                 None,
             ));
         }
+    }
+
+    if let Some(host) = target_host(&parts.uri, &parts.headers) {
+        if !host_is_loopback(host) {
+            tracing::debug!(
+                target_host = %host,
+                endpoint,
+                "refused a tcr endpoint request addressed to a non-loopback host"
+            );
+            return Some(error_response(
+                StatusCode::MISDIRECTED_REQUEST,
+                "invalid_request_error",
+                &format!(
+                    "The tcr {endpoint} endpoint answers only to a loopback host, \
+                     not to '{host}'."
+                ),
+                None,
+            ));
+        }
+    }
+
+    if is_cross_site_request(&parts.headers) {
+        return Some(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            &format!("The tcr {endpoint} endpoint does not serve cross-site requests."),
+            None,
+        ));
     }
 
     None
@@ -818,8 +991,14 @@ struct SetDisabledRequest {
 /// read it, and both halves of the wire contract belong to one type.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SetDisabledResponse {
-    /// The RESOLVED account name. The query may have been an email or a partial,
+    /// The RESOLVED account name. The query may have been the account's bare
+    /// EMAIL where its stored name carries an org suffix (`me@example.com (Acme)`),
     /// so the answer names what was actually parked.
+    ///
+    /// It is NOT a partial or fuzzy match: [`crate::identity::match_accounts`] is
+    /// exact name, then exact email, byte-for-byte, case-sensitive and untrimmed.
+    /// Measured against a fleet holding `alice@example.com`: `alice`, `alice@`,
+    /// `example`, `ALICE@EXAMPLE.COM` and a trailing space are each a 404.
     pub name: String,
     /// The state now in force in the live rotation.
     pub disabled: bool,
@@ -852,6 +1031,22 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
         // that failed the gate, and the CLI never needs the discriminator on a
         // 401/403 — both are terminal for it.
         return refusal;
+    }
+
+    // The browser gate. `application/json` is not a CORS simple media type, so
+    // requiring it forces a preflight this process never answers — see
+    // [`is_json_content_type`] for the four shapes that reached this handler and
+    // parked a live account before the check existed. Stamped, unlike the gate's
+    // refusals above: this is a request-shape error like the 400s below it, and the
+    // CLI reads the stamp to tell a route that answered from a tcr too old to have
+    // one.
+    if !is_json_content_type(&parts.headers) {
+        return stamp_endpoint(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "The tcr account-control endpoint requires Content-Type: application/json.",
+            None,
+        ));
     }
 
     let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
@@ -995,7 +1190,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     a proxy-private path onto api.anthropic.com WITH A POOLED OAUTH BEARER
     //     attached: that is how a typo'd status probe once put Gil's bearer on
     //     `api.anthropic.com/_tcr/status` and burned an account. [`path_is_under`]
-    //     covers the bare `/_tcr` too, so the prefix has no unguarded edge.
+    //     covers the bare `/_tcr` too — but only as SPELLED: the compare is
+    //     byte-exact and case-sensitive, so `//_tcr/…`, `/_TCR/…` and `/%5ftcr/…`
+    //     miss it and are forwarded (measured). See [`LOCAL_PREFIX`] for why that is
+    //     a forwarded 404 rather than a hole, and why it is left as it is.
     if path_is_under(&path, LOCAL_PREFIX) {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -1025,21 +1223,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     //     direct-axum test harness) the guard is skipped — fail OPEN for the
     //     ambiguous local case, closed only for a host we can positively identify
     //     as neither loopback nor Anthropic.
-    let target_host: Option<&str> = parts.uri.host().or_else(|| {
-        req_headers
-            .get(HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(|h| h.rsplit_once(':').map_or(h, |(host, _)| host))
-    });
-    if let Some(host) = target_host {
-        // Loopback (base-URL mode) reuses the `IpAddr::is_loopback` primitive the
-        // client-peer check uses above; `localhost` is not an IP literal so it is
-        // matched by name. `rsplit_once` mirrors the crate's CONNECT-target split.
-        let is_loopback = host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-            || host == "localhost";
-        if !is_loopback && !crate::mitm::host_allowed(host) {
+    let target = target_host(&parts.uri, &req_headers);
+    if let Some(host) = target {
+        // [`host_is_loopback`] (base-URL mode) reuses the `IpAddr::is_loopback`
+        // primitive the client-peer check uses above, and the same derivation the
+        // local-endpoint gate runs — one answer to "which host did the client
+        // mean", on both paths.
+        if !host_is_loopback(host) && !crate::mitm::host_allowed(host) {
             tracing::debug!(target_host = %host, "rejected misrouted forward-proxy request");
             return error_response(
                 StatusCode::MISDIRECTED_REQUEST,
@@ -3808,6 +3998,451 @@ mod tests {
             );
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    /// Drive the control route with FULL control over the request line and every
+    /// header, so a BROWSER-shaped or forward-proxy-shaped request is testable as
+    /// it would actually arrive. [`control_request`] always sends
+    /// `content-type: application/json` on an origin-form target — which is
+    /// precisely the one shape that was never the attack.
+    ///
+    /// The peer is always loopback and no proxy api-key is configured, because that
+    /// is the population this class applies to: [`crate::config`] defaults
+    /// `api_key: None` and nothing generates one, so on a fresh install loopback is
+    /// the whole gate. With a key configured the route is closed by the key check
+    /// (see [`control_endpoint_rejects_a_bad_api_key`]) — requiring a header also
+    /// makes the request non-simple, so a browser never sends it at all.
+    async fn control_request_shaped(
+        manager: Arc<Manager>,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(Method::POST).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut req = builder
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, response_headers, bytes)
+    }
+
+    /// One row of a request-SHAPE table: what it is, the request target, the
+    /// headers, and the status it must come back with.
+    type ShapeCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>, StatusCode);
+    /// A row of a table every case of which must be SERVED, so there is no status
+    /// column to get wrong.
+    type ServedCase<'a> = (&'a str, &'a str, Vec<(&'a str, &'a str)>);
+    /// A row that varies only in its headers — the target is fixed.
+    type HeaderCase<'a> = (&'a str, Vec<(&'a str, &'a str)>, StatusCode);
+
+    /// THE CSRF TABLE — the biting test for this change. Every row is a request a
+    /// WEB PAGE open in a browser on this host can actually cause, and each of the
+    /// first four **returned 200 and parked a live account** before these checks
+    /// existed (measured on the route as merged in #71).
+    ///
+    /// Why a browser can send them at all: `text/plain`,
+    /// `application/x-www-form-urlencoded` and `multipart/form-data` are the three
+    /// CORS **simple** content types, so a cross-origin `fetch`/form POST carrying
+    /// one is sent with NO preflight. The page cannot read the reply — this proxy
+    /// emits no `Access-Control-*` header — which is irrelevant: the entire payoff
+    /// of this route IS the side effect, so write-only is the whole attack. The
+    /// read route next door was immune by being a read; this class arrives with the
+    /// FIRST mutating route, and the loopback gate's own doc-comment already argues
+    /// that bind scope is not authorization. The browser is the caller it failed to
+    /// enumerate.
+    ///
+    /// The rebound `Host` row is the DNS-rebinding shape and the reason a
+    /// content-type check alone is not enough: a page served from a name that
+    /// resolves to 127.0.0.1 is SAME-ORIGIN with the proxy, so it sends no `Origin`,
+    /// triggers no preflight, and may use any content type it likes. The only thing
+    /// that distinguishes it from a real local caller is the name it addressed us
+    /// by.
+    ///
+    /// The assertion that bites is the in-memory one: a handler that answers 415
+    /// politely and parks the account anyway passes a status-only check.
+    #[tokio::test]
+    async fn control_endpoint_refuses_every_browser_reachable_shape() {
+        let json = r#"{"query":"alice@example.com","disabled":true}"#;
+        let absolute_form = format!("http://api.anthropic.com{DISABLED_PATH}");
+        let cases: Vec<ShapeCase> = vec![
+            (
+                "a text/plain body — a CORS simple request, so no preflight",
+                DISABLED_PATH,
+                vec![("content-type", "text/plain;charset=UTF-8")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "an x-www-form-urlencoded body — simple too, and what a bare \
+                 <form> posts",
+                DISABLED_PATH,
+                vec![("content-type", "application/x-www-form-urlencoded")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "a multipart/form-data body — the third simple type",
+                DISABLED_PATH,
+                vec![("content-type", "multipart/form-data; boundary=x")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "no content-type at all — absent is simple as well",
+                DISABLED_PATH,
+                vec![],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "a rebound Host — a name that resolves to 127.0.0.1, so the page \
+                 is same-origin and sends nothing that marks it cross-site",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("host", "rebound.example.com"),
+                ],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+            (
+                "an absolute-form request line naming anthropic — a forward-proxy \
+                 request, never something addressed to this route",
+                &absolute_form,
+                vec![("content-type", "application/json")],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+            (
+                "a cross-origin fetch that DID preflight (a future route may not \
+                 be JSON, so the Origin is refused on its own merits)",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("origin", "https://evil.example.com"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "Sec-Fetch-Site: cross-site — the browser saying so itself",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("sec-fetch-site", "cross-site"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "Sec-Fetch-Site: same-site — a sibling subdomain is not us",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("sec-fetch-site", "same-site"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+        ];
+
+        for (label, uri, headers, expected) in cases {
+            let (manager, path) = control_manager("csrf", None);
+            let (status, _headers, body) =
+                control_request_shaped(Arc::clone(&manager), uri, &headers, json).await;
+            assert_eq!(
+                status,
+                expected,
+                "{label}: expected {expected}, got {status}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            // THE assertion. A refusal that still mutates is the same defect one
+            // altitude up, and a status-only table would not see it.
+            assert!(
+                !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{label}: a refused request changed the LIVE rotation"
+            );
+            assert_eq!(
+                disabled_in_file(&path, 0),
+                None,
+                "{label}: a refused request wrote the config"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The other direction, so the checks above cannot be satisfied by refusing
+    /// everything: every shape a LEGITIMATE local caller emits is still served and
+    /// still mutates. `tcr disable` builds its request with reqwest's `.json()`
+    /// against `http://127.0.0.1:<port>` (`cli.rs`), which is row 1.
+    #[tokio::test]
+    async fn control_endpoint_still_serves_every_legitimate_local_shape() {
+        let json = r#"{"query":"alice@example.com","disabled":true}"#;
+        let loopback_form = format!("http://127.0.0.1:3456{DISABLED_PATH}");
+        let cases: Vec<ServedCase> = vec![
+            (
+                "what `tcr disable` sends: reqwest .json() to a loopback literal",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("host", "127.0.0.1:3456"),
+                ],
+            ),
+            (
+                "a charset parameter on the media type — RFC 9110 legitimate",
+                DISABLED_PATH,
+                vec![("content-type", "application/json; charset=utf-8")],
+            ),
+            (
+                "an upper-case media type — the type is case-insensitive",
+                DISABLED_PATH,
+                vec![("content-type", "Application/JSON")],
+            ),
+            (
+                "Host: localhost — loopback by name, not by literal",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("host", "localhost:3456"),
+                ],
+            ),
+            (
+                "Host: [::1] — the v6 loopback literal, port stripped like the \
+                 forwarding path's own host guard does",
+                DISABLED_PATH,
+                vec![("content-type", "application/json"), ("host", "[::1]:3456")],
+            ),
+            (
+                "no Host header at all — an origin-form base-URL request, which is \
+                 also every direct-axum caller",
+                DISABLED_PATH,
+                vec![("content-type", "application/json")],
+            ),
+            (
+                "an absolute-form loopback target — the authority is still ours",
+                &loopback_form,
+                vec![("content-type", "application/json")],
+            ),
+            (
+                "Sec-Fetch-Site: same-origin",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("sec-fetch-site", "same-origin"),
+                ],
+            ),
+            (
+                "Sec-Fetch-Site: none — a user-initiated request, not a site's",
+                DISABLED_PATH,
+                vec![
+                    ("content-type", "application/json"),
+                    ("sec-fetch-site", "none"),
+                ],
+            ),
+        ];
+
+        for (label, uri, headers) in cases {
+            let (manager, path) = control_manager("legit", None);
+            let (status, headers, body) =
+                control_request_shaped(Arc::clone(&manager), uri, &headers, json).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{label}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(
+                headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+                Some(DISABLED_ENDPOINT),
+                "{label}: the route still stamps itself"
+            );
+            assert!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+                "{label}: a served request must still reach the LIVE rotation"
+            );
+            assert_eq!(
+                disabled_in_file(&path, 0),
+                Some(serde_json::json!(true)),
+                "{label}: and the durable half"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// The READ route is deliberately NOT content-type gated (a GET has no body to
+    /// type), and this pins that: the shapes the mutating route now refuses with a
+    /// 415 are served here, unchanged. Changing it would buy nothing — the route is
+    /// side-effect-free and a page cannot read its reply — and would break `tcr
+    /// status`, which sends no content-type on a GET.
+    ///
+    /// The cross-site and host checks DO apply, because they live in the shared
+    /// [`local_endpoint_gate`]: one implementation for both routes, per that
+    /// function's own reasoning about which copy of a duplicated gate drifts.
+    #[tokio::test]
+    async fn status_endpoint_is_not_content_type_gated_but_is_cross_site_gated() {
+        use tower::ServiceExt as _;
+        let served = [
+            ("no content-type — what `tcr status` actually sends", vec![]),
+            (
+                "a text/plain content-type on a GET",
+                vec![("content-type", "text/plain")],
+            ),
+        ];
+        let refused: [HeaderCase; 3] = [
+            (
+                "a cross-origin Origin",
+                vec![("origin", "https://evil.example.com")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "Sec-Fetch-Site: cross-site",
+                vec![("sec-fetch-site", "cross-site")],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                "a rebound Host",
+                vec![("host", "rebound.example.com")],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+        ];
+
+        let probe_status = |headers: Vec<(&'static str, &'static str)>| async move {
+            let manager = Manager::with_live_refresher(two_account_config(None), None);
+            let mut builder = Request::builder().method(Method::GET).uri(STATUS_PATH);
+            for (name, value) in &headers {
+                builder = builder.header(*name, *value);
+            }
+            let mut req = builder.body(Body::empty()).expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback_peer()));
+            app(manager)
+                .oneshot(req)
+                .await
+                .expect("router response")
+                .status()
+        };
+
+        for (label, headers) in served {
+            assert_eq!(probe_status(headers).await, StatusCode::OK, "{label}");
+        }
+        for (label, headers, expected) in refused {
+            assert_eq!(probe_status(headers).await, expected, "{label}");
+        }
+    }
+
+    /// The three new pure helpers, in isolation — the negatives are the point.
+    #[test]
+    fn local_gate_helpers_classify_their_edges() {
+        // A loopback name is any 127/8 address, the v6 loopback bracketed or bare,
+        // and `localhost` in any case. Nothing else, including the addresses a
+        // rebound page would be served from.
+        for host in [
+            "127.0.0.1",
+            "127.0.0.53",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LocalHost",
+        ] {
+            assert!(host_is_loopback(host), "{host} is loopback");
+        }
+        for host in [
+            "rebound.example.com",
+            "api.anthropic.com",
+            "169.254.169.254",
+            "0.0.0.0",
+            "192.168.1.10",
+            "localhost.evil.example.com",
+            "",
+        ] {
+            assert!(!host_is_loopback(host), "{host} is NOT loopback");
+        }
+
+        let with = |name: &str, value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                HeaderValue::from_str(value).expect("header value"),
+            );
+            headers
+        };
+
+        // Only `application/json`, parameters and case allowed; ABSENT is a no.
+        for value in [
+            "application/json",
+            "Application/JSON",
+            "application/json; charset=utf-8",
+            "application/json;charset=UTF-8",
+        ] {
+            assert!(
+                is_json_content_type(&with("content-type", value)),
+                "{value} is json"
+            );
+        }
+        for value in [
+            "text/plain",
+            "text/plain;charset=UTF-8",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data; boundary=x",
+            "application/json-patch+json",
+            "application/jsonx",
+            "",
+        ] {
+            assert!(
+                !is_json_content_type(&with("content-type", value)),
+                "{value} is NOT json"
+            );
+        }
+        assert!(
+            !is_json_content_type(&HeaderMap::new()),
+            "no content-type at all is a CORS simple request too"
+        );
+
+        // Cross-site: any Origin, or a Sec-Fetch-Site that is not ours.
+        assert!(is_cross_site_request(&with(
+            "origin",
+            "https://evil.example.com"
+        )));
+        assert!(is_cross_site_request(&with("origin", "null")));
+        assert!(is_cross_site_request(&with("sec-fetch-site", "cross-site")));
+        assert!(is_cross_site_request(&with("sec-fetch-site", "same-site")));
+        assert!(!is_cross_site_request(&with(
+            "sec-fetch-site",
+            "same-origin"
+        )));
+        assert!(!is_cross_site_request(&with("sec-fetch-site", "none")));
+        assert!(
+            !is_cross_site_request(&HeaderMap::new()),
+            "a non-browser caller sends neither header, and must not be refused"
+        );
+
+        // The authority in an absolute-form target WINS over the Host header, and
+        // an origin-form request with no Host names no host at all.
+        let absolute: axum::http::Uri =
+            "http://api.anthropic.com/_tcr/status".parse().expect("uri");
+        assert_eq!(
+            target_host(&absolute, &with("host", "127.0.0.1:3456")),
+            Some("api.anthropic.com"),
+            "the request line is what the client asked for"
+        );
+        let origin_form: axum::http::Uri = "/_tcr/status".parse().expect("uri");
+        assert_eq!(
+            target_host(&origin_form, &with("host", "localhost:3456")),
+            Some("localhost"),
+            "the port is stripped"
+        );
+        assert_eq!(
+            target_host(&origin_form, &with("host", "[::1]:3456")),
+            Some("[::1]"),
+            "…and a bracketed v6 literal survives it, brackets included"
+        );
+        assert_eq!(
+            target_host(&origin_form, &with("host", "[::1]")),
+            Some("[::1]"),
+            "a v6 literal with NO port keeps every colon: splitting on the last \
+             one yields '[:' and misroutes an IPv6 loopback client"
+        );
+        assert_eq!(target_host(&origin_form, &HeaderMap::new()), None);
     }
 
     // --- rotation-bypassing relays -----------------------------------------

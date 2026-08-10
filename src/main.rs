@@ -79,7 +79,8 @@ struct RemoveArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name (email) or a case-insensitive substring of it.
+    /// Account name, or its bare email if the name carries an org suffix. Exact
+    /// and case-sensitive — not a substring.
     query: String,
     /// Narrow an ambiguous match to a single org (name or uuid).
     #[arg(long)]
@@ -91,7 +92,8 @@ struct PriorityArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name (email) or a case-insensitive substring of it.
+    /// Account name, or its bare email if the name carries an org suffix. Exact
+    /// and case-sensitive — not a substring.
     query: String,
     /// The explicit priority value (lower = preferred). Omit with --first/--last.
     #[arg(conflicts_with_all = ["first", "last"])]
@@ -112,7 +114,8 @@ struct EnableArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name (email) or a case-insensitive substring of it.
+    /// Account name, or its bare email if the name carries an org suffix. Exact
+    /// and case-sensitive — not a substring.
     query: String,
     /// Narrow an ambiguous match to a single org (name or uuid).
     #[arg(long)]
@@ -124,7 +127,8 @@ struct DisableArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name (email) or a case-insensitive substring of it.
+    /// Account name, or its bare email if the name carries an org suffix. Exact
+    /// and case-sensitive — not a substring.
     query: String,
     /// Narrow an ambiguous match to a single org (name or uuid).
     #[arg(long)]

@@ -278,10 +278,17 @@ impl crate::identity::Queryable for AccountRuntime {
 
 /// What [`Manager::set_disabled_by_query`] did.
 ///
-/// `Applied` carries the RESOLVED name (the caller's query may have been a
-/// substring, and the answer has to name what was actually parked) plus the
-/// durable half's fate, which the caller must surface — see
-/// [`DisablePersist::warning`].
+/// `Applied` carries the RESOLVED name plus the durable half's fate, which the
+/// caller must surface — see [`DisablePersist::warning`].
+///
+/// The name is resolved, not echoed, because the query may have been the account's
+/// bare EMAIL where its stored name carries an org suffix (`me@example.com
+/// (Acme)`) — so the answer has to say what was actually parked. It is NOT a
+/// substring or case-insensitive match: [`crate::identity::match_accounts`] tries
+/// exact name, then exact email, byte-for-byte and untrimmed. Do not "fix"
+/// resolution to match a looser description; a widened rule is how a query
+/// silently parks an account nobody named, which is exactly what the `Ambiguous`
+/// arm below exists to refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetDisabledOutcome {
     Applied {
