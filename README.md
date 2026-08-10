@@ -10,7 +10,7 @@ Point Claude Code (or any Anthropic API client) at it, and it spreads requests a
 several Claude accounts, refreshes their OAuth tokens, and shows what each one has left.
 
 [![CI](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
 [Install](#install) · [Usage](#usage) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
@@ -155,7 +155,7 @@ rather than a public issue.
 
 ## Credits and license
 
-MIT, see [`LICENSE`](LICENSE). This is a from-scratch Rust rewrite of the Node proxy
-[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT). The original's
-copyright and license are preserved in [`NOTICE`](NOTICE). Contributors should also read
-[`CLAUDE.md`](CLAUDE.md), which records what this project got wrong before and how.
+PolyForm Noncommercial 1.0.0, see [`LICENSE`](LICENSE). This is a from-scratch Rust rewrite
+of the Node proxy [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude), which
+is MIT, and its notice is retained. The original's copyright and license are preserved in
+[`NOTICE`](NOTICE).

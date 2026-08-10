@@ -2,7 +2,10 @@
 name = "teamclaude-rs"
 version = "0.2.4"
 edition = "2021"
-license = "MIT"
+license = "PolyForm-Noncommercial-1.0.0"
+# Noncommercial license, so this crate must never reach crates.io, whose terms
+# require a license permitting redistribution and commercial use.
+publish = false
 description = "Lean single-user rotating Anthropic proxy with a live TUI — a Rust replacement for the personal teamclaude proxy"
 repository = "https://github.com/dhkts1/teamclaude-rs"
 homepage = "https://github.com/dhkts1/teamclaude-rs"

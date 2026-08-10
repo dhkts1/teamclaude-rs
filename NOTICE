@@ -9,4 +9,11 @@ under the MIT License. Its copyright and permission notice are retained in the
 LICENSE file of this project, as the MIT License requires for derivative works.
 
 The Rust implementation in this repository is Copyright (c) 2026 Gil
-(https://github.com/dhkts1) and is likewise released under the MIT License.
+(https://github.com/dhkts1) and is released under the PolyForm Noncommercial
+License 1.0.0, whose full text is in the LICENSE file. That is a
+source-available license, not an open source license: it permits use for
+noncommercial purposes only.
+
+The change of license for the Rust implementation does not affect the original
+work. Portions of this project derived from teamclaude remain under the MIT
+License, and its notice is retained as described above.
