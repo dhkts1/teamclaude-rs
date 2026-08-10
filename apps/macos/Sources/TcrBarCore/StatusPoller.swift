@@ -103,10 +103,18 @@ public final class StatusPoller: ObservableObject {
         task = nil
     }
 
-    public func pollOnce() async {
+    /// Returns the state it just published, so a caller that polls *in order to
+    /// check something* can compare against the exact read it triggered rather
+    /// than against whatever `state` holds by the time it looks — a later timer
+    /// tick can land in between. The toggle read-back
+    /// (``AccountController/record(readback:requestedEnabled:account:now:)``)
+    /// depends on that.
+    @discardableResult
+    public func pollOnce() async -> PollState {
         let next = await Task.detached(priority: .utility) { Self.fetch() }.value
         state = next
         lastPollAt = Date()
+        return next
     }
 
     /// Blocking fetch — always called off the main actor.

@@ -25,7 +25,7 @@ use anyhow::{bail, Context as _};
 use time::OffsetDateTime;
 
 use crate::build_info::{self, BuildInfo};
-use crate::config::{self, Account, Config};
+use crate::config::{self, Config};
 use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
@@ -92,30 +92,34 @@ fn save_after_edit(config_path: &Path, config: &Config) -> anyhow::Result<()> {
 /// silently resolving to the first entry. Zero or more-than-one surviving
 /// candidate is an error — the ambiguous error lists the candidate names so the
 /// caller can disambiguate. (`Account.name` IS the email.)
-pub fn resolve_account(
-    accounts: &[Account],
+pub fn resolve_account<T: identity::Queryable>(
+    accounts: &[T],
     query: &str,
     org: Option<&str>,
 ) -> anyhow::Result<usize> {
-    let candidates = identity::match_accounts(accounts, query, org);
-
-    match candidates.as_slice() {
-        [] => {
+    match identity::match_one(accounts, query, org) {
+        identity::Match::One(only) => Ok(only),
+        identity::Match::None => {
             let org_note = org
                 .map(|o| format!(" (with org matching '{o}')"))
                 .unwrap_or_default();
             bail!("no account matches '{query}'{org_note}");
         }
-        [only] => Ok(*only),
-        many => {
-            let names: Vec<&str> = many.iter().map(|&i| accounts[i].name.as_str()).collect();
-            bail!(
-                "'{query}' is ambiguous — matches {} accounts: {}. Narrow with --org or use an exact name.",
-                names.len(),
-                names.join(", ")
-            );
+        identity::Match::Ambiguous(names) => {
+            bail!("{}", ambiguous_query_message(query, &names));
         }
     }
+}
+
+/// The one-line explanation of an ambiguous query, shared by the CLI's own
+/// resolution and by the live control endpoint's 409 body, so a caller gets the
+/// same actionable sentence — and the same candidate list — whichever answered.
+pub fn ambiguous_query_message(query: &str, names: &[String]) -> String {
+    format!(
+        "'{query}' is ambiguous — matches {} accounts: {}. Narrow with --org or use an exact name.",
+        names.len(),
+        names.join(", ")
+    )
 }
 
 /// Load → resolve `(query, org)` to one account → hand it to `mutate` → save.
@@ -194,26 +198,245 @@ pub fn set_priority(
     Ok(())
 }
 
-/// Enable or disable the account matching `query`.
+/// Enable or disable the account matching `query`, **in the running proxy first**.
 ///
-/// `disabled = true` writes `"disabled": true`; `disabled = false` sets the
-/// field to `None` so `skip_serializing_if = Option::is_none` DROPS the key
-/// entirely — matching the JS `delete account.disabled`, not a `false` literal.
-pub fn set_enabled(
+/// A file-only write was the bug. The proxy reads `disabled` from the config once,
+/// at `Manager::new`, and never again — so `tcr disable alice` exited 0, printed
+/// "Disabled account 'alice'.", and the serving process kept handing that account
+/// live traffic. `tcr status` prefers the live server, so nothing anywhere said
+/// otherwise. Two accounts were measured in that state on the live fleet.
+///
+/// So: ask the server ([`crate::proxy::DISABLED_PATH`]), which applies the flag to
+/// its in-memory rotation AND persists it, and fall back to the file only when no
+/// server answered. The fallback is not silent when a server DID answer and could
+/// not do the job — that silence is the entire reason the defect was invisible.
+///
+/// `disabled = false` on the file path sets the field to `None` so
+/// `skip_serializing_if = Option::is_none` DROPS the key entirely — matching the
+/// JS `delete account.disabled`, not a `false` literal. `Manager::set_disabled`'s
+/// persist does the same, so both paths leave the same document.
+pub async fn set_enabled(
     config_path: &Path,
     query: &str,
     org: Option<&str>,
     disabled: bool,
 ) -> anyhow::Result<()> {
-    let name = edit_account(config_path, query, org, |config, idx| {
-        config.accounts[idx].disabled = if disabled { Some(true) } else { None };
-        config.accounts[idx].name.clone()
-    })?;
+    // A config we cannot read has no port and no api-key to reach a server with;
+    // fall through to the file path, which reports the load failure as it always
+    // has. Never a silent skip of the live attempt for any other reason.
+    if let Ok(config) = config::load(config_path) {
+        match post_set_disabled(&config, query, org, disabled).await {
+            Ok(applied) => {
+                println!(
+                    "{} account '{}'.",
+                    if disabled { "Disabled" } else { "Enabled" },
+                    applied.name
+                );
+                if let Some(warning) = &applied.warning {
+                    eprintln!("[tcr] warning: {warning}");
+                }
+                return Ok(());
+            }
+            // Nothing is listening: the historical case, and the only quiet one.
+            // There is no live rotation to disagree with the file.
+            Err(LiveControlError::NoServer) => {}
+            // A server is there and REFUSED us. Writing the file here would be the
+            // old lie in a new place: the config would say benched while the proxy
+            // we could not talk to keeps rotating. Change nothing, exit non-zero.
+            Err(LiveControlError::Unauthorized) => {
+                bail!(
+                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                    config.proxy.port,
+                    config_path.display()
+                );
+            }
+            // The route is missing: an older tcr is serving. The file write is all
+            // we can do, and it is HALF a disable — say so loudly. This arm is the
+            // one that used to be the whole function, silently.
+            Err(LiveControlError::NoRoute) => {
+                let name = write_disabled_flag(config_path, query, org, disabled)?;
+                eprintln!(
+                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                    config.proxy.port,
+                    crate::proxy::DISABLED_PATH,
+                    if disabled { "routing to" } else { "benching" },
+                );
+                return Ok(());
+            }
+            // The route ran and refused the QUERY: it matched no live account, or
+            // matched several. Do not fall back — the file's own resolution could
+            // land on a different account than the one the server was talking
+            // about, and a disable applied to the wrong row is worse than none.
+            Err(LiveControlError::Rejected(message)) => {
+                bail!(
+                    "the proxy running on :{} refused this: {message} Nothing was changed.",
+                    config.proxy.port
+                );
+            }
+            // It answered something we cannot use, or did not answer at all. Same
+            // shape of consequence as the arm above, different cause, and equally
+            // never silent.
+            Err(other) => {
+                let name = write_disabled_flag(config_path, query, org, disabled)?;
+                eprintln!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP {} '{name}' until it restarts.",
+                    config.proxy.port,
+                    other.why(),
+                    if disabled { "routing to" } else { "benching" },
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    let name = write_disabled_flag(config_path, query, org, disabled)?;
     println!(
         "{} account '{name}'.",
         if disabled { "Disabled" } else { "Enabled" }
     );
     Ok(())
+}
+
+/// The file half of enable/disable: resolve, set the flag, save, return the
+/// resolved name. Exactly what `set_enabled` did before it learned to ask the
+/// server.
+fn write_disabled_flag(
+    config_path: &Path,
+    query: &str,
+    org: Option<&str>,
+    disabled: bool,
+) -> anyhow::Result<String> {
+    edit_account(config_path, query, org, |config, idx| {
+        config.accounts[idx].disabled = if disabled { Some(true) } else { None };
+        config.accounts[idx].name.clone()
+    })
+}
+
+/// Why a live account-control request did not apply.
+///
+/// The arms are the CLI's decision table, not decoration: one of them must NOT
+/// write the config (`Unauthorized`), one writes it quietly (`NoServer`), and the
+/// rest write it and shout. Collapsing them is how a half-applied disable becomes
+/// invisible again.
+#[derive(Debug)]
+enum LiveControlError {
+    /// Nothing is listening on the configured port. No live rotation exists, so
+    /// the file IS the whole truth — the ordinary offline case.
+    NoServer,
+    /// A server answered, but the account-control route is not there: an older
+    /// tcr, identified structurally by the absent
+    /// [`crate::proxy::ENDPOINT_HEADER`] on a 404/405, never by error text.
+    NoRoute,
+    /// The proxy rejected our api-key. The one arm that must not touch the file.
+    Unauthorized,
+    /// Something is listening but produced no usable response before the deadline.
+    NoAnswer(String),
+    /// It answered and the answer was not one we can act on: a 4xx/5xx from the
+    /// route itself, or a body that is not ours.
+    Unusable(String),
+    /// The route resolved our query to nothing, or to more than one account. The
+    /// server's own message is carried through verbatim — it names the candidates.
+    Rejected(String),
+}
+
+impl LiveControlError {
+    fn why(&self) -> String {
+        match self {
+            LiveControlError::NoServer => "nothing is listening".to_string(),
+            LiveControlError::NoRoute => {
+                "the running proxy has no account-control route".to_string()
+            }
+            LiveControlError::Unauthorized => "the proxy api-key was rejected".to_string(),
+            LiveControlError::NoAnswer(why)
+            | LiveControlError::Unusable(why)
+            | LiveControlError::Rejected(why) => why.clone(),
+        }
+    }
+}
+
+/// Ask the running proxy to park/unpark an account. Mirrors [`fetch_live_status`]:
+/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr, so honouring it
+/// would send this command through the proxy it is about), same timeouts, same
+/// api-key header — the control route has no loopback exemption either.
+async fn post_set_disabled(
+    config: &Config,
+    query: &str,
+    org: Option<&str>,
+    disabled: bool,
+) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
+
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::DISABLED_PATH
+    );
+    let mut request = client.post(&url).json(&serde_json::json!({
+        "query": query,
+        "org": org,
+        "disabled": disabled,
+    }));
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        Err(e) if e.is_timeout() => {
+            return Err(LiveControlError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
+    };
+
+    let status = response.status();
+    // Whether THIS route produced the answer, decided structurally. A 404 from a
+    // tcr without the route and a 404 meaning "no such account" are the same status
+    // code with opposite consequences, and the header is the only difference that
+    // is not a matched error string.
+    let from_route = response
+        .headers()
+        .get(crate::proxy::ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(crate::proxy::DISABLED_ENDPOINT);
+    let body = response.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        return serde_json::from_str(&body).map_err(|e| {
+            LiveControlError::Unusable(format!(
+                "the response was not a tcr account-control payload ({e})"
+            ))
+        });
+    }
+    if status.as_u16() == 401 {
+        return Err(LiveControlError::Unauthorized);
+    }
+    if !from_route && matches!(status.as_u16(), 404 | 405) {
+        return Err(LiveControlError::NoRoute);
+    }
+    if from_route && matches!(status.as_u16(), 404 | 409) {
+        return Err(LiveControlError::Rejected(
+            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+}
+
+/// Pull `error.message` out of the proxy's standard error envelope.
+fn error_message_of(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("error")?
+        .get("message")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Build an OFFLINE snapshot from `config`: a [`Manager`] with `config_path =
@@ -1060,27 +1283,167 @@ mod tests {
 
     // --- enable / disable --------------------------------------------------
 
-    #[test]
-    fn set_enabled_true_writes_disabled_true() {
-        let path = write_config("disable", TWO_ACCOUNTS);
-        set_enabled(&path, "alice@example.com", None, true).unwrap();
+    /// A free port nothing is listening on: bound, then dropped.
+    async fn dead_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// `TWO_ACCOUNTS` pointed at a port nothing serves, written to a temp file.
+    ///
+    /// Load-bearing safety, not tidiness: `set_enabled` is live-first now, and
+    /// `TWO_ACCOUNTS` names port **3456** — the port a REAL tcr serves Gil's fleet
+    /// on. A test left on that port would POST an account-control command at the
+    /// live proxy. The substitution is asserted below because a silent no-op here
+    /// would aim every one of these tests at the running server.
+    async fn config_on_a_dead_port(tag: &str) -> std::path::PathBuf {
+        let port = dead_port().await;
+        let json = TWO_ACCOUNTS.replace("\"port\": 3456", &format!("\"port\": {port}"));
+        assert!(
+            !json.contains("\"port\": 3456") && json.contains(&format!("\"port\": {port}")),
+            "the port substitution must apply, or this test talks to the live proxy"
+        );
+        write_config(tag, &json)
+    }
+
+    #[tokio::test]
+    async fn set_enabled_true_writes_disabled_true() {
+        let path = config_on_a_dead_port("disable").await;
+        set_enabled(&path, "alice@example.com", None, true)
+            .await
+            .unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["accounts"][0]["disabled"], serde_json::json!(true));
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn set_enabled_false_drops_the_disabled_key() {
-        let path = write_config("enable", TWO_ACCOUNTS);
+    #[tokio::test]
+    async fn set_enabled_false_drops_the_disabled_key() {
+        let path = config_on_a_dead_port("enable").await;
         // First disable, then re-enable — the key must vanish entirely.
-        set_enabled(&path, "alice@example.com", None, true).unwrap();
-        set_enabled(&path, "alice@example.com", None, false).unwrap();
+        set_enabled(&path, "alice@example.com", None, true)
+            .await
+            .unwrap();
+        set_enabled(&path, "alice@example.com", None, false)
+            .await
+            .unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(
             value["accounts"][0].get("disabled").is_none(),
             "re-enable must DROP the disabled key, not write false"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// THE BITING TEST for the CLI half, end to end through the PRODUCTION path:
+    /// a real hybrid listener (the thing that injects `ClientAddr`), a real socket,
+    /// the real router, and `set_enabled` as `tcr disable` calls it.
+    ///
+    /// The two assertions after the call are the whole bug. Pre-change `set_enabled`
+    /// wrote the file and stopped, so the RUNNING manager's `disabled` stayed
+    /// `false` and the account it named kept being handed traffic — measured on the
+    /// live fleet, two accounts deep. A file-only assertion passes against that
+    /// defect; the in-memory one does not.
+    #[tokio::test]
+    async fn set_enabled_parks_the_account_in_the_running_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-disable").await;
+        let mut config = load(&path);
+        config.proxy.port = port;
+
+        // The server owns the SAME config file the CLI is pointed at, exactly as
+        // the real proxy does — so the durable half lands where `tcr` looks.
+        let manager = Manager::with_live_refresher(config.clone(), Some(path.clone()));
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+
+        // Point the CLI at the live port by rewriting the file it will load.
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        set_enabled(&path, "alice@example.com", None, true)
+            .await
+            .unwrap();
+
+        // 1. THE RUNNING ROTATION. Not a fresh Manager, not the file — the process
+        //    that would serve the next request.
+        let live = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(live.accounts[0].name, "alice@example.com");
+        assert!(
+            live.accounts[0].disabled,
+            "the account is parked IN THE SERVING PROCESS, not just on disk"
+        );
+        assert!(
+            !live.accounts[1].disabled,
+            "and only the resolved account was touched"
+        );
+
+        // 2. …and the file carries it, so the bench survives a restart.
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["accounts"][0]["disabled"],
+            serde_json::json!(true),
+            "the durable half landed too: {after}"
+        );
+
+        // 3. Re-enable, live, and the key is DROPPED from the document — the same
+        //    contract the file-only path has always had.
+        set_enabled(&path, "alice@example.com", None, false)
+            .await
+            .unwrap();
+        assert!(
+            !manager.snapshot(OffsetDateTime::now_utc()).accounts[0].disabled,
+            "re-enable reaches the live rotation too"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            after["accounts"][0].get("disabled").is_none(),
+            "re-enable DROPS the key rather than writing false: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// An ambiguous query is refused by the SERVER and the CLI does not fall back:
+    /// the file's own resolution could land on a different row than the one the
+    /// server was talking about, and a disable applied to the wrong account is
+    /// worse than none. Both accounts share an email here, so `--org` is the fix
+    /// the message must name.
+    #[tokio::test]
+    async fn set_enabled_refuses_an_ambiguous_query_without_writing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-ambiguous").await;
+        // Same email in two orgs — the shape `--org` exists for.
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        doc["accounts"][1]["name"] = serde_json::json!("alice@example.com");
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let config = load(&path);
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let err = set_enabled(&path, "alice@example.com", None, true)
+            .await
+            .expect_err("an ambiguous query must not be applied");
+        let text = err.to_string();
+        assert!(
+            text.contains("ambiguous") && text.contains("--org"),
+            "the refusal names the candidates and the fix: {text}"
+        );
+        assert_eq!(
+            before,
+            fs::read_to_string(&path).unwrap(),
+            "a refused command leaves the config byte-identical"
         );
         fs::remove_file(&path).ok();
     }

@@ -557,17 +557,23 @@ private struct RowsHeightKey: PreferenceKey {
 /// matched the wrong account (the query is a substring match) shows up as the
 /// wrong row changing rather than as a lie. A non-zero exit is rendered in place.
 ///
-/// One thing this row deliberately does not claim: that the *running proxy* has
-/// picked the change up. `tcr` rewrites the config; whether a live server re-reads
-/// it without a restart is unverified from here, in either direction.
+/// This row no longer lets a toggle succeed silently. `tcr` rewrites the config
+/// and exits 0; a proxy that read `disabled` once at boot keeps reporting the old
+/// value, and `tcr status` prefers the live server — so the refresh used to come
+/// back unchanged and the row showed nothing at all. Every toggle now ends in a
+/// stated outcome from ``ToggleVerdict``, drawn by `verdictLine` and spoken by
+/// `rowAccessibilityLabel`.
 ///
 /// No confirmation dialog: disabling is reversible and costs nothing.
 struct AccountRow: View {
     let account: Account
     let countersAreStructural: Bool
     @ObservedObject var accounts: AccountController
-    /// Called after a successful toggle so the row re-reads reality.
-    let onChanged: () async -> Void
+    /// Called after a successful toggle so the row re-reads reality. It returns
+    /// the state of the read it just performed, which is what the verdict is
+    /// computed against — reading the poller's published `state` afterwards could
+    /// pick up a different, later poll.
+    let onChanged: () async -> PollState
 
     /// The single tint for this row's quota evidence. The pill and the bar both
     /// read it, so the two can never disagree about whether a quota is known.
@@ -639,6 +645,12 @@ struct AccountRow: View {
         if let hold = account.soonestHold { parts.append(hold.countdownLabel) }
         if let failure = accounts.failure(for: account.name) {
             parts.append("last action failed: \(failure.summary)")
+        }
+        // Spoken for the same reason the pill is: a confirmation only a sighted
+        // user gets is half built, and the `✓` in `rowLabel` is punctuation to a
+        // screen reader.
+        if let verdict = accounts.verdict(for: account.name, reportedDisabled: account.disabled) {
+            parts.append(verdict.spokenLabel)
         }
         return parts.joined(separator: ", ")
     }
@@ -749,6 +761,41 @@ struct AccountRow: View {
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            verdictLine
+        }
+    }
+
+    /// The outcome of the last successful toggle, as the fleet then reported it.
+    ///
+    /// Three tints for three different facts. A not-honoured toggle is drawn in
+    /// `Tok.near` rather than `Tok.spent`: nothing failed — the call landed and
+    /// the config changed — so it must not wear the colour this palette reserves
+    /// for errors, which is already taken by the verbatim `tcr` failure directly
+    /// above it. The two lines can appear for different reasons and have to stay
+    /// tellable apart.
+    @ViewBuilder
+    private var verdictLine: some View {
+        if let verdict = accounts.verdict(for: account.name, reportedDisabled: account.disabled) {
+            Label(verdict.rowLabel, systemImage: Self.verdictGlyph(verdict))
+                .font(Tok.detailFont)
+                .foregroundStyle(Self.verdictTint(verdict))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private static func verdictGlyph(_ verdict: ToggleVerdict) -> String {
+        switch verdict {
+        case .confirmed: return "checkmark.circle"
+        case .notHonoured: return Tok.unreadableGlyph
+        case .unverified: return "questionmark.circle"
+        }
+    }
+
+    private static func verdictTint(_ verdict: ToggleVerdict) -> Color {
+        switch verdict {
+        case .confirmed: return Tok.ok
+        case .notHonoured: return Tok.near
+        case .unverified: return Tok.unmeasured
         }
     }
 
@@ -765,7 +812,13 @@ struct AccountRow: View {
         return Button(title) {
             Task {
                 if await accounts.setEnabled(enabling, account: account.name) {
-                    await onChanged()
+                    // Exit 0 is not the outcome — it is permission to go and find
+                    // out what the outcome was. The refresh's own result is
+                    // compared against what was asked, and the row says which of
+                    // the three things happened.
+                    let readback = await onChanged()
+                    accounts.record(
+                        readback: readback, requestedEnabled: enabling, account: account.name)
                 }
             }
         }
