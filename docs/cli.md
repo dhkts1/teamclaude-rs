@@ -95,8 +95,19 @@ Trailing args are captured with `trailing_var_arg` and `allow_hyphen_values`, so
 
 If the proxy is not listening, `tcr run` launches `claude` **untouched** and says so on
 stderr, so a stopped proxy never breaks the shell alias. When the proxy is up, the child
-gets the routing environment, plus `ANTHROPIC_API_KEY` set to `proxy.apiKey` when one is
-configured (`src/main.rs:329-331`). The process exits with `claude`'s own exit code.
+gets the routing environment and nothing else — in particular **no `ANTHROPIC_API_KEY`**,
+even when `proxy.apiKey` is set. It used to get one, and that broke Claude Code: an
+`ANTHROPIC_API_KEY` outranks claude's own claude.ai login as an auth source, which
+**disables every claude.ai connector**, announced in one startup line that scrolls away,
+after which the tools are simply absent. It bought nothing in exchange — the proxy's
+`x-api-key` gate exempts loopback clients and the server binds `127.0.0.1` only, so a
+`tcr run` child was always exempt. When a key is configured, `tcr run` prints a line on
+stderr saying it is deliberately withholding it (`src/main.rs:329-334`; the reason is the
+doc comment at `:387-408`).
+
+A value **you** exported is inherited untouched: an explicit choice wins, and it is the
+escape hatch for a `claude` with no claude.ai login of its own, which does need some
+credential to start. The process exits with `claude`'s own exit code.
 
 ---
 

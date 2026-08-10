@@ -56,7 +56,7 @@ said 0.90, which was never the shipped value.
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
 | `proxy.port` | u16 | `3456` | no | port the proxy binds on loopback (`src/config.rs:72-73`, default at `:26-28`) |
-| `proxy.apiKey` | string | absent | no | shared secret required by the local control routes, and exported to `claude` by `tcr run` (`src/config.rs:74-75`) |
+| `proxy.apiKey` | string | absent | no | shared secret required by the local `/_tcr/` control routes; the request path exempts loopback callers, and it is never handed to `claude` (`src/config.rs:74-75`) |
 
 `--port` beats the file. `tcr server --port 9000` overrides `proxy.port` at runtime; the
 flag is threaded into `ServeOptions.port` at `src/main.rs:548` and wins wherever it is
@@ -66,12 +66,12 @@ flag is threaded into `ServeOptions.port` at `src/main.rs:548` and wins wherever
 
 When it is set, it is **required on every request to the `/_tcr/` control routes, with no
 loopback exemption**. That is deliberate and stricter than the request path: the doc
-comment on `local_endpoint_gate` (`src/proxy.rs:806-826`) spells out why — the ordinary
+comment on `local_endpoint_gate` (`src/proxy.rs:810-852`) spells out why — the ordinary
 proxy path exempts loopback because `claude` authenticates with its own OAuth and never
 sends the proxy key, but nothing on the machine has any business reading or steering the
 fleet without the operator's secret, so `/_tcr/status` and `/_tcr/accounts/disabled` cost
 the same secret that using the proxy does. The check is a constant-time compare of the
-`x-api-key` header at `src/proxy.rs:858-869`; a miss is a 401.
+`x-api-key` header at `src/proxy.rs:871-880`; a miss is a 401.
 
 Binding to loopback is not authorization. `127.0.0.1` is reachable by every process and
 every container on the host, which is exactly the reasoning in that comment. If you set
@@ -79,8 +79,15 @@ every container on the host, which is exactly the reasoning in that comment. If 
 through the same gate, and a rejected key makes them refuse rather than silently fall back
 to a file write (`src/cli.rs:246-252`).
 
-`tcr run` exports the same value as `ANTHROPIC_API_KEY` to the child `claude` process
-(`src/main.rs:329-331`).
+**`tcr run` does not give this value to `claude`.** It used to export it as
+`ANTHROPIC_API_KEY`, and that made Claude Code take an API key as its auth source ahead of
+its claude.ai login, which **disables every claude.ai connector** — announced in one
+startup line that scrolls away, after which the tools are simply absent. It bought nothing:
+the request path exempts loopback clients from this key, so the child was always exempt
+anyway. When a key is configured, `tcr run` says on stderr that it is withholding it
+(`src/main.rs:329-334`, reasoning at `:387-408`); a value the caller exported is inherited
+untouched. So the key's whole job is the `/_tcr/` gate above — it is not a credential
+anything downstream of the proxy needs.
 
 ## `accounts[]`
 
