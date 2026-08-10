@@ -39,7 +39,8 @@ impl Manager {
     ///    interval: both latch sites signal [`Manager::warm_wake`] on the flip and
     ///    the warm loop `select!`s on it.
     /// 3. **Evidence unavailable** → proceed anyway, and say so once.
-    ///    [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] consecutive failed sweeps mean
+    ///    [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] consecutive failed probes of
+    ///    this account mean
     ///    the probe is not going to answer. Absence of evidence is not evidence of
     ///    a live window, and a permanently dark feature is worse than a bounded
     ///    warm on stale information — the wait must be BOUNDED, or gating on
@@ -125,9 +126,35 @@ impl Manager {
         }
     }
 
+    /// Warm ONE account, if it is still eligible at this instant.
+    ///
+    /// The per-account entry point [`crate::schedule`] drives, and the
+    /// re-checking is the point: an account's due instant was drawn up to a whole
+    /// cadence ago, and in between it may have started serving traffic (live 5h
+    /// window), crossed its threshold, or been disabled — all of which
+    /// [`Self::warm_targets`] excludes and all of which would otherwise be a
+    /// wasted, quota-spending request. Takes the same [`Self::warm_in_flight`]
+    /// guard [`Self::warm_all`] does, so a scheduled warm and a wake-driven sweep
+    /// can never double-warm the same account.
+    pub async fn warm_one(&self, idx: usize) {
+        if !self.warm_targets().contains(&idx) {
+            return;
+        }
+        if self.warm_in_flight.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _guard = WarmInFlightGuard(&self.warm_in_flight);
+        self.warm_account(idx).await;
+    }
+
     /// Warm every eligible idle account once, SEQUENTIALLY with [`crate::probe::PROBE_SPACING`]
     /// between calls (mirrors the spaced probe sweep). Overlapping sweeps are
     /// skipped via [`Self::warm_in_flight`] so two timers never double-warm.
+    ///
+    /// This stays the ONE-SHOT sweep, reached from the edge-triggered
+    /// [`Manager::warm_wake`] signal (the whole fleet's eligibility just changed)
+    /// rather than from a cadence — the periodic path is per-account and random,
+    /// via [`Self::warm_one`].
     pub async fn warm_all(&self) {
         // Skip if a sweep is already running (mirrors the JS `_running` guard).
         if self.warm_in_flight.swap(true, Ordering::SeqCst) {

@@ -101,8 +101,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // kept here because deleting the flag would otherwise delete the reason
         // it existed with it.
         //
-        // Safe by construction either way: this is `start()`, which passes
-        // `--no-replace`, so a proxy that is already serving is never disturbed.
+        // Safe by construction either way: this is `start()`, which spawns
+        // `tcr server --headless --no-replace` (`ServerController.safeArguments`).
+        // Standing down rather than disturbing a proxy that is already serving is
+        // `tcr`'s default; `--no-replace` only restates it for an older binary.
+        // `--headless` is the flag that matters here — without it the child dies
+        // on startup trying to put a TUI on a pipe.
         if shell.preference.startServerAtLaunch {
             shell.server.start()
         }

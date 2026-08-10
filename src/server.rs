@@ -699,20 +699,26 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         }));
     }
 
-    // Background probe loop: refresh every account's quota on the configured
-    // cadence (a value <= 0 in `quotaProbeSeconds` disables it). The first tick
-    // fires immediately, so the bars populate at startup rather than after a lag.
+    // Background probe: refresh every account's quota around the configured
+    // cadence (a value <= 0 in `quotaProbeSeconds` disables it).
+    //
+    // Boot does ONE immediate whole-fleet sweep, then hands over to `schedule`,
+    // which runs each account on its own randomly drawn schedule (`cadence +/-
+    // 30%`, random initial offset — see `crate::schedule`). The boot sweep is
+    // kept deliberately: `interval`'s first tick used to fire immediately so the
+    // bars populate at startup rather than after a lag, and a random first offset
+    // would otherwise leave a fresh proxy showing blank bars for up to a whole
+    // cadence. It is a single sweep at a known-quiet moment, not a repeating
+    // synchronization — every subsequent probe is per-account and random.
     let probe_seconds = manager.probe_interval_seconds();
     if probe_seconds > 0 {
         let prober = manager.clone();
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(async move {
             let probe = async {
-                let mut ticker = tokio::time::interval(Duration::from_secs(probe_seconds));
-                loop {
-                    ticker.tick().await;
-                    prober.probe_all().await;
-                }
+                prober.probe_all().await;
+                crate::schedule::run(prober.clone(), crate::schedule::Job::Probe, probe_seconds)
+                    .await;
             };
             tokio::select! {
                 _ = probe => {}
@@ -724,35 +730,24 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // Opt-in keep-warm loop: periodically warm idle accounts so their 5h session
     // window stays live. Ships DARK — `warmupSeconds` defaults to 0, and when it is
     // absent/0 NO task is spawned here at all (unlike the probe, warming spends real
-    // quota). `MissedTickBehavior::Skip` drops a missed tick rather than bursting a
-    // catch-up warm after the process was suspended.
+    // quota).
+    //
+    // Same treatment as the probe and for the same reason — it had the identical
+    // synchronized shape — with one deliberate difference: there is NO boot sweep
+    // here, because a warm spends real quota and `warm_targets`' boot gate exists
+    // precisely to stop a restart from firing one at every account. Each account
+    // gets a random initial offset and a random interval thereafter
+    // (`crate::schedule`), and the edge-triggered `warm_wake` still starts a
+    // one-shot sweep: it is what keeps the boot gate from being a kill switch on
+    // a proxy restarted more often than `warmupSeconds`. That wake is handled
+    // inside `schedule::run`, where a permit stored by `notify_one` while a warm
+    // is in flight is consumed by the next `notified()` rather than lost.
     let warmup_seconds = manager.warmup_interval_seconds();
     if warmup_seconds > 0 {
         let m = manager.clone();
         let mut stop = shutdown_tx.subscribe();
         background.push(tokio::spawn(async move {
-            let warm = async {
-                let mut ticker = tokio::time::interval(Duration::from_secs(warmup_seconds));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    // Two things start a sweep: the configured cadence, and the probe
-                    // reporting that it has READ an account's quota for the first time.
-                    // The second is what keeps `warm_targets`' boot gate from being a
-                    // kill switch — the ticker's immediate first tick necessarily finds
-                    // no targets (no quota read yet) and `Skip` puts the next one a whole
-                    // `warmupSeconds` away, so at 3600s a proxy restarted more often than
-                    // hourly would otherwise warm nothing, ever. A wake arriving while
-                    // this task is inside `warm_all` is stored as a permit by
-                    // `notify_one` and consumed by the next `notified()`, so it is never
-                    // lost; the flip fires at most once per account per process, so this
-                    // cannot spin.
-                    tokio::select! {
-                        _ = ticker.tick() => {}
-                        _ = m.warm_wake().notified() => {}
-                    }
-                    m.warm_all().await;
-                }
-            };
+            let warm = crate::schedule::run(m, crate::schedule::Job::Warm, warmup_seconds);
             tokio::select! {
                 _ = warm => {}
                 _ = stop.changed() => {}

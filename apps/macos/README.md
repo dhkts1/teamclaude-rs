@@ -10,22 +10,44 @@ to `tcr status --json`.
 
 ## Why it shells out instead of calling the proxy
 
-`GET /_tcr/status` exists, but it requires the operator's proxy API key and has no
-loopback exemption. Using it would mean a GUI process holding that secret. `tcr
-status --json` authenticates itself, so TcrBar never reads `~/.config/teamclaude.json`,
-never handles a token and never sends an `Authorization` header.
+`GET /_tcr/status` exists, but whenever `proxy.apiKey` is configured the route
+requires that key, and being on loopback is no exemption from it
+(`src/proxy.rs:858`). The key is unset by default, so on a default install the
+route answers any loopback caller — but a GUI cannot assume the operator's
+install, and on the ones that do set a key using the route would mean a GUI
+process holding that secret. `tcr status --json` authenticates itself, so TcrBar
+never reads `~/.config/teamclaude.json`, never handles a token and never sends an
+`Authorization` header.
 
 ## The one safety property
 
 `tcr`'s port singleton can take the port over: a starting server may kill a proxy
-already holding it, which wipes the session→account pin map and costs every live
-session a full cold prompt-cache prefix. That kill is now behind an explicit
-`--replace`; the default is to stand down and exit without binding.
+already holding it, costing every live session a full cold prompt-cache prefix.
+That is the worst case, not the rule, and this file used to state it as the rule.
+Session affinity persists the session→account pins to
+`~/.cache/teamclaude/session-affinity.json` — flushed every 5s while the map is
+dirty (`src/server.rs:674-690`) and restored at boot (`src/server.rs:643`) — so a
+takeover *inside* the pin TTL (`affinity::PIN_TTL_MS`, 15 minutes,
+`src/affinity.rs:71`) keeps most sessions warm, while one after it restores
+nothing at all. That the flush is incremental rather than shutdown-only is
+exactly because of this path: `--replace` follows SIGTERM with SIGKILL, and no
+shutdown hook runs for a SIGKILL (`src/affinity.rs:29-37`). None of it applies
+with `sessionAffinity` off, which is the default (`src/manager/state.rs:33-46`).
 
-TcrBar therefore always spawns `tcr server --no-replace` on the routine path, and
-reaches for `--replace` only from "Take over port…", behind a confirmation. (The
-flag is redundant against a current `tcr`, where standing down is the default, and
-load-bearing against an older one, where omitting it meant takeover.) It only ever
+That kill is now behind an explicit `--replace`; the default is to stand down and
+exit without binding.
+
+TcrBar therefore always spawns `tcr server --headless --no-replace` on the routine
+path (`ServerController.swift:153`), and reaches for `--replace` only from "Take
+over port…", behind a confirmation. Of the two, `--headless` is the load-bearing
+one: without it `tcr server` runs its ratatui TUI, which calls `enable_raw_mode()`
+on a stdout that is a pipe here, so the child exits immediately and presents as a
+proxy crash — a shipped bug on every spawn path
+(`ServerController.swift:141-151`). `--no-replace` is **deprecated and now a
+no-op**: nothing reads it (`src/main.rs:194-206`), because standing down rather
+than disturbing an incumbent is what the default already does. It is not what
+produces the safety; it is passed so that against an older `tcr`, where omitting
+it meant takeover, the routine path still stands down. It only ever
 signals a child **it** spawned. A server that was already running is displayed and left
 alone — there is no code path that can terminate it. A spawn that declines because
 an incumbent holds the port is reported as "already running", which is a success.

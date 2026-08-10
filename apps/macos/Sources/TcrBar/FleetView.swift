@@ -343,21 +343,43 @@ struct FleetView: View {
     /// The warning is not decoration. Once TcrBar supervises the server, Quit
     /// stops it — correct for a supervisor, and a genuinely expensive surprise if
     /// nobody said so before the box was ticked.
+    ///
+    /// So it is drawn UNCONDITIONALLY, not inside `if startServerAtLaunch`. The
+    /// preference defaults to off (`LaunchPreference.swift`), so a caveat that
+    /// only appears once the box is ticked appears strictly *after* the decision
+    /// it exists to inform — it can tell an operator what they already did, never
+    /// what they are about to do. The hover help cannot carry it either: a
+    /// tooltip is opt-in, and this cost is not.
+    ///
+    /// Always-present also holds the panel's height still as the box toggles,
+    /// which a conditional line does not: the fleet rows above would shift under
+    /// the pointer at the moment of the click.
+    ///
+    /// It carries `Tok.inkFaint`, not `Tok.near`. Every amber line in this footer
+    /// is a live condition of *this* install; this one is a standing fact about
+    /// what the mode means, true before anybody chooses anything, and drawing a
+    /// permanent note in the alarm colour would leave the panel looking alarmed at
+    /// rest. The wording is deliberately state-neutral for the same reason — it
+    /// reads correctly both as a consequence to weigh and as one already taken on.
     private var startServerToggle: some View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             Toggle("Start server at launch", isOn: $startServerAtLaunch)
                 .toggleStyle(.checkbox)
                 .font(Tok.secondaryFont)
                 .help(
-                    "Runs `tcr server --no-replace` when TcrBar starts, so a proxy "
-                        + "that is already serving is never disturbed."
+                    "Runs `tcr server --headless --no-replace` when TcrBar starts. "
+                        + "`--headless` is the load-bearing one: it keeps the "
+                        + "server alive with no terminal to run its TUI in. "
+                        + "Standing down rather than disturbing a proxy that is "
+                        + "already serving is the default, which `--no-replace` "
+                        + "only restates for an older `tcr`. TcrBar then "
+                        + "supervises the server it started, and quitting TcrBar "
+                        + "stops it."
                 )
-            if startServerAtLaunch {
-                Text("TcrBar supervises the server, so quitting TcrBar stops it.")
-                    .font(Tok.detailFont)
-                    .foregroundStyle(Tok.near)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text("TcrBar supervises a server it starts, so quitting TcrBar stops it.")
+                .font(Tok.detailFont)
+                .foregroundStyle(Tok.inkFaint)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -508,7 +530,8 @@ struct FleetView: View {
 
     /// The alert names the real cost in plain language, defaults to Cancel, and
     /// styles the other button as destructive. Only on an explicit confirm does
-    /// this call `startTakingOverPort()`, which spawns `tcr server --replace`
+    /// this call `startTakingOverPort()`, which spawns
+    /// `tcr server --headless --replace`
     /// — the replacement is performed by `tcr`'s own singleton.
     /// TcrBar signals nothing it did not spawn.
     private func confirmTakeover() {

@@ -1,211 +1,161 @@
+<div align="center">
+
+<img src="assets/tcrbar-icon.png" alt="" width="116">
+
 # teamclaude-rs (`tcr`)
+
+A rotating Anthropic proxy that lives in your menu bar.
+
+Point Claude Code (or any Anthropic API client) at it, and it spreads requests across
+several Claude accounts, refreshes their OAuth tokens, and shows what each one has left.
 
 [![CI](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 
-A lean, single-user **rotating Anthropic proxy** in Rust. Point your Claude Code (or
-any Anthropic API client) at it and it spreads requests across several Claude
-accounts, refreshes their OAuth tokens automatically, and shows a live TUI with
-per-account quota and request counts.
+[Install](#install) · [Usage](#usage) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
 
-It's a from-scratch Rust rewrite of the Node proxy [teamclaude](https://github.com/KarpelesLab/teamclaude) — same on-disk config, same certs,
-so it's a drop-in on the same port.
+<img src="assets/tcrbar-panel-healthy.png" alt="TcrBar menu-bar panel showing a healthy fleet" width="400">
 
-![tcr live TUI](assets/tui-demo.gif)
-
-> The dashboard above is `tcr demo` — the real TUI rendered with fake accounts. Run it yourself with `tcr demo`.
+</div>
 
 ## What it does
 
-- **Load-balances** across your accounts: least-recently-selected rotation, so no
-  single account gets hammered. Priority tiers are respected (keep "pillow"
-  accounts as last resort).
-- **Two entry modes on one port:**
-  - **Base-URL:** set `ANTHROPIC_BASE_URL=http://127.0.0.1:3456`.
-  - **Forward-proxy (MITM):** set `HTTPS_PROXY=http://127.0.0.1:3456` +
-    `NODE_EXTRA_CA_CERTS=<ca.pem>`. Only `api.anthropic.com` is intercepted and
-    token-injected; every other host is blind-tunneled, so Claude Code's other
-    endpoints keep working.
-- **Zero-spend quota probe:** reads each account's usage from the OAuth usage
-  endpoint (no message quota spent) so the bars stay fresh even when idle.
-- **Honest live TUI:** per-account status, 5h / 7d quota bars, probe health,
-  request counts, and a recent-request log. Near-limit accounts read as
-  "near"/"full" — never a false "error".
-- **Localhost only:** binds `127.0.0.1`, so local clients need no API key.
+- Rotates requests across a pool of Claude accounts, with `priority` as a hard tier.
+- Refreshes OAuth tokens in the background, so accounts do not expire out from under you.
+- Native macOS menu-bar app: live quota bars, per-account enable/disable, server supervision.
+- Two entry modes on one port (base-URL and forward-proxy), chosen per connection.
+- A live terminal dashboard, on macOS and Linux alike, showing everything the app shows.
+- Session affinity keeps a conversation on one account, so its prompt cache stays warm.
+- Drop-in for the Node [teamclaude](https://github.com/KarpelesLab/teamclaude): same config, certs and port.
 
-## Build & install
+## Install
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh | sh
+```
+
+Or from source, with a Rust toolchain. Use the script rather than `cp`, because [`cp` onto a
+running binary rewrites the same inode and macOS then kills it](CONTRIBUTING.md#installing-it-onto-your-path):
 
 ```sh
 cargo build --release
-scripts/install-cli.sh          # put `tcr` on PATH (~/.local/bin/tcr by default)
+scripts/install-cli.sh          # places `tcr` at ~/.local/bin/tcr by default
 ```
 
-## Configure
+| Platform | `tcr` CLI | TcrBar menu-bar app |
+|---|---|---|
+| macOS, Apple silicon (`aarch64-apple-darwin`) | prebuilt | yes |
+| macOS, Intel (`x86_64-apple-darwin`) | prebuilt | yes |
+| Linux x86_64, musl (`x86_64-unknown-linux-musl`) | prebuilt | no |
+| Linux aarch64, musl (`aarch64-unknown-linux-musl`) | prebuilt | no |
+| Anything else | build from source | no |
 
-Config lives at `~/.config/teamclaude.json`. It holds **working OAuth credentials** for every account
-in the pool, so it never belongs in a commit — this repository is public, and its contents (tokens,
-account emails, org UUIDs) must stay out of code, fixtures, tests and PR descriptions. Contributors:
-see [`CLAUDE.md`](CLAUDE.md).
+Linux builds are static musl, so Alpine and glibc both work. TcrBar and `tcr ui` are macOS-only.
 
-The shape:
-
-```json
-{
-  "proxy": { "port": 3456 },
-  "switchThreshold": 0.90,
-  "quotaProbeSeconds": 75,
-  "accounts": [
-    {
-      "name": "you@example.com",
-      "type": "oauth",
-      "accessToken": "sk-ant-oat01-...",
-      "refreshToken": "sk-ant-ort01-...",
-      "expiresAt": 1893456000000,
-      "priority": 0
-    }
-  ]
-}
-```
-
-`priority` is lowest-wins (default 0); give backup accounts a higher number so
-they're used only when the primaries are near their cap.
-
-> **Adding accounts:** run `tcr login` — it walks you through Anthropic's OAuth
-> browser flow (PKCE) and writes the resulting tokens straight into the config.
-> You can also paste existing OAuth tokens in by hand. Either way the file is
-> written `0600`; never commit it.
-
-## Run
+## Usage
 
 ```sh
-tcr                 # start the proxy with the live TUI (q to quit)
-tcr server --headless   # run in the background, log to stdout
-tcr run -- <args>   # launch `claude` already pointed at the proxy
+tcr login          # PKCE browser flow, once per account you want in the pool
+tcr                # start the proxy with the live TUI (q quits)
+tcr run -- <args>  # launch Claude Code already pointed at the proxy
 ```
 
-Then either export `ANTHROPIC_BASE_URL` / `HTTPS_PROXY` as above, or use `tcr run`.
-
-## TcrBar — the menu bar app (macOS)
-
-`apps/macos` is a native front end over the same `tcr status --json` the TUI
-reads. The menu-bar item is the whole app — no Dock icon, no window
-(`LSUIElement`). The glyph carries fleet capacity at a glance; the dropdown
-carries the detail: per-account quota bars, whether each account is in the
-rotation, the countdown to the next reset on a held account, and probe health.
-
-It polls every 3 seconds and never renders a blank list. `tcr` missing, the poll
-failing (usually: no server), and an offline read whose counters are
-structurally zero are three different facts, and each gets its own banner — an
-operator who cannot tell them apart will misread the panel.
-
-It can also supervise the proxy. "Start server at launch" runs
-`tcr server --no-replace`, so a proxy that is already serving is never
-disturbed; the flip side is that quitting TcrBar then stops the server it
-started, which the footer says before you tick the box. "Take over port…" is the
-deliberate exception — it replaces an incumbent proxy, which wipes the
-session-to-account pin map — so it sits below its own rule, away from the row
-your hand is already in, and asks first.
+To point a client yourself instead of using `tcr run`:
 
 ```sh
-apps/macos/scripts/install.sh     # build, sign, install to /Applications, launch
-apps/macos/scripts/uninstall.sh   # remove it
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3456   # base-URL mode
+# or
+export HTTPS_PROXY=http://127.0.0.1:3456          # forward-proxy mode
+export NODE_EXTRA_CA_CERTS=<the CA path tcr logs at boot>
 ```
 
-To try a local build without losing the one you use, install it as a separate
-app:
+Forward-proxy mode terminates TLS with a locally generated certificate, so the client has to
+trust it. `tcr` prints the CA path to advertise when it starts. Config lives at
+`~/.config/teamclaude.json`, where `name` and `accessToken` are the only required keys.
+Every other key, its default and the file's permissions are in
+[`docs/configuration.md`](docs/configuration.md).
 
-```sh
-TCRBAR_DEV_BUILD=1 apps/macos/scripts/install.sh   # -> /Applications/TcrBar Dev.app
-```
+## Menu bar app
 
-That gives the dev build its own bundle id as well as its own path, and both
-matter: macOS keys the menu-bar status item on the bundle id, and two processes
-registering the same one get that id blacklisted by ControlCenter — permanently,
-across reboots.
+`apps/macos` is a native front end over the same `tcr status --json` the TUI reads. The
+menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet capacity at
+a glance. Each row carries quota bars, a reset countdown, probe health, and an
+Enable/Disable button that shells out to `tcr`, so you can steer the fleet from the panel.
+It can also supervise the proxy, and self-updates through [Sparkle](https://sparkle-project.org).
 
-### Design tokens
+Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run
+`tcr ui`. Build it here with `apps/macos/scripts/install.sh`; releases: [`docs/RELEASING.md`](docs/RELEASING.md).
 
-The palette is generated, not picked by eye. `scripts/tcrbar-palette.py` authors
-it in OKLCH, converts to sRGB, rejects anything out of gamut, and measures WCAG
-contrast against the surface each colour is actually drawn on — in all four
-appearances (light, dark, and an increased-contrast variant of each). A token
-that fails is a build error rather than a matter of taste.
+The panel never renders a blank list. It also distinguishes `tcr` being missing, a failing
+poll, an empty fleet and an offline read, because each one needs a different response.
 
-The same generator emits the palette for anything designed outside the app:
+<p>
+  <img src="assets/tcrbar-panel-offline.png" alt="TcrBar panel showing an offline read" width="400">
+  <img src="assets/tcrbar-panel-no-capacity.png" alt="TcrBar panel with no capacity left" width="400">
+</p>
 
-```sh
-python3 scripts/tcrbar-palette.py \
-  --emit-css apps/macos/design-tokens/tokens.css \
-  --emit-json apps/macos/design-tokens/tokens.json
-```
+<details>
+<summary>The full fleet view, and the terminal dashboard</summary>
 
-Colour comes from the generator; the spacing ramp, radii and type sizes are read
-out of `Tokens.swift`, where they are authored. Neither is copied, so neither
-can drift. Committing a stale copy is blocked by the pre-commit hook.
+<img src="assets/tcrbar-panel-fleet.png" alt="TcrBar panel listing a full fleet of accounts" width="400">
 
-## Updating
+![tcr live TUI](assets/tui-demo.gif)
 
-The CLI and the app update by different mechanisms, and only one of them is
-automatic.
+`tcr demo` renders the real TUI against fake accounts (which is how these screenshots were
+made). It needs no config and contacts nothing.
 
-TcrBar self-updates through [Sparkle](https://sparkle-project.org). Use
-**Check for Updates…** in the panel footer, or `open tcrbar://check-for-updates`
-— the CLI can trigger the same user-initiated check that way. Background checks
-stay quiet when there is nothing to install; a check you asked for reports
-either way. The feed is the `appcast.xml` published on the latest GitHub
-release, and Sparkle orders releases on `CFBundleVersion`, which this project
-derives from the commit count.
+</details>
 
-A build can only *install* an update if it was built with the Sparkle public key
-in its `Info.plist`. Local builds omit it unless you say otherwise, and then
-Sparkle will check the feed and refuse to install what it downloads — that is
-deliberate, since a placeholder key would fail the same way while looking
-configured. If you want a local build that can still self-update:
+## How it works
 
-```sh
-export TCRBAR_SPARKLE_PUBLIC_KEY=1WZWEwzSEijRarey7qE0a+n4AO/+7e4Fj/nW8Y8ZKMM=
-```
+One TCP listener serves both entry modes, decided by a non-destructive peek at the first
+eight bytes of each connection: a `CONNECT` for an Anthropic API host is TLS-terminated with
+a locally generated leaf, anything else is copied through as raw bytes, and plain HTTP is
+base-URL mode. Requests then run a bounded rotation loop: pick an eligible account, refresh
+its token if it is expiring, swap the client's credentials for the pooled one, send, and
+rotate on a 401, 429, 529 or transport failure. The request-flow diagram, the account
+selection ordering and the probe schedule are in [`docs/architecture.md`](docs/architecture.md).
 
-Publishing that key is the point of it — it verifies downloads, it does not sign
-them. Cutting a release is a separate, local, credentialled process; see
-[`docs/RELEASING.md`](docs/RELEASING.md).
+## Documentation
 
-## Feature status
-
-Everything the Node original did (and a couple it didn't) is implemented: OAuth
-`login`, per-model (Fable-aware) routing, the account CLI (`accounts` / `remove` /
-`priority` / `enable` / `disable` / `status`), `update`, keep-warm, and session
-affinity. Three are opt-in via `~/.config/teamclaude.json`, off by default:
-
-- `"sessionAffinity": true` — pin a client session to one account for its
-  lifetime. **Anthropic's prompt cache is per-account**, so per-request rotation
-  gives every turn a cold cache; affinity keeps a session's cache warm on its
-  account while different sessions still spread across accounts.
-- `"warmupSeconds": <n>` — periodically warm idle accounts so their 5-hour window
-  stays active. This one *spends real quota*, so enable it deliberately.
-  Keep-warm never warms an account whose quota it has not actually read, so it
-  does nothing until the first probe sweep has reported.
-- `"loadBalanceMigration": true` — re-pin a session off an account that several
-  sessions stack on, onto a less-loaded one. Off by default for the same
-  per-account-cache reason: a session that has a pin is already warm, so every
-  such move re-creates its whole conversation prefix on the target. A session's
-  account is chosen at start, or when its pin fails a hard gate — not to even
-  out counts.
+| Document | What is in it |
+|---|---|
+| [`docs/configuration.md`](docs/configuration.md) | Every config key, its type, default and source citation. |
+| [`docs/cli.md`](docs/cli.md) | Every command and flag, exit codes, account resolution. |
+| [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, account selection, quota probes. |
+| [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptoms and what they mean. |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, test and lint gates, what `main` requires. |
 
 ## Security
 
-- Binds `127.0.0.1` only; the forward-proxy tunnel is reachable solely by the
-  local user (no wider than the shell itself).
-- Only `api.anthropic.com` is TLS-terminated; all other hosts are pass-through
-  byte tunnels (never decrypted).
-- Config and leaf key are `0600`. No secrets belong in this repo.
-- **Secret scanning:** a `.githooks/pre-commit` hook runs `gitleaks git --staged`
-  (config: `.gitleaks.toml`) so no secret reaches a commit. Enable it after
-  cloning with `git config core.hooksPath .githooks` (needs `gitleaks` on PATH).
+Worth reading before you run it.
 
-## License
+**Bind scope is not authorization.** `tcr` binds `127.0.0.1`, but loopback is reachable by
+every process and container on the host. The forwarding path exempts loopback from the
+api-key gate, and nothing generates a `proxy.apiKey` for you, so on a default install being
+on this host is the whole gate. Set one if that is not the boundary you want.
 
-MIT — see [`LICENSE`](LICENSE). This is a Rust rewrite of
-[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT); the
-original's copyright and license are preserved in [`NOTICE`](NOTICE).
+**The forward proxy is an open tunnel by design.** The MITM allowlist is three hosts:
+`api.anthropic.com`, `console.anthropic.com` and `platform.anthropic.com`. Every other
+`CONNECT` target is copied through as raw bytes, never decrypted and never filtered, which
+makes `tcr` an unrestricted forward proxy to any host for any local process. That is
+intentional (Claude Code needs it), but treat it as a tunnel rather than a firewall. Which
+hosts actually terminate depends on the leaf certificate in use, which
+[`MITM-DESIGN.md`](MITM-DESIGN.md) works through.
+
+**Credentials.** The client's own `authorization` and `x-api-key` headers are dropped before
+the pooled Bearer is injected, so a client credential is never forwarded alongside ours.
+`git config core.hooksPath .githooks` enables a pre-commit secret scan and the other gates
+listed in [CONTRIBUTING.md](CONTRIBUTING.md#git-hooks). Treat it as a backstop: it only sees
+what you stage, and `--no-verify` exists.
+
+Found a security issue? Please open a private report through GitHub's security advisories
+rather than a public issue.
+
+## Credits and license
+
+MIT, see [`LICENSE`](LICENSE). This is a from-scratch Rust rewrite of the Node proxy
+[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude) (MIT). The original's
+copyright and license are preserved in [`NOTICE`](NOTICE). Contributors should also read
+[`CLAUDE.md`](CLAUDE.md), which records what this project got wrong before and how.
