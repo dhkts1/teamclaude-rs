@@ -51,6 +51,13 @@ shift || true
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/../../.." && pwd)"
+# Preflight FIRST, before any credential work: it changes nothing, takes about a
+# second, and refuses the five conditions that have broken four consecutive
+# releases of this project — including the assetless-`latest` window that cost
+# 11m 37s of update-feed outage on v0.2.4 (2026-08-10). Read its header for the
+# incident behind each check. `set -e` makes a non-zero exit stop the release.
+"$repo_root/apps/macos/scripts/release-preflight.sh" "$tag"
+
 item="${TCRBAR_OP_ITEM:-}"
 if [ -z "$item" ]; then
   echo "ERROR: TCRBAR_OP_ITEM is not set." >&2
