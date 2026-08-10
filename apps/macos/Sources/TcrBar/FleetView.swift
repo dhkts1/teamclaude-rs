@@ -367,8 +367,12 @@ struct FleetView: View {
                 .toggleStyle(.checkbox)
                 .font(Tok.secondaryFont)
                 .help(
-                    "Runs `tcr server --no-replace` when TcrBar starts, so a proxy "
-                        + "that is already serving is never disturbed. TcrBar then "
+                    "Runs `tcr server --headless --no-replace` when TcrBar starts. "
+                        + "`--headless` is the load-bearing one: it keeps the "
+                        + "server alive with no terminal to run its TUI in. "
+                        + "Standing down rather than disturbing a proxy that is "
+                        + "already serving is the default, which `--no-replace` "
+                        + "only restates for an older `tcr`. TcrBar then "
                         + "supervises the server it started, and quitting TcrBar "
                         + "stops it."
                 )
@@ -526,7 +530,8 @@ struct FleetView: View {
 
     /// The alert names the real cost in plain language, defaults to Cancel, and
     /// styles the other button as destructive. Only on an explicit confirm does
-    /// this call `startTakingOverPort()`, which spawns `tcr server --replace`
+    /// this call `startTakingOverPort()`, which spawns
+    /// `tcr server --headless --replace`
     /// — the replacement is performed by `tcr`'s own singleton.
     /// TcrBar signals nothing it did not spawn.
     private func confirmTakeover() {
