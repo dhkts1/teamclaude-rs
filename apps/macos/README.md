@@ -63,23 +63,30 @@ and therefore meant nothing.
 
 ## Keeping the Mac awake
 
-"Keep this Mac awake" in the panel holds an idle-system-sleep power assertion —
-the same thing `caffeinate -i` does — for as long as the box is ticked. While it
-is on, a second tinted mark appears beside the capacity gauge in the menu bar.
+"Keep this Mac awake" in the panel holds the three power assertions
+`caffeinate -i -m -s` holds — `PreventUserIdleSystemSleep`,
+`PreventSystemSleep` and `PreventDiskIdle`, taken through
+`IOPMAssertionCreateWithName` — for as long as the box is ticked. While it is
+on, a second tinted mark appears beside the capacity gauge in the menu bar.
 
 Three things it deliberately does not do:
 
 - **It does not keep the display awake.** The job is "a long run keeps running",
   and a dark screen does not stop a run. Holding the backlight on all night is a
   cost nobody asked for.
-- **It does not survive closing the lid.** No assertion of this class does. The
-  panel says so while the mode is on, because an operator who believes otherwise
-  comes back to a dead run and blames the proxy.
+- **It does not hold sleep off on battery.** `PreventSystemSleep` "is valid only
+  when system is running on AC power" (`man caffeinate`), and the power log
+  agrees: on AC the effective state carries `PrevSleep`, on battery it does not.
+  The panel says so while the mode is on. Whether the hold survives closing the
+  lid on AC has not been measured here, so nothing claims an answer either way.
 - **It does not persist across launches.** A Mac that silently never sleeps
   because of a box ticked last week is a worse bug than having to tick it again;
   the symptom (a laptop cooking in a bag) is nowhere near the cause.
 
-Untick it, or quit TcrBar, and the assertion is released.
+Untick it, or quit TcrBar, and all three are released. The take is
+all-or-nothing — if any one of the three fails the others are released again and
+the control reports OFF, so the checkbox can never disagree with what the
+machine is holding.
 
 ### Proving it, without a screenshot
 
@@ -89,26 +96,44 @@ agent may not have, so "look at the menu bar" is not available as a gate. This
 is:
 
 ```sh
+# The build is its own line on purpose. `--show-bin-path` PRINTS the path and
+# builds nothing, so folding the two together silently probes whatever binary
+# happened to be there — which is how an earlier draft of this gate passed a
+# controller with two of its three assertions deleted (2026-08-10, found by
+# mutating the source and watching the gate stay green).
+swift build --package-path apps/macos || exit 1
 BIN="$(swift build --package-path apps/macos --show-bin-path)/TcrBar"
 
-# Positive control, started HERE so the gate generates its own: a bare
-# `caffeinate` holds exactly one assertion, PreventUserIdleSystemSleep.
-caffeinate -t 15 &
-CAFF=$!
+# Two positive controls, started HERE so the gate generates its own. A bare
+# `caffeinate` holds exactly one assertion; `caffeinate -i -m -s` holds three.
+# The pair is what makes the count below discriminating: with only the 1-control
+# in place, a probe that had silently dropped two of its three assertions would
+# still look like "the grep can see assertions".
+caffeinate -t 20 &
+CAFF1=$!
+caffeinate -i -m -s -t 20 &
+CAFF3=$!
 
 "$BIN" --keep-awake-probe 6 &
 PROBE=$!
 
 sleep 3
-pmset -g assertions | grep -c "pid $CAFF"   # control: 1 — the grep can see assertions
-pmset -g assertions | grep TcrBar           # held:    PreventUserIdleSystemSleep, named
+pmset -g assertions | grep -c "pid $CAFF1("  # control: 1
+pmset -g assertions | grep -c "pid $CAFF3("  # control: 3
+pmset -g assertions | grep -c "pid $PROBE("  # held:    3 — one line per assertion
+pmset -g assertions | grep -A0 "pid $PROBE(" # named:   the three types, all "TcrBar is …"
 
 sleep 4                                      # past the release, inside the linger
 ps -p "$PROBE" >/dev/null && echo "probe still alive"
-pmset -g assertions | grep -c TcrBar        # released: 0, while the process still runs
+pmset -g assertions | grep -c TcrBar         # released: 0, while the process still runs
 
-wait "$PROBE"; kill "$CAFF" 2>/dev/null
+wait "$PROBE"; kill "$CAFF1" "$CAFF3" 2>/dev/null
 ```
+
+`grep -c "pid $PROBE("` rather than `grep TcrBar`: the count is the assertion
+that matters, and the trailing `(` stops pid 1847 matching pid 18470. A run of
+this gate on 2026-08-10 printed `1`, `3`, `3`, then `0` — the three named lines
+are `PreventUserIdleSystemSleep`, `PreventSystemSleep` and `PreventDiskIdle`.
 
 The flag holds the assertion for the given number of seconds and exits; like
 `--render-states` it is handled before the app starts, so no menu-bar item
