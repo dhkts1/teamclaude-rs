@@ -245,12 +245,21 @@ fi
 # editing one cannot make anything "claim to be 0.2.3 while not being it" —
 # which is the entire failure this gate exists to stop. Without this, hardening
 # a hook forced a version bump that shipped nothing.
+# apps/macos/appcast.xml is exempt because it is STRUCTURALLY post-release and
+# could never pass. release-tcrbar.sh appends the entry for vX.Y.Z at stage 8,
+# after that tag exists, so committing it always looks like "code shipping under
+# an already-released version" to this gate. It is a Sparkle feed manifest: not
+# in the binary, not in the app bundle, describing a release rather than being
+# one. This is not hypothetical — the v0.2.3 entry was left uncommitted for
+# exactly this reason, and the published feed sat on 0.2.1 while a signed 0.2.3
+# DMG was already on the release.
 staged_shippable="$(git diff --cached --name-only --diff-filter=ACMR -- . \
                     ':(exclude)*.md' \
                     ':(exclude)docs/**' \
                     ':(exclude)assets/**' \
                     ':(exclude).github/**' \
-                    ':(exclude).githooks/**' || true)"
+                    ':(exclude).githooks/**' \
+                    ':(exclude)apps/macos/appcast.xml' || true)"
 
 if [ -n "$staged_shippable" ]; then
   # Read the INDEX (`:Cargo.toml`), not the working tree: that is what this
