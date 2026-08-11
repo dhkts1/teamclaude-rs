@@ -275,6 +275,11 @@ pub struct AccountRuntime {
     /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
     /// alongside the decayed count above.
     pub last_stream_error: Option<String>,
+    /// Coalescing gate for THIS account's OAuth refresh. Lives on the account rather
+    /// than in a parallel Vec indexed by position, so an account added after startup
+    /// cannot be missing one — the desync it replaces made `ensure_fresh` a silent
+    /// no-op (no log, no status change) until the initial token expired.
+    pub refresh_lock: Arc<AsyncMutex<()>>,
 }
 
 /// A rotation slot answers a user's account query by the same three fields a
@@ -357,6 +362,7 @@ impl AccountRuntime {
             probe_error: None,
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
+            refresh_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -440,8 +446,6 @@ struct SessionStat {
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
 pub struct Manager {
     accounts: RwLock<Vec<AccountRuntime>>,
-    /// One coalescing gate per account, indexed by account position.
-    refresh_locks: Vec<Arc<AsyncMutex<()>>>,
     refresher: Arc<dyn TokenRefresher>,
     /// Reads each account's quota from the zero-spend usage endpoint on a timer.
     prober: Arc<dyn UsageProber>,
@@ -640,10 +644,6 @@ impl Manager {
         config_path: Option<PathBuf>,
         accounts: Vec<AccountRuntime>,
     ) -> Arc<Self> {
-        let refresh_locks = accounts
-            .iter()
-            .map(|_| Arc::new(AsyncMutex::new(())))
-            .collect();
         let upstream = config.upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
@@ -666,7 +666,6 @@ impl Manager {
 
         let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
-            refresh_locks,
             refresher,
             prober,
             warmer,
@@ -1159,6 +1158,41 @@ impl Manager {
     /// Record which account actually served the most recent request.
     pub fn set_current(&self, idx: usize) {
         *self.current.lock().expect("current lock poisoned") = Some(idx);
+    }
+
+    /// Append a new account to the live rotation and return its index.
+    ///
+    /// APPEND-ONLY — this is a hard requirement, not a style choice. Pins are
+    /// in-memory `(session_key, account_index)`; appending keeps every existing
+    /// index valid, whereas inserting or reordering would re-key live sessions
+    /// and cold-start their prompt cache, which is the exact cost this whole
+    /// feature exists to avoid. Never insert at a position other than the end,
+    /// and never reorder either vec.
+    ///
+    /// Updates both `self.accounts` (the live rotation `AccountRuntime`s) and
+    /// `self.config`'s accounts vec (so later identity-resolution in
+    /// `persist_tokens` / `persist_disabled` finds the row instead of logging
+    /// the "no loaded config account carries this identity" WARN). The two
+    /// locks are taken SEQUENTIALLY, never nested — the same discipline
+    /// `set_disabled` documents: holding both at once risks inverting the lock
+    /// order `warm_targets` reads them in.
+    ///
+    /// Derives the runtime row via [`AccountRuntime::from_config`], which is
+    /// exactly how every other account's runtime state is built at startup, so
+    /// an appended account gets its own `refresh_lock` for free — there is no
+    /// longer a parallel structure to keep in sync.
+    pub fn add_account(&self, account: config::Account) -> usize {
+        let runtime = AccountRuntime::from_config(&account);
+        let idx = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            accounts.push(runtime);
+            accounts.len() - 1
+        };
+        {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            config.accounts.push(account);
+        }
+        idx
     }
 }
 
@@ -2256,6 +2290,42 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.access_token(0).as_deref(), Some("fresh-access"));
+    }
+
+    /// The refresh coalescing lock now lives on `AccountRuntime` itself rather than
+    /// in a parallel `Vec` sized at construction — an account appended after
+    /// startup via [`Manager::add_account`] must still refresh. Before this fix,
+    /// the appended account's index was beyond `refresh_locks.len()` and
+    /// `ensure_fresh_inner` returned `false` SILENTLY (no log, no error) — this
+    /// test proves refresh actually fires for it, not just that the call returns.
+    #[tokio::test]
+    async fn appended_account_refreshes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = Arc::new(CountingRefresher {
+            calls: calls.clone(),
+        });
+        // Seed with one pre-existing account so the appended one is NOT index 0 —
+        // the desync this guards against only bites an index beyond the
+        // construction-time Vec's length.
+        let manager = build_manager(config_with(vec![account("seed", 0)]), refresher);
+
+        let mut appended = account("appended", 0);
+        appended.expires_at = Some(crate::now_ms() - 60_000); // already expired
+        let idx = manager.add_account(appended);
+        assert_eq!(idx, 1, "appended account must land at the next index");
+
+        manager.ensure_fresh(idx).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "refresh must actually fire for an account appended after construction"
+        );
+        assert_eq!(
+            manager.access_token(idx).as_deref(),
+            Some("fresh-access"),
+            "the appended account's access token must be the refreshed one"
+        );
     }
 
     /// Transient-leader coalescing (the bug this fixes): when the leader's
