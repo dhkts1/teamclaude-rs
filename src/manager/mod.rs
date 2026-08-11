@@ -336,7 +336,11 @@ pub enum AddAccountOutcome {
     /// No account in the live rotation carried this identity — appended at the
     /// END via [`Manager::add_account`]. Pins are in-memory `(session_key,
     /// account_index)`, so appending is the only insertion that cannot re-key a
-    /// live session onto the wrong account.
+    /// live session onto the wrong account. An account with no explicit
+    /// `priority` is assigned `max(existing priorities) + 1` — deliberate,
+    /// not incidental: it joins the back of the fleet rather than reading as
+    /// 0 (the primary tier) — see the doc-comment on the Added arm inside
+    /// [`Manager::add_or_update_account`].
     Added {
         idx: usize,
         name: String,
@@ -1311,7 +1315,43 @@ impl Manager {
     /// duplicating the live row. Holding one write lock across resolve-then-
     /// mutate means the second caller's resolve runs after the first caller's
     /// append is already visible, so it finds the row and updates it instead.
-    pub fn add_or_update_account(&self, account: config::Account) -> AddAccountOutcome {
+    ///
+    /// `config_write` is held across the WHOLE function — resolve, mutate, and
+    /// persist — not just the file I/O at the end. The `self.accounts` fix
+    /// above only serializes the LIVE half: it guarantees the second of two
+    /// concurrent same-identity submissions sees the first one's row and takes
+    /// the Updated path instead of duplicating it. It said nothing about the
+    /// DURABLE half, which used to take its own `config_write` lock only
+    /// inside `persist_added`/`persist_replaced`, well after `self.accounts`
+    /// was released — so two callers' persists could still race onto
+    /// `config_write` in the OPPOSITE order from the one their live resolves
+    /// agreed on, each writing its OWN submitted credentials. The loser's
+    /// `persist_replaced` (seeing nothing on disk yet) would append a fresh
+    /// entry with ITS tokens; the winner's `persist_added` would then find
+    /// that entry and merge ITS OWN tokens over it — leaving the file holding
+    /// whichever call happened to reach `config_write` first, independent of
+    /// which one actually won the live race. Measured 2/200 over 200 rounds of
+    /// two concurrent adds of one identity. Holding this lock across both
+    /// halves makes resolve-mutate-persist one atomic unit, so the durable
+    /// write order always agrees with the live resolve order.
+    ///
+    /// This is the one place in `Manager` that holds `config_write` and
+    /// `self.accounts` at once — everywhere else they are taken sequentially,
+    /// never nested (see `set_disabled`'s and `warm_targets`'s comments on
+    /// that discipline). It is safe: `self.accounts` is held only for the
+    /// brief in-memory resolve-and-mutate inside this span, never across the
+    /// file I/O below, and no other code path holds `self.accounts` and then
+    /// reaches for `config_write` or `config` — so this adds one new,
+    /// one-directional edge (`config_write` → `self.accounts`) to the lock
+    /// order, not a cycle. `persist_added`/`persist_replaced` no longer take
+    /// `config_write` themselves — they assume the caller already holds it.
+    pub fn add_or_update_account(&self, mut account: config::Account) -> AddAccountOutcome {
+        // N2 — see above: held across resolve, mutate AND persist so this
+        // whole operation never interleaves with another concurrent call's.
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
         let target = crate::identity::probe(
             &account.name,
             account.account_uuid.clone(),
@@ -1323,9 +1363,11 @@ impl Manager {
             && account.org_name.is_none();
 
         /// What the locked resolve-and-mutate section below produced, so the
-        /// (unlocked) durable write can run after the lock is released —
+        /// durable write can run after `self.accounts`'s lock is released —
         /// `persist_added`/`persist_replaced` do their own file I/O and must
-        /// never run under `self.accounts`'s lock.
+        /// never run under `self.accounts`'s lock (though both still run
+        /// under `config_write`, held since function entry — see the N2
+        /// doc-comment on `add_or_update_account`).
         enum Resolution {
             Added {
                 idx: usize,
@@ -1462,6 +1504,30 @@ impl Manager {
                     }
                 }
                 None => {
+                    // A follow-up regression on this arm (distinct from the
+                    // TOCTOU fix this function is named for above): an
+                    // appended account with no explicit priority must join
+                    // the BACK of the fleet — `max(existing priorities) + 1`
+                    // — not the 0 that `AccountRuntime::from_config`'s
+                    // `unwrap_or(0)` reads from an absent priority, which
+                    // would silently promote it to the PRIMARY tier ahead of
+                    // the established fleet. Computed from `accounts` (the
+                    // LIVE rotation, not the config snapshot) because this
+                    // section already holds its write lock and it is
+                    // authoritative for what is routing right now. Skipped
+                    // when the caller submitted an explicit priority (the
+                    // documented new-account case — see `AddAccountRequest`'s
+                    // doc-comment in `proxy.rs`), which is never overridden.
+                    // Mirrors the identical fix in `config::merge_account`'s
+                    // Added arm.
+                    if account.priority.is_none() {
+                        let next_priority = accounts
+                            .iter()
+                            .map(|a| a.priority)
+                            .max()
+                            .map_or(0, |max| max + 1);
+                        account.priority = Some(next_priority);
+                    }
                     let runtime = AccountRuntime::from_config(&account);
                     accounts.push(runtime);
                     Resolution::Added {
@@ -1473,8 +1539,13 @@ impl Manager {
 
         match resolution {
             Resolution::Added { idx } => {
-                // Sequential, never nested with the accounts lock above — same
-                // discipline `add_account` documents.
+                // Still sequential, never nested, with `self.accounts` (which
+                // is already released by this point) — the `self.config` lock
+                // here is a separate, short critical section, same discipline
+                // `add_account` documents. It runs nested inside
+                // `config_write` (held since function entry, see the N2
+                // doc-comment above), which is what makes this whole arm
+                // atomic with respect to another concurrent call.
                 {
                     let mut config = self.config.lock().expect("config lock poisoned");
                     config.accounts.push(account.clone());
@@ -1495,14 +1566,17 @@ impl Manager {
     /// whole `config::save_account` read-modify-write runs under
     /// `config_write`, never `self.config` — nothing here needs the in-memory
     /// snapshot, because [`Self::add_account`] already pushed `account` onto it.
+    ///
+    /// PRECONDITION: unlike every other `config_write` writer in this module,
+    /// this one does NOT take the lock itself — its only caller,
+    /// [`Self::add_or_update_account`], already holds it across the whole
+    /// resolve-mutate-persist sequence (see that function's N2 doc-comment),
+    /// and `Mutex` is not reentrant, so locking again here would deadlock.
+    /// Never call this without `config_write` already held.
     fn persist_added(&self, account: &config::Account) -> AddPersist {
         let Some(path) = &self.config_path else {
             return AddPersist::NoConfigFile;
         };
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
         match config::save_account(path, account) {
             Ok(config::AccountWrite::Added) => {
                 tracing::info!(account = %account.name, "persisted newly added account to config");
@@ -1559,6 +1633,10 @@ impl Manager {
     /// `target` would append a fresh, un-benched entry for an account that was
     /// deliberately disabled, so it would come back into rotation on the very
     /// next restart — the exact bug `persist_disabled` exists to prevent.
+    ///
+    /// PRECONDITION: same as [`Self::persist_added`] — does NOT take
+    /// `config_write` itself; its only caller, [`Self::add_or_update_account`],
+    /// already holds it. Never call this without `config_write` already held.
     fn persist_replaced(
         &self,
         idx: usize,
@@ -1568,10 +1646,6 @@ impl Manager {
         let Some(path) = &self.config_path else {
             return AddPersist::NoConfigFile;
         };
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
         let mut for_disk = target.clone();
         for_disk.access_token = fresh.access_token.clone();
         for_disk.refresh_token = fresh.refresh_token.clone();
@@ -5768,6 +5842,148 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A follow-up regression on the Added path (distinct from the F3 TOCTOU
+    /// finding above, and from `config::save_account`'s identical fix on the
+    /// durable side): appending an account with no explicit priority must
+    /// join the BACK of the LIVE fleet — `max(existing priorities) + 1` — not
+    /// the 0 that `AccountRuntime::from_config`'s `unwrap_or(0)` reads from an
+    /// absent `priority`, which would silently promote a freshly added
+    /// account to the PRIMARY tier ahead of the established fleet.
+    #[test]
+    fn add_or_update_account_added_path_assigns_max_plus_one_priority_when_none_submitted() {
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![
+                account("alice@example.com", 0),
+                account("bob@example.com", 1),
+            ]),
+            "live-default-priority",
+        );
+
+        let submission = Account {
+            priority: None,
+            ..account("carol@example.com", 0)
+        };
+        let idx = match manager.add_or_update_account(submission) {
+            AddAccountOutcome::Added { idx, .. } => idx,
+            other => panic!("expected Added: {other:?}"),
+        };
+
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                accounts[idx].priority, 2,
+                "an added account with no explicit priority must join the back \
+                 of the live fleet, not the default-derived 0"
+            );
+        }
+
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(
+            reloaded.accounts[idx].priority,
+            Some(2),
+            "the durable half must agree with the live rotation on the assigned priority"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An explicit priority submitted on the Added path is never overridden by
+    /// the max+1 default — mirrors the durable-side test of the same name in
+    /// `config.rs`.
+    #[test]
+    fn add_or_update_account_added_path_keeps_an_explicit_priority() {
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0)]),
+            "live-explicit-priority",
+        );
+
+        let submission = Account {
+            priority: Some(99),
+            ..account("carol@example.com", 0)
+        };
+        let idx = match manager.add_or_update_account(submission) {
+            AddAccountOutcome::Added { idx, .. } => idx,
+            other => panic!("expected Added: {other:?}"),
+        };
+
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert_eq!(accounts[idx].priority, 99);
+        drop(accounts);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The live half of a brand-new-identity race was already serialized by
+    /// the single `accounts` write-lock spanning resolve+mutate (see the
+    /// TOCTOU fix above) — but the two callers' DURABLE writes still queued on
+    /// `config_write` independently, in whatever order the OS scheduled them,
+    /// with no guarantee that order agreed with which caller actually won the
+    /// live race. Two real logins of the SAME identity racing each other (a
+    /// double-submit, a retried `tcr login`) carry genuinely DIFFERENT tokens,
+    /// so a disagreement is observable: the file could end up holding the
+    /// LOSING submission's token while the live rotation served the winner's.
+    /// Measured 2/200 over 200 rounds of two simultaneous adds of one
+    /// identity before `config_write` was widened to span the whole
+    /// resolve-mutate-persist sequence. Runs the same 200 rounds to catch it.
+    #[test]
+    fn concurrent_adds_of_one_new_identity_never_disagree_with_disk_on_the_token() {
+        use std::thread;
+        for round in 0..200 {
+            let (manager, path) = build_manager_with_disk(
+                config_with(vec![account("alice@example.com", 0)]),
+                &format!("n2-token-race-{round}"),
+            );
+
+            let base = Account {
+                account_uuid: Some("uuid-new".to_string()),
+                ..account("carol@example.com", 0)
+            };
+            let submission_a = Account {
+                access_token: "at-A".to_string(),
+                refresh_token: Some("rt-A".to_string()),
+                ..base.clone()
+            };
+            let submission_b = Account {
+                access_token: "at-B".to_string(),
+                refresh_token: Some("rt-B".to_string()),
+                ..base
+            };
+
+            let m1 = Arc::clone(&manager);
+            let m2 = Arc::clone(&manager);
+            let h1 = thread::spawn(move || m1.add_or_update_account(submission_a));
+            let h2 = thread::spawn(move || m2.add_or_update_account(submission_b));
+            h1.join().expect("adder A panicked");
+            h2.join().expect("adder B panicked");
+
+            let live_token = {
+                let accounts = manager.accounts.read().expect("accounts lock poisoned");
+                accounts
+                    .iter()
+                    .find(|a| a.name == "carol@example.com")
+                    .expect("carol's row exists live")
+                    .access_token
+                    .clone()
+            };
+            let reloaded = config::load(&path).expect("reload persisted config");
+            let disk_token = reloaded
+                .accounts
+                .iter()
+                .find(|a| a.name == "carol@example.com")
+                .expect("carol's row exists on disk")
+                .access_token
+                .clone();
+
+            assert_eq!(
+                live_token, disk_token,
+                "round {round}: live token ({live_token}) and disk token \
+                 ({disk_token}) disagree for the same identity"
+            );
+
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     /// F4 — an `Error` row given fresh credentials must clear back to `Active`

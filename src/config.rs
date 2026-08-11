@@ -1131,7 +1131,13 @@ fn find_account_entry<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountWrite {
     /// No entry on disk carried this identity — a new one was appended, holding
-    /// every field `account` carries (identity, credentials, and routing knobs).
+    /// every field `account` carries (identity, credentials, and routing
+    /// knobs) — with one deliberate exception: an ABSENT `priority` is filled
+    /// in as `max(existing priorities) + 1`, joining the back of the fleet,
+    /// rather than left absent (which reads as 0 at runtime and silently
+    /// promotes the new account to the primary tier). An explicit `priority`
+    /// the caller submitted is never overridden. See [`merge_account`]'s
+    /// doc-comment on the Added arm for the full rationale.
     Added,
     /// Exactly one entry carried this identity — its CREDENTIAL fields
     /// (`accessToken` / `refreshToken` / `expiresAt`) were updated in place,
@@ -1272,7 +1278,30 @@ fn merge_account(
                 // shape that was not actually verified to be an array.
                 return Ok(AccountWrite::Unwritable);
             };
-            entries.push(serde_json::to_value(account)?);
+            let mut new_entry = serde_json::to_value(account)?;
+            // An appended account with no explicit priority joins the BACK
+            // of the fleet — `max(existing priorities) + 1` — rather than
+            // being left absent. `priority` is deliberate-default here, not
+            // incidental: `skip_serializing_if` means a `None` would otherwise
+            // serialize to no key at all, and an absent `priority` reads as 0
+            // at runtime (`AccountRuntime::from_config`'s `unwrap_or(0)`),
+            // which silently promotes a freshly added account to the PRIMARY
+            // tier ahead of the established fleet. Mirrors
+            // `oauth::upsert_account`'s historical default. Skipped when the
+            // caller submitted an explicit priority (the documented
+            // new-account case — see `AddAccountRequest`'s doc-comment in
+            // `proxy.rs`), which is never overridden.
+            if account.priority.is_none() {
+                let next_priority = entries
+                    .iter()
+                    .filter_map(|e| e.get("priority").and_then(Value::as_i64))
+                    .max()
+                    .map_or(0, |max| max + 1);
+                if let Value::Object(fields) = &mut new_entry {
+                    fields.insert("priority".to_string(), Value::from(next_priority));
+                }
+            }
+            entries.push(new_entry);
             Ok(AccountWrite::Added)
         }
     }
@@ -2593,6 +2622,71 @@ mod tests {
         assert_eq!(accounts[0]["name"], json!("acct-a"));
         assert_eq!(accounts[1]["name"], json!("acct-b"));
         assert_eq!(after["warmupSeconds"], json!(900));
+        fs::remove_file(&path).ok();
+    }
+
+    /// Two pre-existing entries with real, distinct priorities — the shape
+    /// needed to prove the Added path computes MAX+1 rather than reading an
+    /// absent priority as 0.
+    const PRIORITY_SAMPLE: &str = r#"{
+      "accounts": [
+        { "name": "acct-a", "type": "oauth", "accessToken": "at-a", "priority": 0 },
+        { "name": "acct-b", "type": "oauth", "accessToken": "at-b", "priority": 1 }
+      ]
+    }"#;
+
+    /// An appended account with no explicit priority joins the BACK of the
+    /// fleet — `max(existing priorities) + 1` — never left absent. An absent
+    /// `priority` reads as 0 at runtime (`AccountRuntime::from_config`'s
+    /// `unwrap_or(0)`), which silently promotes a freshly added account to the
+    /// PRIMARY tier ahead of the established fleet. Mirrors
+    /// `oauth::upsert_account`'s historical default, which this route did not
+    /// share before this fix.
+    #[test]
+    fn save_account_added_path_assigns_max_plus_one_priority_when_none_submitted() {
+        let path = tmp_path("add-default-priority");
+        fs::write(&path, PRIORITY_SAMPLE).unwrap();
+
+        let new_account = Account {
+            priority: None,
+            ..full_account("carol@example.com", "at-carol")
+        };
+        assert_eq!(
+            save_account(&path, &new_account).unwrap(),
+            AccountWrite::Added
+        );
+
+        let after = read_json(&path);
+        let accounts = after["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts.len(), 3);
+        assert_eq!(
+            accounts[2]["priority"],
+            json!(2),
+            "an added account with no explicit priority must join the back of \
+             the fleet, not read as 0: {after}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The max+1 default only fills an ABSENT priority — a caller that submits
+    /// one explicitly (the documented new-account case, see
+    /// `AddAccountRequest`'s doc-comment in `proxy.rs`) is never overridden.
+    #[test]
+    fn save_account_added_path_keeps_an_explicit_priority() {
+        let path = tmp_path("add-explicit-priority");
+        fs::write(&path, PRIORITY_SAMPLE).unwrap();
+
+        let new_account = Account {
+            priority: Some(99),
+            ..full_account("carol@example.com", "at-carol")
+        };
+        assert_eq!(
+            save_account(&path, &new_account).unwrap(),
+            AccountWrite::Added
+        );
+
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][2]["priority"], json!(99));
         fs::remove_file(&path).ok();
     }
 
