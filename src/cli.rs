@@ -25,7 +25,7 @@ use anyhow::{bail, Context as _};
 use time::OffsetDateTime;
 
 use crate::build_info::{self, BuildInfo};
-use crate::config::{self, Config};
+use crate::config::{self, Account, Config};
 use crate::identity;
 use crate::manager::Manager;
 use crate::oauth::{NoRefresh, TokenRefresher};
@@ -318,8 +318,12 @@ fn write_disabled_flag(
 /// write the config (`Unauthorized`), one writes it quietly (`NoServer`), and the
 /// rest write it and shout. Collapsing them is how a half-applied disable becomes
 /// invisible again.
+///
+/// `pub(crate)`: [`crate::oauth`]'s live-login half reuses this exact enum for
+/// [`post_add_account`] rather than defining a parallel one — see that
+/// function's doc-comment.
 #[derive(Debug)]
-enum LiveControlError {
+pub(crate) enum LiveControlError {
     /// Nothing is listening on the configured port. No live rotation exists, so
     /// the file IS the whole truth — the ordinary offline case.
     NoServer,
@@ -340,7 +344,7 @@ enum LiveControlError {
 }
 
 impl LiveControlError {
-    fn why(&self) -> String {
+    pub(crate) fn why(&self) -> String {
         match self {
             LiveControlError::NoServer => "nothing is listening".to_string(),
             LiveControlError::NoRoute => {
@@ -422,6 +426,94 @@ async fn post_set_disabled(
         return Err(LiveControlError::NoRoute);
     }
     if from_route && matches!(status.as_u16(), 404 | 409) {
+        return Err(LiveControlError::Rejected(
+            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+}
+
+/// Ask the running proxy to add an account to the live rotation, or — when the
+/// submitted identity already matches one — replace its credentials in place.
+/// No restart, so no session pin is invalidated. Mirrors [`post_set_disabled`]:
+/// same `no_proxy()` client (`HTTP_PROXY` commonly points AT tcr), same
+/// timeouts, same api-key header — the control route has no loopback
+/// exemption either.
+///
+/// `account` is POSTed directly as the request body: [`config::Account`]
+/// already serializes to the exact wire shape
+/// [`crate::proxy::ADD_ACCOUNT_PATH`] expects (see that route's
+/// `AddAccountRequest` doc-comment), so a caller builds the credential once —
+/// for a real login, or [`crate::oauth::probe_add_capability`]'s deliberately
+/// blank probe — and this function never re-lists its fields.
+///
+/// Reuses [`LiveControlError`] rather than a parallel enum, extended with one
+/// more structural case [`post_set_disabled`] never needs: a `400` FROM the
+/// route (stamped) is this route's own request-validation failure — e.g. a
+/// blank name or token — and is exactly as much a "the route said no" signal
+/// as the `404`/`409` [`post_set_disabled`] already treats that way. The
+/// [`crate::proxy::ENDPOINT_HEADER`] stamp remains the only thing that
+/// decides "no such route" vs "the route said no" — never error text.
+pub(crate) async fn post_add_account(
+    config: &Config,
+    account: &Account,
+) -> Result<crate::proxy::AddAccountResponse, LiveControlError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
+
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::ADD_ACCOUNT_PATH
+    );
+    let mut request = client.post(&url).json(account);
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        Err(e) if e.is_timeout() => {
+            return Err(LiveControlError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
+    };
+
+    let status = response.status();
+    // Same structural discriminator `post_set_disabled` uses: whether THIS
+    // route produced the answer, decided by the header, never by status code
+    // or error text alone.
+    let from_route = response
+        .headers()
+        .get(crate::proxy::ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(crate::proxy::ADD_ACCOUNT_ENDPOINT);
+    let body = response.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        return serde_json::from_str(&body).map_err(|e| {
+            LiveControlError::Unusable(format!(
+                "the response was not a tcr account-add payload ({e})"
+            ))
+        });
+    }
+    if status.as_u16() == 401 {
+        return Err(LiveControlError::Unauthorized);
+    }
+    if !from_route && matches!(status.as_u16(), 404 | 405) {
+        return Err(LiveControlError::NoRoute);
+    }
+    // 400: the route's own request validation (blank name/token) — the
+    // positive capability signal `probe_add_capability` looks for. 409: the
+    // submitted identity matched more than one live account.
+    if from_route && matches!(status.as_u16(), 400 | 409) {
         return Err(LiveControlError::Rejected(
             error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
         ));
@@ -1447,6 +1539,179 @@ mod tests {
             "a refused command leaves the config byte-identical"
         );
         fs::remove_file(&path).ok();
+    }
+
+    // --- post_add_account ---------------------------------------------------
+
+    /// A minimal valid live server config: the port, no accounts, no api-key.
+    fn add_route_config(port: u16) -> Config {
+        serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap()
+    }
+
+    /// A blank credential — the deliberately-invalid probe body — always
+    /// rejected by [`crate::proxy::add_account_handler`]'s own validation, so
+    /// this can never add a real account.
+    fn blank_account() -> Account {
+        Account {
+            name: String::new(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_add_account_reads_a_stamped_400_as_rejected() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = add_route_config(port);
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let err = post_add_account(&config, &blank_account())
+            .await
+            .expect_err("a blank name/token must be refused by the route's own validation");
+        assert!(
+            matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("required")),
+            "a stamped 400 is a structural Rejected, not a guess from status alone: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_add_account_unstamped_404_is_no_route() {
+        // An "older tcr": something answers, but not on this route — no
+        // `ENDPOINT_HEADER`, unlike every response this crate's own router
+        // produces (even its 404s and 405s).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new()).await;
+        });
+        let config = add_route_config(port);
+
+        let err = post_add_account(&config, &blank_account())
+            .await
+            .expect_err("nothing is registered at this path");
+        assert!(
+            matches!(err, LiveControlError::NoRoute),
+            "an unstamped 404 must read as NoRoute, never Rejected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_add_account_wrong_api_key_is_unauthorized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
+        ))
+        .unwrap();
+        let manager = Manager::with_live_refresher(server_config, None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let client_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#
+        ))
+        .unwrap();
+        let err = post_add_account(&client_config, &blank_account())
+            .await
+            .expect_err("a wrong api-key must be refused");
+        assert!(
+            matches!(err, LiveControlError::Unauthorized),
+            "must surface as Unauthorized, never NoRoute: {err:?}"
+        );
+    }
+
+    /// THE ROUND TRIP: a real account, POSTed to a real live server, lands in
+    /// the SERVING rotation — not just in the response body.
+    #[tokio::test]
+    async fn post_add_account_adds_a_new_account_to_the_live_rotation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = add_route_config(port);
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+
+        let account = Account {
+            name: "new@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-new".to_string(),
+            refresh_token: Some("rt-new".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        let applied = post_add_account(&config, &account)
+            .await
+            .expect("a fresh identity must be added, not rejected");
+        assert!(
+            applied.added,
+            "a nonexistent identity is ADDED: {applied:?}"
+        );
+        assert_eq!(applied.name, "new@example.com");
+
+        let live = manager.snapshot(OffsetDateTime::now_utc());
+        assert!(
+            live.accounts.iter().any(|a| a.name == "new@example.com"),
+            "the account must be in the SERVING rotation, not just the response"
+        );
+    }
+
+    /// An ambiguous identity is refused by the route, structurally — never
+    /// guessed onto one of the candidates.
+    #[tokio::test]
+    async fn post_add_account_ambiguous_identity_is_rejected_not_guessed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Two live accounts share a name and neither carries an org — the
+        // legacy shape `same_identity`/`match_one` cannot break a tie on.
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                {{ "name": "dup@example.com", "type": "oauth", "accessToken": "at-1",
+                  "refreshToken": "rt-1", "priority": 0 }},
+                {{ "name": "dup@example.com", "type": "oauth", "accessToken": "at-2",
+                  "refreshToken": "rt-2", "priority": 1 }}
+            ] }}"#
+        );
+        let config: Config = serde_json::from_str(&seed).unwrap();
+        let manager = Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let account = Account {
+            name: "dup@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-new".to_string(),
+            refresh_token: Some("rt-new".to_string()),
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        let err = post_add_account(&config, &account)
+            .await
+            .expect_err("an ambiguous identity must be refused, not guessed");
+        assert!(
+            matches!(err, LiveControlError::Rejected(ref msg) if msg.contains("ambiguous")),
+            "{err:?}"
+        );
     }
 
     // --- resolve_account ---------------------------------------------------

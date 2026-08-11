@@ -744,29 +744,55 @@ fn login_target_port(config_path: &Path) -> u16 {
         .port
 }
 
+/// What `login()` should do with the finished credential, decided purely from
+/// the incumbent detected on the guarded port, whether a probe already
+/// confirmed THAT incumbent carries the live account-add route, and
+/// `--force`. Returned by [`login_guard_refusal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoginRoute {
+    /// No live proxy on the port, or `--force`: the historical file-only
+    /// login. `--force` always means this, even when the live route WAS
+    /// confirmed — it is the deliberate escape hatch past the live
+    /// coordination below, not just past the old refusal.
+    File,
+    /// A live proxy is there and its add route is confirmed: route the
+    /// finished credential through it instead of the file.
+    Live,
+    /// A live proxy is there without the route, and `--force` was not given:
+    /// refuse outright with this message, unchanged from before this route
+    /// existed.
+    Refuse(String),
+}
+
 /// The pure login-guard DECISION: given any live proxy server detected on the
-/// port, the port, and the `--force` flag, return the one-line refusal message to
-/// abort with, or `None` to proceed. Split from the impure lsof-based detection
-/// ([`crate::singleton::live_proxy_server`]) so the refuse/allow logic is
-/// unit-testable, mirroring singleton's pure-decision / impure-executor split.
+/// port, whether that incumbent's live account-add route was already
+/// confirmed (never probed in here — see [`probe_add_capability`]), the port,
+/// and the `--force` flag, return which [`LoginRoute`] `login()` should take.
+/// Split from the impure lsof-based detection
+/// ([`crate::singleton::live_proxy_server`]) AND from the impure HTTP
+/// capability probe so the decision itself stays unit-testable, mirroring
+/// singleton's pure-decision / impure-executor split.
 ///
-/// The incumbent's KIND decides the instruction, and it is not cosmetic. Since
-/// the owner file, detection reaches a proxy served INSIDE a host application,
-/// and the pid reported is then the HOST's. "kill {pid}" would SIGTERM a GUI
-/// process that installs no handler for it: no `applicationWillTerminate`, no
-/// final session→account pin write, and every live session cold-starts its
-/// prompt cache at the next boot. `takeover_decision` and `incumbents_to_signal`
-/// are both hardened against exactly that signal; a message that ADVISES it would
-/// walk around both. So an embedded incumbent is told to be quit, not killed.
+/// The incumbent's KIND decides the REFUSAL instruction, and it is not
+/// cosmetic. Since the owner file, detection reaches a proxy served INSIDE a
+/// host application, and the pid reported is then the HOST's. "kill {pid}"
+/// would SIGTERM a GUI process that installs no handler for it: no
+/// `applicationWillTerminate`, no final session→account pin write, and every
+/// live session cold-starts its prompt cache at the next boot.
+/// `takeover_decision` and `incumbents_to_signal` are both hardened against
+/// exactly that signal; a message that ADVISES it would walk around both. So
+/// an embedded incumbent is told to be quit, not killed — whether or not it
+/// has the add route, since that's the refusal-message case regardless.
 fn login_guard_refusal(
     incumbent: Option<singleton::Incumbent>,
+    has_add_route: bool,
     port: u16,
     force: bool,
-) -> Option<String> {
+) -> LoginRoute {
     match incumbent {
-        Some(incumbent) if !force => {
+        Some(incumbent) if !force && !has_add_route => {
             let pid = incumbent.pid;
-            Some(match incumbent.kind {
+            LoginRoute::Refuse(match incumbent.kind {
                 singleton::ProxyKind::TcrEmbedded => format!(
                     "a tcr server is already running on port {port} (pid {pid}); logging in now would be overwritten by the server's next token refresh — that pid is the HOST APPLICATION serving the proxy in-process, so do not signal it: quit the host application (killing it skips its shutdown and loses the session pin map), run 'tcr login', then start it again. Re-run with --force to log in anyway."
                 ),
@@ -775,24 +801,114 @@ fn login_guard_refusal(
                 ),
             })
         }
-        _ => None,
+        Some(_) if !force => LoginRoute::Live,
+        _ => LoginRoute::File,
     }
 }
 
-/// Run the full browser OAuth login and persist the account to `config_path`.
-/// Returns the account name on success. Never logs or prints the tokens.
+/// What a live proxy said, structurally, about whether it can accept a live
+/// account add. Read from [`crate::cli::post_add_account`]'s own
+/// [`crate::cli::LiveControlError`] classification, which is itself driven by
+/// [`crate::proxy::ENDPOINT_HEADER`] — never by matching error text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddCapability {
+    /// The route answered (stamped, whatever the status) — a live add is
+    /// possible.
+    Present,
+    /// Nothing usable answered: no server, a route-less 404/405 (an older
+    /// tcr), or the probe timed out / returned something unreadable. All
+    /// three collapse to the same conservative answer: `login_guard_refusal`
+    /// treats "confirmed absent" and "could not confirm" identically, always
+    /// falling back to the historical refusal rather than guessing a route is
+    /// there.
+    Absent,
+    /// The proxy answered and rejected our api-key. Its own condition — never
+    /// folded into `Absent`: that would either wrongly read as an older proxy
+    /// with no route, or let `login()` silently fall back to writing the file
+    /// out from under a server that is right there, listening.
+    Unauthorized,
+}
+
+/// Probe whether the proxy `config` points at can accept a live account add,
+/// via a deliberately-invalid POST to [`crate::proxy::ADD_ACCOUNT_PATH`] — a
+/// blank name and access token, always rejected by the route's own
+/// validation — so this can run BEFORE any OAuth tokens exist and before the
+/// browser opens. Never probes by adding a real account.
+async fn probe_add_capability(config: &Config) -> AddCapability {
+    let probe = Account {
+        name: String::new(),
+        account_type: "oauth".to_string(),
+        account_uuid: None,
+        org_uuid: None,
+        org_name: None,
+        access_token: String::new(),
+        refresh_token: None,
+        expires_at: None,
+        priority: None,
+        switch_threshold: None,
+        disabled: None,
+        extra: serde_json::Map::new(),
+    };
+    match crate::cli::post_add_account(config, &probe).await {
+        // A blank name/token can never be added, so `Ok` cannot happen in
+        // practice — but a stamped success is just as much "the route
+        // exists" as a stamped rejection, so it counts as `Present` too.
+        Ok(_) => AddCapability::Present,
+        // The route validated the (deliberately bad) body and said so,
+        // stamped — exactly the positive capability signal.
+        Err(crate::cli::LiveControlError::Rejected(_)) => AddCapability::Present,
+        Err(crate::cli::LiveControlError::Unauthorized) => AddCapability::Unauthorized,
+        Err(_) => AddCapability::Absent,
+    }
+}
+
+/// Resolve which [`LoginRoute`] `login()` should take, running the impure
+/// capability probe only when it can matter — a live incumbent is on the port
+/// and `--force` was not given. Fully resolves before `login()` starts the
+/// OAuth dance, so a user is never told to stop a server AFTER completing a
+/// full browser round-trip, and never silently falls back to the file when
+/// the incumbent answered but rejected our api-key.
+async fn login_route(
+    config_path: &Path,
+    incumbent: Option<singleton::Incumbent>,
+    port: u16,
+    force: bool,
+) -> anyhow::Result<LoginRoute> {
+    if force || incumbent.is_none() {
+        return Ok(login_guard_refusal(incumbent, false, port, force));
+    }
+    let config = load_or_default(config_path)?;
+    match probe_add_capability(&config).await {
+        AddCapability::Unauthorized => bail!(
+            "the proxy on :{port} rejected the api-key in {} while checking whether it could \
+             take a live login — no browser was opened and nothing was changed. Fix \
+             `proxy.apiKey` and retry, or re-run with --force to log in via the file instead \
+             (this still risks the running server overwriting it on its next token refresh).",
+            config_path.display()
+        ),
+        AddCapability::Present => Ok(login_guard_refusal(incumbent, true, port, force)),
+        AddCapability::Absent => Ok(login_guard_refusal(incumbent, false, port, force)),
+    }
+}
+
+/// Run the full browser OAuth login and persist the account. Returns the
+/// account name on success. Never logs or prints the tokens.
 ///
-/// Refuses (unless `force`) when a live proxy server already holds the configured
-/// port: the server reads config only at boot and its next `persist_tokens`
-/// writes its boot-time TOKENS back over the file, silently clobbering the fresh
-/// ones this login writes (observed live 2026-07-19 — a server refresh overwrote
-/// a re-login within seconds). Persisting is otherwise tokens-only
-/// ([`config::save_tokens`]), so a live server no longer reverts the user's
-/// SETTINGS — but credentials are exactly what a login writes, so the guard
-/// stands. Detection is read-only; the server is never signalled.
+/// Refuses (unless `force`) when a live proxy server already holds the
+/// configured port AND that proxy has no live account-add route: an older
+/// tcr reads config only at boot, and its next `persist_tokens` writes its
+/// boot-time TOKENS back over the file, silently clobbering the fresh ones
+/// this login writes (observed live 2026-07-19 — a server refresh overwrote a
+/// re-login within seconds). When the live route IS there, this routes the
+/// finished credential through the server instead ([`finish_login`]) — the
+/// server owns the write with its own current state, so the window above
+/// does not exist on that path at all. Detection is read-only; the server is
+/// never signalled.
 pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
     let port = login_target_port(config_path);
-    if let Some(msg) = login_guard_refusal(singleton::live_proxy_server(port), port, force) {
+    let incumbent = singleton::live_proxy_server(port);
+    let route = login_route(config_path, incumbent, port, force).await?;
+    if let LoginRoute::Refuse(msg) = route {
         bail!("{}", msg);
     }
 
@@ -800,8 +916,8 @@ pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .context("bind local OAuth callback server")?;
-    let port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://localhost:{port}/callback");
+    let callback_port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://localhost:{callback_port}/callback");
 
     // PKCE + CSRF state + authorize URL, built by the oauth2 crate.
     let flow = build_login_flow(&redirect_uri)?;
@@ -826,18 +942,145 @@ pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
         None => prompt_account_name(&fallback),
     };
 
+    finish_login(config_path, route, &mut config, &name, &tokens, profile).await
+}
+
+/// The file half of a login: `upsert_account` + whole-file [`config::save`].
+/// Exactly what `login()` always did, kept as its own function so both
+/// [`LoginRoute::File`] and every live-path fallback in [`finish_login`] run
+/// the identical sequence rather than duplicating it.
+fn persist_via_file(
+    config_path: &Path,
+    config: &mut Config,
+    name: &str,
+    tokens: &Tokens,
+    profile: Profile,
+) -> anyhow::Result<String> {
     upsert_account(
-        &mut config,
-        &name,
-        &tokens,
+        config,
+        name,
+        tokens,
         profile.account_uuid,
         profile.org_uuid,
         profile.org_name,
     );
-    config::save(config_path, &config).context("save config after login")?;
-
+    config::save(config_path, config).context("save config after login")?;
     println!("Saved account '{name}' to {}", config_path.display());
-    Ok(name)
+    Ok(name.to_string())
+}
+
+/// Persist the finished OAuth credential per `route`: through the live proxy
+/// when it is [`LoginRoute::Live`], via [`persist_via_file`] when it is
+/// [`LoginRoute::File`]. Split out of [`login`] so WHERE the credential lands
+/// is testable without driving a real browser.
+///
+/// On the live path the running server owns the durable write — this must
+/// NOT also whole-file [`config::save`] the (possibly already-stale) `config`
+/// this process is holding; that write is exactly the clobber this unit
+/// exists to remove. Falls back to the file only on the quiet
+/// [`crate::cli::LiveControlError::NoServer`] case, mirroring
+/// [`crate::cli::set_enabled`]'s discipline: a server that answered and
+/// REFUSED us (`Unauthorized`, `Rejected`) must surface, never silently write
+/// the file instead, because the two halves would then disagree about what
+/// the account's credentials are.
+async fn finish_login(
+    config_path: &Path,
+    route: LoginRoute,
+    config: &mut Config,
+    name: &str,
+    tokens: &Tokens,
+    profile: Profile,
+) -> anyhow::Result<String> {
+    match route {
+        LoginRoute::Refuse(_) => {
+            unreachable!("login() bails on a refusal before fetching tokens")
+        }
+        LoginRoute::File => persist_via_file(config_path, config, name, tokens, profile),
+        LoginRoute::Live => {
+            let account = Account {
+                name: name.to_string(),
+                account_type: "oauth".to_string(),
+                account_uuid: profile.account_uuid.clone(),
+                org_uuid: profile.org_uuid.clone(),
+                org_name: profile.org_name.clone(),
+                access_token: tokens.access_token.clone(),
+                refresh_token: Some(tokens.refresh_token.clone()),
+                expires_at: Some(tokens.expires_at_ms),
+                priority: None,
+                switch_threshold: None,
+                disabled: None,
+                extra: serde_json::Map::new(),
+            };
+            match crate::cli::post_add_account(config, &account).await {
+                Ok(applied) => {
+                    println!(
+                        "Saved account '{}' to the running proxy on :{}",
+                        applied.name, config.proxy.port
+                    );
+                    if let Some(warning) = &applied.warning {
+                        eprintln!("[tcr] warning: {warning}");
+                    }
+                    if !applied.persisted {
+                        eprintln!(
+                            "[tcr] warning: this account is live but NOT saved to {} — it will not survive a restart.",
+                            config_path.display()
+                        );
+                    }
+                    Ok(applied.name)
+                }
+                // Nothing is listening any more (it exited between the probe
+                // and here): the quiet fallback, same discipline as
+                // `set_enabled`.
+                Err(crate::cli::LiveControlError::NoServer) => {
+                    persist_via_file(config_path, config, name, tokens, profile)
+                }
+                // The proxy rejected our api-key. Writing the file here would
+                // be the clobber this unit exists to remove, in a new place:
+                // the running server keeps whatever it already had while the
+                // file quietly disagrees. Change nothing, exit non-zero.
+                Err(crate::cli::LiveControlError::Unauthorized) => bail!(
+                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, \
+                     because writing it would leave the running proxy unaware of this login. \
+                     Fix `proxy.apiKey` and retry.",
+                    config.proxy.port,
+                    config_path.display()
+                ),
+                // The route ran and refused the submission itself (e.g. the
+                // identity matched more than one live account). Do not fall
+                // back — the file's own resolution could land on a different
+                // account than the one the server was talking about.
+                Err(crate::cli::LiveControlError::Rejected(message)) => bail!(
+                    "the proxy running on :{} refused this: {message} Nothing was changed.",
+                    config.proxy.port
+                ),
+                // The route is missing: the capability probe said it was
+                // there and it no longer is (a race, or a downgrade mid-run).
+                // The file write is all we can do, and it is HALF a login —
+                // say so loudly, mirroring `set_enabled`'s NoRoute arm.
+                Err(crate::cli::LiveControlError::NoRoute) => {
+                    let saved = persist_via_file(config_path, config, name, tokens, profile)?;
+                    eprintln!(
+                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so only the config file was changed. Run `tcr restart` when a cold prompt cache is acceptable.",
+                        config.proxy.port,
+                        crate::proxy::ADD_ACCOUNT_PATH,
+                    );
+                    Ok(saved)
+                }
+                // It answered something unusable, or did not answer in time.
+                // Same shape of consequence as NoRoute, different cause, and
+                // equally never silent.
+                Err(other) => {
+                    let why = other.why();
+                    let saved = persist_via_file(config_path, config, name, tokens, profile)?;
+                    eprintln!(
+                        "[tcr] WARNING: could not apply this login to the proxy running on :{} ({why}), so only the config file was changed.",
+                        config.proxy.port,
+                    );
+                    Ok(saved)
+                }
+            }
+        }
+    }
 }
 
 /// Load the config, treating a missing file as an empty default (so the very
@@ -1239,10 +1482,25 @@ mod tests {
         Some(singleton::Incumbent { pid: 4242, kind })
     }
 
+    /// Unwrap a [`LoginRoute::Refuse`]'s message, or panic naming what came back
+    /// instead — every existing refusal test still wants the bare message
+    /// string, and this is the one place that unwrap lives now that the guard
+    /// returns a three-way enum instead of `Option<String>`.
+    fn expect_refuse(route: LoginRoute) -> String {
+        match route {
+            LoginRoute::Refuse(msg) => msg,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[test]
     fn login_guard_refusal_message_carries_pid_and_stop_login_restart_sequence() {
-        let msg = login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), 3456, false)
-            .expect("a live server without --force must refuse");
+        let msg = expect_refuse(login_guard_refusal(
+            incumbent(singleton::ProxyKind::Tcr),
+            false,
+            3456,
+            false,
+        ));
         // Actionable + greppable: names the port, the PID, and the escape hatch.
         assert!(msg.contains("3456"), "names the port: {msg}");
         assert!(msg.contains("4242"), "names the pid: {msg}");
@@ -1269,10 +1527,39 @@ mod tests {
 
     #[test]
     fn login_guard_allows_with_force_or_no_server() {
-        // --force is the deliberate escape hatch even when a server is live.
-        assert!(login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), 3456, true).is_none());
+        // --force is the deliberate escape hatch even when a server is live —
+        // it takes the file path regardless of whether the route is there.
+        assert_eq!(
+            login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), false, 3456, true),
+            LoginRoute::File
+        );
         // No server on the port → nothing to refuse.
-        assert!(login_guard_refusal(None, 3456, false).is_none());
+        assert_eq!(
+            login_guard_refusal(None, false, 3456, false),
+            LoginRoute::File
+        );
+    }
+
+    /// THE NEW OUTCOME. A live proxy that HAS the add route is no longer
+    /// refused at all — the whole point of this unit.
+    #[test]
+    fn login_guard_proceeds_live_when_the_incumbent_has_the_add_route() {
+        assert_eq!(
+            login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), true, 3456, false),
+            LoginRoute::Live
+        );
+        // Even an embedded host, whose absent-route refusal has the special
+        // "quit, don't kill" wording — once the route is confirmed there is
+        // nothing left to refuse, embedded or not.
+        assert_eq!(
+            login_guard_refusal(
+                incumbent(singleton::ProxyKind::TcrEmbedded),
+                true,
+                3456,
+                false
+            ),
+            LoginRoute::Live
+        );
     }
 
     /// THE ADVICE MUST BE SURVIVABLE. `live_proxy_server` can now name the pid of
@@ -1284,8 +1571,12 @@ mod tests {
     /// than no guard, because the operator does what the tool says.
     #[test]
     fn the_login_guard_never_tells_an_operator_to_kill_a_host_application() {
-        let msg = login_guard_refusal(incumbent(singleton::ProxyKind::TcrEmbedded), 3456, false)
-            .expect("an embedded server must still block a login");
+        let msg = expect_refuse(login_guard_refusal(
+            incumbent(singleton::ProxyKind::TcrEmbedded),
+            false,
+            3456,
+            false,
+        ));
         assert!(
             !msg.contains("kill 4242"),
             "must not advise signalling the host application: {msg}"
@@ -1313,8 +1604,12 @@ mod tests {
         // And the control: a plain CLI peer, which the operator CAN signal, still
         // gets the kill instruction — so the assertions above are about the kind,
         // not about the message having been softened for everyone.
-        let cli = login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), 3456, false)
-            .expect("a live CLI server must block a login");
+        let cli = expect_refuse(login_guard_refusal(
+            incumbent(singleton::ProxyKind::Tcr),
+            false,
+            3456,
+            false,
+        ));
         assert!(cli.contains("kill 4242"), "{cli}");
     }
 
@@ -1336,7 +1631,10 @@ mod tests {
                 is_proxy_server(&argv),
                 "the bool and the classifying form must agree: {cmd:?}"
             );
-            login_guard_refusal(server, 3456, false).is_some()
+            matches!(
+                login_guard_refusal(server, false, 3456, false),
+                LoginRoute::Refuse(_)
+            )
         };
         assert!(
             refuses(&["/opt/teamclaude-rs/target/release/tcr", "server"]),
@@ -1363,5 +1661,268 @@ mod tests {
         // A missing/unreadable config falls back to the serde default (3456).
         let missing = std::env::temp_dir().join("tcr-oauth-login-port-does-not-exist.json");
         assert_eq!(login_target_port(&missing), 3456);
+    }
+
+    // --- probe_add_capability -----------------------------------------------
+
+    #[tokio::test]
+    async fn probe_add_capability_reads_a_stamped_400_as_present() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config: Config =
+            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+        let manager = crate::manager::Manager::with_live_refresher(config.clone(), None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        assert_eq!(probe_add_capability(&config).await, AddCapability::Present);
+    }
+
+    #[tokio::test]
+    async fn probe_add_capability_unstamped_404_is_absent() {
+        // An "older tcr": something answers, but not on this route at all — no
+        // `ENDPOINT_HEADER`, unlike every response this crate's own router
+        // produces (even its 404s and 405s).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new()).await;
+        });
+        let config: Config =
+            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+        assert_eq!(probe_add_capability(&config).await, AddCapability::Absent);
+    }
+
+    #[tokio::test]
+    async fn probe_add_capability_wrong_api_key_is_unauthorized_not_absent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
+        ))
+        .unwrap();
+        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        // The caller's config carries the WRONG key.
+        let client_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            probe_add_capability(&client_config).await,
+            AddCapability::Unauthorized,
+            "a rejected api-key must surface as itself, never read as 'no route'"
+        );
+    }
+
+    // --- finish_login ---------------------------------------------------------
+
+    /// A [`Profile`] carrying only an email — the common case, no org info.
+    fn profile_named(email: &str) -> Profile {
+        Profile {
+            email: Some(email.to_string()),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+        }
+    }
+
+    /// THE BITING TEST for the whole-file-write hazard `finish_login` exists to
+    /// remove. The documented failure: `login()` loads a config snapshot, does
+    /// slow async work (a profile fetch, an unbounded stdin prompt), and THEN
+    /// whole-file `config::save`s that now-stale snapshot — silently reverting
+    /// any account the live server rotated in the meantime. Refresh tokens are
+    /// single-use, so that does not just lose a write, it bricks the reverted
+    /// account.
+    ///
+    /// Reproduced here without a real browser: seed a live server + config file
+    /// with two accounts, take a CLIENT-SIDE snapshot (what `login()` would be
+    /// holding across its own async window), then have the LIVE SERVER itself
+    /// rotate one of those accounts' credentials — via the same
+    /// `/_tcr/accounts` route, a real re-login — AFTER the snapshot was taken.
+    /// Only then does `finish_login` run, on the STALE snapshot, adding a THIRD
+    /// account live. If it whole-file-saved that snapshot, the rotation would
+    /// be reverted. It must not be.
+    #[tokio::test]
+    async fn finish_login_live_path_does_not_clobber_a_concurrent_rotation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-clobber-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }},
+                {{ "name": "bob@example.com", "type": "oauth", "accessToken": "at-bob-STALE",
+                  "refreshToken": "rt-bob-STALE", "expiresAt": 1893456000000, "priority": 1 }}
+            ] }}"#
+        );
+        std::fs::write(&path, &seed).unwrap();
+
+        let server_config: Config = serde_json::from_str(&seed).unwrap();
+        let manager =
+            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        // The stale snapshot: what `login()` would have loaded before its own
+        // async window (profile fetch / stdin prompt) opened.
+        let mut client_config = load_or_default(&path).unwrap();
+
+        // The live server rotates bob's credentials WHILE that snapshot is
+        // held — a real re-login through the same route this unit adds,
+        // exactly the race `login()`'s doc-comment describes.
+        let rotated_bob = Account {
+            name: "bob@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-bob-ROTATED".to_string(),
+            refresh_token: Some("rt-bob-ROTATED".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        let rotate_config = load_or_default(&path).unwrap();
+        crate::cli::post_add_account(&rotate_config, &rotated_bob)
+            .await
+            .expect("the live re-login must succeed");
+
+        // Sanity: the rotation really did land on disk before the race window
+        // (the `finish_login` call below) closes.
+        let after_rotation = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_rotation.contains("rt-bob-ROTATED"),
+            "setup: the rotation must be on disk first: {after_rotation}"
+        );
+
+        // Now finish a THIRD account's login, live, using the STALE snapshot.
+        let name = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut client_config,
+            "charlie@example.com",
+            &tokens("at-charlie", "rt-charlie", 1_893_456_000_000),
+            profile_named("charlie@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "charlie@example.com");
+
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        assert_eq!(
+            accounts.len(),
+            3,
+            "alice, rotated bob, and charlie: {final_doc}"
+        );
+        let bob = accounts
+            .iter()
+            .find(|a| a["name"] == "bob@example.com")
+            .expect("bob still on disk");
+        assert_eq!(
+            bob["refreshToken"],
+            serde_json::json!("rt-bob-ROTATED"),
+            "the live add must NOT whole-file-write a stale snapshot back over \
+             bob's rotation: {final_doc}"
+        );
+        assert!(
+            accounts.iter().any(|a| a["name"] == "charlie@example.com"),
+            "charlie was added live: {final_doc}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A server that answered and REFUSED us (wrong api-key) must surface,
+    /// never silently fall back to writing the file — that silent fallback is
+    /// how the two halves end up disagreeing about an account's credentials.
+    #[tokio::test]
+    async fn finish_login_live_unauthorized_does_not_fall_back_to_file() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#);
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-unauthorized-{}-{port}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, &seed).unwrap();
+
+        let server_config: Config = serde_json::from_str(&seed).unwrap();
+        let manager =
+            crate::manager::Manager::with_live_refresher(server_config, Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        // The caller's config carries the WRONG key.
+        let mut client_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#
+        ))
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut client_config,
+            "dave@example.com",
+            &tokens("at-dave", "rt-dave", 1_893_456_000_000),
+            profile_named("dave@example.com"),
+        )
+        .await
+        .expect_err("a rejected api-key must not silently write the file");
+        assert!(err.to_string().contains("api-key"), "{err}");
+
+        assert_eq!(
+            before,
+            std::fs::read_to_string(&path).unwrap(),
+            "the file must be byte-identical after a surfaced Unauthorized"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The quiet fallback: nothing is listening at all, so there is no live
+    /// rotation to disagree with the file — `finish_login` writes it exactly
+    /// as the historical file-only path always has.
+    #[tokio::test]
+    async fn finish_login_no_server_falls_back_to_file_quietly() {
+        let dead_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-noserver-{}-{dead_port}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [] }}"#),
+        )
+        .unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let name = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut config,
+            "erin@example.com",
+            &tokens("at-erin", "rt-erin", 1_893_456_000_000),
+            profile_named("erin@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "erin@example.com");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["accounts"][0]["name"],
+            serde_json::json!("erin@example.com")
+        );
+        std::fs::remove_file(&path).ok();
     }
 }
