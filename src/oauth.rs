@@ -774,9 +774,13 @@ fn login_target_port(config_path: &Path) -> u16 {
 enum LoginRoute {
     /// No live proxy on the port at all — the historical file-only login,
     /// unchanged. Also reached under `--force` when the probe could not
-    /// confirm a safe live route (no route, unauthorized, or an unusable
-    /// answer): `--force` is the escape hatch PAST A REFUSAL, never a way to
-    /// skip a live route that IS there — `Live` below takes priority over it.
+    /// confirm a safe live route (no route, or an unusable answer):
+    /// `--force` is the escape hatch PAST A REFUSAL, never a way to skip a
+    /// live route that IS there — `Live` below takes priority over it. An
+    /// api-key rejection (`AddCapability::Unauthorized`) never resolves to
+    /// this, under `--force` or otherwise: that is positive evidence the
+    /// proxy is alive, so there is no unsafe file write for `--force` to
+    /// rescue — see `login_route`'s `Unauthorized` arm.
     File,
     /// A live proxy is there and its add route is confirmed: route the
     /// finished credential through it instead of the file. Wins even against
@@ -934,10 +938,15 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
 /// the probe under `--force` is exactly the bug bridge item C removed, since
 /// it is what let `--force` take the file path even when the live route was
 /// confirmed and safe. `force` only changes what happens when the probe
-/// itself cannot confirm a safe live route (unauthorized, or an unusable
-/// answer) — those cases fall back to `LoginRoute::File` under `--force`
-/// instead of erroring out, mirroring the historical "force always succeeds
-/// via the file" behaviour. Fully resolves before `login()` starts the OAuth
+/// itself produced an UNUSABLE answer (something holds the port but is not
+/// confirmed safe) — that case falls back to `LoginRoute::File` under
+/// `--force` instead of erroring out, mirroring the historical "force always
+/// succeeds via the file" behaviour. An api-key rejection (`Unauthorized`) is
+/// a DIFFERENT case, and `--force` never rescues it: it is positive evidence
+/// of a live, healthy proxy — it answered, parsed our request, and rejected
+/// the key — which makes it the worst-informed moment to whole-file-write
+/// beside it, since a live server rotating tokens is exactly what makes that
+/// write destructive. Fully resolves before `login()` starts the OAuth
 /// dance, so a user is never told to stop a server AFTER completing a full
 /// browser round-trip, and never silently falls back to the file when a live
 /// proxy answered but rejected our api-key.
@@ -949,16 +958,18 @@ async fn login_route(
 ) -> anyhow::Result<LoginRoute> {
     let config = load_or_default(config_path)?;
     match probe_add_capability(&config).await {
+        // Positive evidence the proxy is alive: it answered, parsed our
+        // request, and rejected the key. Refuses regardless of `--force` —
+        // unlike `Unusable` below, there is no unsafe-but-forceable file
+        // write to fall back to here, only a safe path one config edit away.
         AddCapability::Unauthorized => {
-            if force {
-                return Ok(LoginRoute::File);
-            }
             bail!(
                 "the proxy on :{port} rejected the api-key in {} while checking whether it \
-                 could take a live login — no browser was opened and nothing was changed. Fix \
-                 `proxy.apiKey` and retry, or re-run with --force to log in via the file \
-                 instead (this still risks the running server overwriting it on its next token \
-                 refresh).",
+                 could take a live login — no browser was opened and nothing was changed. This \
+                 refuses even under --force: a rejected api-key is proof the proxy is alive, \
+                 which makes this the worst-informed moment to write the config file beside it. \
+                 Fix `proxy.apiKey` in the config to match the running server, or stop the \
+                 server and log in offline.",
                 config_path.display()
             );
         }
@@ -2142,6 +2153,49 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         drop(listener);
+    }
+
+    /// THE OVERRULE: `--force` is the escape hatch past a wedged-port
+    /// refusal (above), but it must NOT be one past `AddCapability::
+    /// Unauthorized`. A rejected api-key is positive evidence the proxy is
+    /// alive and healthy — the worst-informed moment to fall back to a
+    /// whole-file write beside it — so `login_route` must keep refusing even
+    /// under `--force`, and nothing along the way may touch the config file.
+    #[tokio::test]
+    async fn login_route_refuses_unauthorized_even_under_force() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }} }}"#
+        ))
+        .unwrap();
+        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        // The file `login_route` reads carries the WRONG key.
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-unauthorized-force-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(r#"{{ "proxy": {{ "port": {port}, "apiKey": "wrong-key" }} }}"#);
+        std::fs::write(&path, &seed).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = login_route(&path, None, port, true)
+            .await
+            .expect_err("--force must not rescue a rejected api-key");
+        assert!(err.to_string().contains("api-key"), "{err}");
+        assert!(
+            err.to_string().contains("even under --force"),
+            "the message must say --force does not apply here: {err}"
+        );
+
+        assert_eq!(
+            before,
+            std::fs::read_to_string(&path).unwrap(),
+            "the file must be byte-identical — --force must not trigger a write here"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // --- finish_login ---------------------------------------------------------

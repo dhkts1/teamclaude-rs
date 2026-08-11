@@ -116,17 +116,18 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 | flag | type | default | effect |
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
-| `--force` | bool | `false` | skip the live proxy entirely and write the config file |
+| `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
 
 **A running proxy no longer has to be stopped.** Before opening the browser, `tcr login`
 asks the proxy on the configured port whether it can take an account live, by POSTing a
-deliberately-invalid body to `/_tcr/accounts` and reading the reply. What happens next
-depends only on that answer:
+deliberately-invalid body to `/_tcr/accounts` and reading the reply — always, even with
+`--force`. What happens next depends on that answer:
 
 | the proxy on the port | what login does |
 |---|---|
-| answers, and has the route | hands the account to the **running** proxy; it joins rotation immediately and the proxy writes the config itself |
-| answers, but has no such route (an older `tcr`) | refuses, exactly as it always did |
+| answers, and has the route | hands the account to the **running** proxy; it joins rotation immediately and the proxy writes the config itself — wins even under `--force` |
+| answers, but rejects the configured api-key | refuses outright — `--force` does not override this |
+| answers, but has no such route (an older `tcr`), or answers unusably (wedged or timed out) | refuses, unless `--force`, which writes the config file instead |
 | nothing listening | writes the config file, exactly as it always did |
 
 The live path is the one worth having. Restarting the proxy to pick up a new account
@@ -147,11 +148,16 @@ server, run `tcr login`, then start it again. If the pid belongs to a host appli
 the proxy in-process (TcrBar), it says so and tells you to quit the application rather than
 kill the pid: killing it skips shutdown and loses the pin map.
 
-`--force` **skips the probe and writes the config file**, even when the running proxy would
-have accepted the account safely. That makes it the unsafe path rather than the way around a
-blocked one, and you almost certainly do not want it: the login succeeds and the running
-server's next refresh can overwrite it. It remains only as an escape hatch for a proxy that
-answers but misbehaves. Detection is read-only throughout; the server is never signalled.
+`--force` **overrides a refusal**, not the probe: the probe still runs, and still wins when it
+confirms a safe path. It never overrides a confirmed live route — that path is already safe,
+so there is nothing to force. It never overrides a rejected api-key either: a rejection is
+proof the proxy is alive and answering, which makes it the worst-informed moment to write the
+config file beside it — fix `proxy.apiKey` to match the running server, or stop it and log in
+offline, instead. Where `--force` *does* apply — no route on the port (an older `tcr`), or an
+unusable answer (wedged or timed out) — it makes the unsafe path available anyway: the login
+succeeds and the running server's next refresh can overwrite it. It remains only as an escape
+hatch for a proxy that answers but misbehaves. Detection is read-only throughout; the server is
+never signalled.
 
 The callback server binds a random loopback port, and tokens are never printed or logged.
 

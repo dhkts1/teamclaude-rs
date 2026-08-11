@@ -1232,17 +1232,18 @@ struct AddAccountRequest {
 /// field below carries `#[serde(default)]` so a field a NEWER server has
 /// renamed or dropped does not fail the whole deserialize: `cli::post_add_account`
 /// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
-/// `oauth::probe_add_capability` reads that as `AddCapability::Absent` — a
-/// *successful* live add would then look indistinguishable from "no route
-/// here", and `tcr login` falls back to the whole-file `config::save` path
-/// beside a server that just handled the request correctly. Field
-/// ADDITIONS are already safe on their own (an older CLI just ignores a key
-/// it doesn't know); this attribute is what makes removals and renames safe
-/// too. Each default is chosen as the SAFER of the two readings, not merely
-/// the type's zero value: `persisted` defaults to `false` (never claim
-/// durability we can't confirm) and `added` defaults to `false` (never claim
-/// a fresh account was created when it might have been an in-place
-/// credential replacement) — same degrade-to-the-safer-state shape as
+/// `oauth::probe_add_capability` reads that as `AddCapability::Unusable` — a
+/// *successful* live add would then look indistinguishable from a wedged or
+/// route-less proxy, and `login_route` REFUSES outright (bridge item D)
+/// instead of silently falling back to the file beside a server that just
+/// handled the request correctly. Field ADDITIONS are already safe on their
+/// own (an older CLI just ignores a key it doesn't know); this attribute is
+/// what makes removals and renames safe too. Each default is chosen as the
+/// SAFER of the two readings, not merely the type's zero value: `persisted`
+/// defaults to `false` (never claim durability we can't confirm) and `added`
+/// defaults to `false` (never claim a fresh account was created when it
+/// might have been an in-place credential replacement) — same
+/// degrade-to-the-safer-state shape as
 /// `ProxyHost::Unknown`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AddAccountResponse {
@@ -1375,8 +1376,10 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
     // 400 back as proof this route exists. Changing the status (e.g. to 422),
     // or answering without `stamp_add_endpoint`, silently turns that read into
-    // `AddCapability::Absent` — `tcr login` then falls back to the whole-file
-    // `config::save` path beside a live server. See the seam test
+    // `AddCapability::Unusable` — `login_route` then REFUSES outright (bridge
+    // item D) rather than falling back to the file, so this degrades to a
+    // needless refusal beside a server that actually has the route, not the
+    // whole-file clobber this feature exists to remove. See the seam test
     // `probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing`.
     let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
         return stamp_add_endpoint(error_response(
@@ -5242,13 +5245,15 @@ mod tests {
     /// decides whether `tcr login` takes the LIVE route by POSTing this exact
     /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
     /// `cli::post_add_account` and reading whether the reply is a STAMPED
-    /// 400. Anything else — an unstamped answer, a different status, or
-    /// (worst of all) a 200 that actually appended a blank-named account to
-    /// the live fleet — reads as `AddCapability::Absent`, and `tcr login`
-    /// silently falls back to the whole-file `config::save` path while THIS
-    /// server is still running: the exact single-use-refresh-token clobber
-    /// this whole feature exists to remove, reopened as a silent fallback
-    /// rather than a loud error.
+    /// 400. An unstamped answer, or a different (non-400) status, reads as
+    /// `AddCapability::Unusable` — `login_route` now REFUSES outright rather
+    /// than falling back to the whole-file `config::save` path (bridge item
+    /// D): a needless refusal beside a server that has the route, not the
+    /// single-use-refresh-token clobber this whole feature exists to remove.
+    /// Worst of all would be a 200 that actually appended a blank-named
+    /// account to the live fleet: that reads as `AddCapability::Present`
+    /// instead — a probe that is supposed to always fail silently succeeding
+    /// and mutating the live server.
     ///
     /// Driven through the REAL production stack — a real `TcpListener` and
     /// `crate::mitm::serve`, exactly how `main()` invokes it — not a
@@ -5313,9 +5318,9 @@ mod tests {
                 .get(ENDPOINT_HEADER)
                 .and_then(|v| v.to_str().ok()),
             Some(ADD_ACCOUNT_ENDPOINT),
-            "unstamped and `probe_add_capability` reads this as Absent — `tcr login` \
-             silently falls back to the whole-file config::save path with a live \
-             server running"
+            "unstamped and `probe_add_capability` reads this as Unusable — `login_route` \
+             now refuses outright instead of falling back to the whole-file config::save \
+             path with a live server running"
         );
 
         assert_eq!(
