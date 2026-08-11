@@ -662,14 +662,21 @@ fn prompt_account_name(fallback: &str) -> String {
 }
 
 /// Add or update an OAuth account in `config`, keyed on `(account_uuid, org)`
-/// via [`identity::same_identity`] rather than name alone. An existing account
-/// with the same identity has its tokens refreshed in place and any absent
-/// identity field backfilled (never duplicated); otherwise a new account is
-/// appended with the next-highest priority and every identity field populated.
+/// via [`identity::resolve`] — never a loose first-match — so the legacy
+/// two-org tie ([`identity::same_identity_strict`]) is broken the same way
+/// [`config::save_account`] and [`crate::manager::Manager::add_or_update_account`]
+/// already break it, and an unbreakable tie is REFUSED rather than guessed:
+/// guessing here means stamping a fresh credential over a DIFFERENT account's
+/// single-use refresh token (see [`identity::Resolved::Many`]'s doc-comment).
+/// An existing account with the same identity has its tokens refreshed in
+/// place and any absent identity field backfilled (never duplicated);
+/// otherwise a new account is appended with the next-highest priority and
+/// every identity field populated.
 ///
 /// Backward compatible: when the probe and the stored entry both lack identity
-/// fields (today's real config), `same_identity` falls back to name equality —
-/// so a single-org re-login matches its existing entry exactly as before.
+/// fields (today's real config), `identity::resolve` falls back to name
+/// equality — so a single-org re-login matches its existing entry exactly as
+/// before.
 pub fn upsert_account(
     config: &mut Config,
     name: &str,
@@ -677,7 +684,7 @@ pub fn upsert_account(
     account_uuid: Option<String>,
     org_uuid: Option<String>,
     org_name: Option<String>,
-) {
+) -> anyhow::Result<()> {
     let probe = crate::identity::probe(
         name,
         account_uuid.clone(),
@@ -685,50 +692,65 @@ pub fn upsert_account(
         org_name.clone(),
     );
 
-    if let Some(account) = config
-        .accounts
-        .iter_mut()
-        .find(|a| crate::identity::same_identity(a, &probe))
-    {
-        account.account_type = "oauth".to_string();
-        account.access_token = tokens.access_token.clone();
-        account.refresh_token = Some(tokens.refresh_token.clone());
-        account.expires_at = Some(tokens.expires_at_ms);
-        // Backfill any identity field the stored entry was missing (e.g. a legacy
-        // pre-org entry newly profiled), without overwriting known values.
-        if account.account_uuid.is_none() {
-            account.account_uuid = account_uuid;
+    match crate::identity::resolve(config.accounts.iter().enumerate(), &probe) {
+        crate::identity::Resolved::One(index) => {
+            let account = &mut config.accounts[index];
+            account.account_type = "oauth".to_string();
+            account.access_token = tokens.access_token.clone();
+            account.refresh_token = Some(tokens.refresh_token.clone());
+            account.expires_at = Some(tokens.expires_at_ms);
+            // Backfill any identity field the stored entry was missing (e.g. a
+            // legacy pre-org entry newly profiled), without overwriting known
+            // values.
+            if account.account_uuid.is_none() {
+                account.account_uuid = account_uuid;
+            }
+            if account.org_uuid.is_none() {
+                account.org_uuid = org_uuid;
+            }
+            if account.org_name.is_none() {
+                account.org_name = org_name;
+            }
+            Ok(())
         }
-        if account.org_uuid.is_none() {
-            account.org_uuid = org_uuid;
+        crate::identity::Resolved::None => {
+            let next_priority = config
+                .accounts
+                .iter()
+                .filter_map(|a| a.priority)
+                .max()
+                .map_or(0, |max| max + 1);
+
+            config.accounts.push(Account {
+                name: name.to_string(),
+                account_type: "oauth".to_string(),
+                account_uuid,
+                org_uuid,
+                org_name,
+                access_token: tokens.access_token.clone(),
+                refresh_token: Some(tokens.refresh_token.clone()),
+                expires_at: Some(tokens.expires_at_ms),
+                priority: Some(next_priority),
+                switch_threshold: None,
+                disabled: None,
+                extra: serde_json::Map::new(),
+            });
+            Ok(())
         }
-        if account.org_name.is_none() {
-            account.org_name = org_name;
+        // Recompute the loose set for its names: `Resolved::Many` itself
+        // carries none, and this is exactly the set `resolve` drew from (same
+        // predicate, same candidates) — mirrors
+        // `Manager::add_or_update_account`'s identical recomputation.
+        crate::identity::Resolved::Many => {
+            let candidates: Vec<String> = config
+                .accounts
+                .iter()
+                .filter(|a| crate::identity::same_identity(a, &probe))
+                .map(|a| a.name.clone())
+                .collect();
+            bail!("{}", crate::cli::ambiguous_query_message(name, &candidates));
         }
-        return;
     }
-
-    let next_priority = config
-        .accounts
-        .iter()
-        .filter_map(|a| a.priority)
-        .max()
-        .map_or(0, |max| max + 1);
-
-    config.accounts.push(Account {
-        name: name.to_string(),
-        account_type: "oauth".to_string(),
-        account_uuid,
-        org_uuid,
-        org_name,
-        access_token: tokens.access_token.clone(),
-        refresh_token: Some(tokens.refresh_token.clone()),
-        expires_at: Some(tokens.expires_at_ms),
-        priority: Some(next_priority),
-        switch_threshold: None,
-        disabled: None,
-        extra: serde_json::Map::new(),
-    });
 }
 
 /// The proxy port a login must guard against — the port the running server binds.
@@ -750,13 +772,16 @@ fn login_target_port(config_path: &Path) -> u16 {
 /// `--force`. Returned by [`login_guard_refusal`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LoginRoute {
-    /// No live proxy on the port, or `--force`: the historical file-only
-    /// login. `--force` always means this, even when the live route WAS
-    /// confirmed — it is the deliberate escape hatch past the live
-    /// coordination below, not just past the old refusal.
+    /// No live proxy on the port at all — the historical file-only login,
+    /// unchanged. Also reached under `--force` when the probe could not
+    /// confirm a safe live route (no route, unauthorized, or an unusable
+    /// answer): `--force` is the escape hatch PAST A REFUSAL, never a way to
+    /// skip a live route that IS there — `Live` below takes priority over it.
     File,
     /// A live proxy is there and its add route is confirmed: route the
-    /// finished credential through it instead of the file.
+    /// finished credential through it instead of the file. Wins even against
+    /// `--force` — forcing the unsafe file write only makes sense when the
+    /// safe live route is not available.
     Live,
     /// A live proxy is there without the route, and `--force` was not given:
     /// refuse outright with this message, unchanged from before this route
@@ -802,11 +827,17 @@ fn login_guard_refusal(
     port: u16,
     force: bool,
 ) -> LoginRoute {
-    if force {
-        return LoginRoute::File;
-    }
+    // `has_add_route` is checked BEFORE `force`, deliberately: a confirmed
+    // route wins even against the escape hatch. Checking `force` first (the
+    // pre-fix order) meant `--force` chose the file write even when the live
+    // route was confirmed safe — the exact whole-file clobber this unit
+    // exists to remove, reintroduced by the escape hatch meant to route
+    // around a REFUSAL, not around a safe route that was never refused.
     if has_add_route {
         return LoginRoute::Live;
+    }
+    if force {
+        return LoginRoute::File;
     }
     match incumbent {
         Some(incumbent) => {
@@ -828,23 +859,34 @@ fn login_guard_refusal(
 /// account add. Read from [`crate::cli::post_add_account`]'s own
 /// [`crate::cli::LiveControlError`] classification, which is itself driven by
 /// [`crate::proxy::ENDPOINT_HEADER`] — never by matching error text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AddCapability {
     /// The route answered (stamped, whatever the status) — a live add is
     /// possible.
     Present,
-    /// Nothing usable answered: no server, a route-less 404/405 (an older
-    /// tcr), or the probe timed out / returned something unreadable. All
-    /// three collapse to the same conservative answer: `login_guard_refusal`
-    /// treats "confirmed absent" and "could not confirm" identically, always
-    /// falling back to the historical refusal rather than guessing a route is
-    /// there.
+    /// A connection could not even be made — genuinely nothing is listening
+    /// on the port. The ONLY outcome that may resolve to `LoginRoute::File`
+    /// without `--force` and without `incumbent` separately confirming a
+    /// server: there is truly no live process to disagree with the file.
     Absent,
     /// The proxy answered and rejected our api-key. Its own condition — never
     /// folded into `Absent`: that would either wrongly read as an older proxy
     /// with no route, or let `login()` silently fall back to writing the file
     /// out from under a server that is right there, listening.
     Unauthorized,
+    /// Something holds the port and is either an older proxy answering
+    /// without the route (identified structurally, never by error text) or
+    /// accepted the connection and then produced nothing usable before the
+    /// deadline — the wedged-port shape `cli::probe_incumbent`'s own tests
+    /// document as measured and real (`a_listener_that_never_answers_is_silent_not_answering`).
+    /// Both are first-hand evidence a live process holds the port — at least
+    /// as strong as the `incumbent` pid heuristic, and stronger exactly where
+    /// that heuristic is documented to miss (an embedded host). Split out of
+    /// `Absent` because the two are NOT the same conservative answer: folding
+    /// them together let a `None` incumbent silently choose `File` beside a
+    /// real, wedged server, without `--force` ever being asked for. Carries
+    /// the probe's own account of what happened, for the refusal message.
+    Unusable(String),
 }
 
 /// Probe whether the proxy `config` points at can accept a live account add,
@@ -876,17 +918,26 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
         // stamped — exactly the positive capability signal.
         Err(crate::cli::LiveControlError::Rejected(_)) => AddCapability::Present,
         Err(crate::cli::LiveControlError::Unauthorized) => AddCapability::Unauthorized,
-        Err(_) => AddCapability::Absent,
+        // A connection could not be made at all — the ONLY genuinely-absent
+        // case.
+        Err(crate::cli::LiveControlError::NoServer) => AddCapability::Absent,
+        // Everything else (`NoRoute`, `NoAnswer`, `Unusable`) is first-hand
+        // evidence something holds the port, just not usably.
+        Err(other) => AddCapability::Unusable(other.why()),
     }
 }
 
 /// Resolve which [`LoginRoute`] `login()` should take. Runs the impure HTTP
-/// capability probe UNCONDITIONALLY whenever `--force` was not given —
-/// deliberately never gated on whether [`crate::singleton::live_proxy_server`]
-/// (`incumbent`) noticed anything on the port first. That detection is a pid
-/// inference and can miss a live proxy this build's argv/owner-file matcher
-/// was never taught to recognize; the probe asks the port directly and is
-/// authoritative on its own. Fully resolves before `login()` starts the OAuth
+/// capability probe UNCONDITIONALLY — including under `--force` — deliberately
+/// never gated on whether [`crate::singleton::live_proxy_server`]
+/// (`incumbent`) noticed anything on the port first, NOR on `force`: skipping
+/// the probe under `--force` is exactly the bug bridge item C removed, since
+/// it is what let `--force` take the file path even when the live route was
+/// confirmed and safe. `force` only changes what happens when the probe
+/// itself cannot confirm a safe live route (unauthorized, or an unusable
+/// answer) — those cases fall back to `LoginRoute::File` under `--force`
+/// instead of erroring out, mirroring the historical "force always succeeds
+/// via the file" behaviour. Fully resolves before `login()` starts the OAuth
 /// dance, so a user is never told to stop a server AFTER completing a full
 /// browser round-trip, and never silently falls back to the file when a live
 /// proxy answered but rejected our api-key.
@@ -896,20 +947,41 @@ async fn login_route(
     port: u16,
     force: bool,
 ) -> anyhow::Result<LoginRoute> {
-    if force {
-        return Ok(login_guard_refusal(incumbent, false, port, force));
-    }
     let config = load_or_default(config_path)?;
     match probe_add_capability(&config).await {
-        AddCapability::Unauthorized => bail!(
-            "the proxy on :{port} rejected the api-key in {} while checking whether it could \
-             take a live login — no browser was opened and nothing was changed. Fix \
-             `proxy.apiKey` and retry, or re-run with --force to log in via the file instead \
-             (this still risks the running server overwriting it on its next token refresh).",
-            config_path.display()
-        ),
+        AddCapability::Unauthorized => {
+            if force {
+                return Ok(LoginRoute::File);
+            }
+            bail!(
+                "the proxy on :{port} rejected the api-key in {} while checking whether it \
+                 could take a live login — no browser was opened and nothing was changed. Fix \
+                 `proxy.apiKey` and retry, or re-run with --force to log in via the file \
+                 instead (this still risks the running server overwriting it on its next token \
+                 refresh).",
+                config_path.display()
+            );
+        }
         AddCapability::Present => Ok(login_guard_refusal(incumbent, true, port, force)),
         AddCapability::Absent => Ok(login_guard_refusal(incumbent, false, port, force)),
+        // Bridge item D: something holds the port but answered unusably —
+        // first-hand evidence at least as strong as `incumbent`, so this
+        // refuses REGARDLESS of what `incumbent` separately concluded, never
+        // falling through to `LoginRoute::File` the way folding this into
+        // `Absent` used to when `incumbent` was `None`.
+        AddCapability::Unusable(why) => {
+            if force {
+                return Ok(LoginRoute::File);
+            }
+            bail!(
+                "the proxy on :{port} answered but not usably ({why}) while checking whether \
+                 it could take a live login — no browser was opened and nothing was changed. \
+                 This is first-hand evidence something holds the port even though process \
+                 detection may have missed it, so the historical whole-file-write hazard still \
+                 applies. Re-run with --force to log in via the file instead (this still risks \
+                 the running server overwriting it on its next token refresh)."
+            );
+        }
     }
 }
 
@@ -985,10 +1057,50 @@ fn persist_via_file(
         profile.account_uuid,
         profile.org_uuid,
         profile.org_name,
-    );
+    )?;
     config::save(config_path, config).context("save config after login")?;
     println!("Saved account '{name}' to {}", config_path.display());
     Ok(name.to_string())
+}
+
+/// The surgical half of a live-route fallback — [`config::save_account`]'s
+/// single-account read-modify-write — used when [`probe_add_capability`]
+/// confirmed the route moments earlier but [`crate::cli::post_add_account`]
+/// itself then could not apply it (the route disappeared, or the proxy
+/// stopped answering before its 5s deadline). Bridge item A: this replaces
+/// [`persist_via_file`] on exactly those two arms of [`finish_login`].
+///
+/// Unlike `persist_via_file`, this never touches any account row but
+/// `account`'s own, and it is safe to call even though `account` was built
+/// from data gathered before this call's own async window (the profile
+/// fetch, the possible stdin prompt, the up-to-5s `post_add_account`
+/// timeout): `config::save_account` re-reads the config document FRESH from
+/// disk and resolves identity itself, rather than whole-file-saving the
+/// (possibly already-stale) in-memory `config` this process is holding — so
+/// there is no stale snapshot for it to clobber a concurrent server-side
+/// rotation with. This is the same write the server's own persist path uses.
+fn persist_via_account(config_path: &Path, account: &Account) -> anyhow::Result<String> {
+    match config::save_account(config_path, account).context("save account after login")? {
+        config::AccountWrite::Added | config::AccountWrite::Updated => {
+            println!(
+                "Saved account '{}' to {}",
+                account.name,
+                config_path.display()
+            );
+            Ok(account.name.clone())
+        }
+        config::AccountWrite::Ambiguous => bail!(
+            "'{}' matches more than one account already in {} — narrow with --org or use an \
+             exact name. Nothing was changed.",
+            account.name,
+            config_path.display()
+        ),
+        config::AccountWrite::Unwritable => bail!(
+            "the accounts key in {} is not a JSON array — refusing to write. Nothing was \
+             changed.",
+            config_path.display()
+        ),
+    }
 }
 
 /// Persist the finished OAuth credential per `route`: through the live proxy
@@ -1077,26 +1189,40 @@ async fn finish_login(
                 ),
                 // The route is missing: the capability probe said it was
                 // there and it no longer is (a race, or a downgrade mid-run).
-                // The file write is all we can do, and it is HALF a login —
-                // say so loudly, mirroring `set_enabled`'s NoRoute arm.
+                // Bridge item A: this is reached with a CONFIRMED-live server
+                // on the other end of the port, seconds after the config
+                // snapshot above was loaded (a profile fetch, possibly an
+                // unbounded stdin prompt, then this call itself came between)
+                // — so a whole-file `persist_via_file` here would revert any
+                // edit the live server made to any OTHER account in that
+                // window. `persist_via_account` writes only this one row,
+                // re-reading the file fresh instead of trusting the stale
+                // snapshot. It is still HALF a login — say so loudly,
+                // mirroring `set_enabled`'s NoRoute arm.
                 Err(crate::cli::LiveControlError::NoRoute) => {
-                    let saved = persist_via_file(config_path, config, name, tokens, profile)?;
+                    let saved = persist_via_account(config_path, &account)?;
                     eprintln!(
-                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so only the config file was changed. Run `tcr restart` when a cold prompt cache is acceptable.",
+                        "[tcr] WARNING: the proxy running on :{} is too old to accept a live login (no {} route), so the account was written to {} while the proxy is running — it will not see this account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
                         config.proxy.port,
                         crate::proxy::ADD_ACCOUNT_PATH,
+                        config_path.display(),
                     );
                     Ok(saved)
                 }
-                // It answered something unusable, or did not answer in time.
-                // Same shape of consequence as NoRoute, different cause, and
+                // It answered something unusable, or did not answer in time
+                // (the wedged-port shape `cli::probe_incumbent`'s own tests
+                // document as measured and real — the probe confirmed the
+                // route seconds ago and `post_add_account` then hit its own
+                // 5s deadline). Same shape of consequence as `NoRoute`, same
+                // surgical write for the same reason, different cause, and
                 // equally never silent.
                 Err(other) => {
                     let why = other.why();
-                    let saved = persist_via_file(config_path, config, name, tokens, profile)?;
+                    let saved = persist_via_account(config_path, &account)?;
                     eprintln!(
-                        "[tcr] WARNING: could not apply this login to the proxy running on :{} ({why}), so only the config file was changed.",
+                        "[tcr] WARNING: could not apply this login to the proxy running on :{} ({why}), so the account was written to {} while the proxy is running — it may not see this account until it restarts.",
                         config.proxy.port,
+                        config_path.display(),
                     );
                     Ok(saved)
                 }
@@ -1336,7 +1462,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(config.accounts.len(), 1);
         let account = &config.accounts[0];
@@ -1365,7 +1492,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
 
         // Same account count — updated in place, not duplicated.
         assert_eq!(config.accounts.len(), 1);
@@ -1394,7 +1522,8 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
 
         assert_eq!(config.accounts.len(), 2);
         // max existing priority (3) + 1.
@@ -1413,7 +1542,8 @@ mod tests {
             Some("uuid-person".into()),
             Some("org-corp".into()),
             Some("Corp".into()),
-        );
+        )
+        .unwrap();
         upsert_account(
             &mut config,
             "me@example.com",
@@ -1421,7 +1551,8 @@ mod tests {
             Some("uuid-person".into()),
             Some("org-personal".into()),
             Some("Personal".into()),
-        );
+        )
+        .unwrap();
 
         assert_eq!(config.accounts.len(), 2, "second org is a distinct account");
         assert_eq!(config.accounts[0].access_token, "at-corp");
@@ -1448,7 +1579,8 @@ mod tests {
             Some("uuid-person".into()),
             Some("org-corp".into()),
             Some("Corp".into()),
-        );
+        )
+        .unwrap();
 
         assert_eq!(
             config.accounts.len(),
@@ -1459,6 +1591,96 @@ mod tests {
         assert_eq!(account.access_token, "new-at");
         assert_eq!(account.org_uuid.as_deref(), Some("org-corp"));
         assert_eq!(account.org_name.as_deref(), Some("Corp"));
+    }
+
+    /// THE MEASURED FAILURE bridge item B exists to fix: entries
+    /// `[{u1, org-a, at-ORG-A/rt-ORG-A}, {u1, no org, at-LEGACY/rt-LEGACY}]`
+    /// with a login identity `{u1, no org}`. Under the old `.find()`
+    /// first-match-wins, `same_identity` matches BOTH rows — a legacy no-org
+    /// entry loosely matches every org of that person — so `.find()` silently
+    /// took index 0, stamping the fresh credential over org-a's row and
+    /// destroying its single-use refresh token. `identity::resolve` exists
+    /// exactly to break this tie via `same_identity_strict`: only the legacy
+    /// row (also org-less) is a STRICT match, so the target resolves to it.
+    #[test]
+    fn upsert_resolves_the_legacy_two_org_tie_onto_the_legacy_row() {
+        let mut config: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "me@example.com", "type": "oauth", "accountUuid": "u1",
+                  "orgUuid": "org-a", "orgName": "Org A",
+                  "accessToken": "at-ORG-A", "refreshToken": "rt-ORG-A",
+                  "expiresAt": 100, "priority": 0 },
+                { "name": "me@example.com", "type": "oauth", "accountUuid": "u1",
+                  "accessToken": "at-LEGACY", "refreshToken": "rt-LEGACY",
+                  "expiresAt": 100, "priority": 1 }
+            ] }"#,
+        )
+        .unwrap();
+
+        upsert_account(
+            &mut config,
+            "me@example.com",
+            &tokens("at-NEW", "rt-NEW", 999),
+            Some("u1".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(config.accounts.len(), 2, "no new row appended");
+        assert_eq!(
+            config.accounts[0].access_token, "at-ORG-A",
+            "org-a's row must be untouched: {:?}",
+            config.accounts[0]
+        );
+        assert_eq!(
+            config.accounts[0].refresh_token.as_deref(),
+            Some("rt-ORG-A"),
+            "org-a's refresh token is single-use — clobbering it bricks the account"
+        );
+        assert_eq!(
+            config.accounts[1].access_token, "at-NEW",
+            "the legacy row (also org-less) is the strict match, not org-a"
+        );
+        assert_eq!(config.accounts[1].refresh_token.as_deref(), Some("rt-NEW"));
+    }
+
+    /// A genuine, unbreakable tie — two rows sharing the exact same identity —
+    /// refuses rather than guesses, and writes NOTHING: the config must be
+    /// byte-for-byte unchanged after the refusal.
+    #[test]
+    fn upsert_refuses_and_writes_nothing_on_an_unbreakable_tie() {
+        let mut config: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "me@example.com", "type": "oauth", "accountUuid": "u1",
+                  "orgUuid": "org-a", "orgName": "Org A",
+                  "accessToken": "at-1", "refreshToken": "rt-1",
+                  "expiresAt": 100, "priority": 0 },
+                { "name": "me@example.com", "type": "oauth", "accountUuid": "u1",
+                  "orgUuid": "org-a", "orgName": "Org A",
+                  "accessToken": "at-2", "refreshToken": "rt-2",
+                  "expiresAt": 100, "priority": 1 }
+            ] }"#,
+        )
+        .unwrap();
+        let before = serde_json::to_value(&config).unwrap();
+
+        let err = upsert_account(
+            &mut config,
+            "me@example.com",
+            &tokens("at-NEW", "rt-NEW", 999),
+            Some("u1".to_string()),
+            Some("org-a".to_string()),
+            Some("Org A".to_string()),
+        )
+        .expect_err("an unbreakable tie must refuse rather than guess");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            before,
+            "nothing was written on refusal"
+        );
     }
 
     // --- authorize URL ------------------------------------------------------
@@ -1559,6 +1781,21 @@ mod tests {
         assert_eq!(
             login_guard_refusal(None, false, 3456, false),
             LoginRoute::File
+        );
+    }
+
+    /// THE BRIDGE ITEM C FIX: `--force` overrides only the `Refuse` outcome,
+    /// never a confirmed-safe `Live` route. The pre-fix code checked `force`
+    /// BEFORE `has_add_route`, so `--force` took the file path even when the
+    /// live route was confirmed and safe — the exact bug this unit exists to
+    /// remove, self-inflicted by the escape hatch. Nobody wants the file
+    /// write *because* it is a file write; they want the login not refused.
+    #[test]
+    fn login_guard_prefers_live_over_force_when_the_route_is_confirmed() {
+        assert_eq!(
+            login_guard_refusal(incumbent(singleton::ProxyKind::Tcr), true, 3456, true),
+            LoginRoute::Live,
+            "--force must not choose the file write when the live route IS available and safe"
         );
     }
 
@@ -1715,11 +1952,15 @@ mod tests {
         assert_eq!(probe_add_capability(&config).await, AddCapability::Present);
     }
 
+    /// Bridge item D: an "older tcr" — something answers, but not on this
+    /// route at all (no `ENDPOINT_HEADER`, unlike every response this crate's
+    /// own router produces, even its 404s and 405s) — is first-hand evidence
+    /// a live process holds the port. It must NOT collapse into `Absent`
+    /// (renamed from this test's old expectation): folding it in there is
+    /// exactly what let `login_route` silently choose `File` beside a real,
+    /// answering-but-old server whenever pid detection missed it.
     #[tokio::test]
-    async fn probe_add_capability_unstamped_404_is_absent() {
-        // An "older tcr": something answers, but not on this route at all — no
-        // `ENDPOINT_HEADER`, unlike every response this crate's own router
-        // produces (even its 404s and 405s).
+    async fn probe_add_capability_unstamped_404_is_unusable_not_absent() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -1727,7 +1968,44 @@ mod tests {
         });
         let config: Config =
             serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+        assert!(matches!(
+            probe_add_capability(&config).await,
+            AddCapability::Unusable(_)
+        ));
+    }
+
+    /// The genuinely-absent case, for contrast with the test above: nothing
+    /// is bound to the port at all, so the connection is refused outright.
+    /// This is the ONLY shape that may still resolve to `LoginRoute::File`
+    /// without `--force` and without `incumbent` separately confirming a
+    /// server.
+    #[tokio::test]
+    async fn probe_add_capability_connection_refused_is_absent() {
+        let dead_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let config: Config =
+            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {dead_port} }} }}"#)).unwrap();
         assert_eq!(probe_add_capability(&config).await, AddCapability::Absent);
+    }
+
+    /// The WEDGED shape `cli::probe_incumbent`'s own tests document as
+    /// measured and real (`a_listener_that_never_answers_is_silent_not_answering`):
+    /// bound, the connect succeeds off the kernel backlog, and nothing is
+    /// ever written back. Costs the probe's own 5s deadline by construction.
+    #[tokio::test]
+    async fn probe_add_capability_wedged_port_is_unusable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config: Config =
+            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+
+        assert!(matches!(
+            probe_add_capability(&config).await,
+            AddCapability::Unusable(_)
+        ));
+        drop(listener);
     }
 
     #[tokio::test]
@@ -1789,6 +2067,81 @@ mod tests {
             "the probe must decide this on its own, independent of incumbent detection"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Bridge item C, at the `login_route` level: `--force` must still probe
+    /// and still prefer `Live` when a real server confirms the route — never
+    /// skip straight to `File` the way the pre-fix early-return did.
+    #[tokio::test]
+    async fn login_route_prefers_live_over_force_when_a_real_server_confirms_the_route() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-force-live-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
+        std::fs::write(&path, &seed).unwrap();
+
+        let server_config: Config = serde_json::from_str(&seed).unwrap();
+        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let route = login_route(&path, None, port, true)
+            .await
+            .expect("a confirmed route under --force must not error");
+        assert_eq!(
+            route,
+            LoginRoute::Live,
+            "--force must still probe and prefer Live when the route is confirmed"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Bridge item D, at the `login_route` level: a wedged port — something
+    /// answers the TCP connect and then never responds — must refuse even
+    /// when `incumbent` is `None` (pid/argv detection missed it entirely, the
+    /// TcrBar shape). Before this fix, `AddCapability::Absent` covered this
+    /// case too, and `login_guard_refusal`'s `None => LoginRoute::File` arm
+    /// let it through with no `--force` needed at all.
+    #[tokio::test]
+    async fn login_route_refuses_a_wedged_port_even_when_incumbent_detection_missed_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-wedged-{}-{port}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+
+        let err = login_route(&path, None, port, false)
+            .await
+            .expect_err("a wedged port must refuse, not silently choose File");
+        assert!(err.to_string().contains("--force"), "{err}");
+
+        std::fs::remove_file(&path).ok();
+        drop(listener);
+    }
+
+    /// The escape hatch still works past a wedged-port refusal: `--force`
+    /// resolves to `File` rather than erroring out.
+    #[tokio::test]
+    async fn login_route_force_resolves_to_file_past_a_wedged_port_refusal() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-wedged-force-{}-{port}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!(r#"{{ "proxy": {{ "port": {port} }} }}"#)).unwrap();
+
+        let route = login_route(&path, None, port, true)
+            .await
+            .expect("--force must still resolve past a wedged-port refusal");
+        assert_eq!(route, LoginRoute::File);
+
+        std::fs::remove_file(&path).ok();
+        drop(listener);
     }
 
     // --- finish_login ---------------------------------------------------------
@@ -2000,5 +2353,108 @@ mod tests {
             serde_json::json!("erin@example.com")
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// THE σ5 EXPERIMENT bridge item A calls for. The WEDGED shape
+    /// `cli::probe_incumbent`'s own tests document as measured and real
+    /// (`a_listener_that_never_answers_is_silent_not_answering`): bound, the
+    /// connect succeeds off the kernel backlog, and nothing is ever written
+    /// back — reached on the `Live` route when the capability probe confirmed
+    /// the route seconds earlier and `post_add_account` then hits its own 5s
+    /// deadline.
+    ///
+    /// Reproduces the same race `finish_login_live_path_does_not_clobber_a_concurrent_rotation`
+    /// does — a stale client-side snapshot plus a write that lands on disk
+    /// AFTER that snapshot was taken — but via `config::save_account` (the
+    /// server's own persist primitive) directly, rather than a live HTTP
+    /// round-trip: the port in THIS scenario is deliberately silent for the
+    /// test's whole lifetime, so nothing can be routed through it. Before
+    /// this fix, the `NoAnswer` arm fell through to `persist_via_file`'s
+    /// WHOLE-FILE `config::save` of that now-stale snapshot, reverting
+    /// alice's rotation — the exact hazard `finish_login` exists to remove,
+    /// reintroduced in this one arm (watched failing directly: with that arm
+    /// reverted to `persist_via_file`, this test fails with `left:
+    /// "rt-alice" right: "rt-alice-ROTATED"`). Fixed, it lands through
+    /// `config::save_account`'s surgical single-row write instead, so
+    /// alice's rotated row survives and the new account is still added.
+    #[tokio::test]
+    async fn finish_login_live_timeout_does_not_clobber_other_accounts() {
+        // Bound and never accepted: connections queue in the kernel backlog
+        // and the connect succeeds, but nothing is ever written back —
+        // `post_add_account` times out at its own 5s deadline.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-timeout-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
+            ] }}"#
+        );
+        std::fs::write(&path, &seed).unwrap();
+
+        // The stale snapshot: what `login()` would have loaded before its own
+        // async window (profile fetch / stdin prompt) opened.
+        let mut client_config = load_or_default(&path).unwrap();
+
+        // A rotation lands on disk AFTER that snapshot was taken — the live
+        // server's own persist path, used directly since the port itself is
+        // silent in this scenario and cannot carry a real round-trip.
+        let rotated_alice = Account {
+            name: "alice@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-alice-ROTATED".to_string(),
+            refresh_token: Some("rt-alice-ROTATED".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
+        let after_rotation = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_rotation.contains("rt-alice-ROTATED"),
+            "setup: the rotation must be on disk first: {after_rotation}"
+        );
+
+        let name = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut client_config,
+            "carol@example.com",
+            &tokens("at-carol", "rt-carol", 1_893_456_000_000),
+            profile_named("carol@example.com"),
+        )
+        .await
+        .expect("a timed-out live add must still fall back to a file write");
+        assert_eq!(name, "carol@example.com");
+
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        let alice = accounts
+            .iter()
+            .find(|a| a["name"] == "alice@example.com")
+            .expect("alice must still be on disk");
+        assert_eq!(
+            alice["refreshToken"],
+            serde_json::json!("rt-alice-ROTATED"),
+            "the timed-out live add must NOT whole-file-write a stale snapshot back over \
+             alice's rotation: {final_doc}"
+        );
+        assert!(
+            accounts.iter().any(|a| a["name"] == "carol@example.com"),
+            "carol was added: {final_doc}"
+        );
+
+        std::fs::remove_file(&path).ok();
+        drop(listener);
     }
 }
