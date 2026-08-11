@@ -1225,26 +1225,50 @@ struct AddAccountRequest {
 
 /// The 200 body of [`ADD_ACCOUNT_PATH`]. Deserializable too — unit 3's CLI
 /// deserializes it, and both halves of a wire contract belong to one type.
+///
+/// This is a cross-BUILD wire contract — the same class as
+/// [`crate::singleton::ProxyHost::Unknown`] — because the `tcr` that
+/// deserializes a reply can be older than the `tcr` that served it. Every
+/// field below carries `#[serde(default)]` so a field a NEWER server has
+/// renamed or dropped does not fail the whole deserialize: `cli::post_add_account`
+/// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
+/// `oauth::probe_add_capability` reads that as `AddCapability::Absent` — a
+/// *successful* live add would then look indistinguishable from "no route
+/// here", and `tcr login` falls back to the whole-file `config::save` path
+/// beside a server that just handled the request correctly. Field
+/// ADDITIONS are already safe on their own (an older CLI just ignores a key
+/// it doesn't know); this attribute is what makes removals and renames safe
+/// too. Each default is chosen as the SAFER of the two readings, not merely
+/// the type's zero value: `persisted` defaults to `false` (never claim
+/// durability we can't confirm) and `added` defaults to `false` (never claim
+/// a fresh account was created when it might have been an in-place
+/// credential replacement) — same degrade-to-the-safer-state shape as
+/// `ProxyHost::Unknown`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AddAccountResponse {
     /// The account's name AS STORED. For an update this is the EXISTING row's
     /// name, which may differ from what was submitted (e.g. a bare email
     /// meeting a stored `"email (org)"` display name) — never a name that only
     /// ever existed in the request.
+    #[serde(default)]
     pub name: String,
     /// `true` when this identity had no match in the live rotation and was
     /// appended; `false` when an existing account's credentials were replaced
     /// in place. "Created" and "credentials replaced" are different facts and
     /// the operator needs to know which one they got.
+    #[serde(default)]
     pub added: bool,
     /// The account's index in the live rotation. Stable for the process
     /// lifetime — append-only, never reused, and an update never moves it.
+    #[serde(default)]
     pub index: usize,
     /// Whether the config file also carries it. `false` with a `warning` is a
     /// change that is live but will not survive a restart.
+    #[serde(default)]
     pub persisted: bool,
     /// [`AddPersist::warning`] and/or the no-refresh-token warning, joined when
     /// both apply, or `null`.
+    #[serde(default)]
     pub warning: Option<String>,
 }
 
@@ -1347,6 +1371,13 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             None,
         ));
     };
+    // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_capability` deliberately
+    // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
+    // 400 back as proof this route exists. Changing the status (e.g. to 422),
+    // or answering without `stamp_add_endpoint`, silently turns that read into
+    // `AddCapability::Absent` — `tcr login` then falls back to the whole-file
+    // `config::save` path beside a live server. See the seam test
+    // `probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing`.
     let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
         return stamp_add_endpoint(error_response(
             StatusCode::BAD_REQUEST,
@@ -1355,6 +1386,10 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
             None,
         ));
     };
+    // Same load-bearing signal as the blank-name branch above — the probe's
+    // body is ALSO blank on `accessToken`, so whichever of the two checks
+    // fires first is the one the probe actually exercises. Keep this one a
+    // stamped 400 too.
     let Some(access_token) = parsed.access_token.filter(|t| !t.trim().is_empty()) else {
         return stamp_add_endpoint(error_response(
             StatusCode::BAD_REQUEST,
@@ -5239,14 +5274,30 @@ mod tests {
             .no_proxy()
             .build()
             .expect("build client");
-        // The EXACT body `probe_add_capability` builds (oauth.rs:855-869): a
-        // blank name, a blank accessToken, `type: "oauth"`, everything else
-        // absent — serialized the same way `post_add_account` sends it
-        // (`.json(account)` over `config::Account`'s wire shape).
+        // The EXACT `Account` `probe_add_capability` builds (oauth.rs:855-869):
+        // a blank name, a blank access token, everything else absent.
+        // DERIVED, not a restated literal — a future edit to the probe's body
+        // (oauth.rs, out of this route's reach) changes this test's request
+        // too, instead of leaving a stale literal green while it tests a body
+        // nobody sends. Sent via `.json()` exactly like `post_add_account`
+        // sends it (`cli.rs:473`, `.json(account)`).
+        let probe_body = Account {
+            name: String::new(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
         let resp = client
             .post(format!("http://{addr}{ADD_ACCOUNT_PATH}"))
-            .header("content-type", "application/json")
-            .body(r#"{"name":"","type":"oauth","accessToken":""}"#)
+            .json(&probe_body)
             .send()
             .await
             .expect("send the probe's blank body");
