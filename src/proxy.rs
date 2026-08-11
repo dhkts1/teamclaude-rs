@@ -5203,6 +5203,80 @@ mod tests {
         }
     }
 
+    /// SEAM TEST. `oauth::probe_add_capability` (unit 3, `oauth.rs:855-881`)
+    /// decides whether `tcr login` takes the LIVE route by POSTing this exact
+    /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
+    /// `cli::post_add_account` and reading whether the reply is a STAMPED
+    /// 400. Anything else — an unstamped answer, a different status, or
+    /// (worst of all) a 200 that actually appended a blank-named account to
+    /// the live fleet — reads as `AddCapability::Absent`, and `tcr login`
+    /// silently falls back to the whole-file `config::save` path while THIS
+    /// server is still running: the exact single-use-refresh-token clobber
+    /// this whole feature exists to remove, reopened as a silent fallback
+    /// rather than a loud error.
+    ///
+    /// Driven through the REAL production stack — a real `TcpListener` and
+    /// `crate::mitm::serve`, exactly how `main()` invokes it — not a
+    /// hand-built router, so a change to route registration or middleware
+    /// ordering is covered here too, not only by the in-process `oneshot`
+    /// tests above. Complements (does not replace) unit 3's own
+    /// `probe_add_capability_reads_a_stamped_400_as_present` (oauth.rs) and
+    /// `post_add_account_reads_a_stamped_400_as_rejected` (cli.rs), which
+    /// this repo's cross-file boundary keeps this route from editing.
+    #[tokio::test]
+    async fn probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing() {
+        let (manager, path) = control_manager("seam-probe", None);
+        let before = manager.snapshot(OffsetDateTime::now_utc()).accounts.len();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind seam-probe listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let serving = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        // The EXACT body `probe_add_capability` builds (oauth.rs:855-869): a
+        // blank name, a blank accessToken, `type: "oauth"`, everything else
+        // absent — serialized the same way `post_add_account` sends it
+        // (`.json(account)` over `config::Account`'s wire shape).
+        let resp = client
+            .post(format!("http://{addr}{ADD_ACCOUNT_PATH}"))
+            .header("content-type", "application/json")
+            .body(r#"{"name":"","type":"oauth","accessToken":""}"#)
+            .send()
+            .await
+            .expect("send the probe's blank body");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "the probe body must answer a local 400 — never forwarded, never a \
+             soft-fail status the probe would misclassify"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT),
+            "unstamped and `probe_add_capability` reads this as Absent — `tcr login` \
+             silently falls back to the whole-file config::save path with a live \
+             server running"
+        );
+
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            before,
+            "the probe's deliberately-blank body must never reach add_or_update_account"
+        );
+        assert_eq!(account_count_in_file(&path), before, "…nor the disk");
+
+        std::fs::remove_file(&path).ok();
+    }
+
     // --- rotation-bypassing relays -----------------------------------------
 
     /// What a fake upstream saw — one of these per request it received.
