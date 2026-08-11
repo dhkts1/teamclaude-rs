@@ -53,8 +53,18 @@ upstream for a local fault.
 
 ## `tcr login` refuses to run
 
-A proxy is holding the port and its next token refresh would overwrite what the login
-writes. Stop it, log in, start it again, or use `--force`.
+A running proxy on its own no longer causes this — `tcr login` adds the account to a live
+proxy without stopping it. The refusal means the proxy holding the port is an **older build
+without the `/_tcr/accounts` route**, and against that build the original hazard is real: it
+reads the config at boot and its next token refresh writes its boot-time tokens back over the
+file, silently clobbering the fresh login.
+
+Update the running proxy and log in again, or stop it, log in, and start it again. `--force`
+also gets past it, but it skips the live path and writes the file, which is the unsafe
+behaviour this refusal exists to prevent — reach for it last, not first.
+
+If the pid named belongs to TcrBar, quit the application rather than killing the pid: killing
+it skips shutdown and loses the session pin map.
 
 ## `tcr ui` or a TcrBar update will not replace the app
 

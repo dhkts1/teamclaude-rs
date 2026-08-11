@@ -111,26 +111,47 @@ credential to start. The process exits with `claude`'s own exit code.
 
 ## `tcr login`
 
-Runs the browser OAuth flow and writes the resulting account into the config.
+Runs the browser OAuth flow and adds the resulting account to the pool.
 
 | flag | type | default | effect |
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
-| `--force` | bool | `false` | log in even while a proxy holds the port |
+| `--force` | bool | `false` | skip the live proxy entirely and write the config file |
 
-**It refuses while a proxy is running on the configured port.** The refusal is not caution:
-the server reads the config at boot and its next token refresh writes its *boot-time* tokens
-back over the file, silently clobbering the ones a fresh login just wrote, observed live.
-The message names the port, the pid, and the ordered remedy: stop the server, run
-`tcr login`, then start it again.
+**A running proxy no longer has to be stopped.** Before opening the browser, `tcr login`
+asks the proxy on the configured port whether it can take an account live, by POSTing a
+deliberately-invalid body to `/_tcr/accounts` and reading the reply. What happens next
+depends only on that answer:
 
-If the pid it names belongs to a host application serving the proxy in-process (TcrBar), the
-message says so and tells you to quit the application rather than kill the pid. Killing it
-skips shutdown and loses the session pin map.
+| the proxy on the port | what login does |
+|---|---|
+| answers, and has the route | hands the account to the **running** proxy; it joins rotation immediately and the proxy writes the config itself |
+| answers, but has no such route (an older `tcr`) | refuses, exactly as it always did |
+| nothing listening | writes the config file, exactly as it always did |
 
-`--force` is the deliberate escape hatch, and it is genuinely unsafe: the login succeeds and
-then the running server's next refresh overwrites it. Detection is read-only either way; the
-server is never signalled.
+The live path is the one worth having. Restarting the proxy to pick up a new account
+discards the session→account pin map, so every live session cold-starts its prompt cache on
+its next turn — the most expensive event in this system. Adding an account live costs none of
+that. It also removes a second hazard: when the CLI writes the file itself while a proxy is
+running, the two can interleave, and because Anthropic's refresh tokens are single-use, a
+reverted write is not recoverable by retrying. On the live path only one process writes.
+
+Logging in again as an account already in the pool is the same operation — its credentials
+are replaced in place, and it keeps its position, its priority and its learned quota.
+
+**The refusal still exists, and still means what it said.** Against a proxy too old to have
+the route, the original hazard is real: that server reads the config at boot and its next
+token refresh writes its *boot-time* tokens back over the file, silently clobbering a fresh
+login (observed live). The message names the port, the pid, and the ordered remedy — stop the
+server, run `tcr login`, then start it again. If the pid belongs to a host application serving
+the proxy in-process (TcrBar), it says so and tells you to quit the application rather than
+kill the pid: killing it skips shutdown and loses the pin map.
+
+`--force` **skips the probe and writes the config file**, even when the running proxy would
+have accepted the account safely. That makes it the unsafe path rather than the way around a
+blocked one, and you almost certainly do not want it: the login succeeds and the running
+server's next refresh can overwrite it. It remains only as an escape hatch for a proxy that
+answers but misbehaves. Detection is read-only throughout; the server is never signalled.
 
 The callback server binds a random loopback port, and tokens are never printed or logged.
 
