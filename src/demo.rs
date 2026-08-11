@@ -9,8 +9,10 @@
 //! run loop unchanged; nothing here is ever exercised by the serving path.
 
 use std::io;
+use std::sync::Arc;
 
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::manager::{AccountRuntime, AccountStatus, Manager};
 use crate::probe::ProbeStatus;
@@ -75,6 +77,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         probe_error: None,
         stream_error_times_ms: std::collections::VecDeque::new(),
         last_stream_error: None,
+        refresh_lock: Arc::new(AsyncMutex::new(())),
     }
 }
 

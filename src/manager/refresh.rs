@@ -29,8 +29,13 @@ impl Manager {
             return false;
         };
 
-        let lock = match self.refresh_locks.get(idx) {
-            Some(lock) => lock.clone(),
+        let lock = match self
+            .accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+        {
+            Some(account) => account.refresh_lock.clone(),
             None => return false,
         };
         let _guard = lock.lock().await;

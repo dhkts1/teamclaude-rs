@@ -1127,6 +1127,157 @@ fn find_account_entry<'a>(
         .ok_or(DisabledWrite::NoEntry)
 }
 
+/// What a targeted [`save_account`] upsert did to the on-disk document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountWrite {
+    /// No entry on disk carried this identity — a new one was appended, holding
+    /// every field `account` carries (identity, credentials, and routing knobs).
+    Added,
+    /// Exactly one entry carried this identity — its CREDENTIAL fields
+    /// (`accessToken` / `refreshToken` / `expiresAt`) were updated in place,
+    /// `type` was stamped to `account.account_type` unconditionally, and any
+    /// of `accountUuid` / `orgUuid` / `orgName` the entry was MISSING got
+    /// backfilled from `account` (never overwriting a value already present —
+    /// this is what permanently stops a legacy no-org entry from loosely
+    /// matching every org variant of that person forever). `priority`,
+    /// `disabled`, `switchThreshold`, and any unmodelled `extra` key are
+    /// untouched, exactly as [`merge_tokens`] leaves them.
+    Updated,
+    /// More than one on-disk entry carries this identity; nothing was written.
+    /// Same refusal as [`DisabledWrite::Ambiguous`], for the same reason: a
+    /// write here would have to guess which entry to overwrite.
+    Ambiguous,
+    /// The document has an `accounts` key that exists but is not a JSON array —
+    /// too corrupt a shape to append into blindly. Nothing was written.
+    Unwritable,
+}
+
+impl std::fmt::Display for AccountWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Added => "added",
+            Self::Updated => "updated",
+            Self::Ambiguous => "more than one entry on disk carries this identity",
+            Self::Unwritable => "the accounts key is not an array",
+        })
+    }
+}
+
+/// Insert-or-replace, by identity, the ONE `accounts` entry matching `account` —
+/// the durable half of live account-add (`POST /_tcr/accounts`,
+/// [`crate::manager::Manager::add_or_update_account`]).
+///
+/// Sibling of [`save_disabled`], and it shares its whole shape: read the raw
+/// document, mutate ONLY what needs to change, write back atomically only if
+/// something did. It differs from `save_disabled` in exactly one place — a MISS
+/// is not a refusal here. `save_disabled` refuses on [`DisabledWrite::NoEntry`]
+/// because its `target` is an identity-only probe with no real credential to
+/// write ([`crate::identity::probe`] leaves `access_token` empty); appending it
+/// would create a useless entry. `account` here is always a COMPLETE record —
+/// either a brand-new login or an existing account's own identity with fresh
+/// credentials merged in (`Manager::persist_replaced`) — so a miss is filled in
+/// rather than refused. That is also why `find_account_entry` (which returns
+/// only the refuse-on-miss `DisabledWrite`) is not reused directly here; this
+/// calls the lower-level [`locate_account_entry`] it is itself built on, so both
+/// functions still run the identical resolution scan.
+///
+/// An identity matching MORE than one on-disk entry still refuses: guessing
+/// which one to overwrite risks stamping fresh credentials over a DIFFERENT
+/// account's single-use refresh token — exactly the failure `find_account_entry`
+/// exists to rule out.
+pub fn save_account(path: &Path, account: &Account) -> Result<AccountWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_account(&mut doc, account)?;
+    if matches!(outcome, AccountWrite::Added | AccountWrite::Updated) {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+/// Insert-or-replace `account` by identity in `doc`. See [`save_account`].
+fn merge_account(
+    doc: &mut Map<String, Value>,
+    account: &Account,
+) -> Result<AccountWrite, ConfigError> {
+    match locate_account_entry(doc, account) {
+        EntryMatch::Many => Ok(AccountWrite::Ambiguous),
+        EntryMatch::One(index) => {
+            // Proven present by the immutable scan `locate_account_entry` just
+            // ran; this chain cannot miss in practice, but a save must never
+            // silently drop a credential if it somehow does.
+            if let Some(entry) = doc
+                .get_mut("accounts")
+                .and_then(Value::as_array_mut)
+                .and_then(|entries| entries.get_mut(index))
+                .and_then(Value::as_object_mut)
+            {
+                let credentials = Credentials {
+                    access_token: &account.access_token,
+                    refresh_token: account.refresh_token.as_deref(),
+                    expires_at: account.expires_at,
+                };
+                if let Value::Object(fields) = serde_json::to_value(&credentials)? {
+                    entry.extend(fields);
+                }
+                // `type` always wins — `save_account` is only ever called with a
+                // real credential, so a stale stored type (e.g. an API-key row
+                // re-added as OAuth) is corrected here; leaving it wrong is a
+                // silent death (`refresh_plan` skips any account whose type is
+                // not `"oauth"`).
+                //
+                // Identity fields are BACKFILLED — written only where the entry
+                // does not already carry a value, never overwriting one that is
+                // present. `locate_account_entry` may have matched loosely (the
+                // org-unknown tolerance), so this is what turns a legacy no-org
+                // entry into a fully-known one: the NEXT submission for a
+                // genuinely different org of the same person then requires an
+                // exact match instead of tolerating the still-unknown org key,
+                // closing the split-brain trigger for good rather than only
+                // for this one write.
+                entry.insert(
+                    "type".to_string(),
+                    Value::String(account.account_type.clone()),
+                );
+                let present = |entry: &Map<String, Value>, key: &str| matches!(entry.get(key), Some(Value::String(s)) if !s.is_empty());
+                if !present(entry, "accountUuid") {
+                    if let Some(uuid) = &account.account_uuid {
+                        entry.insert("accountUuid".to_string(), Value::String(uuid.clone()));
+                    }
+                }
+                if !present(entry, "orgUuid") {
+                    if let Some(uuid) = &account.org_uuid {
+                        entry.insert("orgUuid".to_string(), Value::String(uuid.clone()));
+                    }
+                }
+                if !present(entry, "orgName") {
+                    if let Some(name) = &account.org_name {
+                        entry.insert("orgName".to_string(), Value::String(name.clone()));
+                    }
+                }
+            }
+            Ok(AccountWrite::Updated)
+        }
+        EntryMatch::None => {
+            // Distinguished from "no `accounts` key at all" (fine — create it)
+            // so a document where `accounts` is present but the wrong JSON type
+            // is never silently overwritten with a fresh single-element array.
+            if matches!(doc.get("accounts"), Some(v) if !v.is_array()) {
+                return Ok(AccountWrite::Unwritable);
+            }
+            let entries = doc
+                .entry("accounts".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(entries) = entries else {
+                // Unreachable given the check above, but never index into a
+                // shape that was not actually verified to be an array.
+                return Ok(AccountWrite::Unwritable);
+            };
+            entries.push(serde_json::to_value(account)?);
+            Ok(AccountWrite::Added)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2393,6 +2544,155 @@ mod tests {
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    // --- save_account (the durable half of live account-add) ----------------
+
+    /// A full, valid account record — the shape `Manager::add_or_update_account`
+    /// always hands `save_account`, whether it is a brand-new login or an
+    /// existing account's own identity with fresh credentials merged in.
+    fn full_account(name: &str, access_token: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: access_token.to_string(),
+            refresh_token: Some(format!("rt-{access_token}")),
+            expires_at: Some(1_800_000_000_000),
+            priority: Some(2),
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// A miss appends a brand-new entry carrying every field, and leaves the
+    /// rest of the document untouched.
+    #[test]
+    fn save_account_appends_a_new_identity() {
+        let path = tmp_path("add-append");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        assert_eq!(
+            save_account(&path, &full_account("carol@example.com", "at-carol")).unwrap(),
+            AccountWrite::Added
+        );
+
+        let after = read_json(&path);
+        let accounts = after["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts.len(), 3, "appended, not replacing anything");
+        assert_eq!(accounts[2]["name"], json!("carol@example.com"));
+        assert_eq!(accounts[2]["accessToken"], json!("at-carol"));
+        assert_eq!(accounts[2]["refreshToken"], json!("rt-at-carol"));
+        assert_eq!(accounts[2]["priority"], json!(2));
+        // The pre-existing rows and unmodelled top-level keys are untouched.
+        assert_eq!(accounts[0]["name"], json!("acct-a"));
+        assert_eq!(accounts[1]["name"], json!("acct-b"));
+        assert_eq!(after["warmupSeconds"], json!(900));
+        fs::remove_file(&path).ok();
+    }
+
+    /// A hit replaces ONLY the credential triple on the matching entry — name,
+    /// type, and every unmodelled key (here `models`) survive untouched, exactly
+    /// as `merge_tokens` leaves them.
+    #[test]
+    fn save_account_updates_an_existing_identity_in_place() {
+        let path = tmp_path("add-update");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        let fresh = Account {
+            expires_at: Some(999),
+            priority: Some(99), // deliberately different — must NOT land on disk
+            ..full_account("acct-a", "at-a-fresh")
+        };
+        assert_eq!(save_account(&path, &fresh).unwrap(), AccountWrite::Updated);
+
+        let after = read_json(&path);
+        let accounts = after["accounts"].as_array().expect("accounts array");
+        assert_eq!(accounts.len(), 2, "no duplicate row");
+        assert_eq!(accounts[0]["name"], json!("acct-a"), "identity untouched");
+        assert_eq!(accounts[0]["accessToken"], json!("at-a-fresh"));
+        assert_eq!(accounts[0]["refreshToken"], json!("rt-at-a-fresh"));
+        assert_eq!(accounts[0]["expiresAt"], json!(999));
+        assert!(
+            accounts[0].get("priority").is_none(),
+            "priority was never on this entry and the update must not add it: {after}"
+        );
+        assert_eq!(
+            accounts[0]["models"],
+            json!(["claude-fable-5"]),
+            "an unmodelled per-account key survives the credential-only merge"
+        );
+        // The account we did NOT name keeps its own credentials.
+        assert_eq!(accounts[1]["accessToken"], json!("at-b"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// An identity matching more than one on-disk entry refuses rather than
+    /// guesses which one to overwrite — same posture as `save_disabled`.
+    #[test]
+    fn save_account_refuses_an_ambiguous_identity() {
+        const TWINS: &str = r#"{
+          "accounts": [
+            { "name": "dup@example.com", "type": "oauth", "accessToken": "at-1" },
+            { "name": "dup@example.com", "type": "oauth", "accessToken": "at-2" }
+          ]
+        }"#;
+        let path = tmp_path("add-ambiguous");
+        fs::write(&path, TWINS).unwrap();
+
+        assert_eq!(
+            save_account(&path, &full_account("dup@example.com", "at-new")).unwrap(),
+            AccountWrite::Ambiguous
+        );
+
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][0]["accessToken"], json!("at-1"));
+        assert_eq!(after["accounts"][1]["accessToken"], json!("at-2"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// A miss on a document with NO `accounts` key at all still succeeds — the
+    /// key is created — because (unlike `save_disabled`'s target) `account` here
+    /// is always a complete, real record worth creating a home for.
+    #[test]
+    fn save_account_creates_the_accounts_array_when_absent() {
+        let path = tmp_path("add-no-accounts-key");
+        fs::write(&path, r#"{"warmupSeconds": 900}"#).unwrap();
+
+        assert_eq!(
+            save_account(&path, &full_account("carol@example.com", "at-carol")).unwrap(),
+            AccountWrite::Added
+        );
+
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][0]["name"], json!("carol@example.com"));
+        assert_eq!(after["warmupSeconds"], json!(900));
+        fs::remove_file(&path).ok();
+    }
+
+    /// An `accounts` key that is present but NOT an array is too corrupt a shape
+    /// to append into blindly — refused, and the document is left byte-identical.
+    #[test]
+    fn save_account_refuses_when_accounts_key_is_not_an_array() {
+        const MALFORMED: &str = r#"{"accounts": "not-an-array"}"#;
+        let path = tmp_path("add-not-array");
+        fs::write(&path, MALFORMED).unwrap();
+
+        assert_eq!(
+            save_account(&path, &full_account("carol@example.com", "at-carol")).unwrap(),
+            AccountWrite::Unwritable
+        );
+
+        let after: Value = serde_json::from_str(MALFORMED).unwrap();
+        assert_eq!(
+            read_json(&path),
+            after,
+            "an unwritable shape is left untouched"
         );
         fs::remove_file(&path).ok();
     }

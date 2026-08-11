@@ -37,7 +37,10 @@ use futures::StreamExt;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::manager::{AccountStatus, DisablePersist, Manager, SetDisabledOutcome};
+use crate::config;
+use crate::manager::{
+    AccountStatus, AddAccountOutcome, AddPersist, DisablePersist, Manager, SetDisabledOutcome,
+};
 use crate::stats::{RequestLogEntry, SessionKind};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -480,6 +483,29 @@ pub const ENDPOINT_HEADER: &str = "x-tcr-endpoint";
 /// The [`ENDPOINT_HEADER`] value the account-control route stamps.
 pub const DISABLED_ENDPOINT: &str = "accounts-disabled";
 
+/// Path of the live account-ADD endpoint [`add_account_handler`] serves — `POST`
+/// only, the other route on this process that MUTATES rotation.
+///
+/// It exists because adding an account has, until now, required stopping the
+/// proxy, running `tcr login`, and starting it again — which wipes the in-memory
+/// session→account pin map, so every live session cold-starts its prompt cache
+/// on the next turn. That is the most expensive event in this system; see
+/// [`Manager::add_account`] for the append primitive this route drives and why
+/// it must never insert anywhere but the end.
+///
+/// Same shape as [`DISABLED_PATH`] and for the same reasons: registered as a
+/// real route so axum matches it exactly and BEFORE the catch-all — a `POST`
+/// here can never be rewritten onto api.anthropic.com carrying a pooled OAuth
+/// Bearer. What authorizes the mutation is [`local_endpoint_gate`] plus the
+/// `application/json` requirement, neither of which the path shape has any part
+/// in.
+pub const ADD_ACCOUNT_PATH: &str = "/_tcr/accounts";
+
+/// The [`ENDPOINT_HEADER`] value [`add_account_handler`] stamps. Distinct from
+/// [`DISABLED_ENDPOINT`] so a caller can tell which of the two mutating routes
+/// answered — the same structural discriminator [`ENDPOINT_HEADER`] documents.
+pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
+
 /// Body cap for the local control route: a JSON object with three short fields.
 /// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
 /// route buffers into memory in a credential-holding process, and nothing
@@ -796,12 +822,16 @@ pub fn app(manager: Arc<Manager>) -> Router {
             STATUS_PATH,
             axum::routing::get(status_handler).fallback(status_method_not_allowed),
         )
-        // The one MUTATING local route. Same reasoning as above, and the method
+        // The two MUTATING local routes. Same reasoning as above, and the method
         // fallback matters more here: an unregistered method must answer a local
         // 405, never fall through to `handle` and be forwarded upstream.
         .route(
             DISABLED_PATH,
             axum::routing::post(set_disabled_handler).fallback(disabled_method_not_allowed),
+        )
+        .route(
+            ADD_ACCOUNT_PATH,
+            axum::routing::post(add_account_handler).fallback(add_account_method_not_allowed),
         )
         .fallback(handle)
         .with_state(manager)
@@ -978,12 +1008,26 @@ async fn disabled_method_not_allowed() -> Response {
     ))
 }
 
-/// Add [`ENDPOINT_HEADER`] to a response the account-control route produced.
-fn stamp_endpoint(mut response: Response) -> Response {
+/// Add [`ENDPOINT_HEADER`] to a response, naming which local mutating route
+/// produced it. ONE implementation shared by both stampers below, so the two
+/// routes cannot drift on how the header is set — only on which value they set
+/// it to.
+fn stamp_endpoint_as(mut response: Response, endpoint: &'static str) -> Response {
     response
         .headers_mut()
-        .insert(ENDPOINT_HEADER, HeaderValue::from_static(DISABLED_ENDPOINT));
+        .insert(ENDPOINT_HEADER, HeaderValue::from_static(endpoint));
     response
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the account-control (disable) route
+/// produced.
+fn stamp_endpoint(response: Response) -> Response {
+    stamp_endpoint_as(response, DISABLED_ENDPOINT)
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the account-add route produced.
+fn stamp_add_endpoint(response: Response) -> Response {
+    stamp_endpoint_as(response, ADD_ACCOUNT_ENDPOINT)
 }
 
 /// The request body of [`DISABLED_PATH`].
@@ -1128,6 +1172,270 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             headers.insert("cache-control", HeaderValue::from_static("no-store"));
             stamp_endpoint(response)
+        }
+    }
+}
+
+/// A non-`POST` on [`ADD_ACCOUNT_PATH`]. Answered locally with 405, same
+/// reasoning as [`disabled_method_not_allowed`] — the route is a command with
+/// exactly one verb, and it is stamped so a caller can tell this 405 (route
+/// exists, wrong verb) from the local 404 a tcr without the route returns.
+async fn add_account_method_not_allowed() -> Response {
+    stamp_add_endpoint(error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr account-add endpoint takes POST.",
+        None,
+    ))
+}
+
+/// The request body of [`ADD_ACCOUNT_PATH`].
+///
+/// Mirrors [`config::Account`]'s wire shape (camelCase, `type` for
+/// `account_type`) so a caller can build the body directly from the credentials
+/// a login already produced. `name` and `access_token` are `Option` — like
+/// [`SetDisabledRequest`]'s fields — so a body missing either gets a specific
+/// 400 naming the field instead of axum's own rejection text.
+///
+/// `priority` and `switch_threshold` are accepted for the NEW-account case only;
+/// see [`add_account_handler`]. `disabled` is deliberately not accepted at all —
+/// an account reaching this route is one the operator wants serving traffic now.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AddAccountRequest {
+    name: Option<String>,
+    #[serde(rename = "type", default)]
+    account_type: Option<String>,
+    #[serde(default)]
+    account_uuid: Option<String>,
+    #[serde(default)]
+    org_uuid: Option<String>,
+    #[serde(default)]
+    org_name: Option<String>,
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_at: Option<i64>,
+    #[serde(default)]
+    priority: Option<i64>,
+    #[serde(default)]
+    switch_threshold: Option<f64>,
+}
+
+/// The 200 body of [`ADD_ACCOUNT_PATH`]. Deserializable too — unit 3's CLI
+/// deserializes it, and both halves of a wire contract belong to one type.
+///
+/// This is a cross-BUILD wire contract — the same class as
+/// [`crate::singleton::ProxyHost::Unknown`] — because the `tcr` that
+/// deserializes a reply can be older than the `tcr` that served it. Every
+/// field below carries `#[serde(default)]` so a field a NEWER server has
+/// renamed or dropped does not fail the whole deserialize: `cli::post_add_account`
+/// maps a deserialize failure on a 2xx to `LiveControlError::Unusable`, and
+/// `oauth::probe_add_capability` reads that as `AddCapability::Unusable` — a
+/// *successful* live add would then look indistinguishable from a wedged or
+/// route-less proxy, and `login_route` REFUSES outright (bridge item D)
+/// instead of silently falling back to the file beside a server that just
+/// handled the request correctly. Field ADDITIONS are already safe on their
+/// own (an older CLI just ignores a key it doesn't know); this attribute is
+/// what makes removals and renames safe too. Each default is chosen as the
+/// SAFER of the two readings, not merely the type's zero value: `persisted`
+/// defaults to `false` (never claim durability we can't confirm) and `added`
+/// defaults to `false` (never claim a fresh account was created when it
+/// might have been an in-place credential replacement) — same
+/// degrade-to-the-safer-state shape as
+/// `ProxyHost::Unknown`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AddAccountResponse {
+    /// The account's name AS STORED. For an update this is the EXISTING row's
+    /// name, which may differ from what was submitted (e.g. a bare email
+    /// meeting a stored `"email (org)"` display name) — never a name that only
+    /// ever existed in the request.
+    #[serde(default)]
+    pub name: String,
+    /// `true` when this identity had no match in the live rotation and was
+    /// appended; `false` when an existing account's credentials were replaced
+    /// in place. "Created" and "credentials replaced" are different facts and
+    /// the operator needs to know which one they got.
+    #[serde(default)]
+    pub added: bool,
+    /// The account's index in the live rotation. Stable for the process
+    /// lifetime — append-only, never reused, and an update never moves it.
+    #[serde(default)]
+    pub index: usize,
+    /// Whether the config file also carries it. `false` with a `warning` is a
+    /// change that is live but will not survive a restart.
+    #[serde(default)]
+    pub persisted: bool,
+    /// [`AddPersist::warning`] and/or the no-refresh-token warning, joined when
+    /// both apply, or `null`.
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+/// Shown when the submitted account carries no refresh token: it will serve
+/// until its access token expires and then go dead, silently, unless the
+/// operator hears about it now.
+const NO_REFRESH_TOKEN_WARNING: &str =
+    "this account has no refresh token — it will serve until its access token expires, then go dead";
+
+/// Join whichever of the durable-persist warning and the no-refresh-token
+/// warning actually apply into the single `warning` field the response carries.
+fn combine_warnings(persist: Option<&str>, no_refresh_token: Option<&str>) -> Option<String> {
+    match (persist, no_refresh_token) {
+        (None, None) => None,
+        (Some(a), None) => Some(a.to_string()),
+        (None, Some(b)) => Some(b.to_string()),
+        (Some(a), Some(b)) => Some(format!("{a} {b}")),
+    }
+}
+
+/// Build the 200 body of [`ADD_ACCOUNT_PATH`], stamped like every response this
+/// route produces.
+fn add_account_response(
+    name: String,
+    added: bool,
+    index: usize,
+    persist: AddPersist,
+    warning: Option<String>,
+) -> Response {
+    let payload = AddAccountResponse {
+        name,
+        added,
+        index,
+        persisted: matches!(persist, AddPersist::Persisted),
+        warning,
+    };
+    let Ok(body) = serde_json::to_string(&payload) else {
+        return stamp_add_endpoint(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "api_error",
+            "Could not serialize the account-add result.",
+            None,
+        ));
+    };
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers.insert("cache-control", HeaderValue::from_static("no-store"));
+    stamp_add_endpoint(response)
+}
+
+/// `POST /_tcr/accounts` — add an account to the LIVE rotation with no proxy
+/// restart, for a `tcr login` that should not have to stop and restart the
+/// process to take effect.
+///
+/// Gated exactly as [`set_disabled_handler`] is — [`local_endpoint_gate`], the
+/// `application/json` requirement, the same [`CONTROL_BODY_LIMIT`] — because this
+/// route carries an OAuth access token and refresh token in its body and is a
+/// write, so it is authorized no more weakly than the read routes.
+///
+/// The behaviour is [`Manager::add_or_update_account`]'s: the submitted identity
+/// resolves against the live rotation via [`crate::identity::match_one`], and
+/// either appends (nothing matched — a brand new account) or replaces an
+/// existing account's credentials in place (exactly one matched — a re-login).
+/// See that function's doc-comment for why the two cases use different
+/// resolution anchors for their durable write. An ambiguous match is a 409
+/// naming the candidates, via [`crate::cli::ambiguous_query_message`] — never
+/// guessed.
+async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "account-add") {
+        // NOT stamped — see [`set_disabled_handler`]'s identical comment: a
+        // refusal must not confirm the route exists to a caller that failed
+        // the gate.
+        return refusal;
+    }
+
+    if !is_json_content_type(&parts.headers) {
+        return stamp_add_endpoint(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "The tcr account-add endpoint requires Content-Type: application/json.",
+            None,
+        ));
+    }
+
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return stamp_add_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+            None,
+        ));
+    };
+    let Ok(parsed) = serde_json::from_slice::<AddAccountRequest>(&bytes) else {
+        return stamp_add_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object: {\"name\": \"<account>\", \"accessToken\": \"<token>\", …}.",
+            None,
+        ));
+    };
+    // LOAD-BEARING CAPABILITY SIGNAL: `oauth::probe_add_capability` deliberately
+    // POSTs a blank name to trigger exactly this branch, and reads a STAMPED
+    // 400 back as proof this route exists. Changing the status (e.g. to 422),
+    // or answering without `stamp_add_endpoint`, silently turns that read into
+    // `AddCapability::Unusable` — `login_route` then REFUSES outright (bridge
+    // item D) rather than falling back to the file, so this degrades to a
+    // needless refusal beside a server that actually has the route, not the
+    // whole-file clobber this feature exists to remove. See the seam test
+    // `probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing`.
+    let Some(name) = parsed.name.filter(|n| !n.trim().is_empty()) else {
+        return stamp_add_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "\"name\" (string) is required and must not be empty.",
+            None,
+        ));
+    };
+    // Same load-bearing signal as the blank-name branch above — the probe's
+    // body is ALSO blank on `accessToken`, so whichever of the two checks
+    // fires first is the one the probe actually exercises. Keep this one a
+    // stamped 400 too.
+    let Some(access_token) = parsed.access_token.filter(|t| !t.trim().is_empty()) else {
+        return stamp_add_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "\"accessToken\" (string) is required and must not be empty.",
+            None,
+        ));
+    };
+    let refresh_token = parsed.refresh_token.filter(|t| !t.trim().is_empty());
+    let no_refresh_token_warning = refresh_token.is_none().then_some(NO_REFRESH_TOKEN_WARNING);
+
+    let account = config::Account {
+        name,
+        account_type: parsed.account_type.unwrap_or_else(|| "oauth".to_string()),
+        account_uuid: parsed.account_uuid,
+        org_uuid: parsed.org_uuid,
+        org_name: parsed.org_name,
+        access_token,
+        refresh_token,
+        expires_at: parsed.expires_at,
+        priority: parsed.priority,
+        switch_threshold: parsed.switch_threshold,
+        disabled: None,
+        extra: serde_json::Map::new(),
+    };
+    // Captured before the move below: on an ambiguous match this is the ONLY
+    // copy of what the caller actually searched for.
+    let query_name = account.name.clone();
+
+    match manager.add_or_update_account(account) {
+        AddAccountOutcome::Ambiguous(names) => stamp_add_endpoint(error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &crate::cli::ambiguous_query_message(&query_name, &names),
+            None,
+        )),
+        AddAccountOutcome::Added { idx, name, persist } => {
+            let warning = combine_warnings(persist.warning(), no_refresh_token_warning);
+            add_account_response(name, true, idx, persist, warning)
+        }
+        AddAccountOutcome::Updated { idx, name, persist } => {
+            let warning = combine_warnings(persist.warning(), no_refresh_token_warning);
+            add_account_response(name, false, idx, persist, warning)
         }
     }
 }
@@ -3944,7 +4252,9 @@ mod tests {
     async fn an_unrouted_local_path_is_not_stamped_as_the_control_route() {
         use tower::ServiceExt as _;
         for uri in [
-            "/_tcr/accounts",
+            // NOT `/_tcr/accounts` — that is now [`ADD_ACCOUNT_PATH`], a real
+            // registered route (see the account-add tests below).
+            "/_tcr/accounts/add",
             "/_tcr/accounts/disable",
             "/_tcr/accounts/disabled/extra",
         ] {
@@ -4456,6 +4766,571 @@ mod tests {
              one yields '[:' and misroutes an IPv6 loopback client"
         );
         assert_eq!(target_host(&origin_form, &HeaderMap::new()), None);
+    }
+
+    // --- POST /_tcr/accounts (add) -------------------------------------------
+
+    /// Drive the router at [`ADD_ACCOUNT_PATH`], mirroring [`control_request`].
+    async fn add_request(
+        manager: Arc<Manager>,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(ADD_ACCOUNT_PATH);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, bytes)
+    }
+
+    fn account_in_file(path: &std::path::Path, index: usize) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(path).expect("read the test config");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        doc["accounts"].get(index).cloned()
+    }
+
+    fn account_count_in_file(path: &std::path::Path) -> usize {
+        let raw = std::fs::read_to_string(path).expect("read the test config");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        doc["accounts"].as_array().map_or(0, |a| a.len())
+    }
+
+    /// THE BITING TEST for the append half: a brand-new identity lands at the END
+    /// of the live rotation and is **immediately servable** — not merely
+    /// acknowledged. Every OTHER account is put in `tried`, so `select` can only
+    /// return the new one by actually finding it eligible.
+    #[tokio::test]
+    async fn add_endpoint_appends_a_new_account_and_it_is_immediately_servable() {
+        let (manager, path) = control_manager("append", None);
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(before.accounts.len(), 2, "starts with alice and bob");
+
+        let (status, headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","accessToken":"at-carol","refreshToken":"rt-carol","expiresAt":9999999999999}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT),
+            "the route stamps itself so a caller can tell it from a missing route"
+        );
+
+        let payload: AddAccountResponse =
+            serde_json::from_slice(&body).expect("an account-add payload");
+        assert_eq!(payload.name, "carol@example.com");
+        assert!(
+            payload.added,
+            "a brand new identity is an APPEND, not an update"
+        );
+        assert_eq!(payload.index, 2, "appended at the END");
+        assert!(payload.persisted, "the durable half succeeded");
+        assert_eq!(payload.warning, None, "a refresh token was supplied");
+
+        // 1. THE LIVE ROTATION — present AND selectable, not merely acknowledged.
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(after.accounts.len(), 3);
+        assert_eq!(after.accounts[2].name, "carol@example.com");
+        let mut tried: HashSet<usize> = HashSet::new();
+        tried.insert(0);
+        tried.insert(1);
+        assert_eq!(
+            manager.select(&tried, OffsetDateTime::now_utc(), None, None),
+            Some(2),
+            "the new account is eligible and selectable immediately, with no restart"
+        );
+
+        // 2. …and the file, so it survives one.
+        assert_eq!(account_count_in_file(&path), 3);
+        let on_disk = account_in_file(&path, 2).expect("the appended entry");
+        assert_eq!(on_disk["name"], "carol@example.com");
+        assert_eq!(on_disk["accessToken"], "at-carol");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// THE BITING TEST for the update half: re-adding an EXISTING identity
+    /// replaces its credentials in place — same index, same account count — and
+    /// its routing state (priority) survives untouched.
+    #[tokio::test]
+    async fn add_endpoint_updates_an_existing_account_in_place_and_keeps_the_index() {
+        let (manager, path) = control_manager("update", None);
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(before.accounts.len(), 2);
+        assert_eq!(before.accounts[0].name, "alice@example.com");
+        assert_eq!(before.accounts[0].priority, 0);
+
+        let (status, _headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"alice@example.com","accessToken":"at-alice-fresh","refreshToken":"rt-alice-fresh","expiresAt":9999999999999}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+        let payload: AddAccountResponse =
+            serde_json::from_slice(&body).expect("an account-add payload");
+        assert_eq!(payload.name, "alice@example.com");
+        assert!(
+            !payload.added,
+            "an existing identity is an UPDATE, not an append"
+        );
+        assert_eq!(
+            payload.index, 0,
+            "the SAME index — never moved, never duplicated"
+        );
+        assert!(payload.persisted, "the durable half succeeded");
+
+        // 1. THE LIVE ROTATION: same count, same index, NEW credentials, and
+        // routing state (priority) untouched.
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(after.accounts.len(), 2, "no duplicate appended");
+        assert_eq!(after.accounts[0].name, "alice@example.com");
+        assert_eq!(after.accounts[0].priority, 0, "routing state preserved");
+        assert_eq!(
+            manager.access_token(0).as_deref(),
+            Some("at-alice-fresh"),
+            "the credential actually changed"
+        );
+
+        // 2. …and the file: same entry, same position, new token.
+        assert_eq!(account_count_in_file(&path), 2, "no duplicate row on disk");
+        let on_disk = account_in_file(&path, 0).expect("alice's entry");
+        assert_eq!(on_disk["accessToken"], "at-alice-fresh");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SECURITY GUARD 1 — origin, on the account-ADD route. [`local_endpoint_gate`]
+    /// is the ONE implementation the disable and add routes both use, so this is
+    /// largely a re-proof — but on a write that carries a fresh OAuth token in its
+    /// body, a drift here would be worse.
+    #[tokio::test]
+    async fn add_endpoint_rejects_a_non_loopback_client() {
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let (manager, path) = control_manager("add-origin", None);
+            let (status, _headers, _body) = add_request(
+                Arc::clone(&manager),
+                peer,
+                None,
+                r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} must be refused, got {status}"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+                2,
+                "{label}: a refused caller appended an account"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// SECURITY GUARD 2 — the key, on the account-ADD route.
+    #[tokio::test]
+    async fn add_endpoint_rejects_a_bad_api_key() {
+        for (label, provided) in [("no key at all", None), ("a wrong key", Some("wrong-key"))] {
+            let (manager, path) = control_manager("add-key", Some("secret-key"));
+            let (status, _headers, _body) = add_request(
+                Arc::clone(&manager),
+                Some(loopback_peer()),
+                provided,
+                r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{label} must be refused, got {status}"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+                2,
+                "{label}: an unauthenticated caller appended an account"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+
+        // …and the right key, from loopback, is served.
+        let (manager, path) = control_manager("add-key-ok", Some("secret-key"));
+        let (status, _headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            Some("secret-key"),
+            r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            3
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A non-JSON content-type is refused — this route carries an OAuth token in
+    /// its body and is a write, so the browser/CSRF defence must be no weaker
+    /// than the disable route's.
+    #[tokio::test]
+    async fn add_endpoint_requires_json_content_type() {
+        use tower::ServiceExt as _;
+        let (manager, path) = control_manager("add-ctype", None);
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(ADD_ACCOUNT_PATH)
+            .header(CONTENT_TYPE, "text/plain")
+            .body(Body::from(
+                r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+            ))
+            .expect("build request");
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(Arc::clone(&manager))
+            .oneshot(req)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response
+                .headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT)
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            2
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The bad-request table. None of these may half-apply anything.
+    #[tokio::test]
+    async fn add_endpoint_rejects_malformed_bodies() {
+        for (label, body) in [
+            ("an empty body", ""),
+            ("not json", "add carol"),
+            ("a json array", r#"["carol@example.com"]"#),
+            ("no accessToken field", r#"{"name":"carol@example.com"}"#),
+            ("no name field", r#"{"accessToken":"at-carol"}"#),
+            (
+                "an empty name",
+                r#"{"name":"   ","accessToken":"at-carol"}"#,
+            ),
+            (
+                "an empty accessToken",
+                r#"{"name":"carol@example.com","accessToken":"  "}"#,
+            ),
+        ] {
+            let (manager, path) = control_manager("add-badbody", None);
+            let (status, headers, response) =
+                add_request(Arc::clone(&manager), Some(loopback_peer()), None, body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{label} must be a 400, got {status}: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_eq!(
+                headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+                Some(ADD_ACCOUNT_ENDPOINT),
+                "{label}: a 400 still identifies the route that produced it"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+                2,
+                "{label}: a rejected body still appended an account"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// An ambiguous identity — the same email in two orgs — is a 409 naming the
+    /// candidates, never guessed. `--org` is the only fix.
+    #[tokio::test]
+    async fn add_endpoint_409s_an_ambiguous_identity_naming_the_candidates() {
+        let path = control_config_path("add-ambiguous");
+        let mut config = two_account_config(None);
+        // The same person in two orgs: one email, two rows, `--org` the only fix.
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+
+        let (status, headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"alice@example.com","accessToken":"at-new"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT)
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("ambiguous") && text.contains("--org"),
+            "the 409 says what to do about it: {text}"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            2,
+            "an unbreakable tie changes nothing"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A manager with no `config_path` (`tcr demo`, `tcr status --probe`, tests)
+    /// applies the change LIVE and has nothing to persist to — reported honestly
+    /// (`persisted: false`, no warning), exactly as the disable route's
+    /// equivalent case.
+    #[tokio::test]
+    async fn add_endpoint_reports_an_unpersisted_change_honestly() {
+        let manager = Manager::with_live_refresher(two_account_config(None), None);
+        let (status, _headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","accessToken":"at-carol","refreshToken":"rt-carol"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let payload: AddAccountResponse = serde_json::from_slice(&body).expect("payload");
+        assert!(payload.added);
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            3,
+            "the live append still happened"
+        );
+        assert!(
+            !payload.persisted,
+            "…and the answer does not claim it is durable"
+        );
+        assert_eq!(
+            payload.warning, None,
+            "memory-only by design, not a failure"
+        );
+    }
+
+    /// A failed durable write still returns 200 — the live change stands — with
+    /// `persisted: false` and a warning, never swallowed. Here the config file
+    /// does not exist at all, so the write fails.
+    #[tokio::test]
+    async fn add_endpoint_surfaces_a_failed_persist() {
+        let path = control_config_path("add-nofile");
+        std::fs::remove_file(&path).ok();
+        let manager = Manager::with_live_refresher(two_account_config(None), Some(path.clone()));
+
+        let (status, _headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","accessToken":"at-carol","refreshToken":"rt-carol"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "the LIVE half succeeded");
+        let payload: AddAccountResponse = serde_json::from_slice(&body).expect("payload");
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            3,
+            "the account is appended in the live rotation"
+        );
+        assert!(!payload.persisted, "but the file does not carry it");
+        let warning = payload.warning.expect("a NOT SAVED warning, never silence");
+        assert!(
+            warning.contains("NOT SAVED"),
+            "the warning is AddPersist::warning verbatim: {warning}"
+        );
+    }
+
+    /// The submitted account carries no refresh token — a fact the operator
+    /// needs at add time, not a hard error: it will serve now and go dead once
+    /// the access token expires.
+    #[tokio::test]
+    async fn add_endpoint_warns_when_no_refresh_token_is_supplied() {
+        let (manager, path) = control_manager("add-norefresh", None);
+        let (status, _headers, body) = add_request(
+            Arc::clone(&manager),
+            Some(loopback_peer()),
+            None,
+            r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload: AddAccountResponse = serde_json::from_slice(&body).expect("payload");
+        assert!(payload.persisted);
+        let warning = payload.warning.expect("a no-refresh-token warning");
+        assert!(warning.contains("no refresh token"), "{warning}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F7 — the add route is `POST`-only, same as the disable route
+    /// ([`control_endpoint_refuses_other_methods_locally`]), and had no test of
+    /// its own: a wrong method must be answered LOCALLY (never forwarded, never
+    /// able to mutate), and the 405 must still identify the route so a caller
+    /// can tell it from an older tcr that has no route at all.
+    #[tokio::test]
+    async fn add_endpoint_refuses_other_methods_locally() {
+        use tower::ServiceExt as _;
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+            let (manager, path) = control_manager("add-method", None);
+            let mut req = Request::builder()
+                .method(method.clone())
+                .uri(ADD_ACCOUNT_PATH)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"carol@example.com","accessToken":"at-carol"}"#,
+                ))
+                .expect("build request");
+            req.extensions_mut().insert(ClientAddr(loopback_peer()));
+            let response = app(Arc::clone(&manager))
+                .oneshot(req)
+                .await
+                .expect("router response");
+            assert_eq!(
+                response.status(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on the add-account path is refused locally"
+            );
+            assert_ne!(
+                response.status(),
+                StatusCode::BAD_GATEWAY,
+                "{method} must never fall through to the upstream forwarder"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(ENDPOINT_HEADER)
+                    .and_then(|v| v.to_str().ok()),
+                Some(ADD_ACCOUNT_ENDPOINT),
+                "{method}: the 405 identifies the route, so a caller does not read \
+                 it as a proxy too old to have one"
+            );
+            assert_eq!(
+                manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+                2,
+                "{method} appended or changed an account"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// SEAM TEST. `oauth::probe_add_capability` (unit 3, `oauth.rs:855-881`)
+    /// decides whether `tcr login` takes the LIVE route by POSTing this exact
+    /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
+    /// `cli::post_add_account` and reading whether the reply is a STAMPED
+    /// 400. An unstamped answer, or a different (non-400) status, reads as
+    /// `AddCapability::Unusable` — `login_route` now REFUSES outright rather
+    /// than falling back to the whole-file `config::save` path (bridge item
+    /// D): a needless refusal beside a server that has the route, not the
+    /// single-use-refresh-token clobber this whole feature exists to remove.
+    /// Worst of all would be a 200 that actually appended a blank-named
+    /// account to the live fleet: that reads as `AddCapability::Present`
+    /// instead — a probe that is supposed to always fail silently succeeding
+    /// and mutating the live server.
+    ///
+    /// Driven through the REAL production stack — a real `TcpListener` and
+    /// `crate::mitm::serve`, exactly how `main()` invokes it — not a
+    /// hand-built router, so a change to route registration or middleware
+    /// ordering is covered here too, not only by the in-process `oneshot`
+    /// tests above. Complements (does not replace) unit 3's own
+    /// `probe_add_capability_reads_a_stamped_400_as_present` (oauth.rs) and
+    /// `post_add_account_reads_a_stamped_400_as_rejected` (cli.rs), which
+    /// this repo's cross-file boundary keeps this route from editing.
+    #[tokio::test]
+    async fn probe_add_capabilitys_blank_body_is_a_stamped_400_and_mutates_nothing() {
+        let (manager, path) = control_manager("seam-probe", None);
+        let before = manager.snapshot(OffsetDateTime::now_utc()).accounts.len();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind seam-probe listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let serving = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, serving, None).await });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        // The EXACT `Account` `probe_add_capability` builds (oauth.rs:855-869):
+        // a blank name, a blank access token, everything else absent.
+        // DERIVED, not a restated literal — a future edit to the probe's body
+        // (oauth.rs, out of this route's reach) changes this test's request
+        // too, instead of leaving a stale literal green while it tests a body
+        // nobody sends. Sent via `.json()` exactly like `post_add_account`
+        // sends it (`cli.rs:473`, `.json(account)`).
+        let probe_body = Account {
+            name: String::new(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        let resp = client
+            .post(format!("http://{addr}{ADD_ACCOUNT_PATH}"))
+            .json(&probe_body)
+            .send()
+            .await
+            .expect("send the probe's blank body");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "the probe body must answer a local 400 — never forwarded, never a \
+             soft-fail status the probe would misclassify"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(ADD_ACCOUNT_ENDPOINT),
+            "unstamped and `probe_add_capability` reads this as Unusable — `login_route` \
+             now refuses outright instead of falling back to the whole-file config::save \
+             path with a live server running"
+        );
+
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),
+            before,
+            "the probe's deliberately-blank body must never reach add_or_update_account"
+        );
+        assert_eq!(account_count_in_file(&path), before, "…nor the disk");
+
+        std::fs::remove_file(&path).ok();
     }
 
     // --- rotation-bypassing relays -----------------------------------------
@@ -4986,15 +5861,21 @@ mod tests {
             (Method::GET, "/_tcr/"),
             (Method::GET, "/_tcr"),
             (Method::GET, "/_tcr/status?x=1&y=2/../nope"),
-            // Near-misses of the account-control route. The mutating verb makes
-            // these the rows that matter most: a `POST` that fell through the
-            // catch-all would be rewritten onto api.anthropic.com carrying a pooled
-            // OAuth Bearer, which is the shape that burned an account.
-            (Method::POST, "/_tcr/accounts"),
+            // Near-misses of the two account-control routes. The mutating verb
+            // makes these the rows that matter most: a `POST` that fell through
+            // the catch-all would be rewritten onto api.anthropic.com carrying a
+            // pooled OAuth Bearer, which is the shape that burned an account.
             (Method::POST, "/_tcr/accounts/"),
             (Method::POST, "/_tcr/accounts/disable"),
             (Method::POST, "/_tcr/accounts/disabled/extra"),
             (Method::POST, "/_tcr/accounts/priority"),
+            // The bare path IS registered (ADD_ACCOUNT_PATH) — a `GET` on it
+            // gets a local 405, not a 404 like every other row here — but it
+            // belongs in this table anyway for the assertion this table makes
+            // and `add_endpoint_refuses_other_methods_locally` does not: the
+            // hit counter, proving a wrong-verb request STILL never reaches
+            // upstream.
+            (Method::GET, "/_tcr/accounts"),
         ] {
             let manager = Manager::with_live_refresher(dummy_config(None, &upstream), None);
             let (status, body) = drive(
@@ -5008,10 +5889,18 @@ mod tests {
             .await;
             let text = String::from_utf8_lossy(&body);
             // `/_tcr/status?…` IS a registered route (the query does not change the
-            // path), so it is served; every other shape is a local 404. Neither is
-            // ever forwarded, which is the single claim this test makes.
+            // path), so it is served; the bare add-account path is registered too,
+            // wrong verb, so it is a local 405; every other shape is a local 404.
+            // None of the three is ever forwarded, which is the single claim this
+            // test makes.
             if uri.starts_with("/_tcr/status?") {
                 assert_eq!(status, StatusCode::OK, "{uri} is the real status route");
+            } else if uri == "/_tcr/accounts" {
+                assert_eq!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {uri} → the route exists, wrong verb"
+                );
             } else {
                 assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri} → local 404");
                 assert!(

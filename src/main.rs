@@ -157,9 +157,13 @@ struct LoginArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Log in even when a proxy server is already running on the configured port.
-    /// Unsafe: the server's next token refresh will overwrite this login — stop the
-    /// server first instead. This is the deliberate escape hatch.
+    /// Skip the refusal a running proxy would otherwise trigger, and write the
+    /// login to the config file directly. Still probes the proxy first and still
+    /// prefers its live account-add route when one is confirmed and safe — this
+    /// only overrides the cases login would otherwise refuse or error on (an
+    /// older proxy with no route, one that answered unusably, or a rejected
+    /// api-key). Unsafe when it takes the file path: the running server's next
+    /// token refresh can overwrite what was just written.
     #[arg(long)]
     force: bool,
 }

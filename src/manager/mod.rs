@@ -275,6 +275,11 @@ pub struct AccountRuntime {
     /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
     /// alongside the decayed count above.
     pub last_stream_error: Option<String>,
+    /// Coalescing gate for THIS account's OAuth refresh. Lives on the account rather
+    /// than in a parallel Vec indexed by position, so an account added after startup
+    /// cannot be missing one — the desync it replaces made `ensure_fresh` a silent
+    /// no-op (no log, no status change) until the initial token expired.
+    pub refresh_lock: Arc<AsyncMutex<()>>,
 }
 
 /// A rotation slot answers a user's account query by the same three fields a
@@ -318,6 +323,43 @@ pub enum SetDisabledOutcome {
     Ambiguous(Vec<String>),
 }
 
+/// What [`Manager::add_or_update_account`] did.
+///
+/// Same shape as [`SetDisabledOutcome`] — resolve by identity against the LIVE
+/// rotation, then report what happened plus the durable half's fate — but with
+/// one difference `SetDisabledOutcome` never needs: a disable/enable query only
+/// ever names an account that must already exist, so a miss is failure
+/// (`NoMatch`). An account-add legitimately names one nobody has seen before, so
+/// `Match::None` here is the SUCCESS arm (`Added`), not a rejection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddAccountOutcome {
+    /// No account in the live rotation carried this identity — appended at the
+    /// END via [`Manager::add_account`]. Pins are in-memory `(session_key,
+    /// account_index)`, so appending is the only insertion that cannot re-key a
+    /// live session onto the wrong account.
+    Added {
+        idx: usize,
+        name: String,
+        persist: AddPersist,
+    },
+    /// Exactly one account already carried this identity — its credentials were
+    /// replaced IN PLACE at `idx` (see [`Manager::add_or_update_account`]). Its
+    /// `account_type` is always stamped to the submitted value and any identity
+    /// field (`account_uuid`/`org_uuid`/`org_name`) it was missing is backfilled
+    /// — never a value it already carried. Routing state — priority, disabled
+    /// flag, switch threshold, learned quota, counters — is untouched, and
+    /// `idx` never moves.
+    Updated {
+        idx: usize,
+        name: String,
+        persist: AddPersist,
+    },
+    /// The submitted identity matches more than one account in the live
+    /// rotation; these are their names, so the caller can tell the operator
+    /// what to disambiguate with. Never guessed.
+    Ambiguous(Vec<String>),
+}
+
 impl AccountRuntime {
     fn from_config(account: &config::Account) -> Self {
         Self {
@@ -357,6 +399,7 @@ impl AccountRuntime {
             probe_error: None,
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
+            refresh_lock: Arc::new(AsyncMutex::new(())),
         }
     }
 }
@@ -425,6 +468,44 @@ impl DisablePersist {
     }
 }
 
+/// What [`Manager::add_or_update_account`] achieved about DURABILITY. Same role
+/// as [`DisablePersist`], deliberately simpler: an upsert either lands or it does
+/// not, and there is no "no such account" / "no config entry" arm here — a MISS
+/// on the durable side is FILLED IN by [`config::save_account`], never refused
+/// (see that function's doc-comment for why it differs from
+/// [`config::save_disabled`] on exactly this point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddPersist {
+    /// The config file carries the new or replaced credentials — written just
+    /// now.
+    Persisted,
+    /// No config file behind this manager (`tcr demo`, `tcr status --probe`,
+    /// tests). Memory-only BY DESIGN.
+    NoConfigFile,
+    /// More than one entry on disk carries this identity; the write was refused
+    /// rather than landed on a guess. See [`config::AccountWrite::Ambiguous`].
+    Ambiguous,
+    /// The write itself failed: unreadable, malformed or unwritable file, or a
+    /// document whose `accounts` key exists but is not a JSON array.
+    WriteFailed,
+}
+
+impl AddPersist {
+    /// The one line to put in front of the operator, or `None` when the outcome
+    /// needs no explanation.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Persisted | Self::NoConfigFile => None,
+            Self::Ambiguous => Some(
+                "NOT SAVED: another config entry shares this account's identity — give it its own orgUuid",
+            ),
+            Self::WriteFailed => {
+                Some("NOT SAVED: writing the config failed — this will not survive a restart")
+            }
+        }
+    }
+}
+
 /// Per-session serving stats, keyed on the stable session key. Independent of
 /// `affinity` (which holds only the current pin) so routing is unaffected.
 struct SessionStat {
@@ -440,8 +521,6 @@ struct SessionStat {
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
 pub struct Manager {
     accounts: RwLock<Vec<AccountRuntime>>,
-    /// One coalescing gate per account, indexed by account position.
-    refresh_locks: Vec<Arc<AsyncMutex<()>>>,
     refresher: Arc<dyn TokenRefresher>,
     /// Reads each account's quota from the zero-spend usage endpoint on a timer.
     prober: Arc<dyn UsageProber>,
@@ -640,10 +719,6 @@ impl Manager {
         config_path: Option<PathBuf>,
         accounts: Vec<AccountRuntime>,
     ) -> Arc<Self> {
-        let refresh_locks = accounts
-            .iter()
-            .map(|_| Arc::new(AsyncMutex::new(())))
-            .collect();
         let upstream = config.upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
@@ -666,7 +741,6 @@ impl Manager {
 
         let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
-            refresh_locks,
             refresher,
             prober,
             warmer,
@@ -1159,6 +1233,422 @@ impl Manager {
     /// Record which account actually served the most recent request.
     pub fn set_current(&self, idx: usize) {
         *self.current.lock().expect("current lock poisoned") = Some(idx);
+    }
+
+    /// Append a new account to the live rotation and return its index.
+    ///
+    /// APPEND-ONLY — this is a hard requirement, not a style choice. Pins are
+    /// in-memory `(session_key, account_index)`; appending keeps every existing
+    /// index valid, whereas inserting or reordering would re-key live sessions
+    /// and cold-start their prompt cache, which is the exact cost this whole
+    /// feature exists to avoid. Never insert at a position other than the end,
+    /// and never reorder either vec.
+    ///
+    /// Updates both `self.accounts` (the live rotation `AccountRuntime`s) and
+    /// `self.config`'s accounts vec (so later identity-resolution in
+    /// `persist_tokens` / `persist_disabled` finds the row instead of logging
+    /// the "no loaded config account carries this identity" WARN). The two
+    /// locks are taken SEQUENTIALLY, never nested — the same discipline
+    /// `set_disabled` documents: holding both at once risks inverting the lock
+    /// order `warm_targets` reads them in.
+    ///
+    /// Derives the runtime row via [`AccountRuntime::from_config`], which is
+    /// exactly how every other account's runtime state is built at startup, so
+    /// an appended account gets its own `refresh_lock` for free — there is no
+    /// longer a parallel structure to keep in sync.
+    pub fn add_account(&self, account: config::Account) -> usize {
+        let runtime = AccountRuntime::from_config(&account);
+        let idx = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            accounts.push(runtime);
+            accounts.len() - 1
+        };
+        {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            config.accounts.push(account);
+        }
+        idx
+    }
+
+    /// Resolve `account` against the LIVE rotation by identity and either append
+    /// it (nothing matched) or replace an existing account's credentials in
+    /// place (exactly one matched) — the whole operation `POST /_tcr/accounts`
+    /// performs, kept here for the same reason [`Self::set_disabled_by_query`]
+    /// is: no caller outside this module needs to know that a rotation index is
+    /// what the mutating primitives take.
+    ///
+    /// Resolution uses [`crate::identity::resolve`]/[`crate::identity::same_identity`]
+    /// — the SAME rule the durable half ([`config::save_account`]) and `tcr
+    /// login` (`oauth::upsert_account`) already run — never
+    /// [`crate::identity::match_one`]. `match_one` goes through
+    /// [`crate::identity::Queryable`], which exposes only name and org: it
+    /// cannot compare `account_uuid`, so it was structurally unable to tell two
+    /// different people sharing a display name apart. Unifying on `resolve`
+    /// fixes that (a differing `account_uuid` never matches, so a same-named
+    /// different person is APPENDED, never overwritten) and it fixes the
+    /// live/durable split brain the old rule caused: `resolve` tolerates an
+    /// unknown org on either side exactly as the durable write does, so a
+    /// legacy no-org row and a submission carrying its own org now agree on
+    /// which one account that is, on both halves, every time — not only when
+    /// there happen to be two orgs in play.
+    ///
+    /// One `match_one`-style fallback survives, deliberately narrow: when
+    /// `account` carries NO identity fields at all (a bare name — the ordinary
+    /// single-account case), `resolve`'s exact name-equality miss is retried
+    /// through `match_one` so a bare email still finds a stored display name
+    /// carrying an org suffix (`email (Org)`), the way the CLI's own query
+    /// resolution always has. It is gated on "no identity fields submitted"
+    /// and nothing looser: widening it to a submission that DOES carry an
+    /// `account_uuid` would resurrect the exact bug this rewrite fixes, by
+    /// matching on name/email again after the uuid comparison already said
+    /// "different person".
+    ///
+    /// Resolve AND mutate under ONE write-lock acquisition of `self.accounts` —
+    /// closing a TOCTOU the old two-lock version had: it resolved under a READ
+    /// lock, released it, then took a separate WRITE lock to append. Two
+    /// concurrent submissions of the same brand-new identity could both resolve
+    /// "no match" before either had appended, and both would append —
+    /// duplicating the live row. Holding one write lock across resolve-then-
+    /// mutate means the second caller's resolve runs after the first caller's
+    /// append is already visible, so it finds the row and updates it instead.
+    pub fn add_or_update_account(&self, account: config::Account) -> AddAccountOutcome {
+        let target = crate::identity::probe(
+            &account.name,
+            account.account_uuid.clone(),
+            account.org_uuid.clone(),
+            account.org_name.clone(),
+        );
+        let bare_identity = account.account_uuid.is_none()
+            && account.org_uuid.is_none()
+            && account.org_name.is_none();
+
+        /// What the locked resolve-and-mutate section below produced, so the
+        /// (unlocked) durable write can run after the lock is released —
+        /// `persist_added`/`persist_replaced` do their own file I/O and must
+        /// never run under `self.accounts`'s lock.
+        enum Resolution {
+            Added {
+                idx: usize,
+            },
+            Updated {
+                idx: usize,
+                name: String,
+                /// The row's OWN identity (post-backfill) plus its REAL routing
+                /// state (priority/switch_threshold/disabled) — never
+                /// `identity::probe`'s placeholders, see [`Self::persist_replaced`]
+                /// and the F5 note there. Boxed: `Added` is a bare `usize`, and
+                /// clippy flags the size gap between variants otherwise.
+                target: Box<config::Account>,
+            },
+        }
+
+        let resolution = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+
+            let probes: Vec<(usize, config::Account)> = accounts
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    (
+                        i,
+                        crate::identity::probe(
+                            &a.name,
+                            a.account_uuid.clone(),
+                            a.org_uuid.clone(),
+                            a.org_name.clone(),
+                        ),
+                    )
+                })
+                .collect();
+
+            let matched =
+                match crate::identity::resolve(probes.iter().map(|(i, p)| (*i, p)), &target) {
+                    crate::identity::Resolved::One(idx) => Some(idx),
+                    crate::identity::Resolved::Many => {
+                        // Recompute the loose set for its names: `Resolved::Many`
+                        // itself carries none, and this is exactly the set
+                        // `resolve` drew from (same predicate, same candidates).
+                        let names = accounts
+                            .iter()
+                            .filter(|a| {
+                                crate::identity::same_identity(
+                                    &target,
+                                    &crate::identity::probe(
+                                        &a.name,
+                                        a.account_uuid.clone(),
+                                        a.org_uuid.clone(),
+                                        a.org_name.clone(),
+                                    ),
+                                )
+                            })
+                            .map(|a| a.name.clone())
+                            .collect();
+                        return AddAccountOutcome::Ambiguous(names);
+                    }
+                    crate::identity::Resolved::None if bare_identity => {
+                        match crate::identity::match_one(&accounts[..], &account.name, None) {
+                            crate::identity::Match::One(idx) => Some(idx),
+                            crate::identity::Match::None => None,
+                            crate::identity::Match::Ambiguous(names) => {
+                                return AddAccountOutcome::Ambiguous(names);
+                            }
+                        }
+                    }
+                    crate::identity::Resolved::None => None,
+                };
+
+            match matched {
+                Some(idx) => {
+                    let row = accounts
+                        .get_mut(idx)
+                        .expect("idx was just resolved against this same vec");
+                    row.access_token = account.access_token.clone();
+                    row.refresh_token = account.refresh_token.clone();
+                    row.expires_at_ms = account.expires_at.map(oauth::normalize_expires_at);
+                    // F4: fresh credentials clear a stuck error — `eligible`
+                    // hard-gates on `status == Error` — but do NOT clear a
+                    // rate-limit hold. That hold expires on its own
+                    // (`MAX_RATE_LIMIT_HOLD_SECONDS`) and the next 429 re-arms
+                    // it; clearing it here bought nothing but the ability to
+                    // race a genuinely-still-limited account back into
+                    // rotation early.
+                    if row.status == AccountStatus::Error {
+                        row.status = AccountStatus::Active;
+                    }
+                    // F6: the submitted type always wins — this route only
+                    // ever carries a real credential, so a row whose stored
+                    // type was stale (e.g. `"api"`) is corrected, or
+                    // `refresh_plan` silently never refreshes it again.
+                    // Identity fields are BACKFILLED — filled in only where
+                    // the row does not already carry a value — mirroring
+                    // `oauth::upsert_account`. Backfilling (rather than
+                    // ignoring) is what permanently closes the split-brain
+                    // trigger: once a legacy no-org row's org is filled in,
+                    // it stops being loosely matched by every org variant of
+                    // that person and starts requiring an exact org match,
+                    // like any other fully-known account.
+                    row.account_type = account.account_type.clone();
+                    if row.account_uuid.is_none() {
+                        row.account_uuid = account.account_uuid.clone();
+                    }
+                    if row.org_uuid.is_none() {
+                        row.org_uuid = account.org_uuid.clone();
+                    }
+                    if row.org_name.is_none() {
+                        row.org_name = account.org_name.clone();
+                    }
+                    // F5: carry the row's REAL routing state, not
+                    // `identity::probe`'s None placeholders — see
+                    // `persist_replaced`'s doc-comment for the restart-un-bench
+                    // this replaces.
+                    let target = config::Account {
+                        name: row.name.clone(),
+                        account_type: row.account_type.clone(),
+                        account_uuid: row.account_uuid.clone(),
+                        org_uuid: row.org_uuid.clone(),
+                        org_name: row.org_name.clone(),
+                        access_token: String::new(),
+                        refresh_token: None,
+                        expires_at: None,
+                        priority: Some(row.priority),
+                        switch_threshold: row.switch_threshold,
+                        disabled: row.disabled.then_some(true),
+                        extra: serde_json::Map::new(),
+                    };
+                    Resolution::Updated {
+                        idx,
+                        name: row.name.clone(),
+                        target: Box::new(target),
+                    }
+                }
+                None => {
+                    let runtime = AccountRuntime::from_config(&account);
+                    accounts.push(runtime);
+                    Resolution::Added {
+                        idx: accounts.len() - 1,
+                    }
+                }
+            }
+        };
+
+        match resolution {
+            Resolution::Added { idx } => {
+                // Sequential, never nested with the accounts lock above — same
+                // discipline `add_account` documents.
+                {
+                    let mut config = self.config.lock().expect("config lock poisoned");
+                    config.accounts.push(account.clone());
+                }
+                let name = account.name.clone();
+                let persist = self.persist_added(&account);
+                AddAccountOutcome::Added { idx, name, persist }
+            }
+            Resolution::Updated { idx, name, target } => {
+                let persist = self.persist_replaced(idx, &target, &account);
+                AddAccountOutcome::Updated { idx, name, persist }
+            }
+        }
+    }
+
+    /// Durably persist a newly-appended account (see [`Self::add_account`]) to
+    /// the config file. Same INV1 discipline as [`Self::persist_disabled`]: the
+    /// whole `config::save_account` read-modify-write runs under
+    /// `config_write`, never `self.config` — nothing here needs the in-memory
+    /// snapshot, because [`Self::add_account`] already pushed `account` onto it.
+    fn persist_added(&self, account: &config::Account) -> AddPersist {
+        let Some(path) = &self.config_path else {
+            return AddPersist::NoConfigFile;
+        };
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        match config::save_account(path, account) {
+            Ok(config::AccountWrite::Added) => {
+                tracing::info!(account = %account.name, "persisted newly added account to config");
+                AddPersist::Persisted
+            }
+            Ok(config::AccountWrite::Updated) => {
+                // The on-disk document already carried this identity even
+                // though the live rotation did not — an entry added to the
+                // file by hand while the proxy ran, or a stale boot snapshot.
+                // The fresh credentials still landed, just as an update to
+                // that row rather than a new one.
+                tracing::info!(
+                    account = %account.name,
+                    "an on-disk entry already carried this identity; its credentials were updated instead of appending a duplicate"
+                );
+                AddPersist::Persisted
+            }
+            Ok(config::AccountWrite::Ambiguous) => {
+                tracing::warn!(
+                    account = %account.name,
+                    path = %path.display(),
+                    "more than one config entry carries this account's identity; refusing to guess, so the new account will NOT survive a restart"
+                );
+                AddPersist::Ambiguous
+            }
+            Ok(config::AccountWrite::Unwritable) => {
+                tracing::error!(
+                    account = %account.name,
+                    path = %path.display(),
+                    "the config document's accounts key is not a JSON array; refusing to touch it"
+                );
+                AddPersist::WriteFailed
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    account = %account.name,
+                    path = %path.display(),
+                    "failed to persist the newly added account to config"
+                );
+                AddPersist::WriteFailed
+            }
+        }
+    }
+
+    /// Durably persist replaced credentials for the account at live index `idx`,
+    /// identified by `target` — its OWN stored identity (post-backfill), never
+    /// the submitted request's (see [`Self::add_or_update_account`] for why).
+    ///
+    /// `target` also carries the row's REAL `priority`/`switch_threshold`/
+    /// `disabled`, not `identity::probe`'s `None` placeholders. That matters
+    /// only on the rare path below where no in-memory or on-disk entry carries
+    /// this identity and one gets APPENDED from `target`: a placeholder-routing
+    /// `target` would append a fresh, un-benched entry for an account that was
+    /// deliberately disabled, so it would come back into rotation on the very
+    /// next restart — the exact bug `persist_disabled` exists to prevent.
+    fn persist_replaced(
+        &self,
+        idx: usize,
+        target: &config::Account,
+        fresh: &config::Account,
+    ) -> AddPersist {
+        let Some(path) = &self.config_path else {
+            return AddPersist::NoConfigFile;
+        };
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        let mut for_disk = target.clone();
+        for_disk.access_token = fresh.access_token.clone();
+        for_disk.refresh_token = fresh.refresh_token.clone();
+        for_disk.expires_at = fresh.expires_at;
+
+        let outcome = config::save_account(path, &for_disk);
+        // INV3, mirroring `persist_disabled`: touch the in-memory snapshot only
+        // once the FILE actually carries the new credentials. Without this, the
+        // snapshot `persist_tokens`/`persist_now` later clone and write back on
+        // shutdown would still hold the OLD (just-replaced) token and stamp it
+        // back over the file this call just fixed.
+        if matches!(
+            outcome,
+            Ok(config::AccountWrite::Updated) | Ok(config::AccountWrite::Added)
+        ) {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            match crate::identity::resolve(config.accounts.iter().enumerate(), target) {
+                crate::identity::Resolved::One(position) => {
+                    if let Some(entry) = config.accounts.get_mut(position) {
+                        entry.access_token = for_disk.access_token.clone();
+                        entry.refresh_token = for_disk.refresh_token.clone();
+                        entry.expires_at = for_disk.expires_at;
+                    }
+                }
+                // No in-memory entry carries this identity either — the disk
+                // row `save_account` just appended has no counterpart here.
+                // Mirror the append so a later persist can still find it.
+                crate::identity::Resolved::None => config.accounts.push(for_disk.clone()),
+                // A tie the in-memory snapshot cannot break either; leave it
+                // alone rather than guess which entry to overwrite.
+                crate::identity::Resolved::Many => {}
+            }
+        }
+
+        match outcome {
+            Ok(config::AccountWrite::Updated) => {
+                tracing::info!(account = %target.name, index = idx, "persisted replaced credentials to config");
+                AddPersist::Persisted
+            }
+            Ok(config::AccountWrite::Added) => {
+                tracing::warn!(
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "no config entry carried this account's identity; a fresh entry was appended"
+                );
+                AddPersist::Persisted
+            }
+            Ok(config::AccountWrite::Ambiguous) => {
+                tracing::warn!(
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "more than one config entry carries this account's identity; refusing to guess, so the replaced credentials will NOT survive a restart"
+                );
+                AddPersist::Ambiguous
+            }
+            Ok(config::AccountWrite::Unwritable) => {
+                tracing::error!(
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "the config document's accounts key is not a JSON array; refusing to touch it"
+                );
+                AddPersist::WriteFailed
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    account = %target.name,
+                    index = idx,
+                    path = %path.display(),
+                    "failed to persist replaced credentials to config"
+                );
+                AddPersist::WriteFailed
+            }
+        }
     }
 }
 
@@ -2256,6 +2746,42 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(manager.access_token(0).as_deref(), Some("fresh-access"));
+    }
+
+    /// The refresh coalescing lock now lives on `AccountRuntime` itself rather than
+    /// in a parallel `Vec` sized at construction — an account appended after
+    /// startup via [`Manager::add_account`] must still refresh. Before this fix,
+    /// the appended account's index was beyond `refresh_locks.len()` and
+    /// `ensure_fresh_inner` returned `false` SILENTLY (no log, no error) — this
+    /// test proves refresh actually fires for it, not just that the call returns.
+    #[tokio::test]
+    async fn appended_account_refreshes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let refresher = Arc::new(CountingRefresher {
+            calls: calls.clone(),
+        });
+        // Seed with one pre-existing account so the appended one is NOT index 0 —
+        // the desync this guards against only bites an index beyond the
+        // construction-time Vec's length.
+        let manager = build_manager(config_with(vec![account("seed", 0)]), refresher);
+
+        let mut appended = account("appended", 0);
+        appended.expires_at = Some(crate::now_ms() - 60_000); // already expired
+        let idx = manager.add_account(appended);
+        assert_eq!(idx, 1, "appended account must land at the next index");
+
+        manager.ensure_fresh(idx).await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "refresh must actually fire for an account appended after construction"
+        );
+        assert_eq!(
+            manager.access_token(idx).as_deref(),
+            Some("fresh-access"),
+            "the appended account's access token must be the refreshed one"
+        );
     }
 
     /// Transient-leader coalescing (the bug this fixes): when the leader's
@@ -5035,6 +5561,414 @@ mod tests {
         manager.set_disabled(9, true);
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        std::fs::remove_file(&path).ok();
+    }
+
+    // ---- live account-add identity resolution (`POST /_tcr/accounts`) ----
+
+    /// A manager whose in-memory config AND on-disk file both start out equal
+    /// to `config` — so both halves of `add_or_update_account` are observable:
+    /// `manager.accounts`/`manager.config` for the live view, and reloading
+    /// `path` for the durable one. Mirrors `proxy.rs`'s `control_manager`.
+    fn build_manager_with_disk(config: Config, tag: &str) -> (Arc<Manager>, PathBuf) {
+        let path = tmp_config_path(tag);
+        config::save(&path, &config).expect("write test config");
+        (build_manager_with_path(config, path.clone()), path)
+    }
+
+    /// F1 — CRITICAL regression. `{alice@example.com, uuid 1111…, rt-CORP}` is
+    /// on record; a submission of `{alice@example.com, uuid 2222…, rt-PERSONAL}`
+    /// is a DIFFERENT PERSON who happens to share a display name. The old rule
+    /// (`identity::match_one`, which goes through `Queryable` and cannot compare
+    /// `account_uuid` at all) matched it onto Corp's row and overwrote its
+    /// single-use refresh token — unrecoverable without a hand re-auth. It must
+    /// APPEND instead, leaving Corp's row untouched, in memory and on disk.
+    #[test]
+    fn add_or_update_account_never_overwrites_a_different_persons_refresh_token() {
+        let corp = Account {
+            account_uuid: Some("uuid-1111".to_string()),
+            access_token: "at-CORP".to_string(),
+            refresh_token: Some("rt-CORP".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let (manager, path) = build_manager_with_disk(config_with(vec![corp]), "f1-uuid-mismatch");
+
+        let submission = Account {
+            account_uuid: Some("uuid-2222".to_string()),
+            access_token: "at-PERSONAL".to_string(),
+            refresh_token: Some("rt-PERSONAL".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+
+        let (idx, persist) = match outcome {
+            AddAccountOutcome::Added { idx, persist, .. } => (idx, persist),
+            other => panic!(
+                "a different account_uuid under the same name must APPEND, not \
+                 update or refuse: {other:?}"
+            ),
+        };
+        assert_eq!(idx, 1, "appended at the end, Corp's row never moves");
+        assert_eq!(persist, AddPersist::Persisted);
+
+        // In memory: Corp's row is byte-identical.
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(accounts.len(), 2);
+            assert_eq!(
+                accounts[0].refresh_token.as_deref(),
+                Some("rt-CORP"),
+                "Corp's single-use refresh token was overwritten in memory"
+            );
+            assert_eq!(accounts[0].access_token, "at-CORP");
+            assert_eq!(accounts[1].refresh_token.as_deref(), Some("rt-PERSONAL"));
+        }
+
+        // On disk: same.
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(reloaded.accounts.len(), 2);
+        assert_eq!(
+            reloaded.accounts[0].refresh_token.as_deref(),
+            Some("rt-CORP"),
+            "Corp's single-use refresh token was overwritten on disk"
+        );
+        assert_eq!(
+            reloaded.accounts[1].refresh_token.as_deref(),
+            Some("rt-PERSONAL")
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F2 — CRITICAL regression. A legacy row with NO stored org, met by a
+    /// submission carrying the row's OWN org (even just profiled for the first
+    /// time), must resolve to the SAME row on both the live and durable halves
+    /// — never split into a second live row backed by the same one disk entry.
+    #[test]
+    fn add_or_update_account_backfills_a_legacy_no_org_row_instead_of_splitting_the_fleet() {
+        let legacy = Account {
+            account_uuid: Some("uuid-legacy".to_string()),
+            refresh_token: Some("rt-legacy".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let (manager, path) = build_manager_with_disk(config_with(vec![legacy]), "f2-legacy-org");
+
+        let submission = Account {
+            account_uuid: Some("uuid-legacy".to_string()),
+            org_uuid: Some("org-corp-uuid".to_string()),
+            org_name: Some("Corp".to_string()),
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+
+        let (idx, persist) = match outcome {
+            AddAccountOutcome::Updated { idx, persist, .. } => (idx, persist),
+            other => panic!(
+                "a legacy no-org row meeting its own org must UPDATE in place, \
+                 not split the fleet: {other:?}"
+            ),
+        };
+        assert_eq!(idx, 0);
+        assert_eq!(persist, AddPersist::Persisted);
+
+        // LIVE: one row, now carrying the org and the fresh credentials.
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                accounts.len(),
+                1,
+                "a second live row appeared — the split brain this fixes"
+            );
+            assert_eq!(accounts[0].org_uuid.as_deref(), Some("org-corp-uuid"));
+            assert_eq!(accounts[0].org_name.as_deref(), Some("Corp"));
+            assert_eq!(accounts[0].refresh_token.as_deref(), Some("rt-fresh"));
+        }
+
+        // DISK: agrees — one entry, same identity, now carrying the org too, so
+        // the NEXT submission (a genuinely different org) requires an exact
+        // match instead of tolerating a still-unknown org key forever.
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(reloaded.accounts.len(), 1, "disk split into a second entry");
+        assert_eq!(
+            reloaded.accounts[0].org_uuid.as_deref(),
+            Some("org-corp-uuid")
+        );
+        assert_eq!(
+            reloaded.accounts[0].refresh_token.as_deref(),
+            Some("rt-fresh")
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F3 — HIGH regression. The old two-lock version resolved under a READ
+    /// lock, released it, then took a separate WRITE lock to append — so N
+    /// concurrent submissions of the same brand-new identity could all resolve
+    /// "no match" before any of them had appended (measured 73 duplicate rows
+    /// in 200 concurrent rounds). Fire N concurrent adds of ONE new identity and
+    /// assert exactly one caller appended, on both halves.
+    #[test]
+    fn concurrent_adds_of_one_new_identity_never_duplicate_the_live_row() {
+        use std::thread;
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0)]),
+            "f3-toctou",
+        );
+
+        let n = 16usize;
+        let submission = Account {
+            account_uuid: Some("uuid-new".to_string()),
+            access_token: "at-new".to_string(),
+            refresh_token: Some("rt-new".to_string()),
+            ..account("carol@example.com", 0)
+        };
+
+        let handles: Vec<_> = (0..n)
+            .map(|_| {
+                let m = Arc::clone(&manager);
+                let acct = submission.clone();
+                thread::spawn(move || m.add_or_update_account(acct))
+            })
+            .collect();
+        let outcomes: Vec<AddAccountOutcome> = handles
+            .into_iter()
+            .map(|h| h.join().expect("add_or_update_account thread panicked"))
+            .collect();
+
+        let added = outcomes
+            .iter()
+            .filter(|o| matches!(o, AddAccountOutcome::Added { .. }))
+            .count();
+        let updated = outcomes
+            .iter()
+            .filter(|o| matches!(o, AddAccountOutcome::Updated { .. }))
+            .count();
+        assert_eq!(
+            added, 1,
+            "exactly one concurrent caller may append a brand-new identity; \
+             the rest must see it as already-added (Updated): added={added} updated={updated}"
+        );
+        assert_eq!(updated, n - 1);
+
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert_eq!(
+            accounts.len(),
+            2,
+            "alice's row plus exactly one new row for carol — not a duplicate"
+        );
+        drop(accounts);
+
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(
+            reloaded.accounts.len(),
+            2,
+            "disk duplicated the new identity"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F4 — an `Error` row given fresh credentials must clear back to `Active`
+    /// (`eligible` hard-gates on `status == Error`) but its rate-limit hold must
+    /// SURVIVE the credential replace — clearing it bought nothing but the
+    /// ability to race a genuinely-still-limited account back into rotation
+    /// early. An EXPIRED hold proves both facts at once without contradiction:
+    /// the field keeps its stamped value, and the account is selectable because
+    /// that value is already in the past.
+    #[test]
+    fn add_or_update_account_clears_error_status_but_keeps_the_rate_limit_hold() {
+        let (manager, path) = build_manager_with_disk(
+            config_with(vec![account("alice@example.com", 0)]),
+            "f4-hold-survives",
+        );
+        let hold_until = crate::now_ms() - 1_000;
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].status = AccountStatus::Error;
+            accounts[0].rate_limited_until_ms = Some(hold_until);
+        }
+
+        let submission = Account {
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+        assert!(
+            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
+            "{outcome:?}"
+        );
+
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                accounts[0].status,
+                AccountStatus::Active,
+                "fresh credentials must clear a stuck error"
+            );
+            assert_eq!(
+                accounts[0].rate_limited_until_ms,
+                Some(hold_until),
+                "the rate-limit hold must survive a credential replace"
+            );
+        }
+
+        assert_eq!(
+            manager.select(&HashSet::new(), OffsetDateTime::now_utc(), None, None),
+            Some(0),
+            "active status + an EXPIRED hold ⇒ immediately selectable"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F5 hardening. When the durable write must APPEND on `persist_replaced`'s
+    /// path (no on-disk entry carries this identity — e.g. it was deleted while
+    /// the proxy ran), the appended record must carry the row's REAL
+    /// `priority`/`disabled`, never `identity::probe`'s `None` placeholders —
+    /// otherwise a deliberately-benched account comes back into rotation on the
+    /// very next restart, the exact bug `persist_disabled` exists to prevent.
+    #[test]
+    fn add_or_update_account_persists_real_routing_state_when_appending_via_replace() {
+        let alice = Account {
+            account_uuid: Some("uuid-alice".to_string()),
+            priority: Some(5),
+            disabled: Some(true),
+            ..account("alice@example.com", 5)
+        };
+        let (manager, path) = build_manager_with_disk(config_with(vec![alice]), "f5-routing-state");
+
+        // The disk entry vanishes out from under the live process — the durable
+        // write must now APPEND.
+        std::fs::write(&path, r#"{"accounts": []}"#).expect("rewrite disk config");
+
+        let submission = Account {
+            account_uuid: Some("uuid-alice".to_string()),
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+        assert!(
+            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
+            "{outcome:?}"
+        );
+
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(reloaded.accounts.len(), 1);
+        assert_eq!(
+            reloaded.accounts[0].priority,
+            Some(5),
+            "a benched account's priority must survive an append-via-replace"
+        );
+        assert_eq!(
+            reloaded.accounts[0].disabled,
+            Some(true),
+            "…and its disabled flag — the exact restart-un-bench persist_disabled exists to prevent"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F6 — an update backfills every identity field the row is missing
+    /// (`account_uuid`/`org_uuid`/`org_name`) and always corrects `account_type`
+    /// to the submitted value: a row left at a stale non-`"oauth"` type is a
+    /// silent death, because `refresh_plan` skips any account whose type is not
+    /// `"oauth"`. On both the live row and the disk entry.
+    #[test]
+    fn add_or_update_account_backfills_identity_and_corrects_a_stale_account_type() {
+        let legacy_api_row = Account {
+            account_type: "api".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "sk-old".to_string(),
+            refresh_token: None,
+            ..account("alice@example.com", 0)
+        };
+        let (manager, path) =
+            build_manager_with_disk(config_with(vec![legacy_api_row]), "f6-backfill");
+
+        let submission = Account {
+            account_type: "oauth".to_string(),
+            account_uuid: Some("uuid-alice".to_string()),
+            org_uuid: Some("org-corp-uuid".to_string()),
+            org_name: Some("Corp".to_string()),
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+        assert!(
+            matches!(outcome, AddAccountOutcome::Updated { idx: 0, .. }),
+            "{outcome:?}"
+        );
+
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                accounts[0].account_type, "oauth",
+                "a stale non-oauth type must be corrected, or refresh_plan silently \
+                 never refreshes this account again"
+            );
+            assert_eq!(accounts[0].account_uuid.as_deref(), Some("uuid-alice"));
+            assert_eq!(accounts[0].org_uuid.as_deref(), Some("org-corp-uuid"));
+            assert_eq!(accounts[0].org_name.as_deref(), Some("Corp"));
+        }
+
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(reloaded.accounts[0].account_type, "oauth");
+        assert_eq!(
+            reloaded.accounts[0].account_uuid.as_deref(),
+            Some("uuid-alice")
+        );
+        assert_eq!(
+            reloaded.accounts[0].org_uuid.as_deref(),
+            Some("org-corp-uuid")
+        );
+        assert_eq!(reloaded.accounts[0].org_name.as_deref(), Some("Corp"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Preservation guard: a submission with NO identity fields at all (a bare
+    /// name) must still find a stored row whose display name carries an org
+    /// suffix, via the CLI's own email-of fallback — `identity::resolve`'s exact
+    /// name equality alone would miss it and append a duplicate. This is the
+    /// one case the bare-name `match_one` fallback exists for.
+    #[test]
+    fn add_or_update_account_bare_email_still_matches_a_display_name_with_org_suffix() {
+        let display_named = Account {
+            name: "alice@example.com (Corp)".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            ..account("alice@example.com (Corp)", 0)
+        };
+        let (manager, path) =
+            build_manager_with_disk(config_with(vec![display_named]), "f-bare-email-fallback");
+
+        let submission = Account {
+            access_token: "at-fresh".to_string(),
+            refresh_token: Some("rt-fresh".to_string()),
+            ..account("alice@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+        let idx = match outcome {
+            AddAccountOutcome::Updated { idx, .. } => idx,
+            other => panic!("a bare email must still match its display-named row: {other:?}"),
+        };
+        assert_eq!(idx, 0);
+        assert_eq!(
+            manager
+                .accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .len(),
+            1,
+            "no duplicate appended"
+        );
+
         std::fs::remove_file(&path).ok();
     }
 
