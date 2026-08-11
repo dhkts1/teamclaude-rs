@@ -764,16 +764,30 @@ enum LoginRoute {
     Refuse(String),
 }
 
-/// The pure login-guard DECISION: given any live proxy server detected on the
-/// port, whether that incumbent's live account-add route was already
-/// confirmed (never probed in here — see [`probe_add_capability`]), the port,
-/// and the `--force` flag, return which [`LoginRoute`] `login()` should take.
-/// Split from the impure lsof-based detection
-/// ([`crate::singleton::live_proxy_server`]) AND from the impure HTTP
-/// capability probe so the decision itself stays unit-testable, mirroring
+/// The pure login-guard DECISION: given whether the HTTP capability probe
+/// already confirmed a live account-add route ([`probe_add_capability`], run
+/// impure and BEFORE this), any live proxy separately detected on the port
+/// (the impure lsof/owner-file detection,
+/// [`crate::singleton::live_proxy_server`]), the port, and the `--force`
+/// flag, return which [`LoginRoute`] `login()` should take. Split from both
+/// impure detectors so the decision itself stays unit-testable, mirroring
 /// singleton's pure-decision / impure-executor split.
 ///
-/// The incumbent's KIND decides the REFUSAL instruction, and it is not
+/// `has_add_route` is decided FIRST and is decisive on its own, independent
+/// of `incumbent` — including when `incumbent` is `None`. The HTTP probe is
+/// first-hand evidence that a live proxy with the route is answering on this
+/// exact port; `incumbent` is an INFERENCE from a pid, an argv string, or an
+/// owner-file claim, any of which can be stale, absent, or blind to a host
+/// application the pid/argv matcher was never taught to recognize (see
+/// `ProxyHost::Unknown`'s doc-comment). Gating the live path on `incumbent`
+/// agreeing would mean any future regression in that inference silently
+/// reintroduces the whole-file clobber this unit exists to remove — as a
+/// silent fallback rather than a loud one. So a confirmed route wins even
+/// against a `None` incumbent, and `incumbent` is consulted only to build the
+/// REFUSAL message, for the one case where the probe did NOT confirm the
+/// route.
+///
+/// The incumbent's KIND decides the refusal instruction, and it is not
 /// cosmetic. Since the owner file, detection reaches a proxy served INSIDE a
 /// host application, and the pid reported is then the HOST's. "kill {pid}"
 /// would SIGTERM a GUI process that installs no handler for it: no
@@ -781,16 +795,21 @@ enum LoginRoute {
 /// live session cold-starts its prompt cache at the next boot.
 /// `takeover_decision` and `incumbents_to_signal` are both hardened against
 /// exactly that signal; a message that ADVISES it would walk around both. So
-/// an embedded incumbent is told to be quit, not killed — whether or not it
-/// has the add route, since that's the refusal-message case regardless.
+/// an embedded incumbent is told to be quit, not killed.
 fn login_guard_refusal(
     incumbent: Option<singleton::Incumbent>,
     has_add_route: bool,
     port: u16,
     force: bool,
 ) -> LoginRoute {
+    if force {
+        return LoginRoute::File;
+    }
+    if has_add_route {
+        return LoginRoute::Live;
+    }
     match incumbent {
-        Some(incumbent) if !force && !has_add_route => {
+        Some(incumbent) => {
             let pid = incumbent.pid;
             LoginRoute::Refuse(match incumbent.kind {
                 singleton::ProxyKind::TcrEmbedded => format!(
@@ -801,8 +820,7 @@ fn login_guard_refusal(
                 ),
             })
         }
-        Some(_) if !force => LoginRoute::Live,
-        _ => LoginRoute::File,
+        None => LoginRoute::File,
     }
 }
 
@@ -862,19 +880,23 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
     }
 }
 
-/// Resolve which [`LoginRoute`] `login()` should take, running the impure
-/// capability probe only when it can matter — a live incumbent is on the port
-/// and `--force` was not given. Fully resolves before `login()` starts the
-/// OAuth dance, so a user is never told to stop a server AFTER completing a
-/// full browser round-trip, and never silently falls back to the file when
-/// the incumbent answered but rejected our api-key.
+/// Resolve which [`LoginRoute`] `login()` should take. Runs the impure HTTP
+/// capability probe UNCONDITIONALLY whenever `--force` was not given —
+/// deliberately never gated on whether [`crate::singleton::live_proxy_server`]
+/// (`incumbent`) noticed anything on the port first. That detection is a pid
+/// inference and can miss a live proxy this build's argv/owner-file matcher
+/// was never taught to recognize; the probe asks the port directly and is
+/// authoritative on its own. Fully resolves before `login()` starts the OAuth
+/// dance, so a user is never told to stop a server AFTER completing a full
+/// browser round-trip, and never silently falls back to the file when a live
+/// proxy answered but rejected our api-key.
 async fn login_route(
     config_path: &Path,
     incumbent: Option<singleton::Incumbent>,
     port: u16,
     force: bool,
 ) -> anyhow::Result<LoginRoute> {
-    if force || incumbent.is_none() {
+    if force {
         return Ok(login_guard_refusal(incumbent, false, port, force));
     }
     let config = load_or_default(config_path)?;
@@ -1562,6 +1584,22 @@ mod tests {
         );
     }
 
+    /// THE CASE THE PROBE-FIRST ORDERING EXISTS FOR: the HTTP probe confirmed
+    /// the route, but pid/argv/owner-file detection found NOTHING on the port
+    /// (`incumbent: None`) — a host application `singleton::classify_proxy_server`
+    /// was never taught to recognize, or a stale/unreadable owner file. The
+    /// probe is first-hand evidence and must win on its own; requiring
+    /// `incumbent` to agree would silently fall back to `File` — the
+    /// whole-file clobber this unit exists to remove — the moment that
+    /// unrelated detection heuristic misses.
+    #[test]
+    fn login_guard_proceeds_live_on_a_confirmed_route_even_when_incumbent_detection_missed_it() {
+        assert_eq!(
+            login_guard_refusal(None, true, 3456, false),
+            LoginRoute::Live
+        );
+    }
+
     /// THE ADVICE MUST BE SURVIVABLE. `live_proxy_server` can now name the pid of
     /// the host application that serves the proxy in-process, and telling the
     /// operator to `kill` it is the one action `singleton` is hardened against
@@ -1713,6 +1751,44 @@ mod tests {
             AddCapability::Unauthorized,
             "a rejected api-key must surface as itself, never read as 'no route'"
         );
+    }
+
+    // --- login_route ----------------------------------------------------------
+
+    /// THE INTEGRATION-LEVEL VERSION of
+    /// `login_guard_proceeds_live_on_a_confirmed_route_even_when_incumbent_detection_missed_it`:
+    /// a real live server answering the real route, called with `incumbent:
+    /// None` (simulating a pid/argv/owner-file detection MISS — the TcrBar
+    /// case, where `argv[0]` ends in `/TcrBar` and
+    /// `singleton::classify_proxy_server` recognizes nothing). `login_route`
+    /// must still probe and proceed live — it must never gate the probe
+    /// itself on `incumbent.is_some()`, which is exactly the shape of bug
+    /// this test catches: skipping the probe here would fall through to
+    /// `LoginRoute::File` beside a real, answering server.
+    #[tokio::test]
+    async fn login_route_proceeds_live_even_when_incumbent_detection_missed_a_real_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-route-missed-incumbent-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(r#"{{ "proxy": {{ "port": {port} }} }}"#);
+        std::fs::write(&path, &seed).unwrap();
+
+        let server_config: Config = serde_json::from_str(&seed).unwrap();
+        let manager = crate::manager::Manager::with_live_refresher(server_config, None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let route = login_route(&path, None, port, false)
+            .await
+            .expect("a confirmed route must not error");
+        assert_eq!(
+            route,
+            LoginRoute::Live,
+            "the probe must decide this on its own, independent of incumbent detection"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     // --- finish_login ---------------------------------------------------------
