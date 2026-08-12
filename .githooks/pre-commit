@@ -98,11 +98,20 @@ if [ -n "$added" ]; then
   if [ ! -f .githooks/private-names ] && [ "${TCR_ALLOW_MISSING_PRIVATE_NAMES:-0}" != "1" ]; then
     echo "" >&2
     echo "pre-commit: BLOCKED — .githooks/private-names is missing, so the private-name" >&2
-    echo "  half of the disclosure scan cannot run. It is a tracked file; restore it:" >&2
+    echo "  half of the disclosure scan cannot run." >&2
     echo "" >&2
-    echo "      git checkout -- .githooks/private-names" >&2
+    echo "  The file is local-only and gitignored, so no clone or worktree carries it: a" >&2
+    echo "  committed list of the real names would itself be the disclosure this gate" >&2
+    echo "  exists to stop. Each checkout writes its own." >&2
     echo "" >&2
-    echo "  Deliberate bypass:  TCR_ALLOW_MISSING_PRIVATE_NAMES=1 git commit ..." >&2
+    echo "  Maintaining a list — one name or string per line, '#' comments allowed:" >&2
+    echo "" >&2
+    echo "      \$EDITOR .githooks/private-names" >&2
+    echo "" >&2
+    echo "  Contributing from a fork, with no private names of your own to protect? Then" >&2
+    echo "  this half is not yours to run, and skipping it is the correct answer:" >&2
+    echo "" >&2
+    echo "      TCR_ALLOW_MISSING_PRIVATE_NAMES=1 git commit ..." >&2
     echo "" >&2
     exit 1
   fi
