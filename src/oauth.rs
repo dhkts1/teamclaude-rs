@@ -1091,7 +1091,19 @@ fn persist_via_file(
 /// there is no stale snapshot for it to clobber a concurrent server-side
 /// rotation with. This is the same write the server's own persist path uses.
 fn persist_via_account(config_path: &Path, account: &Account) -> anyhow::Result<String> {
-    match config::save_account(config_path, account).context("save account after login")? {
+    let outcome = config::save_account(config_path, account).context("save account after login")?;
+    account_write_result(config_path, account, outcome)
+}
+
+/// Turn a [`config::AccountWrite`] outcome into `persist_via_account`'s return
+/// value, shared with [`persist_via_account_or_file`] so the two callers agree
+/// on the exact same success/refusal wording rather than drifting apart.
+fn account_write_result(
+    config_path: &Path,
+    account: &Account,
+    outcome: config::AccountWrite,
+) -> anyhow::Result<String> {
+    match outcome {
         config::AccountWrite::Added | config::AccountWrite::Updated => {
             println!(
                 "Saved account '{}' to {}",
@@ -1114,6 +1126,36 @@ fn persist_via_account(config_path: &Path, account: &Account) -> anyhow::Result<
     }
 }
 
+/// [`persist_via_account`], but falling back to [`persist_via_file`] when
+/// there is no file yet for `save_account`'s `read_document` to read —
+/// `fs::read_to_string` cannot create a missing file, and a first-ever login
+/// must still be able to. Used by `finish_login`'s `NoServer` arm, which
+/// otherwise carries the exact same clobber risk `NoRoute` and the
+/// timeout/`Unusable` arm already write surgically around: the config
+/// snapshot in `config` was taken before the profile fetch, the possible
+/// stdin prompt, and the live-add round-trip, so a whole-file write here
+/// would revert any rotation a server that exited moments ago made to any
+/// OTHER account inside that window.
+fn persist_via_account_or_file(
+    config_path: &Path,
+    config: &mut Config,
+    name: &str,
+    tokens: &Tokens,
+    profile: Profile,
+    account: &Account,
+) -> anyhow::Result<String> {
+    match config::save_account(config_path, account) {
+        Err(config::ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            persist_via_file(config_path, config, name, tokens, profile)
+        }
+        result => account_write_result(
+            config_path,
+            account,
+            result.context("save account after login")?,
+        ),
+    }
+}
+
 /// Persist the finished OAuth credential per `route`: through the live proxy
 /// when it is [`LoginRoute::Live`], via [`persist_via_file`] when it is
 /// [`LoginRoute::File`]. Split out of [`login`] so WHERE the credential lands
@@ -1122,12 +1164,17 @@ fn persist_via_account(config_path: &Path, account: &Account) -> anyhow::Result<
 /// On the live path the running server owns the durable write — this must
 /// NOT also whole-file [`config::save`] the (possibly already-stale) `config`
 /// this process is holding; that write is exactly the clobber this unit
-/// exists to remove. Falls back to the file only on the quiet
-/// [`crate::cli::LiveControlError::NoServer`] case, mirroring
-/// [`crate::cli::set_enabled`]'s discipline: a server that answered and
-/// REFUSED us (`Unauthorized`, `Rejected`) must surface, never silently write
-/// the file instead, because the two halves would then disagree about what
-/// the account's credentials are.
+/// exists to remove. The quiet [`crate::cli::LiveControlError::NoServer`]
+/// case carries that SAME clobber risk, not a lesser one: the proxy the
+/// earlier capability probe confirmed alive can have exited any time in the
+/// profile-fetch / stdin-prompt / round-trip window since, so any OTHER
+/// account it rotated in that window is still on disk waiting to be
+/// reverted. It therefore routes through [`persist_via_account_or_file`]'s
+/// surgical write exactly like `NoRoute`/`Unusable` below, never straight to
+/// a whole-file one. A server that answered and REFUSED us (`Unauthorized`,
+/// `Rejected`) must surface, never silently write the file instead, because
+/// the two halves would then disagree about what the account's credentials
+/// are.
 async fn finish_login(
     config_path: &Path,
     route: LoginRoute,
@@ -1174,11 +1221,21 @@ async fn finish_login(
                     Ok(applied.name)
                 }
                 // Nothing is listening any more (it exited between the probe
-                // and here): the quiet fallback, same discipline as
-                // `set_enabled`.
-                Err(crate::cli::LiveControlError::NoServer) => {
-                    persist_via_file(config_path, config, name, tokens, profile)
-                }
+                // and here). NOT the safe "offline the whole time" case
+                // `persist_via_file` is for: a proxy WAS confirmed alive
+                // moments ago, and it can have rotated any OTHER account's
+                // tokens on disk any time in the profile-fetch / stdin-prompt
+                // / round-trip window since. Same surgical write as
+                // `NoRoute`/`Unusable` below, falling back to a whole-file
+                // write only when there is no file yet at all.
+                Err(crate::cli::LiveControlError::NoServer) => persist_via_account_or_file(
+                    config_path,
+                    config,
+                    name,
+                    tokens,
+                    profile,
+                    &account,
+                ),
                 // The proxy rejected our api-key. Writing the file here would
                 // be the clobber this unit exists to remove, in a new place:
                 // the running server keeps whatever it already had while the
@@ -2510,5 +2567,236 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         drop(listener);
+    }
+
+    /// THE σ5 EXPERIMENT for the `NoServer` arm specifically — same shape as
+    /// `finish_login_live_path_does_not_clobber_a_concurrent_rotation` and
+    /// `finish_login_live_timeout_does_not_clobber_other_accounts`, but for
+    /// the arm those two do not reach: the proxy the capability probe found
+    /// alive has exited entirely by the time `post_add_account` connects, so
+    /// the connection is refused outright (`is_connect()`, not `is_timeout()`
+    /// or a 404/405). Before this fix, this arm alone still called
+    /// `persist_via_file` directly regardless of what any other test in this
+    /// file exercises — a stale client-side snapshot whole-file-written over
+    /// a rotation that landed on disk in the profile-fetch / stdin-prompt /
+    /// round-trip window. Watched failing directly: with the `NoServer` arm
+    /// reverted to `persist_via_file`, this test fails with `left:
+    /// "rt-alice" right: "rt-alice-ROTATED"`.
+    #[tokio::test]
+    async fn finish_login_no_server_does_not_clobber_a_concurrent_rotation() {
+        // Bind to grab a free port, then drop the listener immediately: it
+        // was live a moment ago (mirroring the capability probe having
+        // confirmed it), but by the time `finish_login` runs, nothing is
+        // listening and a connect is refused outright.
+        let dead_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-noserver-clobber-{}-{dead_port}.json",
+            std::process::id()
+        ));
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {dead_port} }}, "accounts": [
+                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
+            ] }}"#
+        );
+        std::fs::write(&path, &seed).unwrap();
+
+        // The stale snapshot: what `login()` would have loaded before its own
+        // async window (profile fetch / stdin prompt) opened.
+        let mut client_config = load_or_default(&path).unwrap();
+
+        // A rotation lands on disk AFTER that snapshot was taken — the
+        // (now-gone) server's own persist path, used directly since the port
+        // is silent for the whole test and cannot carry a real round-trip.
+        let rotated_alice = Account {
+            name: "alice@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-alice-ROTATED".to_string(),
+            refresh_token: Some("rt-alice-ROTATED".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
+        let after_rotation = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_rotation.contains("rt-alice-ROTATED"),
+            "setup: the rotation must be on disk first: {after_rotation}"
+        );
+
+        let name = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut client_config,
+            "carol@example.com",
+            &tokens("at-carol", "rt-carol", 1_893_456_000_000),
+            profile_named("carol@example.com"),
+        )
+        .await
+        .expect("a NoServer live add must still fall back to a surgical write");
+        assert_eq!(name, "carol@example.com");
+
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        let alice = accounts
+            .iter()
+            .find(|a| a["name"] == "alice@example.com")
+            .expect("alice must still be on disk");
+        assert_eq!(
+            alice["refreshToken"],
+            serde_json::json!("rt-alice-ROTATED"),
+            "the NoServer live add must NOT whole-file-write a stale snapshot back over \
+             alice's rotation: {final_doc}"
+        );
+        assert!(
+            accounts.iter().any(|a| a["name"] == "carol@example.com"),
+            "carol was added: {final_doc}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A direct exercise of `finish_login`'s `NoRoute` arm. Before this test
+    /// it was covered only by inference — every existing clobber test in
+    /// this file drives either `Live`'s success path, `NoServer`, or the
+    /// timeout/`Unusable` catch-all (`Err(other)`), never the specific
+    /// unstamped-404 shape `NoRoute` is. Same "older tcr" server as
+    /// `probe_add_capability_unstamped_404_is_unusable_not_absent`: an empty
+    /// axum router answers every path, so `post_add_account` sees a 404 with
+    /// no `ENDPOINT_HEADER` and classifies it structurally as `NoRoute`
+    /// rather than `Unusable`.
+    #[tokio::test]
+    async fn finish_login_no_route_does_not_clobber_other_accounts() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new()).await;
+        });
+
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-noroute-{}-{port}.json",
+            std::process::id()
+        ));
+        let seed = format!(
+            r#"{{ "proxy": {{ "port": {port} }}, "accounts": [
+                {{ "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+                  "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }}
+            ] }}"#
+        );
+        std::fs::write(&path, &seed).unwrap();
+
+        // The stale snapshot: what `login()` would have loaded before its own
+        // async window (profile fetch / stdin prompt) opened.
+        let mut client_config = load_or_default(&path).unwrap();
+
+        // A rotation lands on disk AFTER that snapshot was taken — this
+        // "older tcr" has no add-account route to have produced it, standing
+        // in for any other writer that touched the file in the window, same
+        // as every sibling clobber test in this file.
+        let rotated_alice = Account {
+            name: "alice@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-alice-ROTATED".to_string(),
+            refresh_token: Some("rt-alice-ROTATED".to_string()),
+            expires_at: Some(1_893_456_000_000),
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        };
+        config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
+
+        let name = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut client_config,
+            "dana@example.com",
+            &tokens("at-dana", "rt-dana", 1_893_456_000_000),
+            profile_named("dana@example.com"),
+        )
+        .await
+        .expect("a NoRoute live add must still fall back to a surgical write");
+        assert_eq!(name, "dana@example.com");
+
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        let alice = accounts
+            .iter()
+            .find(|a| a["name"] == "alice@example.com")
+            .expect("alice must still be on disk");
+        assert_eq!(
+            alice["refreshToken"],
+            serde_json::json!("rt-alice-ROTATED"),
+            "the NoRoute live add must NOT whole-file-write a stale snapshot back over \
+             alice's rotation: {final_doc}"
+        );
+        assert!(
+            accounts.iter().any(|a| a["name"] == "dana@example.com"),
+            "dana was added: {final_doc}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `persist_via_account_or_file`'s NotFound guard: `config::save_account`'s
+    /// `read_document` opens the file with `fs::read_to_string`, which cannot
+    /// create one that is not there — so a `NoServer` result reached with NO
+    /// config file on disk at all must still fall back to `persist_via_file`
+    /// (the same whole-file write `LoginRoute::File` always used) instead of
+    /// bailing on the read error. A first-ever login must be able to create
+    /// the file exactly as it always has.
+    #[tokio::test]
+    async fn finish_login_no_server_creates_the_file_when_none_exists() {
+        let dead_port = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-live-noserver-nofile-{}-{dead_port}.json",
+            std::process::id()
+        ));
+        std::fs::remove_file(&path).ok();
+        assert!(!path.exists(), "setup: no config file must exist yet");
+
+        // In-memory only — no file backs this, mirroring what `login()` would
+        // hold when there is nothing on disk yet. Must carry `dead_port`
+        // explicitly: leaving `proxy.port` at its serde default would send
+        // this test's request to whatever real port 3456 happens to hold.
+        let mut client_config: Config =
+            serde_json::from_str(&format!(r#"{{ "proxy": {{ "port": {dead_port} }} }}"#)).unwrap();
+
+        let name = finish_login(
+            &path,
+            LoginRoute::Live,
+            &mut client_config,
+            "frank@example.com",
+            &tokens("at-frank", "rt-frank", 1_893_456_000_000),
+            profile_named("frank@example.com"),
+        )
+        .await
+        .expect("a NoServer live add with no file yet must still create one");
+        assert_eq!(name, "frank@example.com");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            doc["accounts"][0]["name"],
+            serde_json::json!("frank@example.com")
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }

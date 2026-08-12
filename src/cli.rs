@@ -391,12 +391,17 @@ async fn post_set_disabled(
 
     let response = match request.send().await {
         Ok(r) => r,
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
+        // dropped rather than refused) reports `is_connect() == true` as
+        // well, so checking `is_connect()` first would misclassify it as
+        // `NoServer` — "nothing is listening" — when the truer reading is
+        // "something is there but not answering", `NoAnswer` below.
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
             ))
         }
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
     };
 
@@ -477,12 +482,17 @@ pub(crate) async fn post_add_account(
 
     let response = match request.send().await {
         Ok(r) => r,
-        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        // `is_timeout()` first: a connect TIMEOUT (a blackholed address, SYN
+        // dropped rather than refused) reports `is_connect() == true` as
+        // well, so checking `is_connect()` first would misclassify it as
+        // `NoServer` — "nothing is listening" — when the truer reading is
+        // "something is there but not answering", `NoAnswer` below.
         Err(e) if e.is_timeout() => {
             return Err(LiveControlError::NoAnswer(
                 "the server did not answer within 5s".to_string(),
             ))
         }
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
         Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
     };
 

@@ -5241,7 +5241,7 @@ mod tests {
         }
     }
 
-    /// SEAM TEST. `oauth::probe_add_capability` (unit 3, `oauth.rs:855-881`)
+    /// SEAM TEST. `oauth::probe_add_capability` (unit 3, `oauth.rs:901-932`)
     /// decides whether `tcr login` takes the LIVE route by POSTing this exact
     /// deliberately-blank body to `ADD_ACCOUNT_PATH` via
     /// `cli::post_add_account` and reading whether the reply is a STAMPED
@@ -5279,13 +5279,13 @@ mod tests {
             .no_proxy()
             .build()
             .expect("build client");
-        // The EXACT `Account` `probe_add_capability` builds (oauth.rs:855-869):
+        // The EXACT `Account` `probe_add_capability` builds (oauth.rs:902-915):
         // a blank name, a blank access token, everything else absent.
         // DERIVED, not a restated literal — a future edit to the probe's body
         // (oauth.rs, out of this route's reach) changes this test's request
         // too, instead of leaving a stale literal green while it tests a body
         // nobody sends. Sent via `.json()` exactly like `post_add_account`
-        // sends it (`cli.rs:473`, `.json(account)`).
+        // sends it (`cli.rs:478`, `.json(account)`).
         let probe_body = Account {
             name: String::new(),
             account_type: "oauth".to_string(),
