@@ -66,9 +66,12 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 - Branch **before** you start editing. Making changes in the primary checkout and then wanting a branch
   is a trap — a fresh worktree branches from `HEAD` without your uncommitted work, and any shared file
   (`Cargo.toml`) blocks a clean move.
-- `main` requires a pull request, one approval, and the `ci` and `audit` checks; an admin bypass exists
-  and is a deliberate decision, never a shortcut. The CI job table and how a bypass shows up in the
-  push output are in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Pull requests and CI".
+- `main` requires a pull request, one approval, and the `ci`, `audit` and `macos` checks; an admin
+  bypass exists and is a deliberate decision, never a shortcut. The CI job table and how a bypass
+  shows up in the push output are in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Pull requests and CI".
+- Without push access here, work from a fork; the pull request's base is this repository and its head
+  is your copy. [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Opening one from a fork" has the mechanics and
+  explains why a fork's checks sit unstarted until a maintainer approves the run.
 
 ## Commits
 

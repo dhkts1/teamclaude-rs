@@ -30,11 +30,29 @@ Building is safe; see the note on `cp` below for the one build-adjacent thing th
 
 ## Getting set up
 
+**Fork first, unless you already have push access.** Only a handful of collaborators can push
+branches to this repository; everyone else contributes from a fork, which is a full copy under your
+own account that you have write access to. This is the normal path, not a lesser one — you do not
+need any permission here to open a pull request, and asking for push access is not the way in. The
+mechanics of turning that fork into a pull request are under
+[Pull requests and CI](#pull-requests-and-ci).
+
 ```sh
+# From a fork (most people): press "Fork" on the repository page first.
+git clone https://github.com/<your-username>/teamclaude-rs
+cd teamclaude-rs
+git remote add upstream https://github.com/dhkts1/teamclaude-rs
+
+# With push access: clone this repository directly.
 git clone https://github.com/dhkts1/teamclaude-rs
 cd teamclaude-rs
+```
+
+Either way, before you touch anything:
+
+```sh
 git config core.hooksPath .githooks      # do this before your first commit
-brew install gitleaks                    # required, see below
+brew install gitleaks                    # required; non-macOS instructions below
 cargo build --release
 ```
 
@@ -103,6 +121,13 @@ something unrecoverable. The formatting gates behave the opposite way on purpose
 `swift-format` warns and skips, because a missing formatter costs a red CI job, which is visible and
 recoverable.
 
+`.githooks/private-names` is **local-only and gitignored**, so your clone will not have one and your
+first commit will stop on it. That is not a broken checkout — a committed list of the real names
+would itself be the disclosure the gate exists to prevent, so each checkout writes its own. If you
+are contributing from a fork you have no such list to write, and
+`TCR_ALLOW_MISSING_PRIVATE_NAMES=1 git commit ...` is the intended answer rather than a workaround;
+the other five gates still run.
+
 The disclosure scan reads **added lines only**, so pre-existing content can never block you. It rejects
 absolute home paths (`/Users/<someone>/...`), real-looking email addresses, and any name listed in
 `.githooks/private-names`. Synthetic users (`alice`, `bob`, `test`, `example`, `runner`, ...) and
@@ -128,10 +153,31 @@ version that has already been tagged and released. It is self-clearing: bump the
 
 ## Pull requests and CI
 
-`main` is protected. Changes land through a pull request with one approval and passing `ci` and
-`audit` checks. An admin bypass exists; using it is a deliberate decision and GitHub records it as
-`Bypassed rule violations` in the push output. Read that output, because a push can succeed *and*
+`main` is protected. Changes land through a pull request with one approval and passing `ci`, `audit`
+and `macos` checks. An admin bypass exists; using it is a deliberate decision and GitHub records it
+as `Bypassed rule violations` in the push output. Read that output, because a push can succeed *and*
 have bypassed the rules.
+
+### Opening one from a fork
+
+Push the branch to your own copy — `git push origin fix/whatever`, where `origin` is your fork — and
+open the pull request with the **base** set to `dhkts1/teamclaude-rs` `main` and the **head** set to
+your fork's branch. GitHub offers this as a "Compare & pull request" banner in the minutes after you
+push; from a terminal, `gh pr create --repo dhkts1/teamclaude-rs` does the same thing. Read the base
+before you submit. A fresh fork's pull request form can default to your own copy as the base, which
+produces a pull request from you to you — it looks completely normal and no maintainer will ever
+see it.
+
+Nothing in that sequence needs write access to this repository. The commits live in yours; the pull
+request is a request that someone merge them, and merging is the only step that requires access here.
+
+**Your checks will not start on their own, and that is deliberate.** Workflow runs from a fork wait
+for a maintainer to approve them, because a pull request otherwise executes an unreviewed
+contributor's code on this repository's runners the moment it is opened. So expect the checks to sit
+unstarted after you open the pull request; that is the configured behaviour and not a broken
+pipeline. When they do run, they get a read-only token and no repository secrets, which is why
+`release-app.yml` — the workflow holding the signing and notarization credentials — is triggered by
+tags alone and can never be reached from a pull request.
 
 `.github/workflows/ci.yml` defines five jobs:
 
@@ -139,7 +185,7 @@ have bypassed the rules.
 | --- | --- | --- |
 | `ci` **(required)** | ubuntu | `cargo fmt --all --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --all --locked`, `cargo build --release --locked` |
 | `audit` **(required)** | ubuntu | `cargo audit` against `Cargo.lock`: fails on real RustSec advisories, warns on unmaintained deps |
-| `macos` | macOS | `cargo test --all --locked` again (different code paths: `src/singleton.rs` shells out to BSD `ps`/`lsof`, install placement relies on `rename(2)`, `$TMPDIR` is a sandbox path), plus `swift-format lint --strict`, `swift build` and `swift test` for the TcrBar app |
+| `macos` **(required)** | macOS | `cargo test --all --locked` again (different code paths: `src/singleton.rs` shells out to BSD `ps`/`lsof`, install placement relies on `rename(2)`, `$TMPDIR` is a sandbox path), plus `swift-format lint --strict`, `swift build` and `swift test` for the TcrBar app |
 | `tsan` | ubuntu | ThreadSanitizer over the `concurrent_pacing_stress` harness on nightly |
 | `miri` | ubuntu | UB detection over the pure leaf modules (`model::`, `account_uuid::`, `quota::`). `continue-on-error`, so it is informational rather than a gate |
 
