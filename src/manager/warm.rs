@@ -2,6 +2,25 @@
 
 use super::*;
 
+/// Re-arm [`AccountRuntime::warm_evidence_retry_after_ms`] if this account is
+/// currently AT OR PAST [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`] — shared by
+/// [`Manager::record_warm_without_evidence`] (a warm that succeeded but
+/// latched no evidence) and [`Manager::record_warm_failure`] (a warm that
+/// failed outright). Either one, if it happens during the one retry the
+/// cooldown just granted, must push the deadline forward again: the deadline
+/// this replaces is already in the PAST by the time a retry runs (that is
+/// what made the account eligible again — see [`Manager::warm_targets`]), so
+/// leaving it alone after a failing retry keeps `warm_targets` re-admitting
+/// the account on EVERY subsequent pass instead of once per cooldown —
+/// exactly the unbounded-repeat bug this latch exists to bound, just entered
+/// from the failure path instead of the header-less-200 path.
+fn rearm_warm_evidence_cooldown_if_excluded(account: &mut AccountRuntime) {
+    if account.consecutive_warms_without_evidence >= WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT {
+        account.warm_evidence_retry_after_ms =
+            Some(crate::now_ms() + WARM_EVIDENCE_RETRY_COOLDOWN_MS);
+    }
+}
+
 impl Manager {
     /// The account indices eligible for a keep-warm request. Starts from the same
     /// base as [`Self::probeable_indices`] (an OAuth account with a refresh token
@@ -107,7 +126,7 @@ impl Manager {
                     // elapsed — this is the recovery half, bounded by
                     // WARM_EVIDENCE_RETRY_COOLDOWN_MS rather than left permanent.
                     && (a.consecutive_warms_without_evidence < WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT
-                        || a.warm_evidence_retry_after_ms.is_some_and(|until| now_ms >= until))
+                        || cooldown_elapsed(a.warm_evidence_retry_after_ms, now_ms))
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -156,6 +175,17 @@ impl Manager {
                 }
             }
             Err(err) => {
+                // A failed warm is not "succeeded without evidence" — it does not
+                // bump `consecutive_warms_without_evidence`, which specifically
+                // counts a 200 that latched nothing. But if the account is
+                // already PAST the limit, this failure just consumed the one
+                // retry `warm_evidence_retry_after_ms`'s cooldown granted, and
+                // that deadline must move forward again — see
+                // `rearm_warm_evidence_cooldown_if_excluded`'s doc-comment for
+                // why leaving it alone reopens the unbounded-repeat bug this
+                // whole latch exists to bound, just on the failure path instead
+                // of the header-less-200 path.
+                self.record_warm_failure(idx);
                 tracing::warn!(
                     account = %name,
                     index = idx,
@@ -172,13 +202,10 @@ impl Manager {
     /// logs the give-up once rather than every cadence — mirrors
     /// [`Manager::record_probe`]'s crossing-log pattern for the same reason.
     ///
-    /// At or past the limit, (re-)arms [`AccountRuntime::warm_evidence_retry_after_ms`]
-    /// to `now + `[`WARM_EVIDENCE_RETRY_COOLDOWN_MS`] — including on a MISS that
-    /// happens during the one retry the cooldown just granted, which is what
-    /// keeps the retry rate at one attempt per cooldown rather than one per
-    /// scheduled warm tick once the account is past the limit: without
-    /// re-arming here, the very next scheduled warm would see the (now past)
-    /// old deadline and immediately re-qualify.
+    /// Re-arms the retry cooldown once at/past the limit via
+    /// [`rearm_warm_evidence_cooldown_if_excluded`] — see that function's
+    /// doc-comment for why a MISS that happens during the one retry the
+    /// cooldown just granted must re-arm it too.
     fn record_warm_without_evidence(&self, idx: usize) -> bool {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         let Some(account) = accounts.get_mut(idx) else {
@@ -188,11 +215,23 @@ impl Manager {
             account.consecutive_warms_without_evidence.saturating_add(1);
         let crossed =
             account.consecutive_warms_without_evidence == WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT;
-        if account.consecutive_warms_without_evidence >= WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT {
-            account.warm_evidence_retry_after_ms =
-                Some(crate::now_ms() + WARM_EVIDENCE_RETRY_COOLDOWN_MS);
-        }
+        rearm_warm_evidence_cooldown_if_excluded(account);
         crossed
+    }
+
+    /// The failure-path twin of [`Self::record_warm_without_evidence`]: a warm
+    /// that came back `Err` (see [`Self::warm_account`]) rather than a
+    /// header-less `Ok`. Does NOT bump `consecutive_warms_without_evidence` —
+    /// that counter's doc-comment defines it as "succeeded but carried no
+    /// evidence", and an outright failure is neither — but still re-arms the
+    /// cooldown when the account is already excluded, via
+    /// [`rearm_warm_evidence_cooldown_if_excluded`].
+    fn record_warm_failure(&self, idx: usize) {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let Some(account) = accounts.get_mut(idx) else {
+            return;
+        };
+        rearm_warm_evidence_cooldown_if_excluded(account);
     }
 
     /// Warm ONE account, if it is still eligible at this instant.

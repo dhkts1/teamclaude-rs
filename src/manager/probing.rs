@@ -91,7 +91,7 @@ impl Manager {
                     && a.refresh_token.is_some()
                     && !a.disabled
                     && (a.status != AccountStatus::Error
-                        || a.error_retry_after_ms.is_some_and(|until| now_ms >= until))
+                        || cooldown_elapsed(a.error_retry_after_ms, now_ms))
             })
             .map(|(idx, _)| idx)
             .collect()
