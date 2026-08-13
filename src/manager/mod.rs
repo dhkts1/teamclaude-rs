@@ -366,11 +366,14 @@ pub struct AccountRuntime {
 
 // Test-only fault injection for `build_serving_client`: set via
 // `fail_next_client_build`, consumed (and cleared) by the next call on this
-// thread. Exists to prove — with a real panic, not a hypothetical one — that
-// `Manager::add_or_update_account`'s Added path builds its runtime BEFORE
-// taking `self.accounts`'s write lock: a panic here that happens UNDER that
-// lock poisons it for every other `.expect("accounts lock poisoned")` call
-// site in this module; one that happens before the lock is taken does not.
+// thread. Exists to prove — with a real panic, not a hypothetical one — two
+// properties of `Manager::add_or_update_account`: its Added path builds the
+// runtime with NEITHER `self.accounts` nor `config_write` held, so a panic
+// here poisons neither lock — every other `.expect(...)` call site on either
+// one in this module would otherwise go down with it — and its Updated path
+// never reaches this function at all. See
+// `add_or_update_account_added_path_does_not_poison_either_lock_on_a_client_build_panic`
+// and `add_or_update_account_updated_path_never_builds_a_client`.
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_CLIENT_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
