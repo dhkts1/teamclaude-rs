@@ -43,8 +43,11 @@ impl Manager {
                     // account is not stuck returning header-less responses —
                     // resets keep-warm's miss counter regardless of whether this
                     // particular update was the warm path or a served request.
+                    // Also clears the cooldown timestamp so no stale retry-after
+                    // lingers on a row that just proved it does not need one.
                     if read_five_hour {
                         account.consecutive_warms_without_evidence = 0;
+                        account.warm_evidence_retry_after_ms = None;
                     }
                     (flipped, read_five_hour)
                 }
@@ -93,18 +96,22 @@ impl Manager {
     /// endpoint reported no 5h bucket at all: "we have read this account's quota" is
     /// about the READ, not about which windows came back.
     ///
-    /// Also resets [`AccountRuntime::consecutive_warms_without_evidence`], for the
-    /// same reason [`Manager::update_quota`] does on a header-bearing response: a
-    /// successful probe is ITSELF a first-hand read of this account's quota, so it
-    /// is evidence too, regardless of whether a 5h bucket came back. This is the
-    /// recovery path for [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]'s exclusion: the
-    /// background prober visits every [`Manager::probeable_indices`] account on its
-    /// own schedule (`schedule::run`'s `Job::Probe` arm), which does NOT check this
-    /// counter — so it is the one path that still reaches an account keep-warm has
-    /// given up on and that never gets picked to serve (and so never earns a
-    /// header-bearing response of its own). Without this reset, an account excluded
-    /// here would stay excluded for the life of the process even after the upstream
-    /// condition that caused the miss streak clears.
+    /// Deliberately does NOT reset [`AccountRuntime::consecutive_warms_without_evidence`],
+    /// even though this can latch [`AccountRuntime::quota_known`] just like a
+    /// header-bearing served response does. A first cut of this fix reset it
+    /// here unconditionally and reopened the exact loop the counter exists to
+    /// close: `probeable_indices` (unlike [`Self::warm_targets`]) does not check
+    /// this counter, so the background prober keeps visiting an excluded account
+    /// on its OWN schedule — reset it on every successful probe and a
+    /// persistently header-less account gets re-warmed once per probe cycle
+    /// forever, worse than the original unbounded-warm bug this counter fixed.
+    /// A probe finding no 5h bucket also says nothing about whether the next
+    /// WARM response would carry one — it is a different, zero-spend endpoint,
+    /// not a rehearsal of the warm request the counter is bounding. Recovery
+    /// from the exclusion is [`Manager::record_warm_without_evidence`]'s
+    /// [`AccountRuntime::warm_evidence_retry_after_ms`] cooldown instead — a
+    /// flat wall-clock wait, decoupled from probe cadence, so the retry rate is
+    /// bounded by policy rather than by how often the fleet happens to probe.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
         let newly_known = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
@@ -113,7 +120,6 @@ impl Manager {
                     account.quota.apply_usage(usage);
                     let flipped = !account.quota_known;
                     account.quota_known = true;
-                    account.consecutive_warms_without_evidence = 0;
                     flipped
                 }
                 None => false,

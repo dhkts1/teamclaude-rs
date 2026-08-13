@@ -52,7 +52,11 @@ impl Manager {
     /// it does NOT — a 200 with none of the unified headers — nothing is folded
     /// and the account would stay a target forever; that half of the bound is
     /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`] below, not this doc-comment's
-    /// promise alone.
+    /// promise alone. Once that limit excludes the account, the exclusion is
+    /// itself bounded by [`AccountRuntime::warm_evidence_retry_after_ms`] (see
+    /// the filter below) rather than being permanent — see that field's
+    /// doc-comment for why the recovery is a flat wall-clock cooldown and not a
+    /// reset on the next successful background probe.
     ///
     /// The predicate is NOT `probe_status`: `record_probe` stamps
     /// `Error`/`Timeout`/`RateLimited` on a FAILED probe, which leaves
@@ -67,6 +71,7 @@ impl Manager {
     /// to wait for and no failure count to accrue either.
     pub fn warm_targets(&self) -> Vec<usize> {
         let now = OffsetDateTime::now_utc();
+        let now_ms = crate::now_ms();
         // Read the probe cadence BEFORE taking the accounts lock: this touches the
         // config lock, and holding both at once here would invert the order
         // `set_disabled` takes them in (accounts, then config).
@@ -97,8 +102,12 @@ impl Manager {
                     // Repeated warms that never latch a 5h window are not
                     // self-limiting on their own (see the doc-comment above) — cap
                     // the repeat so a header-less upstream response cannot spend
-                    // real quota on this account every cadence forever.
-                    && a.consecutive_warms_without_evidence < WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT
+                    // real quota on this account every cadence forever. Past the
+                    // cap the account is STILL excluded unless its cooldown has
+                    // elapsed — this is the recovery half, bounded by
+                    // WARM_EVIDENCE_RETRY_COOLDOWN_MS rather than left permanent.
+                    && (a.consecutive_warms_without_evidence < WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT
+                        || a.warm_evidence_retry_after_ms.is_some_and(|until| now_ms >= until))
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -162,6 +171,14 @@ impl Manager {
     /// call just CROSSED [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`], so the caller
     /// logs the give-up once rather than every cadence — mirrors
     /// [`Manager::record_probe`]'s crossing-log pattern for the same reason.
+    ///
+    /// At or past the limit, (re-)arms [`AccountRuntime::warm_evidence_retry_after_ms`]
+    /// to `now + `[`WARM_EVIDENCE_RETRY_COOLDOWN_MS`] — including on a MISS that
+    /// happens during the one retry the cooldown just granted, which is what
+    /// keeps the retry rate at one attempt per cooldown rather than one per
+    /// scheduled warm tick once the account is past the limit: without
+    /// re-arming here, the very next scheduled warm would see the (now past)
+    /// old deadline and immediately re-qualify.
     fn record_warm_without_evidence(&self, idx: usize) -> bool {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         let Some(account) = accounts.get_mut(idx) else {
@@ -169,7 +186,13 @@ impl Manager {
         };
         account.consecutive_warms_without_evidence =
             account.consecutive_warms_without_evidence.saturating_add(1);
-        account.consecutive_warms_without_evidence == WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT
+        let crossed =
+            account.consecutive_warms_without_evidence == WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT;
+        if account.consecutive_warms_without_evidence >= WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT {
+            account.warm_evidence_retry_after_ms =
+                Some(crate::now_ms() + WARM_EVIDENCE_RETRY_COOLDOWN_MS);
+        }
+        crossed
     }
 
     /// Warm ONE account, if it is still eligible at this instant.

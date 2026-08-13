@@ -60,6 +60,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         quota_known: true,
         consecutive_probe_failures: 0,
         consecutive_warms_without_evidence: 0,
+        warm_evidence_retry_after_ms: None,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,

@@ -141,7 +141,30 @@ const PROBE_FAILURES_BEFORE_WARMING_UNPROBED: u32 = 3;
 /// misses is a hiccup, not a verdict) but bounds the opposite direction: that one
 /// bounds a WAIT before warming starts; this one bounds a REPEAT once warming
 /// itself stops producing evidence.
+///
+/// Crossing this excludes the account from [`Manager::warm_targets`] — but that
+/// exclusion must itself be recoverable without a restart, or a transient
+/// upstream condition that strips the 5h headers for a few minutes sidelines the
+/// account for the life of the process. [`AccountRuntime::warm_evidence_retry_after_ms`]
+/// is that recovery: a flat cooldown, not a per-response reset — an EARLIER
+/// version of this fix reset the counter on every successful background probe,
+/// which reopened exactly the loop this constant bounds (`probeable_indices`
+/// probes an excluded account regardless of `warm_targets` membership, so a
+/// probe-triggered reset re-armed a full burst of [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]
+/// warms every probe cycle — worse than the original unbounded-warm bug).
 const WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT: u32 = 3;
+
+/// Flat cooldown before a keep-warm-excluded account (see
+/// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]) is retried. An hour: two orders of
+/// magnitude cheaper than retrying every probe cycle (probe cadence defaults to
+/// minutes, not hours — see [`crate::probe::DEFAULT_PROBE_SECONDS`]) while still
+/// recovering well inside a restart's cost. Deliberately a flat wait, not
+/// exponential backoff like [`AccountRuntime::error_backoff_ms`]: a header-less
+/// warm response is not evidence the account is unhealthy (unlike a rejected
+/// refresh token), so there is no reason to believe the NEXT retry is less
+/// likely to work than this one, and a flat interval keeps the recovery time
+/// bound simple to state.
+const WARM_EVIDENCE_RETRY_COOLDOWN_MS: i64 = 3_600_000;
 
 /// Decay window for [`AccountRuntime::stream_error_times_ms`] — how far back a
 /// stream error still counts toward the operator-facing decayed count. An hour:
@@ -236,17 +259,25 @@ pub struct AccountRuntime {
     pub consecutive_probe_failures: u32,
     /// Consecutive keep-warm requests ([`Manager::warm_account`]) that succeeded
     /// but carried none of the unified 5h rate-limit headers — a 200 that latched
-    /// no evidence. Reset to `0` by ANY response (warm or served) whose headers DO
-    /// carry the 5h window — see [`Manager::update_quota`] — and also by a
-    /// SUCCESSFUL background probe of this account's usage endpoint — see
-    /// [`Manager::apply_usage`]. The probe reset is what makes the exclusion below
-    /// recoverable without a restart: the prober reaches every
-    /// [`Manager::probeable_indices`] account on its own schedule regardless of
-    /// `warm_targets` membership, so it is the one path that still reaches an
-    /// account this counter has excluded from keep-warm and that never gets
-    /// picked to serve. Bounds [`Manager::warm_targets`]'s otherwise-unbounded
-    /// repeat; see [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`].
+    /// no evidence. Reset to `0` only by a response (warm or served) whose
+    /// headers DO carry the 5h window — see [`Manager::update_quota`].
+    /// Deliberately NOT reset by a successful background probe
+    /// ([`Manager::apply_usage`]): see that function's doc-comment for why a
+    /// probe read is not the evidence this counter is bounding. Bounds
+    /// [`Manager::warm_targets`]'s otherwise-unbounded repeat; see
+    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]. The exclusion this drives is
+    /// recovered by [`Self::warm_evidence_retry_after_ms`] instead, once its
+    /// cooldown elapses.
     pub consecutive_warms_without_evidence: u32,
+    /// Set by [`Manager::record_warm_without_evidence`] once
+    /// `consecutive_warms_without_evidence` reaches
+    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]: the wall-clock instant (epoch
+    /// ms) at or after which [`Manager::warm_targets`] treats this account as
+    /// eligible again despite the counter still being at or over the limit —
+    /// one bounded retry per [`WARM_EVIDENCE_RETRY_COOLDOWN_MS`], not one per
+    /// probe cycle. `None` when the account is not currently excluded, or once
+    /// a header-bearing response clears it (see [`Manager::update_quota`]).
+    pub warm_evidence_retry_after_ms: Option<i64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
@@ -498,6 +529,7 @@ impl AccountRuntime {
             quota_known: false,
             consecutive_probe_failures: 0,
             consecutive_warms_without_evidence: 0,
+            warm_evidence_retry_after_ms: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -6618,25 +6650,73 @@ mod tests {
         );
     }
 
+    /// A follow-up regression on the bound above: it must not be defeatable by
+    /// the background prober. A first cut of the recovery fix reset
+    /// `consecutive_warms_without_evidence` on every successful `apply_usage`
+    /// call — but `probeable_indices` (unlike `warm_targets`) does not check
+    /// that counter, so the prober keeps visiting an excluded account on its
+    /// OWN schedule regardless of exclusion. That reset would reopen the gate
+    /// every probe cycle and hand back a full burst of
+    /// `WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT` header-less warms each time —
+    /// MORE spend than the original unbounded-warm bug, not less. Drives an
+    /// account past the limit, then feeds it several successful
+    /// no-5h-bucket probes (several "probe cycles") and asserts it stays
+    /// excluded throughout — recovery must come from the cooldown, not from
+    /// probe traffic.
+    #[tokio::test]
+    async fn repeated_probe_cycles_do_not_reopen_a_warm_exclusion() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let warmer = Arc::new(HeaderlessWarmer);
+        let manager =
+            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "setup: the account must be excluded before the probe-cycle check runs"
+        );
+
+        let headerless_probe = crate::probe::Usage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_oi: None,
+        };
+        for cycle in 0..5 {
+            manager.apply_usage(0, &headerless_probe);
+            assert!(
+                !manager.warm_targets().contains(&0),
+                "probe cycle {cycle}: a successful probe that reads no 5h bucket \
+                 must not, by itself, reopen a warm exclusion — recovery is the \
+                 cooldown, not probe traffic"
+            );
+        }
+    }
+
     /// The recovery half of the bound above. `consecutive_warms_without_evidence`
     /// is a ONE-WAY latch with a single writer (`record_warm_without_evidence`)
-    /// and, before this fix, a single reset (`update_quota`, on a header-bearing
-    /// served or warmed response) — but an account excluded from `warm_targets`
-    /// is never picked to SERVE either, so it can never earn one of those. Left
-    /// that way, a transient upstream condition that strips the 5h headers for a
-    /// few minutes would exclude the account from keep-warm for the life of the
+    /// and only one reset (`update_quota`, on a header-bearing served or warmed
+    /// response) — but an account excluded from `warm_targets` is never picked
+    /// to SERVE either, so it can never earn one of those on its own. Left that
+    /// way, a transient upstream condition that strips the 5h headers for a few
+    /// minutes would exclude the account from keep-warm for the life of the
     /// process, recoverable only by a restart (this repo's most expensive event
     /// — a full cold prompt-cache prefix for every live session).
     ///
-    /// The fix is `apply_usage` also resetting the counter: the background
-    /// prober reaches every `probeable_indices` account on its own schedule
-    /// (`schedule::run`'s `Job::Probe` arm), which does NOT check this counter,
-    /// so it is the one path that still reaches an idle, excluded account. This
-    /// drives an account past the limit, then feeds it a successful probe (no 5h
-    /// bucket at all, so `update_quota` never runs — isolating the probe path as
-    /// the thing that recovers it) and asserts it is a warm target again.
+    /// The fix is `warm_evidence_retry_after_ms`'s flat cooldown, set by
+    /// `record_warm_without_evidence` once the account crosses the limit. This
+    /// drives an account past the limit, confirms it is excluded, fast-forwards
+    /// the cooldown by writing a past deadline directly (the same pattern this
+    /// module's other `_until_ms`/`_after_ms` cooldown tests use — a real sleep
+    /// of `WARM_EVIDENCE_RETRY_COOLDOWN_MS` is not a reasonable thing to do in a
+    /// unit test), and asserts the account is a warm target again.
     #[tokio::test]
-    async fn a_successful_probe_recovers_an_account_the_warm_latch_excluded() {
+    async fn warm_evidence_retry_cooldown_recovers_an_excluded_account() {
         let refresher = Arc::new(CountingRefresher {
             calls: Arc::new(AtomicUsize::new(0)),
         });
@@ -6653,23 +6733,23 @@ mod tests {
             !manager.warm_targets().contains(&0),
             "setup: the account must be excluded before recovery is exercised"
         );
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert!(
+                accounts[0].warm_evidence_retry_after_ms.is_some(),
+                "setup: crossing the limit must arm a retry cooldown"
+            );
+        }
 
-        // A successful probe that reports NO 5h bucket at all — still evidence
-        // (see `apply_usage`'s doc-comment), and deliberately not routed through
-        // `update_quota`/`warm_account`, so this isolates the probe path.
-        manager.apply_usage(
-            0,
-            &crate::probe::Usage {
-                five_hour: None,
-                seven_day: None,
-                seven_day_oi: None,
-            },
-        );
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].warm_evidence_retry_after_ms = Some(crate::now_ms() - 1);
+        }
 
         assert!(
             manager.warm_targets().contains(&0),
-            "a successful probe must recover an account the warm latch excluded, \
-             without a restart"
+            "an elapsed retry cooldown must recover an account the warm latch \
+             excluded, without a restart"
         );
     }
 
