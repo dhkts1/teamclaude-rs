@@ -143,10 +143,12 @@ impl Manager {
         }
     }
 
-    /// Record that account `idx` served a stream that carried an in-band SSE
-    /// `error` event (`kind` is `error.error.type`, e.g. `"overloaded_error"`) —
-    /// a truncated turn the client saw as a 200 that must not read as a clean
-    /// serve. OBSERVABILITY ONLY: this warns and updates a decayed counter and
+    /// Record that account `idx` served a stream that failed to complete cleanly
+    /// (`kind` is either an Anthropic `error.error.type`, e.g. `"overloaded_error"`,
+    /// from an in-band SSE `error` event, or the fixed string `"truncated"` for a
+    /// stream that hit EOF without Anthropic's `message_stop` terminator) — a
+    /// turn the client saw as a 200 that must not read as a clean serve.
+    /// OBSERVABILITY ONLY: this warns and updates a decayed counter and
     /// the account's last-error label; it deliberately does NOT call
     /// `mark_error` (that condemns terminally — see its doc comment on the 2026-07-17
     /// incident) or `mark_rate_limited` (an overloaded account is not over quota —
@@ -162,7 +164,7 @@ impl Manager {
                 account = %account.name,
                 index = idx,
                 error_type = kind,
-                "SSE stream carried an in-band error event — truncated turn, not a clean serve"
+                "stream failed to complete cleanly — truncated turn, not a clean serve"
             );
             account.stream_error_times_ms.push_back(now_ms);
             prune_stream_errors(&mut account.stream_error_times_ms, now_ms);

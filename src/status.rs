@@ -147,8 +147,10 @@ pub struct AccountStatus {
     /// The account's effective switch threshold on the SERVER (its own
     /// `switchThreshold`, else the global one).
     pub threshold: f64,
-    /// Decayed count of in-band SSE `error` events (see
-    /// [`AccountSnapshot::stream_error_count`]). Put ON the wire deliberately —
+    /// Decayed count of stream failures — an in-band SSE `error` event, or a
+    /// stream that hit EOF without Anthropic's `message_stop` terminator
+    /// (recorded as `"truncated"`); see [`AccountSnapshot::stream_error_count`].
+    /// Put ON the wire deliberately —
     /// it carries no credential material and `tcr status --json` is how an
     /// operator sees the fleet (`tcr status --json | jq '.[].streamErrorCount'`);
     /// see this module's doc comment on the no-secret invariant.
