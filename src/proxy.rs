@@ -2223,7 +2223,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             method: method.to_string(),
             path: path_and_query.clone(),
             status: status.as_u16(),
-            account: account_name.unwrap_or_default(),
+            // Cloned, not moved: the streaming arm below still needs
+            // `account_name` to log a mid-stream transport failure by name.
+            account: account_name.clone().unwrap_or_default(),
         });
 
         let is_stream = up_headers
@@ -2279,13 +2281,32 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // `&` reference forces edition-2021 precise capture to take the guard by
                 // value; an unmentioned capture would be elided and dropped early.
                 let _anchor = &_in_flight;
-                if let Ok(bytes) = &chunk {
-                    // Best-effort tee: `try_send` never blocks the passthrough. A
-                    // full channel (slow/starved parser) or a dropped receiver
-                    // drops the chunk for the PARSER only — usage counting becomes
-                    // best-effort under backpressure; the client stream forwards
-                    // untouched. Intentional discard, hence `let _`.
-                    let _ = tx.try_send(bytes.clone());
+                match &chunk {
+                    Ok(bytes) => {
+                        // Best-effort tee: `try_send` never blocks the passthrough. A
+                        // full channel (slow/starved parser) or a dropped receiver
+                        // drops the chunk for the PARSER only — usage counting becomes
+                        // best-effort under backpressure; the client stream forwards
+                        // untouched. Intentional discard, hence `let _`.
+                        let _ = tx.try_send(bytes.clone());
+                    }
+                    Err(err) => {
+                        // The transport died AFTER headers were already forwarded —
+                        // this `Err` is what silently reached the client as a
+                        // severed connection while the request was already booked
+                        // as a clean 200 upstream response. Nothing else observes
+                        // a body-level transport failure, so this is the only place
+                        // it is ever logged. Same field shape as the pre-header
+                        // transport-failure ladder above, so both halves of a
+                        // request's lifecycle log alike.
+                        tracing::warn!(
+                            account_index = idx,
+                            account = account_name.as_deref().unwrap_or("?"),
+                            error = ?err,
+                            "upstream transport failure mid-stream — forwarding the \
+                             severed connection to the client"
+                        );
+                    }
                 }
                 chunk
             });
@@ -2819,6 +2840,15 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
 /// as a template, and the `event: error` fixture below) — that is a truncated,
 /// failed turn, not usage to add to the quota. First `error` event wins; a
 /// second is ignored, so multi-event streams still name their root cause.
+///
+/// `message_stop` is Anthropic's ONLY marker for "this turn completed" — it
+/// does not appear anywhere else in this crate (grepped: zero hits before this
+/// function existed). A stream that ends without one — the transport dying
+/// mid-body, or the malformed/utf8 `break` above — is exactly as truncated as
+/// one that carries an in-band `error` event, so it gets the same treatment:
+/// `stream_error` is set, this time to the fixed kind `"truncated"`, UNLESS an
+/// `error` event already explained the failure (that one names a root cause;
+/// this one only names the absence of proof the turn finished).
 async fn parse_sse_usage<S, B, E>(stream: S) -> (ParsedUsage, Option<String>)
 where
     S: futures::Stream<Item = Result<B, E>>,
@@ -2829,6 +2859,7 @@ where
 
     let mut parsed = ParsedUsage::default();
     let mut stream_error: Option<String> = None;
+    let mut saw_message_stop = false;
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
             break; // malformed/utf8/transport error — stop parsing, keep totals
@@ -2858,6 +2889,9 @@ where
                     parsed.output = out;
                 }
             }
+            Some("message_stop") => {
+                saw_message_stop = true;
+            }
             // First `error` event wins — a later one is ignored (guard skips the
             // arm rather than nesting an `if` inside it, per clippy).
             Some("error") if stream_error.is_none() => {
@@ -2871,6 +2905,12 @@ where
             }
             _ => {}
         }
+    }
+    // The loop exited — either the upstream closed cleanly after `message_stop`,
+    // or it stopped short. No terminator and no more specific error already
+    // recorded means the turn's ending was never observed: that IS truncation.
+    if !saw_message_stop && stream_error.is_none() {
+        stream_error = Some("truncated".to_string());
     }
     (parsed, stream_error)
 }
@@ -3329,6 +3369,8 @@ mod tests {
             "\"cache_read_input_tokens\":1000,\"output_tokens\":1}}}\n\n",
             "event: message_delta\n",
             "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
         );
         // Split mid-way through the first event's data line.
         let split = 60usize;
@@ -3337,7 +3379,10 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[split..])),
         ];
         let (parsed, stream_error) = parse_sse_usage(futures::stream::iter(chunks)).await;
-        assert_eq!(stream_error, None, "a clean stream has no error event");
+        assert_eq!(
+            stream_error, None,
+            "a stream that reaches message_stop has no error event"
+        );
         // R1: the quota sum is byte-identical to before.
         assert_eq!(
             parsed.input_total, 1110,
@@ -3361,10 +3406,14 @@ mod tests {
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":20}}\n\n",
             "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":37}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
         let (parsed, stream_error) = parse_sse_usage(stream).await;
-        assert_eq!(stream_error, None, "a clean stream has no error event");
+        assert_eq!(
+            stream_error, None,
+            "a stream that reaches message_stop has no error event"
+        );
         assert_eq!(parsed.input_total, 5);
         assert_eq!(parsed.output, 37, "final cumulative output, not 20 + 37");
         // No cache tokens in this fixture → both stay zero.
@@ -6486,12 +6535,18 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL: a clean 200 SSE stream (normal `message_start` /
-    /// `message_delta`, no `error` event) must record NO stream error. Uses the
-    /// same bounded-poll discipline as the positive case — asserting absence
-    /// after a trivially-passing zero-wait would be vacuous.
+    /// THE OTHER BUG this fix closes: a stream that ends after `message_start` /
+    /// `message_delta` with no `message_stop` is not a clean serve — it is
+    /// indistinguishable, from inside `parse_sse_usage`, from a connection that
+    /// was severed mid-turn. Anthropic's ONLY marker that a turn actually
+    /// finished is `message_stop`; a complete turn carries one, and anything
+    /// that reaches EOF without one — this fixture included — is truncated.
+    /// Before this fix this test asserted `stream_error_count == 0` under the
+    /// docstring "a clean 200 SSE stream" for exactly this fixture — the
+    /// assertion WAS the bug, encoded as the contract. It is inverted here to
+    /// assert the truncation IS detected.
     #[tokio::test]
-    async fn sse_clean_stream_records_no_stream_error() {
+    async fn sse_stream_without_message_stop_is_recorded_as_truncated() {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_addr = upstream.local_addr().unwrap();
         tokio::spawn(async move {
@@ -6508,6 +6563,81 @@ mod tests {
                         "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
                         "event: message_delta\n",
                         "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        let _ = resp.bytes().await.unwrap();
+
+        let (seen, polls) = poll_stream_error_count(&manager, 1).await;
+        assert_eq!(
+            seen, 1,
+            "polled {polls} times, stream-error count stayed {seen} — a stream that \
+             ends without message_stop must be recorded as truncated, not booked as \
+             a clean serve"
+        );
+
+        // The tee task updates usage BEFORE it records the stream error (see the
+        // spawned task above `parse_sse_usage` is awaited in), so by the time the
+        // poll above observes the error count, usage from `message_start` has
+        // already landed too — truncation detection does not cost the quota
+        // accounting anything.
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens,
+            5,
+            "usage already parsed before the stream was found truncated must still count"
+        );
+    }
+
+    /// POSITIVE CONTROL for the truncation detector above: the identical
+    /// fixture, this time WITH `message_stop`, must record NO stream error.
+    /// Without this, the detector could not be told apart from one that fires
+    /// unconditionally — this is what proves it discriminates on the
+    /// terminator rather than on the mere absence of an in-band `error` event.
+    #[tokio::test]
+    async fn sse_stream_with_message_stop_records_no_stream_error() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                        "event: message_delta\n",
+                        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}\n\n",
+                        "event: message_stop\n",
+                        "data: {\"type\":\"message_stop\"}\n\n",
                     );
                     let response = format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -6556,7 +6686,7 @@ mod tests {
         assert_eq!(
             manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count,
             0,
-            "a clean SSE stream must record no stream error"
+            "a stream that reaches message_stop must record no stream error"
         );
     }
 
