@@ -287,14 +287,23 @@ pub struct AccountRuntime {
     pub probe_status: ProbeStatus,
     pub last_probe_ms: Option<i64>,
     pub probe_error: Option<String>,
-    /// Wall-clock ms of each in-band SSE `error` event observed on a stream this
-    /// account served (see [`Manager::record_stream_error`]), pruned to
-    /// [`STREAM_ERROR_WINDOW_MS`] and hard-capped at [`STREAM_ERROR_CAP`] entries
-    /// on BOTH insert and read, so it cannot grow unbounded. OBSERVABILITY ONLY —
-    /// nothing in `select.rs` reads this field; see that module's gates for why.
+    /// Wall-clock ms of each stream failure observed on a stream this account
+    /// served (see [`Manager::record_stream_error`]): an in-band SSE `error`
+    /// event, or a stream that hit EOF without Anthropic's `message_stop`
+    /// terminator — recorded with the fixed kind `"truncated"`, which covers a
+    /// mid-stream transport death and the malformed/utf8 break alike. An
+    /// `error` event takes precedence: EOF without `message_stop` is only
+    /// counted as `"truncated"` when no more specific `error` was already
+    /// recorded. Pruned to [`STREAM_ERROR_WINDOW_MS`] and hard-capped at
+    /// [`STREAM_ERROR_CAP`] entries on BOTH insert and read, so it cannot grow
+    /// unbounded. OBSERVABILITY ONLY — nothing in `select.rs` reads this
+    /// field; see that module's gates for why.
     pub stream_error_times_ms: VecDeque<i64>,
-    /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
-    /// alongside the decayed count above.
+    /// The most recent stream failure's kind: an Anthropic `error.type` (e.g.
+    /// `"overloaded_error"`) from an in-band SSE `error` event, or the fixed
+    /// string `"truncated"` when the stream hit EOF without `message_stop` and
+    /// no more specific `error` was already recorded, alongside the decayed
+    /// count above.
     pub last_stream_error: Option<String>,
     /// Coalescing gate for THIS account's OAuth refresh. Lives on the account rather
     /// than in a parallel Vec indexed by position, so an account added after startup
