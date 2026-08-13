@@ -22,7 +22,6 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -1450,6 +1449,31 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
     }
 }
 
+/// Whether a dropped SSE tee chunk represents genuine evidence loss for the
+/// truncation classifier. `evidence_dropped` asserts exactly one thing: that
+/// bytes arrived from UPSTREAM which the parser never got to see. `Full`
+/// answers yes — the bounded channel could not keep up, those bytes are
+/// gone, and "no `message_stop`" is no longer trustworthy. `Closed` answers
+/// a different question: the CONSUMER (the parser task's own `rx`-backed
+/// stream) went away. A consumer going away is never evidence that upstream
+/// data was lost, so it must not latch the same flag — the distinction holds
+/// no matter why `rx` closed, including a parser that later gains a read
+/// timeout, an explicit cancellation, or has its task aborted at shutdown.
+///
+/// `eventsource-stream`'s `Utf8Stream` never surfaces a UTF-8 error
+/// mid-stream — an unresolved tail is buffered, not rejected, until the
+/// underlying byte stream itself reaches EOF — so `parse_sse_usage`'s
+/// malformed-frame `break` cannot close `rx` while the upstream is still
+/// sending; that specific race is not constructible through real TCP
+/// behavior. What IS reachable: a parser-side panic drops `rx` while the
+/// upstream keeps streaming, and without this split every subsequent
+/// `try_send` on that request would latch `evidence_dropped`, making the
+/// classifier silently abstain on a turn whose evidence it never actually
+/// lost — an unrelated bug quietly disabling this feature.
+fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) -> bool {
+    matches!(err, tokio::sync::mpsc::error::TrySendError::Full(_))
+}
+
 /// The catch-all proxy handler.
 async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
@@ -2310,20 +2334,22 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 //
                 // A forwarded 3xx/4xx/5xx SSE body never had a `message_stop`
                 // contract to begin with — it is an error response, not a
-                // truncated turn — so nothing is classified unless the upstream
-                // actually answered 2xx.
-                if status_is_success {
-                    if let Some(kind) = stream_error {
-                        // An in-band `error` event is a POSITIVE observation —
-                        // we directly read those bytes off the wire, so it is
-                        // recorded regardless of how the tee itself ended. The
-                        // synthesized `TRUNCATED_STREAM_ERROR_KIND` is an
-                        // ABSENCE (no `message_stop` seen) rather than a
-                        // positive observation, and an absence is only
-                        // evidence when we know we saw everything there was to
-                        // see — hence the extra gate below, which the positive
-                        // case skips entirely.
-                        if kind == TRUNCATED_STREAM_ERROR_KIND {
+                // truncated turn — so the SYNTHESIZED verdict below only fires
+                // once the upstream actually answered 2xx. That status gate
+                // must scope to the synthesized branch ALONE: a genuine in-band
+                // `error` event is a positive observation read directly off
+                // the wire, independent of the response's status line, and
+                // wrapping it in the same `if` too was a coverage regression —
+                // a real error on a forwarded non-2xx body went unrecorded.
+                if let Some(kind) = stream_error {
+                    if kind == TRUNCATED_STREAM_ERROR_KIND {
+                        // The synthesized verdict is an ABSENCE (no
+                        // `message_stop` seen) rather than a positive
+                        // observation, and an absence is only evidence when we
+                        // know we saw everything there was to see — hence the
+                        // status gate plus the ended/evidence checks below,
+                        // which the positive case in the `else` skips entirely.
+                        if status_is_success {
                             let ended_naturally = ended_rx.await.is_ok();
                             let dropped = evidence_dropped_reader.load(Ordering::SeqCst);
                             if ended_naturally && !dropped {
@@ -2338,9 +2364,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                      a fabricated truncation"
                                 );
                             }
-                        } else {
-                            manager_side.record_stream_error(idx, &kind);
                         }
+                    } else {
+                        // An in-band `error` event is a POSITIVE observation —
+                        // we directly read those bytes off the wire, so it is
+                        // recorded regardless of the response status and
+                        // regardless of how the tee itself ended.
+                        manager_side.record_stream_error(idx, &kind);
                     }
                 }
             });
@@ -2357,8 +2387,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // disconnect — rather than at response-headers. See the long-form
             // comment this replaced for why `_in_flight` cannot just be a
             // handler-local.
-            struct TeeState {
-                inner: Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+            // Generic over the concrete upstream stream type rather than boxed
+            // as `dyn Stream` — there is exactly one call site (below), so a
+            // trait object bought nothing but a v-table indirection and a heap
+            // allocation on every streamed response.
+            struct TeeState<S> {
+                inner: S,
                 tx: tokio::sync::mpsc::Sender<Bytes>,
                 evidence_dropped: Arc<AtomicBool>,
                 ended: Option<tokio::sync::oneshot::Sender<()>>,
@@ -2367,28 +2401,36 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 _in_flight: InFlightGuard,
             }
             let state = TeeState {
-                inner: Box::pin(resp.bytes_stream()),
+                inner: resp.bytes_stream(),
                 tx,
                 evidence_dropped,
                 ended: Some(ended_tx),
                 account_index: idx,
-                account_name: account_name.clone(),
+                // Moved, not cloned: this is the last use of `account_name` in
+                // this iteration — the retry loop above already re-fetches its
+                // own copy from `manager.account_name(idx)` on the next pass.
+                account_name,
                 _in_flight,
             };
             let passthrough = futures::stream::unfold(state, |mut state| async move {
                 match state.inner.next().await {
                     Some(Ok(bytes)) => {
                         // Best-effort tee: `try_send` never blocks the
-                        // passthrough. A full channel (slow/starved parser) or
-                        // a dropped receiver drops the chunk for the PARSER
-                        // only — usage counting becomes best-effort under
-                        // backpressure; the client stream forwards untouched.
-                        // Unlike before, the drop is no longer silent: it
-                        // flips `evidence_dropped` so the parser task can tell
-                        // "no message_stop" apart from "no message_stop THAT
-                        // WE COULD SEE".
-                        if state.tx.try_send(bytes.clone()).is_err() {
-                            state.evidence_dropped.store(true, Ordering::SeqCst);
+                        // passthrough. A FULL channel (slow/starved parser)
+                        // drops the chunk for the PARSER only — usage counting
+                        // becomes best-effort under backpressure; the client
+                        // stream forwards untouched. That drop is genuine
+                        // evidence loss and flips `evidence_dropped` so the
+                        // parser task can tell "no message_stop" apart from
+                        // "no message_stop THAT WE COULD SEE". A CLOSED
+                        // receiver is a different thing entirely — the parser
+                        // task's own `rx`-side stream already ended and it does
+                        // not want any more bytes — so it must not poison the
+                        // verdict the same way; see [`is_genuine_evidence_loss`].
+                        if let Err(err) = state.tx.try_send(bytes.clone()) {
+                            if is_genuine_evidence_loss(&err) {
+                                state.evidence_dropped.store(true, Ordering::SeqCst);
+                            }
                         }
                         Some((Ok(bytes), state))
                     }
@@ -2968,11 +3010,23 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
 /// one that carries an in-band `error` event, so it gets the same treatment:
 /// `stream_error` is set, this time to the fixed kind [`TRUNCATED_STREAM_ERROR_KIND`],
 /// UNLESS an `error` event already explained the failure (that one names a
-/// root cause; this one only names the absence of proof the turn finished) —
-/// OR `message_start` never arrived either, because then this was never
-/// observed to be a Messages turn in the first place (a non-2xx SSE error
-/// body or a non-Messages endpoint that happens to share the content-type has
-/// no `message_stop` contract to begin with, so its absence proves nothing).
+/// root cause; this one only names the absence of proof the turn finished).
+///
+/// The remaining case is a stream that never saw `message_start` — this used
+/// to suppress the verdict unconditionally, on the theory that such a stream
+/// was "never confirmed to be a Messages turn" (a non-2xx SSE error body, a
+/// HEAD response, or a future non-Messages endpoint sharing the content-type).
+/// That conflated two shapes that are NOT the same: a stream cut off before
+/// its first parseable event (zero events observed at all — `!saw_any_event`)
+/// and a stream that genuinely produced OTHER events but none of them
+/// `message_start` (`saw_any_event && !saw_message_start`). Only the second
+/// one is evidence the stream was never a Messages turn; the first is
+/// indistinguishable from a Messages turn severed before `message_start` ever
+/// arrived — the single worst case this classifier exists to catch, since it
+/// otherwise records nothing at all. So the verdict fires when `message_start`
+/// was seen (truncated mid-turn) OR nothing was ever seen (severed before the
+/// first event) — and stays silent only when events arrived that affirmatively
+/// were not `message_start`.
 async fn parse_sse_usage<S, B, E>(stream: S) -> (ParsedUsage, Option<String>)
 where
     S: futures::Stream<Item = Result<B, E>>,
@@ -2983,6 +3037,7 @@ where
 
     let mut parsed = ParsedUsage::default();
     let mut stream_error: Option<String> = None;
+    let mut saw_any_event = false;
     let mut saw_message_start = false;
     let mut saw_message_stop = false;
     while let Some(item) = events.next().await {
@@ -2992,6 +3047,7 @@ where
         if event.data.is_empty() {
             continue;
         }
+        saw_any_event = true;
         let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
             continue;
         };
@@ -3034,11 +3090,16 @@ where
     }
     // The loop exited — either the upstream closed cleanly after `message_stop`,
     // or it stopped short. No terminator and no more specific error already
-    // recorded means the turn's ending was never observed: that IS truncation
-    // — but only for a stream that was ever confirmed to BE a Messages turn.
-    // Without `saw_message_start`, "no message_stop" is not evidence of
-    // anything (see the doc comment above).
-    if saw_message_start && !saw_message_stop && stream_error.is_none() {
+    // recorded means the turn's ending was never observed: that IS truncation,
+    // for either of two shapes — `message_start` was seen (a confirmed Messages
+    // turn that never reached its terminator) or NOTHING was ever seen at all
+    // (`!saw_any_event`, severed before the stream produced a single event —
+    // indistinguishable from a Messages turn cut off before `message_start`,
+    // so it gets the same verdict rather than a silent pass). The one case
+    // that stays silent is events having arrived that affirmatively were not
+    // `message_start` — that is the actual proof this was never a Messages
+    // turn (see the doc comment above).
+    if !saw_message_stop && stream_error.is_none() && (saw_message_start || !saw_any_event) {
         stream_error = Some(TRUNCATED_STREAM_ERROR_KIND.to_string());
     }
     (parsed, stream_error)
@@ -3551,23 +3612,113 @@ mod tests {
     }
 
     /// FALSE-POSITIVE case #3 (contract-derived, not a path allowlist): a
-    /// stream that never sent `message_start` was never confirmed to BE a
-    /// Messages turn in the first place — a forwarded 3xx/4xx/5xx SSE error
-    /// body, a HEAD response, or a future non-Messages endpoint that happens
-    /// to share `text/event-stream` all look like this from inside
-    /// `parse_sse_usage`. Before the `saw_message_start` gate, the absence of
-    /// `message_stop` alone was enough to synthesize `"truncated"` here; an
-    /// empty stream would have been misclassified on every such request.
+    /// stream that PRODUCED events but none of them `message_start` was
+    /// never confirmed to BE a Messages turn in the first place — a future
+    /// non-Messages endpoint that happens to share `text/event-stream` looks
+    /// exactly like this from inside `parse_sse_usage`. This is the only
+    /// shape that earns the exemption. A round-4 fix (see the sibling test
+    /// below) narrowed this from "no message_start" to "no message_start
+    /// AND at least one other event arrived" — a stream with ZERO events is
+    /// a different, indistinguishable-from-severed-early shape and must NOT
+    /// share this exemption; conflating the two was exactly the round-4 bug.
     #[tokio::test]
-    async fn sse_stream_with_no_message_start_records_no_stream_error() {
-        let stream = futures::stream::iter(Vec::<Result<Bytes, Infallible>>::new());
+    async fn sse_stream_with_non_message_events_records_no_stream_error() {
+        // A heartbeat-shaped event, never `message_start` — stands in for a
+        // non-Messages endpoint that happens to emit `text/event-stream`.
+        let full = concat!("event: heartbeat\n", "data: {\"type\":\"heartbeat\"}\n\n",);
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
         let (parsed, stream_error) = parse_sse_usage(stream).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error, None,
-            "a stream that never confirmed itself as a Messages turn (no \
-             message_start) must not be classified as truncated just because \
-             it also has no message_stop"
+            "a stream that produced events but none of them message_start \
+             was genuinely never a Messages turn — it must not be classified \
+             as truncated just because it also has no message_stop"
+        );
+    }
+
+    /// THE SEVEREST case this classifier exists to catch (round-4 fix): a
+    /// stream cut off BEFORE its first parseable event ever arrives. Before
+    /// this fix, `saw_message_start` gated the verdict on its own, so this
+    /// looked IDENTICAL to the sibling test above — zero events either way —
+    /// and a 2xx Messages turn severed before `message_start` recorded
+    /// NOTHING: zero content delivered to the client, `tcr status` showing a
+    /// perfectly healthy account. That is precisely "a truncated turn booked
+    /// as a clean serve," the bug this whole feature exists to catch. The
+    /// fix keys on `saw_any_event` instead of `saw_message_start` alone: zero
+    /// events is indistinguishable from a Messages turn severed early, so it
+    /// gets the SAME verdict as the confirmed-truncated case, not the
+    /// not-a-Messages-turn exemption above.
+    #[tokio::test]
+    async fn sse_stream_severed_before_any_event_records_truncation() {
+        let stream = futures::stream::iter(Vec::<Result<Bytes, Infallible>>::new());
+        let (parsed, stream_error) = parse_sse_usage(stream).await;
+        assert_eq!(parsed, ParsedUsage::default());
+        assert_eq!(
+            stream_error.as_deref(),
+            Some(TRUNCATED_STREAM_ERROR_KIND),
+            "a stream that produced ZERO parseable events before ending must \
+             be treated as truncated, not silently passed — it is \
+             indistinguishable from a Messages turn severed before \
+             message_start ever arrived"
+        );
+    }
+
+    /// MUST-RECORD: "a malformed/utf8 frame that ends parsing mid-turn ⇒
+    /// truncation, not abstention." `eventsource-stream` 0.2.3's `Utf8Stream`
+    /// never surfaces a UTF-8 error MID-stream (it buffers an unresolved
+    /// tail hoping the next chunk completes it) — the error only surfaces
+    /// once the underlying byte stream ends with that tail still unresolved
+    /// (verified by reading `utf8_stream.rs`: mid-stream `Ok` is returned
+    /// unconditionally; `Err` is only constructed in the `Poll::Ready(None)`
+    /// arm). So "malformed frame" and "stream end" are the same moment here
+    /// — this fixture reproduces that: a confirmed `message_start`, then one
+    /// byte (`0xFF`) that can never resolve into valid UTF-8 no matter what
+    /// follows, and nothing follows. `parse_sse_usage`'s `break` on that `Err`
+    /// must still leave `saw_message_start` set, so the post-loop check
+    /// classifies it exactly like the ordinary "no message_stop" case.
+    #[tokio::test]
+    async fn sse_stream_with_malformed_utf8_after_message_start_records_truncation() {
+        let head = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\
+             \"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+        );
+        let chunks = vec![
+            Ok::<Bytes, Infallible>(Bytes::from(head)),
+            Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&[0xFFu8])),
+        ];
+        let (parsed, stream_error) = parse_sse_usage(futures::stream::iter(chunks)).await;
+        assert_eq!(
+            parsed.input_total, 5,
+            "usage from message_start is retained even though the stream ends malformed"
+        );
+        assert_eq!(
+            stream_error.as_deref(),
+            Some(TRUNCATED_STREAM_ERROR_KIND),
+            "a confirmed Messages turn that ends on an unresolvable malformed \
+             byte must be treated as truncated, not silently abstained"
+        );
+    }
+
+    /// The other half of the malformed-frame property: `evidence_dropped`
+    /// must latch on `Full` (a real dropped chunk — genuine evidence loss)
+    /// and NOT on `Closed` (the consumer went away — never evidence about
+    /// upstream data). See [`is_genuine_evidence_loss`]'s doc comment for why
+    /// that distinction holds independent of the malformed-frame path
+    /// specifically. Exercised directly against the extracted predicate
+    /// rather than a network-level reproduction of the race, which the
+    /// malformed-frame path alone cannot trigger.
+    #[test]
+    fn evidence_loss_predicate_distinguishes_full_from_closed() {
+        use tokio::sync::mpsc::error::TrySendError;
+        assert!(
+            is_genuine_evidence_loss(&TrySendError::Full(())),
+            "a full channel is genuine evidence loss — the parser never saw those bytes"
+        );
+        assert!(
+            !is_genuine_evidence_loss(&TrySendError::Closed(())),
+            "a closed receiver is the parser's own exit, not evidence loss"
         );
     }
 
@@ -7040,6 +7191,146 @@ mod tests {
             0,
             "a forwarded 400 body missing message_stop is an error response, \
              not a truncated Messages turn — it must not be classified"
+        );
+    }
+
+    /// End-to-end version of `sse_stream_severed_before_any_event_records_truncation`
+    /// above: a 2xx `text/event-stream` response that closes with an EMPTY
+    /// body — no bytes at all, so `parse_sse_usage` sees zero events — must
+    /// be recorded as truncated through the FULL pipeline, including the
+    /// `status_is_success` / `ended_naturally` / `evidence_dropped` gates the
+    /// unit-level test above never exercises. This is the severest live
+    /// regression named in the round-4 review: before the fix, this exact
+    /// shape recorded NOTHING — zero content delivered to the client, and
+    /// the account looked perfectly healthy.
+    #[tokio::test]
+    async fn sse_stream_severed_before_message_start_is_recorded_as_truncated_e2e() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    // Headers claim an SSE body, then the connection closes
+                    // having sent NOT ONE byte of it — severed before the
+                    // stream could ever produce its first parseable event.
+                    let response = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let _ = resp.bytes().await.unwrap();
+
+        let (seen, polls) = poll_stream_error_count(&manager, 1).await;
+        assert_eq!(
+            seen, 1,
+            "polled {polls} times, stream-error count stayed {seen} — a 2xx \
+             SSE stream severed before its first event must be recorded as \
+             truncated, not booked as a clean serve"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .last_stream_error
+                .as_deref(),
+            Some(TRUNCATED_STREAM_ERROR_KIND)
+        );
+    }
+
+    /// MUST-RECORD: "an in-band `error` event, at ANY status, always." This is
+    /// the live regression from `status_is_success` wrapping BOTH the
+    /// synthesized-truncation branch and the positive-observation branch: a
+    /// genuine `error` event forwarded inside a NON-2xx body used to be
+    /// silently dropped, a coverage regression versus before the truncation
+    /// feature existed at all. Same fixture shape as
+    /// `sse_error_event_is_observed_not_counted_as_clean_serve` (a 200), this
+    /// time on a 400 — proving the status gate no longer reaches the positive
+    /// case.
+    #[tokio::test]
+    async fn in_band_error_on_non_2xx_is_recorded_regardless_of_status() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = concat!(
+                        "event: error\n",
+                        "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad\"}}\n\n",
+                    );
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let _ = resp.bytes().await.unwrap();
+
+        let (seen, polls) = poll_stream_error_count(&manager, 1).await;
+        assert_eq!(
+            seen, 1,
+            "polled {polls} times, stream-error count stayed {seen} — an \
+             in-band SSE error event must be observed on a forwarded non-2xx \
+             body too, not just on 200"
+        );
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0]
+                .last_stream_error
+                .as_deref(),
+            Some("invalid_request_error"),
+            "the recorded kind must be the POSITIVE observation read off the \
+             wire, never the synthesized \"truncated\" kind — this path must \
+             not go anywhere near the status_is_success gate"
         );
     }
 

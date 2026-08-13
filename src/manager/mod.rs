@@ -366,11 +366,14 @@ pub struct AccountRuntime {
 
 // Test-only fault injection for `build_serving_client`: set via
 // `fail_next_client_build`, consumed (and cleared) by the next call on this
-// thread. Exists to prove — with a real panic, not a hypothetical one — that
-// `Manager::add_or_update_account`'s Added path builds its runtime BEFORE
-// taking `self.accounts`'s write lock: a panic here that happens UNDER that
-// lock poisons it for every other `.expect("accounts lock poisoned")` call
-// site in this module; one that happens before the lock is taken does not.
+// thread. Exists to prove — with a real panic, not a hypothetical one — two
+// properties of `Manager::add_or_update_account`: its Added path builds the
+// runtime with NEITHER `self.accounts` nor `config_write` held, so a panic
+// here poisons neither lock — every other `.expect(...)` call site on either
+// one in this module would otherwise go down with it — and its Updated path
+// never reaches this function at all. See
+// `add_or_update_account_added_path_does_not_poison_either_lock_on_a_client_build_panic`
+// and `add_or_update_account_updated_path_never_builds_a_client`.
 #[cfg(test)]
 thread_local! {
     static FAIL_NEXT_CLIENT_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -834,6 +837,15 @@ fn ms_to_odt(ms: i64) -> Option<OffsetDateTime> {
 /// Fold a u64 session key to a short, stable hex id for display (24 bits).
 fn short_session_id(key: u64) -> String {
     format!("{:06x}", ((key ^ (key >> 40)) & 0xFF_FFFF))
+}
+
+/// Whether a wall-clock cooldown deadline (epoch ms) has elapsed as of `now_ms`.
+/// `None` (no cooldown armed) reads as "not held back by this gate" — the same
+/// shape [`Manager::probeable_indices`]'s `error_retry_after_ms` check and
+/// [`Manager::warm_targets`]'s `warm_evidence_retry_after_ms` check both need,
+/// factored out so the two don't drift on the `>=` vs `>` boundary.
+fn cooldown_elapsed(deadline_ms: Option<i64>, now_ms: i64) -> bool {
+    deadline_ms.is_some_and(|until| now_ms >= until)
 }
 
 impl Manager {
@@ -1459,13 +1471,19 @@ impl Manager {
     /// one-directional edge (`config_write` → `self.accounts`) to the lock
     /// order, not a cycle. `persist_added`/`persist_replaced` no longer take
     /// `config_write` themselves — they assume the caller already holds it.
+    ///
+    /// A resolution that lands on Added needs a freshly-built
+    /// [`AccountRuntime`] (a `reqwest::Client`) to push, and building one must
+    /// never happen while EITHER lock is held — a panic mid-build would
+    /// poison it for every other `.expect(...)` site on that lock,
+    /// `config_write` included (`persist_tokens`, `persist_now`'s shutdown
+    /// flush, this function's own next call). So `config_write` is held
+    /// across each ATTEMPT's resolve/mutate/persist, not necessarily across
+    /// the whole call: an attempt that resolves Added with no runtime ready
+    /// yet mutates NOTHING, drops both locks, builds, and retries — see the
+    /// loop inside the function body for why at most one retry is ever
+    /// needed and why it cannot reopen the TOCTOU above.
     pub fn add_or_update_account(&self, mut account: config::Account) -> AddAccountOutcome {
-        // N2 — see above: held across resolve, mutate AND persist so this
-        // whole operation never interleaves with another concurrent call's.
-        let _writing = self
-            .config_write
-            .lock()
-            .expect("config write lock poisoned");
         let target = crate::identity::probe(
             &account.name,
             account.account_uuid.clone(),
@@ -1476,28 +1494,11 @@ impl Manager {
             && account.org_uuid.is_none()
             && account.org_name.is_none();
 
-        // Built SPECULATIVELY, before `self.accounts`'s write lock below —
-        // `AccountRuntime::from_config` ends in `build_serving_client()`'s
-        // `.expect("build reqwest client")`, and a panic while that lock's write
-        // guard is held poisons it for every other caller (`http_client`,
-        // `select`, `snapshot`, `record_stream_error`, ~97 sites total all
-        // `.expect` the same lock). Every field `from_config` derives from
-        // `account` is already final at this point except possibly `priority`
-        // (only mutated below, under the lock, and only on the Added path) — so
-        // if resolution lands on Added, the `priority` field is patched on this
-        // already-built value instead of rebuilding. If it lands on Updated,
-        // this is simply dropped unused. Mirrors what `add_account` already
-        // does (build before the lock); `add_or_update_account` isn't a hot
-        // path (`POST /_tcr/accounts`, driven by login/config-reload, not by
-        // served traffic), so building one extra idle client on the Updated
-        // path costs nothing worth avoiding.
-        let mut speculative_runtime = AccountRuntime::from_config(&account);
-
         /// What the locked resolve-and-mutate section below produced, so the
         /// durable write can run after `self.accounts`'s lock is released —
         /// `persist_added`/`persist_replaced` do their own file I/O and must
         /// never run under `self.accounts`'s lock (though both still run
-        /// under `config_write`, held since function entry — see the N2
+        /// under `config_write`, held since this attempt's start — see the N2
         /// doc-comment on `add_or_update_account`).
         enum Resolution {
             Added {
@@ -1513,186 +1514,225 @@ impl Manager {
                 /// clippy flags the size gap between variants otherwise.
                 target: Box<config::Account>,
             },
+            /// The resolve below landed on Added, but there is no
+            /// already-built [`AccountRuntime`] to push yet — see the loop
+            /// below, which built nothing here on purpose.
+            NeedsBuild,
         }
 
-        let resolution = {
-            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        // Built on demand, never while a lock is held — see the doc-comment
+        // above `add_or_update_account`. `None` until the first attempt
+        // below discovers it actually needs one.
+        let mut speculative_runtime: Option<AccountRuntime> = None;
 
-            let probes: Vec<(usize, config::Account)> = accounts
-                .iter()
-                .enumerate()
-                .map(|(i, a)| {
-                    (
-                        i,
-                        crate::identity::probe(
-                            &a.name,
-                            a.account_uuid.clone(),
-                            a.org_uuid.clone(),
-                            a.org_name.clone(),
-                        ),
-                    )
-                })
-                .collect();
+        loop {
+            // N2 — see above: held across THIS ATTEMPT's resolve, mutate and
+            // persist so it never interleaves with another concurrent call's.
+            // Dropped early, before any mutation, on an attempt that turns out
+            // to need a client it doesn't have yet (`NeedsBuild` below).
+            let _writing = self
+                .config_write
+                .lock()
+                .expect("config write lock poisoned");
 
-            let matched =
-                match crate::identity::resolve(probes.iter().map(|(i, p)| (*i, p)), &target) {
-                    crate::identity::Resolved::One(idx) => Some(idx),
-                    crate::identity::Resolved::Many => {
-                        // Recompute the loose set for its names: `Resolved::Many`
-                        // itself carries none, and this is exactly the set
-                        // `resolve` drew from (same predicate, same candidates).
-                        let names = accounts
-                            .iter()
-                            .filter(|a| {
-                                crate::identity::same_identity(
-                                    &target,
-                                    &crate::identity::probe(
-                                        &a.name,
-                                        a.account_uuid.clone(),
-                                        a.org_uuid.clone(),
-                                        a.org_name.clone(),
-                                    ),
-                                )
-                            })
-                            .map(|a| a.name.clone())
-                            .collect();
-                        return AddAccountOutcome::Ambiguous(names);
-                    }
-                    crate::identity::Resolved::None if bare_identity => {
-                        match crate::identity::match_one(&accounts[..], &account.name, None) {
-                            crate::identity::Match::One(idx) => Some(idx),
-                            crate::identity::Match::None => None,
-                            crate::identity::Match::Ambiguous(names) => {
-                                return AddAccountOutcome::Ambiguous(names);
+            let resolution = {
+                let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+
+                let probes: Vec<(usize, config::Account)> = accounts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        (
+                            i,
+                            crate::identity::probe(
+                                &a.name,
+                                a.account_uuid.clone(),
+                                a.org_uuid.clone(),
+                                a.org_name.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+
+                let matched =
+                    match crate::identity::resolve(probes.iter().map(|(i, p)| (*i, p)), &target) {
+                        crate::identity::Resolved::One(idx) => Some(idx),
+                        crate::identity::Resolved::Many => {
+                            // Recompute the loose set for its names: `Resolved::Many`
+                            // itself carries none, and this is exactly the set
+                            // `resolve` drew from (same predicate, same candidates).
+                            let names = accounts
+                                .iter()
+                                .filter(|a| {
+                                    crate::identity::same_identity(
+                                        &target,
+                                        &crate::identity::probe(
+                                            &a.name,
+                                            a.account_uuid.clone(),
+                                            a.org_uuid.clone(),
+                                            a.org_name.clone(),
+                                        ),
+                                    )
+                                })
+                                .map(|a| a.name.clone())
+                                .collect();
+                            return AddAccountOutcome::Ambiguous(names);
+                        }
+                        crate::identity::Resolved::None if bare_identity => {
+                            match crate::identity::match_one(&accounts[..], &account.name, None) {
+                                crate::identity::Match::One(idx) => Some(idx),
+                                crate::identity::Match::None => None,
+                                crate::identity::Match::Ambiguous(names) => {
+                                    return AddAccountOutcome::Ambiguous(names);
+                                }
                             }
                         }
-                    }
-                    crate::identity::Resolved::None => None,
-                };
-
-            match matched {
-                Some(idx) => {
-                    let row = accounts
-                        .get_mut(idx)
-                        .expect("idx was just resolved against this same vec");
-                    row.access_token = account.access_token.clone();
-                    row.refresh_token = account.refresh_token.clone();
-                    row.expires_at_ms = account.expires_at.map(oauth::normalize_expires_at);
-                    // F4: fresh credentials clear a stuck error — `eligible`
-                    // hard-gates on `status == Error` — but do NOT clear a
-                    // rate-limit hold. That hold expires on its own
-                    // (`MAX_RATE_LIMIT_HOLD_SECONDS`) and the next 429 re-arms
-                    // it; clearing it here bought nothing but the ability to
-                    // race a genuinely-still-limited account back into
-                    // rotation early.
-                    if row.status == AccountStatus::Error {
-                        row.status = AccountStatus::Active;
-                    }
-                    // F6: the submitted type always wins — this route only
-                    // ever carries a real credential, so a row whose stored
-                    // type was stale (e.g. `"api"`) is corrected, or
-                    // `refresh_plan` silently never refreshes it again.
-                    // Identity fields are BACKFILLED — filled in only where
-                    // the row does not already carry a value — mirroring
-                    // `oauth::upsert_account`. Backfilling (rather than
-                    // ignoring) is what permanently closes the split-brain
-                    // trigger: once a legacy no-org row's org is filled in,
-                    // it stops being loosely matched by every org variant of
-                    // that person and starts requiring an exact org match,
-                    // like any other fully-known account.
-                    row.account_type = account.account_type.clone();
-                    if row.account_uuid.is_none() {
-                        row.account_uuid = account.account_uuid.clone();
-                    }
-                    if row.org_uuid.is_none() {
-                        row.org_uuid = account.org_uuid.clone();
-                    }
-                    if row.org_name.is_none() {
-                        row.org_name = account.org_name.clone();
-                    }
-                    // F5: carry the row's REAL routing state, not
-                    // `identity::probe`'s None placeholders — see
-                    // `persist_replaced`'s doc-comment for the restart-un-bench
-                    // this replaces.
-                    let target = config::Account {
-                        name: row.name.clone(),
-                        account_type: row.account_type.clone(),
-                        account_uuid: row.account_uuid.clone(),
-                        org_uuid: row.org_uuid.clone(),
-                        org_name: row.org_name.clone(),
-                        access_token: String::new(),
-                        refresh_token: None,
-                        expires_at: None,
-                        priority: Some(row.priority),
-                        switch_threshold: row.switch_threshold,
-                        disabled: row.disabled.then_some(true),
-                        extra: serde_json::Map::new(),
+                        crate::identity::Resolved::None => None,
                     };
-                    Resolution::Updated {
-                        idx,
-                        name: row.name.clone(),
-                        target: Box::new(target),
-                    }
-                }
-                None => {
-                    // A follow-up regression on this arm (distinct from the
-                    // TOCTOU fix this function is named for above): an
-                    // appended account with no explicit priority must join
-                    // the BACK of the fleet — `max(existing priorities) + 1`
-                    // — not the 0 that `AccountRuntime::from_config`'s
-                    // `unwrap_or(0)` reads from an absent priority, which
-                    // would silently promote it to the PRIMARY tier ahead of
-                    // the established fleet. Computed from `accounts` (the
-                    // LIVE rotation, not the config snapshot) because this
-                    // section already holds its write lock and it is
-                    // authoritative for what is routing right now. Skipped
-                    // when the caller submitted an explicit priority (the
-                    // documented new-account case — see `AddAccountRequest`'s
-                    // doc-comment in `proxy.rs`), which is never overridden.
-                    // Mirrors the identical fix in `config::merge_account`'s
-                    // Added arm.
-                    if account.priority.is_none() {
-                        let next_priority = accounts
-                            .iter()
-                            .map(|a| a.priority)
-                            .max()
-                            .map_or(0, |max| max + 1);
-                        account.priority = Some(next_priority);
-                        // The speculative build above ran before `next_priority`
-                        // was known — patch it in rather than rebuilding (which
-                        // would call `build_serving_client()` again, under this
-                        // same lock, resurrecting exactly the bug this comment
-                        // block exists to avoid).
-                        speculative_runtime.priority = next_priority;
-                    }
-                    accounts.push(speculative_runtime);
-                    Resolution::Added {
-                        idx: accounts.len() - 1,
-                    }
-                }
-            }
-        };
 
-        match resolution {
-            Resolution::Added { idx } => {
-                // Still sequential, never nested, with `self.accounts` (which
-                // is already released by this point) — the `self.config` lock
-                // here is a separate, short critical section, same discipline
-                // `add_account` documents. It runs nested inside
-                // `config_write` (held since function entry, see the N2
-                // doc-comment above), which is what makes this whole arm
-                // atomic with respect to another concurrent call.
-                {
-                    let mut config = self.config.lock().expect("config lock poisoned");
-                    config.accounts.push(account.clone());
+                match matched {
+                    Some(idx) => {
+                        let row = accounts
+                            .get_mut(idx)
+                            .expect("idx was just resolved against this same vec");
+                        row.access_token = account.access_token.clone();
+                        row.refresh_token = account.refresh_token.clone();
+                        row.expires_at_ms = account.expires_at.map(oauth::normalize_expires_at);
+                        // F4: fresh credentials clear a stuck error — `eligible`
+                        // hard-gates on `status == Error` — but do NOT clear a
+                        // rate-limit hold. That hold expires on its own
+                        // (`MAX_RATE_LIMIT_HOLD_SECONDS`) and the next 429 re-arms
+                        // it; clearing it here bought nothing but the ability to
+                        // race a genuinely-still-limited account back into
+                        // rotation early.
+                        if row.status == AccountStatus::Error {
+                            row.status = AccountStatus::Active;
+                        }
+                        // F6: the submitted type always wins — this route only
+                        // ever carries a real credential, so a row whose stored
+                        // type was stale (e.g. `"api"`) is corrected, or
+                        // `refresh_plan` silently never refreshes it again.
+                        // Identity fields are BACKFILLED — filled in only where
+                        // the row does not already carry a value — mirroring
+                        // `oauth::upsert_account`. Backfilling (rather than
+                        // ignoring) is what permanently closes the split-brain
+                        // trigger: once a legacy no-org row's org is filled in,
+                        // it stops being loosely matched by every org variant of
+                        // that person and starts requiring an exact org match,
+                        // like any other fully-known account.
+                        row.account_type = account.account_type.clone();
+                        if row.account_uuid.is_none() {
+                            row.account_uuid = account.account_uuid.clone();
+                        }
+                        if row.org_uuid.is_none() {
+                            row.org_uuid = account.org_uuid.clone();
+                        }
+                        if row.org_name.is_none() {
+                            row.org_name = account.org_name.clone();
+                        }
+                        // F5: carry the row's REAL routing state, not
+                        // `identity::probe`'s None placeholders — see
+                        // `persist_replaced`'s doc-comment for the restart-un-bench
+                        // this replaces.
+                        let target = config::Account {
+                            name: row.name.clone(),
+                            account_type: row.account_type.clone(),
+                            account_uuid: row.account_uuid.clone(),
+                            org_uuid: row.org_uuid.clone(),
+                            org_name: row.org_name.clone(),
+                            access_token: String::new(),
+                            refresh_token: None,
+                            expires_at: None,
+                            priority: Some(row.priority),
+                            switch_threshold: row.switch_threshold,
+                            disabled: row.disabled.then_some(true),
+                            extra: serde_json::Map::new(),
+                        };
+                        Resolution::Updated {
+                            idx,
+                            name: row.name.clone(),
+                            target: Box::new(target),
+                        }
+                    }
+                    None => match speculative_runtime.take() {
+                        // No runtime ready yet — mutate nothing, report it, and
+                        // let the loop below build one with no lock held before
+                        // retrying. Safe to abandon this attempt outright: it
+                        // has not touched `accounts`, `self.config`, or disk.
+                        None => Resolution::NeedsBuild,
+                        Some(mut runtime) => {
+                            // A follow-up regression on this arm (distinct from the
+                            // TOCTOU fix this function is named for above): an
+                            // appended account with no explicit priority must join
+                            // the BACK of the fleet — `max(existing priorities) + 1`
+                            // — not the 0 that `AccountRuntime::from_config`'s
+                            // `unwrap_or(0)` reads from an absent priority, which
+                            // would silently promote it to the PRIMARY tier ahead of
+                            // the established fleet. Computed from `accounts` (the
+                            // LIVE rotation, not the config snapshot) because this
+                            // section already holds its write lock and it is
+                            // authoritative for what is routing right now. Skipped
+                            // when the caller submitted an explicit priority (the
+                            // documented new-account case — see `AddAccountRequest`'s
+                            // doc-comment in `proxy.rs`), which is never overridden.
+                            // Mirrors the identical fix in `config::merge_account`'s
+                            // Added arm.
+                            if account.priority.is_none() {
+                                let next_priority = accounts
+                                    .iter()
+                                    .map(|a| a.priority)
+                                    .max()
+                                    .map_or(0, |max| max + 1);
+                                account.priority = Some(next_priority);
+                                // Built on the PRIOR attempt, before `next_priority`
+                                // was known — patch it in rather than rebuilding
+                                // (which would call `build_serving_client()` again,
+                                // under this same lock, resurrecting exactly the bug
+                                // the loop above exists to avoid).
+                                runtime.priority = next_priority;
+                            }
+                            accounts.push(runtime);
+                            Resolution::Added {
+                                idx: accounts.len() - 1,
+                            }
+                        }
+                    },
                 }
-                let name = account.name.clone();
-                let persist = self.persist_added(&account);
-                AddAccountOutcome::Added { idx, name, persist }
-            }
-            Resolution::Updated { idx, name, target } => {
-                let persist = self.persist_replaced(idx, &target, &account);
-                AddAccountOutcome::Updated { idx, name, persist }
+            };
+
+            match resolution {
+                Resolution::NeedsBuild => {
+                    // Both locks are released here (self.accounts already went
+                    // out of scope above; config_write is dropped explicitly)
+                    // before the one call that can panic — see the doc-comment
+                    // above `add_or_update_account`. Nothing was mutated on this
+                    // attempt, so retrying from scratch is safe; the next
+                    // attempt is guaranteed to have a runtime ready, so it
+                    // cannot hit this arm again.
+                    drop(_writing);
+                    speculative_runtime = Some(AccountRuntime::from_config(&account));
+                    continue;
+                }
+                Resolution::Added { idx } => {
+                    // Still sequential, never nested, with `self.accounts` (which
+                    // is already released by this point) — the `self.config` lock
+                    // here is a separate, short critical section, same discipline
+                    // `add_account` documents. It runs nested inside
+                    // `config_write` (held since this attempt's start, see the N2
+                    // doc-comment above), which is what makes this whole arm
+                    // atomic with respect to another concurrent call.
+                    {
+                        let mut config = self.config.lock().expect("config lock poisoned");
+                        config.accounts.push(account.clone());
+                    }
+                    let name = account.name.clone();
+                    let persist = self.persist_added(&account);
+                    return AddAccountOutcome::Added { idx, name, persist };
+                }
+                Resolution::Updated { idx, name, target } => {
+                    let persist = self.persist_replaced(idx, &target, &account);
+                    return AddAccountOutcome::Updated { idx, name, persist };
+                }
             }
         }
     }
@@ -6111,20 +6151,29 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Before this fix, the Added path's `AccountRuntime::from_config(&account)`
+    /// Before the first fix, the Added path's `AccountRuntime::from_config(&account)`
     /// ran INSIDE the `self.accounts.write()` block — meaning
     /// `build_serving_client`'s `.expect("build reqwest client")` executed while
     /// the write guard was held. A panic there poisons the `RwLock` for every
     /// other caller in this module: `http_client`, `select`, `snapshot`,
     /// `record_stream_error` and ~93 more all `.expect("accounts lock
     /// poisoned")`, so one recoverable client-build failure would take down the
-    /// whole proxy. Uses the `#[cfg(test)]` fault-injection seam on
-    /// `build_serving_client` to make that failure real rather than
-    /// hypothetical, on a submission guaranteed to resolve Added (an empty
-    /// fleet, so nothing can match), and asserts the lock survives.
+    /// whole proxy.
+    ///
+    /// A second round moved the build OUTSIDE `self.accounts`'s lock but left
+    /// it inside `config_write` (held from function entry in that version) —
+    /// so the SAME panic instead poisoned `config_write`, which is arguably
+    /// worse: `persist_tokens` and `persist_now`'s shutdown flush both
+    /// `.expect()` it, so a poisoned `config_write` stops rotated refresh
+    /// tokens from ever reaching disk again, on top of every future call to
+    /// this very function panicking at its own `config_write.lock()`.
+    ///
+    /// Uses the `#[cfg(test)]` fault-injection seam on `build_serving_client`
+    /// to make that failure real rather than hypothetical, on a submission
+    /// guaranteed to resolve Added (an empty fleet, so nothing can match),
+    /// and asserts BOTH locks survive.
     #[test]
-    fn add_or_update_account_added_path_does_not_poison_the_accounts_lock_on_a_client_build_panic()
-    {
+    fn add_or_update_account_added_path_does_not_poison_either_lock_on_a_client_build_panic() {
         let manager = build_manager(config_with(vec![]), lock_refresher());
         let submission = account("brand-new@example.com", 0);
 
@@ -6142,6 +6191,51 @@ mod tests {
             "a client-build panic in add_or_update_account must not poison the \
              accounts lock — every other .expect(\"accounts lock poisoned\") \
              call site would panic in turn"
+        );
+        assert!(
+            manager.config_write.lock().is_ok(),
+            "a client-build panic in add_or_update_account must not poison the \
+             config_write lock either — persist_tokens and persist_now's \
+             shutdown flush both .expect() it, and this function itself takes \
+             it again on its very next call"
+        );
+    }
+
+    /// The Added-only half of the fix above: an ordinary re-auth of an
+    /// EXISTING account (the common case this route serves — every token
+    /// refresh's re-login goes through `POST /_tcr/accounts`, not just a
+    /// first-time add) must resolve Updated on its FIRST locked attempt and
+    /// never reach `build_serving_client` at all. A version that built the
+    /// runtime unconditionally before resolving (fixing the poisoning bug
+    /// above but not this one) would waste a client build on every re-auth
+    /// and widen the panic surface to a call that never needed one. Arms the
+    /// SAME fault-injection seam on a submission guaranteed to resolve
+    /// Updated (an existing row with a matching bare identity) — if the
+    /// build were ever reached the injected panic would fire, so a normal
+    /// return proves it was not.
+    #[test]
+    fn add_or_update_account_updated_path_never_builds_a_client() {
+        let existing = account("alice@example.com", 0);
+        let manager = build_manager(config_with(vec![existing.clone()]), lock_refresher());
+        let mut resubmission = existing.clone();
+        resubmission.access_token = "at-alice-rotated".to_string();
+
+        fail_next_client_build();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            manager.add_or_update_account(resubmission)
+        }));
+
+        let outcome = result.unwrap_or_else(|_| {
+            panic!(
+                "add_or_update_account must never reach build_serving_client on \
+                 the Updated path — the injected client-build failure should \
+                 not have fired at all"
+            )
+        });
+        assert!(
+            matches!(outcome, AddAccountOutcome::Updated { .. }),
+            "setup: the resubmission must resolve against the existing row, \
+             not append a new one"
         );
     }
 
@@ -6750,6 +6844,62 @@ mod tests {
             manager.warm_targets().contains(&0),
             "an elapsed retry cooldown must recover an account the warm latch \
              excluded, without a restart"
+        );
+    }
+
+    /// The failing half of the recovery above. `record_warm_without_evidence`
+    /// only re-arms `warm_evidence_retry_after_ms` from the Ok-but-header-less
+    /// branch of `warm_account` — a warm that FAILS outright takes the `Err`
+    /// arm instead, which (before this fix) never touched the deadline. Once
+    /// the cooldown had elapsed, a FAILING retry left the now-past deadline in
+    /// place, and `warm_targets`' `cooldown_elapsed` check re-admitted the
+    /// account on every subsequent pass rather than once per cooldown — the
+    /// "one bounded retry burst per hour" property collapsing back to "every
+    /// tick" on the failure path specifically, which is the unbounded-repeat
+    /// bug this whole latch exists to bound. Drives an account past the limit
+    /// and elapses its cooldown directly (this test is about the `Err` arm's
+    /// re-arm, not about repeating `warm_account` 50 times to get there), then
+    /// feeds it ONE failing warm (`NoWarmer` always returns `Err`) and asserts
+    /// the deadline moved back into the future — and the account is excluded
+    /// again immediately, not just eventually.
+    #[tokio::test]
+    async fn a_failing_retry_does_not_reset_the_warm_evidence_cooldown() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager_with_warmer(
+            config_with(vec![account("cold", 0)]),
+            refresher,
+            Arc::new(NoWarmer),
+        );
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].consecutive_warms_without_evidence = WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT;
+            accounts[0].warm_evidence_retry_after_ms = Some(crate::now_ms() - 1);
+        }
+        assert!(
+            manager.warm_targets().contains(&0),
+            "setup: an elapsed cooldown must make the account a target again"
+        );
+
+        manager.warm_account(0).await; // NoWarmer always returns Err
+
+        let deadline = {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            accounts[0].warm_evidence_retry_after_ms
+        };
+        assert!(
+            deadline.is_some_and(|until| until > crate::now_ms()),
+            "a FAILING retry must re-arm the cooldown into the future too, not \
+             just an Ok-but-header-less one — otherwise the account is \
+             re-admitted on every subsequent tick instead of once per cooldown"
+        );
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "immediately after a failing retry the account must be excluded \
+             again, not left eligible on a stale past deadline"
         );
     }
 
