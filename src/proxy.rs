@@ -22,6 +22,8 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +41,8 @@ use time::OffsetDateTime;
 
 use crate::config;
 use crate::manager::{
-    AccountStatus, AddAccountOutcome, AddPersist, DisablePersist, Manager, SetDisabledOutcome,
+    AccountStatus, AddAccountOutcome, AddPersist, DisablePersist, InFlightGuard, Manager,
+    SetDisabledOutcome,
 };
 use crate::stats::{RequestLogEntry, SessionKind};
 
@@ -52,6 +55,13 @@ const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
 /// the parser (usage counting becomes best-effort) rather than letting the buffer
 /// grow without bound or gating the client passthrough on the parser.
 const SSE_TEE_CAPACITY: usize = 256;
+/// The fixed `stream_error` kind [`parse_sse_usage`] synthesizes when a stream
+/// ends without Anthropic's `message_stop` terminator and no more specific
+/// in-band `error` event already explained why. Named so the proxy handler's
+/// classifier can tell "we witnessed an explicit error" (always trustworthy)
+/// apart from "we never saw the terminator" (trustworthy only when we also
+/// know we saw everything there was to see — see the handler's use of this).
+const TRUNCATED_STREAM_ERROR_KIND: &str = "truncated";
 /// A transient `429` whose `retry-after` is within this bound is waited out
 /// inline on the same account; anything longer throttles + rotates instead of
 /// tying up the client connection.
@@ -2251,7 +2261,30 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // channel; `try_send` on the passthrough side keeps that bound from
             // ever applying backpressure to the client — see below.
             let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(SSE_TEE_CAPACITY);
+            // Distinguishes WHY the tee ends. A plain `.map()` over the upstream
+            // stream (this passthrough's previous shape) only ever sees `Some`
+            // items — it cannot observe `Ready(None)`/the stream being dropped,
+            // so a client hitting Esc mid-turn (axum drops the response body,
+            // dropping everything the passthrough owns) looked IDENTICAL, from
+            // inside the parser, to the upstream finishing the stream itself.
+            // This oneshot is consumed exactly once, the moment `TeeState` (below)
+            // observes the WRAPPED stream reach a genuine terminal state — clean
+            // EOF or a transport error, both real signals ABOUT THE UPSTREAM. If
+            // `TeeState` is dropped before either happens (client walked away),
+            // the sender drops unfired and `ended_rx` resolves to `Err` — the
+            // signal for "we never learned how the stream would have ended,"
+            // which must never be booked as truncation.
+            let (ended_tx, ended_rx) = tokio::sync::oneshot::channel::<()>();
+            // Set the instant a teed chunk is dropped by the bounded channel
+            // below (full channel or a dead receiver). A dropped chunk might
+            // have been the one carrying `message_stop` — from that point on,
+            // "no message_stop was observed" no longer means "the turn was
+            // truncated", it means "we don't know", so the classifier abstains
+            // instead of guessing.
+            let evidence_dropped = Arc::new(AtomicBool::new(false));
+            let evidence_dropped_reader = Arc::clone(&evidence_dropped);
             let manager_side = manager.clone();
+            let status_is_success = status.is_success();
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -2274,50 +2307,128 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // (a truncated stream booked as a clean serve). Called ONCE per
                 // stream, after the parse loop ends, never per event — a
                 // per-event call on a long erroring stream is a log-flood vector.
-                if let Some(kind) = stream_error {
-                    manager_side.record_stream_error(idx, &kind);
+                //
+                // A forwarded 3xx/4xx/5xx SSE body never had a `message_stop`
+                // contract to begin with — it is an error response, not a
+                // truncated turn — so nothing is classified unless the upstream
+                // actually answered 2xx.
+                if status_is_success {
+                    if let Some(kind) = stream_error {
+                        // An in-band `error` event is a POSITIVE observation —
+                        // we directly read those bytes off the wire, so it is
+                        // recorded regardless of how the tee itself ended. The
+                        // synthesized `TRUNCATED_STREAM_ERROR_KIND` is an
+                        // ABSENCE (no `message_stop` seen) rather than a
+                        // positive observation, and an absence is only
+                        // evidence when we know we saw everything there was to
+                        // see — hence the extra gate below, which the positive
+                        // case skips entirely.
+                        if kind == TRUNCATED_STREAM_ERROR_KIND {
+                            let ended_naturally = ended_rx.await.is_ok();
+                            let dropped = evidence_dropped_reader.load(Ordering::SeqCst);
+                            if ended_naturally && !dropped {
+                                manager_side.record_stream_error(idx, &kind);
+                            } else {
+                                tracing::debug!(
+                                    account_index = idx,
+                                    ended_naturally,
+                                    evidence_dropped = dropped,
+                                    "SSE stream ended without message_stop but the tee \
+                                     cannot prove why — abstaining rather than recording \
+                                     a fabricated truncation"
+                                );
+                            }
+                        } else {
+                            manager_side.record_stream_error(idx, &kind);
+                        }
+                    }
                 }
             });
-            let passthrough = resp.bytes_stream().map(move |chunk| {
-                // Anchor the in-flight guard to THIS streamed body. Returning
-                // `Body::from_stream(..)` drops every handler-local, but axum polls
-                // the body AFTER the handler returns — so a handler-local guard would
-                // decrement `in_flight` at response-headers while the stream keeps
-                // flowing for seconds. Moving the OWNED guard into this `move` closure
-                // makes the closure (hence the stream body) own it, so its Drop — the
-                // account's `in_flight` decrement — fires at stream completion / client
-                // disconnect / body drop, which is when pacing must count the load. The
-                // `&` reference forces edition-2021 precise capture to take the guard by
-                // value; an unmentioned capture would be elided and dropped early.
-                let _anchor = &_in_flight;
-                match &chunk {
-                    Ok(bytes) => {
-                        // Best-effort tee: `try_send` never blocks the passthrough. A
-                        // full channel (slow/starved parser) or a dropped receiver
-                        // drops the chunk for the PARSER only — usage counting becomes
-                        // best-effort under backpressure; the client stream forwards
-                        // untouched. Intentional discard, hence `let _`.
-                        let _ = tx.try_send(bytes.clone());
+
+            // Threads the tee's mutable state — the wrapped byte stream, the
+            // side-channel sender, the dropped-evidence flag, the `ended`
+            // oneshot, and the `_in_flight` RAII guard — through
+            // `stream::unfold` so all of it lives exactly as long as the
+            // passthrough stream does and drops in ONE place, together. That
+            // single drop site is what lets `ended` (this arm's job: tell the
+            // parser task client-abandonment from upstream-completion) and
+            // `_in_flight` (unrelated: pacing's load counter) each fire exactly
+            // once, at real completion — clean EOF, transport error, OR client
+            // disconnect — rather than at response-headers. See the long-form
+            // comment this replaced for why `_in_flight` cannot just be a
+            // handler-local.
+            struct TeeState {
+                inner: Pin<Box<dyn futures::Stream<Item = reqwest::Result<Bytes>> + Send>>,
+                tx: tokio::sync::mpsc::Sender<Bytes>,
+                evidence_dropped: Arc<AtomicBool>,
+                ended: Option<tokio::sync::oneshot::Sender<()>>,
+                account_index: usize,
+                account_name: Option<String>,
+                _in_flight: InFlightGuard,
+            }
+            let state = TeeState {
+                inner: Box::pin(resp.bytes_stream()),
+                tx,
+                evidence_dropped,
+                ended: Some(ended_tx),
+                account_index: idx,
+                account_name: account_name.clone(),
+                _in_flight,
+            };
+            let passthrough = futures::stream::unfold(state, |mut state| async move {
+                match state.inner.next().await {
+                    Some(Ok(bytes)) => {
+                        // Best-effort tee: `try_send` never blocks the
+                        // passthrough. A full channel (slow/starved parser) or
+                        // a dropped receiver drops the chunk for the PARSER
+                        // only — usage counting becomes best-effort under
+                        // backpressure; the client stream forwards untouched.
+                        // Unlike before, the drop is no longer silent: it
+                        // flips `evidence_dropped` so the parser task can tell
+                        // "no message_stop" apart from "no message_stop THAT
+                        // WE COULD SEE".
+                        if state.tx.try_send(bytes.clone()).is_err() {
+                            state.evidence_dropped.store(true, Ordering::SeqCst);
+                        }
+                        Some((Ok(bytes), state))
                     }
-                    Err(err) => {
-                        // The transport died AFTER headers were already forwarded —
-                        // this `Err` is what silently reached the client as a
-                        // severed connection while the request was already booked
-                        // as a clean 200 upstream response. Nothing else observes
-                        // a body-level transport failure, so this is the only place
-                        // it is ever logged. Same field shape as the pre-header
+                    Some(Err(err)) => {
+                        // The transport died AFTER headers were already
+                        // forwarded — this `Err` is what silently reached the
+                        // client as a severed connection while the request was
+                        // already booked as a clean 200 upstream response.
+                        // Nothing else observes a body-level transport
+                        // failure, so this is the only place it is ever
+                        // logged. Same field shape as the pre-header
                         // transport-failure ladder above, so both halves of a
-                        // request's lifecycle log alike.
+                        // request's lifecycle log alike. It is ALSO a genuine
+                        // observation about the upstream, not a client
+                        // abandonment — fire `ended` before returning it.
                         tracing::warn!(
-                            account_index = idx,
-                            account = account_name.as_deref().unwrap_or("?"),
+                            account_index = state.account_index,
+                            account = state.account_name.as_deref().unwrap_or("?"),
                             error = ?err,
                             "upstream transport failure mid-stream — forwarding the \
                              severed connection to the client"
                         );
+                        if let Some(ended) = state.ended.take() {
+                            let _ = ended.send(());
+                        }
+                        Some((Err(err), state))
+                    }
+                    None => {
+                        // Clean EOF — the upstream itself closed the stream.
+                        // Also a genuine observation. Client abandonment never
+                        // reaches this arm at all: axum drops the response
+                        // body (hence this whole stream, mid-poll) instead of
+                        // ever seeing it reach `None`, which drops `state` —
+                        // and `state.ended` along with it — unfired.
+                        if let Some(ended) = state.ended.take() {
+                            let _ = ended.send(());
+                        }
+                        None
                     }
                 }
-                chunk
             });
             return build_response(
                 status,
@@ -2855,9 +2966,13 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
 /// function existed). A stream that ends without one — the transport dying
 /// mid-body, or the malformed/utf8 `break` above — is exactly as truncated as
 /// one that carries an in-band `error` event, so it gets the same treatment:
-/// `stream_error` is set, this time to the fixed kind `"truncated"`, UNLESS an
-/// `error` event already explained the failure (that one names a root cause;
-/// this one only names the absence of proof the turn finished).
+/// `stream_error` is set, this time to the fixed kind [`TRUNCATED_STREAM_ERROR_KIND`],
+/// UNLESS an `error` event already explained the failure (that one names a
+/// root cause; this one only names the absence of proof the turn finished) —
+/// OR `message_start` never arrived either, because then this was never
+/// observed to be a Messages turn in the first place (a non-2xx SSE error
+/// body or a non-Messages endpoint that happens to share the content-type has
+/// no `message_stop` contract to begin with, so its absence proves nothing).
 async fn parse_sse_usage<S, B, E>(stream: S) -> (ParsedUsage, Option<String>)
 where
     S: futures::Stream<Item = Result<B, E>>,
@@ -2868,6 +2983,7 @@ where
 
     let mut parsed = ParsedUsage::default();
     let mut stream_error: Option<String> = None;
+    let mut saw_message_start = false;
     let mut saw_message_stop = false;
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
@@ -2881,6 +2997,7 @@ where
         };
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                saw_message_start = true;
                 if let Some(usage) = value.get("message").and_then(|m| m.get("usage")) {
                     parsed.input_total = sum_input_tokens(usage);
                     (parsed.cache_read, parsed.cache_creation) = cache_breakdown(usage);
@@ -2917,9 +3034,12 @@ where
     }
     // The loop exited — either the upstream closed cleanly after `message_stop`,
     // or it stopped short. No terminator and no more specific error already
-    // recorded means the turn's ending was never observed: that IS truncation.
-    if !saw_message_stop && stream_error.is_none() {
-        stream_error = Some("truncated".to_string());
+    // recorded means the turn's ending was never observed: that IS truncation
+    // — but only for a stream that was ever confirmed to BE a Messages turn.
+    // Without `saw_message_start`, "no message_stop" is not evidence of
+    // anything (see the doc comment above).
+    if saw_message_start && !saw_message_stop && stream_error.is_none() {
+        stream_error = Some(TRUNCATED_STREAM_ERROR_KIND.to_string());
     }
     (parsed, stream_error)
 }
@@ -3428,6 +3548,27 @@ mod tests {
         // No cache tokens in this fixture → both stay zero.
         assert_eq!(parsed.cache_read, 0);
         assert_eq!(parsed.cache_creation, 0);
+    }
+
+    /// FALSE-POSITIVE case #3 (contract-derived, not a path allowlist): a
+    /// stream that never sent `message_start` was never confirmed to BE a
+    /// Messages turn in the first place — a forwarded 3xx/4xx/5xx SSE error
+    /// body, a HEAD response, or a future non-Messages endpoint that happens
+    /// to share `text/event-stream` all look like this from inside
+    /// `parse_sse_usage`. Before the `saw_message_start` gate, the absence of
+    /// `message_stop` alone was enough to synthesize `"truncated"` here; an
+    /// empty stream would have been misclassified on every such request.
+    #[tokio::test]
+    async fn sse_stream_with_no_message_start_records_no_stream_error() {
+        let stream = futures::stream::iter(Vec::<Result<Bytes, Infallible>>::new());
+        let (parsed, stream_error) = parse_sse_usage(stream).await;
+        assert_eq!(parsed, ParsedUsage::default());
+        assert_eq!(
+            stream_error, None,
+            "a stream that never confirmed itself as a Messages turn (no \
+             message_start) must not be classified as truncated just because \
+             it also has no message_stop"
+        );
     }
 
     /// Non-stream JSON path also sums the cache tokens into `input`.
@@ -6696,6 +6837,209 @@ mod tests {
             manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count,
             0,
             "a stream that reaches message_stop must record no stream error"
+        );
+    }
+
+    /// FALSE-POSITIVE case #1 (the worst of the set): a CLIENT abandoning the
+    /// connection mid-turn — exactly what happens when a user hits Esc in
+    /// Claude Code — must record NOTHING, not `"truncated"`. Before the
+    /// `ended`/`evidence_dropped` machinery, `tx` was owned by the `.map()`
+    /// closure over `resp.bytes_stream()`; axum dropping the response body on
+    /// client disconnect dropped that closure, hence `tx`, and `rx.recv()`
+    /// returning `None` was INDISTINGUISHABLE from the upstream finishing the
+    /// stream itself. The fake upstream here sends `message_start` and then
+    /// hangs forever (never sends `message_stop`, never closes) — the ONLY
+    /// way this stream ever ends is the test client dropping it, so any
+    /// `stream_error` this test observes was fabricated from an interrupt,
+    /// not from anything upstream actually did.
+    ///
+    /// Also covers the overwrite half of the same bug: a genuine PRIOR
+    /// `last_stream_error` is seeded before the interrupted request, and must
+    /// survive it untouched — `record_stream_error` always overwrites the
+    /// label (see its doc comment), so a false "truncated" here would have
+    /// erased real evidence of the account being `overloaded_error`.
+    #[tokio::test]
+    async fn client_abort_mid_stream_records_no_stream_error() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let event = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                    );
+                    // Chunked, not content-length: a real Messages turn's
+                    // length isn't known up front. One chunk, then HANG —
+                    // never a terminating "0\r\n\r\n" chunk, never a close.
+                    // If the client does not abandon this connection, this
+                    // handler simply blocks forever and the test times out —
+                    // which is the point: nothing here ever produces
+                    // `message_stop` or EOF on its own.
+                    let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+                    let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+                    let _ = sock.write_all(headers.as_bytes()).await;
+                    let _ = sock.write_all(chunk.as_bytes()).await;
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+        // Seed a genuine prior error BEFORE the interrupted request — the
+        // overwrite-on-abandonment bug would clobber this.
+        manager.record_stream_error(0, "overloaded_error");
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let resp = client
+                .post(format!("http://{proxy_addr}/v1/messages"))
+                .body("{}")
+                .send()
+                .await
+                .unwrap();
+            let mut body = resp.bytes_stream();
+            // Read the ONE chunk the fake upstream ever sends, proving the
+            // tee actually started, THEN abandon — mirrors a client that
+            // received partial output before the user hit Esc.
+            let first = body.next().await;
+            assert!(first.is_some(), "expected the message_start chunk");
+            drop(body);
+        })
+        .await
+        .expect("client-abort scenario must not hang the server");
+
+        // Positive, waitable signal that the tee's parse loop drained the one
+        // chunk it got: usage from `message_start` lands regardless of how
+        // the stream ends (see `sse_stream_without_message_stop_...` above).
+        let (input_tokens, polls) = {
+            let mut polls = 0u32;
+            let mut seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
+            while seen == 0 && polls < 200 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                seen = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].input_tokens;
+                polls += 1;
+            }
+            (seen, polls)
+        };
+        assert_eq!(
+            input_tokens, 5,
+            "polled {polls} times waiting for usage to land"
+        );
+
+        // No positive signal exists for "the classifier decided to abstain" —
+        // silence IS the pass condition — so flat-wait comfortably past the
+        // `ended`/`evidence_dropped` decision (a local oneshot + atomic load,
+        // never network-bound) before asserting nothing changed.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.accounts[0].stream_error_count, 1,
+            "count must stay at the ONE seeded error — the client abandoning \
+             the connection must add nothing"
+        );
+        assert_eq!(
+            snapshot.accounts[0].last_stream_error.as_deref(),
+            Some("overloaded_error"),
+            "the genuine prior error label must survive a client abandoning \
+             a later stream — record_stream_error unconditionally overwrites \
+             this field, so a fabricated \"truncated\" here would erase real \
+             evidence"
+        );
+    }
+
+    /// FALSE-POSITIVE case #3: a forwarded non-2xx response never had a
+    /// `message_stop` contract — it is an error response, not a truncated
+    /// turn. The fixture is deliberately the SAME shape that would have been
+    /// misclassified as truncated before this fix (a `message_start` with no
+    /// `message_stop`), on a 400 instead of a 200, to prove the status gate
+    /// — not the message_start gate above — is what suppresses it here.
+    #[tokio::test]
+    async fn non_2xx_sse_body_records_no_stream_error() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = concat!(
+                        "event: message_start\n",
+                        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+                    );
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let _ = resp.bytes().await.unwrap();
+
+        // record_served fires on the terminal outcome regardless of status
+        // (same as the in-band-error test above) — a waitable positive
+        // signal that the request was actually processed before we check for
+        // the absence of a stream error.
+        let mut polls = 0u32;
+        let mut requests = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests;
+        while requests == 0 && polls < 200 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            requests = manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests;
+            polls += 1;
+        }
+        assert_eq!(
+            requests, 1,
+            "polled {polls} times waiting for the request to be booked"
+        );
+
+        // Flat-wait past where the tee task would have recorded a stream
+        // error had the status gate not suppressed it — same rationale as
+        // the client-abort test above (silence is the pass condition).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            manager.snapshot(OffsetDateTime::now_utc()).accounts[0].stream_error_count,
+            0,
+            "a forwarded 400 body missing message_stop is an error response, \
+             not a truncated Messages turn — it must not be classified"
         );
     }
 
