@@ -129,6 +129,43 @@ const ERROR_REPROBE_CAP_MS: i64 = 30 * 60_000;
 /// here at all.
 const PROBE_FAILURES_BEFORE_WARMING_UNPROBED: u32 = 3;
 
+/// Bound on consecutive keep-warm requests that succeeded (200) but carried NONE
+/// of the `anthropic-ratelimit-unified-5h-*` headers — a response that latches no
+/// evidence (see [`Manager::update_quota`]'s doc-comment: "a response WITHOUT the
+/// header latches nothing"). Left unbounded, such an account would stay a
+/// [`Manager::warm_targets`] member forever — its 5h window never gets folded, so
+/// `live_reset` never fires — and get re-warmed every cadence at real upstream
+/// cost for nothing.
+///
+/// Mirrors [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] in shape (three consecutive
+/// misses is a hiccup, not a verdict) but bounds the opposite direction: that one
+/// bounds a WAIT before warming starts; this one bounds a REPEAT once warming
+/// itself stops producing evidence.
+///
+/// Crossing this excludes the account from [`Manager::warm_targets`] — but that
+/// exclusion must itself be recoverable without a restart, or a transient
+/// upstream condition that strips the 5h headers for a few minutes sidelines the
+/// account for the life of the process. [`AccountRuntime::warm_evidence_retry_after_ms`]
+/// is that recovery: a flat cooldown, not a per-response reset — an EARLIER
+/// version of this fix reset the counter on every successful background probe,
+/// which reopened exactly the loop this constant bounds (`probeable_indices`
+/// probes an excluded account regardless of `warm_targets` membership, so a
+/// probe-triggered reset re-armed a full burst of [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]
+/// warms every probe cycle — worse than the original unbounded-warm bug).
+const WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT: u32 = 3;
+
+/// Flat cooldown before a keep-warm-excluded account (see
+/// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]) is retried. An hour: two orders of
+/// magnitude cheaper than retrying every probe cycle (probe cadence defaults to
+/// minutes, not hours — see [`crate::probe::DEFAULT_PROBE_SECONDS`]) while still
+/// recovering well inside a restart's cost. Deliberately a flat wait, not
+/// exponential backoff like [`AccountRuntime::error_backoff_ms`]: a header-less
+/// warm response is not evidence the account is unhealthy (unlike a rejected
+/// refresh token), so there is no reason to believe the NEXT retry is less
+/// likely to work than this one, and a flat interval keeps the recovery time
+/// bound simple to state.
+const WARM_EVIDENCE_RETRY_COOLDOWN_MS: i64 = 3_600_000;
+
 /// Decay window for [`AccountRuntime::stream_error_times_ms`] — how far back a
 /// stream error still counts toward the operator-facing decayed count. An hour:
 /// long enough to show a persistent pattern, short enough that a stale blip from
@@ -220,6 +257,27 @@ pub struct AccountRuntime {
     /// probe fails forever, so gating on it unconditionally makes keep-warm
     /// structurally dark. See [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`].
     pub consecutive_probe_failures: u32,
+    /// Consecutive keep-warm requests ([`Manager::warm_account`]) that succeeded
+    /// but carried none of the unified 5h rate-limit headers — a 200 that latched
+    /// no evidence. Reset to `0` only by a response (warm or served) whose
+    /// headers DO carry the 5h window — see [`Manager::update_quota`].
+    /// Deliberately NOT reset by a successful background probe
+    /// ([`Manager::apply_usage`]): see that function's doc-comment for why a
+    /// probe read is not the evidence this counter is bounding. Bounds
+    /// [`Manager::warm_targets`]'s otherwise-unbounded repeat; see
+    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]. The exclusion this drives is
+    /// recovered by [`Self::warm_evidence_retry_after_ms`] instead, once its
+    /// cooldown elapses.
+    pub consecutive_warms_without_evidence: u32,
+    /// Set by [`Manager::record_warm_without_evidence`] once
+    /// `consecutive_warms_without_evidence` reaches
+    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]: the wall-clock instant (epoch
+    /// ms) at or after which [`Manager::warm_targets`] treats this account as
+    /// eligible again despite the counter still being at or over the limit —
+    /// one bounded retry per [`WARM_EVIDENCE_RETRY_COOLDOWN_MS`], not one per
+    /// probe cycle. `None` when the account is not currently excluded, or once
+    /// a header-bearing response clears it (see [`Manager::update_quota`]).
+    pub warm_evidence_retry_after_ms: Option<i64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
@@ -266,20 +324,105 @@ pub struct AccountRuntime {
     pub probe_status: ProbeStatus,
     pub last_probe_ms: Option<i64>,
     pub probe_error: Option<String>,
-    /// Wall-clock ms of each in-band SSE `error` event observed on a stream this
-    /// account served (see [`Manager::record_stream_error`]), pruned to
-    /// [`STREAM_ERROR_WINDOW_MS`] and hard-capped at [`STREAM_ERROR_CAP`] entries
-    /// on BOTH insert and read, so it cannot grow unbounded. OBSERVABILITY ONLY —
-    /// nothing in `select.rs` reads this field; see that module's gates for why.
+    /// Wall-clock ms of each stream failure observed on a stream this account
+    /// served (see [`Manager::record_stream_error`]): an in-band SSE `error`
+    /// event, or a stream that hit EOF without Anthropic's `message_stop`
+    /// terminator — recorded with the fixed kind `"truncated"`, which covers a
+    /// mid-stream transport death and the malformed/utf8 break alike. An
+    /// `error` event takes precedence: EOF without `message_stop` is only
+    /// counted as `"truncated"` when no more specific `error` was already
+    /// recorded. Pruned to [`STREAM_ERROR_WINDOW_MS`] and hard-capped at
+    /// [`STREAM_ERROR_CAP`] entries on BOTH insert and read, so it cannot grow
+    /// unbounded. OBSERVABILITY ONLY — nothing in `select.rs` reads this
+    /// field; see that module's gates for why.
     pub stream_error_times_ms: VecDeque<i64>,
-    /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
-    /// alongside the decayed count above.
+    /// The most recent stream failure's kind: an Anthropic `error.type` (e.g.
+    /// `"overloaded_error"`) from an in-band SSE `error` event, or the fixed
+    /// string `"truncated"` when the stream hit EOF without `message_stop` and
+    /// no more specific `error` was already recorded, alongside the decayed
+    /// count above.
     pub last_stream_error: Option<String>,
     /// Coalescing gate for THIS account's OAuth refresh. Lives on the account rather
     /// than in a parallel Vec indexed by position, so an account added after startup
     /// cannot be missing one — the desync it replaces made `ensure_fresh` a silent
     /// no-op (no log, no status change) until the initial token expired.
     pub refresh_lock: Arc<AsyncMutex<()>>,
+    /// This account's OWN upstream-forwarding client — never shared with any
+    /// other account. `hyper-util`'s pool keys a connection on `(scheme,
+    /// authority)` alone (`PoolKey`, `client/legacy/client.rs`), with nothing in
+    /// that key touching the Bearer token or account identity — so a single
+    /// `reqwest::Client` reused across the fleet collapses every account's
+    /// traffic onto ONE pooled connection, and that connection's death (an h2
+    /// `PROTOCOL_ERROR` reset, observed live spanning 2-3 distinct accounts at
+    /// once) takes every account down with it, defeating rotation and failover
+    /// at the connection layer no matter how healthy any individual account is.
+    /// Built once per account by [`build_serving_client`] (never rebuilt on
+    /// every request — that would throw away the warm pool this exists to
+    /// keep) and wrapped in `Arc` so [`Manager::http_client`] can hand out
+    /// cheap clones while still letting a test prove two accounts' clients are
+    /// genuinely distinct instances via `Arc::ptr_eq`.
+    pub http: Arc<reqwest::Client>,
+}
+
+// Test-only fault injection for `build_serving_client`: set via
+// `fail_next_client_build`, consumed (and cleared) by the next call on this
+// thread. Exists to prove — with a real panic, not a hypothetical one — that
+// `Manager::add_or_update_account`'s Added path builds its runtime BEFORE
+// taking `self.accounts`'s write lock: a panic here that happens UNDER that
+// lock poisons it for every other `.expect("accounts lock poisoned")` call
+// site in this module; one that happens before the lock is taken does not.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CLIENT_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm [`FAIL_NEXT_CLIENT_BUILD`] so the next call to `build_serving_client` on
+/// this thread panics instead of building. Test-only.
+#[cfg(test)]
+pub(crate) fn fail_next_client_build() {
+    FAIL_NEXT_CLIENT_BUILD.with(|f| f.set(true));
+}
+
+/// Build one upstream-forwarding HTTP client. Called once per account (see
+/// [`AccountRuntime::http`]) so every account's client is configured
+/// identically and differs from every other account's only in the connection
+/// pool it privately owns.
+pub(crate) fn build_serving_client() -> Arc<reqwest::Client> {
+    #[cfg(test)]
+    if FAIL_NEXT_CLIENT_BUILD.with(|f| f.replace(false)) {
+        panic!("build reqwest client (test-injected failure)");
+    }
+    // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
+    // proxy — routing our upstream through an ambient proxy (e.g. the JS
+    // teamclaude on :3456) loops us through the thing we replace and every
+    // request dies as "upstream unreachable". Always reach Anthropic directly.
+    Arc::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
+            // otherwise stalls the attempt until the OS TCP timeout, and with a
+            // retry budget of `account_count * 2 + 4` that is many minutes of a
+            // hung request. `oauth.rs` and `probe.rs` both already set one.
+            //
+            // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
+            // responses are long-lived SSE streams that legitimately run longer
+            // than any bound worth setting, and a total timeout would truncate
+            // them mid-stream. `connect_timeout` cannot — it applies only before
+            // the response headers arrive, so once a stream is flowing it is out
+            // of the picture.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // Keep the single HTTP/2 connection to Anthropic warm across
+            // interactive think-time pauses. reqwest reaps idle connections
+            // after 90s by default, but a coding session routinely pauses
+            // longer — so the next request would pay a fresh TCP+TLS handshake
+            // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
+            // connection open so a post-pause request skips the reconnect.
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("build reqwest client"),
+    )
 }
 
 /// A rotation slot answers a user's account query by the same three fields a
@@ -385,6 +528,8 @@ impl AccountRuntime {
             // every account's quota is genuinely unread.
             quota_known: false,
             consecutive_probe_failures: 0,
+            consecutive_warms_without_evidence: 0,
+            warm_evidence_retry_after_ms: None,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -404,6 +549,7 @@ impl AccountRuntime {
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
             refresh_lock: Arc::new(AsyncMutex::new(())),
+            http: build_serving_client(),
         }
     }
 }
@@ -549,9 +695,6 @@ pub struct Manager {
     /// ONLY on the false→true `quota_known` flip, which happens at most once per
     /// account per process, so it can never become a self-feeding loop of sweeps.
     warm_wake: Notify,
-    /// Client used for upstream forwarding — deliberately no total timeout so
-    /// long SSE streams are never cut (an idle guard belongs on the read side).
-    http: reqwest::Client,
     /// The persisted config, kept so token refreshes can be written back with
     /// every unmodelled field intact.
     config: Mutex<Config>,
@@ -750,35 +893,6 @@ impl Manager {
             warmer,
             warm_in_flight: AtomicBool::new(false),
             warm_wake: Notify::new(),
-            // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
-            // proxy — routing our upstream through an ambient proxy (e.g. the JS
-            // teamclaude on :3456) loops us through the thing we replace and every
-            // request dies as "upstream unreachable". Always reach Anthropic directly.
-            http: reqwest::Client::builder()
-                .no_proxy()
-                // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
-                // otherwise stalls the attempt until the OS TCP timeout, and with a
-                // retry budget of `account_count * 2 + 4` that is many minutes of a
-                // hung request. `oauth.rs` and `probe.rs` both already set one.
-                //
-                // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
-                // responses are long-lived SSE streams that legitimately run longer
-                // than any bound worth setting, and a total timeout would truncate
-                // them mid-stream. `connect_timeout` cannot — it applies only before
-                // the response headers arrive, so once a stream is flowing it is out
-                // of the picture.
-                .connect_timeout(std::time::Duration::from_secs(10))
-                // Keep the single HTTP/2 connection to Anthropic warm across
-                // interactive think-time pauses. reqwest reaps idle connections
-                // after 90s by default, but a coding session routinely pauses
-                // longer — so the next request would pay a fresh TCP+TLS handshake
-                // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
-                // connection open so a post-pause request skips the reconnect.
-                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-                .http2_keep_alive_while_idle(true)
-                .pool_idle_timeout(std::time::Duration::from_secs(300))
-                .build()
-                .expect("build reqwest client"),
             config: Mutex::new(config),
             config_write: Mutex::new(()),
             config_path,
@@ -1362,6 +1476,23 @@ impl Manager {
             && account.org_uuid.is_none()
             && account.org_name.is_none();
 
+        // Built SPECULATIVELY, before `self.accounts`'s write lock below —
+        // `AccountRuntime::from_config` ends in `build_serving_client()`'s
+        // `.expect("build reqwest client")`, and a panic while that lock's write
+        // guard is held poisons it for every other caller (`http_client`,
+        // `select`, `snapshot`, `record_stream_error`, ~97 sites total all
+        // `.expect` the same lock). Every field `from_config` derives from
+        // `account` is already final at this point except possibly `priority`
+        // (only mutated below, under the lock, and only on the Added path) — so
+        // if resolution lands on Added, the `priority` field is patched on this
+        // already-built value instead of rebuilding. If it lands on Updated,
+        // this is simply dropped unused. Mirrors what `add_account` already
+        // does (build before the lock); `add_or_update_account` isn't a hot
+        // path (`POST /_tcr/accounts`, driven by login/config-reload, not by
+        // served traffic), so building one extra idle client on the Updated
+        // path costs nothing worth avoiding.
+        let mut speculative_runtime = AccountRuntime::from_config(&account);
+
         /// What the locked resolve-and-mutate section below produced, so the
         /// durable write can run after `self.accounts`'s lock is released —
         /// `persist_added`/`persist_replaced` do their own file I/O and must
@@ -1527,9 +1658,14 @@ impl Manager {
                             .max()
                             .map_or(0, |max| max + 1);
                         account.priority = Some(next_priority);
+                        // The speculative build above ran before `next_priority`
+                        // was known — patch it in rather than rebuilding (which
+                        // would call `build_serving_client()` again, under this
+                        // same lock, resurrecting exactly the bug this comment
+                        // block exists to avoid).
+                        speculative_runtime.priority = next_priority;
                     }
-                    let runtime = AccountRuntime::from_config(&account);
-                    accounts.push(runtime);
+                    accounts.push(speculative_runtime);
                     Resolution::Added {
                         idx: accounts.len() - 1,
                     }
@@ -2110,6 +2246,19 @@ mod tests {
                 );
                 Ok(h)
             })
+        }
+    }
+
+    /// A warmer that succeeds (never a `WarmError`) but returns EMPTY headers — no
+    /// `anthropic-ratelimit-unified-5h-*` at all. Models a 200 response that
+    /// carries none of the unified rate-limit headers (an intermediary that
+    /// strips them, or a response shape the warm endpoint does not always emit):
+    /// the "silence" case [`Manager::update_quota`]'s doc-comment distinguishes
+    /// from evidence — a warm that latches nothing.
+    struct HeaderlessWarmer;
+    impl AccountWarmer for HeaderlessWarmer {
+        fn warm(&self, _access_token: String, _upstream: String) -> WarmFuture {
+            Box::pin(async { Ok(reqwest::header::HeaderMap::new()) })
         }
     }
 
@@ -5197,9 +5346,56 @@ mod tests {
             "reqwest no longer reports a total timeout in Debug — this guard needs rewriting"
         );
 
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
         assert!(
-            !format!("{:?}", manager.http).contains("TotalTimeout"),
+            !format!("{:?}", accounts[0].http).contains("TotalTimeout"),
             "the serving client grew a total timeout; it will truncate SSE streams"
+        );
+    }
+
+    /// The connection-pool isolation this whole module exists for: two accounts
+    /// must never be handed the SAME client. `hyper-util` keys its pool on
+    /// `(scheme, authority)` alone — nothing about the Bearer token or account
+    /// identity — so a client shared across accounts collapses every account
+    /// onto one pooled connection, and that connection's death takes every
+    /// account down with it regardless of how healthy any individual account is
+    /// (see [`AccountRuntime::http`]'s doc comment for the measured incident).
+    ///
+    /// This is an IN-PROCESS identity check, not a live network measurement —
+    /// `Arc::ptr_eq` proves two accounts never share the same client instance
+    /// (and thus never share its connection pool), and that repeated lookups of
+    /// the SAME account keep returning the SAME instance rather than a fresh
+    /// one that would throw away its warm pool. It does not, and cannot, prove
+    /// two real TCP connections were opened — that would need an actual
+    /// upstream to observe.
+    #[test]
+    fn different_accounts_never_share_a_serving_client() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+        );
+
+        let client_a = manager.http_client(0).expect("account 0 exists");
+        let client_b = manager.http_client(1).expect("account 1 exists");
+        assert!(
+            !Arc::ptr_eq(&client_a, &client_b),
+            "two different accounts were handed the same client — a dead \
+             connection on one account's pool would take every other account \
+             down with it"
+        );
+
+        // The SAME account, looked up again, must return the SAME instance —
+        // a fresh client per lookup would defeat the whole point (a cold pool
+        // on every single request), even though it would still pass the
+        // distinctness assertion above.
+        let client_a_again = manager.http_client(0).expect("account 0 exists");
+        assert!(
+            Arc::ptr_eq(&client_a, &client_a_again),
+            "the same account's client must be stable across lookups, not \
+             rebuilt per call"
         );
     }
 
@@ -5915,6 +6111,40 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Before this fix, the Added path's `AccountRuntime::from_config(&account)`
+    /// ran INSIDE the `self.accounts.write()` block — meaning
+    /// `build_serving_client`'s `.expect("build reqwest client")` executed while
+    /// the write guard was held. A panic there poisons the `RwLock` for every
+    /// other caller in this module: `http_client`, `select`, `snapshot`,
+    /// `record_stream_error` and ~93 more all `.expect("accounts lock
+    /// poisoned")`, so one recoverable client-build failure would take down the
+    /// whole proxy. Uses the `#[cfg(test)]` fault-injection seam on
+    /// `build_serving_client` to make that failure real rather than
+    /// hypothetical, on a submission guaranteed to resolve Added (an empty
+    /// fleet, so nothing can match), and asserts the lock survives.
+    #[test]
+    fn add_or_update_account_added_path_does_not_poison_the_accounts_lock_on_a_client_build_panic()
+    {
+        let manager = build_manager(config_with(vec![]), lock_refresher());
+        let submission = account("brand-new@example.com", 0);
+
+        fail_next_client_build();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            manager.add_or_update_account(submission)
+        }));
+        assert!(
+            result.is_err(),
+            "setup: the injected client-build failure must actually panic"
+        );
+
+        assert!(
+            manager.accounts.read().is_ok(),
+            "a client-build panic in add_or_update_account must not poison the \
+             accounts lock — every other .expect(\"accounts lock poisoned\") \
+             call site would panic in turn"
+        );
+    }
+
     /// The live half of a brand-new-identity race was already serialized by
     /// the single `accounts` write-lock spanning resolve+mutate (see the
     /// TOCTOU fix above) — but the two callers' DURABLE writes still queued on
@@ -6383,6 +6613,143 @@ mod tests {
         assert!(
             manager.warm_targets().is_empty(),
             "a freshly-warmed account is no longer a target"
+        );
+    }
+
+    /// **THE truncation guard.** `warm_targets`' own doc-comment calls a warm that
+    /// latches no evidence "self-limiting", on the strength of `warm_account`
+    /// folding the response's rate-limit headers back into the account's quota. A
+    /// 200 that carries none of the `anthropic-ratelimit-unified-5h-*` headers
+    /// folds NOTHING (`Quota::update_from_headers`'s own doc-comment: "a response
+    /// without the header latches nothing") — so the account's 5h window stays
+    /// blank, `live_reset` stays `None`, and it stays a `warm_targets` member
+    /// forever, warmed again every cadence at real upstream cost. This asserts the
+    /// promise in `warm_targets`' doc-comment actually holds: a warm that never
+    /// latches evidence must not repeat without limit.
+    #[tokio::test]
+    async fn warm_account_without_evidence_headers_does_not_repeat_forever() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let warmer = Arc::new(HeaderlessWarmer);
+        let manager =
+            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+
+        // A generous number of cadence-driven warms, standing in for "forever" —
+        // if the account is STILL a target after this many header-less 200s, the
+        // loop has no bound at all.
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "a warm that never latches evidence must not remain an eligible target forever"
+        );
+    }
+
+    /// A follow-up regression on the bound above: it must not be defeatable by
+    /// the background prober. A first cut of the recovery fix reset
+    /// `consecutive_warms_without_evidence` on every successful `apply_usage`
+    /// call — but `probeable_indices` (unlike `warm_targets`) does not check
+    /// that counter, so the prober keeps visiting an excluded account on its
+    /// OWN schedule regardless of exclusion. That reset would reopen the gate
+    /// every probe cycle and hand back a full burst of
+    /// `WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT` header-less warms each time —
+    /// MORE spend than the original unbounded-warm bug, not less. Drives an
+    /// account past the limit, then feeds it several successful
+    /// no-5h-bucket probes (several "probe cycles") and asserts it stays
+    /// excluded throughout — recovery must come from the cooldown, not from
+    /// probe traffic.
+    #[tokio::test]
+    async fn repeated_probe_cycles_do_not_reopen_a_warm_exclusion() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let warmer = Arc::new(HeaderlessWarmer);
+        let manager =
+            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "setup: the account must be excluded before the probe-cycle check runs"
+        );
+
+        let headerless_probe = crate::probe::Usage {
+            five_hour: None,
+            seven_day: None,
+            seven_day_oi: None,
+        };
+        for cycle in 0..5 {
+            manager.apply_usage(0, &headerless_probe);
+            assert!(
+                !manager.warm_targets().contains(&0),
+                "probe cycle {cycle}: a successful probe that reads no 5h bucket \
+                 must not, by itself, reopen a warm exclusion — recovery is the \
+                 cooldown, not probe traffic"
+            );
+        }
+    }
+
+    /// The recovery half of the bound above. `consecutive_warms_without_evidence`
+    /// is a ONE-WAY latch with a single writer (`record_warm_without_evidence`)
+    /// and only one reset (`update_quota`, on a header-bearing served or warmed
+    /// response) — but an account excluded from `warm_targets` is never picked
+    /// to SERVE either, so it can never earn one of those on its own. Left that
+    /// way, a transient upstream condition that strips the 5h headers for a few
+    /// minutes would exclude the account from keep-warm for the life of the
+    /// process, recoverable only by a restart (this repo's most expensive event
+    /// — a full cold prompt-cache prefix for every live session).
+    ///
+    /// The fix is `warm_evidence_retry_after_ms`'s flat cooldown, set by
+    /// `record_warm_without_evidence` once the account crosses the limit. This
+    /// drives an account past the limit, confirms it is excluded, fast-forwards
+    /// the cooldown by writing a past deadline directly (the same pattern this
+    /// module's other `_until_ms`/`_after_ms` cooldown tests use — a real sleep
+    /// of `WARM_EVIDENCE_RETRY_COOLDOWN_MS` is not a reasonable thing to do in a
+    /// unit test), and asserts the account is a warm target again.
+    #[tokio::test]
+    async fn warm_evidence_retry_cooldown_recovers_an_excluded_account() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let warmer = Arc::new(HeaderlessWarmer);
+        let manager =
+            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "setup: the account must be excluded before recovery is exercised"
+        );
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert!(
+                accounts[0].warm_evidence_retry_after_ms.is_some(),
+                "setup: crossing the limit must arm a retry cooldown"
+            );
+        }
+
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].warm_evidence_retry_after_ms = Some(crate::now_ms() - 1);
+        }
+
+        assert!(
+            manager.warm_targets().contains(&0),
+            "an elapsed retry cooldown must recover an account the warm latch \
+             excluded, without a restart"
         );
     }
 

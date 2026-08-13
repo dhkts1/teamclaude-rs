@@ -59,6 +59,8 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         // a permanently un-warmable account.
         quota_known: true,
         consecutive_probe_failures: 0,
+        consecutive_warms_without_evidence: 0,
+        warm_evidence_retry_after_ms: None,
         input_tokens: 0,
         output_tokens: 0,
         cache_read_tokens: 0,
@@ -78,6 +80,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         stream_error_times_ms: std::collections::VecDeque::new(),
         last_stream_error: None,
         refresh_lock: Arc::new(AsyncMutex::new(())),
+        http: crate::manager::build_serving_client(),
     }
 }
 

@@ -585,8 +585,10 @@ fn render_accounts(
                         )),
                         output,
                         last,
-                        // In-band SSE `error` events (decayed count), observability
-                        // only — never a routing input. `-` when none observed.
+                        // Stream failures — in-band SSE `error` events plus streams
+                        // that hit EOF without `message_stop` (decayed count),
+                        // observability only — never a routing input. `-` when none
+                        // observed.
                         Cell::from(if account.stream_error_count > 0 {
                             account.stream_error_count.to_string()
                         } else {

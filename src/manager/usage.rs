@@ -21,17 +21,37 @@ impl Manager {
     ///
     /// `probe_status` is deliberately still untouched here — that field is about
     /// probe HEALTH, which a served response says nothing about.
-    pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let newly_known = {
+    ///
+    /// Returns whether THIS response's headers carried the 5h window — the same
+    /// signal [`crate::quota::Quota::update_from_headers`] returns, passed through
+    /// so a caller like [`Manager::warm_account`] can tell "evidence read" apart
+    /// from "silence" on this specific response, not just the account's
+    /// once-ever `quota_known` latch. Deliberately NOT `#[must_use]`: most
+    /// callers (every served-response path in `proxy.rs`, most existing tests)
+    /// only care about the side effect of folding the headers in, and forcing
+    /// every one of them to consume the bool would be pure churn unrelated to
+    /// this fix.
+    pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) -> bool {
+        let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let read_five_hour = account.quota.update_from_headers(headers);
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
-                    flipped
+                    // Any response that DOES carry the 5h window is proof this
+                    // account is not stuck returning header-less responses —
+                    // resets keep-warm's miss counter regardless of whether this
+                    // particular update was the warm path or a served request.
+                    // Also clears the cooldown timestamp so no stale retry-after
+                    // lingers on a row that just proved it does not need one.
+                    if read_five_hour {
+                        account.consecutive_warms_without_evidence = 0;
+                        account.warm_evidence_retry_after_ms = None;
+                    }
+                    (flipped, read_five_hour)
                 }
-                None => false,
+                None => (false, false),
             }
         };
         // Edge-triggered, with the accounts lock RELEASED — identical to
@@ -39,6 +59,7 @@ impl Manager {
         if newly_known {
             self.warm_wake.notify_one();
         }
+        read_five_hour
     }
 
     /// Add token usage to account `idx` (the true serving account — bug #3).
@@ -74,6 +95,23 @@ impl Manager {
     /// the account's keep-warm eligibility) untouched. Note it latches even when the
     /// endpoint reported no 5h bucket at all: "we have read this account's quota" is
     /// about the READ, not about which windows came back.
+    ///
+    /// Deliberately does NOT reset [`AccountRuntime::consecutive_warms_without_evidence`],
+    /// even though this can latch [`AccountRuntime::quota_known`] just like a
+    /// header-bearing served response does. A first cut of this fix reset it
+    /// here unconditionally and reopened the exact loop the counter exists to
+    /// close: `probeable_indices` (unlike [`Self::warm_targets`]) does not check
+    /// this counter, so the background prober keeps visiting an excluded account
+    /// on its OWN schedule — reset it on every successful probe and a
+    /// persistently header-less account gets re-warmed once per probe cycle
+    /// forever, worse than the original unbounded-warm bug this counter fixed.
+    /// A probe finding no 5h bucket also says nothing about whether the next
+    /// WARM response would carry one — it is a different, zero-spend endpoint,
+    /// not a rehearsal of the warm request the counter is bounding. Recovery
+    /// from the exclusion is [`Manager::record_warm_without_evidence`]'s
+    /// [`AccountRuntime::warm_evidence_retry_after_ms`] cooldown instead — a
+    /// flat wall-clock wait, decoupled from probe cadence, so the retry rate is
+    /// bounded by policy rather than by how often the fleet happens to probe.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
         let newly_known = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
@@ -125,10 +163,12 @@ impl Manager {
         }
     }
 
-    /// Record that account `idx` served a stream that carried an in-band SSE
-    /// `error` event (`kind` is `error.error.type`, e.g. `"overloaded_error"`) —
-    /// a truncated turn the client saw as a 200 that must not read as a clean
-    /// serve. OBSERVABILITY ONLY: this warns and updates a decayed counter and
+    /// Record that account `idx` served a stream that failed to complete cleanly
+    /// (`kind` is either an Anthropic `error.error.type`, e.g. `"overloaded_error"`,
+    /// from an in-band SSE `error` event, or the fixed string `"truncated"` for a
+    /// stream that hit EOF without Anthropic's `message_stop` terminator) — a
+    /// turn the client saw as a 200 that must not read as a clean serve.
+    /// OBSERVABILITY ONLY: this warns and updates a decayed counter and
     /// the account's last-error label; it deliberately does NOT call
     /// `mark_error` (that condemns terminally — see its doc comment on the 2026-07-17
     /// incident) or `mark_rate_limited` (an overloaded account is not over quota —
@@ -144,7 +184,7 @@ impl Manager {
                 account = %account.name,
                 index = idx,
                 error_type = kind,
-                "SSE stream carried an in-band error event — truncated turn, not a clean serve"
+                "stream failed to complete cleanly — truncated turn, not a clean serve"
             );
             account.stream_error_times_ms.push_back(now_ms);
             prune_stream_errors(&mut account.stream_error_times_ms, now_ms);

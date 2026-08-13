@@ -124,9 +124,15 @@ pub struct AccountSnapshot {
     /// (`Login`/`Disabled`), or when a gating window has no known reset (unknown —
     /// we cannot promise a time).
     pub free_at: Option<OffsetDateTime>,
-    /// Count of in-band SSE `error` events this account's streams carried within
-    /// the decay window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`) — a
-    /// truncated 200 that got booked as a clean serve before this field existed.
+    /// Count of stream failures this account's streams carried within the decay
+    /// window (see `STREAM_ERROR_WINDOW_MS` in `manager/mod.rs`): an in-band SSE
+    /// `error` event, or a stream that hit EOF without Anthropic's `message_stop`
+    /// terminator — recorded with the fixed kind `"truncated"`, which covers a
+    /// mid-stream transport death and the malformed/utf8 break alike. An `error`
+    /// event takes precedence: EOF without `message_stop` is only counted as
+    /// `"truncated"` when no more specific `error` was already recorded. Before
+    /// that check existed, a truncated 200 with no in-band `error` event was
+    /// booked as a clean serve and never reached this field at all.
     /// OBSERVABILITY ONLY: nothing in `select.rs` reads it, so it never gates
     /// rotation. On the wire deliberately (see `status.rs`'s module doc): it
     /// carries no credential material, and `tcr status --json` is how an
@@ -140,10 +146,12 @@ pub struct AccountSnapshot {
     /// — if a future change drops either renderer, delete the claim with it rather
     /// than leaving a rationale the code no longer earns.
     pub stream_error_count: usize,
-    /// The most recent stream error's `error.type` (e.g. `"overloaded_error"`),
-    /// alongside the count above. Same on-the-wire decision as `stream_error_count`,
-    /// and surfaced by the same two renderers (`lastStreamError` in JSON, the
-    /// `last_stream_error=` token in text).
+    /// The most recent stream failure's kind: an Anthropic `error.type` (e.g.
+    /// `"overloaded_error"`) from an in-band SSE `error` event, or the fixed
+    /// string `"truncated"` when the stream hit EOF without `message_stop` and
+    /// no more specific `error` was already recorded. Same on-the-wire decision
+    /// as `stream_error_count`, and surfaced by the same two renderers
+    /// (`lastStreamError` in JSON, the `last_stream_error=` token in text).
     pub last_stream_error: Option<String>,
 }
 

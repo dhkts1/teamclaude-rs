@@ -755,8 +755,9 @@ pub fn render_accounts(
                 a.cache_read_tokens as f64 / a.input_tokens as f64 * 100.0
             )
         };
-        // In-band SSE `error` events this account's streams carried (decayed
-        // window). A truncated 200 books as a clean serve, so this is the only
+        // Stream failures this account's streams carried (decayed window): an
+        // in-band SSE `error` event, or a stream that hit EOF without Anthropic's
+        // `message_stop` terminator (recorded as `"truncated"`). This is the only
         // place that class of failure is visible at all.
         //
         // `n/a` — never `0` — on an OFFLINE snapshot, for the same reason
@@ -909,8 +910,9 @@ fn render_accounts_json(
                 },
                 "probeStatus": a.probe_status.as_str(),
                 "probeError": a.probe_error,
-                // Decayed count of in-band SSE `error` events — a truncated 200
-                // that books as a clean serve. `null`, NEVER 0, on the offline
+                // Decayed count of stream failures — an in-band SSE `error` event,
+                // or a stream that hit EOF without `message_stop` (recorded as
+                // `"truncated"`). `null`, NEVER 0, on the offline
                 // path: the counter lives in the serving process, so a fresh one
                 // is structurally zero, and an unmeasured `0` on an ERROR counter
                 // publishes an all-clear nobody measured. Same "not measured"

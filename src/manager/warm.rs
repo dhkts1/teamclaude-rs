@@ -46,10 +46,17 @@ impl Manager {
     ///    warm on stale information — the wait must be BOUNDED, or gating on
     ///    `quota_known` is a silent kill switch whenever the probe stays broken.
     ///
-    /// State 3 is self-limiting, which is what makes it safe: `warm_account` folds
-    /// the warm response's own rate-limit headers back in, so one warm request per
-    /// account produces the evidence the gate wanted and states 1/2 take over
-    /// again. It cannot become a repeating burst.
+    /// State 3 is self-limiting IF the warm response actually carries the 5h
+    /// headers: `warm_account` folds them back in, so one warm request per account
+    /// produces the evidence the gate wanted and states 1/2 take over again. When
+    /// it does NOT — a 200 with none of the unified headers — nothing is folded
+    /// and the account would stay a target forever; that half of the bound is
+    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`] below, not this doc-comment's
+    /// promise alone. Once that limit excludes the account, the exclusion is
+    /// itself bounded by [`AccountRuntime::warm_evidence_retry_after_ms`] (see
+    /// the filter below) rather than being permanent — see that field's
+    /// doc-comment for why the recovery is a flat wall-clock cooldown and not a
+    /// reset on the next successful background probe.
     ///
     /// The predicate is NOT `probe_status`: `record_probe` stamps
     /// `Error`/`Timeout`/`RateLimited` on a FAILED probe, which leaves
@@ -64,6 +71,7 @@ impl Manager {
     /// to wait for and no failure count to accrue either.
     pub fn warm_targets(&self) -> Vec<usize> {
         let now = OffsetDateTime::now_utc();
+        let now_ms = crate::now_ms();
         // Read the probe cadence BEFORE taking the accounts lock: this touches the
         // config lock, and holding both at once here would invert the order
         // `set_disabled` takes them in (accounts, then config).
@@ -91,6 +99,15 @@ impl Manager {
                     && !a
                         .quota
                         .is_near(a.switch_threshold.unwrap_or(self.global_threshold), now)
+                    // Repeated warms that never latch a 5h window are not
+                    // self-limiting on their own (see the doc-comment above) — cap
+                    // the repeat so a header-less upstream response cannot spend
+                    // real quota on this account every cadence forever. Past the
+                    // cap the account is STILL excluded unless its cooldown has
+                    // elapsed — this is the recovery half, bounded by
+                    // WARM_EVIDENCE_RETRY_COOLDOWN_MS rather than left permanent.
+                    && (a.consecutive_warms_without_evidence < WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT
+                        || a.warm_evidence_retry_after_ms.is_some_and(|until| now_ms >= until))
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -101,6 +118,13 @@ impl Manager {
     /// rate-limit headers so the just-started window is immediately visible (which
     /// suppresses a re-warm on the next sweep). A warm FAILURE is non-fatal —
     /// logged at `warn` and stepped over, never a crash of the loop.
+    ///
+    /// A warm that comes back 200 but carries none of the unified 5h headers is a
+    /// THIRD outcome, distinct from both: not a failure (nothing to log at `warn`
+    /// as broken), but not evidence either (`update_quota` returns `false` — see
+    /// its doc-comment). Claiming "started 5h window" there would be false, so
+    /// this logs what actually happened and bumps the miss counter
+    /// [`Self::warm_targets`] gates on, so the repeat is bounded.
     pub async fn warm_account(&self, idx: usize) {
         self.ensure_fresh(idx).await;
         let Some(token) = self.access_token(idx) else {
@@ -112,8 +136,24 @@ impl Manager {
             Ok(headers) => {
                 // Fold the now-live 5h window into the account's quota so the next
                 // sweep sees it as already warm (REQUIRED — suppresses re-warm).
-                self.update_quota(idx, &headers);
-                tracing::info!(account = %name, index = idx, "keep-warm: started 5h window");
+                if self.update_quota(idx, &headers) {
+                    tracing::info!(account = %name, index = idx, "keep-warm: started 5h window");
+                } else {
+                    let gave_up = self.record_warm_without_evidence(idx);
+                    tracing::warn!(
+                        account = %name,
+                        index = idx,
+                        "keep-warm: request succeeded but the response carried no 5h window — no evidence latched"
+                    );
+                    if gave_up {
+                        tracing::warn!(
+                            account = %name,
+                            index = idx,
+                            attempts = WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT,
+                            "keep-warm: giving up on this account — repeated warms have never returned a 5h window"
+                        );
+                    }
+                }
             }
             Err(err) => {
                 tracing::warn!(
@@ -124,6 +164,35 @@ impl Manager {
                 );
             }
         }
+    }
+
+    /// Bump account `idx`'s consecutive miss counter after a warm that succeeded
+    /// but latched no evidence (see [`Self::warm_account`]). Returns whether this
+    /// call just CROSSED [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`], so the caller
+    /// logs the give-up once rather than every cadence — mirrors
+    /// [`Manager::record_probe`]'s crossing-log pattern for the same reason.
+    ///
+    /// At or past the limit, (re-)arms [`AccountRuntime::warm_evidence_retry_after_ms`]
+    /// to `now + `[`WARM_EVIDENCE_RETRY_COOLDOWN_MS`] — including on a MISS that
+    /// happens during the one retry the cooldown just granted, which is what
+    /// keeps the retry rate at one attempt per cooldown rather than one per
+    /// scheduled warm tick once the account is past the limit: without
+    /// re-arming here, the very next scheduled warm would see the (now past)
+    /// old deadline and immediately re-qualify.
+    fn record_warm_without_evidence(&self, idx: usize) -> bool {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let Some(account) = accounts.get_mut(idx) else {
+            return false;
+        };
+        account.consecutive_warms_without_evidence =
+            account.consecutive_warms_without_evidence.saturating_add(1);
+        let crossed =
+            account.consecutive_warms_without_evidence == WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT;
+        if account.consecutive_warms_without_evidence >= WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT {
+            account.warm_evidence_retry_after_ms =
+                Some(crate::now_ms() + WARM_EVIDENCE_RETRY_COOLDOWN_MS);
+        }
+        crossed
     }
 
     /// Warm ONE account, if it is still eligible at this instant.
