@@ -237,9 +237,15 @@ pub struct AccountRuntime {
     /// Consecutive keep-warm requests ([`Manager::warm_account`]) that succeeded
     /// but carried none of the unified 5h rate-limit headers — a 200 that latched
     /// no evidence. Reset to `0` by ANY response (warm or served) whose headers DO
-    /// carry the 5h window — see [`Manager::update_quota`]. Bounds
-    /// [`Manager::warm_targets`]'s otherwise-unbounded repeat; see
-    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`].
+    /// carry the 5h window — see [`Manager::update_quota`] — and also by a
+    /// SUCCESSFUL background probe of this account's usage endpoint — see
+    /// [`Manager::apply_usage`]. The probe reset is what makes the exclusion below
+    /// recoverable without a restart: the prober reaches every
+    /// [`Manager::probeable_indices`] account on its own schedule regardless of
+    /// `warm_targets` membership, so it is the one path that still reaches an
+    /// account this counter has excluded from keep-warm and that never gets
+    /// picked to serve. Bounds [`Manager::warm_targets`]'s otherwise-unbounded
+    /// repeat; see [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`].
     pub consecutive_warms_without_evidence: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -327,11 +333,34 @@ pub struct AccountRuntime {
     pub http: Arc<reqwest::Client>,
 }
 
+// Test-only fault injection for `build_serving_client`: set via
+// `fail_next_client_build`, consumed (and cleared) by the next call on this
+// thread. Exists to prove — with a real panic, not a hypothetical one — that
+// `Manager::add_or_update_account`'s Added path builds its runtime BEFORE
+// taking `self.accounts`'s write lock: a panic here that happens UNDER that
+// lock poisons it for every other `.expect("accounts lock poisoned")` call
+// site in this module; one that happens before the lock is taken does not.
+#[cfg(test)]
+thread_local! {
+    static FAIL_NEXT_CLIENT_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm [`FAIL_NEXT_CLIENT_BUILD`] so the next call to `build_serving_client` on
+/// this thread panics instead of building. Test-only.
+#[cfg(test)]
+pub(crate) fn fail_next_client_build() {
+    FAIL_NEXT_CLIENT_BUILD.with(|f| f.set(true));
+}
+
 /// Build one upstream-forwarding HTTP client. Called once per account (see
 /// [`AccountRuntime::http`]) so every account's client is configured
 /// identically and differs from every other account's only in the connection
 /// pool it privately owns.
 pub(crate) fn build_serving_client() -> Arc<reqwest::Client> {
+    #[cfg(test)]
+    if FAIL_NEXT_CLIENT_BUILD.with(|f| f.replace(false)) {
+        panic!("build reqwest client (test-injected failure)");
+    }
     // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
     // proxy — routing our upstream through an ambient proxy (e.g. the JS
     // teamclaude on :3456) loops us through the thing we replace and every
@@ -1415,6 +1444,23 @@ impl Manager {
             && account.org_uuid.is_none()
             && account.org_name.is_none();
 
+        // Built SPECULATIVELY, before `self.accounts`'s write lock below —
+        // `AccountRuntime::from_config` ends in `build_serving_client()`'s
+        // `.expect("build reqwest client")`, and a panic while that lock's write
+        // guard is held poisons it for every other caller (`http_client`,
+        // `select`, `snapshot`, `record_stream_error`, ~97 sites total all
+        // `.expect` the same lock). Every field `from_config` derives from
+        // `account` is already final at this point except possibly `priority`
+        // (only mutated below, under the lock, and only on the Added path) — so
+        // if resolution lands on Added, the `priority` field is patched on this
+        // already-built value instead of rebuilding. If it lands on Updated,
+        // this is simply dropped unused. Mirrors what `add_account` already
+        // does (build before the lock); `add_or_update_account` isn't a hot
+        // path (`POST /_tcr/accounts`, driven by login/config-reload, not by
+        // served traffic), so building one extra idle client on the Updated
+        // path costs nothing worth avoiding.
+        let mut speculative_runtime = AccountRuntime::from_config(&account);
+
         /// What the locked resolve-and-mutate section below produced, so the
         /// durable write can run after `self.accounts`'s lock is released —
         /// `persist_added`/`persist_replaced` do their own file I/O and must
@@ -1580,9 +1626,14 @@ impl Manager {
                             .max()
                             .map_or(0, |max| max + 1);
                         account.priority = Some(next_priority);
+                        // The speculative build above ran before `next_priority`
+                        // was known — patch it in rather than rebuilding (which
+                        // would call `build_serving_client()` again, under this
+                        // same lock, resurrecting exactly the bug this comment
+                        // block exists to avoid).
+                        speculative_runtime.priority = next_priority;
                     }
-                    let runtime = AccountRuntime::from_config(&account);
-                    accounts.push(runtime);
+                    accounts.push(speculative_runtime);
                     Resolution::Added {
                         idx: accounts.len() - 1,
                     }
@@ -6028,6 +6079,40 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// Before this fix, the Added path's `AccountRuntime::from_config(&account)`
+    /// ran INSIDE the `self.accounts.write()` block — meaning
+    /// `build_serving_client`'s `.expect("build reqwest client")` executed while
+    /// the write guard was held. A panic there poisons the `RwLock` for every
+    /// other caller in this module: `http_client`, `select`, `snapshot`,
+    /// `record_stream_error` and ~93 more all `.expect("accounts lock
+    /// poisoned")`, so one recoverable client-build failure would take down the
+    /// whole proxy. Uses the `#[cfg(test)]` fault-injection seam on
+    /// `build_serving_client` to make that failure real rather than
+    /// hypothetical, on a submission guaranteed to resolve Added (an empty
+    /// fleet, so nothing can match), and asserts the lock survives.
+    #[test]
+    fn add_or_update_account_added_path_does_not_poison_the_accounts_lock_on_a_client_build_panic()
+    {
+        let manager = build_manager(config_with(vec![]), lock_refresher());
+        let submission = account("brand-new@example.com", 0);
+
+        fail_next_client_build();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            manager.add_or_update_account(submission)
+        }));
+        assert!(
+            result.is_err(),
+            "setup: the injected client-build failure must actually panic"
+        );
+
+        assert!(
+            manager.accounts.read().is_ok(),
+            "a client-build panic in add_or_update_account must not poison the \
+             accounts lock — every other .expect(\"accounts lock poisoned\") \
+             call site would panic in turn"
+        );
+    }
+
     /// The live half of a brand-new-identity race was already serialized by
     /// the single `accounts` write-lock spanning resolve+mutate (see the
     /// TOCTOU fix above) — but the two callers' DURABLE writes still queued on
@@ -6530,6 +6615,61 @@ mod tests {
         assert!(
             !manager.warm_targets().contains(&0),
             "a warm that never latches evidence must not remain an eligible target forever"
+        );
+    }
+
+    /// The recovery half of the bound above. `consecutive_warms_without_evidence`
+    /// is a ONE-WAY latch with a single writer (`record_warm_without_evidence`)
+    /// and, before this fix, a single reset (`update_quota`, on a header-bearing
+    /// served or warmed response) — but an account excluded from `warm_targets`
+    /// is never picked to SERVE either, so it can never earn one of those. Left
+    /// that way, a transient upstream condition that strips the 5h headers for a
+    /// few minutes would exclude the account from keep-warm for the life of the
+    /// process, recoverable only by a restart (this repo's most expensive event
+    /// — a full cold prompt-cache prefix for every live session).
+    ///
+    /// The fix is `apply_usage` also resetting the counter: the background
+    /// prober reaches every `probeable_indices` account on its own schedule
+    /// (`schedule::run`'s `Job::Probe` arm), which does NOT check this counter,
+    /// so it is the one path that still reaches an idle, excluded account. This
+    /// drives an account past the limit, then feeds it a successful probe (no 5h
+    /// bucket at all, so `update_quota` never runs — isolating the probe path as
+    /// the thing that recovers it) and asserts it is a warm target again.
+    #[tokio::test]
+    async fn a_successful_probe_recovers_an_account_the_warm_latch_excluded() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let warmer = Arc::new(HeaderlessWarmer);
+        let manager =
+            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "setup: the account must be excluded before recovery is exercised"
+        );
+
+        // A successful probe that reports NO 5h bucket at all — still evidence
+        // (see `apply_usage`'s doc-comment), and deliberately not routed through
+        // `update_quota`/`warm_account`, so this isolates the probe path.
+        manager.apply_usage(
+            0,
+            &crate::probe::Usage {
+                five_hour: None,
+                seven_day: None,
+                seven_day_oi: None,
+            },
+        );
+
+        assert!(
+            manager.warm_targets().contains(&0),
+            "a successful probe must recover an account the warm latch excluded, \
+             without a restart"
         );
     }
 

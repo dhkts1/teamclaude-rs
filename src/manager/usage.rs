@@ -92,6 +92,19 @@ impl Manager {
     /// the account's keep-warm eligibility) untouched. Note it latches even when the
     /// endpoint reported no 5h bucket at all: "we have read this account's quota" is
     /// about the READ, not about which windows came back.
+    ///
+    /// Also resets [`AccountRuntime::consecutive_warms_without_evidence`], for the
+    /// same reason [`Manager::update_quota`] does on a header-bearing response: a
+    /// successful probe is ITSELF a first-hand read of this account's quota, so it
+    /// is evidence too, regardless of whether a 5h bucket came back. This is the
+    /// recovery path for [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`]'s exclusion: the
+    /// background prober visits every [`Manager::probeable_indices`] account on its
+    /// own schedule (`schedule::run`'s `Job::Probe` arm), which does NOT check this
+    /// counter — so it is the one path that still reaches an account keep-warm has
+    /// given up on and that never gets picked to serve (and so never earns a
+    /// header-bearing response of its own). Without this reset, an account excluded
+    /// here would stay excluded for the life of the process even after the upstream
+    /// condition that caused the miss streak clears.
     pub fn apply_usage(&self, idx: usize, usage: &Usage) {
         let newly_known = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
@@ -100,6 +113,7 @@ impl Manager {
                     account.quota.apply_usage(usage);
                     let flipped = !account.quota_known;
                     account.quota_known = true;
+                    account.consecutive_warms_without_evidence = 0;
                     flipped
                 }
                 None => false,
