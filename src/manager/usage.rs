@@ -21,17 +21,34 @@ impl Manager {
     ///
     /// `probe_status` is deliberately still untouched here — that field is about
     /// probe HEALTH, which a served response says nothing about.
-    pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
-        let newly_known = {
+    ///
+    /// Returns whether THIS response's headers carried the 5h window — the same
+    /// signal [`crate::quota::Quota::update_from_headers`] returns, passed through
+    /// so a caller like [`Manager::warm_account`] can tell "evidence read" apart
+    /// from "silence" on this specific response, not just the account's
+    /// once-ever `quota_known` latch. Deliberately NOT `#[must_use]`: most
+    /// callers (every served-response path in `proxy.rs`, most existing tests)
+    /// only care about the side effect of folding the headers in, and forcing
+    /// every one of them to consume the bool would be pure churn unrelated to
+    /// this fix.
+    pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) -> bool {
+        let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
                     let read_five_hour = account.quota.update_from_headers(headers);
                     let flipped = read_five_hour && !account.quota_known;
                     account.quota_known |= read_five_hour;
-                    flipped
+                    // Any response that DOES carry the 5h window is proof this
+                    // account is not stuck returning header-less responses —
+                    // resets keep-warm's miss counter regardless of whether this
+                    // particular update was the warm path or a served request.
+                    if read_five_hour {
+                        account.consecutive_warms_without_evidence = 0;
+                    }
+                    (flipped, read_five_hour)
                 }
-                None => false,
+                None => (false, false),
             }
         };
         // Edge-triggered, with the accounts lock RELEASED — identical to
@@ -39,6 +56,7 @@ impl Manager {
         if newly_known {
             self.warm_wake.notify_one();
         }
+        read_five_hour
     }
 
     /// Add token usage to account `idx` (the true serving account — bug #3).

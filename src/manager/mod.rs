@@ -129,6 +129,20 @@ const ERROR_REPROBE_CAP_MS: i64 = 30 * 60_000;
 /// here at all.
 const PROBE_FAILURES_BEFORE_WARMING_UNPROBED: u32 = 3;
 
+/// Bound on consecutive keep-warm requests that succeeded (200) but carried NONE
+/// of the `anthropic-ratelimit-unified-5h-*` headers — a response that latches no
+/// evidence (see [`Manager::update_quota`]'s doc-comment: "a response WITHOUT the
+/// header latches nothing"). Left unbounded, such an account would stay a
+/// [`Manager::warm_targets`] member forever — its 5h window never gets folded, so
+/// `live_reset` never fires — and get re-warmed every cadence at real upstream
+/// cost for nothing.
+///
+/// Mirrors [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] in shape (three consecutive
+/// misses is a hiccup, not a verdict) but bounds the opposite direction: that one
+/// bounds a WAIT before warming starts; this one bounds a REPEAT once warming
+/// itself stops producing evidence.
+const WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT: u32 = 3;
+
 /// Decay window for [`AccountRuntime::stream_error_times_ms`] — how far back a
 /// stream error still counts toward the operator-facing decayed count. An hour:
 /// long enough to show a persistent pattern, short enough that a stale blip from
@@ -220,6 +234,13 @@ pub struct AccountRuntime {
     /// probe fails forever, so gating on it unconditionally makes keep-warm
     /// structurally dark. See [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`].
     pub consecutive_probe_failures: u32,
+    /// Consecutive keep-warm requests ([`Manager::warm_account`]) that succeeded
+    /// but carried none of the unified 5h rate-limit headers — a 200 that latched
+    /// no evidence. Reset to `0` by ANY response (warm or served) whose headers DO
+    /// carry the 5h window — see [`Manager::update_quota`]. Bounds
+    /// [`Manager::warm_targets`]'s otherwise-unbounded repeat; see
+    /// [`WARM_ATTEMPTS_WITHOUT_EVIDENCE_LIMIT`].
+    pub consecutive_warms_without_evidence: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Cache-read input tokens (a SUBSET of `input_tokens`, not additional quota).
@@ -385,6 +406,7 @@ impl AccountRuntime {
             // every account's quota is genuinely unread.
             quota_known: false,
             consecutive_probe_failures: 0,
+            consecutive_warms_without_evidence: 0,
             input_tokens: 0,
             output_tokens: 0,
             cache_read_tokens: 0,
@@ -2110,6 +2132,19 @@ mod tests {
                 );
                 Ok(h)
             })
+        }
+    }
+
+    /// A warmer that succeeds (never a `WarmError`) but returns EMPTY headers — no
+    /// `anthropic-ratelimit-unified-5h-*` at all. Models a 200 response that
+    /// carries none of the unified rate-limit headers (an intermediary that
+    /// strips them, or a response shape the warm endpoint does not always emit):
+    /// the "silence" case [`Manager::update_quota`]'s doc-comment distinguishes
+    /// from evidence — a warm that latches nothing.
+    struct HeaderlessWarmer;
+    impl AccountWarmer for HeaderlessWarmer {
+        fn warm(&self, _access_token: String, _upstream: String) -> WarmFuture {
+            Box::pin(async { Ok(reqwest::header::HeaderMap::new()) })
         }
     }
 
@@ -6383,6 +6418,40 @@ mod tests {
         assert!(
             manager.warm_targets().is_empty(),
             "a freshly-warmed account is no longer a target"
+        );
+    }
+
+    /// **THE truncation guard.** `warm_targets`' own doc-comment calls a warm that
+    /// latches no evidence "self-limiting", on the strength of `warm_account`
+    /// folding the response's rate-limit headers back into the account's quota. A
+    /// 200 that carries none of the `anthropic-ratelimit-unified-5h-*` headers
+    /// folds NOTHING (`Quota::update_from_headers`'s own doc-comment: "a response
+    /// without the header latches nothing") — so the account's 5h window stays
+    /// blank, `live_reset` stays `None`, and it stays a `warm_targets` member
+    /// forever, warmed again every cadence at real upstream cost. This asserts the
+    /// promise in `warm_targets`' doc-comment actually holds: a warm that never
+    /// latches evidence must not repeat without limit.
+    #[tokio::test]
+    async fn warm_account_without_evidence_headers_does_not_repeat_forever() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let warmer = Arc::new(HeaderlessWarmer);
+        let manager =
+            build_manager_with_warmer(config_with(vec![account("cold", 0)]), refresher, warmer);
+        mark_all_probed(&manager); // isolate from the never-probed boot gate
+        assert_eq!(manager.warm_targets(), vec![0]);
+
+        // A generous number of cadence-driven warms, standing in for "forever" —
+        // if the account is STILL a target after this many header-less 200s, the
+        // loop has no bound at all.
+        for _ in 0..50 {
+            manager.warm_account(0).await;
+        }
+
+        assert!(
+            !manager.warm_targets().contains(&0),
+            "a warm that never latches evidence must not remain an eligible target forever"
         );
     }
 
