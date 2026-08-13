@@ -79,6 +79,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         stream_error_times_ms: std::collections::VecDeque::new(),
         last_stream_error: None,
         refresh_lock: Arc::new(AsyncMutex::new(())),
+        http: crate::manager::build_serving_client(),
     }
 }
 

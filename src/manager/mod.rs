@@ -301,6 +301,59 @@ pub struct AccountRuntime {
     /// cannot be missing one — the desync it replaces made `ensure_fresh` a silent
     /// no-op (no log, no status change) until the initial token expired.
     pub refresh_lock: Arc<AsyncMutex<()>>,
+    /// This account's OWN upstream-forwarding client — never shared with any
+    /// other account. `hyper-util`'s pool keys a connection on `(scheme,
+    /// authority)` alone (`PoolKey`, `client/legacy/client.rs`), with nothing in
+    /// that key touching the Bearer token or account identity — so a single
+    /// `reqwest::Client` reused across the fleet collapses every account's
+    /// traffic onto ONE pooled connection, and that connection's death (an h2
+    /// `PROTOCOL_ERROR` reset, observed live spanning 2-3 distinct accounts at
+    /// once) takes every account down with it, defeating rotation and failover
+    /// at the connection layer no matter how healthy any individual account is.
+    /// Built once per account by [`build_serving_client`] (never rebuilt on
+    /// every request — that would throw away the warm pool this exists to
+    /// keep) and wrapped in `Arc` so [`Manager::http_client`] can hand out
+    /// cheap clones while still letting a test prove two accounts' clients are
+    /// genuinely distinct instances via `Arc::ptr_eq`.
+    pub http: Arc<reqwest::Client>,
+}
+
+/// Build one upstream-forwarding HTTP client. Called once per account (see
+/// [`AccountRuntime::http`]) so every account's client is configured
+/// identically and differs from every other account's only in the connection
+/// pool it privately owns.
+pub(crate) fn build_serving_client() -> Arc<reqwest::Client> {
+    // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
+    // proxy — routing our upstream through an ambient proxy (e.g. the JS
+    // teamclaude on :3456) loops us through the thing we replace and every
+    // request dies as "upstream unreachable". Always reach Anthropic directly.
+    Arc::new(
+        reqwest::Client::builder()
+            .no_proxy()
+            // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
+            // otherwise stalls the attempt until the OS TCP timeout, and with a
+            // retry budget of `account_count * 2 + 4` that is many minutes of a
+            // hung request. `oauth.rs` and `probe.rs` both already set one.
+            //
+            // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
+            // responses are long-lived SSE streams that legitimately run longer
+            // than any bound worth setting, and a total timeout would truncate
+            // them mid-stream. `connect_timeout` cannot — it applies only before
+            // the response headers arrive, so once a stream is flowing it is out
+            // of the picture.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // Keep the single HTTP/2 connection to Anthropic warm across
+            // interactive think-time pauses. reqwest reaps idle connections
+            // after 90s by default, but a coding session routinely pauses
+            // longer — so the next request would pay a fresh TCP+TLS handshake
+            // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
+            // connection open so a post-pause request skips the reconnect.
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_keep_alive_while_idle(true)
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("build reqwest client"),
+    )
 }
 
 /// A rotation slot answers a user's account query by the same three fields a
@@ -426,6 +479,7 @@ impl AccountRuntime {
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
             refresh_lock: Arc::new(AsyncMutex::new(())),
+            http: build_serving_client(),
         }
     }
 }
@@ -571,9 +625,6 @@ pub struct Manager {
     /// ONLY on the false→true `quota_known` flip, which happens at most once per
     /// account per process, so it can never become a self-feeding loop of sweeps.
     warm_wake: Notify,
-    /// Client used for upstream forwarding — deliberately no total timeout so
-    /// long SSE streams are never cut (an idle guard belongs on the read side).
-    http: reqwest::Client,
     /// The persisted config, kept so token refreshes can be written back with
     /// every unmodelled field intact.
     config: Mutex<Config>,
@@ -772,35 +823,6 @@ impl Manager {
             warmer,
             warm_in_flight: AtomicBool::new(false),
             warm_wake: Notify::new(),
-            // no_proxy(): reqwest honors HTTPS_PROXY/HTTP_PROXY by default. We ARE the
-            // proxy — routing our upstream through an ambient proxy (e.g. the JS
-            // teamclaude on :3456) loops us through the thing we replace and every
-            // request dies as "upstream unreachable". Always reach Anthropic directly.
-            http: reqwest::Client::builder()
-                .no_proxy()
-                // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
-                // otherwise stalls the attempt until the OS TCP timeout, and with a
-                // retry budget of `account_count * 2 + 4` that is many minutes of a
-                // hung request. `oauth.rs` and `probe.rs` both already set one.
-                //
-                // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
-                // responses are long-lived SSE streams that legitimately run longer
-                // than any bound worth setting, and a total timeout would truncate
-                // them mid-stream. `connect_timeout` cannot — it applies only before
-                // the response headers arrive, so once a stream is flowing it is out
-                // of the picture.
-                .connect_timeout(std::time::Duration::from_secs(10))
-                // Keep the single HTTP/2 connection to Anthropic warm across
-                // interactive think-time pauses. reqwest reaps idle connections
-                // after 90s by default, but a coding session routinely pauses
-                // longer — so the next request would pay a fresh TCP+TLS handshake
-                // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
-                // connection open so a post-pause request skips the reconnect.
-                .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-                .http2_keep_alive_while_idle(true)
-                .pool_idle_timeout(std::time::Duration::from_secs(300))
-                .build()
-                .expect("build reqwest client"),
             config: Mutex::new(config),
             config_write: Mutex::new(()),
             config_path,
@@ -5232,9 +5254,56 @@ mod tests {
             "reqwest no longer reports a total timeout in Debug — this guard needs rewriting"
         );
 
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
         assert!(
-            !format!("{:?}", manager.http).contains("TotalTimeout"),
+            !format!("{:?}", accounts[0].http).contains("TotalTimeout"),
             "the serving client grew a total timeout; it will truncate SSE streams"
+        );
+    }
+
+    /// The connection-pool isolation this whole module exists for: two accounts
+    /// must never be handed the SAME client. `hyper-util` keys its pool on
+    /// `(scheme, authority)` alone — nothing about the Bearer token or account
+    /// identity — so a client shared across accounts collapses every account
+    /// onto one pooled connection, and that connection's death takes every
+    /// account down with it regardless of how healthy any individual account is
+    /// (see [`AccountRuntime::http`]'s doc comment for the measured incident).
+    ///
+    /// This is an IN-PROCESS identity check, not a live network measurement —
+    /// `Arc::ptr_eq` proves two accounts never share the same client instance
+    /// (and thus never share its connection pool), and that repeated lookups of
+    /// the SAME account keep returning the SAME instance rather than a fresh
+    /// one that would throw away its warm pool. It does not, and cannot, prove
+    /// two real TCP connections were opened — that would need an actual
+    /// upstream to observe.
+    #[test]
+    fn different_accounts_never_share_a_serving_client() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            refresher,
+        );
+
+        let client_a = manager.http_client(0).expect("account 0 exists");
+        let client_b = manager.http_client(1).expect("account 1 exists");
+        assert!(
+            !Arc::ptr_eq(&client_a, &client_b),
+            "two different accounts were handed the same client — a dead \
+             connection on one account's pool would take every other account \
+             down with it"
+        );
+
+        // The SAME account, looked up again, must return the SAME instance —
+        // a fresh client per lookup would defeat the whole point (a cold pool
+        // on every single request), even though it would still pass the
+        // distinctness assertion above.
+        let client_a_again = manager.http_client(0).expect("account 0 exists");
+        assert!(
+            Arc::ptr_eq(&client_a, &client_a_again),
+            "the same account's client must be stable across lookups, not \
+             rebuilt per call"
         );
     }
 

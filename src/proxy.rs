@@ -1620,7 +1620,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
     // 3. Selection + rotation loop.
     let account_count = manager.account_count();
-    let http = manager.http_client();
     let mut tried: HashSet<usize> = HashSet::new();
     // Accounts that already got their one force-refresh on a 401.
     let mut forced_401: HashSet<usize> = HashSet::new();
@@ -1850,6 +1849,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             continue;
         }
         let Some(token) = manager.access_token(idx) else {
+            tried.insert(idx);
+            continue;
+        };
+        // This account's OWN client — fetched INSIDE the loop, keyed on the idx
+        // this iteration is actually about to serve. Hoisting this above the
+        // loop (as it used to be) reused whichever account was selected FIRST
+        // for every later rotation attempt too, which is the bug
+        // `AccountRuntime::http` exists to fix: every account collapsing onto
+        // one shared connection pool regardless of which one is serving.
+        let Some(http) = manager.http_client(idx) else {
             tried.insert(idx);
             continue;
         };

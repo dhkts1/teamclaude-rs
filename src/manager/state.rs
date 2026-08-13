@@ -107,8 +107,17 @@ impl Manager {
         self.proxy_api_key.as_deref()
     }
 
-    pub fn http_client(&self) -> reqwest::Client {
-        self.http.clone()
+    /// Account `idx`'s OWN upstream-forwarding client — see
+    /// [`AccountRuntime::http`] for why every account carries its own. `None`
+    /// only if `idx` is stale (accounts are appended, never removed, so this is
+    /// never observed on the live serving path — it exists for the same reason
+    /// [`Self::access_token`] and [`Self::account_name`] return `Option`).
+    pub fn http_client(&self, idx: usize) -> Option<Arc<reqwest::Client>> {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.http.clone())
     }
 
     /// The access token to inject for account `idx` (a clone — the request
