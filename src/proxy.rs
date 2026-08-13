@@ -1450,31 +1450,26 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
 }
 
 /// Whether a dropped SSE tee chunk represents genuine evidence loss for the
-/// truncation classifier. This is a SEMANTIC distinction, not a defensive
-/// one: `evidence_dropped` exists to answer exactly one question — did bytes
-/// arrive from UPSTREAM that the parser never got to see? `Full` answers
-/// yes: the bounded channel could not keep up, those bytes were dropped, and
-/// "no `message_stop`" is no longer trustworthy. `Closed` answers a
-/// different question entirely — the CONSUMER (the parser task's own
-/// `rx`-backed stream) went away — and a consumer going away can never be
-/// evidence that upstream data was lost, so it must never latch the same
-/// flag. Treating it as such was a coverage regression: a `Closed`
-/// `try_send` used to make the classifier abstain on turns it had, in fact,
-/// fully observed.
+/// truncation classifier. `evidence_dropped` asserts exactly one thing: that
+/// bytes arrived from UPSTREAM which the parser never got to see. `Full`
+/// answers yes — the bounded channel could not keep up, those bytes are
+/// gone, and "no `message_stop`" is no longer trustworthy. `Closed` answers
+/// a different question: the CONSUMER (the parser task's own `rx`-backed
+/// stream) went away. A consumer going away is never evidence that upstream
+/// data was lost, so it must not latch the same flag — the distinction holds
+/// no matter why `rx` closed, including a parser that later gains a read
+/// timeout, an explicit cancellation, or has its task aborted at shutdown.
 ///
-/// Reachability today, read directly from the pinned `eventsource-stream`
-/// 0.2.3 source rather than assumed: its `Utf8Stream` never surfaces a UTF-8
-/// error mid-stream (an unresolved tail is buffered, not rejected, until the
-/// underlying byte stream itself reaches EOF), so `parse_sse_usage`'s
-/// malformed-frame `break` cannot fire before `rx` would have closed on its
-/// own — the specific "malformed frame closes `rx` early while upstream
-/// keeps sending" scenario this was first written to guard is not
-/// constructible through today's wiring. The predicate stays correct
-/// regardless: it guards CONSUMER-side death generally, and a parser task
-/// that exits early for some reason added later — a read timeout, an
-/// explicit cancellation, an abort at runtime shutdown — would drop `rx`
-/// while the passthrough is still actively forwarding upstream bytes, which
-/// IS reachable and hits exactly this path.
+/// `eventsource-stream`'s `Utf8Stream` never surfaces a UTF-8 error
+/// mid-stream — an unresolved tail is buffered, not rejected, until the
+/// underlying byte stream itself reaches EOF — so `parse_sse_usage`'s
+/// malformed-frame `break` cannot close `rx` while the upstream is still
+/// sending; that specific race is not constructible through real TCP
+/// behavior. What IS reachable: a parser-side panic drops `rx` while the
+/// upstream keeps streaming, and without this split every subsequent
+/// `try_send` on that request would latch `evidence_dropped`, making the
+/// classifier silently abstain on a turn whose evidence it never actually
+/// lost — an unrelated bug quietly disabling this feature.
 fn is_genuine_evidence_loss<T>(err: &tokio::sync::mpsc::error::TrySendError<T>) -> bool {
     matches!(err, tokio::sync::mpsc::error::TrySendError::Full(_))
 }
@@ -3708,14 +3703,12 @@ mod tests {
 
     /// The other half of the malformed-frame property: `evidence_dropped`
     /// must latch on `Full` (a real dropped chunk — genuine evidence loss)
-    /// and NOT on `Closed` (the parser's own `rx`-side stream already ended —
-    /// not evidence loss). See [`is_genuine_evidence_loss`]'s doc comment for
-    /// why this is semantic, not defensive, and for why today's wiring
-    /// specifically cannot reach `Closed` via the malformed-frame path (it
-    /// remains reachable via a future consumer-side early exit — a timeout,
-    /// a cancellation, a shutdown abort). Exercised directly against the
-    /// extracted predicate rather than a network-level reproduction of a
-    /// race that this exact code path cannot currently trigger.
+    /// and NOT on `Closed` (the consumer went away — never evidence about
+    /// upstream data). See [`is_genuine_evidence_loss`]'s doc comment for why
+    /// that distinction holds independent of the malformed-frame path
+    /// specifically. Exercised directly against the extracted predicate
+    /// rather than a network-level reproduction of the race, which the
+    /// malformed-frame path alone cannot trigger.
     #[test]
     fn evidence_loss_predicate_distinguishes_full_from_closed() {
         use tokio::sync::mpsc::error::TrySendError;
