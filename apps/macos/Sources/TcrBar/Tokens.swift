@@ -249,14 +249,14 @@ public enum Tok {
 
     public static let panelWidth: CGFloat = 380
     public static let panelMaxHeight: CGFloat = 520
-    /// Number of account rows visible before the list scrolls. Fixed, not a
-    /// user setting (Gil, 2026-08-14) — a 13-account fleet otherwise renders
-    /// ~8 rows and pushes the footer off the bottom of the screen. This is a
-    /// ROW COUNT, not a per-row height multiplier: rows are not uniform
-    /// height (`AccountRow` grows for the needs-relogin state and several
-    /// conditional detail lines), so the panel sums actual measured heights
-    /// for the first N rows rather than multiplying this by a constant — see
-    /// `FleetView.visibleRowsHeight(for:)`.
+    /// Number of account rows visible before the list scrolls. Fixed rather
+    /// than a preference: a long fleet otherwise renders far enough to push the
+    /// footer past the bottom of the screen, taking Quit and the checkboxes with
+    /// it. This is a ROW COUNT, not a per-row height multiplier — rows are not
+    /// uniform height (`AccountRow` grows for the needs-relogin state and
+    /// several conditional detail lines), so the panel sums actual measured
+    /// heights for the first N rows rather than multiplying this by a constant.
+    /// See `FleetView.visibleRowsHeight(for:)`.
     public static let visibleAccountRows = 4
     public static let gutter = space4
     public static let rowSpacing = space3
