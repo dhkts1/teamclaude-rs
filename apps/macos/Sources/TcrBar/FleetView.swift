@@ -42,7 +42,8 @@ struct FleetView: View {
     /// nothing is worse than one that says why.
     @State private var loginError: String?
 
-    /// Measured height of the account rows.
+    /// Measured height of each account row, keyed by account id (`Account.id`
+    /// is the account name).
     ///
     /// A `ScrollView` has a flexible ideal height, and the window this panel
     /// lives in sizes itself to its content's *ideal* height — so a scroll view
@@ -54,7 +55,11 @@ struct FleetView: View {
     /// is equally true of the `NSPopover` it lives in now, whose hosting
     /// controller is set to `sizingOptions = [.preferredContentSize]`
     /// (`MenuBarShell.swift`) for exactly this reason.
-    @State private var rowsHeight: CGFloat = 0
+    ///
+    /// Per-row rather than one summed total because rows are not uniform
+    /// height — see `Tok.visibleAccountRows`. `visibleRowsHeight(for:)` sums
+    /// the first `Tok.visibleAccountRows` of these, in display order.
+    @State private var rowHeights: [String: CGFloat] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
@@ -179,15 +184,9 @@ struct FleetView: View {
             } else {
                 ScrollView {
                     rowStack(fleet)
-                        .background(
-                            GeometryReader { proxy in
-                                Color.clear.preference(
-                                    key: RowsHeightKey.self, value: proxy.size.height)
-                            }
-                        )
                 }
-                .frame(height: min(max(rowsHeight, Tok.rowSpacing), Tok.panelMaxHeight))
-                .onPreferenceChange(RowsHeightKey.self) { rowsHeight = $0 }
+                .frame(height: visibleRowsHeight(for: fleet))
+                .onPreferenceChange(RowHeightsKey.self) { rowHeights = $0 }
             }
         }
     }
@@ -202,8 +201,39 @@ struct FleetView: View {
                     onChanged: { await poller.pollOnce() },
                     onRelogin: { reloginAccount(account.name) }
                 )
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: RowHeightsKey.self, value: [account.id: proxy.size.height])
+                    }
+                )
             }
         }
+    }
+
+    /// Height of the scroll viewport: room for the first `Tok.visibleAccountRows`
+    /// rows (any accounts past that scroll into view), clamped so it never
+    /// collapses to nothing and never exceeds the historical panel-wide cap.
+    ///
+    /// Sums per-row *measured* heights rather than `Tok.visibleAccountRows *`
+    /// some constant, because rows are not uniform height — see the doc on
+    /// `Tok.visibleAccountRows`.
+    ///
+    /// Fallback: before SwiftUI has laid out and reported any row height (the
+    /// first frame, prior to the first `onPreferenceChange`), `rowHeights` is
+    /// empty and this returns `Tok.panelMaxHeight` — the original
+    /// always-room-for-roughly-8-rows behaviour — so the panel never renders
+    /// at zero or one-row height while waiting for a real measurement.
+    private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
+        let orderedHeights = fleet.rowsInDisplayOrder.compactMap { rowHeights[$0.id] }
+        guard !orderedHeights.isEmpty else {
+            return Tok.panelMaxHeight
+        }
+        let visibleCount = min(orderedHeights.count, Tok.visibleAccountRows)
+        let summed =
+            orderedHeights.prefix(visibleCount).reduce(0, +)
+            + Tok.rowSpacing * CGFloat(max(visibleCount - 1, 0))
+        return min(max(summed, Tok.rowSpacing), Tok.panelMaxHeight)
     }
 
     private func offlineNotice(_ source: StatusSource) -> some View {
@@ -239,7 +269,17 @@ struct FleetView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             fleetActions
+            // Scope boundary by PROXIMITY, not by a rule. A `Hairline` shipped
+            // here first and was then rendered with `--render-states`: it put a
+            // THIRD full-width rule into the bottom third of the panel — one
+            // above this block, one here, one above the danger zone — and the
+            // new one sat between two rows that are both just buttons, while
+            // the checkboxes directly below it got no separator at all. The
+            // original trailing-alignment was reaching for the right thing
+            // ("without needing a rule between them"); only its method was
+            // wrong. Space groups these two without adding weight.
             appActions
+                .padding(.top, Tok.tightSpacing)
 
             if let loginError {
                 Text(loginError)
@@ -280,7 +320,7 @@ struct FleetView: View {
     /// `launchAtLogin` is documented as living beside Quit precisely because it
     /// "is about TcrBar, not about the fleet".
     private var fleetActions: some View {
-        HStack {
+        HStack(spacing: Tok.tightSpacing) {
             if server.state.isOurChild {
                 Button("Stop server") { server.stop() }
             } else {
@@ -310,16 +350,23 @@ struct FleetView: View {
                         + "an older one refuses before any browser opens and "
                         + "prints how to recover."
                 )
-            Spacer()
+            Spacer(minLength: 0)
         }
         .buttonStyle(.bordered)
     }
 
-    /// Actions that act on the APP, trailing-aligned so they read as a separate
-    /// group from the fleet row above without needing a rule between them.
+    /// Actions that act on the APP rather than on the fleet.
+    ///
+    /// These used to be trailing-aligned, on the reasoning that opposite
+    /// alignment would read as a separate group "without needing a rule between
+    /// them". In practice it read as misalignment: two button rows with
+    /// different left edges look broken before they look grouped, and the
+    /// second row's buttons floated away from everything above them. The scope
+    /// split is real, so it is now drawn — a `Hairline`, the same divider this
+    /// panel already uses to separate its sections — and both rows share one
+    /// left edge so the footer has a single vertical rhythm.
     private var appActions: some View {
-        HStack {
-            Spacer()
+        HStack(spacing: Tok.tightSpacing) {
             // Disabled rather than silently no-op while Sparkle already has
             // a check in flight — the same rule "Take over port…" follows.
             Button("Check for Updates…") { updater.checkForUpdates() }
@@ -329,6 +376,7 @@ struct FleetView: View {
                         + "Also reachable as `tcrbar://check-for-updates`."
                 )
             Button("Quit") { NSApplication.shared.terminate(nil) }
+            Spacer(minLength: 0)
         }
         .buttonStyle(.bordered)
     }
@@ -560,11 +608,14 @@ struct FleetView: View {
     }
 }
 
-/// Carries the measured height of the account rows out of the scroll view.
-private struct RowsHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+/// Carries the measured height of each account row out of the scroll view,
+/// keyed by `Account.id`. A dictionary rather than one summed scalar because
+/// rows are not uniform height — `visibleRowsHeight(for:)` needs the first N
+/// individually, in display order, not just their total.
+private struct RowHeightsKey: PreferenceKey {
+    static let defaultValue: [String: CGFloat] = [:]
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
     }
 }
 
