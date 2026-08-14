@@ -208,6 +208,39 @@ assert_hardened_runtime() {
 }
 
 # ---------------------------------------------------------------------------
+# Stage 3.5 — Sparkle public key assert
+# ---------------------------------------------------------------------------
+
+# build-tcrbar.sh only WARNS when TCRBAR_SPARKLE_PUBLIC_KEY is unset — right
+# for a local build, where the warning is right there on the screen you are
+# watching. This is the distribution path: the warning scrolls past into a
+# log nobody re-reads, and the built app carries no SUPublicEDKey. That app
+# CAN check the feed but its Sparkle instance will refuse to install anything
+# it finds there, because it has no key to verify the download against — a
+# one-way trap that needs a manual reinstall to escape. Refuse here, before a
+# DMG of that app exists, rather than warn and let it ship.
+assert_sparkle_public_key() {
+  local bundle="$1" key
+  key="$(/usr/libexec/PlistBuddy -c 'Print :SUPublicEDKey' "$bundle/Contents/Info.plist" 2>/dev/null || true)"
+  if [ -n "$key" ]; then
+    note "SUPublicEDKey: present in Info.plist"
+    return 0
+  fi
+  {
+    echo "ERROR: $bundle/Contents/Info.plist has no SUPublicEDKey."
+    echo "ERROR: the app inside this bundle can check the Sparkle feed but will"
+    echo "ERROR: refuse to install anything it finds there — it has no key to"
+    echo "ERROR: verify a downloaded update against. Every installed copy would"
+    echo "ERROR: need a manual reinstall to recover; this is a one-way trap."
+    echo "ERROR:"
+    echo "ERROR: Fix: export TCRBAR_SPARKLE_PUBLIC_KEY=<the EdDSA public key> and"
+    echo "ERROR: rebuild, or export TCRBAR_OP_ITEM so release-local.sh can fetch"
+    echo "ERROR: it from 1Password before calling this script."
+  } >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
 # Sparkle
 # ---------------------------------------------------------------------------
 
@@ -324,6 +357,79 @@ appcast_insert() {
 }
 
 # ---------------------------------------------------------------------------
+# Feed-outage guard
+# ---------------------------------------------------------------------------
+
+# Measured across four releases (docs/plans/swarm-retrospectives.md,
+# 2026-08-10 entry: 11m37s outage; prevented on 2026-08-14 only by a
+# disposable ad-hoc script) the update feed goes dark for the entire gap
+# between the tag-triggered workflow creating the GitHub Release — which
+# becomes `latest` immediately, carrying only CLI tarballs — and THIS script
+# reaching stage 9 to upload the DMG and appcast, which is after the build,
+# sign, DMG and (usually) notarize stages. Waiting until stage 9 to look is
+# what left the window open: by the time stage 9's own wait-loop finds the
+# release, it may already have been live and assetless for as long as the
+# build took.
+#
+# `releases/latest/download/appcast.xml` is the URL Sparkle fetches; a
+# release that IS `latest` and has no appcast.xml on it 404s every install's
+# update check, and GitHub's CDN caches that 404 against the exact URL.
+#
+# Reports whether $tag's Release exists and is assetless (no appcast.xml on
+# it yet) — the exact state stage 9 already knows how to mark prerelease.
+# Prints nothing; callers act on the exit code. Treats "could not ask" as
+# "nothing to quarantine" rather than failing the release outright — this
+# guard runs unattended in the background during the build and must never be
+# the thing that aborts a release over a transient network blip.
+release_is_assetless() {
+  local tag="$1" repo="$2" assets
+  assets="$(gh api "repos/$repo/releases/tags/$tag" --jq '[.assets[].name] | join(" ")' 2>/dev/null)" || return 1
+  case " $assets " in
+    *" appcast.xml "*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# Marks $tag prerelease so `latest` falls back to the previous good release.
+# Idempotent — `gh release edit` succeeds whether or not it was already
+# prerelease — so calling this repeatedly from a poll loop is safe. Failure
+# is swallowed rather than fatal for the same "must not abort a release over
+# a network blip" reason as release_is_assetless above; stage 9's own
+# explicit call (not this one) is the one whose failure IS fatal, because by
+# then it is the last chance before upload.
+quarantine_if_assetless() {
+  local tag="$1" repo="$2"
+  release_is_assetless "$tag" "$repo" || return 0
+  gh release edit "$tag" --prerelease --repo "$repo" >/dev/null 2>&1 || true
+}
+
+# Runs quarantine_if_assetless in the background every 10s for the whole
+# build/sign/notarize duration — the actual window this guard exists to
+# close. Sets `quarantine_watcher_pid`; stop_quarantine_watcher tears it down.
+# The subshell has its own `set +e`: a background loop must never let one
+# failed `gh` call kill itself, since nothing would then be watching for the
+# rest of the build.
+quarantine_watcher_pid=""
+start_quarantine_watcher() {
+  local tag="$1" repo="$2"
+  (
+    set +e
+    while true; do
+      quarantine_if_assetless "$tag" "$repo"
+      sleep 10
+    done
+  ) &
+  quarantine_watcher_pid=$!
+}
+
+stop_quarantine_watcher() {
+  [ -n "$quarantine_watcher_pid" ] || return 0
+  kill "$quarantine_watcher_pid" >/dev/null 2>&1 || true
+  wait "$quarantine_watcher_pid" 2>/dev/null || true
+  quarantine_watcher_pid=""
+}
+
+# ---------------------------------------------------------------------------
 
 usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -345,6 +451,7 @@ main() {
     stage "verify-only: $verify_only"
     assert_developer_id "$verify_only"
     assert_hardened_runtime "$verify_only"
+    assert_sparkle_public_key "$verify_only"
     exit 0
   fi
 
@@ -364,6 +471,19 @@ main() {
 
   local dmg="$build_dir/$app_name-$version.dmg"
 
+  # Start the feed-outage guard now, before the build even begins: the tag is
+  # normally pushed just before this script is invoked (see docs/RELEASING.md),
+  # so the tag-triggered Release can already exist by the time we get here, and
+  # the build/sign/notarize stages below are the whole outage window this
+  # guard exists to close. A --dry-run never touches a real GitHub Release
+  # (nothing is uploaded, stage 9 is skipped), so there is nothing to
+  # quarantine and starting the watcher would just poll a real repo for no
+  # reason — skip it.
+  if [ "$dry_run" != 1 ]; then
+    start_quarantine_watcher "$tag" "$repo"
+    trap stop_quarantine_watcher EXIT
+  fi
+
   # ---- stage 1: build -----------------------------------------------------
   stage "stage 1/9  build (apps/macos/scripts/build-tcrbar.sh)"
   "$here/build-tcrbar.sh"
@@ -376,6 +496,10 @@ main() {
   stage "stage 3/9  re-sign with the hardened runtime and a secure timestamp"
   resign_hardened "$app_dir"
   assert_hardened_runtime "$app_dir"
+
+  # ---- stage 3.5: Sparkle public key assert -------------------------------
+  stage "stage 3.5/9  assert the bundle carries a Sparkle public key"
+  assert_sparkle_public_key "$app_dir"
 
   # ---- stage 4: DMG -------------------------------------------------------
   stage "stage 4/9  build the DMG"
@@ -495,6 +619,12 @@ main() {
     note "would upload $(basename "$dmg") and appcast.xml to $repo release $tag"
   else
     stage "stage 9/9  publish to the GitHub Release"
+
+    # Stop the background guard here: from this point on, the fatal
+    # gh-release-edit calls below are the ones responsible for the
+    # prerelease/upload/reveal sequence, and having both running at once buys
+    # nothing but a harder-to-read log.
+    stop_quarantine_watcher
 
     # WAIT for the release to exist. It is a race, not a given.
     #
