@@ -2,6 +2,7 @@
   {
     "cacheHitRatio": 0.75,
     "cacheReadTokens": 6000000,
+    "control": false,
     "disabled": false,
     "fiveHour": 0.04,
     "freeAtMs": null,
@@ -31,6 +32,7 @@
   {
     "cacheHitRatio": 0.75,
     "cacheReadTokens": 6000000,
+    "control": false,
     "disabled": false,
     "fiveHour": 0.95,
     "freeAtMs": null,
@@ -71,6 +73,7 @@
   {
     "cacheHitRatio": 0.75,
     "cacheReadTokens": 6000000,
+    "control": false,
     "disabled": false,
     "fiveHour": 1.0,
     "freeAtMs": 1767312000000,
@@ -111,6 +114,7 @@
   {
     "cacheHitRatio": null,
     "cacheReadTokens": 0,
+    "control": false,
     "disabled": true,
     "fiveHour": null,
     "freeAtMs": null,

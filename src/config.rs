@@ -239,6 +239,15 @@ pub struct Config {
     /// fail rather than rotating. Set to the exact `accounts[].name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_account: Option<String>,
+    /// The identity-bound control account: the one name that `_tcr/accounts/control`
+    /// resolves to and that stays PROBEABLE (usage tracked) even while `disabled`.
+    /// Unlike [`Self::lock_account`] this does NOT change selection by itself —
+    /// see the manager's `control_idx` doc for the resolution and the routing this
+    /// key only sets up for (part 2). Absent → no control account (default).
+    /// `skip_serializing_if` so clearing it REMOVES the key rather than writing
+    /// `null` — same contract as `lock_account` would want if it grew a setter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_account: Option<String>,
     /// Force the upstream-forwarding client onto HTTP/1.1 instead of the
     /// h2-and-fall-back-to-h1 negotiation reqwest does by default. Absent →
     /// `false` (h2). OFF by default deliberately: an intermittent
@@ -1046,6 +1055,57 @@ fn merge_disabled(doc: &mut Map<String, Value>, target: &Account, disabled: bool
     DisabledWrite::Updated
 }
 
+/// What a targeted [`save_control_account`] did to the on-disk document.
+/// Simpler than [`DisabledWrite`]: `controlAccount` is a single top-level
+/// string, not a per-entry flag located by identity, so there is no
+/// `NoEntry`/`Ambiguous` — the key is either already what was asked, or it
+/// isn't, and the caller is free to name an account nothing on disk carries
+/// yet (resolution to a live rotation slot happens in the manager, not here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlWrite {
+    /// The key was set (or removed) and the file rewritten.
+    Updated,
+    /// The document already said exactly this; nothing was written.
+    Unchanged,
+}
+
+/// Persist ONLY the top-level `controlAccount` key into the file at `path`,
+/// leaving every other key exactly as the user left it. Same read-modify-write
+/// shape as [`save_disabled`] and for the same reason: the running server's
+/// `Config` is a boot-time snapshot, so writing it whole (what [`save`] does)
+/// would revert every setting the user edited while the proxy ran — that
+/// clobber is the exact bug fixed in `1d978ce`. The edit therefore runs on the
+/// file's RAW JSON document via [`read_document`] + [`write_atomic`], never on
+/// a `Config` round-trip through [`save`].
+///
+/// `name == None` REMOVES the key (matches `#[serde(skip_serializing_if =
+/// "Option::is_none")]` on [`Config::control_account`]) rather than writing
+/// `null` — the same "clear removes, never sets to a null-ish literal"
+/// contract [`save_disabled`] uses for `disabled == false`.
+pub fn save_control_account(path: &Path, name: Option<&str>) -> Result<ControlWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_control_account(&mut doc, name);
+    if outcome == ControlWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+/// Set or remove the top-level `controlAccount` key in `doc`. Reports whether
+/// the document actually changed, so the caller can skip a pointless rewrite
+/// of a credential file.
+fn merge_control_account(doc: &mut Map<String, Value>, name: Option<&str>) -> ControlWrite {
+    let desired = name.map(|n| Value::String(n.to_string()));
+    if doc.get("controlAccount").cloned() == desired {
+        return ControlWrite::Unchanged;
+    }
+    match desired {
+        Some(value) => doc.insert("controlAccount".to_string(), value),
+        None => doc.remove("controlAccount"),
+    };
+    ControlWrite::Updated
+}
+
 /// Where the ONE `accounts` entry carrying `target`'s identity lives — or why
 /// there is no one entry to write into. Separate from [`find_account_entry`] so
 /// the whole array can be scanned immutably (counting matches) before any mutable
@@ -1483,6 +1543,36 @@ mod tests {
     fn lock_account_absent_defaults_none() {
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
         assert_eq!(config.lock_account, None);
+    }
+
+    #[test]
+    fn control_account_parses_when_present() {
+        let config: Config =
+            serde_json::from_str(r#"{ "accounts": [], "controlAccount": "alice@example.com" }"#)
+                .unwrap();
+        assert_eq!(
+            config.control_account,
+            Some("alice@example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn control_account_absent_defaults_none() {
+        let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        assert_eq!(config.control_account, None);
+    }
+
+    /// `skip_serializing_if` round trip: setting then serializing must NOT emit
+    /// a `null`, only either the string or an absent key — this is what makes
+    /// `save_control_account`'s clear-removes-the-key contract representable.
+    #[test]
+    fn control_account_absent_does_not_serialize_a_null() {
+        let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        let json = serde_json::to_value(&config).unwrap();
+        assert!(
+            json.get("controlAccount").is_none(),
+            "an absent control account must not serialize at all: {json}"
+        );
     }
 
     /// A unique temp path per test — the suite runs tests in parallel threads of
@@ -2274,6 +2364,88 @@ mod tests {
             DisabledWrite::Unchanged
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), disabled_text);
+        fs::remove_file(&path).ok();
+    }
+
+    // --- save_control_account -----------------------------------------------
+
+    /// Setting `controlAccount` writes the top-level key and changes nothing
+    /// else — same "raw document, not a `Config` round trip" contract as
+    /// `save_disabled`. This is also `control_persist_preserves_unmodelled_top_level_keys`
+    /// from the bridge: a key nothing here models (`routes`) survives the write.
+    #[test]
+    fn set_control_writes_the_key_and_changes_nothing_else() {
+        let path = tmp_path("control-write");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        assert_eq!(
+            save_control_account(&path, Some("acct-a")).unwrap(),
+            ControlWrite::Updated
+        );
+
+        let mut after = read_json(&path);
+        assert_eq!(after["controlAccount"], json!("acct-a"));
+        after
+            .as_object_mut()
+            .expect("document is an object")
+            .remove("controlAccount");
+        let before: Value = serde_json::from_str(DISABLE_SAMPLE).unwrap();
+        assert_eq!(
+            after, before,
+            "the write touched something other than controlAccount"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Clearing (`name: None`) REMOVES the key rather than writing `null` —
+    /// matching `#[serde(skip_serializing_if = "Option::is_none")]` on
+    /// `Config::control_account`, and a set→clear round trip leaves the file
+    /// exactly as it started.
+    #[test]
+    fn clear_control_drops_the_key_and_round_trips_the_document() {
+        let path = tmp_path("control-roundtrip");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        save_control_account(&path, Some("acct-a")).unwrap();
+        assert_eq!(
+            save_control_account(&path, None).unwrap(),
+            ControlWrite::Updated
+        );
+
+        let after = read_json(&path);
+        assert!(
+            after.get("controlAccount").is_none(),
+            "clearing must DROP the key, not write null: {after}"
+        );
+        let before: Value = serde_json::from_str(DISABLE_SAMPLE).unwrap();
+        assert_eq!(
+            after, before,
+            "a set→clear round trip must leave the document as it started"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A redundant write — the document already names this control account —
+    /// reports `Unchanged` and leaves the file byte-identical.
+    #[test]
+    fn redundant_control_write_reports_unchanged_and_leaves_the_file_alone() {
+        let path = tmp_path("control-noop");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+
+        // Already unset → clearing again is a no-op.
+        assert_eq!(
+            save_control_account(&path, None).unwrap(),
+            ControlWrite::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), DISABLE_SAMPLE);
+
+        save_control_account(&path, Some("acct-a")).unwrap();
+        let with_control = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            save_control_account(&path, Some("acct-a")).unwrap(),
+            ControlWrite::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), with_control);
         fs::remove_file(&path).ok();
     }
 

@@ -40,8 +40,8 @@ use time::OffsetDateTime;
 
 use crate::config;
 use crate::manager::{
-    AccountStatus, AddAccountOutcome, AddPersist, DisablePersist, InFlightGuard, Manager,
-    SetDisabledOutcome,
+    AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, InFlightGuard,
+    Manager, SetControlOutcome, SetDisabledOutcome,
 };
 use crate::stats::{RequestLogEntry, SessionKind};
 
@@ -627,6 +627,22 @@ pub const ADD_ACCOUNT_PATH: &str = "/_tcr/accounts";
 /// answered — the same structural discriminator [`ENDPOINT_HEADER`] documents.
 pub const ADD_ACCOUNT_ENDPOINT: &str = "accounts-add";
 
+/// Path of the control-account endpoint [`set_control_handler`] serves — `POST`
+/// only, the third route on this process that MUTATES rotation state.
+///
+/// Same shape as [`DISABLED_PATH`] and for the same reasons: registered as a
+/// real route so axum matches it exactly and BEFORE the catch-all, so a `POST`
+/// here can never be rewritten onto api.anthropic.com carrying a pooled OAuth
+/// Bearer. What authorizes the mutation is [`local_endpoint_gate`] plus the
+/// `application/json` requirement, neither of which the path shape has any
+/// part in.
+pub const CONTROL_PATH: &str = "/_tcr/accounts/control";
+
+/// The [`ENDPOINT_HEADER`] value [`set_control_handler`] stamps. Distinct from
+/// [`DISABLED_ENDPOINT`]/[`ADD_ACCOUNT_ENDPOINT`] so a caller can tell which of
+/// the three mutating routes answered.
+pub const CONTROL_ENDPOINT: &str = "account-control";
+
 /// Body cap for the local control route: a JSON object with three short fields.
 /// Deliberately not [`MAX_BODY_BYTES`] (256 MiB, sized for model requests) — this
 /// route buffers into memory in a credential-holding process, and nothing
@@ -954,6 +970,10 @@ pub fn app(manager: Arc<Manager>) -> Router {
             ADD_ACCOUNT_PATH,
             axum::routing::post(add_account_handler).fallback(add_account_method_not_allowed),
         )
+        .route(
+            CONTROL_PATH,
+            axum::routing::post(set_control_handler).fallback(control_method_not_allowed),
+        )
         .fallback(handle)
         .with_state(manager)
 }
@@ -1099,6 +1119,7 @@ async fn status_handler(
         &manager.snapshot(now),
         &manager.thresholds(),
         manager.http1_only(),
+        manager.control_name(),
     );
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
@@ -1296,6 +1317,157 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             headers.insert("cache-control", HeaderValue::from_static("no-store"));
             stamp_endpoint(response)
+        }
+    }
+}
+
+/// A non-`POST` on [`CONTROL_PATH`]. Answered locally with 405, same reasoning
+/// as [`disabled_method_not_allowed`] — the route is a command with exactly
+/// one verb.
+async fn control_method_not_allowed() -> Response {
+    stamp_control_endpoint(error_response(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "invalid_request_error",
+        "The tcr control-account endpoint takes POST.",
+        None,
+    ))
+}
+
+/// Add [`ENDPOINT_HEADER`] to a response the control-account route produced.
+fn stamp_control_endpoint(response: Response) -> Response {
+    stamp_endpoint_as(response, CONTROL_ENDPOINT)
+}
+
+/// The request body of [`CONTROL_PATH`].
+///
+/// `query: null` (or the field omitted) CLEARS the control account —
+/// deliberately not an error, unlike [`SetDisabledRequest`] where a missing
+/// `query` is a 400: there is no destructive-vs-informative ambiguity here,
+/// clearing is a complete and meaningful request on its own.
+#[derive(serde::Deserialize, Default)]
+struct SetControlRequest {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    org: Option<String>,
+}
+
+/// The 200 body of [`CONTROL_PATH`]. Deserializable too — `tcr control` reads
+/// it, and both halves of the wire contract belong to one type.
+///
+/// Every field `#[serde(default)]`, with the safer reading as the default —
+/// same cross-build posture [`SetDisabledResponse`] would want if a future
+/// tcr shipped a field this one predates: an OLDER client parsing a NEWER
+/// server's body (or vice versa) must land on "nothing happened / not saved"
+/// rather than silently assume success on a field it never received.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SetControlResponse {
+    /// The RESOLVED account name now set as control, or `None` when this call
+    /// cleared it. Resolved rather than echoed for the same reason
+    /// [`SetDisabledResponse::name`] is.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Whether this call cleared the control account (`query` was `null`).
+    #[serde(default)]
+    pub cleared: bool,
+    /// Whether the config file also carries it. `false` with a `warning` is a
+    /// change that is live but will not survive a restart.
+    #[serde(default)]
+    pub persisted: bool,
+    /// [`crate::manager::ControlPersist::warning`], verbatim, or `null`.
+    #[serde(default)]
+    pub warning: Option<String>,
+}
+
+/// `POST /_tcr/accounts/control` — set or clear the identity-bound CONTROL
+/// account IN THE LIVE ROTATION, for `tcr control`.
+///
+/// Cloned from [`set_disabled_handler`], same gate order: [`local_endpoint_gate`]
+/// first (refusal NOT stamped — a caller that failed the gate gets no
+/// confirmation the route exists), then [`is_json_content_type`] (stamped —
+/// a request-shape error like the 400s below it). Does the work through
+/// [`Manager::set_control_by_query`], the same call `tcr control` makes.
+///
+/// Unlike [`set_disabled_handler`], a missing/`null` `query` is not a 400 — it
+/// is the CLEAR request, a complete operation on its own.
+async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Some(refusal) = local_endpoint_gate(&parts, &manager, "control-account") {
+        // NOT stamped — see `set_disabled_handler`'s identical comment.
+        return refusal;
+    }
+
+    if !is_json_content_type(&parts.headers) {
+        return stamp_control_endpoint(error_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "The tcr control-account endpoint requires Content-Type: application/json.",
+            None,
+        ));
+    }
+
+    let Ok(bytes) = to_bytes(body, CONTROL_BODY_LIMIT).await else {
+        return stamp_control_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Could not read the request body.",
+            None,
+        ));
+    };
+    let Ok(parsed) = serde_json::from_slice::<SetControlRequest>(&bytes) else {
+        return stamp_control_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "Expected a JSON object: {\"query\": \"<account>\" | null, \"org\": null}.",
+            None,
+        ));
+    };
+    if matches!(&parsed.query, Some(q) if q.trim().is_empty()) {
+        return stamp_control_endpoint(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "\"query\" must not be empty; omit it or send null to clear.",
+            None,
+        ));
+    }
+    let cleared = parsed.query.is_none();
+
+    match manager.set_control_by_query(parsed.query.as_deref(), parsed.org.as_deref()) {
+        SetControlOutcome::NoMatch => stamp_control_endpoint(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found_error",
+            &format!(
+                "No account in the live rotation matches '{}'.",
+                parsed.query.unwrap_or_default()
+            ),
+            None,
+        )),
+        SetControlOutcome::Ambiguous(names) => stamp_control_endpoint(error_response(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            &crate::cli::ambiguous_query_message(&parsed.query.unwrap_or_default(), &names),
+            None,
+        )),
+        SetControlOutcome::Applied { name, persist } => {
+            let payload = SetControlResponse {
+                name,
+                cleared,
+                persisted: matches!(persist, ControlPersist::Persisted),
+                warning: persist.warning().map(str::to_string),
+            };
+            let Ok(body) = serde_json::to_string(&payload) else {
+                return stamp_control_endpoint(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "api_error",
+                    "Could not serialize the control-account result.",
+                    None,
+                ));
+            };
+            let mut response = Response::new(Body::from(body));
+            let headers = response.headers_mut();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            headers.insert("cache-control", HeaderValue::from_static("no-store"));
+            stamp_control_endpoint(response)
         }
     }
 }
@@ -3353,6 +3525,7 @@ mod tests {
             pacing: crate::config::PacingConfig::default(),
             throttle: crate::config::ThrottleConfig::default(),
             lock_account: None,
+            control_account: None,
             http1_only: false,
             accounts: vec![Account {
                 name: "dummy".to_string(),
@@ -5123,6 +5296,288 @@ mod tests {
             );
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    // --- POST /_tcr/accounts/control ----------------------------------------
+
+    fn control_account_in_file(path: &std::path::Path) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(path).expect("read the test config");
+        let doc: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        doc.get("controlAccount").cloned()
+    }
+
+    /// Drive the control-ACCOUNT route with a `ClientAddr` we control, the same
+    /// shape as [`control_request`] but against [`CONTROL_PATH`].
+    async fn control_account_request(
+        manager: Arc<Manager>,
+        method: Method,
+        peer: Option<SocketAddr>,
+        api_key: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, HeaderMap, Bytes) {
+        use tower::ServiceExt as _;
+        let mut builder = Request::builder().method(method).uri(CONTROL_PATH);
+        if let Some(key) = api_key {
+            builder = builder.header("x-api-key", key);
+        }
+        let mut req = builder
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("build request");
+        if let Some(addr) = peer {
+            req.extensions_mut().insert(ClientAddr(addr));
+        }
+        let response = app(manager).oneshot(req).await.expect("router response");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), MAX_BODY_BYTES)
+            .await
+            .expect("read body");
+        (status, headers, bytes)
+    }
+
+    /// THE BITING TEST for the control-account route: after the endpoint
+    /// answers, the LIVE manager resolves it (`control_name()`), not merely the
+    /// response body, and the file's top-level `controlAccount` carries it too.
+    #[tokio::test]
+    async fn control_account_endpoint_sets_it_in_memory_and_on_disk() {
+        let (manager, path) = control_manager("control-apply", None);
+        assert_eq!(manager.control(), None, "starts with no control account");
+
+        let (status, headers, body) = control_account_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com","org":null}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(CONTROL_ENDPOINT),
+            "the route stamps itself so a caller can tell it from a missing route"
+        );
+
+        let payload: SetControlResponse =
+            serde_json::from_slice(&body).expect("a control-account payload");
+        assert_eq!(payload.name, Some("alice@example.com".to_string()));
+        assert!(!payload.cleared);
+        assert!(payload.persisted, "the durable half succeeded");
+        assert_eq!(payload.warning, None);
+
+        // 1. THE LIVE MANAGER resolves the control account — not merely an
+        // acknowledgement in the response body.
+        assert_eq!(
+            manager.control_name(),
+            Some("alice@example.com".to_string()),
+            "the live manager must resolve the new control account"
+        );
+
+        // 2. …and the file's top-level key carries it too.
+        assert_eq!(
+            control_account_in_file(&path),
+            Some(serde_json::json!("alice@example.com"))
+        );
+
+        // Clearing (`query: null`) removes it from both halves.
+        let (status, _headers, body) = control_account_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":null}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let payload: SetControlResponse = serde_json::from_slice(&body).expect("payload");
+        assert_eq!(payload.name, None);
+        assert!(payload.cleared);
+        assert!(payload.persisted);
+        assert_eq!(manager.control(), None, "cleared in memory");
+        assert_eq!(control_account_in_file(&path), None, "cleared on disk");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// SECURITY GUARD 1 — origin, on the control-account route: same posture as
+    /// [`control_endpoint_rejects_a_non_loopback_client`].
+    #[tokio::test]
+    async fn control_account_endpoint_rejects_a_non_loopback_client() {
+        for (label, peer) in [
+            ("a routable peer", Some(remote_peer())),
+            ("no ClientAddr at all", None),
+        ] {
+            let (manager, path) = control_manager("control-origin", None);
+            let (status, _headers, _body) = control_account_request(
+                Arc::clone(&manager),
+                Method::POST,
+                peer,
+                None,
+                r#"{"query":"alice@example.com"}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} must be refused, got {status}"
+            );
+            assert_eq!(
+                manager.control(),
+                None,
+                "{label}: a refused caller changed the control account"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// SECURITY GUARD 2 — the key, on the control-account route: same posture as
+    /// [`control_endpoint_rejects_a_bad_api_key`].
+    #[tokio::test]
+    async fn control_account_endpoint_rejects_a_bad_api_key() {
+        for (label, provided) in [("no key at all", None), ("a wrong key", Some("wrong-key"))] {
+            let (manager, path) = control_manager("control-key", Some("secret-key"));
+            let (status, _headers, _body) = control_account_request(
+                Arc::clone(&manager),
+                Method::POST,
+                Some(loopback_peer()),
+                provided,
+                r#"{"query":"alice@example.com"}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{label} must be refused, got {status}"
+            );
+            assert_eq!(manager.control(), None);
+            std::fs::remove_file(&path).ok();
+        }
+
+        let (manager, path) = control_manager("control-key-ok", Some("secret-key"));
+        let (status, _headers, body) = control_account_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            Some("secret-key"),
+            r#"{"query":"alice@example.com"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(manager.control(), Some(0));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A missing/wrong `content-type` is refused (415), stamped, and changes
+    /// nothing — same posture [`is_json_content_type`] enforces on the other two
+    /// mutating routes.
+    #[tokio::test]
+    async fn control_account_endpoint_requires_json_content_type() {
+        use tower::ServiceExt as _;
+        let (manager, path) = control_manager("control-ctype", None);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri(CONTROL_PATH)
+            .body(Body::from(r#"{"query":"alice@example.com"}"#.to_string()))
+            .expect("build request");
+        let mut req = req;
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+        let response = app(Arc::clone(&manager))
+            .oneshot(req)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response
+                .headers()
+                .get(ENDPOINT_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(CONTROL_ENDPOINT),
+            "a 415 still identifies the route that produced it"
+        );
+        assert_eq!(manager.control(), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The route is `POST`-only; a wrong method is answered LOCALLY (405),
+    /// never forwarded, and never able to mutate — same posture as
+    /// [`control_endpoint_refuses_other_methods_locally`].
+    #[tokio::test]
+    async fn control_account_endpoint_refuses_other_methods_locally() {
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::PATCH] {
+            let (manager, path) = control_manager("control-method", None);
+            let (status, headers, _body) = control_account_request(
+                Arc::clone(&manager),
+                method.clone(),
+                Some(loopback_peer()),
+                None,
+                r#"{"query":"alice@example.com"}"#,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} on the control-account path is refused locally"
+            );
+            assert_ne!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(
+                headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+                Some(CONTROL_ENDPOINT)
+            );
+            assert_eq!(
+                manager.control(),
+                None,
+                "{method} changed the control account"
+            );
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    /// A query naming no live account is a 404 from the route (stamped), and an
+    /// ambiguous query is a 409 naming the candidates — same posture as the
+    /// disabled-flag route's equivalents.
+    #[tokio::test]
+    async fn control_account_endpoint_404s_and_409s() {
+        let (manager, path) = control_manager("control-nomatch", None);
+        let (status, headers, body) = control_account_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"nobody@example.com"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(CONTROL_ENDPOINT)
+        );
+        assert!(String::from_utf8_lossy(&body).contains("nobody@example.com"));
+        assert_eq!(manager.control(), None);
+        std::fs::remove_file(&path).ok();
+
+        let path = control_config_path("control-ambiguous");
+        let mut config = two_account_config(None);
+        config.accounts[1].name = "alice@example.com".to_string();
+        crate::config::save(&path, &config).expect("write the test config");
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        let (status, headers, body) = control_account_request(
+            Arc::clone(&manager),
+            Method::POST,
+            Some(loopback_peer()),
+            None,
+            r#"{"query":"alice@example.com"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            headers.get(ENDPOINT_HEADER).and_then(|v| v.to_str().ok()),
+            Some(CONTROL_ENDPOINT)
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("ambiguous") && text.contains("--org"));
+        assert_eq!(manager.control(), None, "an unbreakable tie sets nothing");
+        std::fs::remove_file(&path).ok();
     }
 
     /// Drive the control route with FULL control over the request line and every

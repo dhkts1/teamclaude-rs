@@ -631,6 +631,59 @@ impl DisablePersist {
     }
 }
 
+/// What [`Manager::set_control_by_query`] did. Same shape as
+/// [`SetDisabledOutcome`], with one difference: a `None` query is a legitimate
+/// request (clear the control account), not a missing argument, so `Applied`'s
+/// `name` is itself an `Option` rather than `Applied` only ever meaning "matched
+/// something".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetControlOutcome {
+    /// `name` is the resolved account name, or `None` when this call cleared
+    /// the control account.
+    Applied {
+        name: Option<String>,
+        persist: ControlPersist,
+    },
+    /// The query named no account in the live rotation.
+    NoMatch,
+    /// The query named more than one, listed so the caller can tell the user
+    /// what to pass `--org` for.
+    Ambiguous(Vec<String>),
+}
+
+/// What [`Manager::set_control`] achieved about DURABILITY — whether the
+/// control account will still be set (or cleared) after a restart. Simpler
+/// than [`DisablePersist`]: `controlAccount` is a single top-level key
+/// resolved by NAME, not a per-account flag located by identity, so there is
+/// no `NoEntry`/`Ambiguous` arm on the durable side — see
+/// [`config::ControlWrite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPersist {
+    /// The config file carries the control account (or its absence) — written
+    /// just now, or already correct.
+    Persisted,
+    /// No config file behind this manager (`tcr demo`, `tcr status --probe`,
+    /// tests). Memory-only BY DESIGN.
+    NoConfigFile,
+    /// The write itself failed (unreadable, malformed, or unwritable file).
+    WriteFailed,
+}
+
+impl ControlPersist {
+    /// The one line to put in front of the user, or `None` when the outcome
+    /// needs no explanation. Mirrors [`DisablePersist::warning`]; there is no
+    /// direction-dependent wording here because clearing and setting fail the
+    /// same way — a failed write just leaves the file saying whatever it said.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Persisted | Self::NoConfigFile => None,
+            Self::WriteFailed => {
+                Some("NOT SAVED: writing the config failed — this will not survive a restart")
+            }
+        }
+    }
+}
+
 /// What [`Manager::add_or_update_account`] achieved about DURABILITY. Same role
 /// as [`DisablePersist`], deliberately simpler: an upsert either lands or it does
 /// not, and there is no "no such account" / "no config entry" arm here — a MISS
@@ -745,6 +798,20 @@ pub struct Manager {
     /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
     /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
     locked_idx: Option<usize>,
+    /// The resolved identity-bound control account (index of the account named
+    /// by `config.controlAccount`), or `None` when unset / the name did not
+    /// match. Deliberately **not** `locked_idx`'s immutable `Option<usize>` —
+    /// this one is set at runtime via `tcr control` / `POST
+    /// /_tcr/accounts/control`, mirroring `set_disabled_by_query`, so it needs
+    /// interior mutability. Read by [`Self::probeable_indices`] to keep usage
+    /// tracking on this account even while it stays `disabled` (out of the
+    /// inference rotation on purpose — see the module's `probing.rs` doc).
+    /// Selection itself does NOT consult this field (part 1's invariant);
+    /// routing is added on top in part 2.
+    ///
+    /// Lock order: taken ALONE, never nested under `accounts` or `affinity` —
+    /// same discipline as `select.rs:253-256`.
+    control_idx: RwLock<Option<usize>>,
     /// GCRA theoretical-arrival-time (epoch ms) for the global outbound throttle.
     /// Guarded by an async mutex held ONLY for the O(1) slot update, released
     /// before any sleep so concurrent callers stagger and sleep concurrently.
@@ -911,6 +978,18 @@ impl Manager {
         // Capture the locked account name BEFORE `accounts` is moved into the struct.
         let locked_name = locked_idx.and_then(|i| accounts.get(i).map(|a| a.name.clone()));
 
+        let control_idx = config.control_account.as_ref().and_then(|name| {
+            let idx = accounts.iter().position(|a| a.name == *name);
+            if idx.is_none() {
+                let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+                tracing::error!(
+                    control_account = %name, available = ?names,
+                    "controlAccount name did not match any account — running with NO control account"
+                );
+            }
+            idx
+        });
+
         let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
             refresher,
@@ -927,6 +1006,7 @@ impl Manager {
             pacing,
             throttle,
             locked_idx,
+            control_idx: RwLock::new(control_idx),
             throttle_tat_ms: AsyncMutex::new(0),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
@@ -1370,6 +1450,147 @@ impl Manager {
         SetDisabledOutcome::Applied {
             name,
             persist: self.set_disabled(idx, disabled),
+        }
+    }
+
+    /// The current control account's rotation index, or `None` when unset.
+    pub fn control(&self) -> Option<usize> {
+        *self.control_idx.read().expect("control lock poisoned")
+    }
+
+    /// The current control account's name, or `None` when unset / the index no
+    /// longer resolves (an account row cannot disappear — `add_account` is
+    /// append-only — so the only way this reads `None` with `control()` some
+    /// is a bug, not a live scenario; resolving defensively here rather than
+    /// indexing avoids a panic either way).
+    pub fn control_name(&self) -> Option<String> {
+        let idx = self.control()?;
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.name.clone())
+    }
+
+    /// Persist ONLY the top-level `controlAccount` key, via
+    /// [`config::save_control_account`] — never the whole config (see
+    /// [`Self::persist_disabled`]'s doc-comment for why: the in-memory
+    /// `Config` is a boot-time snapshot, and flushing it whole would revert
+    /// every setting the user edited while the proxy ran — the exact clobber
+    /// fixed in `1d978ce`).
+    ///
+    /// Same three invariants as [`Self::persist_disabled`]:
+    ///  - **INV1** — `config_write` spans the whole read-modify-rename, so this
+    ///    write and a concurrent token rotation or disabled-flag write can
+    ///    never interleave.
+    ///  - **INV2** — `save_control_account` runs with `self.config` NOT held,
+    ///    so the file I/O never blocks the per-connection config read.
+    ///  - **INV3** — the in-memory snapshot (`config.control_account`) is
+    ///    mutated only once the file is known to carry the desired state
+    ///    (`Updated` or `Unchanged`); a failed write leaves memory and disk in
+    ///    the same (divergent-from-the-request) state rather than only disk.
+    ///
+    /// A missing `config_path` (tests, `tcr demo`, `tcr status --probe`) is a
+    /// SILENT no-op — those managers must never touch a real config file.
+    fn persist_control(&self, name: Option<String>) -> ControlPersist {
+        let Some(path) = &self.config_path else {
+            return ControlPersist::NoConfigFile;
+        };
+        // INV1 — held across `save_control_account`'s whole read + modify +
+        // sync + rename.
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        // INV2 — no `self.config` guard is alive on this line.
+        let outcome = config::save_control_account(path, name.as_deref());
+        // INV3 — memory is touched only on the arms where the FILE now carries
+        // the desired state.
+        if matches!(
+            outcome,
+            Ok(config::ControlWrite::Updated) | Ok(config::ControlWrite::Unchanged)
+        ) {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            config.control_account = name.clone();
+        }
+        match outcome {
+            Ok(config::ControlWrite::Updated) => {
+                tracing::info!(
+                    control_account = ?name,
+                    "persisted control account to config"
+                );
+                ControlPersist::Persisted
+            }
+            Ok(config::ControlWrite::Unchanged) => {
+                tracing::debug!(
+                    control_account = ?name,
+                    "config already names this control account; nothing written"
+                );
+                ControlPersist::Persisted
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    control_account = ?name,
+                    path = %path.display(),
+                    "failed to persist the control account to config"
+                );
+                ControlPersist::WriteFailed
+            }
+        }
+    }
+
+    /// Set (`idx = Some(_)`) or clear (`idx = None`) the control account by
+    /// rotation index, and persist it. Mirrors [`Self::set_disabled`]'s
+    /// resolve-name-then-persist shape: the name is read out under a released
+    /// `accounts` READ lock before `control_idx` is taken, so the two never
+    /// nest (same discipline `set_disabled` documents for `accounts`/`config`).
+    fn set_control(&self, idx: Option<usize>) -> ControlPersist {
+        let name = idx.and_then(|i| {
+            self.accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .get(i)
+                .map(|a| a.name.clone())
+        });
+        {
+            let mut control = self.control_idx.write().expect("control lock poisoned");
+            *control = idx;
+        }
+        self.persist_control(name)
+    }
+
+    /// Resolve a user-supplied `(query, org)` against the LIVE rotation and set
+    /// the control account to whatever it names — the whole operation the
+    /// control endpoint performs. `query = None` CLEARS the control account
+    /// (there is nothing to resolve, so this never reaches `match_one`).
+    ///
+    /// Resolution runs over `self.accounts` — never the boot-time config
+    /// snapshot — for the same reason [`Self::set_disabled_by_query`] does.
+    pub fn set_control_by_query(
+        &self,
+        query: Option<&str>,
+        org: Option<&str>,
+    ) -> SetControlOutcome {
+        let Some(query) = query else {
+            return SetControlOutcome::Applied {
+                name: None,
+                persist: self.set_control(None),
+            };
+        };
+        let (idx, name) = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            match crate::identity::match_one(&accounts[..], query, org) {
+                crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
+                crate::identity::Match::None => return SetControlOutcome::NoMatch,
+                crate::identity::Match::Ambiguous(names) => {
+                    return SetControlOutcome::Ambiguous(names)
+                }
+            }
+        };
+        SetControlOutcome::Applied {
+            name: Some(name),
+            persist: self.set_control(Some(idx)),
         }
     }
 
@@ -2015,6 +2236,7 @@ mod tests {
             pacing: PacingConfig::default(),
             throttle: ThrottleConfig::default(),
             lock_account: None,
+            control_account: None,
             http1_only: false,
             accounts,
             extra: serde_json::Map::new(),
@@ -2476,6 +2698,12 @@ mod tests {
         config
     }
 
+    fn config_with_control(accounts: Vec<Account>, control: &str) -> Config {
+        let mut config = config_with(accounts);
+        config.control_account = Some(control.to_string());
+        config
+    }
+
     /// A hard lock pins EVERY select to the locked index, ignoring the LRU
     /// preference and any session-affinity key that points elsewhere.
     #[test]
@@ -2541,6 +2769,116 @@ mod tests {
         assert_eq!(manager.locked_idx, None);
         let now = OffsetDateTime::now_utc();
         assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(0));
+    }
+
+    /// `assemble` resolves the configured `controlAccount` name to its account
+    /// index, mirroring `assemble_resolves_lock_name`; a name that matches no
+    /// account resolves to `None` (runs with no control account, not a panic).
+    #[test]
+    fn assemble_resolves_control_name() {
+        let matched = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0), account("c", 0)], "c"),
+            lock_refresher(),
+        );
+        assert_eq!(matched.control(), Some(2));
+
+        let unmatched = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0)], "ghost"),
+            lock_refresher(),
+        );
+        assert_eq!(unmatched.control(), None);
+    }
+
+    /// Absent `controlAccount` → `control() == None`.
+    #[test]
+    fn control_absent_default_leaves_control_none() {
+        let manager = build_manager(config_with(vec![account("solo", 0)]), lock_refresher());
+        assert_eq!(manager.control(), None);
+    }
+
+    /// The invariant part 1 exists to protect: setting a control account must
+    /// NOT change which account `select` returns. Two managers, identical
+    /// accounts, one with a control account set — the same `select` sequence
+    /// over N calls proves selection stayed byte-identical. Routing (making
+    /// the control account preferred for identity traffic) is part 2.
+    #[test]
+    fn setting_a_control_account_does_not_change_selection() {
+        let without_control = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let with_control = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0)], "a"),
+            lock_refresher(),
+        );
+        assert_eq!(with_control.control(), Some(0));
+
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..20 {
+            let picked_without = without_control.select(&HashSet::new(), now, None, None);
+            let picked_with = with_control.select(&HashSet::new(), now, None, None);
+            assert_eq!(
+                picked_without, picked_with,
+                "a control account must not change which account select() returns"
+            );
+            if let Some(idx) = picked_without {
+                without_control.set_current(idx);
+                with_control.set_current(idx);
+            }
+        }
+    }
+
+    /// `set_control_by_query` resolves against the LIVE rotation (mirroring
+    /// `set_disabled_by_query`), reports the resolved name, sets `control()`,
+    /// and a `None` query clears it.
+    #[test]
+    fn set_control_by_query_resolves_sets_and_clears() {
+        let manager = build_manager(
+            config_with(vec![account("gil", 0), account("other", 0)]),
+            lock_refresher(),
+        );
+
+        let outcome = manager.set_control_by_query(Some("gil"), None);
+        assert_eq!(
+            outcome,
+            SetControlOutcome::Applied {
+                name: Some("gil".to_string()),
+                persist: ControlPersist::NoConfigFile,
+            }
+        );
+        assert_eq!(manager.control(), Some(0));
+        assert_eq!(manager.control_name(), Some("gil".to_string()));
+
+        let cleared = manager.set_control_by_query(None, None);
+        assert_eq!(
+            cleared,
+            SetControlOutcome::Applied {
+                name: None,
+                persist: ControlPersist::NoConfigFile,
+            }
+        );
+        assert_eq!(manager.control(), None);
+    }
+
+    #[test]
+    fn set_control_by_query_no_match_and_ambiguous() {
+        let manager = build_manager(
+            config_with(vec![account("dup", 0), account("dup", 0)]),
+            lock_refresher(),
+        );
+        assert_eq!(
+            manager.set_control_by_query(Some("ghost"), None),
+            SetControlOutcome::NoMatch
+        );
+        assert_eq!(
+            manager.set_control_by_query(Some("dup"), None),
+            SetControlOutcome::Ambiguous(vec!["dup".to_string(), "dup".to_string()])
+        );
+        assert_eq!(
+            manager.control(),
+            None,
+            "an ambiguous query must not set anything"
+        );
     }
 
     #[test]
@@ -3144,6 +3482,13 @@ mod tests {
     /// Finding #1: the background probe must SKIP disabled and errored accounts —
     /// never spend upstream traffic on a sidelined account nor let a probe's
     /// refresh silently flip an errored account back into rotation.
+    ///
+    /// UPDATED contract (control account, part 1): "disabled → skipped" now
+    /// has exactly one exception, the control account, covered separately by
+    /// [`probeable_indices_still_includes_a_disabled_control_account`] and
+    /// [`probeable_indices_excludes_a_disabled_non_control_account_even_with_a_control_set`]
+    /// below. This test has no control account configured at all, so it keeps
+    /// asserting the base case: an ordinary disabled account is skipped.
     #[tokio::test]
     async fn probe_all_skips_disabled_and_errored_accounts() {
         let refresher = Arc::new(CountingRefresher {
@@ -3172,7 +3517,7 @@ mod tests {
         assert_eq!(
             snap.accounts[1].probe_status,
             ProbeStatus::Never,
-            "a disabled account must not be probed"
+            "a disabled non-control account must not be probed"
         );
         assert!(snap.accounts[1].last_probe.is_none());
         assert_eq!(
@@ -3182,6 +3527,54 @@ mod tests {
         );
         // And the errored account was NOT flipped back to active by a probe refresh.
         assert_eq!(manager.account_status(2), Some(AccountStatus::Error));
+    }
+
+    /// The narrow exception itself, asserted directly on `probeable_indices()`
+    /// — the unit `probe_all` merely iterates: a disabled account that IS the
+    /// control account stays probeable, so its usage keeps getting tracked
+    /// even though it is deliberately out of the inference rotation.
+    #[test]
+    fn probeable_indices_still_includes_a_disabled_control_account() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("ok", 0), account("gil", 0)]),
+            refresher,
+        );
+        manager.set_control_by_query(Some("gil"), None);
+        manager.set_disabled(1, true);
+
+        assert_eq!(
+            manager.probeable_indices(),
+            vec![0, 1],
+            "the disabled CONTROL account (idx 1) must still be probeable"
+        );
+    }
+
+    /// The exception must not silently widen: with a control account set,
+    /// every OTHER disabled account is still excluded from
+    /// `probeable_indices()`.
+    #[test]
+    fn probeable_indices_excludes_a_disabled_non_control_account_even_with_a_control_set() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("gil", 0), account("ok", 0), account("off", 0)]),
+            refresher,
+        );
+        manager.set_control_by_query(Some("gil"), None);
+        manager.set_disabled(0, true); // the control account itself, disabled
+        manager.set_disabled(2, true); // an unrelated account, disabled
+
+        assert_eq!(
+            manager.probeable_indices(),
+            vec![0, 1],
+            "idx 0 (disabled control) stays probeable, idx 1 (enabled) stays \
+             probeable, idx 2 (disabled, NOT control) is excluded — the \
+             exception must not widen"
+        );
     }
 
     #[tokio::test]
