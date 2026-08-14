@@ -413,6 +413,63 @@ struct UserIdMeta {
     user_id: Option<String>,
 }
 
+/// Minimal shape reading only the request's CACHEABLE PREFIX — the top-level
+/// `system` and `tools` fields — as `&RawValue`, so the returned slices borrow
+/// the VERBATIM source bytes out of `body` rather than a re-serialized copy
+/// (same technique as `account_uuid.rs`'s `BodyPeek`). That verbatim-ness is
+/// load-bearing for tier 3 of [`stable_session_key`]: Anthropic's prompt cache
+/// is a byte-exact match, so hashing anything other than the original bytes
+/// (e.g. a canonicalized/key-sorted re-encoding) could merge two bodies our hash
+/// treats as identical that Anthropic's cache treats as distinct, buying zero
+/// cache hits while still concentrating load onto one account.
+#[derive(serde::Deserialize)]
+struct PrefixPeek<'a> {
+    #[serde(borrow)]
+    system: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    tools: Option<&'a serde_json::value::RawValue>,
+}
+
+/// Tier 3 of [`stable_session_key`]: derive a fallback affinity key from the
+/// request's cacheable prefix when the client carries no stable identity at
+/// all. Returns `None` when BOTH `system` and `tools` are absent (or the body
+/// doesn't parse) — there is then no cacheable prefix, so a pin buys no cache
+/// win and only concentrates unrelated anonymous traffic onto one account. This
+/// is the guard that stops every trivial anonymous request (no system prompt,
+/// no tools) from piling onto a single account; do not drop it.
+///
+/// Hashes the RAW bytes of each field via `RawValue::get()` — never
+/// canonicalized — namespaced under `"pfx:"` so this input space cannot collide
+/// with the `"key:"` / `"uid:"` tiers. `system` and `tools` are hashed as
+/// `Option<&str>` (not concatenated into one string) so presence/absence of
+/// each field is part of the hash input and a `(None, Some("ab"))` pair can
+/// never collide with a `(Some("ab"), None)` pair; `str`'s own `Hash` impl
+/// appends a sentinel byte after each value, so this is also safe against a
+/// `system`/`tools` boundary shift (e.g. `("a", "bc")` vs `("ab", "c")`).
+///
+/// Deliberately NO minimum-size floor. A tiny `system`/`tools` field that can
+/// never reach Anthropic's minimum cacheable-prefix length pins for zero cache
+/// benefit — a floor would fix that. But the floor would have to be a BYTE
+/// count on the raw JSON text, while Anthropic's minimum is a TOKEN count on
+/// tokenized content, and this proxy has no tokenizer: it never decodes model
+/// text, only relays bytes. Any byte→token constant here would be an
+/// undefended guess — wrong in one direction wastes the tier's whole purpose,
+/// wrong in the other pins traffic that was never going to hit cache. Omitted;
+/// revisit only with either a real tokenizer in this process or a measured
+/// bytes-per-token ratio from live traffic to ground the constant.
+fn prefix_session_key(body: &[u8]) -> Option<u64> {
+    let peek = serde_json::from_slice::<PrefixPeek>(body).ok()?;
+    if peek.system.is_none() && peek.tools.is_none() {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "pfx:".hash(&mut hasher);
+    peek.system.map(|v| v.get()).hash(&mut hasher);
+    peek.tools.map(|v| v.get()).hash(&mut hasher);
+    Some(hasher.finish())
+}
+
 /// Derive a STABLE affinity key from the client's most durable identity, so a
 /// session survives reconnects on one account (warm prompt cache). Priority:
 ///   1. the `x-api-key` header (distinct team keys → distinct accounts) — but
@@ -428,24 +485,41 @@ struct UserIdMeta {
 ///      subagents to one account (warm prompt cache). Do NOT key on the
 ///      `x-claude-code-session-id` HEADER instead: it forks on resume and varies
 ///      across sidechain requests, which would cold-start the cache. Else
-///   3. `None` — the request has no stable identity and routes UNPINNED (plain
-///      LRU). It deliberately does NOT fall back to the per-connection
-///      [`SessionKey`]: that mints a pin no reconnect can ever reuse or reclaim.
+///   3. a hash of the request's cacheable prefix (`system` + `tools`, see
+///      [`prefix_session_key`]) — weaker than 1/2 because it says nothing about
+///      the CLIENT, only about what this one request would cache identically
+///      with another. Still routes reconnects of an SDK/`curl` caller with no
+///      identity onto the same account instead of cold-starting every request,
+///      and self-balances because distinct prefixes hash to distinct accounts.
+///      Else
+///   4. `None` — no stable identity and no cacheable prefix, so the request
+///      routes UNPINNED (plain LRU). It deliberately does NOT fall back to the
+///      per-connection [`SessionKey`]: that mints a pin no reconnect can ever
+///      reuse or reclaim.
 ///
-/// Returns `None` on absence/parse failure, which routes the request unpinned.
-fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>) -> Option<u64> {
+/// Returns `None` on absence/parse failure at every tier, which routes the
+/// request unpinned. The paired [`SessionKind`] records WHICH tier produced the
+/// key — display provenance only, never a routing input.
+fn stable_session_key(
+    headers: &HeaderMap,
+    body: &[u8],
+    proxy_key: Option<&str>,
+) -> Option<(u64, SessionKind)> {
     if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         // The shared proxy secret is not a client identity — skip it so remote
         // clients don't all collapse onto one account.
         if proxy_key != Some(key) {
-            return Some(stable_hash("key:", key));
+            return Some((stable_hash("key:", key), SessionKind::Stable));
         }
     }
-    let user_id = serde_json::from_slice::<MetadataPeek>(body)
+    if let Some(user_id) = serde_json::from_slice::<MetadataPeek>(body)
         .ok()
         .and_then(|p| p.metadata)
-        .and_then(|m| m.user_id)?;
-    Some(stable_hash("uid:", &user_id))
+        .and_then(|m| m.user_id)
+    {
+        return Some((stable_hash("uid:", &user_id), SessionKind::Stable));
+    }
+    prefix_session_key(body).map(|key| (key, SessionKind::Prefix))
 }
 
 /// Path of the read-only live-status endpoint [`status_handler`] serves.
@@ -1635,18 +1709,22 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
     // rotation) by default. When on, key on the most STABLE client identity —
-    // x-api-key, then body `metadata.user_id` — so a client that drops and
-    // reconnects (new connection key) still maps to the SAME account and keeps
-    // its per-account prompt cache warm. With NO stable identity the request routes
-    // UNPINNED (plain LRU): a per-connection key is not a session key — it mints a
-    // fresh pin per connection that nothing ever removes, and those ghosts (93% of
-    // the live pin map) both bloat it and inflate the pinned-session counts that
-    // drive the migration decision in `select`. `session_kind` records WHICH branch
-    // produced the key (stable identity vs unpinned fallback) — DISPLAY provenance
-    // only, threaded into `record_served`.
+    // x-api-key, then body `metadata.user_id`, then (with neither) a hash of the
+    // body's cacheable prefix (`system` + `tools`, see [`prefix_session_key`]) —
+    // so a client that drops and reconnects (new connection key) still maps to
+    // the SAME account and keeps its per-account prompt cache warm, and even a
+    // client with NO stable identity at all still pins on what it would cache
+    // identically. Only with NEITHER an identity NOR a cacheable prefix does the
+    // request route UNPINNED (plain LRU): a per-connection key is not a session
+    // key — it mints a fresh pin per connection that nothing ever removes, and
+    // those ghosts (93% of the live pin map, before this tier existed) both
+    // bloat it and inflate the pinned-session counts that drive the migration
+    // decision in `select`. `session_kind` records WHICH tier produced the key
+    // (stable identity / prefix-derived / unpinned fallback) — DISPLAY
+    // provenance only, threaded into `record_served`.
     let (session_key, session_kind) = match parts.extensions.get::<SessionKey>() {
         Some(_) => match stable_session_key(&req_headers, &body_bytes, manager.proxy_api_key()) {
-            Some(key) => (Some(key), SessionKind::Stable),
+            Some((key, kind)) => (Some(key), kind),
             None => (None, SessionKind::Fallback),
         },
         None => (None, SessionKind::Fallback),
@@ -3545,6 +3623,87 @@ mod tests {
         assert!(
             team.is_some(),
             "a distinct team key is a real identity and must still key"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_falls_back_to_prefix_hash_of_system_and_tools() {
+        // No x-api-key, no metadata.user_id, but a system + tools prefix — tier 3
+        // pins on a hash of that prefix instead of routing unpinned.
+        let body = br#"{"system":"You are a helpful assistant.","tools":[{"name":"bash"}]}"#;
+        let a = stable_session_key(&HeaderMap::new(), body, None);
+        let b = stable_session_key(&HeaderMap::new(), body, None);
+        assert_eq!(a, b, "same prefix must hash the same every time");
+        assert_eq!(
+            a.map(|(_, kind)| kind),
+            Some(SessionKind::Prefix),
+            "tier 3 must record SessionKind::Prefix, not Stable"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_accepts_system_or_tools_alone() {
+        // Either field alone is a cacheable prefix — both need not be present.
+        let system_only = stable_session_key(&HeaderMap::new(), br#"{"system":"hi"}"#, None);
+        let tools_only =
+            stable_session_key(&HeaderMap::new(), br#"{"tools":[{"name":"x"}]}"#, None);
+        assert!(system_only.is_some(), "system alone must pin");
+        assert!(tools_only.is_some(), "tools alone must pin");
+        assert_ne!(
+            system_only, tools_only,
+            "a system-only and a tools-only prefix are different prefixes"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_distinguishes_different_prefixes() {
+        let a = stable_session_key(&HeaderMap::new(), br#"{"system":"prompt A"}"#, None);
+        let b = stable_session_key(&HeaderMap::new(), br#"{"system":"prompt B"}"#, None);
+        assert_ne!(
+            a, b,
+            "distinct prefixes must spread across the fleet, not collide"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_is_byte_exact_not_canonicalized() {
+        // Same fields, different KEY ORDER inside the `system` value. Anthropic's
+        // own cache is byte-exact, so these are two DIFFERENT cache entries —
+        // canonicalizing (sorting keys) before hashing would merge them onto one
+        // account for zero cache benefit and only concentrate load.
+        let a = stable_session_key(&HeaderMap::new(), br#"{"system":{"a":1,"b":2}}"#, None);
+        let b = stable_session_key(&HeaderMap::new(), br#"{"system":{"b":2,"a":1}}"#, None);
+        assert_ne!(
+            a, b,
+            "raw bytes must be hashed verbatim — key order must not be canonicalized"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_none_without_system_or_tools() {
+        // Neither system nor tools → no cacheable prefix → stay unpinned. This is
+        // the guard that stops every trivial anonymous request from piling onto
+        // one account.
+        assert_eq!(
+            stable_session_key(&HeaderMap::new(), br#"{"messages":[]}"#, None),
+            None
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_is_the_last_resort_after_identity_tiers() {
+        // x-api-key and metadata.user_id both outrank the prefix hash even when a
+        // cacheable prefix is also present.
+        let body = br#"{"system":"hi","metadata":{"user_id":"user-123"}}"#;
+        let with_key =
+            stable_session_key(&headers_with_api_key("the-key"), body, None).map(|(_, k)| k);
+        assert_eq!(with_key, Some(SessionKind::Stable), "x-api-key still wins");
+
+        let with_uid = stable_session_key(&HeaderMap::new(), body, None).map(|(_, k)| k);
+        assert_eq!(
+            with_uid,
+            Some(SessionKind::Stable),
+            "user_id still wins over the prefix hash"
         );
     }
 

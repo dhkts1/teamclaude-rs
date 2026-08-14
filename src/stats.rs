@@ -156,11 +156,18 @@ pub struct AccountSnapshot {
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /
-/// metadata.user_id) or had none and served unpinned. DISPLAY-only — never a
-/// routing input.
+/// metadata.user_id), on a hash of its cacheable prefix (`system` + `tools`)
+/// because it had no stronger identity, or had neither and served unpinned.
+/// DISPLAY-only — never a routing input.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionKind {
     Stable,
+    /// Pinned via [`crate::proxy::prefix_session_key`]: no `x-api-key` /
+    /// `metadata.user_id`, but the request had a `system` and/or `tools` field
+    /// whose hash pins it (and byte-identical requests after it) to one
+    /// account. Weaker than `Stable` — it identifies the REQUEST's cacheable
+    /// prefix, not the client — but still a real pin, distinct from `Fallback`.
+    Prefix,
     Fallback,
 }
 
@@ -191,9 +198,12 @@ pub struct SessionSnapshot {
     pub requests: u64,
     pub last_seen: Option<OffsetDateTime>,
     /// [`SessionKind::Stable`] when keyed on a stable client identity (x-api-key /
-    /// `metadata.user_id`); [`SessionKind::Fallback`] when there was none and the
-    /// request served unpinned. Display provenance only — the TUI folds all
-    /// fallback serves into one dim aggregate row; routing is unchanged.
+    /// `metadata.user_id`); [`SessionKind::Prefix`] when there was none but the
+    /// request's `system`/`tools` hash pinned it anyway; [`SessionKind::Fallback`]
+    /// when there was neither and the request served unpinned. Display provenance
+    /// only — the TUI folds only `Fallback` serves into one dim aggregate row;
+    /// `Prefix` sessions have a real pin and group under their account like
+    /// `Stable` ones. Routing is unchanged either way.
     pub kind: SessionKind,
 }
 
