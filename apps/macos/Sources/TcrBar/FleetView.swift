@@ -269,6 +269,11 @@ struct FleetView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             fleetActions
+            // Draws the fleet/app scope boundary the two rows used to imply
+            // through opposite alignment. Same divider the panel uses between
+            // its other sections, so the footer is grouped the way the rest of
+            // the panel is rather than by a rule of its own.
+            Hairline()
             appActions
 
             if let loginError {
@@ -310,7 +315,7 @@ struct FleetView: View {
     /// `launchAtLogin` is documented as living beside Quit precisely because it
     /// "is about TcrBar, not about the fleet".
     private var fleetActions: some View {
-        HStack {
+        HStack(spacing: Tok.tightSpacing) {
             if server.state.isOurChild {
                 Button("Stop server") { server.stop() }
             } else {
@@ -340,16 +345,23 @@ struct FleetView: View {
                         + "an older one refuses before any browser opens and "
                         + "prints how to recover."
                 )
-            Spacer()
+            Spacer(minLength: 0)
         }
         .buttonStyle(.bordered)
     }
 
-    /// Actions that act on the APP, trailing-aligned so they read as a separate
-    /// group from the fleet row above without needing a rule between them.
+    /// Actions that act on the APP rather than on the fleet.
+    ///
+    /// These used to be trailing-aligned, on the reasoning that opposite
+    /// alignment would read as a separate group "without needing a rule between
+    /// them". In practice it read as misalignment: two button rows with
+    /// different left edges look broken before they look grouped, and the
+    /// second row's buttons floated away from everything above them. The scope
+    /// split is real, so it is now drawn — a `Hairline`, the same divider this
+    /// panel already uses to separate its sections — and both rows share one
+    /// left edge so the footer has a single vertical rhythm.
     private var appActions: some View {
-        HStack {
-            Spacer()
+        HStack(spacing: Tok.tightSpacing) {
             // Disabled rather than silently no-op while Sparkle already has
             // a check in flight — the same rule "Take over port…" follows.
             Button("Check for Updates…") { updater.checkForUpdates() }
@@ -359,6 +371,7 @@ struct FleetView: View {
                         + "Also reachable as `tcrbar://check-for-updates`."
                 )
             Button("Quit") { NSApplication.shared.terminate(nil) }
+            Spacer(minLength: 0)
         }
         .buttonStyle(.bordered)
     }
