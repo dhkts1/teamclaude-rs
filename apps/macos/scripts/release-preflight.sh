@@ -254,7 +254,7 @@ else
   # for (`gh release edit $tag --prerelease`). Failing on that state refuses
   # the very remedy it recommends.
   set +e
-  api_out="$(gh api "repos/$repo/releases/tags/$tag" --jq '[[.assets[].name] | join(" "), (.draft|tostring), (.prerelease|tostring)] | join("\t")' 2>&1)"
+  api_out="$(gh api "repos/$repo/releases/tags/$tag" --jq '[([.assets[].name] | join(" ")), (.draft|tostring), (.prerelease|tostring)] | join("\t")' 2>&1)"
   api_rc=$?
   set -e
   if [ "$api_rc" = 0 ]; then
