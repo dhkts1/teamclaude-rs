@@ -32,7 +32,8 @@ takeover *inside* the pin TTL (`affinity::PIN_TTL_MS`, 15 minutes,
 nothing at all. That the flush is incremental rather than shutdown-only is
 exactly because of this path: `--replace` follows SIGTERM with SIGKILL, and no
 shutdown hook runs for a SIGKILL (`src/affinity.rs:29-37`). None of it applies
-with `sessionAffinity` off, which is the default (`src/manager/state.rs:33-46`).
+with `sessionAffinity` off, the explicit opt-out — the default is now ON
+(`src/manager/state.rs:33-50`).
 
 That kill is now behind an explicit `--replace`; the default is to stand down and
 exit without binding.

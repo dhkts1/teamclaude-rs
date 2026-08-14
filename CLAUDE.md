@@ -32,8 +32,8 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
   boot: measured 2026-08-09, three restarts restored 7, 5 and 7 pins. The real limit is the TTL
   (`affinity::PIN_TTL_MS`, 15 minutes) — a restart inside it keeps most sessions warm, and one after
   it restores nothing at all (`restored=0 expired=27`, same log). None of that applies with
-  `sessionAffinity` off, which is the default in a fresh config. Read the log line the server prints
-  at boot rather than assuming either outcome.
+  `sessionAffinity` off, which requires an explicit `"sessionAffinity": false` in a fresh config — the
+  default is now ON. Read the log line the server prints at boot rather than assuming either outcome.
 - **You cannot replace `/Applications/TcrBar.app` while the proxy is running.** TcrBar resolves the
   *bundled* `tcr` ahead of `PATH` (`TcrTool.swift:69-82`) and supervises it as a child, so
   `Contents/MacOS/tcr` is an executing image inside the very bundle being swapped. Finder and Sparkle
