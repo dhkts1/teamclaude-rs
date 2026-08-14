@@ -117,6 +117,11 @@ final class MenuBarShell {
         if let button = statusItem.button {
             button.target = self
             button.action = #selector(togglePanel(_:))
+            // Left click still opens the popover, unchanged. Right click (and
+            // Control-click, which AppKit reports as the same `.rightMouseUp`)
+            // is the only thing added here — the button otherwise only ever
+            // sends on `.leftMouseUp`.
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         // Both publishers, combined, so the image is recomposed whenever either
@@ -183,8 +188,78 @@ final class MenuBarShell {
     // MARK: - The panel
 
     @objc private func togglePanel(_ sender: Any?) {
+        // `NSApp.currentEvent` is how a single action selector, wired to both
+        // mouse buttons above, tells them apart — AppKit does not pass the
+        // triggering event to the action itself. A right-click (or a
+        // Control-click, which arrives as the same `.rightMouseUp`) opens the
+        // quick-actions menu instead of the popover; anything else falls
+        // through to the original left-click behaviour, unchanged.
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showQuickActionsMenu()
+            return
+        }
         if popover.isShown { closePanel() } else { openPanel() }
     }
+
+    // MARK: - Quick actions
+
+    /// Deliberately never assigned to `statusItem.menu`: doing that makes
+    /// AppKit show the menu on *every* click, left included, which is exactly
+    /// the popover-breaking regression this feature must not cause.
+    /// `NSMenu.popUp(positioning:at:in:)` shows a menu once, transiently, with
+    /// the status item's own click handling untouched.
+    private func showQuickActionsMenu() {
+        guard let button = statusItem.button else { return }
+        let menu = NSMenu()
+
+        let serverItem: NSMenuItem
+        if server.state.isOurChild {
+            serverItem = NSMenuItem(
+                title: "Stop server", action: #selector(quickStopServer), keyEquivalent: "")
+        } else {
+            serverItem = NSMenuItem(
+                title: "Start server", action: #selector(quickStartServer), keyEquivalent: "")
+        }
+        serverItem.target = self
+        menu.addItem(serverItem)
+
+        let refreshItem = NSMenuItem(
+            title: "Refresh", action: #selector(quickRefresh), keyEquivalent: "")
+        refreshItem.target = self
+        menu.addItem(refreshItem)
+
+        menu.addItem(.separator())
+
+        let awakeItem = NSMenuItem(
+            title: "Keep this Mac awake", action: #selector(quickToggleAwake), keyEquivalent: "")
+        awakeItem.target = self
+        awakeItem.state = awake.isOn ? .on : .off
+        menu.addItem(awakeItem)
+
+        menu.addItem(.separator())
+
+        let updateItem = NSMenuItem(
+            title: "Check for Updates…", action: #selector(quickCheckForUpdates),
+            keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isEnabled = updater.canCheckForUpdates
+        menu.addItem(updateItem)
+
+        let quitItem = NSMenuItem(
+            title: "Quit", action: #selector(quickQuit), keyEquivalent: "")
+        quitItem.target = self
+        menu.addItem(quitItem)
+
+        menu.popUp(
+            positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+    }
+
+    @objc private func quickStartServer() { server.start() }
+    @objc private func quickStopServer() { server.stop() }
+    @objc private func quickRefresh() { Task { await poller.pollOnce() } }
+    @objc private func quickToggleAwake() { awake.toggle() }
+    @objc private func quickCheckForUpdates() { updater.checkForUpdates() }
+    @objc private func quickQuit() { NSApplication.shared.terminate(nil) }
 
     func openPanel() {
         guard let button = statusItem.button else { return }

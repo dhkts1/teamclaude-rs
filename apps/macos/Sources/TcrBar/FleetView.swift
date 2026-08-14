@@ -846,6 +846,33 @@ struct AccountRow: View {
     }
 
     var body: some View {
+        rowContent
+            // The card inset. Concentric with the border below it: the corner
+            // radius is `Tok.radiusMedium` and this is the padding that keeps
+            // that curve from clipping the account name or the toggle button —
+            // an outer radius with no matching inset draws a border that bites
+            // into its own content at the corners.
+            .padding(.horizontal, Tok.space3)
+            .padding(.vertical, Tok.space2)
+            .background(
+                RoundedRectangle(cornerRadius: Tok.radiusMedium)
+                    .fill(Tok.raised)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Tok.radiusMedium)
+                    .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
+            )
+            .contextMenu { contextMenuItems }
+    }
+
+    /// The row's own layout, unchanged from before the border was added except
+    /// for its name: this used to be `body` directly. Split out so the border
+    /// and the context menu are the ONE place that wraps every row shape,
+    /// rather than three copies of the same background/overlay/contextMenu
+    /// pair — the broken-row branch and the normal branch would otherwise have
+    /// to repeat it identically.
+    @ViewBuilder
+    private var rowContent: some View {
         // A broken row draws its two buttons on their OWN line, below the name
         // and pills, rather than beside `information` the way `toggleButton`
         // alone sits for every other row. Measured, not assumed: beside
@@ -875,6 +902,58 @@ struct AccountRow: View {
             }
             .padding(.vertical, Tok.rowPaddingV)
         }
+    }
+
+    /// Actions beyond the single toggle button, reached by right-click (or
+    /// Control-click / two-finger click, whatever the platform maps to a
+    /// context menu). Built from what ``AccountController`` and the row's own
+    /// `onRelogin` closure already expose — nothing here calls anything new.
+    ///
+    /// Deliberately does NOT add routing or pin controls: that is a separate
+    /// feature, not this row's to invent.
+    @ViewBuilder
+    private var contextMenuItems: some View {
+        let enabling = account.disabled
+        Button(enabling ? "Enable" : "Disable") {
+            Task { await performToggle(enabling: enabling) }
+        }
+        .disabled(accounts.isPending(account.name))
+        if account.health == .needsRelogin {
+            Button("Re-login…") { onRelogin() }
+        }
+        Divider()
+        Button("Copy Account Name") {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(account.name, forType: .string)
+        }
+    }
+
+    /// The one place `tcr enable`/`tcr disable` is actually run. Shared by
+    /// ``toggleButton`` and the context menu's own entry so the two can never
+    /// drift into two different notions of what a toggle does — see the
+    /// doc-comment on `toggleButton`'s old inline `Task` for why the
+    /// read-back-and-record dance below is not optional.
+    private func performToggle(enabling: Bool) async {
+        // Exit 0 is not the outcome — it is permission to go and find out
+        // what the outcome was. The refresh's own result is compared
+        // against what was asked, and the row says which thing happened.
+        //
+        // `notice` is threaded through rather than dropped: `tcr` reports
+        // half-done work (a park the config cannot persist, a proxy too old
+        // for the route) on stderr while exiting 0, and the read-back
+        // cannot see it — `disabled` flipped, so the comparison confirms.
+        // Losing it here is what let the row stamp `parked ✓` on a change
+        // that would not survive a restart.
+        let attempt = await accounts.setEnabled(enabling, account: account.name)
+        guard case .accepted(let notice) = attempt else { return }
+        let readback = await onChanged()
+        accounts.record(
+            readback: readback,
+            requestedEnabled: enabling,
+            account: account.name,
+            notice: notice
+        )
     }
 
     private var information: some View {
@@ -1089,27 +1168,7 @@ struct AccountRow: View {
         let verb = enabling ? "Enable" : "Disable"
         let title = pending ? (enabling ? "Enabling…" : "Disabling…") : verb
         return Button(title) {
-            Task {
-                // Exit 0 is not the outcome — it is permission to go and find out
-                // what the outcome was. The refresh's own result is compared
-                // against what was asked, and the row says which thing happened.
-                //
-                // `notice` is threaded through rather than dropped: `tcr` reports
-                // half-done work (a park the config cannot persist, a proxy too old
-                // for the route) on stderr while exiting 0, and the read-back
-                // cannot see it — `disabled` flipped, so the comparison confirms.
-                // Losing it here is what let the row stamp `parked ✓` on a change
-                // that would not survive a restart.
-                let attempt = await accounts.setEnabled(enabling, account: account.name)
-                guard case .accepted(let notice) = attempt else { return }
-                let readback = await onChanged()
-                accounts.record(
-                    readback: readback,
-                    requestedEnabled: enabling,
-                    account: account.name,
-                    notice: notice
-                )
-            }
+            Task { await performToggle(enabling: enabling) }
         }
         // `.bordered`, not `.borderless`. Borderless draws the label as bare
         // text, so the ONE actionable control in the row looked exactly like
