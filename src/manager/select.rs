@@ -2,6 +2,70 @@
 
 use super::*;
 
+/// Bound on [`Manager::conn_affinity`] — see its doc-comment for why the map is
+/// memory-only and never persisted.
+const CONN_AFFINITY_CAP: usize = 256;
+/// Idle TTL for a [`Manager::conn_affinity`] entry: an entry older than this is
+/// treated as absent (the connection is presumed gone). Short on purpose — this
+/// map exists only to keep NOISE traffic (`/api/event_logging`, `/mcp-registry`)
+/// on one account for the lifetime of one connection, not to survive a
+/// reconnect the way [`Manager::affinity`] does.
+const CONN_AFFINITY_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// The three-way split of an UNPINNED request (control account, part 2 — see
+/// the module doc and `docs/plans/control-routing-bridge-coder.md`). Classified
+/// from `path` alone (the caller's already query-stripped request path), never
+/// from a session/affinity key — see [`classify_request`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RequestClass {
+    /// `/v1/messages`, `/v1/messages/count_tokens` — pool only. **Never** the
+    /// control account, even when `controlAccount` names an ENABLED (pooled)
+    /// account — see [`Manager::select`]'s pool-pick exclusion.
+    Inference,
+    /// `/api/event_logging*`, `/mcp-registry*` — high-volume noise. Follows the
+    /// requesting connection ([`Manager::conn_affinity`]) rather than the
+    /// control account, so it never burns the one account being kept clean.
+    Noise,
+    /// Everything else — the identity/control plane. Prefers the control
+    /// account (bypassing its `disabled` gate — see
+    /// [`Manager::control_eligible`]) when it is genuinely usable; degrades to
+    /// normal rotation otherwise. The classification **fails safe**: an unknown
+    /// path defaults here rather than to the pool, the opposite of
+    /// `CLIENT_CREDENTIAL_PREFIXES`'s fail-unsafe growth.
+    ControlPreferred,
+}
+
+/// Classify an unpinned request's path into the three-way split. Exact match
+/// for the two inference paths (mirrors `stable_session_key`'s
+/// `/v1/messages/count_tokens must NOT prefix-match /v1/messages` guard);
+/// prefix match for the two noise paths, matching the bridge's own examples
+/// (`/api/event_logging/v2/batch`, and any `/mcp-registry...` route).
+pub(super) fn classify_request(path: &str) -> RequestClass {
+    if path == "/v1/messages" || path == "/v1/messages/count_tokens" {
+        RequestClass::Inference
+    } else if path.starts_with("/api/event_logging") || path.starts_with("/mcp-registry") {
+        RequestClass::Noise
+    } else {
+        RequestClass::ControlPreferred
+    }
+}
+
+/// `threshold − reserve` (floored at 0.0) when `allow_reserve` is true — the
+/// effective switch threshold a GENERAL (non-control-preferred) pick applies
+/// to the control account specifically, so ordinary pool traffic leaves it
+/// some headroom instead of racing it to the same edge as every other
+/// account. A control-preferred pick, or `allow_reserve = false`, uses the
+/// full `threshold` unchanged. Pure; see [`Manager::control_reserve`]'s
+/// doc-comment for why this is inert in the current (control-disabled)
+/// configuration.
+pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: bool) -> f64 {
+    if allow_reserve {
+        (threshold - reserve).max(0.0)
+    } else {
+        threshold
+    }
+}
+
 impl Manager {
     /// Pick the best eligible account not in `tried`, spreading load across the
     /// fleet, or `None` if all are exhausted/held/disabled.
@@ -77,12 +141,26 @@ impl Manager {
     /// [`Self::load_balance_migration_enabled`]). Disabled, the scan is skipped
     /// entirely and the pin is honoured; set to `true`, the balancing behaviour
     /// below is unchanged.
+    ///
+    /// **Control-account routing (part 2), applied ONLY when this call reaches
+    /// this point with no existing pin honoured above** (`keep_pin.is_none()` —
+    /// invariant: a pin, even a per-request-diverted one, is never touched by
+    /// this overlay): `path` is classified by [`classify_request`] into the
+    /// three-way split — `Inference` is pool-only and excluded from the control
+    /// account even in the normal pick below; `Noise` prefers whichever account
+    /// `conn_key` ([`crate::proxy::SessionKey`]'s per-connection value, distinct
+    /// from `affinity`) already served on this connection
+    /// ([`Self::conn_affinity`]); everything else prefers the control account
+    /// via [`Self::control_eligible`] (which deliberately bypasses `disabled`).
+    /// Inert whenever [`Self::control`] is `None`.
     pub fn select(
         &self,
         tried: &HashSet<usize>,
         now: OffsetDateTime,
         model: Option<&str>,
         affinity: Option<u64>,
+        path: &str,
+        conn_key: Option<u64>,
     ) -> Option<usize> {
         // Hard account lock: pin ALL traffic to the configured account, bypassing
         // rotation/affinity/migration. `tried` still ends the rotation loop — once the
@@ -94,6 +172,11 @@ impl Manager {
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
+        // Compute the control-account three-way split ONCE (part 2). Consulted
+        // twice below: the routing overlay (control-preferred / noise) after the
+        // affinity fast-path, and the pool-pick exclusion (inference must never
+        // land on the control account) inside the normal pick.
+        let request_class = classify_request(path);
 
         // Set (to the OLD pin index) for the four per-REQUEST failures that DIVERT —
         // the pin is paced out, it cannot serve this request's model class, it is
@@ -408,16 +491,128 @@ impl Manager {
             }
         }
 
-        // Normal LRU/priority pick (identical to the pre-affinity path). The
-        // accounts lock is scoped so it is released before we touch the affinity
-        // lock again for the re-pin below.
+        // Control-account routing overlay (part 2 — three-way split of an
+        // UNPINNED request, see `classify_request`). Gated on `keep_pin.is_none()`
+        // so it NEVER touches a session that already has a pin — even one only
+        // diverted for this one request (invariant 1: a pin is re-keyed ONLY by
+        // an ACCOUNT-level hard gate, never by this preference).
+        if keep_pin.is_none() {
+            match request_class {
+                RequestClass::Inference => {
+                    // Pool-only — no preference here; the exclusion lives in the
+                    // normal pick below so it also covers the case where control
+                    // points at an ENABLED (pooled) account.
+                }
+                RequestClass::Noise => {
+                    // Follow the connection: reuse whichever account this
+                    // connection already served, while it is still eligible
+                    // (the ordinary gate — no disabled-bypass here, unlike
+                    // control preference). `tried` still excludes an account
+                    // that already failed THIS request.
+                    if let Some(k) = conn_key {
+                        if let Some(idx) = self.conn_affinity_get(k, now_ms) {
+                            if !tried.contains(&idx) {
+                                let usable = {
+                                    let accounts =
+                                        self.accounts.read().expect("accounts lock poisoned");
+                                    accounts.get(idx).is_some_and(|a| {
+                                        Self::eligible(
+                                            a,
+                                            self.global_threshold,
+                                            &self.pacing,
+                                            true,
+                                            now,
+                                            now_ms,
+                                            is_fable,
+                                        )
+                                    })
+                                };
+                                if usable {
+                                    let mut accounts =
+                                        self.accounts.write().expect("accounts lock poisoned");
+                                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                                    if let Some(account) = accounts.get_mut(idx) {
+                                        account.last_selected_seq = tick;
+                                        tracing::info!(
+                                            account = %account.name,
+                                            conn = k,
+                                            "control: noise request follows its connection's account"
+                                        );
+                                    }
+                                    drop(accounts);
+                                    self.conn_affinity_record(k, idx, now_ms);
+                                    return Some(idx);
+                                }
+                            }
+                        }
+                    }
+                    // No usable connection-pinned account — fall through to the
+                    // normal pick below, which re-records `conn_affinity` once
+                    // it settles on a winner.
+                }
+                RequestClass::ControlPreferred => {
+                    if let Some(control_idx) = self.control() {
+                        if !tried.contains(&control_idx) {
+                            let usable = {
+                                let accounts =
+                                    self.accounts.read().expect("accounts lock poisoned");
+                                accounts
+                                    .get(control_idx)
+                                    .is_some_and(|a| Self::control_eligible(a, now_ms))
+                            };
+                            if usable {
+                                let mut accounts =
+                                    self.accounts.write().expect("accounts lock poisoned");
+                                let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                                if let Some(account) = accounts.get_mut(control_idx) {
+                                    account.last_selected_seq = tick;
+                                    tracing::info!(
+                                        account = %account.name,
+                                        "control: routing unpinned identity-plane request to the control account"
+                                    );
+                                }
+                                return Some(control_idx);
+                            }
+                        }
+                    }
+                    // Control unset, held, errored, rejected, or already tried —
+                    // degrade to normal rotation (no second designated identity).
+                }
+            }
+        }
+
+        // Normal LRU/priority pick (identical to the pre-affinity path when no
+        // control account is set). The accounts lock is scoped so it is released
+        // before we touch the affinity lock again for the re-pin below.
         let best = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+
+            // Inference must NEVER select the control account, even one that is
+            // ENABLED (pooled) — the default-disabled control account is already
+            // excluded by `eligible`'s own disabled check, so this only starts
+            // doing real work the day `controlAccount` stops being disabled.
+            // Modeled as an extra `tried` member rather than a new parameter
+            // threaded through `pick_eligible`/`pick_least_loaded`, so both
+            // passes (and the pacing/least-loaded fallback) honour it for free.
+            let pool_tried: std::borrow::Cow<'_, HashSet<usize>> =
+                if request_class == RequestClass::Inference {
+                    match self.control() {
+                        Some(control_idx) if !tried.contains(&control_idx) => {
+                            let mut t = tried.clone();
+                            t.insert(control_idx);
+                            std::borrow::Cow::Owned(t)
+                        }
+                        _ => std::borrow::Cow::Borrowed(tried),
+                    }
+                } else {
+                    std::borrow::Cow::Borrowed(tried)
+                };
+            let pool_tried: &HashSet<usize> = &pool_tried;
 
             // First pass: honour pacing (skip accounts at the concurrency cap or
             // inside the min-spacing window). With pacing OFF this is byte-identical
             // to the pre-pacing pick.
-            let mut best = self.pick_eligible(&accounts, tried, now, now_ms, is_fable, true);
+            let mut best = self.pick_eligible(&accounts, pool_tried, now, now_ms, is_fable, true);
 
             // Soft fallback (CRITICAL — pacing must never DROP a servable request):
             // if pacing gated EVERY account out but at least one is servable ignoring
@@ -426,7 +621,9 @@ impl Manager {
             // eligibility, so a None first pass ⟹ None here too — default-OFF stays
             // byte-identical (no spurious fallback, no log).
             if best.is_none() {
-                if let Some(idx) = self.pick_least_loaded(&accounts, tried, now, now_ms, is_fable) {
+                if let Some(idx) =
+                    self.pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable)
+                {
                     if let Some(account) = accounts.get(idx) {
                         tracing::info!(
                             account = %account.name,
@@ -516,6 +713,17 @@ impl Manager {
                     serve_name,
                     reason
                 );
+            }
+        }
+
+        // Re-record the connection's account for NOISE traffic that fell
+        // through to the normal pick above (no usable conn-pinned account, or
+        // affinity itself is off). A direct hit already returned early via
+        // `conn_affinity_record` in the overlay; this is the "otherwise normal
+        // rotation, and re-record" half of §2. Never touches `self.affinity`.
+        if request_class == RequestClass::Noise {
+            if let (Some(k), Some(idx)) = (conn_key, best) {
+                self.conn_affinity_record(k, idx, now_ms);
             }
         }
         best
@@ -919,6 +1127,46 @@ impl Manager {
             && !Self::model_blocked(account, global_threshold, now, is_fable)
     }
 
+    /// Whether the CONTROL account may be preferred for an unpinned
+    /// identity-plane request (control-account part 2, §1). Deliberately
+    /// **bypasses the `disabled` gate**: the control account ships `disabled`
+    /// on purpose (out of the inference rotation) while remaining the admin
+    /// identity — see [`Manager::control_idx`]'s doc-comment. Still honours
+    /// every gate that means genuinely broken:
+    ///   - [`AccountStatus::Error`] → skip (a dead login is a dead login);
+    ///   - `quota.status == Some("rejected")` → skip (Anthropic's own verdict);
+    ///   - a LIVE rate-limit hold (`rate_limited_until_ms` in the future) → skip.
+    ///
+    /// **Deliberately NOT [`Self::eligible`] and NOT [`Self::account_hard_ok`]**
+    /// — both fold `disabled` into their terminal gate
+    /// ([`Self::account_terminal_gate`]), so calling either here would make the
+    /// whole control-routing feature a silent no-op: it compiles, its tests
+    /// pass, and it never fires because the one account it is meant to route to
+    /// always reads as ineligible. This predicate is the bypass; it does NOT
+    /// loosen `eligible` or `account_hard_ok` themselves, which every other
+    /// caller still depends on.
+    ///
+    /// No utilization/pacing/model-class check: those exist to spread LOAD
+    /// across a fleet, which does not apply to a single designated identity —
+    /// the reserve for a POOLED control account is [`effective_threshold`]'s
+    /// job, applied on the GENERAL pick's side, not here.
+    ///
+    /// Pure and lock-free; the caller holds whichever accounts lock it needs.
+    pub(super) fn control_eligible(account: &AccountRuntime, now_ms: i64) -> bool {
+        if account.status == AccountStatus::Error {
+            return false;
+        }
+        if account.quota.status.as_deref() == Some("rejected") {
+            return false;
+        }
+        if let Some(until) = account.rate_limited_until_ms {
+            if now_ms < until {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(super) fn eligible(
         account: &AccountRuntime,
         global_threshold: f64,
@@ -1092,6 +1340,29 @@ impl Manager {
     /// Read-only (no stamp); the caller stamps the winner. Emits one INFO line per
     /// account skipped *specifically because of pacing* (healthy but capped/spaced)
     /// so the knobs are tunable live.
+    /// The GENERAL pick's extra narrowing of the control account (§3): `true`
+    /// for every account that is not the control account (a no-op), and for the
+    /// control account itself, `true` only while its utilization stays under
+    /// `effective_threshold(threshold, control_reserve, true)` rather than the
+    /// full threshold [`Self::eligible`] already checked. Applied AFTER
+    /// `eligible` returns true, so it only ever narrows further — never widens.
+    /// **Inert while the control account is `disabled`**: `eligible` excludes a
+    /// disabled account before this is ever reached (see
+    /// [`Manager::control_reserve`]'s doc-comment).
+    fn pool_pick_respects_control_reserve(
+        &self,
+        idx: usize,
+        account: &AccountRuntime,
+        now: OffsetDateTime,
+    ) -> bool {
+        if self.control() != Some(idx) {
+            return true;
+        }
+        let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+        let reserved = effective_threshold(threshold, self.control_reserve, true);
+        !account.quota.is_near(reserved, now)
+    }
+
     fn pick_eligible(
         &self,
         accounts: &[AccountRuntime],
@@ -1136,6 +1407,9 @@ impl Manager {
                         "pacing: skip in selection"
                     );
                 }
+                continue;
+            }
+            if !self.pool_pick_respects_control_reserve(idx, account, now) {
                 continue;
             }
             // Unknown weekly reset sorts FIRST (probe it) — treat as the minimum.
@@ -1183,6 +1457,9 @@ impl Manager {
             ) {
                 continue;
             }
+            if !self.pool_pick_respects_control_reserve(idx, account, now) {
+                continue;
+            }
             let reset = account
                 .quota
                 .governing_weekly_reset(now)
@@ -1199,6 +1476,47 @@ impl Manager {
             }
         }
         best
+    }
+
+    /// Lookup half of [`Manager::conn_affinity`]: the account this connection
+    /// was last served on, or `None` if never recorded or the entry has aged
+    /// past [`CONN_AFFINITY_TTL_MS`] (treated as absent — the connection is
+    /// presumed gone). Does NOT check the account's current eligibility; the
+    /// caller ([`Manager::select`]'s noise-routing overlay) does that itself so
+    /// it can log/fall through distinctly.
+    pub(super) fn conn_affinity_get(&self, conn_key: u64, now_ms: i64) -> Option<usize> {
+        let map = self
+            .conn_affinity
+            .lock()
+            .expect("conn affinity lock poisoned");
+        map.get(&conn_key).and_then(|&(idx, touch)| {
+            if now_ms.saturating_sub(touch) < CONN_AFFINITY_TTL_MS {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Write half of [`Manager::conn_affinity`]: record (or refresh) which
+    /// account served connection `conn_key`, then evict the single
+    /// oldest-last-touch entry if the map grew past [`CONN_AFFINITY_CAP`] —
+    /// mirrors `select()`'s `AFFINITY_CAP` eviction for `self.affinity`, but on
+    /// this SEPARATE, never-persisted map. Never touches `self.affinity` and
+    /// never marks it dirty.
+    pub(super) fn conn_affinity_record(&self, conn_key: u64, idx: usize, now_ms: i64) {
+        let mut map = self
+            .conn_affinity
+            .lock()
+            .expect("conn affinity lock poisoned");
+        map.insert(conn_key, (idx, now_ms));
+        if map.len() > CONN_AFFINITY_CAP {
+            if let Some((&oldest, _)) = map.iter().min_by_key(|(_, &(_, touch))| touch) {
+                if oldest != conn_key {
+                    map.remove(&oldest);
+                }
+            }
+        }
     }
 }
 

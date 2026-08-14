@@ -32,6 +32,12 @@ fn default_upstream() -> String {
 fn default_switch_threshold() -> f64 {
     0.95
 }
+/// Default headroom (§3, control-account part 2) reserved for the control
+/// account against general (non-control-preferred) picks — see
+/// [`Config::control_reserve`] and [`crate::manager::select::effective_threshold`].
+fn default_control_reserve() -> f64 {
+    0.05
+}
 /// Default pacing when the `pacing` key is absent: OFF — no in-flight cap, no
 /// min-spacing, so an unconfigured proxy runs the no-pacing selection path.
 ///
@@ -248,6 +254,18 @@ pub struct Config {
     /// `null` — same contract as `lock_account` would want if it grew a setter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_account: Option<String>,
+    /// Quota headroom reserved for the control account against GENERAL
+    /// (non-control-preferred) picks — part of the routing half (part 2) of the
+    /// control-account feature. `threshold - control_reserve` is the effective
+    /// switch threshold a general pool pick applies to the control account
+    /// specifically; a control-preferred pick still uses the full threshold.
+    /// Absent → 0.05. Clamped to `[0.0, 0.5]` by the manager at construction — a
+    /// value outside that range in a hand-edited file is not trusted as-is.
+    /// **Inert while the control account stays `disabled`** (the default): a
+    /// disabled account never reaches a general pick's quota check at all. See
+    /// [`crate::manager::select::effective_threshold`].
+    #[serde(default = "default_control_reserve")]
+    pub control_reserve: f64,
     /// Force the upstream-forwarding client onto HTTP/1.1 instead of the
     /// h2-and-fall-back-to-h1 negotiation reqwest does by default. Absent →
     /// `false` (h2). OFF by default deliberately: an intermittent

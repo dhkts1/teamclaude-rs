@@ -216,6 +216,7 @@ impl Fleet {
             throttle: ThrottleConfig::default(),
             lock_account: None,
             control_account: None,
+            control_reserve: 0.05,
             http1_only: false,
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),
             extra: serde_json::Map::new(),
@@ -287,7 +288,10 @@ impl Fleet {
         model: Option<&str>,
         now: OffsetDateTime,
     ) -> usize {
-        match self.manager.select(tried, now, model, Some(lineage.key)) {
+        match self
+            .manager
+            .select(tried, now, model, Some(lineage.key), "/v1/messages", None)
+        {
             Some(account) => {
                 self.serves.push(Serve {
                     key: lineage.key,
@@ -307,7 +311,10 @@ impl Fleet {
     /// One identity-less request: no affinity key, so the selector must route it
     /// without creating or touching a pin.
     fn serve_anon(&mut self, now: OffsetDateTime) -> usize {
-        match self.manager.select(&HashSet::new(), now, None, None) {
+        match self
+            .manager
+            .select(&HashSet::new(), now, None, None, "/v1/messages", None)
+        {
             Some(account) => {
                 self.serves.push(Serve {
                     key: ANON_KEY,

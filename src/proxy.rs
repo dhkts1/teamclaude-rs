@@ -1936,6 +1936,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // the migration decision in `select`. `session_kind` records WHICH tier
     // produced the key (stable identity / prefix-derived / unpinned fallback)
     // — DISPLAY provenance only, threaded into `record_served`.
+    // The raw per-connection key (present iff session affinity is enabled — see
+    // `SessionKey`'s doc-comment), threaded separately from `session_key` above:
+    // `conn_key` is the noise-routing grain (`Manager::conn_affinity`, keyed on
+    // the CONNECTION), `session_key` is the identity-routing grain (keyed on the
+    // client's STABLE identity). The two are deliberately different keys for the
+    // same underlying extension — conflating them is exactly the ghost-pin bug
+    // `SessionKey`'s doc-comment describes for `session_key`.
+    let conn_key = parts.extensions.get::<SessionKey>().map(|k| k.0);
     let (session_key, session_kind) = match parts.extensions.get::<SessionKey>() {
         Some(_) => match stable_session_key(
             &req_headers,
@@ -2048,7 +2056,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         let now = OffsetDateTime::now_utc();
         let idx = match next_idx.take() {
             Some(i) => i,
-            None => match manager.select(&tried, now, request_model.as_deref(), session_key) {
+            None => match manager.select(
+                &tried,
+                now,
+                request_model.as_deref(),
+                session_key,
+                &path,
+                conn_key,
+            ) {
                 Some(idx) => idx,
                 None => {
                     if every_attempt_transport_failed(transport_failures, upstream_responses) {
@@ -2521,6 +2536,8 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     failover_now,
                     request_model.as_deref(),
                     session_key,
+                    &path,
+                    conn_key,
                 ) {
                     debug_assert_ne!(
                         other, idx,
@@ -3526,6 +3543,7 @@ mod tests {
             throttle: crate::config::ThrottleConfig::default(),
             lock_account: None,
             control_account: None,
+            control_reserve: 0.05,
             http1_only: false,
             accounts: vec![Account {
                 name: "dummy".to_string(),
@@ -6112,7 +6130,14 @@ mod tests {
         tried.insert(0);
         tried.insert(1);
         assert_eq!(
-            manager.select(&tried, OffsetDateTime::now_utc(), None, None),
+            manager.select(
+                &tried,
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                "/v1/messages",
+                None
+            ),
             Some(2),
             "the new account is eligible and selectable immediately, with no restart"
         );
