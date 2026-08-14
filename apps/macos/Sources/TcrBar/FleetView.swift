@@ -602,15 +602,57 @@ struct AccountRow: View {
     /// `.needsRelogin` row.
     let onRelogin: () -> Void
 
-    /// The single tint for this row's quota evidence. The pill and the bar both
-    /// read it, so the two can never disagree about whether a quota is known.
+    /// The single tint for this row's quota evidence. The bar and the
+    /// percentage run both read it, so the two can never disagree about
+    /// whether a quota is known — or, now, about whether it is still LIVE.
     ///
     /// `Tok.unmeasured`, not `Tok.unknown`: `FleetTally.Kind` documents these as
     /// deliberately separate — "a quota state this build cannot name" is not the
     /// same fact as "no quota state at all", and colouring them alike re-merges
     /// exactly what the optional model exists to keep apart.
+    ///
+    /// `.needsRelogin` is checked FIRST, ahead of `hasQuotaEvidence`, for a
+    /// reason that is not cosmetic. A broken account that died AFTER being
+    /// probed keeps its last-learned `quota` and `quotaState` — often `.ok` —
+    /// so `Tok.color(for: .ok)` would draw the SAME green a genuinely healthy
+    /// row draws. Green in this palette means "you can work right now"; this
+    /// account's apparent headroom is unreachable until re-login
+    /// (`src/manager/select.rs:931` sends it nothing), so drawing it green
+    /// overclaims exactly the way an unfilled bar overclaims for a nil
+    /// reading — the same reason `QuotaBar`'s own doc-comment makes a nil
+    /// draw DASHED rather than empty. Stale-versus-live is that distinction
+    /// one step over, and this row already committed to the principle.
+    ///
+    /// Neither existing hue fits the stale case. `Tok.unmeasured` is spoken
+    /// for by "never probed" — reusing it re-merges the two causes this
+    /// branch spent three rounds separating. Dashed/`Tok.unknown` would claim
+    /// no reading exists, which misattributes the cause exactly like the grey
+    /// `unmeasured` pill did before this branch started. Red (`Tok.spent`,
+    /// already worn by the pill and the status word on this row) would claim
+    /// the quota is EXHAUSTED, a different and equally false fact — the
+    /// number is real and is not zero. `Tok.disabled` is the closest existing
+    /// token in MEANING ("this row is not in play") even though its literal
+    /// cause (an operator's own choice) is not this row's cause; it is reused
+    /// rather than adding a colour, since this repo's palette is generated
+    /// and gated on WCAG contrast, and a new token is a heavier change than
+    /// muting a stale reading needs.
     private var quotaTint: Color {
-        account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
+        if hasStaleQuotaReading { return Tok.disabled }
+        return account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
+    }
+
+    /// True for exactly the shape this whole round exists to demote: a
+    /// broken account that has a REAL last-learned quota reading, not an
+    /// absent one. Gated on `hasQuotaEvidence` as well as `health`, not
+    /// `health` alone — a broken account that was NEVER probed (the `04b`
+    /// scene) has nothing filled to overclaim with: its bar is already the
+    /// dashed "no reading" outline, unambiguous regardless of colour, and
+    /// its percentage already reads "n/a". Recolouring either would be a
+    /// change with nothing behind it, and `04b` stays byte-identical because
+    /// this stays false for it. Shared by `quotaTint`, the bar's `.help`, and
+    /// the two percentage runs, so all four demote together or not at all.
+    private var hasStaleQuotaReading: Bool {
+        account.health == .needsRelogin && account.hasQuotaEvidence
     }
 
     /// Whether this account is in the rotation, said in BOTH directions.
@@ -714,7 +756,24 @@ struct AccountRow: View {
         // is the same wrong cause a sighted user was told, with less to correct
         // it from.
         if account.health == .needsRelogin {
-            parts.append("refresh token rejected, re-login to restore traffic")
+            // The spoken half of the same fix as `quotaTint`: dropping the
+            // number here (as an earlier round of this did) under-informs a
+            // VoiceOver user exactly where a sighted one still sees a muted
+            // bar and grey digits — deleting real information rather than
+            // demoting it. `hasQuotaEvidence` is false on the never-probed
+            // shape (the `04b` scene), where there truly is no number to
+            // qualify, so only the probed-then-broken shape (`04c`) gets the
+            // longer phrase.
+            if account.hasQuotaEvidence {
+                parts.append(
+                    "refresh token rejected, re-login to restore traffic. Last "
+                        + "reading before rejection: \(account.quotaState.token), "
+                        + "\(QuotaFormat.percent(account.quota)) used — unreachable "
+                        + "until re-login"
+                )
+            } else {
+                parts.append("refresh token rejected, re-login to restore traffic")
+            }
         } else if account.hasQuotaEvidence {
             parts.append("\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used")
         } else if account.probeStatus.isFailure {
@@ -826,16 +885,34 @@ struct AccountRow: View {
                 }
             }
             QuotaBar(fraction: account.quota, tint: quotaTint)
+                // Sighted-hover half of the same fix `quotaTint` makes for the
+                // fill colour: a muted bar alone can still read as "just a
+                // dim healthy bar" rather than "not live" without a word
+                // saying so on hover.
+                .help(
+                    hasStaleQuotaReading
+                        ? "The last reading taken before the credential was rejected. "
+                            + "This headroom is unreachable until you re-login."
+                        : ""
+                )
             HStack(spacing: Tok.tightSpacing) {
                 Text(QuotaFormat.percent(account.quota))
                     .font(Tok.secondaryDigitFont)
-                    .foregroundStyle(.secondary)
+                    // Demoted alongside the bar, not left `.secondary`: the
+                    // eye should group these digits as historical rather than
+                    // live, the same distinction `quotaTint` draws for the
+                    // fill. The number itself is unchanged — it is still
+                    // true, just no longer reachable.
+                    .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
                 Text(
                     "· 5h \(QuotaFormat.percent(account.fiveHour)) "
                         + "· 7d \(QuotaFormat.percent(account.sevenDay))"
                 )
                 .font(Tok.secondaryDigitFont)
-                .foregroundStyle(.secondary)
+                // Same demotion as the leading percentage — one run reading
+                // live and the other historical would be its own new
+                // contradiction inside a single line.
+                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
                 Spacer()
                 // `status` is the account's own field and it keeps saying
                 // "active" while `disabled` is true — verified against live
