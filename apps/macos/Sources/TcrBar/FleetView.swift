@@ -898,16 +898,20 @@ struct AccountRow: View {
                 information
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(rowAccessibilityLabel)
-                toggleButton
+                accountActionsMenu
             }
             .padding(.vertical, Tok.rowPaddingV)
         }
     }
 
-    /// Actions beyond the single toggle button, reached by right-click (or
-    /// Control-click / two-finger click, whatever the platform maps to a
-    /// context menu). Built from what ``AccountController`` and the row's own
-    /// `onRelogin` closure already expose — nothing here calls anything new.
+    /// Actions beyond the single toggle, reached three ways: the gear menu
+    /// beside the row, right-click (or Control-click / two-finger click) for
+    /// a context menu, and — on a broken row only — the standalone
+    /// ``reloginButton``. Built from what ``AccountController`` and the
+    /// row's own `onRelogin` closure already expose — nothing here calls
+    /// anything new. All three routes share this one `@ViewBuilder` so the
+    /// gear and the context menu cannot drift into two different notions of
+    /// what the row can do.
     ///
     /// Deliberately does NOT add routing or pin controls: that is a separate
     /// feature, not this row's to invent.
@@ -927,6 +931,40 @@ struct AccountRow: View {
             pasteboard.clearContents()
             pasteboard.setString(account.name, forType: .string)
         }
+    }
+
+    /// The visible affordance for `contextMenuItems`. Right-click was the
+    /// only way to reach Enable/Disable, Re-login… and Copy Account Name
+    /// before this — undiscoverable, since nothing on the row hinted a menu
+    /// existed. Replaces the row's old trailing `toggleButton` text button
+    /// (still used, unchanged, on the `.needsRelogin` layout — see the
+    /// doc-comment there) so the account name also gets back the width that
+    /// button's text ("Disable"/"Enabling…") used to take, which matters
+    /// because the name already truncates.
+    ///
+    /// `.menuStyle(.borderlessButton)` rather than the `.bordered` style
+    /// every other control in this panel uses: those are all text buttons,
+    /// and a bordered icon-only control reads as heavier chrome than a
+    /// 13pt row wants. This is the one icon-only control in the panel, so
+    /// there is no existing icon-menu style to match instead.
+    private var accountActionsMenu: some View {
+        Menu {
+            contextMenuItems
+        } label: {
+            Image(systemName: "gearshape")
+                .font(Tok.bodyFont)
+                .foregroundStyle(.secondary)
+                // The Menu's own `.accessibilityLabel` below names the
+                // control; without hiding the glyph too, VoiceOver reads
+                // both the image ("gearshape, image") and the label,
+                // announcing the same control twice.
+                .accessibilityHidden(true)
+        }
+        .menuStyle(.borderlessButton)
+        .controlSize(.small)
+        .fixedSize()
+        .accessibilityLabel("Account actions for \(account.name)")
+        .help("Enable/disable, re-login, or copy the account name.")
     }
 
     /// The one place `tcr enable`/`tcr disable` is actually run. Shared by
@@ -1015,6 +1053,16 @@ struct AccountRow: View {
                 }
             }
             QuotaBar(fraction: account.quota, tint: quotaTint)
+                // `Tok.rowLineSpacing` (2pt, shared by every line in this
+                // column) put the bar visually inside the pills above it —
+                // the pills carry their own 2pt vertical padding on top of
+                // that gap, so the two collided. The fix is asymmetric, not
+                // a blanket increase to `rowLineSpacing`: the bar belongs
+                // WITH the percent/req-cache numbers beneath it (same fact,
+                // two notations, and already tight to them), not with the
+                // pills above. So only the bar gets extra top padding,
+                // leaving the numbers below it untouched.
+                .padding(.top, Tok.tightSpacing)
                 // Sighted-hover half of the same fix `quotaTint` makes for the
                 // fill colour: a muted bar alone can still read as "just a
                 // dim healthy bar" rather than "not live" without a word
