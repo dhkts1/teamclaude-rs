@@ -54,6 +54,8 @@ enum Command {
     Enable(EnableArgs),
     /// Disable an account (holds it out of rotation).
     Disable(DisableArgs),
+    /// Set, clear, or show the identity-bound control account.
+    Control(ControlArgs),
     /// Probe every account's live quota and print the fleet status.
     Status(StatusArgs),
     /// Self-update: `git pull --ff-only` + `cargo build --release` in the checkout.
@@ -133,6 +135,26 @@ struct DisableArgs {
     /// Narrow an ambiguous match to a single org (name or uuid).
     #[arg(long)]
     org: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct ControlArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Account name, or its bare email if the name carries an org suffix. Exact
+    /// and case-sensitive — not a substring. Omit with `--clear` or `--show`.
+    #[arg(conflicts_with_all = ["clear", "show"])]
+    query: Option<String>,
+    /// Narrow an ambiguous match to a single org (name or uuid).
+    #[arg(long)]
+    org: Option<String>,
+    /// Clear the control account (identity traffic resolves to none).
+    #[arg(long, conflicts_with = "show")]
+    clear: bool,
+    /// Print the current control account and change nothing.
+    #[arg(long)]
+    show: bool,
 }
 
 #[derive(clap::Args)]
@@ -233,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Priority(args)) => run_priority(args),
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
+        Some(Command::Control(args)) => run_control(args).await,
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
@@ -280,6 +303,22 @@ async fn run_enable(args: EnableArgs) -> anyhow::Result<()> {
 async fn run_disable(args: DisableArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     cli::set_enabled(&config_path, &args.query, args.org.as_deref(), true).await
+}
+
+/// `tcr control <query> [--org] | --clear | --show` — set, clear, or show the
+/// identity-bound control account, in the RUNNING proxy where there is one.
+async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    if args.show {
+        return cli::show_control(&config_path).await;
+    }
+    if args.clear {
+        return cli::set_control(&config_path, None, args.org.as_deref()).await;
+    }
+    let Some(query) = args.query else {
+        anyhow::bail!("provide an account query, or --clear / --show");
+    };
+    cli::set_control(&config_path, Some(&query), args.org.as_deref()).await
 }
 
 /// `tcr status [--json]` — probe every account's live quota and print it.

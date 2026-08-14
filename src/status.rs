@@ -121,6 +121,19 @@ pub struct StatusPayload {
     /// offline snapshot.
     #[serde(default)]
     pub http1_only: bool,
+    /// The identity-bound control account's NAME (`Config::control_account`,
+    /// resolved by `Manager::control_name`), or `None` when unset. Server-wide
+    /// like `http1_only`, and for the same `#[serde(default,
+    /// skip_serializing_if)]` reason: an OLD server's payload has no such key,
+    /// and absent must read as "no control account reported" rather than fail
+    /// the parse and drop to the offline snapshot. A NEW client reading an OLD
+    /// server gets `None` — true, the server genuinely never reported one — and
+    /// an OLD client reading a NEW server simply never looks at the extra key.
+    /// Neither direction is MISREAD, so — per this struct's `build`
+    /// doc-comment on when a bump is and is not warranted — this must NOT bump
+    /// [`STATUS_KIND`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<String>,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -207,7 +220,12 @@ impl StatusPayload {
     /// per-account list (see [`crate::manager::Manager::thresholds`]); a short
     /// list falls back to `1.0` per account, which can only fail CLOSED — at 1.0
     /// nothing but a fully-exhausted window reads as held, never a false hold.
-    pub fn from_snapshot(snapshot: &StatsSnapshot, thresholds: &[f64], http1_only: bool) -> Self {
+    pub fn from_snapshot(
+        snapshot: &StatsSnapshot,
+        thresholds: &[f64],
+        http1_only: bool,
+        control: Option<String>,
+    ) -> Self {
         let accounts = snapshot
             .accounts
             .iter()
@@ -247,6 +265,7 @@ impl StatusPayload {
             // because the only honest answer is the one baked into this process.
             build: BuildInfo::current(),
             http1_only,
+            control,
         }
     }
 
@@ -349,8 +368,13 @@ mod tests {
     #[test]
     fn payload_round_trips_every_rendered_field() {
         let snapshot = snapshot_with_counters();
-        let wire = serde_json::to_string(&StatusPayload::from_snapshot(&snapshot, &[0.85], false))
-            .expect("serialize");
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+        ))
+        .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back.kind, STATUS_KIND);
         let (rebuilt, thresholds) = back.into_snapshot();
@@ -381,6 +405,7 @@ mod tests {
             &snapshot_with_counters(),
             &[0.85],
             false,
+            None,
         ))
         .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
@@ -465,6 +490,47 @@ mod tests {
         assert_eq!(row.requests, 7);
     }
 
+    /// BACK-COMPAT for `control` specifically: a NEW client reading an OLD
+    /// server's payload, which predates the `controlAccount` feature entirely
+    /// and carries no such key. Must parse — a hard error here would drop the
+    /// client to the offline snapshot, the exact regression `#[serde(default)]`
+    /// on every added field exists to prevent — and `control` must read as
+    /// `None`, the honest "the server never reported one", not a fabricated
+    /// name.
+    #[test]
+    fn status_payload_without_control_parses() {
+        let old = r#"{"kind":"tcr.status.v1","accounts":[]}"#;
+        let payload: StatusPayload =
+            serde_json::from_str(old).expect("an older server's payload still parses");
+        assert_eq!(payload.control, None);
+    }
+
+    /// `control` round-trips over the wire like every other field, and
+    /// `skip_serializing_if` means an UNSET control account does not even
+    /// appear on the wire (never a `null` literal) — the same "clear removes
+    /// the key" contract [`crate::config::save_control_account`] uses on disk.
+    #[test]
+    fn control_round_trips_and_absent_serializes_no_key() {
+        let with_control = StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            Some("alice@example.com".to_string()),
+        );
+        let wire = serde_json::to_string(&with_control).expect("serialize");
+        assert!(wire.contains("\"control\":\"alice@example.com\""), "{wire}");
+        let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        assert_eq!(back.control, Some("alice@example.com".to_string()));
+
+        let without_control =
+            StatusPayload::from_snapshot(&snapshot_with_counters(), &[0.85], false, None);
+        let wire = serde_json::to_string(&without_control).expect("serialize");
+        assert!(
+            !wire.contains("\"control\""),
+            "an absent control account must not serialize a null: {wire}"
+        );
+    }
+
     /// The `kind` discriminator is what stops an older server's upstream-forwarded
     /// Anthropic error from being read as a status payload. Assert the exact
     /// literal, since the client compares against it.
@@ -474,6 +540,7 @@ mod tests {
             &snapshot_with_counters(),
             &[0.9],
             false,
+            None,
         ))
         .expect("serialize");
         assert!(

@@ -531,6 +531,207 @@ pub(crate) async fn post_add_account(
     Err(LiveControlError::Unusable(format!("HTTP {status}")))
 }
 
+/// Ask the running proxy to set or clear the identity-bound control account.
+/// Cloned from [`post_set_disabled`]: same `no_proxy()` client, same timeouts,
+/// same api-key header, same `is_timeout()`-before-`is_connect()` ordering,
+/// and `from_route` decided ONLY by [`crate::proxy::ENDPOINT_HEADER`] ==
+/// [`crate::proxy::CONTROL_ENDPOINT`] — never by status code or error text.
+///
+/// `query = None` is the CLEAR request; it is sent through exactly like a
+/// name, since [`crate::proxy::SetControlRequest`] treats `query: null` as a
+/// complete operation on its own, not an error.
+async fn post_set_control(
+    config: &Config,
+    query: Option<&str>,
+    org: Option<&str>,
+) -> Result<crate::proxy::SetControlResponse, LiveControlError> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| LiveControlError::Unusable(format!("http client: {e}")))?;
+
+    let url = format!(
+        "http://127.0.0.1:{}{}",
+        config.proxy.port,
+        crate::proxy::CONTROL_PATH
+    );
+    let mut request = client.post(&url).json(&serde_json::json!({
+        "query": query,
+        "org": org,
+    }));
+    if let Some(key) = config.proxy.api_key.as_deref() {
+        request = request.header("x-api-key", key);
+    }
+
+    let response = match request.send().await {
+        Ok(r) => r,
+        // `is_timeout()` first — see `post_set_disabled`'s identical comment
+        // on why checking `is_connect()` first would misclassify a blackholed
+        // address as `NoServer`.
+        Err(e) if e.is_timeout() => {
+            return Err(LiveControlError::NoAnswer(
+                "the server did not answer within 5s".to_string(),
+            ))
+        }
+        Err(e) if e.is_connect() => return Err(LiveControlError::NoServer),
+        Err(e) => return Err(LiveControlError::NoAnswer(e.to_string())),
+    };
+
+    let status = response.status();
+    let from_route = response
+        .headers()
+        .get(crate::proxy::ENDPOINT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some(crate::proxy::CONTROL_ENDPOINT);
+    let body = response.text().await.unwrap_or_default();
+
+    if status.is_success() {
+        return serde_json::from_str(&body).map_err(|e| {
+            LiveControlError::Unusable(format!(
+                "the response was not a tcr control-account payload ({e})"
+            ))
+        });
+    }
+    if status.as_u16() == 401 {
+        return Err(LiveControlError::Unauthorized);
+    }
+    if !from_route && matches!(status.as_u16(), 404 | 405) {
+        return Err(LiveControlError::NoRoute);
+    }
+    if from_route && matches!(status.as_u16(), 404 | 409) {
+        return Err(LiveControlError::Rejected(
+            error_message_of(&body).unwrap_or_else(|| format!("HTTP {status}")),
+        ));
+    }
+    Err(LiveControlError::Unusable(format!("HTTP {status}")))
+}
+
+/// The file half of `tcr control`: resolve OFFLINE (when `query` is `Some`) →
+/// persist ONLY the top-level `controlAccount` key via
+/// [`config::save_control_account`] — mirroring [`write_disabled_flag`]'s
+/// shape, but never a whole-config [`config::save`]; see
+/// `save_control_account`'s doc-comment and `1d978ce` for why that clobbers
+/// out-of-band keys.
+fn write_control_account(
+    config_path: &Path,
+    query: Option<&str>,
+    org: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    let config = load_for_edit(config_path)?;
+    let name = match query {
+        None => None,
+        Some(q) => Some(
+            config.accounts[resolve_account(&config.accounts, q, org)?]
+                .name
+                .clone(),
+        ),
+    };
+    config::save_control_account(config_path, name.as_deref())
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    Ok(name)
+}
+
+/// Set or clear the identity-bound control account, **in the running proxy
+/// first** — same posture as [`set_enabled`], and for the same reason: a
+/// file-only write would leave the running process still resolving identity
+/// traffic to its OLD control account (or none) until it restarts.
+pub async fn set_control(
+    config_path: &Path,
+    query: Option<&str>,
+    org: Option<&str>,
+) -> anyhow::Result<()> {
+    // A config we cannot read has no port and no api-key to reach a server
+    // with; fall through to the file path, which reports the load failure as
+    // it always has. Never a silent skip of the live attempt for any other
+    // reason.
+    if let Ok(config) = config::load(config_path) {
+        match post_set_control(&config, query, org).await {
+            Ok(applied) => {
+                match &applied.name {
+                    Some(name) => println!("Set control account to '{name}'."),
+                    None => println!("Cleared the control account."),
+                }
+                if let Some(warning) = &applied.warning {
+                    eprintln!("[tcr] warning: {warning}");
+                }
+                return Ok(());
+            }
+            // Nothing is listening: the historical case, and the only quiet
+            // one. There is no live rotation to disagree with the file.
+            Err(LiveControlError::NoServer) => {}
+            // A server is there and REFUSED us. Writing the file here would
+            // be the old lie in a new place: the config would name a new
+            // control account while the running proxy — the one that actually
+            // resolves identity traffic — keeps using its old one (or none).
+            Err(LiveControlError::Unauthorized) => {
+                bail!(
+                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because writing it would leave the running proxy still resolving identity traffic against its old control account. Fix `proxy.apiKey` and retry.",
+                    config.proxy.port,
+                    config_path.display()
+                );
+            }
+            // The route is missing: an older tcr is serving. The file write
+            // is all we can do, and it is HALF a control-account change — say
+            // so loudly.
+            Err(LiveControlError::NoRoute) => {
+                write_control_account(config_path, query, org)?;
+                eprintln!(
+                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                    config.proxy.port,
+                    crate::proxy::CONTROL_PATH,
+                );
+                return Ok(());
+            }
+            // The route ran and refused the QUERY: it matched no live
+            // account, or matched several. Do not fall back — the file's own
+            // offline resolution could land on a different account than the
+            // one the server was talking about.
+            Err(LiveControlError::Rejected(message)) => {
+                bail!(
+                    "the proxy running on :{} refused this: {message} Nothing was changed.",
+                    config.proxy.port
+                );
+            }
+            // It answered something we cannot use, or did not answer at all.
+            Err(other) => {
+                write_control_account(config_path, query, org)?;
+                eprintln!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP its OLD control account until it restarts.",
+                    config.proxy.port,
+                    other.why(),
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    let name = write_control_account(config_path, query, org)?;
+    match name {
+        Some(name) => println!("Set control account to '{name}'."),
+        None => println!("Cleared the control account."),
+    }
+    Ok(())
+}
+
+/// `tcr control --show` — print the current control account, preferring the
+/// LIVE server's answer (it may differ from the file if the server has not
+/// been restarted since a config edit) and falling back to the file.
+pub async fn show_control(config_path: &Path) -> anyhow::Result<()> {
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let control = match fetch_live_status(&config).await {
+        Ok(payload) => payload.control,
+        Err(_) => config.control_account.clone(),
+    };
+    match control {
+        Some(name) => println!("{name}"),
+        None => println!("(none)"),
+    }
+    Ok(())
+}
+
 /// Pull `error.message` out of the proxy's standard error envelope.
 fn error_message_of(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
@@ -853,6 +1054,7 @@ fn render_accounts_json(
     source: StatusSource,
     server: Option<&BuildInfo>,
     http1_only: bool,
+    control: Option<&str>,
 ) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<serde_json::Value> = snapshot
@@ -888,6 +1090,13 @@ fn render_accounts_json(
                 "priority": a.priority,
                 "status": a.status,
                 "disabled": a.disabled,
+                // Whether THIS row is the identity-bound control account
+                // (`Config::control_account` / `Manager::control_name`). Reported
+                // on the offline path too, deliberately — it is a config fact,
+                // not a serving counter, so it does NOT get the
+                // null-when-offline treatment `streamErrorCount` gets below;
+                // see `StatusPayload::control`'s doc-comment for why.
+                "control": control == Some(a.name.as_str()),
                 "quota": quota,
                 "quotaState": quota_state_token(a.quota_state),
                 // The server's own terminal-gate verdict
@@ -1189,12 +1398,15 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
 
-    let (source, server_build, snapshot, thresholds, http1_only) = match fetch_live_status(&config)
-        .await
+    let (source, server_build, snapshot, thresholds, http1_only, control) = match fetch_live_status(
+        &config,
+    )
+    .await
     {
         Ok(payload) => {
             let build = payload.build.clone();
             let http1_only = payload.http1_only;
+            let control = payload.control.clone();
             let (snapshot, thresholds) = payload.into_snapshot();
             (
                 StatusSource::Live,
@@ -1202,6 +1414,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 snapshot,
                 thresholds,
                 http1_only,
+                control,
             )
         }
         Err(reason) => {
@@ -1216,10 +1429,13 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             }
             let thresholds = resolve_thresholds(&config);
             // `config` is consumed by `snapshot_offline` below, so read
-            // `http1_only` off it first — this is the config FILE's value,
-            // not a running server's (there is none in this branch), which
-            // is the honest answer for an offline snapshot.
+            // `http1_only`/`control_account` off it first — this is the
+            // config FILE's value, not a running server's (there is none
+            // in this branch), which is the honest answer for an offline
+            // snapshot. `control` is a config fact either way, so this is
+            // the same reading a live server would derive at boot.
             let http1_only = config.http1_only;
+            let control = config.control_account.clone();
             let snapshot = snapshot_offline(
                 config,
                 Arc::new(NoRefresh),
@@ -1233,6 +1449,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 snapshot,
                 thresholds,
                 http1_only,
+                control,
             )
         }
     };
@@ -1252,7 +1469,8 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 &thresholds,
                 source,
                 server_build.as_ref(),
-                http1_only
+                http1_only,
+                control.as_deref()
             )
         );
     } else {
@@ -1952,7 +2170,14 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
         for row in &rows {
@@ -1980,7 +2205,8 @@ mod tests {
         let mut counted = snapshot.clone();
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
-        let live = render_accounts_json(&counted, &thresholds, StatusSource::Live, None, false);
+        let live =
+            render_accounts_json(&counted, &thresholds, StatusSource::Live, None, false, None);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
         assert_eq!(rows[0]["source"], "live");
@@ -2022,8 +2248,14 @@ mod tests {
         )
         .await;
 
-        let offline =
-            render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
+        let offline = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&offline).expect("valid json");
         for row in &rows {
             // `get`, not `row[...]`: indexing a MISSING key also yields Null, so
@@ -2042,7 +2274,14 @@ mod tests {
         }
 
         // Measured and genuinely clean is a DIFFERENT state, and renders as 0.
-        let live = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, None, false);
+        let live = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(0));
 
@@ -2050,7 +2289,8 @@ mod tests {
         let mut errored = snapshot.clone();
         errored.accounts[0].stream_error_count = 3;
         errored.accounts[0].last_stream_error = Some("overloaded_error".to_string());
-        let live = render_accounts_json(&errored, &thresholds, StatusSource::Live, None, false);
+        let live =
+            render_accounts_json(&errored, &thresholds, StatusSource::Live, None, false, None);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(3));
         assert_eq!(
@@ -2120,6 +2360,7 @@ mod tests {
             StatusSource::Live,
             Some(&build),
             false,
+            None,
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(
@@ -2163,7 +2404,14 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         for row in &rows {
             assert!(
@@ -2493,7 +2741,7 @@ mod tests {
             assert!(secs > 0, "a promised instant is in the future: {line}");
         }
         // JSON mirrors it for machine consumers, in ms like every other instant.
-        let json = render_accounts_json(&gated, &thresholds, StatusSource::Live, None, false);
+        let json = render_accounts_json(&gated, &thresholds, StatusSource::Live, None, false, None);
         assert!(
             json.contains("\"freeAtMs\""),
             "json carries freeAtMs: {json}"
@@ -2602,7 +2850,14 @@ mod tests {
         );
 
         // JSON mirrors the held fields for machine consumers.
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
             json.contains("\"window\": \"5h\""),
@@ -2848,7 +3103,8 @@ mod tests {
                 &thresholds,
                 StatusSource::Live,
                 Some(&build),
-                false
+                false,
+                None
             )
         )
     }

@@ -80,16 +80,27 @@ impl Manager {
     /// Excluding them outright made `Error` a life sentence: nothing probes or selects
     /// an errored row, and only a refresh clears it — so one transient rejection
     /// sidelined a healthy account until restart (observed live 2026-07-17).
+    ///
+    /// One narrow exception on top of "disabled is skipped": the CONTROL account
+    /// (`self.control_idx`) is probeable even while `disabled`. It is
+    /// deliberately kept out of the inference rotation (`disabled=true`) so it
+    /// never burns its own quota, but it is still an identity-bound account
+    /// whose usage must stay visible — see the module doc at the top of
+    /// `manager/mod.rs`'s `control_idx` field. Errored/rejected accounts are
+    /// NOT included in this exception: a control account that is also dead
+    /// still needs a live refresh before anything probes it, same as any other
+    /// row.
     pub fn probeable_indices(&self) -> Vec<usize> {
         let now_ms = crate::now_ms();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let control = *self.control_idx.read().expect("control lock poisoned");
         accounts
             .iter()
             .enumerate()
-            .filter(|(_, a)| {
+            .filter(|(idx, a)| {
                 a.account_type == "oauth"
                     && a.refresh_token.is_some()
-                    && !a.disabled
+                    && (!a.disabled || control == Some(*idx))
                     && (a.status != AccountStatus::Error
                         || cooldown_elapsed(a.error_retry_after_ms, now_ms))
             })

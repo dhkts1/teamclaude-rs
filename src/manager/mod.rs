@@ -631,6 +631,59 @@ impl DisablePersist {
     }
 }
 
+/// What [`Manager::set_control_by_query`] did. Same shape as
+/// [`SetDisabledOutcome`], with one difference: a `None` query is a legitimate
+/// request (clear the control account), not a missing argument, so `Applied`'s
+/// `name` is itself an `Option` rather than `Applied` only ever meaning "matched
+/// something".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetControlOutcome {
+    /// `name` is the resolved account name, or `None` when this call cleared
+    /// the control account.
+    Applied {
+        name: Option<String>,
+        persist: ControlPersist,
+    },
+    /// The query named no account in the live rotation.
+    NoMatch,
+    /// The query named more than one, listed so the caller can tell the user
+    /// what to pass `--org` for.
+    Ambiguous(Vec<String>),
+}
+
+/// What [`Manager::set_control`] achieved about DURABILITY — whether the
+/// control account will still be set (or cleared) after a restart. Simpler
+/// than [`DisablePersist`]: `controlAccount` is a single top-level key
+/// resolved by NAME, not a per-account flag located by identity, so there is
+/// no `NoEntry`/`Ambiguous` arm on the durable side — see
+/// [`config::ControlWrite`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlPersist {
+    /// The config file carries the control account (or its absence) — written
+    /// just now, or already correct.
+    Persisted,
+    /// No config file behind this manager (`tcr demo`, `tcr status --probe`,
+    /// tests). Memory-only BY DESIGN.
+    NoConfigFile,
+    /// The write itself failed (unreadable, malformed, or unwritable file).
+    WriteFailed,
+}
+
+impl ControlPersist {
+    /// The one line to put in front of the user, or `None` when the outcome
+    /// needs no explanation. Mirrors [`DisablePersist::warning`]; there is no
+    /// direction-dependent wording here because clearing and setting fail the
+    /// same way — a failed write just leaves the file saying whatever it said.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Persisted | Self::NoConfigFile => None,
+            Self::WriteFailed => {
+                Some("NOT SAVED: writing the config failed — this will not survive a restart")
+            }
+        }
+    }
+}
+
 /// What [`Manager::add_or_update_account`] achieved about DURABILITY. Same role
 /// as [`DisablePersist`], deliberately simpler: an upsert either lands or it does
 /// not, and there is no "no such account" / "no config entry" arm here — a MISS
@@ -745,6 +798,20 @@ pub struct Manager {
     /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
     /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
     locked_idx: Option<usize>,
+    /// The resolved identity-bound control account (index of the account named
+    /// by `config.controlAccount`), or `None` when unset / the name did not
+    /// match. Deliberately **not** `locked_idx`'s immutable `Option<usize>` —
+    /// this one is set at runtime via `tcr control` / `POST
+    /// /_tcr/accounts/control`, mirroring `set_disabled_by_query`, so it needs
+    /// interior mutability. Read by [`Self::probeable_indices`] to keep usage
+    /// tracking on this account even while it stays `disabled` (out of the
+    /// inference rotation on purpose — see the module's `probing.rs` doc).
+    /// Selection itself does NOT consult this field (part 1's invariant);
+    /// routing is added on top in part 2.
+    ///
+    /// Lock order: taken ALONE, never nested under `accounts` or `affinity` —
+    /// same discipline as `select.rs:253-256`.
+    control_idx: RwLock<Option<usize>>,
     /// GCRA theoretical-arrival-time (epoch ms) for the global outbound throttle.
     /// Guarded by an async mutex held ONLY for the O(1) slot update, released
     /// before any sleep so concurrent callers stagger and sleep concurrently.
@@ -783,6 +850,32 @@ pub struct Manager {
     /// Anti-storm valve for over-threshold revalidation-serve: epoch-ms before which
     /// no new revalidation serve is issued. See [`Manager::select_revalidation`].
     next_revalidation_at_ms: std::sync::atomic::AtomicI64,
+    /// Connection-scoped affinity for NOISE traffic (`/api/event_logging`,
+    /// `/mcp-registry` — see [`select::classify_request`]): connection key
+    /// ([`crate::proxy::SessionKey`]'s wrapped `u64`, minted per-connection by
+    /// [`Manager::next_session_key`]) → `(account index, last-touch ms)`.
+    ///
+    /// Deliberately **separate** from [`Self::affinity`] and **never** written to
+    /// `session-affinity.json` — the whole reason [`crate::proxy::SessionKey`]'s
+    /// own doc-comment objects to using it as a routing key ("a pin keyed on it
+    /// dies with the connection and leaves a ghost entry") does not apply here:
+    /// that objection is about the PERSISTED map surviving past the connection
+    /// it was minted for. This map is memory-only, LRU-capped
+    /// (`CONN_AFFINITY_CAP`) with a short idle TTL (`CONN_AFFINITY_TTL_MS`), so a
+    /// dead connection's entry ages out rather than persisting as a ghost.
+    /// Guarded the same way as `affinity` — never held while the accounts lock
+    /// is taken.
+    conn_affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    /// Per-account quota headroom reserved for the control account (§3, part 2
+    /// of the control-account feature) — `switchThreshold`/`global_threshold`
+    /// minus this, applied ONLY when a general (non-control-preferred) pick
+    /// evaluates the control account as a candidate. See
+    /// [`select::effective_threshold`]. Resolved from `config.control_reserve`,
+    /// clamped to `[0.0, 0.5]`. **Currently inert**: the control account ships
+    /// `disabled`, so `Self::eligible` already excludes it from every general
+    /// pick before this reserve is ever consulted. It exists for the day
+    /// `controlAccount` names a POOLED (non-disabled) account.
+    control_reserve: f64,
 }
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
@@ -911,6 +1004,23 @@ impl Manager {
         // Capture the locked account name BEFORE `accounts` is moved into the struct.
         let locked_name = locked_idx.and_then(|i| accounts.get(i).map(|a| a.name.clone()));
 
+        // Clamp defensively even though `config::default_control_reserve` and
+        // the field's own doc already promise `[0.0, 0.5]` — a hand-edited
+        // config file is not bound by either.
+        let control_reserve = config.control_reserve.clamp(0.0, 0.5);
+
+        let control_idx = config.control_account.as_ref().and_then(|name| {
+            let idx = accounts.iter().position(|a| a.name == *name);
+            if idx.is_none() {
+                let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+                tracing::error!(
+                    control_account = %name, available = ?names,
+                    "controlAccount name did not match any account — running with NO control account"
+                );
+            }
+            idx
+        });
+
         let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
             refresher,
@@ -927,6 +1037,7 @@ impl Manager {
             pacing,
             throttle,
             locked_idx,
+            control_idx: RwLock::new(control_idx),
             throttle_tat_ms: AsyncMutex::new(0),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
@@ -936,6 +1047,8 @@ impl Manager {
             sessions: Mutex::new(HashMap::new()),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
+            conn_affinity: Mutex::new(HashMap::new()),
+            control_reserve,
         });
 
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
@@ -1370,6 +1483,147 @@ impl Manager {
         SetDisabledOutcome::Applied {
             name,
             persist: self.set_disabled(idx, disabled),
+        }
+    }
+
+    /// The current control account's rotation index, or `None` when unset.
+    pub fn control(&self) -> Option<usize> {
+        *self.control_idx.read().expect("control lock poisoned")
+    }
+
+    /// The current control account's name, or `None` when unset / the index no
+    /// longer resolves (an account row cannot disappear — `add_account` is
+    /// append-only — so the only way this reads `None` with `control()` some
+    /// is a bug, not a live scenario; resolving defensively here rather than
+    /// indexing avoids a panic either way).
+    pub fn control_name(&self) -> Option<String> {
+        let idx = self.control()?;
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.name.clone())
+    }
+
+    /// Persist ONLY the top-level `controlAccount` key, via
+    /// [`config::save_control_account`] — never the whole config (see
+    /// [`Self::persist_disabled`]'s doc-comment for why: the in-memory
+    /// `Config` is a boot-time snapshot, and flushing it whole would revert
+    /// every setting the user edited while the proxy ran — the exact clobber
+    /// fixed in `1d978ce`).
+    ///
+    /// Same three invariants as [`Self::persist_disabled`]:
+    ///  - **INV1** — `config_write` spans the whole read-modify-rename, so this
+    ///    write and a concurrent token rotation or disabled-flag write can
+    ///    never interleave.
+    ///  - **INV2** — `save_control_account` runs with `self.config` NOT held,
+    ///    so the file I/O never blocks the per-connection config read.
+    ///  - **INV3** — the in-memory snapshot (`config.control_account`) is
+    ///    mutated only once the file is known to carry the desired state
+    ///    (`Updated` or `Unchanged`); a failed write leaves memory and disk in
+    ///    the same (divergent-from-the-request) state rather than only disk.
+    ///
+    /// A missing `config_path` (tests, `tcr demo`, `tcr status --probe`) is a
+    /// SILENT no-op — those managers must never touch a real config file.
+    fn persist_control(&self, name: Option<String>) -> ControlPersist {
+        let Some(path) = &self.config_path else {
+            return ControlPersist::NoConfigFile;
+        };
+        // INV1 — held across `save_control_account`'s whole read + modify +
+        // sync + rename.
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        // INV2 — no `self.config` guard is alive on this line.
+        let outcome = config::save_control_account(path, name.as_deref());
+        // INV3 — memory is touched only on the arms where the FILE now carries
+        // the desired state.
+        if matches!(
+            outcome,
+            Ok(config::ControlWrite::Updated) | Ok(config::ControlWrite::Unchanged)
+        ) {
+            let mut config = self.config.lock().expect("config lock poisoned");
+            config.control_account = name.clone();
+        }
+        match outcome {
+            Ok(config::ControlWrite::Updated) => {
+                tracing::info!(
+                    control_account = ?name,
+                    "persisted control account to config"
+                );
+                ControlPersist::Persisted
+            }
+            Ok(config::ControlWrite::Unchanged) => {
+                tracing::debug!(
+                    control_account = ?name,
+                    "config already names this control account; nothing written"
+                );
+                ControlPersist::Persisted
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    control_account = ?name,
+                    path = %path.display(),
+                    "failed to persist the control account to config"
+                );
+                ControlPersist::WriteFailed
+            }
+        }
+    }
+
+    /// Set (`idx = Some(_)`) or clear (`idx = None`) the control account by
+    /// rotation index, and persist it. Mirrors [`Self::set_disabled`]'s
+    /// resolve-name-then-persist shape: the name is read out under a released
+    /// `accounts` READ lock before `control_idx` is taken, so the two never
+    /// nest (same discipline `set_disabled` documents for `accounts`/`config`).
+    fn set_control(&self, idx: Option<usize>) -> ControlPersist {
+        let name = idx.and_then(|i| {
+            self.accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .get(i)
+                .map(|a| a.name.clone())
+        });
+        {
+            let mut control = self.control_idx.write().expect("control lock poisoned");
+            *control = idx;
+        }
+        self.persist_control(name)
+    }
+
+    /// Resolve a user-supplied `(query, org)` against the LIVE rotation and set
+    /// the control account to whatever it names — the whole operation the
+    /// control endpoint performs. `query = None` CLEARS the control account
+    /// (there is nothing to resolve, so this never reaches `match_one`).
+    ///
+    /// Resolution runs over `self.accounts` — never the boot-time config
+    /// snapshot — for the same reason [`Self::set_disabled_by_query`] does.
+    pub fn set_control_by_query(
+        &self,
+        query: Option<&str>,
+        org: Option<&str>,
+    ) -> SetControlOutcome {
+        let Some(query) = query else {
+            return SetControlOutcome::Applied {
+                name: None,
+                persist: self.set_control(None),
+            };
+        };
+        let (idx, name) = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            match crate::identity::match_one(&accounts[..], query, org) {
+                crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
+                crate::identity::Match::None => return SetControlOutcome::NoMatch,
+                crate::identity::Match::Ambiguous(names) => {
+                    return SetControlOutcome::Ambiguous(names)
+                }
+            }
+        };
+        SetControlOutcome::Applied {
+            name: Some(name),
+            persist: self.set_control(Some(idx)),
         }
     }
 
@@ -2015,6 +2269,8 @@ mod tests {
             pacing: PacingConfig::default(),
             throttle: ThrottleConfig::default(),
             lock_account: None,
+            control_account: None,
+            control_reserve: 0.05,
             http1_only: false,
             accounts,
             extra: serde_json::Map::new(),
@@ -2476,6 +2732,12 @@ mod tests {
         config
     }
 
+    fn config_with_control(accounts: Vec<Account>, control: &str) -> Config {
+        let mut config = config_with(accounts);
+        config.control_account = Some(control.to_string());
+        config
+    }
+
     /// A hard lock pins EVERY select to the locked index, ignoring the LRU
     /// preference and any session-affinity key that points elsewhere.
     #[test]
@@ -2491,15 +2753,21 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         // No affinity, empty tried → locked account regardless of LRU (index 0
         // would be the natural first pick here).
-        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(1));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1)
+        );
         // An affinity key returns the SAME locked account (lock ignores affinity).
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(42)),
+            manager.select(&HashSet::new(), now, None, Some(42), "/v1/messages", None),
             Some(1)
         );
         // Bias the LRU toward index 0 by pinning affinity elsewhere first — lock
         // still wins.
-        assert_eq!(manager.select(&HashSet::new(), now, None, Some(7)), Some(1));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(7), "/v1/messages", None),
+            Some(1)
+        );
     }
 
     /// The lock has NO failover: once the locked account is in `tried`, select
@@ -2514,7 +2782,10 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let mut tried = HashSet::new();
         tried.insert(1usize);
-        assert_eq!(manager.select(&tried, now, None, None), None);
+        assert_eq!(
+            manager.select(&tried, now, None, None, "/v1/messages", None),
+            None
+        );
     }
 
     /// `assemble` resolves the configured name to its account index; a name that
@@ -2540,7 +2811,599 @@ mod tests {
         let manager = build_manager(config_with(vec![account("solo", 0)]), lock_refresher());
         assert_eq!(manager.locked_idx, None);
         let now = OffsetDateTime::now_utc();
-        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(0));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(0)
+        );
+    }
+
+    /// `assemble` resolves the configured `controlAccount` name to its account
+    /// index, mirroring `assemble_resolves_lock_name`; a name that matches no
+    /// account resolves to `None` (runs with no control account, not a panic).
+    #[test]
+    fn assemble_resolves_control_name() {
+        let matched = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0), account("c", 0)], "c"),
+            lock_refresher(),
+        );
+        assert_eq!(matched.control(), Some(2));
+
+        let unmatched = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0)], "ghost"),
+            lock_refresher(),
+        );
+        assert_eq!(unmatched.control(), None);
+    }
+
+    /// Absent `controlAccount` → `control() == None`.
+    #[test]
+    fn control_absent_default_leaves_control_none() {
+        let manager = build_manager(config_with(vec![account("solo", 0)]), lock_refresher());
+        assert_eq!(manager.control(), None);
+    }
+
+    /// PART 1's invariant, NARROWED by part 2 (deliberately — see the module
+    /// doc for the three-way split): setting a control account must not change
+    /// which account `select` returns **for inference traffic on the realistic
+    /// deployment shape, where the control account stays `disabled`** (the
+    /// documented default — see `Manager::control_idx`'s doc). Part 1 asserted
+    /// this unconditionally, because part 1 shipped no routing at all and the
+    /// control account was inert everywhere.
+    ///
+    /// That is no longer strictly true in general: part 2 permanently excludes
+    /// the control account from inference candidacy REGARDLESS of `disabled`
+    /// (see [`inference_never_goes_to_control_even_when_unpinned`], which
+    /// deliberately leaves control ENABLED and asserts inference still skips
+    /// it) — so on a tiny fleet where the enabled control account would
+    /// otherwise have been the natural LRU pick, inference selection DOES
+    /// change the moment `disabled` is lifted. This test is narrowed to the
+    /// disabled case (`set_disabled(0, true)` below) where the exclusion is
+    /// provably redundant with `eligible`'s own disabled check, so the
+    /// original "byte-identical" claim keeps holding exactly where it matters
+    /// operationally. [`control_preference_prefers_control_for_non_inference_paths`]
+    /// covers the (expected) non-inference side changing.
+    #[test]
+    fn setting_a_control_account_does_not_change_selection() {
+        let without_control = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let with_control = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0)], "a"),
+            lock_refresher(),
+        );
+        // Realistic deployment shape: the control account stays `disabled` —
+        // see the doc-comment above for why this is what keeps the invariant
+        // honestly true rather than coincidentally true. Disabled on BOTH
+        // managers, isolating the effect of `controlAccount` itself: the
+        // baseline already excludes account 0 the ordinary way (a plain
+        // `disabled` account, unrelated to control), so any DIFFERENCE
+        // between the two would be attributable to the control preference,
+        // not to `disabled` doing double duty.
+        without_control.set_disabled(0, true);
+        with_control.set_disabled(0, true);
+        assert_eq!(with_control.control(), Some(0));
+
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..20 {
+            let picked_without =
+                without_control.select(&HashSet::new(), now, None, None, "/v1/messages", None);
+            let picked_with =
+                with_control.select(&HashSet::new(), now, None, None, "/v1/messages", None);
+            assert_eq!(
+                picked_without, picked_with,
+                "a control account must not change which account select() returns for inference traffic"
+            );
+            if let Some(idx) = picked_without {
+                without_control.set_current(idx);
+                with_control.set_current(idx);
+            }
+        }
+    }
+
+    /// The other half of the narrowing above: an UNPINNED, non-inference,
+    /// non-noise request (the identity/control plane) DOES change the pick —
+    /// it now prefers the control account, byte-different from `without_control`.
+    #[test]
+    fn control_preference_prefers_control_for_non_inference_paths() {
+        let without_control = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let with_control = build_manager(
+            config_with_control(vec![account("a", 0), account("b", 0)], "b"),
+            lock_refresher(),
+        );
+        assert_eq!(with_control.control(), Some(1));
+
+        let now = OffsetDateTime::now_utc();
+        let picked_without =
+            without_control.select(&HashSet::new(), now, None, None, "/api/organizations", None);
+        let picked_with =
+            with_control.select(&HashSet::new(), now, None, None, "/api/organizations", None);
+        assert_eq!(
+            picked_without,
+            Some(0),
+            "no control account: ordinary LRU picks index 0"
+        );
+        assert_eq!(
+            picked_with,
+            Some(1),
+            "a control account IS preferred for an unpinned identity-plane request"
+        );
+    }
+
+    // ---- control-account routing (part 2 — see docs/plans/control-routing-bridge-coder.md) ----
+
+    /// Invariant 1, the one that matters: an EXISTING pin is never re-keyed by
+    /// the control preference, even after control is set at runtime.
+    #[test]
+    fn control_preference_never_moves_an_existing_pin() {
+        let manager = build_manager(
+            config_with(vec![account("pool", 0), account("ctrl", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 555u64;
+        // Pin session `key` to account 0 (pool) BEFORE any control account
+        // exists — an ordinary identity-plane select, no preference in play.
+        let pinned = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                Some(key),
+                "/api/organizations",
+                None,
+            )
+            .expect("an account is eligible");
+        assert_eq!(pinned, 0);
+
+        // Set the control account to `ctrl` (index 1) at runtime.
+        manager.set_control_by_query(Some("ctrl"), None);
+        assert_eq!(manager.control(), Some(1));
+
+        // The SAME session's next identity-plane request must still return its
+        // EXISTING pin (0), never the newly-preferred control account (1).
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(
+                    &HashSet::new(),
+                    now,
+                    None,
+                    Some(key),
+                    "/api/organizations",
+                    None
+                ),
+                Some(0),
+                "an existing pin must never be re-keyed by the control preference"
+            );
+        }
+    }
+
+    /// The `keep_pin` half of invariant 1, distinct from the test above: a pin
+    /// that is only DIVERTED for one request (it already failed upstream —
+    /// `tried` — but the ACCOUNT itself is still alive) must not be re-keyed to
+    /// the control account either. The test above never actually reaches the
+    /// control overlay (a clean, servable pin returns from the affinity
+    /// fast-path first); this one forces a divert so `keep_pin` really is
+    /// `Some(_)` when the overlay's `keep_pin.is_none()` gate is checked.
+    #[test]
+    fn control_preference_never_moves_a_diverted_pin() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 777u64;
+        let pinned = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                Some(key),
+                "/api/organizations",
+                None,
+            )
+            .expect("an account is eligible");
+        assert_eq!(pinned, 0, "the first pick, tie-broken by index, is \"a\"");
+
+        // Set control to "c" (index 2) — a DIFFERENT account — after the pin
+        // already exists.
+        manager.set_control_by_query(Some("c"), None);
+        assert_eq!(manager.control(), Some(2));
+
+        // Bias ordinary LRU firmly toward "b" (index 1): stamp "c" (control)
+        // as ALREADY selected, so its LRU key sorts strictly AFTER "b"'s
+        // never-selected key. If the divert incorrectly routed straight to
+        // control (the hoisting bug this test exists to catch — the overlay
+        // reached ahead of the `keep_pin` gate), it would land on "c"
+        // regardless of this bias, because it never consults ordinary LRU at
+        // all for a control-preferred pick.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[2].last_selected_seq = 999;
+        }
+
+        // This ONE request diverts — the pinned account already failed it.
+        let mut tried = HashSet::new();
+        tried.insert(pinned);
+        let served = manager
+            .select(&tried, now, None, Some(key), "/api/organizations", None)
+            .expect("a divert target is eligible");
+        assert_eq!(
+            served, 1,
+            "a diverted pinned request must go through ORDINARY rotation (picking \"b\"), \
+             not straight to the control account"
+        );
+
+        // A clean retry must still return the ORIGINAL pin, never re-keyed to
+        // the control account by the divert.
+        let rechecked = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                Some(key),
+                "/api/organizations",
+                None,
+            )
+            .expect("an account is eligible");
+        assert_eq!(
+            rechecked, pinned,
+            "a per-request divert must never re-key the session's pin to the control account"
+        );
+    }
+
+    /// §1 no-op guard: the control account ships `disabled` (out of the
+    /// inference rotation, by design — see the module doc), and the control
+    /// preference must BYPASS that gate. If `select` used `eligible` or
+    /// `account_hard_ok` here instead of `Self::control_eligible`, this test
+    /// fails silently useful: it would still compile and the feature would
+    /// simply never fire (the single most likely way to get this wrong).
+    #[test]
+    fn control_is_picked_even_though_disabled() {
+        let manager = build_manager(
+            config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
+            lock_refresher(),
+        );
+        manager.set_disabled(1, true);
+        assert_eq!(manager.control(), Some(1));
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/api/organizations", None),
+            Some(1),
+            "a disabled control account must still be picked for an identity-plane request"
+        );
+    }
+
+    #[test]
+    fn control_is_not_picked_when_errored() {
+        let manager = build_manager(
+            config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
+            lock_refresher(),
+        );
+        manager.set_disabled(1, true);
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[1].status = AccountStatus::Error;
+        }
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/api/organizations", None),
+            Some(0),
+            "an ERRORED control account must degrade to normal rotation"
+        );
+    }
+
+    #[test]
+    fn control_is_not_picked_when_rejected() {
+        let manager = build_manager(
+            config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
+            lock_refresher(),
+        );
+        manager.set_disabled(1, true);
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[1].quota.status = Some("rejected".to_string());
+        }
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/api/organizations", None),
+            Some(0),
+            "a REJECTED control account must degrade to normal rotation"
+        );
+    }
+
+    #[test]
+    fn control_is_not_picked_when_rate_limited() {
+        let manager = build_manager(
+            config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
+            lock_refresher(),
+        );
+        manager.set_disabled(1, true);
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[1].rate_limited_until_ms = Some(now_ms + 60_000);
+        }
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/api/organizations", None),
+            Some(0),
+            "a LIVE-held control account must degrade to normal rotation"
+        );
+    }
+
+    /// Inference must NEVER select the control account — including UNPINNED
+    /// and with control left ENABLED (pooled), where `eligible` alone would
+    /// happily pick it. Only the dedicated pool-pick exclusion stops it.
+    #[test]
+    fn inference_never_goes_to_control_even_when_unpinned() {
+        let manager = build_manager(
+            config_with_control(vec![account("ctrl", 0), account("pool", 0)], "ctrl"),
+            lock_refresher(),
+        );
+        assert_eq!(manager.control(), Some(0));
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..10 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+                Some(1),
+                "inference must route to the pool, never the control account"
+            );
+        }
+    }
+
+    /// §2: a NOISE request reuses whichever account this connection already
+    /// served.
+    #[test]
+    fn noise_path_follows_its_connection() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0), account("c", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let conn = 42u64;
+        let first = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/api/event_logging/v2/batch",
+                Some(conn),
+            )
+            .expect("an account is eligible");
+        for _ in 0..5 {
+            assert_eq!(
+                manager.select(
+                    &HashSet::new(),
+                    now,
+                    None,
+                    None,
+                    "/api/event_logging/v2/batch",
+                    Some(conn)
+                ),
+                Some(first),
+                "noise traffic on the same connection must stay on the same account"
+            );
+        }
+    }
+
+    /// §2 fallback: once the connection's account is no longer eligible,
+    /// normal rotation takes over AND `conn_affinity` is re-recorded to the
+    /// new winner (not left stale on the held account).
+    #[test]
+    fn noise_path_falls_back_when_its_account_is_held() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let conn = 7u64;
+        let first = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/mcp-registry/list",
+                Some(conn),
+            )
+            .expect("an account is eligible");
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[first].rate_limited_until_ms = Some(now_ms + 60_000);
+        }
+        let second = manager
+            .select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/mcp-registry/list",
+                Some(conn),
+            )
+            .expect("the other account is still eligible");
+        assert_ne!(
+            second, first,
+            "a held connection-pinned account must fall back to rotation"
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/mcp-registry/list",
+                Some(conn)
+            ),
+            Some(second),
+            "conn_affinity must be RE-RECORDED to the new winner, not left stale"
+        );
+    }
+
+    /// Proves the split splits: noise and identity traffic on the SAME
+    /// connection route independently — a noise pin to the pool account must
+    /// not short-circuit the identity plane's control preference.
+    #[test]
+    fn identity_path_still_goes_to_control_on_the_same_connection() {
+        let manager = build_manager(
+            config_with_control(vec![account("pool", 0), account("ctrl", 0)], "ctrl"),
+            lock_refresher(),
+        );
+        manager.set_disabled(1, true);
+        let now = OffsetDateTime::now_utc();
+        let conn = 99u64;
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/api/event_logging/v2/batch",
+                Some(conn)
+            ),
+            Some(0),
+            "noise pins this connection to the pool account"
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/api/organizations",
+                Some(conn)
+            ),
+            Some(1),
+            "control preference must not be short-circuited by the connection's noise pin"
+        );
+    }
+
+    /// `conn_affinity` is a SEPARATE, memory-only map (invariant 3): noise
+    /// traffic must never mark the persisted affinity map dirty or write into
+    /// it, mirroring `Self::affinity`'s own persistence contract.
+    #[test]
+    fn conn_affinity_is_never_persisted() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        assert!(!manager.affinity_dirty.load(Ordering::Relaxed));
+        let now = OffsetDateTime::now_utc();
+        for i in 0..5u64 {
+            manager.select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/api/event_logging/v2/batch",
+                Some(i),
+            );
+        }
+        assert!(
+            !manager.affinity_dirty.load(Ordering::Relaxed),
+            "noise traffic must never mark the persisted affinity map dirty"
+        );
+        assert!(
+            manager
+                .affinity
+                .lock()
+                .expect("affinity lock poisoned")
+                .is_empty(),
+            "noise traffic must never write into the persisted affinity map"
+        );
+    }
+
+    /// Invariant 4: inert with no control account set — path classification
+    /// changes nothing about ordinary LRU.
+    #[test]
+    fn control_preference_is_inert_when_unset() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            lock_refresher(),
+        );
+        assert_eq!(manager.control(), None);
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/api/organizations", None),
+            Some(0),
+            "no control account set -> ordinary LRU, unaffected by path classification"
+        );
+    }
+
+    /// The hard account lock still short-circuits BEFORE path classification
+    /// is even computed — control preference can never outrank it.
+    #[test]
+    fn control_preference_never_outranks_lock_account() {
+        let mut config =
+            config_with_control(vec![account("locked", 0), account("ctrl", 0)], "ctrl");
+        config.lock_account = Some("locked".to_string());
+        let manager = build_manager(config, lock_refresher());
+        assert_eq!(manager.locked_idx, Some(0));
+        assert_eq!(manager.control(), Some(1));
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/api/organizations", None),
+            Some(0),
+            "the hard lock must win over control preference regardless of path"
+        );
+    }
+
+    /// `set_control_by_query` resolves against the LIVE rotation (mirroring
+    /// `set_disabled_by_query`), reports the resolved name, sets `control()`,
+    /// and a `None` query clears it.
+    #[test]
+    fn set_control_by_query_resolves_sets_and_clears() {
+        let manager = build_manager(
+            config_with(vec![account("gil", 0), account("other", 0)]),
+            lock_refresher(),
+        );
+
+        let outcome = manager.set_control_by_query(Some("gil"), None);
+        assert_eq!(
+            outcome,
+            SetControlOutcome::Applied {
+                name: Some("gil".to_string()),
+                persist: ControlPersist::NoConfigFile,
+            }
+        );
+        assert_eq!(manager.control(), Some(0));
+        assert_eq!(manager.control_name(), Some("gil".to_string()));
+
+        let cleared = manager.set_control_by_query(None, None);
+        assert_eq!(
+            cleared,
+            SetControlOutcome::Applied {
+                name: None,
+                persist: ControlPersist::NoConfigFile,
+            }
+        );
+        assert_eq!(manager.control(), None);
+    }
+
+    #[test]
+    fn set_control_by_query_no_match_and_ambiguous() {
+        let manager = build_manager(
+            config_with(vec![account("dup", 0), account("dup", 0)]),
+            lock_refresher(),
+        );
+        assert_eq!(
+            manager.set_control_by_query(Some("ghost"), None),
+            SetControlOutcome::NoMatch
+        );
+        assert_eq!(
+            manager.set_control_by_query(Some("dup"), None),
+            SetControlOutcome::Ambiguous(vec!["dup".to_string(), "dup".to_string()])
+        );
+        assert_eq!(
+            manager.control(),
+            None,
+            "an ambiguous query must not set anything"
+        );
     }
 
     #[test]
@@ -2583,7 +3446,7 @@ mod tests {
         }
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(0),
             "with PacingConfig::default() the account is selected regardless of load"
         );
@@ -2607,7 +3470,7 @@ mod tests {
         }
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(1),
             "the capped account is skipped and the free one is chosen"
         );
@@ -2681,7 +3544,9 @@ mod tests {
         }
         let now = OffsetDateTime::now_utc();
         assert!(
-            manager.select(&HashSet::new(), now, None, None).is_some(),
+            manager
+                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
+                .is_some(),
             "all-paced but healthy → soft fallback serves least-loaded, never None"
         );
     }
@@ -2795,7 +3660,9 @@ mod tests {
         // And selection still serves normally rather than flooding the fallback.
         drop(a);
         assert!(
-            manager.select(&HashSet::new(), now, None, None).is_some(),
+            manager
+                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
+                .is_some(),
             "cap=0 selects a servable account without pacing anyone out"
         );
     }
@@ -2810,7 +3677,10 @@ mod tests {
             refresher,
         );
         let now = OffsetDateTime::now_utc();
-        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(1));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2824,7 +3694,10 @@ mod tests {
         );
         manager.set_disabled(0, true);
         let now = OffsetDateTime::now_utc();
-        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(1));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2838,7 +3711,10 @@ mod tests {
         );
         manager.mark_rate_limited(0, 300);
         let now = OffsetDateTime::now_utc();
-        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(1));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2863,7 +3739,10 @@ mod tests {
             reset.to_string().parse().unwrap(),
         );
         manager.update_quota(0, &headers);
-        assert_eq!(manager.select(&HashSet::new(), now, None, None), Some(1));
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2874,7 +3753,10 @@ mod tests {
         let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
         let now = OffsetDateTime::now_utc();
         let tried: HashSet<usize> = [0].into_iter().collect();
-        assert_eq!(manager.select(&tried, now, None, None), None);
+        assert_eq!(
+            manager.select(&tried, now, None, None, "/v1/messages", None),
+            None
+        );
     }
 
     /// Load-balancing: within a priority tier, consecutive selects fan out across
@@ -2896,7 +3778,7 @@ mod tests {
         let mut counts = [0usize; 3];
         for _ in 0..6 {
             let idx = manager
-                .select(&HashSet::new(), now, None, None)
+                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
                 .expect("an account is eligible");
             counts[idx] += 1;
         }
@@ -2922,7 +3804,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         for _ in 0..5 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, None),
+                manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
                 Some(0),
                 "the primary tier is never abandoned for a higher-priority-value account"
             );
@@ -3144,6 +4026,13 @@ mod tests {
     /// Finding #1: the background probe must SKIP disabled and errored accounts —
     /// never spend upstream traffic on a sidelined account nor let a probe's
     /// refresh silently flip an errored account back into rotation.
+    ///
+    /// UPDATED contract (control account, part 1): "disabled → skipped" now
+    /// has exactly one exception, the control account, covered separately by
+    /// [`probeable_indices_still_includes_a_disabled_control_account`] and
+    /// [`probeable_indices_excludes_a_disabled_non_control_account_even_with_a_control_set`]
+    /// below. This test has no control account configured at all, so it keeps
+    /// asserting the base case: an ordinary disabled account is skipped.
     #[tokio::test]
     async fn probe_all_skips_disabled_and_errored_accounts() {
         let refresher = Arc::new(CountingRefresher {
@@ -3172,7 +4061,7 @@ mod tests {
         assert_eq!(
             snap.accounts[1].probe_status,
             ProbeStatus::Never,
-            "a disabled account must not be probed"
+            "a disabled non-control account must not be probed"
         );
         assert!(snap.accounts[1].last_probe.is_none());
         assert_eq!(
@@ -3182,6 +4071,54 @@ mod tests {
         );
         // And the errored account was NOT flipped back to active by a probe refresh.
         assert_eq!(manager.account_status(2), Some(AccountStatus::Error));
+    }
+
+    /// The narrow exception itself, asserted directly on `probeable_indices()`
+    /// — the unit `probe_all` merely iterates: a disabled account that IS the
+    /// control account stays probeable, so its usage keeps getting tracked
+    /// even though it is deliberately out of the inference rotation.
+    #[test]
+    fn probeable_indices_still_includes_a_disabled_control_account() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("ok", 0), account("gil", 0)]),
+            refresher,
+        );
+        manager.set_control_by_query(Some("gil"), None);
+        manager.set_disabled(1, true);
+
+        assert_eq!(
+            manager.probeable_indices(),
+            vec![0, 1],
+            "the disabled CONTROL account (idx 1) must still be probeable"
+        );
+    }
+
+    /// The exception must not silently widen: with a control account set,
+    /// every OTHER disabled account is still excluded from
+    /// `probeable_indices()`.
+    #[test]
+    fn probeable_indices_excludes_a_disabled_non_control_account_even_with_a_control_set() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(
+            config_with(vec![account("gil", 0), account("ok", 0), account("off", 0)]),
+            refresher,
+        );
+        manager.set_control_by_query(Some("gil"), None);
+        manager.set_disabled(0, true); // the control account itself, disabled
+        manager.set_disabled(2, true); // an unrelated account, disabled
+
+        assert_eq!(
+            manager.probeable_indices(),
+            vec![0, 1],
+            "idx 0 (disabled control) stays probeable, idx 1 (enabled) stays \
+             probeable, idx 2 (disabled, NOT control) is excluded — the \
+             exception must not widen"
+        );
     }
 
     #[tokio::test]
@@ -3503,7 +4440,7 @@ mod tests {
         let snap = manager.snapshot(now);
         // Both are held out of rotation …
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             None,
             "over-threshold accounts are held out of rotation"
         );
@@ -3567,7 +4504,7 @@ mod tests {
         // The headroom account is not merely labelled Normal — it is actually
         // servable (pre-change it was held out and select() skipped it).
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(0),
             "the 0.92 account is eligible under the raised default"
         );
@@ -3694,7 +4631,7 @@ mod tests {
 
         // Pin the session to `a`, and serve one request there.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(key)),
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None),
             Some(0),
             "precondition: the first select pins the session to `a`"
         );
@@ -3706,7 +4643,7 @@ mod tests {
             accounts[0].rate_limited_until_ms = Some(odt_to_ms(now) + SHORT_HOLD_SECS * 1000);
         }
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(key)),
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None),
             Some(1),
             "precondition: the short hold DIVERTS this one request to `b`"
         );
@@ -3743,7 +4680,7 @@ mod tests {
         let key = 0xBEEFu64;
 
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(key)),
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None),
             Some(0),
             "precondition: the session starts pinned to `a`"
         );
@@ -3752,7 +4689,7 @@ mod tests {
         // A dead credential is ACCOUNT-level death → the pin is durably re-keyed.
         manager.mark_error(0);
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(key)),
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None),
             Some(1),
             "precondition: an errored pin re-keys the session to `b`"
         );
@@ -3785,7 +4722,7 @@ mod tests {
         // Three sessions pinned to the one account, last seen 3s/2s/1s ago — so a
         // recency order and a stable order are genuinely different orders here.
         for key in keys {
-            manager.select(&HashSet::new(), now, None, Some(key));
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None);
         }
         for (offset, key) in [3i64, 2, 1].into_iter().zip(keys) {
             manager.record_served(
@@ -3868,7 +4805,14 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         exhaust_oi_bucket(&manager, 0, now);
         assert_eq!(
-            manager.select(&HashSet::new(), now, Some("claude-fable-5"), None),
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                None,
+                "/v1/messages",
+                None
+            ),
             Some(1),
             "a Fable request must skip the OI-exhausted account 0"
         );
@@ -3889,7 +4833,14 @@ mod tests {
         exhaust_oi_bucket(&manager, 0, now);
         let tried: HashSet<usize> = [1].into_iter().collect();
         assert_eq!(
-            manager.select(&tried, now, Some("claude-opus-4-6"), None),
+            manager.select(
+                &tried,
+                now,
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None
+            ),
             Some(0),
             "a non-Fable model must still serve from the OI-exhausted account 0"
         );
@@ -3910,7 +4861,7 @@ mod tests {
         exhaust_oi_bucket(&manager, 0, now);
         let tried: HashSet<usize> = [1].into_iter().collect();
         assert_eq!(
-            manager.select(&tried, now, None, None),
+            manager.select(&tried, now, None, None, "/v1/messages", None),
             Some(0),
             "no-model traffic must ignore the model-scoped OI bucket"
         );
@@ -3930,11 +4881,11 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let first = manager
-            .select(&HashSet::new(), now, None, Some(7))
+            .select(&HashSet::new(), now, None, Some(7), "/v1/messages", None)
             .expect("an account is eligible");
         for _ in 0..5 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(7)),
+                manager.select(&HashSet::new(), now, None, Some(7), "/v1/messages", None),
                 Some(first),
                 "the same session key must stay pinned to one account"
             );
@@ -3956,7 +4907,7 @@ mod tests {
         let mut counts = [0usize; 3];
         for _ in 0..6 {
             let idx = manager
-                .select(&HashSet::new(), now, None, None)
+                .select(&HashSet::new(), now, None, None, "/v1/messages", None)
                 .expect("an account is eligible");
             counts[idx] += 1;
         }
@@ -3981,17 +4932,17 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(42))
+            .select(&HashSet::new(), now, None, Some(42), "/v1/messages", None)
             .expect("an account is eligible");
         manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
         let repinned = manager
-            .select(&HashSet::new(), now, None, Some(42))
+            .select(&HashSet::new(), now, None, Some(42), "/v1/messages", None)
             .expect("the other account is eligible");
         assert_ne!(repinned, pinned, "must migrate off the ineligible pin");
         // And it sticks to the new pin.
         for _ in 0..3 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(42)),
+                manager.select(&HashSet::new(), now, None, Some(42), "/v1/messages", None),
                 Some(repinned),
                 "the re-pin must be durable"
             );
@@ -4022,7 +4973,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(77))
+            .select(&HashSet::new(), now, None, Some(77), "/v1/messages", None)
             .expect("an account is eligible");
         // Saturate ONLY the pinned account: at cap=1 it is soft-paced while every
         // hard gate (disabled/error/hold/quota) stays clear.
@@ -4031,7 +4982,7 @@ mod tests {
             a[pinned].in_flight = 1;
         }
         let diverted = manager
-            .select(&HashSet::new(), now, None, Some(77))
+            .select(&HashSet::new(), now, None, Some(77), "/v1/messages", None)
             .expect("the un-paced account serves this request");
         assert_ne!(
             diverted, pinned,
@@ -4049,7 +5000,7 @@ mod tests {
         }
         for _ in 0..3 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(77)),
+                manager.select(&HashSet::new(), now, None, Some(77), "/v1/messages", None),
                 Some(pinned),
                 "once un-paced the session must return to its original account"
             );
@@ -4071,7 +5022,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(88))
+            .select(&HashSet::new(), now, None, Some(88), "/v1/messages", None)
             .expect("an account is eligible");
         {
             let mut a = manager.accounts.write().expect("accounts lock poisoned");
@@ -4081,7 +5032,7 @@ mod tests {
         let later = now + time::Duration::seconds(30);
         let later_ms = odt_to_ms(later);
         manager
-            .select(&HashSet::new(), later, None, Some(88))
+            .select(&HashSet::new(), later, None, Some(88), "/v1/messages", None)
             .expect("the un-paced account serves this request");
         let pins = manager.affinity.lock().expect("affinity lock poisoned");
         assert_eq!(
@@ -4110,19 +5061,19 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let a = manager
-            .select(&HashSet::new(), now, None, Some(9))
+            .select(&HashSet::new(), now, None, Some(9), "/v1/messages", None)
             .expect("an account is eligible");
         // The failover that put A in `tried` was durable: it armed a hold that
         // outlives A's prompt cache, so there is nothing left to come home to.
         manager.mark_rate_limited(a, LONG_HOLD_SECS);
         let tried: HashSet<usize> = [a].into_iter().collect();
         let b = manager
-            .select(&tried, now, None, Some(9))
+            .select(&tried, now, None, Some(9), "/v1/messages", None)
             .expect("the untried account is eligible");
         assert_ne!(b, a, "must fall through the tried pin to the other account");
         // The pin updated to B: a fresh same-key select with nothing tried sticks to B.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(9)),
+            manager.select(&HashSet::new(), now, None, Some(9), "/v1/messages", None),
             Some(b),
             "the pin must have migrated to the fallen-through account"
         );
@@ -4148,7 +5099,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(1234))
+            .select(&HashSet::new(), now, None, Some(1234), "/v1/messages", None)
             .expect("an account is eligible");
         // Over the soft threshold, but Anthropic still says `allowed_warning`:
         // every HARD gate is clear.
@@ -4156,7 +5107,7 @@ mod tests {
 
         for _ in 0..3 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(1234)),
+                manager.select(&HashSet::new(), now, None, Some(1234), "/v1/messages", None),
                 Some(pinned),
                 "an over-threshold pin that clears every HARD gate still serves its \
                  own session — upstream, not our utilization arithmetic, is the oracle"
@@ -4171,7 +5122,7 @@ mod tests {
         // The threshold is not dead — it still steers selection with no pin to
         // protect, so a session arriving cold lands on the cooler account.
         let unpinned = manager
-            .select(&HashSet::new(), now, None, None)
+            .select(&HashSet::new(), now, None, None, "/v1/messages", None)
             .expect("the under-threshold account is eligible");
         assert_ne!(
             unpinned, pinned,
@@ -4192,12 +5143,12 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(2345))
+            .select(&HashSet::new(), now, None, Some(2345), "/v1/messages", None)
             .expect("an account is eligible");
         manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
 
         let served = manager
-            .select(&HashSet::new(), now, None, Some(2345))
+            .select(&HashSet::new(), now, None, Some(2345), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_ne!(served, pinned, "a held pin cannot serve");
         assert_eq!(
@@ -4229,7 +5180,7 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(5678))
+            .select(&HashSet::new(), now, None, Some(5678), "/v1/messages", None)
             .expect("an account is eligible");
         set_over_threshold(&manager, pinned, 0.995, "allowed_warning");
         // The serve-over-threshold hit a real 429, which armed a real hold — and a
@@ -4237,7 +5188,7 @@ mod tests {
         manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
 
         let served = manager
-            .select(&HashSet::new(), now, None, Some(5678))
+            .select(&HashSet::new(), now, None, Some(5678), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_ne!(
             served, pinned,
@@ -4250,7 +5201,7 @@ mod tests {
         );
         // Durable: a fresh select with nothing tried stays on the new account.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(5678)),
+            manager.select(&HashSet::new(), now, None, Some(5678), "/v1/messages", None),
             Some(served),
             "the session must not snap back to the held account"
         );
@@ -4267,12 +5218,12 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(3456))
+            .select(&HashSet::new(), now, None, Some(3456), "/v1/messages", None)
             .expect("an account is eligible");
         set_over_threshold(&manager, pinned, 0.995, "rejected");
 
         let served = manager
-            .select(&HashSet::new(), now, None, Some(3456))
+            .select(&HashSet::new(), now, None, Some(3456), "/v1/messages", None)
             .expect("the allowed account serves this request");
         assert_ne!(served, pinned, "a rejected pin cannot serve");
         assert_eq!(
@@ -4299,12 +5250,12 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let pinned = manager
-            .select(&HashSet::new(), now, None, Some(4567))
+            .select(&HashSet::new(), now, None, Some(4567), "/v1/messages", None)
             .expect("an account is eligible");
         let tried: HashSet<usize> = [pinned].into_iter().collect();
 
         let served = manager
-            .select(&tried, now, None, Some(4567))
+            .select(&tried, now, None, Some(4567), "/v1/messages", None)
             .expect("the untried account serves this request");
         assert_ne!(served, pinned, "the tried pin cannot serve THIS request");
         assert_eq!(
@@ -4319,7 +5270,7 @@ mod tests {
         );
         // Nothing tried → straight back to the warm pin.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(4567)),
+            manager.select(&HashSet::new(), now, None, Some(4567), "/v1/messages", None),
             Some(pinned),
             "the session must return to its original account"
         );
@@ -4329,7 +5280,7 @@ mod tests {
         // re-keys.
         manager.mark_rate_limited(pinned, LONG_HOLD_SECS);
         let moved = manager
-            .select(&tried, now, None, Some(4567))
+            .select(&tried, now, None, Some(4567), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_eq!(
             manager
@@ -4377,12 +5328,26 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let key = 909_090u64;
         let home = manager
-            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                Some(key),
+                "/v1/messages",
+                None,
+            )
             .expect("an account is eligible");
         set_fable_exhausted(&manager, home, 0.999);
 
         let served = manager
-            .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
+            .select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                Some(key),
+                "/v1/messages",
+                None,
+            )
             .expect("the other account can still serve Fable");
         assert_ne!(
             served, home,
@@ -4395,7 +5360,14 @@ mod tests {
              request, it may never re-key the session"
         );
         assert_eq!(
-            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                Some(key),
+                "/v1/messages",
+                None
+            ),
             Some(home),
             "the next non-Fable request must come home to the warm prefix"
         );
@@ -4414,7 +5386,14 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let key = 808_080u64;
         let home = manager
-            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                Some(key),
+                "/v1/messages",
+                None,
+            )
             .expect("an account is eligible");
         set_fable_exhausted(&manager, home, 0.999);
         // The account is not merely out of Fable — it is gone for every model class,
@@ -4422,7 +5401,14 @@ mod tests {
         manager.mark_rate_limited(home, LONG_HOLD_SECS);
 
         let served = manager
-            .select(&HashSet::new(), now, Some("claude-fable-5"), Some(key))
+            .select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                Some(key),
+                "/v1/messages",
+                None,
+            )
             .expect("the un-held account serves this request");
         assert_ne!(served, home, "a held pin cannot serve");
         assert_eq!(
@@ -4432,7 +5418,14 @@ mod tests {
              still re-key the session"
         );
         assert_eq!(
-            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                Some(key),
+                "/v1/messages",
+                None
+            ),
             Some(served),
             "and durably: the Opus turn stays on the failover, it does not snap back"
         );
@@ -4455,7 +5448,14 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let key = 707_070u64;
         let home = manager
-            .select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key))
+            .select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                Some(key),
+                "/v1/messages",
+                None,
+            )
             .expect("an account is eligible");
         let other = 1 - home;
         // The whole fleet crosses the SOFT threshold, and the pin is out of Fable.
@@ -4464,7 +5464,14 @@ mod tests {
         set_fable_exhausted(&manager, home, 0.999);
 
         assert_eq!(
-            manager.select(&HashSet::new(), now, Some("claude-fable-5"), Some(key)),
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                Some(key),
+                "/v1/messages",
+                None
+            ),
             None,
             "every account is over the soft threshold → normal select benches all"
         );
@@ -4483,7 +5490,14 @@ mod tests {
         // A non-Fable request comes straight home: `select`'s pin-honor path serves
         // the over-threshold pin rather than diverting it.
         assert_eq!(
-            manager.select(&HashSet::new(), now, Some("claude-opus-4-6"), Some(key)),
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                Some(key),
+                "/v1/messages",
+                None
+            ),
             Some(home),
             "the Opus turn is served by the warm pin"
         );
@@ -4510,12 +5524,12 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let key = 515_151u64;
         let home = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("an account is eligible");
         manager.mark_rate_limited(home, SHORT_HOLD_SECS);
 
         let diverted = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_ne!(
             diverted, home,
@@ -4532,7 +5546,14 @@ mod tests {
         let after = now + Duration::seconds(SHORT_HOLD_SECS + 5);
         for _ in 0..3 {
             assert_eq!(
-                manager.select(&HashSet::new(), after, None, Some(key)),
+                manager.select(
+                    &HashSet::new(),
+                    after,
+                    None,
+                    Some(key),
+                    "/v1/messages",
+                    None
+                ),
                 Some(home),
                 "once the hold clears the session must come home to the account \
                  still holding its warm prefix"
@@ -4555,12 +5576,12 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let key = 525_252u64;
         let home = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("an account is eligible");
         manager.mark_rate_limited(home, LONG_HOLD_SECS);
 
         let served = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_ne!(served, home, "a parked pin cannot serve");
         assert_eq!(
@@ -4571,7 +5592,7 @@ mod tests {
         );
         // Durable: a fresh select with nothing tried stays on the new account.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(key)),
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None),
             Some(served),
             "the session must not snap back to the held account"
         );
@@ -4594,7 +5615,7 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let key = 424_242u64;
         let home = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("an account is eligible");
         {
             let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
@@ -4602,7 +5623,7 @@ mod tests {
             accounts[home].rate_limited_until_ms = Some(now_ms + remaining_ms);
         }
         let served = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_ne!(
             served, home,
@@ -4654,12 +5675,12 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let key = 606_060u64;
         let home = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("an account is eligible");
         manager.mark_rate_limited(home, LONG_HOLD_SECS);
 
         let failover = manager
-            .select(&HashSet::new(), now, None, Some(key))
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
             .expect("the un-held account serves this request");
         assert_ne!(
             failover, home,
@@ -4670,7 +5691,14 @@ mod tests {
         // The hold expires. A past hold reads as expired live, no mutation needed.
         let after = now + Duration::hours(1);
         assert_eq!(
-            manager.select(&HashSet::new(), after, None, Some(key)),
+            manager.select(
+                &HashSet::new(),
+                after,
+                None,
+                Some(key),
+                "/v1/messages",
+                None
+            ),
             Some(failover),
             "the session stays on its failover once the hold clears — the original \
              account's prompt cache is long gone, so coming home would only buy a \
@@ -4696,16 +5724,22 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         let x = manager
-            .select(&HashSet::new(), now, None, Some(1))
+            .select(&HashSet::new(), now, None, Some(1), "/v1/messages", None)
             .expect("an account is eligible");
         let y = manager
-            .select(&HashSet::new(), now, None, Some(2))
+            .select(&HashSet::new(), now, None, Some(2), "/v1/messages", None)
             .expect("an account is eligible");
         assert_ne!(x, y, "distinct keys' initial pins fan out across the tier");
         // Each key repeats onto its own account.
         for _ in 0..3 {
-            assert_eq!(manager.select(&HashSet::new(), now, None, Some(1)), Some(x));
-            assert_eq!(manager.select(&HashSet::new(), now, None, Some(2)), Some(y));
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(1), "/v1/messages", None),
+                Some(x)
+            );
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, Some(2), "/v1/messages", None),
+                Some(y)
+            );
         }
     }
 
@@ -4735,6 +5769,8 @@ mod tests {
                     base + time::Duration::seconds(i as i64),
                     None,
                     Some(key),
+                    "/v1/messages",
+                    None,
                 )
                 .expect("an account is eligible");
         }
@@ -4756,6 +5792,8 @@ mod tests {
             base + time::Duration::seconds((AFFINITY_CAP + 10) as i64),
             None,
             Some(1),
+            "/v1/messages",
+            None,
         );
 
         // One more distinct key pushes len over CAP → evict the single oldest.
@@ -4764,6 +5802,8 @@ mod tests {
             base + time::Duration::seconds((AFFINITY_CAP + 11) as i64),
             None,
             Some((AFFINITY_CAP + 1) as u64),
+            "/v1/messages",
+            None,
         );
 
         let pins = manager.affinity.lock().expect("affinity lock poisoned");
@@ -4829,7 +5869,7 @@ mod tests {
         pin_session(&manager, 100, 0);
         for _ in 0..6 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(100)),
+                manager.select(&HashSet::new(), now, None, Some(100), "/v1/messages", None),
                 Some(0),
                 "a lone session must stay on its warm account (no migration)"
             );
@@ -4854,7 +5894,7 @@ mod tests {
         pin_session(&manager, 11, 0);
         // count(0)=2, count(1)=0 → 0+1 < 2, so migrate this session onto acct 1.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(10)),
+            manager.select(&HashSet::new(), now, None, Some(10), "/v1/messages", None),
             Some(1),
             "a stacked session migrates to the idle eligible account"
         );
@@ -4882,18 +5922,18 @@ mod tests {
         pin_session(&manager, 11, 0);
         // The one migration from #2.
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, Some(10)),
+            manager.select(&HashSet::new(), now, None, Some(10), "/v1/messages", None),
             Some(1)
         );
         // Now 1-and-1: every further select is a lone session on its account.
         for _ in 0..5 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(10)),
+                manager.select(&HashSet::new(), now, None, Some(10), "/v1/messages", None),
                 Some(1),
                 "the migrated session stays put (no bounce back)"
             );
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(11)),
+                manager.select(&HashSet::new(), now, None, Some(11), "/v1/messages", None),
                 Some(0),
                 "the remaining session stays put"
             );
@@ -4918,7 +5958,7 @@ mod tests {
         manager.mark_error(1); // the only alternative is ineligible
         for _ in 0..5 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(20)),
+                manager.select(&HashSet::new(), now, None, Some(20), "/v1/messages", None),
                 Some(0),
                 "no eligible emptier account → honour the pin, never migrate onto a dead one"
             );
@@ -4944,7 +5984,7 @@ mod tests {
         pin_session(&manager, 3, 0);
         // A round of selects, one per session.
         for key in [1u64, 2, 3] {
-            manager.select(&HashSet::new(), now, None, Some(key));
+            manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None);
         }
         let mut homes = [
             pin_of(&manager, 1),
@@ -4987,12 +6027,12 @@ mod tests {
         // count(0)=2, count(1)=0 — exactly the condition that used to migrate.
         for _ in 0..5 {
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(30)),
+                manager.select(&HashSet::new(), now, None, Some(30), "/v1/messages", None),
                 Some(0),
                 "a stacked session keeps its warm account when migration is off"
             );
             assert_eq!(
-                manager.select(&HashSet::new(), now, None, Some(31)),
+                manager.select(&HashSet::new(), now, None, Some(31), "/v1/messages", None),
                 Some(0),
                 "its stack-mate keeps the same account too"
             );
@@ -5014,7 +6054,7 @@ mod tests {
         pin_session(&enabled, 30, 0);
         pin_session(&enabled, 31, 0);
         assert_eq!(
-            enabled.select(&HashSet::new(), now, None, Some(30)),
+            enabled.select(&HashSet::new(), now, None, Some(30), "/v1/messages", None),
             Some(1),
             "with loadBalanceMigration=true the stacked session still migrates"
         );
@@ -6389,7 +7429,14 @@ mod tests {
         }
 
         assert_eq!(
-            manager.select(&HashSet::new(), OffsetDateTime::now_utc(), None, None),
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                None,
+                None,
+                "/v1/messages",
+                None
+            ),
             Some(0),
             "active status + an EXPIRED hold ⇒ immediately selectable"
         );
@@ -7344,7 +8391,9 @@ mod tests {
                         // affinity pins spread across accounts and the pin map
                         // churns — maximising concurrent affinity-lock traffic.
                         let session_key = Some((t as u64) << 32 | (i as u64 % 16));
-                        if let Some(idx) = manager.select(&empty, now, None, session_key) {
+                        if let Some(idx) =
+                            manager.select(&empty, now, None, session_key, "/v1/messages", None)
+                        {
                             // Take the in-flight slot, hold it briefly to widen the
                             // window where a concurrent select/writer observes a
                             // nonzero count, then drop the guard (decrement).
@@ -7438,7 +8487,7 @@ mod tests {
                         // account in the same instant — maximising the TOCTOU window.
                         barrier.wait();
                         let now = OffsetDateTime::now_utc();
-                        manager.select(&empty, now, None, Some(key));
+                        manager.select(&empty, now, None, Some(key), "/v1/messages", None);
                     }
                 })
             })
@@ -7496,7 +8545,7 @@ mod tests {
 
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             None,
             "every account is over the soft threshold → normal select benches all"
         );
@@ -7784,7 +8833,7 @@ mod tests {
         // account 1 stays healthy (no quota set) → under threshold → eligible.
         let now = OffsetDateTime::now_utc();
         assert_eq!(
-            manager.select(&HashSet::new(), now, None, None),
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(1),
             "an under-threshold account is served by the normal path; revalidation \
              is only consulted after select() returns None"
