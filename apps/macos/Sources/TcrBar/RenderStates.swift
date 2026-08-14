@@ -60,22 +60,28 @@ enum RenderStates {
     ///
     /// Those figures move whenever the footer's wording or spacing does; if they
     /// look stale, re-measure rather than trusting them.
-    private static var scenes: [(name: String, state: PollState, awake: Bool)] {
+    private static var scenes: [(name: String, state: PollState, awake: Bool, control: String?)] {
         [
-            ("01-healthy", .loaded(fleet(healthyJSON)), false),
-            ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false),
-            ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false),
-            ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false),
-            ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false),
-            ("04c-probed-then-broken-row", .loaded(fleet(probedThenBrokenJSON)), false),
-            ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false),
-            ("06-offline-source", .loaded(fleet(offlineJSON)), false),
-            ("07-empty-fleet", .loaded(fleet("[]")), false),
-            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]), false),
-            ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused"), false),
-            ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false),
-            ("11-pending", .pending, false),
-            ("12-keeping-awake", .loaded(fleet(healthyJSON)), true),
+            ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),
+            ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
+            ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
+            ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
+            ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false, nil),
+            ("04c-probed-then-broken-row", .loaded(fleet(probedThenBrokenJSON)), false, nil),
+            ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false, nil),
+            ("06-offline-source", .loaded(fleet(offlineJSON)), false, nil),
+            ("07-empty-fleet", .loaded(fleet("[]")), false, nil),
+            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]), false, nil),
+            ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused"), false, nil),
+            ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false, nil),
+            ("11-pending", .pending, false, nil),
+            ("12-keeping-awake", .loaded(fleet(healthyJSON)), true, nil),
+            // The control-account row indicator (`FleetView.controlIndicator`) —
+            // the ONE piece of this feature `ImageRenderer` can actually draw.
+            // `Menu` contents (the gear's "Use as control account" item, its
+            // checkmark) never rasterise regardless of state; see this file's
+            // own header and `AccountRow.accountActionsMenu`'s doc-comment.
+            ("13-control-account", .loaded(fleet(healthyJSON)), false, "alice@example.com"),
         ]
     }
 
@@ -116,7 +122,7 @@ enum RenderStates {
 
     @MainActor
     private static func render(
-        _ scene: (name: String, state: PollState, awake: Bool),
+        _ scene: (name: String, state: PollState, awake: Bool, control: String?),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
@@ -140,6 +146,7 @@ enum RenderStates {
                 server: ServerController(),
                 loginItem: LoginItem(),
                 accounts: AccountController(),
+                control: ControlAccountController(pinned: scene.control),
                 awake: awake,
                 // `startingUpdater: false`: this process was asked for PNGs. A
                 // started updater schedules background checks and can put a

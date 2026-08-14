@@ -13,6 +13,8 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    /// The identity-bound control account. See ``ControlAccountController``.
+    @ObservedObject var control: ControlAccountController
     /// Owned by the app, for the same reason the poller is: the panel is a view
     /// and the mode is not, and an assertion released when the view went away
     /// would be a keep-awake control that keeps nothing awake. Under
@@ -198,6 +200,7 @@ struct FleetView: View {
                     account: account,
                     countersAreStructural: fleet.source.countersAreStructural,
                     accounts: accounts,
+                    control: control,
                     onChanged: { await poller.pollOnce() },
                     onRelogin: { reloginAccount(account.name) }
                 )
@@ -644,6 +647,8 @@ struct AccountRow: View {
     let account: Account
     let countersAreStructural: Bool
     @ObservedObject var accounts: AccountController
+    /// The identity-bound control account. See ``ControlAccountController``.
+    @ObservedObject var control: ControlAccountController
     /// Called after a successful toggle so the row re-reads reality. It returns
     /// the state of the read it just performed, which is what the verdict is
     /// computed against — reading the poller's published `state` afterwards could
@@ -756,6 +761,32 @@ struct AccountRow: View {
     /// could not serve — here the red NEEDS RE-LOGIN pill already says
     /// exactly that, unambiguously, so a second pill would only have two ways
     /// left to be wrong.
+    /// Row-level marker for the identity-bound control account, drawn beside
+    /// the name so it survives without opening the gear menu — the gear's own
+    /// checkmark state is one click away, and `ImageRenderer` cannot rasterise
+    /// a `Menu` at all (see the harness note on `--render-states`), so this is
+    /// also the only place this fact is ever visually verifiable outside a live
+    /// run.
+    ///
+    /// `Tok.accent` — the system control-accent colour, not one of the
+    /// quota/rotation status hues (`ok`/`near`/`spent`/`unmeasured`/`disabled`/
+    /// `unknown`) and not `Tok.awake` (already spoken for by keep-awake mode,
+    /// a genuinely different fact). "Control account" is a designation, not a
+    /// measured state, and `accent` is the one token in this palette already
+    /// reserved for exactly that distinction elsewhere in the app.
+    ///
+    /// Silent — not merely dim — when `control.unavailable` or nothing is set:
+    /// a phantom checkmark on an older `tcr` build (which cannot even confirm
+    /// the concept exists) would be worse than the feature simply not
+    /// appearing yet.
+    @ViewBuilder
+    private var controlIndicator: some View {
+        if control.isControl(account.name) {
+            StatusPill("control", tint: Tok.accent)
+                .help("This account is held out of rotation as the control account.")
+        }
+    }
+
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
@@ -783,6 +814,13 @@ struct AccountRow: View {
     /// actionable.
     private var rowAccessibilityLabel: String {
         var parts = [account.name]
+        // Spoken beside the name for the same reason `controlIndicator` is
+        // drawn beside it: this is an identity fact, not a rotation/quota one,
+        // and a VoiceOver user reaching the row should not have to open the
+        // gear menu to learn it.
+        if control.isControl(account.name) {
+            parts.append("control account")
+        }
         // Spoken in both directions, for the same reason the pill is drawn in
         // both: silence is not a state, and a VoiceOver user has even less to
         // infer it from than a sighted one. A broken row says neither
@@ -926,11 +964,41 @@ struct AccountRow: View {
             Button("Re-login…") { onRelogin() }
         }
         Divider()
+        // Hidden entirely while `control` cannot answer the question at all
+        // (``ControlAccountController/unavailable``) — an older `tcr` has no
+        // `control` subcommand, and an action this build cannot even read back
+        // is worse than no action: a click would exit non-zero with a message
+        // about a route that does not exist, on every single row, forever.
+        if !control.unavailable {
+            if control.isControl(account.name) {
+                Button("Clear Control Account") {
+                    Task { await performSetControl(name: nil, key: account.name) }
+                }
+                .disabled(control.isPending(account.name))
+            } else {
+                Button("Use as Control Account") {
+                    Task { await performSetControl(name: account.name, key: account.name) }
+                }
+                .disabled(control.isPending(account.name))
+            }
+        }
+        Divider()
         Button("Copy Account Name") {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(account.name, forType: .string)
         }
+    }
+
+    /// The one place `tcr control` is actually run for this row — set when
+    /// picked from another row's menu, or cleared when picked from the row that
+    /// currently holds it. Mirrors ``performToggle(enabling:)``: exit 0 is
+    /// permission to re-read, never the outcome itself, so `control.refresh()`
+    /// runs afterward and the row draws whatever it actually says.
+    private func performSetControl(name: String?, key: String) async {
+        let attempt = await control.setControl(name: name, key: key)
+        guard case .accepted = attempt else { return }
+        await control.refresh()
     }
 
     /// The visible affordance for `contextMenuItems`. Right-click was the
@@ -1008,6 +1076,7 @@ struct AccountRow: View {
                     .truncationMode(.middle)
                     .help(account.name)
                     .textSelection(.enabled)
+                controlIndicator
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
                 // A never-probed account's `quotaState` is Rust's default, not a

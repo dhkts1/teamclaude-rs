@@ -26,6 +26,11 @@ final class MenuBarShell {
     let server: ServerController
     let loginItem: LoginItem
     let accounts: AccountController
+    /// The identity-bound control account, read via `tcr control --show` and
+    /// set/cleared via `tcr control`. Owned here, alongside `accounts`, for the
+    /// same reason: it outlives the panel view, and `openPanel()` refreshes it
+    /// the same way it refreshes `loginItem`.
+    let control: ControlAccountController
     /// Owned here, not by the panel: the panel is a view that can be torn down,
     /// and an assertion that ended when the panel closed would be a keep-awake
     /// control that keeps nothing awake.
@@ -52,6 +57,7 @@ final class MenuBarShell {
         server: ServerController? = nil,
         loginItem: LoginItem? = nil,
         accounts: AccountController? = nil,
+        control: ControlAccountController? = nil,
         awake: AwakeController? = nil,
         preference: LaunchPreference? = nil,
         updater: Updater? = nil
@@ -60,6 +66,7 @@ final class MenuBarShell {
         self.server = server ?? ServerController()
         self.loginItem = loginItem ?? LoginItem()
         self.accounts = accounts ?? AccountController()
+        self.control = control ?? ControlAccountController()
         self.awake = awake ?? AwakeController()
         self.preference = preference ?? LaunchPreference()
         self.updater = updater ?? Updater()
@@ -97,8 +104,8 @@ final class MenuBarShell {
         let hosting = NSHostingController(
             rootView: FleetPanel(
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
-                accounts: self.accounts, awake: self.awake, preference: self.preference,
-                updater: self.updater))
+                accounts: self.accounts, control: self.control, awake: self.awake,
+                preference: self.preference, updater: self.updater))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -271,6 +278,13 @@ final class MenuBarShell {
         // `onAppear` now fires once and never again — losing this line is a
         // silent regression, not a visible one.
         loginItem.refresh()
+        // Same reasoning as `loginItem.refresh()` above: another `tcr control`
+        // call — from this app's own menu on a previous open, from the CLI
+        // directly, or from a second TcrBar instance — can have changed it
+        // since this panel last drew, and there is no push channel that would
+        // tell this view. `control` is `@Published`, so a stale in-flight open
+        // still redraws once this completes.
+        Task { await control.refresh() }
         // Without activation the panel opens without key focus, and
         // `.textSelection(.enabled)` on the account name (`FleetView.swift:537`)
         // stops working.
@@ -299,6 +313,7 @@ struct FleetPanel: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    @ObservedObject var control: ControlAccountController
     @ObservedObject var awake: AwakeController
     @ObservedObject var preference: LaunchPreference
     @ObservedObject var updater: Updater
@@ -309,6 +324,7 @@ struct FleetPanel: View {
             server: server,
             loginItem: loginItem,
             accounts: accounts,
+            control: control,
             awake: awake,
             updater: updater,
             startServerAtLaunch: $preference.startServerAtLaunch
