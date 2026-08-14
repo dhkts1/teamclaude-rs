@@ -122,7 +122,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # CFBundleVersion is `git rev-list --count HEAD`. A shallow clone
           # reports 1, which macOS reads as a downgrade — build-tcrbar.sh
@@ -198,7 +198,7 @@ jobs:
 
       - name: Upload the DMG as a workflow artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: TcrBar-dmg
           path: apps/macos/build/*.dmg
