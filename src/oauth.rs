@@ -296,7 +296,17 @@ struct LoginFlow {
 /// `oauth2` client. PKCE (S256), `state`, and standard params (`response_type`,
 /// `client_id`, `redirect_uri`, `scope`, `code_challenge*`) are all produced by
 /// the library; only Claude's non-standard `code=true` is added by hand.
-fn build_login_flow(redirect_uri: &str) -> anyhow::Result<LoginFlow> {
+///
+/// `login_hint`, when present, is passed through to `claude.ai/oauth/authorize`
+/// so the login page pre-selects that address — **ergonomics only**, never the
+/// source of truth. Measured 2026-08-14 (σ3, N=1, clean incognito session): the
+/// endpoint honors it and pre-fills the exact address passed. Untested (σ1):
+/// whether it overrides an *already signed-in* browser session — precisely the
+/// case `open_browser` produces by handing the URL to the default browser.
+/// Because that case is unverified, the caller must never rely on the hint for
+/// correctness; the identity assertion after `fetch_profile` returns is what
+/// actually enforces the requested account, and depends on nothing external.
+fn build_login_flow(redirect_uri: &str, login_hint: Option<&str>) -> anyhow::Result<LoginFlow> {
     let client = BasicClient::new(ClientId::new(CLIENT_ID.to_string()))
         .set_auth_uri(AuthUrl::new(AUTHORIZE_URL.to_string()).context("invalid authorize URL")?)
         .set_token_uri(TokenUrl::new(TOKEN_ENDPOINT.to_string()).context("invalid token URL")?)
@@ -307,7 +317,7 @@ fn build_login_flow(redirect_uri: &str) -> anyhow::Result<LoginFlow> {
     // oauth2 generates a random verifier and its S256 challenge together.
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
 
-    let (auth_url, csrf) = client
+    let mut request = client
         // 32-byte state, NOT the crate-default `new_random()` (16 bytes / 22
         // chars): Claude's authorize endpoint rejects the short state with
         // "Invalid request format" once a logged-in session validates the
@@ -317,8 +327,11 @@ fn build_login_flow(redirect_uri: &str) -> anyhow::Result<LoginFlow> {
         .add_scope(Scope::new(OAUTH_SCOPES.to_string()))
         .set_pkce_challenge(challenge)
         // Claude's authorize endpoint requires this non-standard flag.
-        .add_extra_param("code", "true")
-        .url();
+        .add_extra_param("code", "true");
+    if let Some(email) = login_hint {
+        request = request.add_extra_param("login_hint", email);
+    }
+    let (auth_url, csrf) = request.url();
 
     Ok(LoginFlow {
         verifier: verifier.secret().clone(),
@@ -1009,13 +1022,31 @@ async fn login_route(
 /// server owns the write with its own current state, so the window above
 /// does not exist on that path at all. Detection is read-only; the server is
 /// never signalled.
-pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
+pub async fn login(
+    config_path: &Path,
+    force: bool,
+    account: Option<&str>,
+) -> anyhow::Result<String> {
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
     let route = login_route(config_path, incumbent, port, force).await?;
     if let LoginRoute::Refuse(msg) = route {
         bail!("{}", msg);
     }
+
+    // Resolve --account early, ONLY to compute the login_hint (ergonomics —
+    // see build_login_flow's doc-comment). Fail fast here on a typo'd or
+    // ambiguous name rather than after a full browser round trip. The SAME
+    // resolution runs again below, against a freshly loaded config, where it
+    // is load-bearing rather than a convenience.
+    let hint = match account {
+        Some(query) => {
+            let probe_config = load_or_default(config_path)?;
+            let idx = crate::cli::resolve_account(&probe_config.accounts, query, None)?;
+            Some(crate::identity::email_of(&probe_config.accounts[idx].name).to_string())
+        }
+        None => None,
+    };
 
     // Bind the callback server on a random loopback port (127.0.0.1 only).
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -1025,7 +1056,7 @@ pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
     let redirect_uri = format!("http://localhost:{callback_port}/callback");
 
     // PKCE + CSRF state + authorize URL, built by the oauth2 crate.
-    let flow = build_login_flow(&redirect_uri)?;
+    let flow = build_login_flow(&redirect_uri, hint.as_deref())?;
     println!("Opening browser for authentication...");
     println!("If it doesn't open, visit:\n  {}\n", flow.auth_url);
     open_browser(&flow.auth_url);
@@ -1047,7 +1078,92 @@ pub async fn login(config_path: &Path, force: bool) -> anyhow::Result<String> {
         None => prompt_account_name(&fallback),
     };
 
-    finish_login(config_path, route, &mut config, &name, &tokens, profile).await
+    finish_login_checked(
+        config_path,
+        route,
+        &mut config,
+        &name,
+        &tokens,
+        profile,
+        account,
+    )
+    .await
+}
+
+/// [`finish_login`], but first asserting the requested `--account` identity
+/// when one was given. Split out so the assertion + write sequence `login()`
+/// runs is directly testable without a real browser or network round trip —
+/// exactly the reason [`finish_login`] itself was split from [`login`].
+async fn finish_login_checked(
+    config_path: &Path,
+    route: LoginRoute,
+    config: &mut Config,
+    name: &str,
+    tokens: &Tokens,
+    profile: Profile,
+    requested_account: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(query) = requested_account {
+        assert_requested_identity(config, query, &profile)?;
+    }
+    finish_login(config_path, route, config, name, tokens, profile).await
+}
+
+/// The load-bearing half of `tcr login --account <query>`: resolve `query`
+/// against `config` via [`crate::cli::resolve_account`] — the exact
+/// exact-name-then-email-then-org rule `tcr enable`/`tcr disable` and TcrBar's
+/// row buttons already rely on, not a second copy of it — and refuse to
+/// proceed unless the identity that came back from `fetch_profile` is the
+/// SAME account. `account_uuid` is preferred when both sides have one (an
+/// email can be reused across orgs, a UUID cannot); otherwise email is
+/// compared. Called strictly BEFORE any write path
+/// ([`finish_login`]/[`persist_via_file`]/[`persist_via_account`]): on
+/// mismatch, or on an unresolvable requested account, or on a profile that
+/// carries neither an email nor a uuid (`fetch_profile`'s all-`None` failure
+/// return, `src/oauth.rs:589-592` above — an assertion that cannot be
+/// evaluated must fail closed, not pass by default), nothing is written.
+fn assert_requested_identity(
+    config: &Config,
+    query: &str,
+    profile: &Profile,
+) -> anyhow::Result<()> {
+    let idx = crate::cli::resolve_account(&config.accounts, query, None)?;
+    let requested = &config.accounts[idx];
+
+    if profile.email.is_none() && profile.account_uuid.is_none() {
+        bail!(
+            "could not confirm the identity that just authenticated (the profile carried no \
+             email and no account id) — refusing to touch '{}'. Nothing was changed.",
+            requested.name
+        );
+    }
+
+    let matches = match (&requested.account_uuid, &profile.account_uuid) {
+        (Some(want), Some(got)) => want == got,
+        _ => {
+            let want_email = crate::identity::email_of(&requested.name);
+            profile
+                .email
+                .as_deref()
+                .is_some_and(|got| got == want_email)
+        }
+    };
+
+    if !matches {
+        let got = profile
+            .email
+            .as_deref()
+            .unwrap_or("an account with no email in its profile");
+        bail!(
+            "requested re-login for '{}', but the browser authenticated as '{got}' instead — \
+             nothing was written. Sign out of that account in the browser first, or use a \
+             private/incognito window, then retry `tcr login --account {}`.",
+            requested.name,
+            query
+        );
+    }
+
+    Ok(())
 }
 
 /// The file half of a login: `upsert_account` + whole-file [`config::save`].
@@ -1365,7 +1481,7 @@ mod tests {
     fn login_flow_produces_verifier_and_state() {
         // The oauth2-built flow yields a non-empty verifier and CSRF state, and
         // an authorize URL rooted at Claude's endpoint.
-        let flow = build_login_flow("http://localhost:12345/callback").unwrap();
+        let flow = build_login_flow("http://localhost:12345/callback", None).unwrap();
         assert!(!flow.verifier.is_empty());
         assert!(!flow.state.is_empty());
         assert!(flow.auth_url.starts_with(AUTHORIZE_URL));
@@ -1757,7 +1873,7 @@ mod tests {
     fn authorize_url_carries_required_params() {
         // The oauth2-built authorize URL must carry every required OAuth param
         // plus Claude's non-standard `code=true`.
-        let url = build_login_flow("http://localhost:12345/callback")
+        let url = build_login_flow("http://localhost:12345/callback", None)
             .unwrap()
             .auth_url;
         assert!(url.starts_with(AUTHORIZE_URL));
@@ -1769,6 +1885,16 @@ mod tests {
         assert!(url.contains("state="));
         // redirect_uri is percent-encoded by oauth2.
         assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A12345%2Fcallback"));
+        // No --account given: no login_hint at all (add-a-new-account path).
+        assert!(!url.contains("login_hint"));
+    }
+
+    #[test]
+    fn authorize_url_carries_login_hint_when_given() {
+        let url = build_login_flow("http://localhost:12345/callback", Some("alice@example.com"))
+            .unwrap()
+            .auth_url;
+        assert!(url.contains("login_hint=alice%40example.com"));
     }
 
     #[tokio::test]
@@ -2265,6 +2391,217 @@ mod tests {
             org_uuid: None,
             org_name: None,
         }
+    }
+
+    // --- `--account` identity assertion (`tcr login --account`) ------------
+
+    fn two_account_seed() -> String {
+        r#"{ "accounts": [
+            { "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+              "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 },
+            { "name": "bob@example.com", "type": "oauth", "accessToken": "at-bob",
+              "refreshToken": "rt-bob", "expiresAt": 1893456000000, "priority": 1 }
+        ] }"#
+            .to_string()
+    }
+
+    /// A mismatch between the requested account and the identity that came
+    /// back writes NOTHING — the config file is byte-identical afterwards —
+    /// and the error names both sides.
+    #[tokio::test]
+    async fn finish_login_checked_mismatch_writes_nothing() {
+        let seed = two_account_seed();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-mismatch-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, &seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "alice@example.com",
+            &tokens("at-new", "rt-new", 1_893_456_000_000),
+            profile_named("mallory@example.com"),
+            Some("alice@example.com"),
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("alice@example.com"), "names requested: {msg}");
+        assert!(msg.contains("mallory@example.com"), "names returned: {msg}");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "a mismatch must leave the config untouched");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A match writes normally, through the exact same `finish_login` path as
+    /// today's no-`--account` flow.
+    #[tokio::test]
+    async fn finish_login_checked_match_writes_normally() {
+        let seed = two_account_seed();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-match-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, &seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let name = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "alice@example.com",
+            &tokens("at-fresh", "rt-fresh", 1_893_456_000_000),
+            profile_named("alice@example.com"),
+            Some("alice@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "alice@example.com");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after.contains("rt-fresh"),
+            "a matching identity must be written: {after}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `fetch_profile`'s all-`None` failure return (`src/oauth.rs:589-592`)
+    /// must refuse rather than pass by default — an assertion that cannot be
+    /// evaluated is not evidence of a match.
+    #[tokio::test]
+    async fn finish_login_checked_all_none_profile_refuses() {
+        let seed = two_account_seed();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-allnone-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, &seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let all_none = Profile {
+            email: None,
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+        };
+        let err = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "alice@example.com",
+            &tokens("at-new", "rt-new", 1_893_456_000_000),
+            all_none,
+            Some("alice@example.com"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("alice@example.com"),
+            "{}",
+            err.to_string()
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "an unconfirmable identity must write nothing"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An ambiguous `--account` query is an error, not a guess — same
+    /// zero/one/many rule `crate::cli::resolve_account` already enforces for
+    /// every other command.
+    #[tokio::test]
+    async fn finish_login_checked_ambiguous_query_is_an_error() {
+        let seed = r#"{ "accounts": [
+            { "name": "dup@example.com", "type": "oauth", "accessToken": "at-1",
+              "refreshToken": "rt-1", "expiresAt": 1893456000000, "priority": 0,
+              "orgUuid": "org-a", "orgName": "Corp A" },
+            { "name": "dup@example.com", "type": "oauth", "accessToken": "at-2",
+              "refreshToken": "rt-2", "expiresAt": 1893456000000, "priority": 1,
+              "orgUuid": "org-b", "orgName": "Corp B" }
+        ] }"#;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-ambiguous-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "dup@example.com",
+            &tokens("at-new", "rt-new", 1_893_456_000_000),
+            profile_named("dup@example.com"),
+            Some("dup@example.com"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("more than one")
+                || err.to_string().to_lowercase().contains("ambiguous"),
+            "{}",
+            err.to_string()
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "an ambiguous query must not guess and write");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// No `--account` behaves exactly as before: no identity check runs at
+    /// all, so an unrelated returned identity still writes normally (this is
+    /// the add-a-new-account path, which must not grow an assertion it
+    /// cannot satisfy).
+    #[tokio::test]
+    async fn finish_login_checked_no_account_skips_the_check() {
+        let seed = two_account_seed();
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-none-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, &seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let name = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "carol@example.com",
+            &tokens("at-carol", "rt-carol", 1_893_456_000_000),
+            profile_named("carol@example.com"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "carol@example.com");
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("carol@example.com"), "{after}");
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// THE BITING TEST for the whole-file-write hazard `finish_login` exists to
