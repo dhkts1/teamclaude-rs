@@ -217,47 +217,6 @@ final class RealWorldDecodeTests: XCTestCase {
         )
     }
 
-    // MARK: - `control` — optional, and load-bearing because it is optional
-
-    /// The regression guard: `realWorldFixture` above carries no `control` key
-    /// at all — exactly what an older `tcr` binary emits. If `Account.control`
-    /// were typed as a non-optional `Bool`, the synthesized `Decodable` would
-    /// fail EVERY row in this fixture, not just the one that would have
-    /// carried the field, and the whole panel would go down over one glyph.
-    func testRealWorldOutputWithoutTheControlKeyStillDecodesEveryRow() throws {
-        XCTAssertFalse(
-            realWorldFixture.contains("control"),
-            "precondition: the fixture above predates this field"
-        )
-        let fleet = try fleet()
-        XCTAssertEqual(fleet.accounts.count, 3)
-        XCTAssertTrue(
-            fleet.unreadable.isEmpty,
-            "an absent `control` key must never cost a row: \(fleet.unreadable)"
-        )
-        for account in fleet.accounts {
-            XCTAssertNil(account.control, "absent on the wire must decode to nil, not false")
-        }
-    }
-
-    /// The present-and-true case, once a newer `tcr` starts emitting the key.
-    func testAccountWithControlTrueDecodes() throws {
-        let json = realWorldFixture.replacingOccurrences(
-            of: "\"name\": \"alice@example.com\",",
-            with: "\"control\": true,\n            \"name\": \"alice@example.com\","
-        )
-        let fleet = try Fleet.decode(Data(json.utf8))
-        XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
-
-        let control = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
-        XCTAssertEqual(control.control, true)
-
-        // The other rows never mentioned the key and must stay nil, not
-        // inherit `false` from some shared default.
-        let untouched = try XCTUnwrap(fleet.accounts.first { $0.name == "bob@example.com" })
-        XCTAssertNil(untouched.control)
-    }
-
     // MARK: The committed cross-language contract fixture
 
     /// `<repo>/tests/fixtures/status-contract.json` — the SAME file the Rust test

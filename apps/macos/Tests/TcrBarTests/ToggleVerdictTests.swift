@@ -423,7 +423,6 @@ private func account(_ name: String, disabled: Bool) -> Account {
         priority: 1,
         status: "active",
         disabled: disabled,
-        control: nil,
         quota: 0,
         quotaState: .ok,
         fiveHour: 0,

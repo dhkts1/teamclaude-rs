@@ -160,26 +160,6 @@ public enum Tok {
     /// Numbers that are structurally zero rather than measured.
     public static let offline = inkFaint
 
-    /// The identity-bound control account. Its own hue (gold, ~92) rather than
-    /// reuse of any quota status: control is an operator assignment, not a
-    /// capacity reading, and it routinely co-occurs with `disabled` — the
-    /// control account is usually parked out of the inference rotation while
-    /// still serving identity traffic — so it must read clearly next to grey
-    /// disabled styling rather than substitute for it.
-    ///
-    /// Hand-authored, not run through `scripts/tcrbar-palette.py` (that script
-    /// is out of this change's file scope — see the coder's report). Measured
-    /// the same way that script measures: dark `oklch(0.860 0.160 92)` is
-    /// **11.81:1** on the panel, **10.58:1** on a raised row, and **2.03:1**
-    /// from `disabled` (both dark). Light `oklch(0.380 0.080 75)` is **9.15:1**
-    /// on the light panel (clears the 3:1 floor the generator uses for status
-    /// hues by a wide margin) and **2.57:1** from `disabled` (light) — the
-    /// light ramp sits darker than the dark ramp's brightness because true
-    /// saturated gold clips the sRGB gamut at light-mode lightness levels, the
-    /// same constraint that keeps `near`'s light value (`#ba7702`) far off
-    /// `near`'s dark value (`#ffd16b`).
-    public static let control = dyn(dark: "#f7cd3a", light: "#5b3b00")
-
     /// Keep-awake mode is held.
     ///
     /// Its own hue, and specifically NOT `ok` / `near` / `spent`: those three
