@@ -635,11 +635,32 @@ struct AccountRow: View {
     /// it is the normal state of twelve of thirteen rows, and colouring the
     /// unremarkable case would spend the panel's colour budget on it. Colour
     /// stays with quota, which is the thing worth scanning for.
+    ///
+    /// This pill answers ONE question — can this account be picked for
+    /// traffic — and there are two independent ways for the answer to be no:
+    /// `disabled` (an operator's own choice) and `account.health ==
+    /// .needsRelogin` (`src/manager/select.rs:931` hard-excludes an
+    /// `AccountStatus::Error` account from selection exactly like a disabled
+    /// one, even though `disabled` itself reads false). Drawing "rotating" on
+    /// a broken row would assert the opposite of the NEEDS RE-LOGIN pill
+    /// drawn beside it — precisely the "misread as its own opposite" defect
+    /// this pill exists to kill, just with the second cause substituted for
+    /// the first.
+    ///
+    /// A broken row draws NEITHER "rotating" nor "parked": "parked" claims an
+    /// operator decision that never happened, and "rotating" claims traffic
+    /// can land here, which `select.rs` refuses. Silence is the case this
+    /// pill was rewritten to avoid, but the reason silence used to be
+    /// dangerous was that nothing nearby said the row could not serve — here
+    /// the red NEEDS RE-LOGIN pill already says exactly that, unambiguously,
+    /// so a second pill would only have two ways left to be wrong.
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
+        } else if account.health == .needsRelogin {
+            EmptyView()
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
                 .help("In the rotation — this account can be picked for traffic.")
@@ -657,8 +678,20 @@ struct AccountRow: View {
         var parts = [account.name]
         // Spoken in both directions, for the same reason the pill is drawn in
         // both: silence is not a state, and a VoiceOver user has even less to
-        // infer it from than a sighted one.
-        parts.append(account.disabled ? "parked, out of rotation" : "rotating")
+        // infer it from than a sighted one. A broken row says neither
+        // "rotating" nor "parked" — same reason `rotationPill` draws neither:
+        // `disabled` reads false, so "parked" would claim an operator
+        // decision that never happened, and "rotating" would claim traffic
+        // can land here, which `src/manager/select.rs:931` refuses exactly
+        // like a disabled account. The detail below already names the real
+        // cause, so this element is not left silent either.
+        if account.disabled {
+            parts.append("parked, out of rotation")
+        } else if account.health == .needsRelogin {
+            parts.append("not in rotation")
+        } else {
+            parts.append("rotating")
+        }
         // Mirrors the pill's three cases. A VoiceOver user hearing "never
         // probed" about an account whose probe errored is told the same wrong
         // cause a sighted user was, with less to correct it from.
@@ -667,8 +700,7 @@ struct AccountRow: View {
         // is the same wrong cause a sighted user was told, with less to correct
         // it from.
         if account.health == .needsRelogin {
-            parts.append(
-                "needs re-login, refresh token rejected, out of rotation until re-login")
+            parts.append("refresh token rejected, re-login to restore traffic")
         } else if account.hasQuotaEvidence {
             parts.append("\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used")
         } else if account.probeStatus.isFailure {

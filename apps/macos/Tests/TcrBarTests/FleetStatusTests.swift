@@ -256,6 +256,25 @@ final class AccountHealthTests: XCTestCase {
         XCTAssertEqual(fleet.needsReloginCount, 0)
         XCTAssertEqual(fleet.unmeasuredCount, 1)
     }
+
+    /// `severity` used to fall through to `quotaState.severity` for a broken,
+    /// enabled account — and a broken account's `quotaState` is the same Rust
+    /// `#[default]` `"ok"` a never-probed one carries, so it scored `1`, tied
+    /// with `disabled`, which this same property's doc-comment names as
+    /// deliberately NOT an alarm. A dead credential is the opposite: worse
+    /// than `spent`, not on par with an operator's own parked account.
+    func testBrokenAccountOutranksSpentAndIsNotTiedWithDisabled() {
+        let broken = brokenAccount("dave@example.com")
+        let spent = account("erin@example.com", state: .spent)
+        let disabled = account("off@example.com", state: .ok, disabled: true)
+
+        XCTAssertGreaterThan(broken.severity, spent.severity)
+        XCTAssertNotEqual(
+            broken.severity, disabled.severity,
+            "a dead credential is an alarm; a parked account is an operator's own choice"
+        )
+        XCTAssertEqual(Fleet(accounts: [spent, broken]).worst?.name, "dave@example.com")
+    }
 }
 
 /// The invariant this whole change restores: a broken account is not

@@ -406,8 +406,18 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// Worst-first ordering key. A disabled account is not an alarm — it is an
     /// operator decision — so it sorts below a spent one. This does *not* drive
     /// the menu-bar glyph; see ``Fleet/capacityGlyphState``.
+    ///
+    /// `needsRelogin` is checked explicitly, not left to fall through to
+    /// `quotaState.severity`: a broken account's `quotaState` is Rust's
+    /// `#[default]` `"ok"` (the same default a never-probed account carries),
+    /// so falling through would have scored it `1` — tied with `disabled`,
+    /// the one case this property's own doc-comment names as deliberately
+    /// NOT an alarm. A dead credential earns the opposite ranking: worse than
+    /// `spent`, since a spent account recovers on its own reset and a broken
+    /// one does not without operator action.
     public var severity: Int {
         if disabled { return 1 }
+        if health == .needsRelogin { return QuotaState.spent.severity + 2 }
         return quotaState.severity + 1
     }
 
