@@ -1438,9 +1438,33 @@ mod tests {
     // --- enable / disable --------------------------------------------------
 
     /// A free port nothing is listening on: bound, then dropped.
+    /// An ephemeral port nothing is listening on — and **never 3456**.
+    ///
+    /// Drawing 3456 here is not a cosmetic collision. `TWO_ACCOUNTS` names 3456
+    /// and [`config_on_a_dead_port`] substitutes it away precisely so a test can
+    /// never POST an account-control command at the REAL proxy; if the draw IS
+    /// 3456 the substitution is a no-op, and the assert that guards it fires.
+    ///
+    /// This only ever reproduces in CI, which is what made it look like a flake
+    /// and then like a regression. On a developer Mac a live tcr holds 3456, so
+    /// the OS cannot offer it; on a Linux runner the port is free and gets drawn
+    /// occasionally. Measured 2026-08-14: two consecutive runs of the same
+    /// commit failed on two DIFFERENT tests of this family, which is the
+    /// signature of a shared helper losing a dice roll rather than of a broken
+    /// assertion.
+    ///
+    /// Bounded rather than `loop`: an unbounded retry against an OS that somehow
+    /// only offers 3456 would hang the suite with no diagnosis, and a test that
+    /// hangs is strictly worse than one that fails with a reason.
     async fn dead_port() -> u16 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+        for _ in 0..64 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            if port != 3456 {
+                return port;
+            }
+        }
+        panic!("could not draw an ephemeral port other than 3456 in 64 attempts");
     }
 
     /// `TWO_ACCOUNTS` pointed at a port nothing serves, written to a temp file.
