@@ -56,16 +56,19 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 
 ## Branching
 
-- **The primary checkout stays on `main`.** This is a convention, not something the repo checks — the
-  pre-commit hook in `.githooks/` runs six gates (secret scan, public-repo disclosure scan, Rust
-  format, Swift format, release-version, design-token staleness) and looks at no branch. Keeping to it
-  is on you. Do feature work in a worktree:
-  `git worktree add ~/worktrees/<name> -b <branch> main`. What each gate blocks on, and which two are
-  hard failures when their tool or input is missing, is in [`CONTRIBUTING.md`](CONTRIBUTING.md)
-  § "Git hooks".
-- Branch **before** you start editing. Making changes in the primary checkout and then wanting a branch
-  is a trap — a fresh worktree branches from `HEAD` without your uncommitted work, and any shared file
-  (`Cargo.toml`) blocks a clean move.
+- **Feature work goes on a branch — `git switch -c <branch>` in the checkout you are already in.** A
+  worktree is not required for a pull request and should not be the default: each one is a GB-scale
+  allocation, and a fleet of them accumulates far faster than anyone prunes it. Reach for
+  `git worktree add ~/worktrees/<name> -b <branch> main` only when you genuinely need two trees at the
+  same instant — a long build you must not disturb, or two branches side by side — and remove it when
+  the branch lands.
+- Nothing here keys on which branch you are on: the pre-commit hook in `.githooks/` runs six gates
+  (secret scan, public-repo disclosure scan, Rust format, Swift format, release-version, design-token
+  staleness) and looks at no branch. What each gate blocks on, and which two are hard failures when
+  their tool or input is missing, is in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Git hooks".
+- Branch **before** you start editing. `git switch -c` carries uncommitted work onto the new branch,
+  which is what you want; a *worktree* created after the fact does not — it branches from `HEAD`
+  without those changes, and any shared file (`Cargo.toml`) blocks a clean move afterwards.
 - `main` requires a pull request, one approval, and the `ci`, `audit` and `macos` checks; an admin
   bypass exists and is a deliberate decision, never a shortcut. The CI job table and how a bypass
   shows up in the push output are in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Pull requests and CI".
