@@ -513,7 +513,11 @@ fn prefix_session_key(
 ///   it keys off the request BODY — so without this gate N remote workers
 ///   sharing one harness (one system prompt) would collapse onto one account
 ///   through the exact back door tier 1 closes. A loopback proxy serves one
-///   real user; a non-loopback deployment may not.
+///   real user; a non-loopback deployment may not. (`IpAddr::is_loopback`
+///   does not recognize an IPv4-mapped IPv6 peer like `::ffff:127.0.0.1` as
+///   loopback, so such a peer reads as remote and fails CLOSED here — the
+///   safe direction, and the same primitive [`ClientAddr`]'s own doc-comment
+///   and the api-key exemption already accept this same way.)
 ///
 /// Returns `None` on absence/parse failure at every tier, which routes the
 /// request unpinned. The paired [`SessionKind`] records WHICH tier produced the
@@ -3888,6 +3892,107 @@ mod tests {
             ),
             None,
             "a non-loopback caller must not pin on the cacheable prefix"
+        );
+    }
+
+    /// End-to-end through the REAL router (`app()`, not the unit-tested
+    /// `stable_session_key` directly): a loopback `POST /v1/messages?beta=true`
+    /// — the exact shape live traffic sends, query string included — with no
+    /// `x-api-key` and no `metadata.user_id`, but a `system` field, must record
+    /// as `SessionKind::Prefix` in the manager's own session snapshot.
+    ///
+    /// This is the one seam the unit tests above cannot cover: they call
+    /// `stable_session_key` with a hand-fed `path`, which proves the MATCH
+    /// logic but nothing about which variable the real call site passes it.
+    /// `handle` has two candidates in scope — `path` (query-stripped) and
+    /// `path_and_query` (raw) — and passing the wrong one would silently
+    /// unpin 100% of real `/v1/messages?beta=true` traffic while every one of
+    /// those unit tests kept passing, because they never touch `handle` at
+    /// all. Driving a real request through `app()` with the query string
+    /// attached is what actually pins the wiring, not just the function.
+    #[tokio::test]
+    async fn real_request_through_app_pins_on_prefix_for_loopback_v1_messages() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt as _;
+
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+
+        // Fake upstream: one connection, one 200 with a minimal usage body.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+            }
+        });
+
+        let config = dummy_config(None, &format!("http://{up_addr}"));
+        let manager = Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+
+        // No x-api-key, no metadata.user_id — only a `system` field. Real
+        // `/v1/messages` calls always carry the query string tacked on by
+        // live clients (`?beta=true`); this is not incidental to the test, it
+        // is the exact thing D1 exists to pin.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "system": "You are a helpful assistant.",
+            "messages": [],
+        }))
+        .unwrap();
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages?beta=true")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("build request");
+        // Session affinity's feature flag (see `SessionKey`'s doc-comment) and
+        // the loopback proof `handle`'s auth gate and tier 3 both read — both
+        // injected by the hybrid listener per real connection; `app()` alone
+        // injects neither, so a request driven straight at it needs both by
+        // hand.
+        req.extensions_mut().insert(SessionKey(0xF00D));
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+
+        let response = app(manager.clone()).oneshot(req).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the request must actually reach and clear the fake upstream"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        // Exactly one request was ever served by this manager, so its one
+        // session is the whole list — no need to reach for the private
+        // `short_session_id` helper `manager/mod.rs` uses to derive `s.id`.
+        let session = snap
+            .sessions
+            .first()
+            .expect("the request must have been tracked as a session");
+        assert_eq!(
+            session.kind,
+            SessionKind::Prefix,
+            "a loopback POST /v1/messages?beta=true with a system field and no \
+             identity must pin via tier 3 through the REAL call site, not just \
+             the unit-tested function"
         );
     }
 

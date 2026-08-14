@@ -201,9 +201,19 @@ different requests spread across the fleet on their own.
 This only applies to a loopback caller on `POST /v1/messages` specifically —
 `/v1/messages/count_tokens` and every other endpoint are excluded, since Anthropic does not
 apply prompt caching to token counting, so pinning it would only concentrate load for no
-cache benefit. A non-loopback caller (this proxy binds `127.0.0.1` only, in practice) never
-gets this pin, so N workers sharing one remote harness and one system prompt still spread
-across the fleet rather than collapsing onto one account.
+cache benefit. A caller whose peer address the OS reports as non-loopback (this proxy binds
+`127.0.0.1` only, in practice) never gets this pin, so N workers sharing one remote harness
+and one system prompt still spread across the fleet rather than collapsing onto one account.
+
+"Loopback" here means whatever socket address the OS hands the listener — the same check
+the `proxy.apiKey` loopback exemption above ("`proxy.apiKey` is a security control, not a
+convenience") already relies on. A TCP forwarder terminating locally
+(`ssh -L 3456:localhost:3456 host`, for instance) makes
+every tunneled remote caller present as `127.0.0.1` to this process, just as it already
+bypasses the `proxy.apiKey` exemption — this is an existing property of binding to loopback,
+not something this tier introduces, but it does mean the collapse this section describes as
+excluded for remote callers is not excluded for one tunneled through a locally-terminating
+forwarder.
 
 There is no separate flag for this: it is entirely governed by `sessionAffinity`, and turning
 that off turns this off too.
