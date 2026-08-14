@@ -151,7 +151,12 @@ mod tests {
     /// A manager holding exactly `accounts`, in that order. `from_runtimes` never
     /// invokes its refresher/prober/warmer, and nothing here reaches the network.
     fn manager_over(accounts: &[Account]) -> Arc<Manager> {
-        Manager::from_runtimes(accounts.iter().map(AccountRuntime::from_config).collect())
+        Manager::from_runtimes(
+            accounts
+                .iter()
+                .map(|a| AccountRuntime::from_config(a, false))
+                .collect(),
+        )
     }
 
     /// A unique path per test: the suite runs tests in parallel threads of ONE

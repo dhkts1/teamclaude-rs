@@ -43,6 +43,7 @@ section below.
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
 | `throttle` | object | `{minSpacingMs: 350, burst: 4}` → **ON** | no | fleet-wide egress rate limiter, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
+| `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `accounts` | array | `[]` | no | the rotatable accounts |
 
 `switchThreshold` is **0.95**, not 0.90. The default function is
@@ -220,10 +221,10 @@ that off turns this off too.
 
 ### Which knobs are opt-in and which are opt-out
 
-Four knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
-`loadBalanceMigration`, `pacing` and `lockAccount`. (An older README said three; `pacing`
-and `lockAccount` were missing from that list. `sessionAffinity` was a fifth until it flipped
-to default ON — see below.)
+Five knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
+`loadBalanceMigration`, `pacing`, `lockAccount` and `http1Only`. (An older README said three;
+`pacing` and `lockAccount` were missing from that list. `sessionAffinity` was a sixth until
+it flipped to default ON — see below.)
 
 Two knobs ship ON and are opt-**out**: `revalidationServe`, default `true`, disabled by
 writing `"revalidationServe": false`; and `sessionAffinity`, also default `true`, disabled by
@@ -256,6 +257,26 @@ resilience it removes the resilience entirely. Treat it as a debugging tool.
 A name matching no account is not a startup failure: the proxy logs an error naming the
 available accounts and runs **unlocked**. So a typo'd `lockAccount` looks exactly like an
 ordinary rotating proxy unless you read the log at boot.
+
+## `http1Only`: caps blast radius, costs multiplexing
+
+A connection-level fault on HTTP/2 (GOAWAY, a framing error) kills **every** multiplexed
+stream sharing that connection at once — one fault can take down several concurrent
+sessions on the same account. `http1Only` forces the upstream-forwarding client onto
+HTTP/1.1, which does not multiplex, so the same fault costs exactly one in-flight request
+instead. It is a structural cap on blast radius, not a statistical one, and it stacks with
+the per-account connection pool (each account already owns its own client, so this narrows
+the blast radius further within an account rather than duplicating that isolation).
+
+The trade is real, which is why it ships OFF: h1 gives up multiplexing entirely, opens one
+TCP+TLS connection per concurrent request instead of sharing one, and raises the open-socket
+count against Anthropic's edge. Turn it on only if you have actually observed the
+connection-fault symptom (many sessions failing at once, not a single request failing).
+
+Its state is visible from outside the process on purpose — a knob nobody can see the state
+of is how this repo once lost seven hours of prompt-cache to session-affinity being silently
+off. Check `tcr status` (`http1Only=` on the `source=` line, `http1Only` per row with
+`--json`) or the `"server started"` log line at boot.
 
 ## File permissions and secrecy
 

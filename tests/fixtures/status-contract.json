@@ -7,6 +7,7 @@
     "freeAtMs": null,
     "gate": "ok",
     "held": [],
+    "http1Only": false,
     "inputTokens": 8000000,
     "lastStreamError": "overloaded_error",
     "name": "alice@example.com",
@@ -46,6 +47,7 @@
         "window": "7d"
       }
     ],
+    "http1Only": false,
     "inputTokens": 8000000,
     "lastStreamError": "overloaded_error",
     "name": "bob@example.com",
@@ -85,6 +87,7 @@
         "window": "7d"
       }
     ],
+    "http1Only": false,
     "inputTokens": 8000000,
     "lastStreamError": "overloaded_error",
     "name": "carol@example.com",
@@ -113,6 +116,7 @@
     "freeAtMs": null,
     "gate": "ok",
     "held": [],
+    "http1Only": false,
     "inputTokens": 0,
     "lastStreamError": null,
     "name": "dave@example.com",

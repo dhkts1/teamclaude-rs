@@ -852,6 +852,7 @@ fn render_accounts_json(
     thresholds: &[f64],
     source: StatusSource,
     server: Option<&BuildInfo>,
+    http1_only: bool,
 ) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<serde_json::Value> = snapshot
@@ -879,6 +880,10 @@ fn render_accounts_json(
                 // it is verifying.
                 "serverSha": server.map(|b| b.sha.as_str()),
                 "serverDirty": server.and_then(|b| b.dirty),
+                // Server-wide, repeated per row like `serverSha` above — whether
+                // this server's upstream clients are forced onto HTTP/1.1. See
+                // `Config::http1_only` and `Manager::http1_only`.
+                "http1Only": http1_only,
                 "name": a.name,
                 "priority": a.priority,
                 "status": a.status,
@@ -1184,11 +1189,20 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
 
-    let (source, server_build, snapshot, thresholds) = match fetch_live_status(&config).await {
+    let (source, server_build, snapshot, thresholds, http1_only) = match fetch_live_status(&config)
+        .await
+    {
         Ok(payload) => {
             let build = payload.build.clone();
+            let http1_only = payload.http1_only;
             let (snapshot, thresholds) = payload.into_snapshot();
-            (StatusSource::Live, Some(build), snapshot, thresholds)
+            (
+                StatusSource::Live,
+                Some(build),
+                snapshot,
+                thresholds,
+                http1_only,
+            )
         }
         Err(reason) => {
             // Both "it answered something unusable" and "it answered nothing"
@@ -1196,11 +1210,16 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             if !matches!(reason, LiveStatusError::NoServer) {
                 let why = reason.why();
                 eprintln!(
-                    "[tcr] warning: could not read live status from the proxy on :{} ({why}) — falling back to an offline snapshot, whose serving counters are all zero.",
-                    config.proxy.port
-                );
+                        "[tcr] warning: could not read live status from the proxy on :{} ({why}) — falling back to an offline snapshot, whose serving counters are all zero.",
+                        config.proxy.port
+                    );
             }
             let thresholds = resolve_thresholds(&config);
+            // `config` is consumed by `snapshot_offline` below, so read
+            // `http1_only` off it first — this is the config FILE's value,
+            // not a running server's (there is none in this branch), which
+            // is the honest answer for an offline snapshot.
+            let http1_only = config.http1_only;
             let snapshot = snapshot_offline(
                 config,
                 Arc::new(NoRefresh),
@@ -1208,7 +1227,13 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 true,
             )
             .await;
-            (StatusSource::Offline, None, snapshot, thresholds)
+            (
+                StatusSource::Offline,
+                None,
+                snapshot,
+                thresholds,
+                http1_only,
+            )
         }
     };
 
@@ -1222,13 +1247,23 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     if json {
         println!(
             "{}",
-            render_accounts_json(&snapshot, &thresholds, source, server_build.as_ref())
+            render_accounts_json(
+                &snapshot,
+                &thresholds,
+                source,
+                server_build.as_ref(),
+                http1_only
+            )
         );
     } else {
         // One greppable `source=` line above the account lines, in the same
         // key=value idiom, so the provenance is visible without --json.
+        // `http1Only` rides here rather than per-account: it is a server-wide
+        // fact, like `source` itself, not a per-account gating detail — see
+        // `Manager::http1_only`'s doc-comment for why this must NOT be
+        // re-derived from the config file when `source=live`.
         println!(
-            "status source={}{}{}",
+            "status source={}{}{} http1Only={}",
             source.as_str(),
             match source {
                 StatusSource::Live => String::new(),
@@ -1236,6 +1271,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                     " note=serving-counters-unavailable-no-server-answered".to_string(),
             },
             build_fields(server_build.as_ref()),
+            http1_only,
         );
         print!("{}", render_accounts(&snapshot, &thresholds, source));
     }
@@ -1892,7 +1928,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
         for row in &rows {
@@ -1920,7 +1956,7 @@ mod tests {
         let mut counted = snapshot.clone();
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
-        let live = render_accounts_json(&counted, &thresholds, StatusSource::Live, None);
+        let live = render_accounts_json(&counted, &thresholds, StatusSource::Live, None, false);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
         assert_eq!(rows[0]["source"], "live");
@@ -1962,7 +1998,8 @@ mod tests {
         )
         .await;
 
-        let offline = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let offline =
+            render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&offline).expect("valid json");
         for row in &rows {
             // `get`, not `row[...]`: indexing a MISSING key also yields Null, so
@@ -1981,7 +2018,7 @@ mod tests {
         }
 
         // Measured and genuinely clean is a DIFFERENT state, and renders as 0.
-        let live = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, None);
+        let live = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, None, false);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(0));
 
@@ -1989,7 +2026,7 @@ mod tests {
         let mut errored = snapshot.clone();
         errored.accounts[0].stream_error_count = 3;
         errored.accounts[0].last_stream_error = Some("overloaded_error".to_string());
-        let live = render_accounts_json(&errored, &thresholds, StatusSource::Live, None);
+        let live = render_accounts_json(&errored, &thresholds, StatusSource::Live, None, false);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(3));
         assert_eq!(
@@ -2053,7 +2090,13 @@ mod tests {
         let build = payload.build.clone();
         let (snapshot, thresholds) = payload.into_snapshot();
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Live, Some(&build));
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            Some(&build),
+            false,
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(
             rows[0]["cacheHitRatio"],
@@ -2096,7 +2139,7 @@ mod tests {
         )
         .await;
 
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         for row in &rows {
             assert!(
@@ -2426,7 +2469,7 @@ mod tests {
             assert!(secs > 0, "a promised instant is in the future: {line}");
         }
         // JSON mirrors it for machine consumers, in ms like every other instant.
-        let json = render_accounts_json(&gated, &thresholds, StatusSource::Live, None);
+        let json = render_accounts_json(&gated, &thresholds, StatusSource::Live, None, false);
         assert!(
             json.contains("\"freeAtMs\""),
             "json carries freeAtMs: {json}"
@@ -2535,7 +2578,7 @@ mod tests {
         );
 
         // JSON mirrors the held fields for machine consumers.
-        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None);
+        let json = render_accounts_json(&snapshot, &thresholds, StatusSource::Offline, None, false);
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
             json.contains("\"window\": \"5h\""),
@@ -2776,7 +2819,13 @@ mod tests {
         // itself emits none.
         format!(
             "{}\n",
-            render_accounts_json(&snapshot, &thresholds, StatusSource::Live, Some(&build))
+            render_accounts_json(
+                &snapshot,
+                &thresholds,
+                StatusSource::Live,
+                Some(&build),
+                false
+            )
         )
     }
 

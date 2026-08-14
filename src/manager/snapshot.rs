@@ -86,6 +86,16 @@ impl Manager {
             .collect()
     }
 
+    /// Whether this server's accounts are forced onto HTTP/1.1 — see
+    /// [`config::Config::http1_only`]. Server-wide, not per-account, and
+    /// exposed for the same reason `thresholds` is: a client must not
+    /// re-derive this from `~/.config/teamclaude.json`, which may have been
+    /// edited (or the process not yet restarted to pick it up) since the
+    /// server actually booted its clients.
+    pub fn http1_only(&self) -> bool {
+        self.config.lock().expect("config lock poisoned").http1_only
+    }
+
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
     /// at `now` so the display can never show a past-reset window as still full.
     pub fn snapshot(&self, now: OffsetDateTime) -> StatsSnapshot {

@@ -797,6 +797,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // The build stamp beside it is the field that actually identifies the code
     // this pid is executing — the thing that used to need an `lsof -p <pid>`
     // inode comparison to establish. See `build_info`.
+    // `http1_only` rides on the SAME boot line rather than a separate one,
+    // deliberately: this repo lost seven hours of prompt-cache once to a
+    // default-off knob whose state was invisible from outside the process,
+    // and the fix is making the state show up at the one place every boot is
+    // already guaranteed to log — not adding a second line an operator has to
+    // know to look for. See `Config::http1_only`.
+    let http1_only = manager.http1_only();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         sha = build_info::SHA,
@@ -804,6 +811,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         built_at = build_info::BUILT_AT,
         pid = std::process::id(),
         port = bound.port(),
+        http1_only,
         "server started"
     );
 
