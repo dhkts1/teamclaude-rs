@@ -269,12 +269,17 @@ struct FleetView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             fleetActions
-            // Draws the fleet/app scope boundary the two rows used to imply
-            // through opposite alignment. Same divider the panel uses between
-            // its other sections, so the footer is grouped the way the rest of
-            // the panel is rather than by a rule of its own.
-            Hairline()
+            // Scope boundary by PROXIMITY, not by a rule. A `Hairline` shipped
+            // here first and was then rendered with `--render-states`: it put a
+            // THIRD full-width rule into the bottom third of the panel — one
+            // above this block, one here, one above the danger zone — and the
+            // new one sat between two rows that are both just buttons, while
+            // the checkboxes directly below it got no separator at all. The
+            // original trailing-alignment was reaching for the right thing
+            // ("without needing a rule between them"); only its method was
+            // wrong. Space groups these two without adding weight.
             appActions
+                .padding(.top, Tok.tightSpacing)
 
             if let loginError {
                 Text(loginError)
