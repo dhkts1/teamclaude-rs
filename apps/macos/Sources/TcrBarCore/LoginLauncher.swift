@@ -29,6 +29,16 @@ import Foundation
 ///
 /// `--force` is never passed. `tcr` documents it as unsafe, and a GUI silently
 /// forcing past a guard the CLI put up is exactly the wrong use of a button.
+///
+/// A re-login (``script(forExecutableAt:reloggingIn:)`` with a name) passes
+/// `--account <name>`, added by `src/main.rs` / `src/oauth.rs`'s `login_hint`.
+/// This app used to describe `tcr login` as taking no account argument at
+/// all, upserting by whatever identity the browser handed back — true when
+/// this file said so, and false as of that change: an untargeted re-login can
+/// authenticate as whichever account happens to be signed into the browser,
+/// and `--account` is what makes the button actually target the row it was
+/// clicked from, with `tcr` refusing to write on a mismatch rather than
+/// silently overwriting the wrong account's credentials.
 public enum LoginLauncher {
 
     public enum Failure: Error, Equatable {
@@ -43,35 +53,48 @@ public enum LoginLauncher {
     ///
     /// `reloggingIn` is an optional account-name hint, `nil` by default so the
     /// existing add-account call site is unchanged. When present, the script
-    /// echoes which account this re-login is for — honestly: `tcr login` takes
-    /// no account argument, it upserts by the profile identity the browser hands
-    /// back, so the label says the browser choice is what actually selects the
-    /// account, rather than implying this script can steer it there.
+    /// passes it as `--account <name>` (`src/main.rs`, `LoginArgs::account`;
+    /// `src/oauth.rs`, `login_hint`): `tcr` requests that specific identity and
+    /// refuses to write anything if the browser hands back a different one —
+    /// measured live, not theoretical: a re-login meant for one account
+    /// authenticated as a different one that happened to be signed into the
+    /// browser, and the mismatch assertion is the only reason the config was
+    /// not overwritten. Echoing the name without passing it would have been
+    /// that failure with no seatbelt, landing on whichever account the
+    /// browser happened to be signed into.
     ///
-    /// Shell-quoted exactly like the path just below — POSIX `'\''` — because an
-    /// account name is attacker-adjacent input in principle, and unquoted
-    /// interpolation into a `.command` file is injection.
+    /// Both the path and the name are shell-quoted the same POSIX way —
+    /// `'\''` — because both are now going onto the COMMAND LINE, not just
+    /// into an `echo`: an account name is attacker-adjacent input in
+    /// principle, and unquoted interpolation into a `.command` file is
+    /// injection.
     public static func script(forExecutableAt path: String, reloggingIn name: String? = nil) -> String {
         // Single-quote the path and escape any embedded single quote the POSIX
         // way ('\'') so the shell receives exactly one argument whatever the path
         // contains.
         let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let hint: String
+        let accountArgument: String
         if let name {
             // The WHOLE message is the single-quoted argument, not the name
             // alone inside a double-quoted one — a double-quoted echo still
             // expands `$`, backticks and `\`, so quoting only the name would
             // leave the rest of the line open to exactly the injection this
             // quoting exists to close.
-            let message = "Re-logging in \(name) — choose that account in the browser."
+            let message =
+                "Re-logging in \(name) — tcr requests that account, and refuses "
+                + "to save if the browser hands back a different one."
             let quotedMessage = "'" + message.replacingOccurrences(of: "'", with: "'\\''") + "'"
             hint = """
                 echo \(quotedMessage)
                 echo
 
                 """
+            let quotedName = "'" + name.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            accountArgument = " --account \(quotedName)"
         } else {
             hint = ""
+            accountArgument = ""
         }
         return """
             #!/bin/sh
@@ -81,7 +104,7 @@ public enum LoginLauncher {
             # refuses outright while a proxy is holding the port.
             echo "Running tcr login — follow the prompts below."
             echo
-            \(hint)exec \(quoted) login
+            \(hint)exec \(quoted) login\(accountArgument)
             """
     }
 

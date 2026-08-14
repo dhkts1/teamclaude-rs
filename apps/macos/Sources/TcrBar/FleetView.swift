@@ -912,15 +912,17 @@ struct AccountRow: View {
         }
     }
 
-    /// Hands `tcr login` to a Terminal window, hinting at this account's name.
-    /// Drawn on a `.needsRelogin` row only, beside ``toggleButton``.
+    /// Hands `tcr login --account <name>` to a Terminal window, targeting THIS
+    /// row's account. Drawn on a `.needsRelogin` row only, beside
+    /// ``toggleButton``.
     ///
-    /// `tcr login` takes no account argument — it upserts by the profile
-    /// identity the browser hands back — so this cannot re-authenticate the
-    /// row directly; it only opens the same flow ``addAccount()`` does, with a
-    /// name in the Terminal echo so the operator knows which browser account
-    /// to pick. `.accessibilityLabel` says exactly that, not "Re-login" alone,
-    /// which would promise more than a click here can do.
+    /// `--account` (`src/main.rs` / `src/oauth.rs`'s `login_hint`) requests
+    /// that specific identity and refuses to write anything if the browser
+    /// hands back a different one — this app used to say `tcr login` could
+    /// not be targeted at all, which stopped being true the moment that flag
+    /// shipped. Untargeted, the row's click could authenticate as whichever
+    /// account happened to be signed into the browser; targeted, a mismatch
+    /// refuses rather than overwriting the wrong account's credentials.
     private var reloginButton: some View {
         Button("Re-login…") { onRelogin() }
             .buttonStyle(.bordered)
@@ -928,9 +930,9 @@ struct AccountRow: View {
             .font(Tok.detailFont)
             .accessibilityLabel("Re-login \(account.name)")
             .help(
-                "Opens `tcr login` in a Terminal window for this account. The "
-                    + "browser account you choose is what actually gets logged in — "
-                    + "`tcr login` takes no account argument."
+                "Opens `tcr login --account` in a Terminal window, requesting "
+                    + "this exact account. `tcr` refuses to save if the browser "
+                    + "hands back a different one."
             )
     }
 
