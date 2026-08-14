@@ -696,10 +696,22 @@ enum TreeRow {
         /// pinned account's header; this only annotates the row.
         diverted_to: Option<String>,
     },
-    /// The single collapsed aggregate for ALL fallback sessions — those with no
-    /// stable client identity. Rendered LAST, dim, with no children, so unpinned
-    /// traffic stays visible as one honest row instead of flooding the pane.
-    /// Absent entirely when there are no fallback sessions.
+    /// The single collapsed aggregate for ALL [`SessionKind::Fallback`] sessions
+    /// — those with no pin at all. [`SessionKind::Prefix`] sessions are NOT
+    /// included here: they have a real pin (just a weaker one) and group under
+    /// their account like `Stable` sessions do. Rendered LAST, dim, with no
+    /// children, so if unpinned traffic is ever tracked it stays visible as one
+    /// honest row instead of flooding the pane.
+    ///
+    /// As of this writing, UNREACHABLE from a live request:
+    /// [`crate::manager::Manager::record_served`] only creates a session entry
+    /// when its key is `Some`, and `handle` (`src/proxy.rs`) never pairs
+    /// `SessionKind::Fallback` with a `Some` key — the fallback branch always
+    /// hands back `(None, SessionKind::Fallback)`. So a real request that ends
+    /// up `Fallback` is simply never tracked as a session at all, and this row
+    /// exercises only via `session_tree`'s own unit tests (`demo.rs` does not
+    /// currently seed one either). Kept in case a future change starts tracking
+    /// unpinned sessions, not because it renders today.
     Unpinned {
         count: usize,
         requests: u64,
@@ -707,22 +719,23 @@ enum TreeRow {
     },
 }
 
-/// Group sessions into a PINNED-account→sessions tree. STABLE sessions build the
-/// tree: for each account — in order of its FIRST appearance in the (stably
-/// ordered) input — emit an [`TreeRow::Account`] header carrying the group's
-/// session count, its summed requests, and the group's YOUNGEST `last_seen`,
-/// followed by that account's sessions in input order. Grouping keys on
-/// [`SessionSnapshot::account`], the PIN, so a session whose last request was
-/// merely diverted keeps its row under its own account and is annotated with
-/// `diverted_to` instead of jumping to another group. ALL fallback
-/// (non-`stable`) sessions instead fold into one trailing [`TreeRow::Unpinned`]
-/// aggregate, rendered LAST and only when non-empty — so identity-less telemetry
-/// traffic collapses to one dim row rather than flooding the pane. Pure and
-/// terminal-free so it can be unit-tested directly.
+/// Group sessions into a PINNED-account→sessions tree. Any PINNED session
+/// (`Stable` or `Prefix`) builds the tree: for each account — in order of its
+/// FIRST appearance in the (stably ordered) input — emit an [`TreeRow::Account`]
+/// header carrying the group's session count, its summed requests, and the
+/// group's YOUNGEST `last_seen`, followed by that account's sessions in input
+/// order. Grouping keys on [`SessionSnapshot::account`], the PIN, so a session
+/// whose last request was merely diverted keeps its row under its own account
+/// and is annotated with `diverted_to` instead of jumping to another group. Only
+/// [`SessionKind::Fallback`] sessions — no pin at all — instead fold into one
+/// trailing [`TreeRow::Unpinned`] aggregate, rendered LAST and only when
+/// non-empty (see its doc-comment for why that path does not fire from a real
+/// request today). Pure and terminal-free so it can be unit-tested directly.
 fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
-    // Group STABLE members by account while recording each account's first-appearance
-    // order — an empty freshly-inserted bucket marks a not-yet-seen account. Fallback
-    // sessions bypass the tree and accumulate into the single unpinned aggregate.
+    // Group PINNED (Stable or Prefix) members by account while recording each
+    // account's first-appearance order — an empty freshly-inserted bucket marks
+    // a not-yet-seen account. Only Fallback (no pin at all) sessions bypass the
+    // tree and accumulate into the single unpinned aggregate.
     let mut order: Vec<&str> = Vec::new();
     let mut groups: HashMap<&str, Vec<&SessionSnapshot>> = HashMap::new();
     let mut unpinned_count = 0usize;
