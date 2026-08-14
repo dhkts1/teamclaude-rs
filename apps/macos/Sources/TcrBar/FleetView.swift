@@ -290,7 +290,7 @@ struct FleetView: View {
             // Used to be disabled while a proxy served the port, enforcing a
             // `tcr login` refusal that stopped existing 2026-08-11 (`a385f0f`,
             // "feat: route tcr login through a live proxy instead of
-            // refusing"): `login_route` (src/oauth.rs:953-997) now probes the
+            // refusing"): `login_route` (src/oauth.rs:966-1010) now probes the
             // running proxy and, when it is a modern build, routes the
             // finished credential *through* the server instead of refusing.
             // Gil runs a modern proxy, so the gate this button enforced no
@@ -637,23 +637,32 @@ struct AccountRow: View {
     /// stays with quota, which is the thing worth scanning for.
     ///
     /// This pill answers ONE question — can this account be picked for
-    /// traffic — and there are two independent ways for the answer to be no:
-    /// `disabled` (an operator's own choice) and `account.health ==
+    /// traffic — and there are at least THREE independent ways for the
+    /// answer to be no, only two of which this build can currently see:
+    /// `disabled` (an operator's own choice), `account.health ==
     /// .needsRelogin` (`src/manager/select.rs:931` hard-excludes an
     /// `AccountStatus::Error` account from selection exactly like a disabled
-    /// one, even though `disabled` itself reads false). Drawing "rotating" on
-    /// a broken row would assert the opposite of the NEEDS RE-LOGIN pill
-    /// drawn beside it — precisely the "misread as its own opposite" defect
-    /// this pill exists to kill, just with the second cause substituted for
-    /// the first.
+    /// one, even though `disabled` itself reads false), and a THIRD gate this
+    /// pill cannot yet name: `select.rs:809-822` also excludes an account
+    /// whose `quota.status == Some("rejected")` — Anthropic's own verdict —
+    /// while the snapshot `status` this app decodes stays `"active"`
+    /// (`snapshot.rs:142-153` only ever rewrites `Throttled`). Drawing
+    /// "rotating" on THAT row is the same "misread as its own opposite"
+    /// defect the first two gates were fixed for, and TcrBar currently has no
+    /// way to catch it: `tcr status --json` emits no gate field at all. A
+    /// server-side `GateReason` in the status payload is the fix, tracked
+    /// through the lead rather than added here — decode it as an OPTIONAL
+    /// field when it lands, so an older server (absent field) degrades to
+    /// today's behaviour and never to a false claim in either direction.
     ///
-    /// A broken row draws NEITHER "rotating" nor "parked": "parked" claims an
-    /// operator decision that never happened, and "rotating" claims traffic
-    /// can land here, which `select.rs` refuses. Silence is the case this
-    /// pill was rewritten to avoid, but the reason silence used to be
-    /// dangerous was that nothing nearby said the row could not serve — here
-    /// the red NEEDS RE-LOGIN pill already says exactly that, unambiguously,
-    /// so a second pill would only have two ways left to be wrong.
+    /// A row broken by the SECOND gate draws NEITHER "rotating" nor "parked":
+    /// "parked" claims an operator decision that never happened, and
+    /// "rotating" claims traffic can land here, which `select.rs` refuses.
+    /// Silence is the case this pill was rewritten to avoid, but the reason
+    /// silence used to be dangerous was that nothing nearby said the row
+    /// could not serve — here the red NEEDS RE-LOGIN pill already says
+    /// exactly that, unambiguously, so a second pill would only have two ways
+    /// left to be wrong.
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
@@ -663,7 +672,12 @@ struct AccountRow: View {
             EmptyView()
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
-                .help("In the rotation — this account can be picked for traffic.")
+                .help(
+                    "In the rotation — this account can be picked for traffic, as "
+                        + "far as this build can tell. A quota rejection from "
+                        + "Anthropic can also exclude an account without changing "
+                        + "its status; TcrBar cannot see that gate yet."
+                )
         }
     }
 

@@ -143,6 +143,40 @@ final class LoginLauncherTests: XCTestCase {
         XCTAssertEqual(execLine?.hasSuffix("'"), true, "trailing text after the quoted account name")
     }
 
+    /// The race this fixes: before `--account`, every invocation wrote
+    /// identical bytes to a FIXED path, so two overlapping Re-login clicks
+    /// were harmless. The content is per-account now, so two clicks in quick
+    /// succession could overwrite the file before the first Terminal window
+    /// reads it — window A running window B's `--account`. Two real (default
+    /// `UUID.init`) launches must land at two different paths.
+    func testTwoLaunchesGetDifferentPaths() throws {
+        var opened: [URL] = []
+        for _ in 0..<2 {
+            let result = LoginLauncher.launch(
+                resolve: { .success(URL(fileURLWithPath: "/usr/local/bin/tcr")) },
+                open: { opened.append($0) }
+            )
+            guard case .success = result else { return XCTFail("expected success") }
+        }
+        XCTAssertEqual(opened.count, 2)
+        XCTAssertNotEqual(opened[0], opened[1], "two launches must not race on one shared path")
+    }
+
+    /// The path is deterministic under an injected UUID, which is what makes
+    /// the uniqueness above testable without depending on real randomness.
+    func testPathIncorporatesTheInjectedUUID() throws {
+        let fixed = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        var opened: URL?
+        let result = LoginLauncher.launch(
+            uuid: { fixed },
+            resolve: { .success(URL(fileURLWithPath: "/usr/local/bin/tcr")) },
+            open: { opened = $0 }
+        )
+        guard case .success(let url) = result else { return XCTFail("expected success") }
+        XCTAssertEqual(opened, url)
+        XCTAssertEqual(url.lastPathComponent, "tcr-login-\(fixed.uuidString).command")
+    }
+
     func testSuccessWritesAnExecutableScriptAndOpensIt() throws {
         var opened: URL?
         let result = LoginLauncher.launch(

@@ -480,8 +480,20 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// an unmeasured account reports `quotaState == .ok` by default, so without
     /// it, enabling a never-probed account makes the fleet claim capacity that
     /// nothing has ever verified.
+    ///
+    /// The fourth clause exists for a credential that dies AFTER being
+    /// probed, not before. `probe_account` (`src/manager/probing.rs:128-139`)
+    /// early-returns on an `Error` row instead of clearing anything, and
+    /// `refresh.rs:93-101` only ever sets `status` — so a rejected refresh
+    /// token leaves the LAST-LEARNED `quota` and `probeStatus: .ok` sitting
+    /// there unchanged. Without this clause `hasQuotaEvidence` stays true,
+    /// `quotaState` reads whatever it last measured (often `.ok`), and the
+    /// row reports READY for an account `src/manager/select.rs:931`
+    /// hard-excludes and will serve zero requests — the header could then
+    /// read "1 of 1 ready · 1 need re-login" in the same frame, the panel
+    /// contradicting itself.
     public var isReady: Bool {
-        !disabled && quotaState == .ok && hasQuotaEvidence
+        !disabled && health != .needsRelogin && quotaState == .ok && hasQuotaEvidence
     }
 }
 
@@ -715,6 +727,14 @@ public struct Fleet: Equatable, Sendable {
     /// hard-excluded from selection (`src/manager/select.rs:814`, `:931`).
     /// Reported on the same footing as `unmeasuredCount`: both are reasons an
     /// account is not ready, but they lead to different remedies.
+    ///
+    /// That "not ready" claim is enforced by ``Account/isReady``'s own
+    /// `health != .needsRelogin` clause, not merely implied by this count
+    /// existing — a credential that dies AFTER being probed keeps its
+    /// last-learned `quota` and `quotaState`, so without that clause on
+    /// `isReady` an account counted here could ALSO count in `readyCount`,
+    /// the exact contradiction ("1 of 1 ready · 1 need re-login") this whole
+    /// change exists to rule out.
     public var needsReloginCount: Int {
         enabledAccounts.filter { $0.health == .needsRelogin }.count
     }
@@ -787,7 +807,17 @@ public struct Fleet: Equatable, Sendable {
     public var capacityGlyphState: QuotaState {
         if enabledAccounts.isEmpty { return .unknown("empty") }
         if readyCount > 0 { return .ok }
-        if enabledAccounts.contains(where: { $0.hasQuotaEvidence && $0.quotaState == .near }) {
+        // `health != .needsRelogin` is load-bearing here too, not just on
+        // `isReady`: a credential that dies AFTER being probed keeps its
+        // LAST-LEARNED `quotaState`, which can be `.near` — Rust never resets
+        // it, `probe_account` (`src/manager/probing.rs:128-139`) early-returns
+        // on an `Error` row and `refresh.rs:93-101` only ever sets `status`.
+        // Without the health check, a broken account that used to be close to
+        // its threshold would amber the glyph for capacity that has since
+        // gone to zero, not "close".
+        if enabledAccounts.contains(where: {
+            $0.hasQuotaEvidence && $0.quotaState == .near && $0.health != .needsRelogin
+        }) {
             return .near
         }
         if unmeasuredCount > 0 { return .unknown("unmeasured") }

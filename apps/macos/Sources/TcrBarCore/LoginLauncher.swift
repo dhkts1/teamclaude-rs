@@ -9,15 +9,18 @@ import Foundation
 /// independent reasons, and both are in `tcr`'s own source rather than guesswork:
 ///
 ///  1. **An older `tcr` refuses while a server holds the port.** That used to be
-///     universal (`src/oauth.rs:752-757`, superseded), but `a385f0f`
-///     (2026-08-11, "feat: route tcr login through a live proxy instead of
-///     refusing") added a live route: `login_route` (`src/oauth.rs:953-997`)
-///     probes the running proxy and, on `AddCapability::Present`, takes the
-///     login live through the server instead of refusing. A modern proxy — the
-///     only kind this button needs to assume — accepts a login while serving.
-///     An old one still refuses, before any browser opens, and its message
-///     names the pid and the stop-login-restart sequence — which is useful
-///     only if a human can read it.
+///     universal — refusing outright whenever a proxy held the port, no
+///     exceptions — but `a385f0f` (2026-08-11, "feat: route tcr login
+///     through a live proxy instead of refusing") added a live route:
+///     `login_route` (`src/oauth.rs:966-1010`) probes the running proxy and,
+///     on `AddCapability::Present`, takes the login live through the server
+///     instead of refusing. A modern proxy — the only kind this button needs
+///     to assume — accepts a login while serving. An old one still refuses,
+///     before any browser opens, and its message names the pid and the
+///     stop-login-restart sequence — which is useful only if a human can
+///     read it. (Line numbers move; verified against `src/oauth.rs` as of
+///     `9fc4fe8`, not carried forward from memory — re-check before trusting
+///     them again.)
 ///  2. **It is interactive.** It prompts for an account name on stdin
 ///     (`src/oauth.rs:645`) and can take a pasted authorization code
 ///     (`src/oauth.rs:450`). With no TTY those prompts go nowhere and stdin hits
@@ -113,9 +116,20 @@ public enum LoginLauncher {
     /// A `.command` file opened via LaunchServices starts Terminal directly. The
     /// alternative — an AppleScript `do script` — needs Automation permission and
     /// would put a consent dialog between the operator and a login they asked for.
+    ///
+    /// The filename carries a UUID (`uuid`, injectable for tests), not a fixed
+    /// `tcr-login.command`. Before `--account` shipped every invocation wrote
+    /// IDENTICAL bytes, so a fixed path was harmless — two clicks in quick
+    /// succession just overwrote the file with the same script. It is a
+    /// correctness surface now: the content is per-account, so two Re-login
+    /// clicks in quick succession could overwrite the file before the first
+    /// Terminal window reads it, letting window A run window B's
+    /// `--account`. A unique path per invocation makes that race structurally
+    /// impossible rather than merely unlikely.
     @discardableResult
     public static func launch(
         reloggingIn name: String? = nil,
+        uuid: () -> UUID = UUID.init,
         resolve: () -> Result<URL, TcrTool.NotFound> = { TcrTool.resolve() },
         open: (URL) -> Void = { NSWorkspace.shared.open($0) }
     ) -> Result<URL, Failure> {
@@ -127,7 +141,7 @@ public enum LoginLauncher {
 
         let script = script(forExecutableAt: executable.path, reloggingIn: name)
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("tcr-login.command")
+            .appendingPathComponent("tcr-login-\(uuid().uuidString).command")
 
         do {
             try script.write(to: url, atomically: true, encoding: .utf8)
