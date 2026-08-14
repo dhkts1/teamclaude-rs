@@ -165,6 +165,7 @@ private func account(
         priority: 1,
         status: "active",
         disabled: disabled,
+        control: nil,
         quota: 0,
         quotaState: state,
         fiveHour: 0,
@@ -197,6 +198,7 @@ private func brokenAccount(_ name: String, disabled: Bool = false) -> Account {
         priority: 1,
         status: "error",
         disabled: disabled,
+        control: nil,
         quota: nil,
         quotaState: .ok,
         fiveHour: nil,
@@ -238,6 +240,7 @@ private func probedThenBrokenAccount(
         priority: 1,
         status: "error",
         disabled: disabled,
+        control: nil,
         quota: quota,
         quotaState: quotaState,
         fiveHour: quota,
@@ -302,6 +305,7 @@ final class AccountHealthTests: XCTestCase {
         XCTAssertEqual(account("alice@example.com", state: .ok).health, .active)
         let throttled = Account(
             name: "bob@example.com", priority: 1, status: "throttled", disabled: false,
+            control: nil,
             quota: 0.9, quotaState: .near, fiveHour: 0.9, sevenDay: 0.9, sevenDayOi: 0,
             held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
             cacheHitRatio: nil, probeStatus: .ok, probeError: nil, lastStreamError: nil,
@@ -316,6 +320,7 @@ final class AccountHealthTests: XCTestCase {
     func testUnknownFutureStatusDecodesToOtherAndChangesNoCount() {
         let weird = Account(
             name: "eve@example.com", priority: 1, status: "quarantined", disabled: false,
+            control: nil,
             quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
             held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
             cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,
@@ -409,6 +414,7 @@ final class FleetNeedsReloginTests: XCTestCase {
         let unmeasuredOnly = Fleet(accounts: [
             Account(
                 name: "frank@example.com", priority: 1, status: "active", disabled: false,
+                control: nil,
                 quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
                 held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
                 cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,
@@ -428,6 +434,7 @@ final class FleetNeedsReloginTests: XCTestCase {
         let broken = brokenAccount("dave@example.com")
         let neverProbed = Account(
             name: "frank@example.com", priority: 1, status: "active", disabled: false,
+            control: nil,
             quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
             held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
             cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,

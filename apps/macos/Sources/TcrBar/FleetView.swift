@@ -13,6 +13,12 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    /// Assigning/clearing the identity-bound control account. Kept separate
+    /// from `accounts`: enable/disable and control assignment are different
+    /// subprocess calls with different in-flight state, and folding them into
+    /// one controller would make an in-flight toggle block an unrelated
+    /// control assignment for the same row, or vice versa.
+    @ObservedObject var control: ControlController
     /// Owned by the app, for the same reason the poller is: the panel is a view
     /// and the mode is not, and an assertion released when the view went away
     /// would be a keep-awake control that keeps nothing awake. Under
@@ -198,6 +204,7 @@ struct FleetView: View {
                     account: account,
                     countersAreStructural: fleet.source.countersAreStructural,
                     accounts: accounts,
+                    control: control,
                     onChanged: { await poller.pollOnce() },
                     onRelogin: { reloginAccount(account.name) }
                 )
@@ -644,6 +651,8 @@ struct AccountRow: View {
     let account: Account
     let countersAreStructural: Bool
     @ObservedObject var accounts: AccountController
+    /// Assigning/clearing the identity-bound control account for this row.
+    @ObservedObject var control: ControlController
     /// Called after a successful toggle so the row re-reads reality. It returns
     /// the state of the read it just performed, which is what the verdict is
     /// computed against — reading the poller's published `state` afterwards could
@@ -846,6 +855,26 @@ struct AccountRow: View {
     }
 
     var body: some View {
+        rowContent
+            // The gold wash lives on the WHOLE row, not just the name text, so
+            // it reads as "this row" rather than "this word" — the same reason
+            // `rotationPill`'s tint is not the only thing that marks a parked
+            // row. Applied here rather than per-branch so the needs-relogin
+            // layout and the normal layout can never disagree about it.
+            .background(
+                account.control == true
+                    ? RoundedRectangle(cornerRadius: Tok.radiusSmall).fill(Tok.wash(Tok.control))
+                    : nil
+            )
+            // Right-click assigns, mirroring no existing idiom in this file —
+            // there wasn't one for a fleet-wide singleton before this — but
+            // matching the toggle button's own rule: invoke, then re-poll and
+            // render whatever `tcr status` reports, never an optimistic flip.
+            .contextMenu { controlMenuItems }
+    }
+
+    @ViewBuilder
+    private var rowContent: some View {
         // A broken row draws its two buttons on their OWN line, below the name
         // and pills, rather than beside `information` the way `toggleButton`
         // alone sits for every other row. Measured, not assumed: beside
@@ -877,6 +906,31 @@ struct AccountRow: View {
         }
     }
 
+    /// "Make control account" / "Clear control", following ``toggleButton``'s
+    /// own rule: the click is a subprocess and nothing else, and the row never
+    /// flips its own copy of `control` — it awaits the call, re-polls, and
+    /// renders whatever the fleet then reports.
+    @ViewBuilder
+    private var controlMenuItems: some View {
+        if account.control == true {
+            Button("Clear control") {
+                Task {
+                    let attempt = await control.setControl(nil)
+                    guard case .accepted = attempt else { return }
+                    _ = await onChanged()
+                }
+            }
+        } else {
+            Button("Make control account") {
+                Task {
+                    let attempt = await control.setControl(account.name)
+                    guard case .accepted = attempt else { return }
+                    _ = await onChanged()
+                }
+            }
+        }
+    }
+
     private var information: some View {
         VStack(alignment: .leading, spacing: Tok.rowLineSpacing) {
             HStack(spacing: Tok.tightSpacing) {
@@ -891,6 +945,30 @@ struct AccountRow: View {
                     .truncationMode(.middle)
                     .help(account.name)
                     .textSelection(.enabled)
+                if account.control == true {
+                    Text("♛")
+                        .font(Tok.bodyFont)
+                        .foregroundStyle(Tok.control)
+                        .accessibilityLabel("control account")
+                        .help("Identity-bound traffic resolves to this account.")
+                }
+                // The control account is EXPECTED to be disabled — it is
+                // deliberately parked out of the inference rotation while
+                // still serving identity traffic — so this pairing is common,
+                // not broken. Without this glyph a gold ♛ beside a greyed-out,
+                // PARKED row reads as a contradiction rather than as the
+                // designed state.
+                if account.control == true && account.disabled {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(Tok.detailFont)
+                        .foregroundStyle(Tok.near)
+                        .accessibilityLabel("out of rotation, still serving control traffic")
+                        .help(
+                            "Out of rotation, still serving control traffic — the control "
+                                + "account is deliberately parked from inference while "
+                                + "identity-bound calls keep resolving to it."
+                        )
+                }
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
                 // A never-probed account's `quotaState` is Rust's default, not a

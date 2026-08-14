@@ -352,6 +352,14 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// Free-form on the Rust side; displayed verbatim, never pattern-matched.
     public let status: String
     public let disabled: Bool
+    /// True on the single account that identity-bound traffic resolves to.
+    /// Optional, not `false`-defaulted: `Account` uses the synthesized
+    /// `Decodable`, so a non-optional `Bool` would fail decoding for every
+    /// row against an older `tcr` binary that never emits this key at all
+    /// (see `src/status.rs:170-190` on the Rust side for the incident this
+    /// guards against). Absent on the wire and `nil` here both mean "this
+    /// build doesn't know" — never coerce either into `false`.
+    public let control: Bool?
 
     /// The Rust side's `AccountStatus` (src/manager/mod.rs:182-198), decoded.
     /// `.other` keeps an unknown future variant readable instead of asserting a

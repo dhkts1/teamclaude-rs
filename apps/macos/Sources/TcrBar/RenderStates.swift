@@ -140,6 +140,7 @@ enum RenderStates {
                 server: ServerController(),
                 loginItem: LoginItem(),
                 accounts: AccountController(),
+                control: ControlController(),
                 awake: awake,
                 // `startingUpdater: false`: this process was asked for PNGs. A
                 // started updater schedules background checks and can put a

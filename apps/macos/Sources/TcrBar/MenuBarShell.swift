@@ -26,6 +26,11 @@ final class MenuBarShell {
     let server: ServerController
     let loginItem: LoginItem
     let accounts: AccountController
+    /// Assigning/clearing the identity-bound control account. Owned here for
+    /// the same reason `accounts` is: the panel is a view that can be torn
+    /// down and rebuilt, and a pending-call flag that reset with it would
+    /// let a second click race the first while looking idle.
+    let control: ControlController
     /// Owned here, not by the panel: the panel is a view that can be torn down,
     /// and an assertion that ended when the panel closed would be a keep-awake
     /// control that keeps nothing awake.
@@ -52,6 +57,7 @@ final class MenuBarShell {
         server: ServerController? = nil,
         loginItem: LoginItem? = nil,
         accounts: AccountController? = nil,
+        control: ControlController? = nil,
         awake: AwakeController? = nil,
         preference: LaunchPreference? = nil,
         updater: Updater? = nil
@@ -60,6 +66,7 @@ final class MenuBarShell {
         self.server = server ?? ServerController()
         self.loginItem = loginItem ?? LoginItem()
         self.accounts = accounts ?? AccountController()
+        self.control = control ?? ControlController()
         self.awake = awake ?? AwakeController()
         self.preference = preference ?? LaunchPreference()
         self.updater = updater ?? Updater()
@@ -97,8 +104,8 @@ final class MenuBarShell {
         let hosting = NSHostingController(
             rootView: FleetPanel(
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
-                accounts: self.accounts, awake: self.awake, preference: self.preference,
-                updater: self.updater))
+                accounts: self.accounts, control: self.control, awake: self.awake,
+                preference: self.preference, updater: self.updater))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -224,6 +231,7 @@ struct FleetPanel: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    @ObservedObject var control: ControlController
     @ObservedObject var awake: AwakeController
     @ObservedObject var preference: LaunchPreference
     @ObservedObject var updater: Updater
@@ -234,6 +242,7 @@ struct FleetPanel: View {
             server: server,
             loginItem: loginItem,
             accounts: accounts,
+            control: control,
             awake: awake,
             updater: updater,
             startServerAtLaunch: $preference.startServerAtLaunch
