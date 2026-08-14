@@ -188,6 +188,26 @@ Consequences worth knowing before you tune either number:
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
 
+### `sessionAffinity` also pins identity-less loopback requests
+
+"Pin a session to the account it started on" normally means keying on an `x-api-key` or the
+body's `metadata.user_id` — a stable per-client identity. With `sessionAffinity` on, a
+**loopback** `POST /v1/messages` that carries **neither** — a plain SDK call or a bare
+`curl`, not `claude`, which always sends `metadata.user_id` — is still pinned, on a hash of
+its `system` + `tools` fields (its Anthropic prompt-cache prefix) instead of a client
+identity. Byte-identical requests land on the same account and keep the prompt cache warm;
+different requests spread across the fleet on their own.
+
+This only applies to a loopback caller on `POST /v1/messages` specifically —
+`/v1/messages/count_tokens` and every other endpoint are excluded, since Anthropic does not
+apply prompt caching to token counting, so pinning it would only concentrate load for no
+cache benefit. A non-loopback caller (this proxy binds `127.0.0.1` only, in practice) never
+gets this pin, so N workers sharing one remote harness and one system prompt still spread
+across the fleet rather than collapsing onto one account.
+
+There is no separate flag for this: it is entirely governed by `sessionAffinity`, and turning
+that off turns this off too.
+
 ### Which knobs are opt-in and which are opt-out
 
 Five knobs ship OFF and must be turned on deliberately: `sessionAffinity`, `warmupSeconds`,

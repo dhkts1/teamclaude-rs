@@ -697,12 +697,21 @@ enum TreeRow {
         diverted_to: Option<String>,
     },
     /// The single collapsed aggregate for ALL [`SessionKind::Fallback`] sessions
-    /// — those with no stable client identity AND no cacheable prefix, so they
-    /// carry no pin at all. [`SessionKind::Prefix`] sessions are NOT included
-    /// here: they have a real pin (just a weaker one) and group under their
-    /// account like `Stable` sessions do. Rendered LAST, dim, with no children,
-    /// so unpinned traffic stays visible as one honest row instead of flooding
-    /// the pane. Absent entirely when there are no fallback sessions.
+    /// — those with no pin at all. [`SessionKind::Prefix`] sessions are NOT
+    /// included here: they have a real pin (just a weaker one) and group under
+    /// their account like `Stable` sessions do. Rendered LAST, dim, with no
+    /// children, so if unpinned traffic is ever tracked it stays visible as one
+    /// honest row instead of flooding the pane.
+    ///
+    /// As of this writing, UNREACHABLE from a live request:
+    /// [`crate::manager::Manager::record_served`] only creates a session entry
+    /// when its key is `Some`, and `handle` (`src/proxy.rs`) never pairs
+    /// `SessionKind::Fallback` with a `Some` key — the fallback branch always
+    /// hands back `(None, SessionKind::Fallback)`. So a real request that ends
+    /// up `Fallback` is simply never tracked as a session at all, and this row
+    /// exercises only via `session_tree`'s own unit tests (`demo.rs` does not
+    /// currently seed one either). Kept in case a future change starts tracking
+    /// unpinned sessions, not because it renders today.
     Unpinned {
         count: usize,
         requests: u64,
@@ -720,9 +729,8 @@ enum TreeRow {
 /// and is annotated with `diverted_to` instead of jumping to another group. Only
 /// [`SessionKind::Fallback`] sessions — no pin at all — instead fold into one
 /// trailing [`TreeRow::Unpinned`] aggregate, rendered LAST and only when
-/// non-empty — so identity-less telemetry traffic collapses to one dim row
-/// rather than flooding the pane. Pure and terminal-free so it can be
-/// unit-tested directly.
+/// non-empty (see its doc-comment for why that path does not fire from a real
+/// request today). Pure and terminal-free so it can be unit-tested directly.
 fn session_tree(sessions: &[SessionSnapshot]) -> Vec<TreeRow> {
     // Group PINNED (Stable or Prefix) members by account while recording each
     // account's first-appearance order — an empty freshly-inserted bucket marks
