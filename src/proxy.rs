@@ -1095,8 +1095,11 @@ async fn status_handler(
     }
 
     let now = OffsetDateTime::now_utc();
-    let payload =
-        crate::status::StatusPayload::from_snapshot(&manager.snapshot(now), &manager.thresholds());
+    let payload = crate::status::StatusPayload::from_snapshot(
+        &manager.snapshot(now),
+        &manager.thresholds(),
+        manager.http1_only(),
+    );
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
         // proxy never panics on a client request — surface it as a 500 instead.
@@ -3350,6 +3353,7 @@ mod tests {
             pacing: crate::config::PacingConfig::default(),
             throttle: crate::config::ThrottleConfig::default(),
             lock_account: None,
+            http1_only: false,
             accounts: vec![Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),

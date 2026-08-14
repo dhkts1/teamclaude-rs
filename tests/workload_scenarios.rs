@@ -215,6 +215,7 @@ impl Fleet {
             // path and has no bearing on selection.
             throttle: ThrottleConfig::default(),
             lock_account: None,
+            http1_only: false,
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),
             extra: serde_json::Map::new(),
         };

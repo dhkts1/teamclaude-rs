@@ -826,6 +826,7 @@ mod tests {
             pacing: crate::config::PacingConfig::default(),
             throttle: crate::config::ThrottleConfig::default(),
             lock_account: None,
+            http1_only: false,
             accounts: vec![crate::config::Account {
                 name: "dummy".to_string(),
                 account_type: "oauth".to_string(),

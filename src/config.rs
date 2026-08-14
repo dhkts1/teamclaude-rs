@@ -239,6 +239,20 @@ pub struct Config {
     /// fail rather than rotating. Set to the exact `accounts[].name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_account: Option<String>,
+    /// Force the upstream-forwarding client onto HTTP/1.1 instead of the
+    /// h2-and-fall-back-to-h1 negotiation reqwest does by default. Absent →
+    /// `false` (h2). OFF by default deliberately: an intermittent
+    /// connection-level fault (GOAWAY / framing error) on HTTP/2 kills EVERY
+    /// multiplexed stream sharing that connection at once, so one fault takes
+    /// down every concurrent session an account happens to be serving. h1
+    /// does not multiplex, so a fault there costs exactly one in-flight
+    /// request — a structural cap on blast radius, not a statistical one.
+    /// The trade: h1 gives up multiplexing, opens one TCP+TLS connection per
+    /// concurrent request instead of sharing one, and raises the open-socket
+    /// count against Anthropic's edge — real costs, which is why this stays
+    /// opt-in. Set `"http1Only": true` to enable.
+    #[serde(default)]
+    pub http1_only: bool,
     #[serde(default)]
     pub accounts: Vec<Account>,
     /// Any top-level keys we do not model, preserved verbatim on save.
@@ -1386,6 +1400,15 @@ mod tests {
         assert_eq!(config.pacing.max_in_flight_per_account, None);
         assert_eq!(config.pacing.min_spacing_ms, None);
         assert!(!config.pacing.is_active());
+        // Absent `http1Only` key → OFF: the serving client stays on h2.
+        assert!(!config.http1_only);
+    }
+
+    #[test]
+    fn http1_only_true_deserializes() {
+        let config: Config =
+            serde_json::from_str(r#"{ "accounts": [], "http1Only": true }"#).unwrap();
+        assert!(config.http1_only);
     }
 
     #[test]

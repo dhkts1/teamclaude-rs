@@ -107,6 +107,20 @@ pub struct StatusPayload {
     /// it made a newer client unable to parse an older running server at all.
     #[serde(default)]
     pub build: BuildInfo,
+    /// Whether the SERVING process is forcing HTTP/1.1 on its upstream
+    /// clients — see [`crate::config::Config::http1_only`]. Server-wide, like
+    /// `build`, and for the same reason: re-deriving it from
+    /// `~/.config/teamclaude.json` on the client would report the file's
+    /// state, not the already-booted process's, and the two can differ (the
+    /// config was edited after boot; the flag is only read at client
+    /// construction).
+    ///
+    /// `#[serde(default)]` for the same back-compat reason as `build`: an
+    /// OLD server's payload has no such key, and absent must read as `false`
+    /// (the actual default) rather than fail the parse and drop to the
+    /// offline snapshot.
+    #[serde(default)]
+    pub http1_only: bool,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -193,7 +207,7 @@ impl StatusPayload {
     /// per-account list (see [`crate::manager::Manager::thresholds`]); a short
     /// list falls back to `1.0` per account, which can only fail CLOSED — at 1.0
     /// nothing but a fully-exhausted window reads as held, never a false hold.
-    pub fn from_snapshot(snapshot: &StatsSnapshot, thresholds: &[f64]) -> Self {
+    pub fn from_snapshot(snapshot: &StatsSnapshot, thresholds: &[f64], http1_only: bool) -> Self {
         let accounts = snapshot
             .accounts
             .iter()
@@ -232,6 +246,7 @@ impl StatusPayload {
             // Compile-time constants of the SERVING binary — not passed in,
             // because the only honest answer is the one baked into this process.
             build: BuildInfo::current(),
+            http1_only,
         }
     }
 
@@ -334,7 +349,7 @@ mod tests {
     #[test]
     fn payload_round_trips_every_rendered_field() {
         let snapshot = snapshot_with_counters();
-        let wire = serde_json::to_string(&StatusPayload::from_snapshot(&snapshot, &[0.85]))
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(&snapshot, &[0.85], false))
             .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back.kind, STATUS_KIND);
@@ -365,6 +380,7 @@ mod tests {
         let wire = serde_json::to_string(&StatusPayload::from_snapshot(
             &snapshot_with_counters(),
             &[0.85],
+            false,
         ))
         .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
@@ -457,6 +473,7 @@ mod tests {
         let wire = serde_json::to_string(&StatusPayload::from_snapshot(
             &snapshot_with_counters(),
             &[0.9],
+            false,
         ))
         .expect("serialize");
         assert!(

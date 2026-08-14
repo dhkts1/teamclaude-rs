@@ -390,7 +390,14 @@ pub(crate) fn fail_next_client_build() {
 /// [`AccountRuntime::http`]) so every account's client is configured
 /// identically and differs from every other account's only in the connection
 /// pool it privately owns.
-pub(crate) fn build_serving_client() -> Arc<reqwest::Client> {
+///
+/// `http1_only` mirrors [`config::Config::http1_only`] — see its doc-comment
+/// for why this exists and why it defaults to `false`. When `true`, every
+/// stream this client opens is capped at HTTP/1.1, so the
+/// `http2_keep_alive_*` settings below become inert (h1 has no PING frame to
+/// send); they are left in place because they are still correct for the
+/// default h2 path.
+pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
     #[cfg(test)]
     if FAIL_NEXT_CLIENT_BUILD.with(|f| f.replace(false)) {
         panic!("build reqwest client (test-injected failure)");
@@ -399,33 +406,36 @@ pub(crate) fn build_serving_client() -> Arc<reqwest::Client> {
     // proxy — routing our upstream through an ambient proxy (e.g. the JS
     // teamclaude on :3456) loops us through the thing we replace and every
     // request dies as "upstream unreachable". Always reach Anthropic directly.
-    Arc::new(
-        reqwest::Client::builder()
-            .no_proxy()
-            // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
-            // otherwise stalls the attempt until the OS TCP timeout, and with a
-            // retry budget of `account_count * 2 + 4` that is many minutes of a
-            // hung request. `oauth.rs` and `probe.rs` both already set one.
-            //
-            // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
-            // responses are long-lived SSE streams that legitimately run longer
-            // than any bound worth setting, and a total timeout would truncate
-            // them mid-stream. `connect_timeout` cannot — it applies only before
-            // the response headers arrive, so once a stream is flowing it is out
-            // of the picture.
-            .connect_timeout(std::time::Duration::from_secs(10))
-            // Keep the single HTTP/2 connection to Anthropic warm across
-            // interactive think-time pauses. reqwest reaps idle connections
-            // after 90s by default, but a coding session routinely pauses
-            // longer — so the next request would pay a fresh TCP+TLS handshake
-            // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
-            // connection open so a post-pause request skips the reconnect.
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
-            .http2_keep_alive_while_idle(true)
-            .pool_idle_timeout(std::time::Duration::from_secs(300))
-            .build()
-            .expect("build reqwest client"),
-    )
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        // Cap only the CONNECT phase. A blackholed route (no RST, no reply)
+        // otherwise stalls the attempt until the OS TCP timeout, and with a
+        // retry budget of `account_count * 2 + 4` that is many minutes of a
+        // hung request. `oauth.rs` and `probe.rs` both already set one.
+        //
+        // DELIBERATELY NOT a total `.timeout(...)`, and do not add one: these
+        // responses are long-lived SSE streams that legitimately run longer
+        // than any bound worth setting, and a total timeout would truncate
+        // them mid-stream. `connect_timeout` cannot — it applies only before
+        // the response headers arrive, so once a stream is flowing it is out
+        // of the picture.
+        .connect_timeout(std::time::Duration::from_secs(10))
+        // Keep the single HTTP/2 connection to Anthropic warm across
+        // interactive think-time pauses. reqwest reaps idle connections
+        // after 90s by default, but a coding session routinely pauses
+        // longer — so the next request would pay a fresh TCP+TLS handshake
+        // (~100-300ms). h2 keep-alive PINGs + a 5-min idle timeout hold the
+        // connection open so a post-pause request skips the reconnect.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
+        .pool_idle_timeout(std::time::Duration::from_secs(300));
+    if http1_only {
+        // Structural blast-radius cap: h1 does not multiplex, so a
+        // connection-level fault (GOAWAY / framing error) kills at most the
+        // one request on that connection instead of every stream sharing it.
+        builder = builder.http1_only();
+    }
+    Arc::new(builder.build().expect("build reqwest client"))
 }
 
 /// A rotation slot answers a user's account query by the same three fields a
@@ -511,7 +521,7 @@ pub enum AddAccountOutcome {
 }
 
 impl AccountRuntime {
-    fn from_config(account: &config::Account) -> Self {
+    fn from_config(account: &config::Account, http1_only: bool) -> Self {
         Self {
             name: account.name.clone(),
             account_type: account.account_type.clone(),
@@ -552,7 +562,7 @@ impl AccountRuntime {
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
             refresh_lock: Arc::new(AsyncMutex::new(())),
-            http: build_serving_client(),
+            http: build_serving_client(http1_only),
         }
     }
 }
@@ -865,7 +875,7 @@ impl Manager {
         let accounts: Vec<AccountRuntime> = config
             .accounts
             .iter()
-            .map(AccountRuntime::from_config)
+            .map(|a| AccountRuntime::from_config(a, config.http1_only))
             .collect();
         Self::assemble(config, refresher, prober, warmer, config_path, accounts)
     }
@@ -1390,7 +1400,8 @@ impl Manager {
     /// an appended account gets its own `refresh_lock` for free — there is no
     /// longer a parallel structure to keep in sync.
     pub fn add_account(&self, account: config::Account) -> usize {
-        let runtime = AccountRuntime::from_config(&account);
+        let http1_only = self.config.lock().expect("config lock poisoned").http1_only;
+        let runtime = AccountRuntime::from_config(&account, http1_only);
         let idx = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             accounts.push(runtime);
@@ -1713,7 +1724,8 @@ impl Manager {
                     // attempt is guaranteed to have a runtime ready, so it
                     // cannot hit this arm again.
                     drop(_writing);
-                    speculative_runtime = Some(AccountRuntime::from_config(&account));
+                    let http1_only = self.config.lock().expect("config lock poisoned").http1_only;
+                    speculative_runtime = Some(AccountRuntime::from_config(&account, http1_only));
                     continue;
                 }
                 Resolution::Added { idx } => {
@@ -1926,6 +1938,23 @@ mod tests {
     /// silently turn a re-key test into a divert test.
     const LONG_HOLD_SECS: i64 = CACHE_WARM_HOLD_SECS + 60;
 
+    /// `build_serving_client` must not panic on either branch of `http1_only` —
+    /// h1 support is part of the reqwest/rustls TLS backend this crate already
+    /// pulls in, but a builder method rejecting a combination it doesn't support
+    /// is exactly the kind of thing that only shows up at `.build()`.
+    ///
+    /// This cannot assert the built client actually NEGOTIATES h1 on the wire:
+    /// reqwest exposes no introspection on a built `Client` for its ALPN/HTTP
+    /// version policy, and asserting anything less than that would only prove
+    /// the bool reached this function's own argument — not that it reaches
+    /// reqwest's TLS layer. See the PR report for the explicit statement of
+    /// that gap.
+    #[test]
+    fn build_serving_client_builds_under_both_http1_only_settings() {
+        let _off = build_serving_client(false);
+        let _on = build_serving_client(true);
+    }
+
     #[test]
     fn throttle_slot_burst1_is_strict_spacing() {
         // B=1 (tau=0): threading the TAT across 3 calls at a fixed `now` yields
@@ -1986,6 +2015,7 @@ mod tests {
             pacing: PacingConfig::default(),
             throttle: ThrottleConfig::default(),
             lock_account: None,
+            http1_only: false,
             accounts,
             extra: serde_json::Map::new(),
         }
@@ -5052,7 +5082,7 @@ mod tests {
 
     /// A fresh active runtime with empty quota, for the [`Manager::account_gate`] tests.
     fn gate_runtime() -> AccountRuntime {
-        AccountRuntime::from_config(&account("gate", 0))
+        AccountRuntime::from_config(&account("gate", 0), false)
     }
 
     #[test]
@@ -5165,7 +5195,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let now_ms = odt_to_ms(now);
         let reset = now + Duration::seconds(600);
-        let mut a = AccountRuntime::from_config(&account("std-hold", 0));
+        let mut a = AccountRuntime::from_config(&account("std-hold", 0), false);
         a.switch_threshold = Some(0.90);
         a.rate_limited_until_ms = Some(now_ms + 8_000); // short Hold, +8s
         a.quota.requests_limit = Some(200);
@@ -5452,21 +5482,21 @@ mod tests {
 
         // Account A — weekly-gated: its 5h resets SOON (200s) but its 7d stays over
         // threshold until 5000s, so A does NOT actually return until 5000s.
-        let mut a = AccountRuntime::from_config(&account("a", 0));
+        let mut a = AccountRuntime::from_config(&account("a", 0), false);
         a.switch_threshold = Some(0.90);
         a.quota.five_hour = Some(window(0.99, Some(at(200))));
         a.quota.seven_day = Some(window(0.99, Some(at(5_000))));
 
         // Account B — a dead credential (Error) that holds the SOONEST raw reset
         // (100s). It never self-frees, so it must contribute nothing to the hint.
-        let mut b = AccountRuntime::from_config(&account("b", 0));
+        let mut b = AccountRuntime::from_config(&account("b", 0), false);
         b.switch_threshold = Some(0.90);
         b.status = AccountStatus::Error;
         b.quota.five_hour = Some(window(0.99, Some(at(100))));
 
         // Account C — the TRUE first recovery: 5h-gated with a later reset (900s)
         // and a healthy 7d, so it genuinely returns at 900s.
-        let mut c = AccountRuntime::from_config(&account("c", 0));
+        let mut c = AccountRuntime::from_config(&account("c", 0), false);
         c.switch_threshold = Some(0.90);
         c.quota.five_hour = Some(window(0.99, Some(at(900))));
 
