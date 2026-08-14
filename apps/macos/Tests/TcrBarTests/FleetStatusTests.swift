@@ -448,6 +448,73 @@ final class FleetNeedsReloginTests: XCTestCase {
     }
 }
 
+/// `rowsInDisplayOrder(pinning:)`: the control account (normally `disabled`,
+/// so it would otherwise sink to the very bottom via `displayOrder`) pinned
+/// to the front, above even a fully-`ok` row — a stable partition, never a
+/// re-sort of what remains.
+///
+/// The third edge case the feature's brief calls out — an older `tcr` with no
+/// `control` subcommand at all — has no analog at this layer: this codebase
+/// never decodes a `control` field off `Account` (see
+/// `ControlAccountController`'s own doc-comment), so "the key is absent" is a
+/// fact about `tcr control --show`, not about `tcr status --json`. That shape
+/// is exercised in `ControlAccountCommandTests.testShowIsUnavailableOnANonZeroExit`
+/// / `testControllerNeverReportsControlWhenUnavailable`, which prove
+/// `ControlAccountController.current` stays `nil` in exactly that case — and a
+/// `nil` name here is `testNoControlAccountLeavesOrderUnchanged` below.
+final class FleetControlPinningTests: XCTestCase {
+    func testControlAccountPinnedToFrontPreservesRelativeOrderOfTheRest() {
+        // The control account is disabled — the common shape (parked out of
+        // rotation) — and would otherwise sort dead last.
+        let control = brokenAccount("zoe@example.com", disabled: true)
+        let ready = account("alice@example.com", state: .ok)
+        let near = account("bob@example.com", state: .near)
+        let spent = account("carol@example.com", state: .spent)
+
+        let fleet = Fleet(accounts: [spent, control, ready, near])
+        // Without pinning: ready, near, spent, control (control sinks last).
+        XCTAssertEqual(
+            fleet.rowsInDisplayOrder.map(\.name),
+            ["alice@example.com", "bob@example.com", "carol@example.com", "zoe@example.com"],
+            "sanity check: unpinned, the control account is the worst-ranked row"
+        )
+
+        let pinned = fleet.rowsInDisplayOrder(pinning: "zoe@example.com").map(\.name)
+        XCTAssertEqual(
+            pinned,
+            ["zoe@example.com", "alice@example.com", "bob@example.com", "carol@example.com"],
+            "control row moves to the front; everyone else keeps their prior relative order"
+        )
+    }
+
+    func testNoControlAccountLeavesOrderUnchanged() {
+        let ready = account("alice@example.com", state: .ok)
+        let spent = account("bob@example.com", state: .spent)
+        let parked = account("carol@example.com", state: .ok, disabled: true)
+        let fleet = Fleet(accounts: [spent, parked, ready])
+
+        XCTAssertEqual(
+            fleet.rowsInDisplayOrder(pinning: nil).map(\.name),
+            fleet.rowsInDisplayOrder.map(\.name),
+            "no control account set (the common case) must be byte-identical to today's order"
+        )
+    }
+
+    func testControlNameNotPresentInTheFleetLeavesOrderUnchanged() {
+        // Defensive: a stale/mismatched name (e.g. a fleet snapshot that
+        // hasn't caught up with a just-cleared control account) must not
+        // crash or silently drop a row — it must simply not pin anything.
+        let ready = account("alice@example.com", state: .ok)
+        let spent = account("bob@example.com", state: .spent)
+        let fleet = Fleet(accounts: [spent, ready])
+
+        XCTAssertEqual(
+            fleet.rowsInDisplayOrder(pinning: "nobody@example.com").map(\.name),
+            fleet.rowsInDisplayOrder.map(\.name)
+        )
+    }
+}
+
 /// The bug an adversarial review found: every test above exercises only
 /// `brokenAccount` — never-probed, `quota: nil`. The shape that actually
 /// happens in production is `probedThenBrokenAccount`: a credential that
