@@ -42,7 +42,8 @@ struct FleetView: View {
     /// nothing is worse than one that says why.
     @State private var loginError: String?
 
-    /// Measured height of the account rows.
+    /// Measured height of each account row, keyed by account id (`Account.id`
+    /// is the account name).
     ///
     /// A `ScrollView` has a flexible ideal height, and the window this panel
     /// lives in sizes itself to its content's *ideal* height — so a scroll view
@@ -54,7 +55,11 @@ struct FleetView: View {
     /// is equally true of the `NSPopover` it lives in now, whose hosting
     /// controller is set to `sizingOptions = [.preferredContentSize]`
     /// (`MenuBarShell.swift`) for exactly this reason.
-    @State private var rowsHeight: CGFloat = 0
+    ///
+    /// Per-row rather than one summed total because rows are not uniform
+    /// height — see `Tok.visibleAccountRows`. `visibleRowsHeight(for:)` sums
+    /// the first `Tok.visibleAccountRows` of these, in display order.
+    @State private var rowHeights: [String: CGFloat] = [:]
 
     var body: some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
@@ -179,15 +184,9 @@ struct FleetView: View {
             } else {
                 ScrollView {
                     rowStack(fleet)
-                        .background(
-                            GeometryReader { proxy in
-                                Color.clear.preference(
-                                    key: RowsHeightKey.self, value: proxy.size.height)
-                            }
-                        )
                 }
-                .frame(height: min(max(rowsHeight, Tok.rowSpacing), Tok.panelMaxHeight))
-                .onPreferenceChange(RowsHeightKey.self) { rowsHeight = $0 }
+                .frame(height: visibleRowsHeight(for: fleet))
+                .onPreferenceChange(RowHeightsKey.self) { rowHeights = $0 }
             }
         }
     }
@@ -202,8 +201,39 @@ struct FleetView: View {
                     onChanged: { await poller.pollOnce() },
                     onRelogin: { reloginAccount(account.name) }
                 )
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: RowHeightsKey.self, value: [account.id: proxy.size.height])
+                    }
+                )
             }
         }
+    }
+
+    /// Height of the scroll viewport: room for the first `Tok.visibleAccountRows`
+    /// rows (any accounts past that scroll into view), clamped so it never
+    /// collapses to nothing and never exceeds the historical panel-wide cap.
+    ///
+    /// Sums per-row *measured* heights rather than `Tok.visibleAccountRows *`
+    /// some constant, because rows are not uniform height — see the doc on
+    /// `Tok.visibleAccountRows`.
+    ///
+    /// Fallback: before SwiftUI has laid out and reported any row height (the
+    /// first frame, prior to the first `onPreferenceChange`), `rowHeights` is
+    /// empty and this returns `Tok.panelMaxHeight` — the original
+    /// always-room-for-roughly-8-rows behaviour — so the panel never renders
+    /// at zero or one-row height while waiting for a real measurement.
+    private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
+        let orderedHeights = fleet.rowsInDisplayOrder.compactMap { rowHeights[$0.id] }
+        guard !orderedHeights.isEmpty else {
+            return Tok.panelMaxHeight
+        }
+        let visibleCount = min(orderedHeights.count, Tok.visibleAccountRows)
+        let summed =
+            orderedHeights.prefix(visibleCount).reduce(0, +)
+            + Tok.rowSpacing * CGFloat(max(visibleCount - 1, 0))
+        return min(max(summed, Tok.rowSpacing), Tok.panelMaxHeight)
     }
 
     private func offlineNotice(_ source: StatusSource) -> some View {
@@ -560,11 +590,14 @@ struct FleetView: View {
     }
 }
 
-/// Carries the measured height of the account rows out of the scroll view.
-private struct RowsHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+/// Carries the measured height of each account row out of the scroll view,
+/// keyed by `Account.id`. A dictionary rather than one summed scalar because
+/// rows are not uniform height — `visibleRowsHeight(for:)` needs the first N
+/// individually, in display order, not just their total.
+private struct RowHeightsKey: PreferenceKey {
+    static let defaultValue: [String: CGFloat] = [:]
+    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
+        value.merge(nextValue()) { _, new in new }
     }
 }
 
