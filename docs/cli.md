@@ -117,29 +117,42 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 |---|---|---|---|
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
-| `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back matches it |
+| `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
+| `--org <name-or-uuid>` | string | none | narrow an ambiguous `--account` match to a single org — same flag `tcr enable`/`tcr disable`/`tcr remove`/`tcr priority` take |
 
-**`--account <name>` targets one existing account and refuses to fix the wrong one.**
-Without it, `login` upserts by whatever identity the browser hands back — a
+**`--account <name> [--org <org>]` targets one existing account and refuses to fix the
+wrong one.** Without it, `login` upserts by whatever identity the browser hands back — a
 default-browser OAuth flow carries whatever claude.ai session is already signed in, so
 re-logging in a dead account can silently refresh a *different*, already-healthy one and
-report success while the broken account stays broken. `--account` resolves `<name>`
-against the config with the same exact-name-then-exact-email rule `tcr enable`/`tcr
-disable` use (case-sensitive, no substrings; `--account` itself takes no `--org`, so an
-ambiguous email across two orgs is an error naming the candidates). It also passes the
-resolved account's email as OAuth's `login_hint`, which pre-selects that address on a
-clean login page — this part is ergonomics only, not a guarantee: it is unverified
-whether the hint overrides a browser that is *already* signed in as someone else, which
-is exactly the case the default-browser flow produces. The correctness guarantee is a
-separate check, after the browser round trip and before anything is written: the
-identity that came back (preferring `account_uuid`, since an email can be reused across
-orgs but a uuid cannot) must match the resolved account, or **nothing is written** — the
-config is left byte-identical — and the error names both the account that was requested
-and the one the browser actually authenticated as. A profile with neither an email nor a
-uuid (a failed profile fetch) is refused the same way, never treated as a pass. Omitting
-`--account` behaves exactly as before: no identity check runs, and a fresh login is
-free to land on whatever account the browser returns — that is the add-a-new-account
-path.
+report success while the broken account stays broken. `--account`/`--org` resolve
+`<name>` against the config with the same rule `tcr enable`/`tcr disable` use
+(case-sensitive, no substrings; `--org` narrows an otherwise-ambiguous email match by org
+name or org uuid). It also passes the resolved account's email as OAuth's `login_hint`,
+which pre-selects that address on a clean login page — this part is ergonomics only, not
+a guarantee: it is unverified whether the hint overrides a browser that is *already*
+signed in as someone else, which is exactly the case the default-browser flow produces.
+The hint is only ever sent when the resolved account's name is address-shaped; an
+account named e.g. `work` never produces `login_hint=work`.
+
+The correctness guarantee is a separate check, after the browser round trip and before
+anything is written. **An account UUID alone identifies the *person*, not the account**:
+the same person routinely holds more than one organization (a corporate Pro org and a
+personal Max org), each with its own token and quota, so a UUID can be identical on two
+different rows in the config. The check therefore resolves the identity that came back
+the same way a write would — UUID *and* org together, through the same resolution
+`upsert_account` uses — and only a resolution landing on the SAME row as `--account`
+counts as a match. Two rows sharing a UUID but a different org (Corp vs. Personal) are
+correctly treated as different accounts, and a re-login intended for one can never be
+silently written onto the other. On any other outcome — a different row, an ambiguous
+resolution, or an unresolvable one — **nothing is written**, the config is left
+byte-identical, and the error names both the account that was requested and the identity
+the browser actually authenticated as. A profile with neither an email nor a uuid (a
+failed profile fetch) is refused the same way, never treated as a pass. An account with
+no stored UUID *and* a non-email display name (e.g. `work`) has nothing on file to check
+a returned identity against at all; that case is refused too, with a message that says so
+plainly instead of suggesting a browser sign-out that could not help. Omitting `--account`
+behaves exactly as before: no identity check runs, and a fresh login is free to land on
+whatever account the browser returns — that is the add-a-new-account path.
 
 **A running proxy no longer has to be stopped.** Before opening the browser, `tcr login`
 asks the proxy on the configured port whether it can take an account live, by POSTing a

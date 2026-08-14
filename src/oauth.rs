@@ -1026,6 +1026,7 @@ pub async fn login(
     config_path: &Path,
     force: bool,
     account: Option<&str>,
+    org: Option<&str>,
 ) -> anyhow::Result<String> {
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
@@ -1042,8 +1043,20 @@ pub async fn login(
     let hint = match account {
         Some(query) => {
             let probe_config = load_or_default(config_path)?;
-            let idx = crate::cli::resolve_account(&probe_config.accounts, query, None)?;
-            Some(crate::identity::email_of(&probe_config.accounts[idx].name).to_string())
+            let idx = crate::cli::resolve_account(&probe_config.accounts, query, org)?;
+            let email = crate::identity::email_of(&probe_config.accounts[idx].name);
+            // Only ever send something address-shaped: a non-email display
+            // name (e.g. an account named "work") produces `login_hint=work`
+            // otherwise — an unvalidated non-address value on an endpoint
+            // this crate already knows is picky about param shape (the
+            // 32-byte-state note above). Skipping it there costs nothing:
+            // the hint is ergonomics only (see this function's doc-comment),
+            // never the source of truth.
+            if looks_like_email(email) {
+                Some(email.to_string())
+            } else {
+                None
+            }
         }
         None => None,
     };
@@ -1086,14 +1099,33 @@ pub async fn login(
         &tokens,
         profile,
         account,
+        org,
     )
     .await
+}
+
+/// Whether `s` is plausibly an email address — no whitespace, and exactly one
+/// `@` with at least one character on each side. Deliberately not a full RFC
+/// 5322 validator: this only ever gates whether a value is safe to hand to
+/// `login_hint` (see `build_login_flow`'s doc-comment), where the failure mode
+/// of being too strict is "no pre-fill" and the failure mode of being too
+/// loose is an unvalidated string on an endpoint already known to reject
+/// malformed params outright.
+fn looks_like_email(s: &str) -> bool {
+    if s.contains(char::is_whitespace) {
+        return false;
+    }
+    match s.split_once('@') {
+        Some((local, domain)) => !local.is_empty() && !domain.is_empty() && !domain.contains('@'),
+        None => false,
+    }
 }
 
 /// [`finish_login`], but first asserting the requested `--account` identity
 /// when one was given. Split out so the assertion + write sequence `login()`
 /// runs is directly testable without a real browser or network round trip —
 /// exactly the reason [`finish_login`] itself was split from [`login`].
+#[allow(clippy::too_many_arguments)]
 async fn finish_login_checked(
     config_path: &Path,
     route: LoginRoute,
@@ -1102,32 +1134,46 @@ async fn finish_login_checked(
     tokens: &Tokens,
     profile: Profile,
     requested_account: Option<&str>,
+    requested_org: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(query) = requested_account {
-        assert_requested_identity(config, query, &profile)?;
+        assert_requested_identity(config, query, requested_org, &profile)?;
     }
     finish_login(config_path, route, config, name, tokens, profile).await
 }
 
-/// The load-bearing half of `tcr login --account <query>`: resolve `query`
-/// against `config` via [`crate::cli::resolve_account`] — the exact
-/// exact-name-then-email-then-org rule `tcr enable`/`tcr disable` and TcrBar's
-/// row buttons already rely on, not a second copy of it — and refuse to
-/// proceed unless the identity that came back from `fetch_profile` is the
-/// SAME account. `account_uuid` is preferred when both sides have one (an
-/// email can be reused across orgs, a UUID cannot); otherwise email is
-/// compared. Called strictly BEFORE any write path
+/// The load-bearing half of `tcr login --account <query> [--org <org>]`:
+/// resolve `query`/`org` against `config` via [`crate::cli::resolve_account`]
+/// — the exact rule `tcr enable`/`tcr disable` and TcrBar's row buttons
+/// already rely on, not a second copy of it — then refuse to proceed unless
+/// the identity that came back from `fetch_profile` resolves, through
+/// [`crate::identity::resolve`], to that SAME row.
+///
+/// Deliberately reuses `identity::resolve`/`identity::probe` — the exact
+/// functions [`upsert_account`] writes through — rather than a hand-rolled
+/// comparison: an account UUID alone identifies the *person*, not the
+/// account. The same person routinely holds more than one organization (a
+/// corporate Pro org and a personal Max org), each with its own token and
+/// quota (`src/identity.rs:3-8`), so a `uuid`-only check cannot tell those
+/// apart — it would happily confirm a re-login intended for the Corp row
+/// against a browser session signed into Personal, because both carry the
+/// same `uuid`. `identity::resolve` folds the org discriminator in on top of
+/// the uuid, which is why it — not a second copy of only half its logic — is
+/// what both the check and the write need to agree on.
+///
+/// Called strictly BEFORE any write path
 /// ([`finish_login`]/[`persist_via_file`]/[`persist_via_account`]): on
-/// mismatch, or on an unresolvable requested account, or on a profile that
-/// carries neither an email nor a uuid (`fetch_profile`'s all-`None` failure
-/// return, `src/oauth.rs:589-592` above — an assertion that cannot be
+/// mismatch, on an unresolvable/ambiguous requested account, or on a profile
+/// that carries neither an email nor a uuid (`fetch_profile`'s all-`None`
+/// failure return, `src/oauth.rs:649-654` — an assertion that cannot be
 /// evaluated must fail closed, not pass by default), nothing is written.
 fn assert_requested_identity(
     config: &Config,
     query: &str,
+    org: Option<&str>,
     profile: &Profile,
 ) -> anyhow::Result<()> {
-    let idx = crate::cli::resolve_account(&config.accounts, query, None)?;
+    let idx = crate::cli::resolve_account(&config.accounts, query, org)?;
     let requested = &config.accounts[idx];
 
     if profile.email.is_none() && profile.account_uuid.is_none() {
@@ -1138,22 +1184,61 @@ fn assert_requested_identity(
         );
     }
 
-    let matches = match (&requested.account_uuid, &profile.account_uuid) {
-        (Some(want), Some(got)) => want == got,
-        _ => {
-            let want_email = crate::identity::email_of(&requested.name);
-            profile
-                .email
-                .as_deref()
-                .is_some_and(|got| got == want_email)
-        }
+    // The identity a fresh login resolves to, computed the SAME way
+    // `upsert_account` resolves one for a write: build a probe carrying only
+    // what the browser told us, and resolve it against the WHOLE fleet, not
+    // just `requested`. Comparing against the whole fleet (rather than just
+    // asking "does `requested` match the probe?") is what makes the org
+    // discriminator load-bearing: a uuid-only local comparison against
+    // `requested` alone would still pass when Corp was requested and the
+    // browser returned Personal, because it never looks at whether that
+    // identity actually belongs to a DIFFERENT row.
+    let probe_name = profile.email.as_deref().unwrap_or(&requested.name);
+    let probe = crate::identity::probe(
+        probe_name,
+        profile.account_uuid.clone(),
+        profile.org_uuid.clone(),
+        profile.org_name.clone(),
+    );
+    let resolved = crate::identity::resolve(config.accounts.iter().enumerate(), &probe);
+    let resolved_idx = match resolved {
+        crate::identity::Resolved::One(i) => Some(i),
+        crate::identity::Resolved::None | crate::identity::Resolved::Many => None,
     };
 
-    if !matches {
-        let got = profile
-            .email
-            .as_deref()
-            .unwrap_or("an account with no email in its profile");
+    if resolved_idx != Some(idx) {
+        let got = match resolved_idx {
+            // The identity resolved cleanly, just to a DIFFERENT existing
+            // row — name that row, it is the actionable fact.
+            Some(other) => config.accounts[other].name.clone(),
+            None if requested.account_uuid.is_none() && !requested.name.contains('@') => {
+                // `requested` has no stored account id, and its own display
+                // name isn't email-shaped (e.g. an account named "work"), so
+                // there is no stored fact to compare the browser's identity
+                // against at all — this is not "wrong browser session", it
+                // is "nothing on file to check against". Telling the
+                // operator to sign out cannot help here; say so honestly.
+                bail!(
+                    "'{}' has no stored account id, and its name is not an email address, so \
+                     `--account` cannot confirm the browser authenticated as the right person — \
+                     there is nothing on file to compare against. Nothing was written. Run `tcr \
+                     login` once WITHOUT --account, confirm from the printed email that it is the \
+                     account you intended, then either rename this entry to that email or use \
+                     that email with --account from now on.",
+                    requested.name
+                );
+            }
+            None => {
+                let email = profile
+                    .email
+                    .as_deref()
+                    .unwrap_or("an account with no email in its profile");
+                match profile.org_name.as_deref().or(profile.org_uuid.as_deref()) {
+                    Some(org) => format!("{email} (org {org})"),
+                    None => email.to_string(),
+                }
+            }
+        };
         bail!(
             "requested re-login for '{}', but the browser authenticated as '{got}' instead — \
              nothing was written. Sign out of that account in the browser first, or use a \
@@ -2393,6 +2478,19 @@ mod tests {
         }
     }
 
+    // --- `login_hint` value validation --------------------------------------
+
+    #[test]
+    fn looks_like_email_accepts_and_rejects() {
+        assert!(looks_like_email("alice@example.com"));
+        assert!(!looks_like_email("work"), "a bare display name, no '@'");
+        assert!(!looks_like_email("personal-max"), "no '@'");
+        assert!(!looks_like_email("@example.com"), "empty local part");
+        assert!(!looks_like_email("alice@"), "empty domain");
+        assert!(!looks_like_email("alice @example.com"), "whitespace");
+        assert!(!looks_like_email("alice@b@c"), "two '@'s");
+    }
+
     // --- `--account` identity assertion (`tcr login --account`) ------------
 
     fn two_account_seed() -> String {
@@ -2428,6 +2526,7 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("mallory@example.com"),
             Some("alice@example.com"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2463,6 +2562,7 @@ mod tests {
             &tokens("at-fresh", "rt-fresh", 1_893_456_000_000),
             profile_named("alice@example.com"),
             Some("alice@example.com"),
+            None,
         )
         .await
         .unwrap();
@@ -2477,7 +2577,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `fetch_profile`'s all-`None` failure return (`src/oauth.rs:589-592`)
+    /// `fetch_profile`'s all-`None` failure return (`src/oauth.rs:649-654`)
     /// must refuse rather than pass by default — an assertion that cannot be
     /// evaluated is not evidence of a match.
     #[tokio::test]
@@ -2506,6 +2606,7 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             all_none,
             Some("alice@example.com"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2554,6 +2655,7 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("dup@example.com"),
             Some("dup@example.com"),
+            None,
         )
         .await
         .unwrap_err();
@@ -2566,6 +2668,269 @@ mod tests {
 
         let after = std::fs::read_to_string(&path).unwrap();
         assert_eq!(before, after, "an ambiguous query must not guess and write");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The remedy `ambiguous_query_message` advises ("narrow with --org") must
+    /// actually be followable: `--org` plumbed through resolves the same
+    /// otherwise-ambiguous query to exactly one row.
+    #[tokio::test]
+    async fn finish_login_checked_org_disambiguates_a_duplicate_email() {
+        let seed = r#"{ "accounts": [
+            { "name": "dup@example.com", "type": "oauth", "accessToken": "at-1",
+              "refreshToken": "rt-1", "expiresAt": 1893456000000, "priority": 0,
+              "accountUuid": "uuid-dup", "orgUuid": "org-a", "orgName": "Corp A" },
+            { "name": "dup@example.com", "type": "oauth", "accessToken": "at-2",
+              "refreshToken": "rt-2", "expiresAt": 1893456000000, "priority": 1,
+              "accountUuid": "uuid-dup", "orgUuid": "org-b", "orgName": "Corp B" }
+        ] }"#;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-org-disambig-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let name = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "dup@example.com",
+            &tokens("at-new", "rt-new", 1_893_456_000_000),
+            profile_with_identity(
+                "dup@example.com",
+                Some("uuid-dup"),
+                Some("org-a"),
+                Some("Corp A"),
+            ),
+            Some("dup@example.com"),
+            Some("org-a"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "dup@example.com");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let corp_a = after["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["orgUuid"] == "org-a")
+            .expect("Corp A row still present");
+        assert_eq!(
+            corp_a["refreshToken"],
+            serde_json::json!("rt-new"),
+            "the disambiguated row must be the one that was written: {after}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A [`Profile`] carrying an account uuid and org — the branch the plain
+    /// email-only [`profile_named`] can never exercise, and the one the review
+    /// found untested (`identity::resolve`'s uuid+org comparison, not merely
+    /// its name-equality fallback).
+    fn profile_with_identity(
+        email: &str,
+        account_uuid: Option<&str>,
+        org_uuid: Option<&str>,
+        org_name: Option<&str>,
+    ) -> Profile {
+        Profile {
+            email: Some(email.to_string()),
+            account_uuid: account_uuid.map(str::to_string),
+            org_uuid: org_uuid.map(str::to_string),
+            org_name: org_name.map(str::to_string),
+        }
+    }
+
+    /// THE CANONICAL FAILURE the review found: `account_uuid` alone cannot
+    /// distinguish a person's two orgs. Config holds the SAME person
+    /// (`uuid-person`) in both a Corp row and a Personal row, each with its
+    /// own org and its own refresh token. Corp's token is dead; the operator
+    /// requests `--account` re-login for Corp. The browser — plausibly, this
+    /// IS the feature's premise — is signed into Personal instead.
+    /// `fetch_profile` returns `{uuid: uuid-person, org: org-personal}`. A
+    /// uuid-only comparison takes the `(Some, Some)` arm and passes, because
+    /// both rows share the same person. The org-aware check must refuse, and
+    /// Corp's own refresh token must be UNCHANGED afterwards — not merely
+    /// "an error came back", which a check that still wrote to the wrong row
+    /// before erroring would also produce.
+    #[tokio::test]
+    async fn finish_login_checked_same_uuid_different_org_is_a_mismatch() {
+        let seed = r#"{ "accounts": [
+            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
+              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
+              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
+            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
+              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
+              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
+        ] }"#;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-same-uuid-diff-org-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // The browser authenticated as the SAME person, but the Personal org.
+        let wrong_org_profile = profile_with_identity(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-personal"),
+            Some("Personal"),
+        );
+
+        let err = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "me@example.com",
+            &tokens("at-new", "rt-new", 1_893_456_000_000),
+            wrong_org_profile,
+            Some("me@example.com (Corp)"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("me@example.com (Corp)"),
+            "names requested: {msg}"
+        );
+        assert!(
+            msg.contains("Personal") || msg.contains("me@example.com (Personal)"),
+            "names the org actually authenticated: {msg}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a same-person-different-org mismatch must leave BOTH rows untouched \
+             (Corp's dead token in particular must not be silently 'fixed' onto Personal's row)"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The mirror of the canonical failure: the SAME uuid AND the SAME org
+    /// must still succeed — the org-aware check is not merely stricter, it is
+    /// exactly as permissive as `upsert_account`'s own write-time resolution.
+    #[tokio::test]
+    async fn finish_login_checked_same_uuid_same_org_matches() {
+        let seed = r#"{ "accounts": [
+            { "name": "me@example.com (Corp)", "type": "oauth", "accessToken": "at-corp",
+              "refreshToken": "rt-corp-DEAD", "expiresAt": 1893456000000, "priority": 0,
+              "accountUuid": "uuid-person", "orgUuid": "org-corp", "orgName": "Corp" },
+            { "name": "me@example.com (Personal)", "type": "oauth", "accessToken": "at-pers",
+              "refreshToken": "rt-personal-ALIVE", "expiresAt": 1893456000000, "priority": 1,
+              "accountUuid": "uuid-person", "orgUuid": "org-personal", "orgName": "Personal" }
+        ] }"#;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-same-uuid-same-org-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let right_profile = profile_with_identity(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("org-corp"),
+            Some("Corp"),
+        );
+
+        let name = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "me@example.com (Corp)",
+            &tokens("at-fresh-corp", "rt-fresh-corp", 1_893_456_000_000),
+            right_profile,
+            Some("me@example.com (Corp)"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "me@example.com (Corp)");
+
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let corp = after["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["orgUuid"] == "org-corp")
+            .expect("Corp row still present");
+        assert_eq!(corp["refreshToken"], serde_json::json!("rt-fresh-corp"));
+        let personal = after["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["orgUuid"] == "org-personal")
+            .expect("Personal row untouched and still present");
+        assert_eq!(
+            personal["refreshToken"],
+            serde_json::json!("rt-personal-ALIVE"),
+            "Personal's own token must be untouched by Corp's re-login"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A requested account with no stored `account_uuid` AND a non-email
+    /// display name (e.g. an account named "work") cannot be verified by
+    /// email-equality either — there is nothing on file to compare the
+    /// browser identity against. The message must not suggest "sign out",
+    /// which cannot help here, and it must still refuse (fail closed) rather
+    /// than accept blindly.
+    #[tokio::test]
+    async fn finish_login_checked_non_email_name_with_no_uuid_refuses_honestly() {
+        let seed = r#"{ "accounts": [
+            { "name": "work", "type": "oauth", "accessToken": "at-work",
+              "refreshToken": "rt-work-DEAD", "expiresAt": 1893456000000, "priority": 0 }
+        ] }"#;
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-account-non-email-name-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, seed).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = finish_login_checked(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "work",
+            &tokens("at-new", "rt-new", 1_893_456_000_000),
+            profile_named("someone@example.com"),
+            Some("work"),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            !msg.to_lowercase().contains("sign out"),
+            "advising a sign-out that cannot help is dishonest: {msg}"
+        );
+        assert!(
+            msg.contains("no stored account id") || msg.contains("nothing on file"),
+            "must state the real reason verification is impossible: {msg}"
+        );
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "must still fail closed and write nothing");
 
         std::fs::remove_file(&path).ok();
     }
@@ -2592,6 +2957,7 @@ mod tests {
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
             profile_named("carol@example.com"),
+            None,
             None,
         )
         .await
