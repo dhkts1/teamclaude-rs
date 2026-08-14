@@ -262,13 +262,28 @@ fi
 # one. This is not hypothetical — the v0.2.3 entry was left uncommitted for
 # exactly this reason, and the published feed sat on 0.2.1 while a signed 0.2.3
 # DMG was already on the release.
+#
+# apps/macos/scripts/release-preflight.sh is exempt, BY NAME and not by
+# directory, because its own usage line makes the argument: "asserts the
+# release is safe to start; changes nothing." It reads Cargo.toml, the
+# appcast, the git index and two APIs and either exits 0 or names what is
+# wrong — it cannot make a build claim a version it isn't, because it never
+# touches an artifact. Its neighbours in the same directory are the opposite
+# case and must stay covered: build-tcrbar.sh writes Info.plist, including
+# SUPublicEDKey and SUFeedURL — a build from it has produced an app with no
+# SUPublicEDKey at all — and release-tcrbar.sh orchestrates signing,
+# notarization and stapling. Both change what ships even though neither
+# compiles it. Widen this to `apps/macos/scripts/**` and both slip through
+# under an already-released version; add new preflight-only scripts here by
+# name, the same way, never by loosening the directory.
 staged_shippable="$(git diff --cached --name-only --diff-filter=ACMR -- . \
                     ':(exclude)*.md' \
                     ':(exclude)docs/**' \
                     ':(exclude)assets/**' \
                     ':(exclude).github/**' \
                     ':(exclude).githooks/**' \
-                    ':(exclude)apps/macos/appcast.xml' || true)"
+                    ':(exclude)apps/macos/appcast.xml' \
+                    ':(exclude)apps/macos/scripts/release-preflight.sh' || true)"
 
 if [ -n "$staged_shippable" ]; then
   # Read the INDEX (`:Cargo.toml`), not the working tree: that is what this
