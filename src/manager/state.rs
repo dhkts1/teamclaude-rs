@@ -31,10 +31,17 @@ impl Manager {
     }
 
     /// Whether session affinity is enabled, read from the config's unmodelled
-    /// top-level `sessionAffinity` (default `false` — off unless explicitly
-    /// enabled). Same read pattern as [`Self::probe_interval_seconds`]. When
-    /// `false`, the hybrid server injects no `SessionKey` extension, so `select`
-    /// always receives `affinity = None` and the disabled path is inert.
+    /// top-level `sessionAffinity` (default `true` — ON unless explicitly
+    /// disabled with `"sessionAffinity": false`). An absent key fails safe
+    /// toward keeping caches warm: measured 2026-08-14, a config that lost its
+    /// `sessionAffinity` key silently went cold when the default was `false`,
+    /// and the client-side prompt-cache hit ratio dropped 0.952 → 0.498 with
+    /// cache_creation rising 6.5M/hour → 122M/hour, sustained seven hours — a
+    /// single missing key costing roughly 100M re-created tokens per hour.
+    /// Same read pattern as [`Self::probe_interval_seconds`]. When explicitly
+    /// disabled, the hybrid server injects no `SessionKey` extension, so
+    /// `select` always receives `affinity = None` and the disabled path is
+    /// inert.
     pub fn session_affinity_enabled(&self) -> bool {
         self.config
             .lock()
@@ -42,7 +49,7 @@ impl Manager {
             .extra
             .get("sessionAffinity")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false)
+            .unwrap_or(true)
     }
 
     /// Over-threshold revalidation-serve is ON by default; set top-level
@@ -148,5 +155,39 @@ impl Manager {
             .expect("accounts lock poisoned")
             .get(idx)
             .and_then(|a| a.account_uuid.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager_with(config: &str) -> Arc<Manager> {
+        let config: Config = serde_json::from_str(config).expect("the inline test config parses");
+        Manager::with_live_refresher(config, None)
+    }
+
+    /// The regression guard for the 2026-08-14 incident: a config that lost its
+    /// `sessionAffinity` key silently went cold when the default was `false`
+    /// (0.952 → 0.498 prompt-cache hit ratio, sustained seven hours). An absent
+    /// key must now read as enabled.
+    #[test]
+    fn session_affinity_defaults_to_enabled_when_key_is_absent() {
+        let manager = manager_with(r#"{"accounts": []}"#);
+        assert!(
+            manager.session_affinity_enabled(),
+            "a config with no sessionAffinity key must default to affinity ON"
+        );
+    }
+
+    /// The explicit opt-out must still work: `"sessionAffinity": false` disables
+    /// it.
+    #[test]
+    fn session_affinity_explicit_false_stays_disabled() {
+        let manager = manager_with(r#"{"sessionAffinity": false, "accounts": []}"#);
+        assert!(
+            !manager.session_affinity_enabled(),
+            "an explicit `sessionAffinity: false` must disable affinity"
+        );
     }
 }

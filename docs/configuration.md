@@ -184,7 +184,7 @@ Consequences worth knowing before you tune either number:
 - Randomness is drawn from a SplitMix64 generator seeded once from the boot clock. There is
   no `rand` dependency, and per-account draws are decorrelated by construction; re-reading
   the clock per account in a tight loop would not have been.
-| `sessionAffinity` | bool | **`false`** (OFF) | no | pin a session to the account it started on |
+| `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
 
@@ -220,13 +220,15 @@ that off turns this off too.
 
 ### Which knobs are opt-in and which are opt-out
 
-Five knobs ship OFF and must be turned on deliberately: `sessionAffinity`, `warmupSeconds`,
+Four knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
 `loadBalanceMigration`, `pacing` and `lockAccount`. (An older README said three; `pacing`
-and `lockAccount` were missing from that list.)
+and `lockAccount` were missing from that list. `sessionAffinity` was a fifth until it flipped
+to default ON — see below.)
 
-One knob ships ON and is the file's only opt-**out**: `revalidationServe`, default `true`,
-disabled by writing `"revalidationServe": false`. So is `throttle`, per the inversion above,
-though its off-switch is an empty object rather than a `false`.
+Two knobs ship ON and are opt-**out**: `revalidationServe`, default `true`, disabled by
+writing `"revalidationServe": false`; and `sessionAffinity`, also default `true`, disabled by
+writing `"sessionAffinity": false`. So is `throttle`, per the inversion above, though its
+off-switch is an empty object rather than a `false`.
 
 `loadBalanceMigration` is off because Anthropic's prompt cache is per-account: every
 balancing move costs a full prompt-cache re-creation of the whole conversation prefix on

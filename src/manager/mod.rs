@@ -745,10 +745,11 @@ pub struct Manager {
     /// stamp the account it picks, so the next select prefers a different one
     /// (load spread). Starts at 1 so 0 reads unambiguously as "never selected".
     select_seq: AtomicU64,
-    /// Session affinity (opt-in): a stable identity hash → `(account index it is
-    /// pinned to, last-touch ms)`. Populated only when `sessionAffinity` is enabled
-    /// and a `SessionKey` extension flows in; empty (and never consulted) otherwise,
-    /// so the disabled path is provably inert. Bounded by a size cap
+    /// Session affinity (default ON, opt-out via `"sessionAffinity": false`): a
+    /// stable identity hash → `(account index it is pinned to, last-touch ms)`.
+    /// Populated only when `sessionAffinity` is enabled and a `SessionKey`
+    /// extension flows in; empty (and never consulted) otherwise, so the disabled
+    /// path is provably inert. Bounded by a size cap
     /// (`AFFINITY_CAP`) + LRU-by-last-touch eviction in [`Manager::select`] — stable
     /// pins intentionally SURVIVE reconnects (that is the point of a stable key), so
     /// there is no disconnect-release. Kept a plain `std::sync::Mutex` and **never**

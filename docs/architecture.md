@@ -72,7 +72,8 @@ and reloaded at boot, so a restart does not automatically cold-start every conve
 prompt cache. Pins expire against `affinity::PIN_TTL_MS`, **15 minutes**: a restart inside
 that window restores most of the fleet's pins, and one outside it restores none. The server
 logs how many it restored; read that line rather than assuming either outcome. With
-`sessionAffinity` off, which is the default, there are no pins to restore.
+`sessionAffinity` off — the explicit opt-out, no longer the default — there are no pins to
+restore.
 
 ## Keeping the quota bars fresh
 

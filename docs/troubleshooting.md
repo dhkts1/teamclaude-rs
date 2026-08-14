@@ -35,8 +35,9 @@ running a different commit, or a wedged process holding the socket without answe
 With `sessionAffinity` on, pins are persisted continuously and restored at boot within a
 TTL; a restart inside that window keeps most sessions warm, and one outside it restores
 nothing at all. The server logs how many pins it restored at boot; read that line rather
-than assuming either outcome. With `sessionAffinity` off, which is the default, there are no
-pins to restore. The TTL and the reasoning are in [Session-affinity pins survive a
+than assuming either outcome. With `sessionAffinity` off — the explicit opt-out, no longer
+the default — there are no pins to restore. The TTL and the reasoning are in
+[Session-affinity pins survive a
 restart](architecture.md#session-affinity-pins-survive-a-restart).
 
 ## An account is disabled in the config but still getting traffic
