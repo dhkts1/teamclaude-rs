@@ -152,12 +152,57 @@ fi
 # Stop only OUR app, and only the copy being replaced. `pkill -f TcrBar` would
 # also match an editor with the name in its title or a grep for it. This happens
 # after verification so a bad build never costs you the running app.
+#
+# The supervised proxy at Contents/MacOS/tcr is a SEPARATE executable from
+# Contents/MacOS/TcrBar, so pkill -f "$RUNNING_PATTERN" above never touches it
+# — and `applicationWillTerminate` does not run on a raw SIGTERM, so quitting
+# TcrBar does not reap it either. Measured live: after install.sh reported
+# success, /Applications/TcrBar.app was the new build but the process actually
+# serving traffic was still the OLD tcr binary from the replaced bundle,
+# reparented to init (PPID 1) and still holding port 3456 — the newly
+# installed TcrBar then started its own server with --no-replace, found the
+# port taken, and stood down. The install looked clean while stale code served
+# every request; `tcr status --json`'s serverSha is what exposed it. So the
+# child gets its own DEST-derived pattern and its own explicit kill, exactly
+# like RUNNING_PATTERN: never a bare `pkill -f tcr` (would also match a
+# dev-path install, or anything else named tcr) and never a port match (same
+# blast radius, and the very check that would race the thing it's checking).
+CHILD_PATTERN="$DEST/Contents/MacOS/tcr"
+
 if pgrep -f "$RUNNING_PATTERN" >/dev/null 2>&1; then
   echo "==> Stopping the running $(basename "$DEST" .app)…"
   pkill -f "$RUNNING_PATTERN" || true
   STOPPED_APP=1
-  # Give the supervised child, if any, a moment to be reaped cleanly.
-  sleep 1
+
+  # Only stop the child belonging to the app we just stopped — a standalone
+  # proxy run from some other bundle (or a dev install) is left alone.
+  if pgrep -f "$CHILD_PATTERN" >/dev/null 2>&1; then
+    echo "==> Stopping the supervised proxy it leaves running…"
+    pkill -f "$CHILD_PATTERN" || true
+    # Bounded wait for it to actually exit — not a blind `sleep 1`, which is
+    # exactly the assumption that let the stale-serving-code bug above go
+    # unnoticed: a still-held port 3456 is silent until something checks it.
+    # Poll instead of assuming any fixed delay is enough, and cap it so a
+    # child that refuses to die does not hang the install.
+    waited_ms=0
+    while pgrep -f "$CHILD_PATTERN" >/dev/null 2>&1; do
+      if [ "$waited_ms" -ge 5000 ]; then
+        echo "" >&2
+        echo "WARNING: the supervised proxy at $CHILD_PATTERN did not exit" >&2
+        echo "         within 5s of being stopped. It may still be holding" >&2
+        echo "         port 3456, which will make the newly installed" >&2
+        echo "         ${APP_NAME} stand its own server down instead of" >&2
+        echo "         serving — the exact bug this check exists to catch." >&2
+        echo "         Check with: pgrep -fl \"$CHILD_PATTERN\"" >&2
+        break
+      fi
+      sleep 0.1
+      waited_ms=$((waited_ms + 100))
+    done
+    if ! pgrep -f "$CHILD_PATTERN" >/dev/null 2>&1; then
+      echo "==> Supervised proxy stopped."
+    fi
+  fi
 fi
 
 echo "==> Installing to ${DEST}…"

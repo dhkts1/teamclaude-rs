@@ -194,8 +194,9 @@ struct FleetView: View {
     }
 
     private func rowStack(_ fleet: Fleet) -> some View {
-        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            ForEach(fleet.rowsInDisplayOrder) { account in
+        let rows = fleet.rowsInDisplayOrder(pinning: control.current)
+        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            ForEach(Array(rows.enumerated()), id: \.element.id) { index, account in
                 AccountRow(
                     account: account,
                     countersAreStructural: fleet.source.countersAreStructural,
@@ -210,6 +211,14 @@ struct FleetView: View {
                             key: RowHeightsKey.self, value: [account.id: proxy.size.height])
                     }
                 )
+                // A thin separator between the pinned control row and the
+                // rotation pool below it — the same `Hairline` this panel
+                // already uses to mark a scope boundary (see `appActions`).
+                // Only drawn when the control row is actually first: index 0
+                // is an ordinary pool row on every fleet without one set.
+                if index == 0, account.name == control.current {
+                    Hairline()
+                }
             }
         }
     }
@@ -228,7 +237,9 @@ struct FleetView: View {
     /// always-room-for-roughly-8-rows behaviour — so the panel never renders
     /// at zero or one-row height while waiting for a real measurement.
     private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
-        let orderedHeights = fleet.rowsInDisplayOrder.compactMap { rowHeights[$0.id] }
+        let orderedHeights = fleet.rowsInDisplayOrder(pinning: control.current).compactMap {
+            rowHeights[$0.id]
+        }
         guard !orderedHeights.isEmpty else {
             return Tok.panelMaxHeight
         }

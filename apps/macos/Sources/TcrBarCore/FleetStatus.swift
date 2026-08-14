@@ -687,6 +687,32 @@ public struct Fleet: Equatable, Sendable {
         }
     }
 
+    /// ``rowsInDisplayOrder``, with the identity-bound control account (if any)
+    /// pinned to the very front — above the rotation pool, ahead of even an
+    /// otherwise-first `ok` row.
+    ///
+    /// `controlName` is not a field on ``Account``: the control account is read
+    /// via `tcr control --show` (`ControlAccountController`), a source
+    /// deliberately separate from `tcr status --json` — see that controller's
+    /// doc-comment. So this takes the name as a parameter instead of reading it
+    /// off the row, and the caller (`FleetView`) is the one place that already
+    /// holds both a `Fleet` and a `ControlAccountController`.
+    ///
+    /// A **stable partition**, not a re-sort: everything that isn't the control
+    /// row keeps the exact relative order ``rowsInDisplayOrder`` already gave
+    /// it. `controlName == nil` — no control account set, or this build cannot
+    /// ask (``ControlAccountController/unavailable``, which always pairs with a
+    /// `nil` `current`) — leaves the order byte-identical to
+    /// ``rowsInDisplayOrder``, which is the common case.
+    public func rowsInDisplayOrder(pinning controlName: String?) -> [Account] {
+        let ordered = rowsInDisplayOrder
+        guard let controlName else { return ordered }
+        let control = ordered.filter { $0.name == controlName }
+        guard !control.isEmpty else { return ordered }
+        let rest = ordered.filter { $0.name != controlName }
+        return control + rest
+    }
+
     // MARK: Capacity summary
     //
     // The panel lists every account, which answers "what is each one doing" but
