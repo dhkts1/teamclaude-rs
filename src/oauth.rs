@@ -1251,28 +1251,70 @@ fn assert_requested_identity(
     Ok(())
 }
 
-/// The file half of a login: `upsert_account` + whole-file [`config::save`].
-/// Exactly what `login()` always did, kept as its own function so both
-/// [`LoginRoute::File`] and every live-path fallback in [`finish_login`] run
-/// the identical sequence rather than duplicating it.
+/// The file half of a login: a surgical [`config::save_account`] write built
+/// from `name`/`tokens`/`profile`, sharing the exact identity-resolution and
+/// backfill semantics [`upsert_account`] used to apply in memory.
+///
+/// Used to be `upsert_account` (mutating the in-memory `config` this
+/// process loaded at the top of `login()`) followed by a whole-file
+/// [`config::save`] of that snapshot. That snapshot is taken BEFORE the
+/// profile fetch, the browser round-trip and a possibly-unbounded stdin
+/// prompt — the exact window `persist_via_account`'s doc-comment names —
+/// so a whole-file write here silently reverted anything an out-of-band
+/// writer (a live `tcr` server, a concurrent `tcr login`, a hand-edited
+/// top-level key such as `sessionAffinity`) added or changed on disk during
+/// that window. `config::save_account` re-reads the document fresh from
+/// disk immediately before writing and touches only `name`'s own row, so
+/// there is nothing left in this path for a stale in-memory snapshot to
+/// clobber. `config` is accepted but intentionally left unmutated: nothing
+/// downstream of `login()` reads it after this call returns (`finish_login`
+/// is `login()`'s tail expression), and mutating it here would just
+/// resurrect the same stale-snapshot hazard on any FUTURE caller that grew
+/// a reason to read `config` back after this call.
+///
+/// One case `config::save_account` cannot serve on its own: no file exists
+/// at `config_path` yet at all. Its `read_document` is a bare
+/// `fs::read_to_string`, which cannot create a missing path — mirrors the
+/// same NotFound guard [`persist_via_account_or_file`] already carries for
+/// exactly this reason. There is nothing on disk in that case for a stale
+/// snapshot to clobber, so falling back to a fresh single-account
+/// [`config::save`] is safe rather than a reintroduction of the hazard this
+/// function exists to remove.
 fn persist_via_file(
     config_path: &Path,
-    config: &mut Config,
+    _config: &mut Config,
     name: &str,
     tokens: &Tokens,
     profile: Profile,
 ) -> anyhow::Result<String> {
-    upsert_account(
-        config,
-        name,
-        tokens,
-        profile.account_uuid,
-        profile.org_uuid,
-        profile.org_name,
-    )?;
-    config::save(config_path, config).context("save config after login")?;
-    println!("Saved account '{name}' to {}", config_path.display());
-    Ok(name.to_string())
+    let account = Account {
+        name: name.to_string(),
+        account_type: "oauth".to_string(),
+        account_uuid: profile.account_uuid,
+        org_uuid: profile.org_uuid,
+        org_name: profile.org_name,
+        access_token: tokens.access_token.clone(),
+        refresh_token: Some(tokens.refresh_token.clone()),
+        expires_at: Some(tokens.expires_at_ms),
+        priority: None,
+        switch_threshold: None,
+        disabled: None,
+        extra: serde_json::Map::new(),
+    };
+    match config::save_account(config_path, &account) {
+        Ok(outcome) => account_write_result(config_path, &account, outcome),
+        Err(config::ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            let mut fresh: Config =
+                serde_json::from_str("{}").expect("empty object is a valid default config");
+            let mut first_account = account;
+            first_account.priority = Some(0);
+            fresh.accounts.push(first_account);
+            config::save(config_path, &fresh).context("save config after login")?;
+            println!("Saved account '{name}' to {}", config_path.display());
+            Ok(name.to_string())
+        }
+        Err(err) => Err(err).context("save config after login"),
+    }
 }
 
 /// The surgical half of a live-route fallback — [`config::save_account`]'s
@@ -3359,6 +3401,97 @@ mod tests {
             serde_json::json!("rt-alice-ROTATED"),
             "the NoServer live add must NOT whole-file-write a stale snapshot back over \
              alice's rotation: {final_doc}"
+        );
+        assert!(
+            accounts.iter().any(|a| a["name"] == "carol@example.com"),
+            "carol was added: {final_doc}"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// THE σ5 EXPERIMENT for `LoginRoute::File` itself — the arm
+    /// `persist_via_file` serves directly, not one of its live-path
+    /// fallbacks. Reproduces the 2026-08-14 incident: a `tcr login` lands on
+    /// `File` (no live proxy answers on the guarded port — the exact
+    /// condition every restart window produces), and while that login's own
+    /// async window (profile fetch / possible stdin prompt) is open, TWO
+    /// things change on disk out from under the config snapshot this call
+    /// was handed: an unrelated top-level key gets added (standing in for
+    /// `sessionAffinity`, which is exactly this shape — a key with no
+    /// modelled field in [`Config`] at all, so nothing short of a
+    /// document-level fresh read can preserve it) and a DIFFERENT account's
+    /// tokens get rotated by some other writer. Before this fix,
+    /// `persist_via_file` whole-file-saved the stale snapshot taken before
+    /// this call, silently reverting both — watched failing directly: with
+    /// `persist_via_file` reverted to `upsert_account` + whole-file
+    /// [`config::save`], this test fails on the `sessionAffinity` assertion
+    /// first (the key is entirely unmodelled, so it cannot survive a
+    /// snapshot round-trip at all) and, independently, on the rotated
+    /// refresh token.
+    #[tokio::test]
+    async fn finish_login_file_route_does_not_clobber_out_of_band_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-file-route-clobber-{}.json",
+            std::process::id()
+        ));
+        let seed = r#"{ "accounts": [
+            { "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+              "refreshToken": "rt-alice", "expiresAt": 1893456000000, "priority": 0 }
+        ] }"#;
+        std::fs::write(&path, seed).unwrap();
+
+        // The stale snapshot: what `login()` loads before its own async
+        // window (profile fetch / possible stdin prompt) opens. No live
+        // proxy is involved at all — this is the historical `File` route.
+        let mut client_config = load_or_default(&path).unwrap();
+
+        // Out-of-band changes land on disk AFTER that snapshot was taken:
+        // an unmodelled top-level key (standing in for `sessionAffinity`)
+        // and a rotation of alice's tokens by some other writer.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["sessionAffinity"] = serde_json::json!(true);
+        doc["accounts"][0]["accessToken"] = serde_json::json!("at-alice-ROTATED");
+        doc["accounts"][0]["refreshToken"] = serde_json::json!("rt-alice-ROTATED");
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let after_out_of_band = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_out_of_band.contains("rt-alice-ROTATED")
+                && after_out_of_band.contains("sessionAffinity"),
+            "setup: both out-of-band changes must be on disk first: {after_out_of_band}"
+        );
+
+        let name = finish_login(
+            &path,
+            LoginRoute::File,
+            &mut client_config,
+            "carol@example.com",
+            &tokens("at-carol", "rt-carol", 1_893_456_000_000),
+            profile_named("carol@example.com"),
+        )
+        .await
+        .expect("the File route must still succeed");
+        assert_eq!(name, "carol@example.com");
+
+        let final_doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            final_doc["sessionAffinity"],
+            serde_json::json!(true),
+            "the File route must NOT whole-file-write a stale snapshot back over an \
+             out-of-band top-level key: {final_doc}"
+        );
+        let accounts = final_doc["accounts"].as_array().unwrap();
+        let alice = accounts
+            .iter()
+            .find(|a| a["name"] == "alice@example.com")
+            .expect("alice must still be on disk");
+        assert_eq!(
+            alice["refreshToken"],
+            serde_json::json!("rt-alice-ROTATED"),
+            "the File route must NOT whole-file-write a stale snapshot back over an \
+             out-of-band rotation: {final_doc}"
         );
         assert!(
             accounts.iter().any(|a| a["name"] == "carol@example.com"),
