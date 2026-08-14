@@ -133,11 +133,25 @@ fi
 # ---------------------------------------------------------------------------
 # 2 — the tag does not exist, locally OR on origin
 # ---------------------------------------------------------------------------
-check "2/5  the tag does not already exist"
+check "2/5  the tag does not name a different commit"
+# The guard is against a tag that names OTHER code, not against the tag
+# existing: the documented order pushes vX.Y.Z first, because that push is what
+# starts the release, and the local script then uploads onto the Release the
+# push created. A tag that already points at HEAD is therefore the expected
+# state here. What must still refuse is a tag pointing somewhere else — that is
+# the v0.2.4 incident, where a tag was re-pointed onto a commit that did not
+# carry the fix and the release shipped code the tag did not name.
+head_sha="$(git -C "$repo_root" rev-parse HEAD)"
 if git -C "$repo_root" rev-parse -q --verify "refs/tags/$tag" >/dev/null 2>&1; then
-  fail "$tag already exists as a LOCAL tag." \
-       "Releasing again would either be a no-op or move a published tag." \
-       "Inspect it first:  git show $tag --stat"
+  local_tag_sha="$(git -C "$repo_root" rev-parse "$tag^{commit}")"
+  if [ "$local_tag_sha" = "$head_sha" ]; then
+    ok "local tag $tag points at HEAD"
+  else
+    fail "$tag exists as a LOCAL tag naming a DIFFERENT commit than HEAD." \
+         "Releasing would publish assets for code the tag does not name." \
+         "Inspect it first:  git show $tag --stat" \
+         "tag: ${local_tag_sha:0:12}  HEAD: ${head_sha:0:12}"
+  fi
 else
   ok "no local tag $tag"
 fi
@@ -153,9 +167,16 @@ remote_rc=$?
 set -e
 case "$remote_rc" in
   0)
-    fail "$tag already exists on origin." \
-         "Pushing it again cannot start a release, and a release may already" \
-         "be in flight for it — see check 4/5 below." ;;
+    remote_sha="${remote_out%%$'\t'*}"
+    if [ "$remote_sha" = "$head_sha" ]; then
+      ok "tag $tag on origin points at HEAD — the tag push is what starts the release"
+    else
+      fail "$tag exists on origin naming a DIFFERENT commit than HEAD." \
+           "A release started now would upload assets for code the published" \
+           "tag does not name, and moving a published tag is the v0.2.4" \
+           "incident. Reconcile the tag before releasing." \
+           "origin: ${remote_sha:0:12}  HEAD: ${head_sha:0:12}"
+    fi ;;
   2)
     ok "no tag $tag on origin" ;;
   *)
