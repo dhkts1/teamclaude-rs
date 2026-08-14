@@ -161,21 +161,43 @@ fi
 # the release, so the remote is the only authority. --exit-code makes the three
 # outcomes distinguishable — 0 found, 2 no such ref, anything else an error we
 # must NOT read as "absent".
+#
+# Two refs are asked for, not one: for an ANNOTATED tag (`git tag -a`, what
+# this project uses), `refs/tags/$tag` names the tag OBJECT, not the commit —
+# ls-remote returns that wrapper's own sha, which never equals a commit sha and
+# so always disagreed with $head_sha even when the tag was correct. The peeled
+# form `refs/tags/$tag^{}` is what ls-remote reports as the commit the tag
+# points at; a LIGHTWEIGHT tag has no such entry because it IS the commit ref,
+# so the plain form is used only when the peeled one is absent — never compare
+# a wrapper sha to a commit sha.
 set +e
-remote_out="$(git -C "$repo_root" ls-remote --exit-code --tags origin "refs/tags/$tag" 2>&1)"
+remote_out="$(git -C "$repo_root" ls-remote --exit-code --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" 2>&1)"
 remote_rc=$?
 set -e
 case "$remote_rc" in
   0)
-    remote_sha="${remote_out%%$'\t'*}"
-    if [ "$remote_sha" = "$head_sha" ]; then
-      ok "tag $tag on origin points at HEAD — the tag push is what starts the release"
+    remote_peeled_sha=""
+    remote_plain_sha=""
+    while IFS=$'\t' read -r sha ref; do
+      case "$ref" in
+        "refs/tags/$tag^{}") remote_peeled_sha="$sha" ;;
+        "refs/tags/$tag") remote_plain_sha="$sha" ;;
+      esac
+    done <<<"$remote_out"
+    remote_sha="${remote_peeled_sha:-$remote_plain_sha}"
+    if [ -z "$remote_sha" ]; then
+      fail "ls-remote reported $tag but neither the peeled commit nor the" \
+           "plain ref could be parsed out of its output." \
+           "Not treated as absent: an unread answer is not a pass." \
+           "git said: ${remote_out:-<no output>}"
+    elif [ "$remote_sha" = "$head_sha" ]; then
+      ok "tag $tag on origin points at HEAD (commit ${remote_sha:0:12}) — the tag push is what starts the release"
     else
       fail "$tag exists on origin naming a DIFFERENT commit than HEAD." \
            "A release started now would upload assets for code the published" \
            "tag does not name, and moving a published tag is the v0.2.4" \
            "incident. Reconcile the tag before releasing." \
-           "origin: ${remote_sha:0:12}  HEAD: ${head_sha:0:12}"
+           "origin (commit): ${remote_sha:0:12}  HEAD: ${head_sha:0:12}"
     fi ;;
   2)
     ok "no tag $tag on origin" ;;
@@ -224,38 +246,53 @@ else
   # have to be told apart: a 404 means no release yet (fine, the normal case)
   # while an auth or network error means we do not know (never fine). Anything
   # that is not a clean 404 and not a clean success is a failure here.
+  #
+  # `is_draft`/`is_prerelease` come out of the SAME call: `releases/latest`
+  # skips both a draft and a prerelease and falls back to the next eligible
+  # release, so an assetless release that is EITHER is not serving the feed —
+  # it is exactly the state check 4's own remedy tells an operator to reach
+  # for (`gh release edit $tag --prerelease`). Failing on that state refuses
+  # the very remedy it recommends.
   set +e
-  assets="$(gh api "repos/$repo/releases/tags/$tag" --jq '[.assets[].name] | join(" ")' 2>&1)"
+  api_out="$(gh api "repos/$repo/releases/tags/$tag" --jq '[([.assets[].name] | join(" ")), (.draft|tostring), (.prerelease|tostring)] | join("\t")' 2>&1)"
   api_rc=$?
   set -e
   if [ "$api_rc" = 0 ]; then
+    IFS=$'\t' read -r assets is_draft is_prerelease <<<"$api_out"
     case " $assets " in
       *" appcast.xml "*)
         ok "release $tag exists and already carries appcast.xml" ;;
       *)
-        fail "release $tag ALREADY EXISTS and has no appcast.xml asset." \
-             "The update feed is dark RIGHT NOW: releases/latest/download/appcast.xml" \
-             "is the URL Sparkle fetches, and it resolves to this release." \
-             "Every installed copy's update check is failing with" \
-             "\"An error occurred in retrieving update information\", and GitHub's" \
-             "CDN caches that 404 against the exact URL Sparkle requests." \
-             "Measured on v0.2.4, 2026-08-10: 11m 37s of outage this way." \
-             "" \
-             "Do NOT start another release. Finish this one, or step out of the" \
-             "way of the feed:" \
-             "  gh release edit $tag --prerelease --repo $repo   # latest falls back" \
-             "  gh release upload $tag <dmg> $appcast_rel --clobber --repo $repo" \
-             "  gh release edit $tag --prerelease=false --latest --repo $repo" \
-             "" \
-             "assets currently on it: ${assets:-<none>}" ;;
+        if [ "$is_draft" = "true" ] || [ "$is_prerelease" = "true" ]; then
+          ok "release $tag exists, is assetless, but is $( [ "$is_draft" = "true" ] && printf draft || printf prerelease )." \
+             "releases/latest/download/appcast.xml falls back past it, so it is" \
+             "not serving the feed. It still needs finishing before it can go" \
+             "live: assets currently on it: ${assets:-<none>}"
+        else
+          fail "release $tag ALREADY EXISTS and has no appcast.xml asset." \
+               "The update feed is dark RIGHT NOW: releases/latest/download/appcast.xml" \
+               "is the URL Sparkle fetches, and it resolves to this release." \
+               "Every installed copy's update check is failing with" \
+               "\"An error occurred in retrieving update information\", and GitHub's" \
+               "CDN caches that 404 against the exact URL Sparkle requests." \
+               "Measured on v0.2.4, 2026-08-10: 11m 37s of outage this way." \
+               "" \
+               "Do NOT start another release. Finish this one, or step out of the" \
+               "way of the feed:" \
+               "  gh release edit $tag --prerelease --repo $repo   # latest falls back" \
+               "  gh release upload $tag <dmg> $appcast_rel --clobber --repo $repo" \
+               "  gh release edit $tag --prerelease=false --latest --repo $repo" \
+               "" \
+               "assets currently on it: ${assets:-<none>}"
+        fi ;;
     esac
-  elif printf '%s' "$assets" | grep -q '404'; then
+  elif printf '%s' "$api_out" | grep -q '404'; then
     ok "no GitHub Release for $tag yet — nothing is serving an empty feed"
   else
     fail "could not ask GitHub about release $tag." \
          "Not treated as absent: this is the check that stands between a user" \
          "and a broken update feed, and it must not pass on an unread answer." \
-         "gh said: ${assets:-<no output>}"
+         "gh said: ${api_out:-<no output>}"
   fi
 fi
 
