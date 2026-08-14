@@ -666,8 +666,10 @@ struct SessionStat {
     requests: u64,
     last_seen_ms: i64,
     /// [`SessionKind::Stable`] when this session was keyed on a stable client identity
-    /// (x-api-key / `metadata.user_id`); [`SessionKind::Fallback`] when there was none
-    /// and the request served unpinned. DISPLAY provenance only — never routing.
+    /// (x-api-key / `metadata.user_id`); [`SessionKind::Prefix`] when there was none
+    /// but a `system`/`tools` hash pinned it anyway; [`SessionKind::Fallback`] when
+    /// there was neither and the request served unpinned. DISPLAY provenance
+    /// only — never routing.
     kind: SessionKind,
 }
 

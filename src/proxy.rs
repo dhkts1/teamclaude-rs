@@ -389,10 +389,12 @@ pub struct ClientAddr(pub SocketAddr);
 pub struct SessionKey(pub u64);
 
 /// A deterministic hash of `prefix` + `value`, used to derive a stable affinity
-/// key. `DefaultHasher` is deterministic within a process (unlike a randomized
-/// `RandomState`), which is all affinity needs — the map lives for the process's
-/// lifetime. The `prefix` namespaces the input space so an x-api-key and a
-/// `user_id` with the same string never collide onto one account.
+/// key. What this needs to hold is DETERMINISM ACROSS PROCESSES, not just
+/// within one — pins now persist to disk and are restored at boot (see
+/// [`crate::affinity`]), so a hash that only agreed with itself for the
+/// lifetime of one process would silently stop matching every restart. That
+/// property is documented, measured and cited at [`crate::affinity::StoredPin::key`]
+/// — read it there rather than re-deriving it here.
 fn stable_hash(prefix: &str, value: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -401,16 +403,71 @@ fn stable_hash(prefix: &str, value: &str) -> u64 {
     hasher.finish()
 }
 
-/// Minimal shape reading only top-level `metadata.user_id`, ignoring everything
-/// else. Mirrors [`crate::model::parse_request_model`]'s lenient peek.
+/// Combined single-pass peek for [`stable_session_key`]: the body's top-level
+/// `metadata.user_id` (tier 2) and its `system`/`tools` fields (tier 3's
+/// cacheable prefix), read with ONE `serde_json::from_slice` instead of one
+/// per tier — the two used to be independent structs (`MetadataPeek` /
+/// `PrefixPeek`), each parsing the same bytes again.
+///
+/// `system`/`tools` are `&RawValue`, so the returned slices borrow the
+/// VERBATIM source bytes out of `body` rather than a re-serialized copy (same
+/// technique as `account_uuid.rs`'s `BodyPeek`). That verbatim-ness is
+/// load-bearing for tier 3: see [`prefix_session_key`].
 #[derive(serde::Deserialize)]
-struct MetadataPeek {
+struct SessionKeyPeek<'a> {
     metadata: Option<UserIdMeta>,
+    #[serde(borrow)]
+    system: Option<&'a serde_json::value::RawValue>,
+    #[serde(borrow)]
+    tools: Option<&'a serde_json::value::RawValue>,
 }
 
 #[derive(serde::Deserialize)]
 struct UserIdMeta {
     user_id: Option<String>,
+}
+
+/// Tier 3 of [`stable_session_key`]: derive a fallback affinity key from the
+/// request's cacheable prefix — its already-parsed `system`/`tools` fields
+/// (see [`SessionKeyPeek`]) — when the client carries no stable identity at
+/// all. Returns `None` when BOTH are absent — there is then no cacheable
+/// prefix, so a pin buys no cache win and only concentrates unrelated
+/// anonymous traffic onto one account. This is the guard that stops every
+/// trivial anonymous request (no system prompt, no tools) from piling onto a
+/// single account; do not drop it.
+///
+/// Hashes the RAW bytes of each field via `RawValue::get()` — never
+/// canonicalized — namespaced under `"pfx:"` so this input space cannot collide
+/// with the `"key:"` / `"uid:"` tiers. `system` and `tools` are hashed as
+/// `Option<&str>` (not concatenated into one string) so presence/absence of
+/// each field is part of the hash input and a `(None, Some("ab"))` pair can
+/// never collide with a `(Some("ab"), None)` pair; `str`'s own `Hash` impl
+/// appends a sentinel byte after each value, so this is also safe against a
+/// `system`/`tools` boundary shift (e.g. `("a", "bc")` vs `("ab", "c")`).
+///
+/// Deliberately NO minimum-size floor. A tiny `system`/`tools` field that can
+/// never reach Anthropic's minimum cacheable-prefix length pins for zero cache
+/// benefit — a floor would fix that. But the floor would have to be a BYTE
+/// count on the raw JSON text, while Anthropic's minimum is a TOKEN count on
+/// tokenized content, and this proxy has no tokenizer: it never decodes model
+/// text, only relays bytes. Any byte→token constant here would be an
+/// undefended guess — wrong in one direction wastes the tier's whole purpose,
+/// wrong in the other pins traffic that was never going to hit cache. Omitted;
+/// revisit only with either a real tokenizer in this process or a measured
+/// bytes-per-token ratio from live traffic to ground the constant.
+fn prefix_session_key(
+    system: Option<&serde_json::value::RawValue>,
+    tools: Option<&serde_json::value::RawValue>,
+) -> Option<u64> {
+    if system.is_none() && tools.is_none() {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "pfx:".hash(&mut hasher);
+    system.map(|v| v.get()).hash(&mut hasher);
+    tools.map(|v| v.get()).hash(&mut hasher);
+    Some(hasher.finish())
 }
 
 /// Derive a STABLE affinity key from the client's most durable identity, so a
@@ -428,24 +485,79 @@ struct UserIdMeta {
 ///      subagents to one account (warm prompt cache). Do NOT key on the
 ///      `x-claude-code-session-id` HEADER instead: it forks on resume and varies
 ///      across sidechain requests, which would cold-start the cache. Else
-///   3. `None` — the request has no stable identity and routes UNPINNED (plain
-///      LRU). It deliberately does NOT fall back to the per-connection
-///      [`SessionKey`]: that mints a pin no reconnect can ever reuse or reclaim.
+///   3. a hash of the request's cacheable prefix (`system` + `tools`, see
+///      [`prefix_session_key`]) — weaker than 1/2 because it says nothing about
+///      the CLIENT, only about what this one request would cache identically
+///      with another, so it is scoped MUCH more narrowly than tiers 1/2. Still
+///      routes reconnects of an SDK/`curl` caller with no identity onto the
+///      same account instead of cold-starting every request, and self-balances
+///      because distinct prefixes hash to distinct accounts. Else
+///   4. `None` — no stable identity and no in-scope cacheable prefix, so the
+///      request routes UNPINNED (plain LRU). It deliberately does NOT fall
+///      back to the per-connection [`SessionKey`]: that mints a pin no
+///      reconnect can ever reuse or reclaim.
 ///
-/// Returns `None` on absence/parse failure, which routes the request unpinned.
-fn stable_session_key(headers: &HeaderMap, body: &[u8], proxy_key: Option<&str>) -> Option<u64> {
+/// Tier 3's scope, and why both halves are required:
+///
+/// - **`POST /v1/messages` only**, exact match on `path`, not a prefix match —
+///   `/v1/messages/count_tokens` must NOT qualify. Anthropic documents that
+///   token counting never uses prompt caching, so pinning it would concentrate
+///   load for zero cache benefit. `path` is the caller's ALREADY
+///   query-stripped path — see `handle`, which matches the same guards this
+///   way.
+/// - **Loopback callers only**, via `client_is_loopback` (the same
+///   [`ClientAddr`] extension `handle`'s api-key gate uses). Tier 1 already
+///   refuses to key on `x-api-key` when it equals the configured proxy secret,
+///   specifically so remote clients sharing that secret don't collapse onto
+///   one account (see the comment below). Tier 3 has no such secret to check —
+///   it keys off the request BODY — so without this gate N remote workers
+///   sharing one harness (one system prompt) would collapse onto one account
+///   through the exact back door tier 1 closes. A loopback proxy serves one
+///   real user; a non-loopback deployment may not. (`IpAddr::is_loopback`
+///   does not recognize an IPv4-mapped IPv6 peer like `::ffff:127.0.0.1` as
+///   loopback, so such a peer reads as remote and fails CLOSED here — the
+///   safe direction, and the same primitive [`ClientAddr`]'s own doc-comment
+///   and the api-key exemption already accept this same way.)
+///
+/// Returns `None` on absence/parse failure at every tier, which routes the
+/// request unpinned. The paired [`SessionKind`] records WHICH tier produced the
+/// key — display provenance only, never a routing input.
+fn stable_session_key(
+    headers: &HeaderMap,
+    body: &[u8],
+    proxy_key: Option<&str>,
+    method: &Method,
+    path: &str,
+    client_is_loopback: bool,
+) -> Option<(u64, SessionKind)> {
     if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
         // The shared proxy secret is not a client identity — skip it so remote
         // clients don't all collapse onto one account.
         if proxy_key != Some(key) {
-            return Some(stable_hash("key:", key));
+            return Some((stable_hash("key:", key), SessionKind::Stable));
         }
     }
-    let user_id = serde_json::from_slice::<MetadataPeek>(body)
-        .ok()
-        .and_then(|p| p.metadata)
-        .and_then(|m| m.user_id)?;
-    Some(stable_hash("uid:", &user_id))
+
+    // ONE parse serves both tier 2 (`metadata.user_id`) and tier 3
+    // (`system`/`tools`) — see [`SessionKeyPeek`].
+    let peek = serde_json::from_slice::<SessionKeyPeek>(body).ok();
+
+    if let Some(user_id) = peek
+        .as_ref()
+        .and_then(|p| p.metadata.as_ref())
+        .and_then(|m| m.user_id.as_deref())
+    {
+        return Some((stable_hash("uid:", user_id), SessionKind::Stable));
+    }
+
+    // Tier 3's scope guard — see the doc-comment above for why both halves are
+    // load-bearing. `path` must match EXACTLY: `/v1/messages` and nothing
+    // longer (`/v1/messages/count_tokens`), nothing shorter.
+    if !client_is_loopback || *method != Method::POST || path != "/v1/messages" {
+        return None;
+    }
+    let peek = peek?;
+    prefix_session_key(peek.system, peek.tools).map(|key| (key, SessionKind::Prefix))
 }
 
 /// Path of the read-only live-status endpoint [`status_handler`] serves.
@@ -1635,18 +1747,30 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
     // rotation) by default. When on, key on the most STABLE client identity —
-    // x-api-key, then body `metadata.user_id` — so a client that drops and
-    // reconnects (new connection key) still maps to the SAME account and keeps
-    // its per-account prompt cache warm. With NO stable identity the request routes
-    // UNPINNED (plain LRU): a per-connection key is not a session key — it mints a
-    // fresh pin per connection that nothing ever removes, and those ghosts (93% of
-    // the live pin map) both bloat it and inflate the pinned-session counts that
-    // drive the migration decision in `select`. `session_kind` records WHICH branch
-    // produced the key (stable identity vs unpinned fallback) — DISPLAY provenance
-    // only, threaded into `record_served`.
+    // x-api-key, then body `metadata.user_id`, then (for a loopback
+    // `POST /v1/messages` with neither) a hash of the body's cacheable prefix
+    // (`system` + `tools`, see [`stable_session_key`] and [`prefix_session_key`])
+    // — so a client that drops and reconnects (new connection key) still maps
+    // to the SAME account and keeps its per-account prompt cache warm, and even
+    // a client with no stable identity at all still pins on what it would cache
+    // identically. Only with NEITHER an identity NOR an in-scope cacheable
+    // prefix does the request route UNPINNED (plain LRU): a per-connection key
+    // is not a session key — it mints a fresh pin per connection that nothing
+    // ever removes, and those ghosts (93% of the live pin map, before this tier
+    // existed) both bloat it and inflate the pinned-session counts that drive
+    // the migration decision in `select`. `session_kind` records WHICH tier
+    // produced the key (stable identity / prefix-derived / unpinned fallback)
+    // — DISPLAY provenance only, threaded into `record_served`.
     let (session_key, session_kind) = match parts.extensions.get::<SessionKey>() {
-        Some(_) => match stable_session_key(&req_headers, &body_bytes, manager.proxy_api_key()) {
-            Some(key) => (Some(key), SessionKind::Stable),
+        Some(_) => match stable_session_key(
+            &req_headers,
+            &body_bytes,
+            manager.proxy_api_key(),
+            &method,
+            &path,
+            client_is_loopback,
+        ) {
+            Some((key, kind)) => (Some(key), kind),
             None => (None, SessionKind::Fallback),
         },
         None => (None, SessionKind::Fallback),
@@ -3251,6 +3375,26 @@ mod tests {
         h
     }
 
+    /// The scope tier 3 requires: a loopback `POST /v1/messages`. Tiers 1/2
+    /// don't care about method/path/loopback, so tests exercising ONLY those
+    /// tiers call `stable_session_key` through this helper rather than
+    /// re-stating the tier-3 gate at every call site; tests of the gate itself
+    /// call `stable_session_key` directly with a different method/path/loopback.
+    fn messages_key(
+        headers: &HeaderMap,
+        body: &[u8],
+        proxy_key: Option<&str>,
+    ) -> Option<(u64, SessionKind)> {
+        stable_session_key(
+            headers,
+            body,
+            proxy_key,
+            &Method::POST,
+            "/v1/messages",
+            true,
+        )
+    }
+
     #[test]
     fn parse_retry_after_ignores_rfc_date() {
         // Numeric seconds parse to Some(n).
@@ -3458,8 +3602,8 @@ mod tests {
     #[test]
     fn stable_session_key_is_deterministic_for_api_key() {
         let h = headers_with_api_key("sk-team-alice");
-        let a = stable_session_key(&h, b"{}", None);
-        let b = stable_session_key(&h, b"{}", None);
+        let a = messages_key(&h, b"{}", None);
+        let b = messages_key(&h, b"{}", None);
         assert_eq!(a, b, "same x-api-key must survive a reconnect");
         assert!(a.is_some());
     }
@@ -3468,8 +3612,8 @@ mod tests {
     fn stable_session_key_is_deterministic_for_user_id() {
         let body = br#"{"metadata":{"user_id":"user-123"},"messages":[]}"#;
         let h = HeaderMap::new();
-        let a = stable_session_key(&h, body, None);
-        let b = stable_session_key(&h, body, None);
+        let a = messages_key(&h, body, None);
+        let b = messages_key(&h, body, None);
         assert_eq!(a, b, "same user_id must survive a reconnect");
         assert!(a.is_some());
     }
@@ -3477,16 +3621,16 @@ mod tests {
     #[test]
     fn stable_session_key_prefers_api_key_over_user_id() {
         let body = br#"{"metadata":{"user_id":"user-123"}}"#;
-        let with_key = stable_session_key(&headers_with_api_key("the-key"), body, None);
-        let key_only = stable_session_key(&headers_with_api_key("the-key"), b"{}", None);
+        let with_key = messages_key(&headers_with_api_key("the-key"), body, None);
+        let key_only = messages_key(&headers_with_api_key("the-key"), b"{}", None);
         assert_eq!(with_key, key_only, "x-api-key must win over user_id");
     }
 
     #[test]
     fn stable_session_key_namespaces_key_vs_uid() {
         // An x-api-key "abc" and a user_id "abc" must NOT collide.
-        let from_key = stable_session_key(&headers_with_api_key("abc"), b"{}", None);
-        let from_uid = stable_session_key(
+        let from_key = messages_key(&headers_with_api_key("abc"), b"{}", None);
+        let from_uid = messages_key(
             &HeaderMap::new(),
             br#"{"metadata":{"user_id":"abc"}}"#,
             None,
@@ -3496,9 +3640,10 @@ mod tests {
 
     #[test]
     fn stable_session_key_none_without_identity() {
-        // No x-api-key and no top-level metadata.user_id → fall back to conn key.
+        // No x-api-key, no top-level metadata.user_id, no system/tools → None
+        // even ON the endpoint and origin tier 3 is scoped to.
         assert_eq!(
-            stable_session_key(&HeaderMap::new(), br#"{"messages":[]}"#, None),
+            messages_key(&HeaderMap::new(), br#"{"messages":[]}"#, None),
             None
         );
     }
@@ -3507,13 +3652,13 @@ mod tests {
     fn stable_session_key_ignores_nested_user_id() {
         // A user_id nested in message content is NOT top-level metadata.
         let body = br#"{"messages":[{"role":"user","content":{"metadata":{"user_id":"nested"}}}]}"#;
-        assert_eq!(stable_session_key(&HeaderMap::new(), body, None), None);
+        assert_eq!(messages_key(&HeaderMap::new(), body, None), None);
     }
 
     #[test]
     fn stable_session_key_distinguishes_different_api_keys() {
-        let a = stable_session_key(&headers_with_api_key("key-a"), b"{}", None);
-        let b = stable_session_key(&headers_with_api_key("key-b"), b"{}", None);
+        let a = messages_key(&headers_with_api_key("key-a"), b"{}", None);
+        let b = messages_key(&headers_with_api_key("key-b"), b"{}", None);
         assert_ne!(a, b, "distinct team keys → distinct accounts");
     }
 
@@ -3526,14 +3671,14 @@ mod tests {
         let shared = "sk-proxy-secret";
         // No user_id → falls through to None (per-connection key at the caller).
         assert_eq!(
-            stable_session_key(&headers_with_api_key(shared), b"{}", Some(shared)),
+            messages_key(&headers_with_api_key(shared), b"{}", Some(shared)),
             None,
             "the shared proxy key must not be used as an affinity discriminator"
         );
         // With a body user_id, it falls through to that instead of the shared key.
         let body = br#"{"metadata":{"user_id":"user-123"}}"#;
-        let via_shared = stable_session_key(&headers_with_api_key(shared), body, Some(shared));
-        let via_uid = stable_session_key(&HeaderMap::new(), body, None);
+        let via_shared = messages_key(&headers_with_api_key(shared), body, Some(shared));
+        let via_uid = messages_key(&HeaderMap::new(), body, None);
         assert_eq!(
             via_shared, via_uid,
             "with the shared key skipped, the user_id is the discriminator"
@@ -3541,10 +3686,313 @@ mod tests {
         assert!(via_shared.is_some());
         // A DIFFERENT (genuine team) key with the same proxy_key configured is
         // still used — only the exact shared secret is skipped.
-        let team = stable_session_key(&headers_with_api_key("sk-team-alice"), b"{}", Some(shared));
+        let team = messages_key(&headers_with_api_key("sk-team-alice"), b"{}", Some(shared));
         assert!(
             team.is_some(),
             "a distinct team key is a real identity and must still key"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_falls_back_to_prefix_hash_of_system_and_tools() {
+        // No x-api-key, no metadata.user_id, but a system + tools prefix on an
+        // in-scope (loopback POST /v1/messages) request — tier 3 pins on a hash
+        // of that prefix instead of routing unpinned.
+        let body = br#"{"system":"You are a helpful assistant.","tools":[{"name":"bash"}]}"#;
+        let a = messages_key(&HeaderMap::new(), body, None);
+        let b = messages_key(&HeaderMap::new(), body, None);
+        assert_eq!(a, b, "same prefix must hash the same every time");
+        assert_eq!(
+            a.map(|(_, kind)| kind),
+            Some(SessionKind::Prefix),
+            "tier 3 must record SessionKind::Prefix, not Stable"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_accepts_system_or_tools_alone() {
+        // Either field alone is a cacheable prefix — both need not be present.
+        let system_only = messages_key(&HeaderMap::new(), br#"{"system":"hi"}"#, None);
+        let tools_only = messages_key(&HeaderMap::new(), br#"{"tools":[{"name":"x"}]}"#, None);
+        assert!(system_only.is_some(), "system alone must pin");
+        assert!(tools_only.is_some(), "tools alone must pin");
+        assert_ne!(
+            system_only, tools_only,
+            "a system-only and a tools-only prefix are different prefixes"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_distinguishes_different_prefixes() {
+        let a = messages_key(&HeaderMap::new(), br#"{"system":"prompt A"}"#, None);
+        let b = messages_key(&HeaderMap::new(), br#"{"system":"prompt B"}"#, None);
+        assert_ne!(
+            a, b,
+            "distinct prefixes must spread across the fleet, not collide"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_is_byte_exact_not_canonicalized() {
+        // Same fields, different KEY ORDER inside the `system` value. Anthropic's
+        // own cache is byte-exact, so these are two DIFFERENT cache entries —
+        // canonicalizing (sorting keys) before hashing would merge them onto one
+        // account for zero cache benefit and only concentrate load.
+        let a = messages_key(&HeaderMap::new(), br#"{"system":{"a":1,"b":2}}"#, None);
+        let b = messages_key(&HeaderMap::new(), br#"{"system":{"b":2,"a":1}}"#, None);
+        assert_ne!(
+            a, b,
+            "raw bytes must be hashed verbatim — key order must not be canonicalized"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_distinguishes_field_identity() {
+        // The SAME raw text "ab", attached to a DIFFERENT field. A naive
+        // implementation that concatenated system+tools into one string before
+        // hashing (e.g. `format!("{system}{tools}")`) would treat
+        // `{"system":"ab"}` (tools absent, so "" via unwrap_or) and
+        // `{"tools":"ab"}` (system absent) as the identical string "ab" and hash
+        // them the same. Hashing each field as its own `Option<&str>` must not.
+        let system_ab = messages_key(&HeaderMap::new(), br#"{"system":"ab"}"#, None);
+        let tools_ab = messages_key(&HeaderMap::new(), br#"{"tools":"ab"}"#, None);
+        assert_ne!(
+            system_ab, tools_ab,
+            "system:\"ab\" and tools:\"ab\" must not collide"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_hash_resists_boundary_shift() {
+        // Bare JSON NUMBERS, not quoted strings: a quoted string's own `"`
+        // delimiters would accidentally break a naive concatenation apart, which
+        // defeats the point of this test. Numbers have no such delimiter, so a
+        // concatenating implementation genuinely collides here: `system:12` +
+        // `tools:3` and `system:1` + `tools:23` both concatenate their raw text
+        // to "123". `str`'s own `Hash` impl appends a sentinel byte after each
+        // value specifically to prevent this; hashing system and tools as two
+        // separate `.hash()` calls relies on it.
+        let a = messages_key(&HeaderMap::new(), br#"{"system":12,"tools":3}"#, None);
+        let b = messages_key(&HeaderMap::new(), br#"{"system":1,"tools":23}"#, None);
+        assert_ne!(a, b, "a field boundary shift must not collide");
+    }
+
+    #[test]
+    fn stable_session_key_prefix_none_without_system_or_tools() {
+        // Neither system nor tools → no cacheable prefix → stay unpinned even
+        // in scope. This is the guard that stops every trivial anonymous
+        // request from piling onto one account.
+        assert_eq!(
+            messages_key(&HeaderMap::new(), br#"{"messages":[]}"#, None),
+            None
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_is_the_last_resort_after_identity_tiers() {
+        // x-api-key and metadata.user_id both outrank the prefix hash even when a
+        // cacheable prefix is also present.
+        let body = br#"{"system":"hi","metadata":{"user_id":"user-123"}}"#;
+        let with_key = messages_key(&headers_with_api_key("the-key"), body, None).map(|(_, k)| k);
+        assert_eq!(with_key, Some(SessionKind::Stable), "x-api-key still wins");
+
+        let with_uid = messages_key(&HeaderMap::new(), body, None).map(|(_, k)| k);
+        assert_eq!(
+            with_uid,
+            Some(SessionKind::Stable),
+            "user_id still wins over the prefix hash"
+        );
+    }
+
+    /// The cacheable-prefix body used by every tier-3 scope-gating test below —
+    /// no x-api-key, no user_id, so tier 3 is the only tier that could fire.
+    const PREFIX_ONLY_BODY: &[u8] = br#"{"system":"You are a helpful assistant."}"#;
+
+    #[test]
+    fn stable_session_key_prefix_requires_exact_v1_messages_path() {
+        // In scope: exact match.
+        assert!(
+            stable_session_key(
+                &HeaderMap::new(),
+                PREFIX_ONLY_BODY,
+                None,
+                &Method::POST,
+                "/v1/messages",
+                true,
+            )
+            .is_some(),
+            "an exact /v1/messages match must pin"
+        );
+        // Out of scope: a LONGER path must not match as a prefix — this is the
+        // exact trap the scope gate exists to close. /v1/messages/count_tokens
+        // never uses prompt caching (Anthropic's own docs), so pinning it would
+        // concentrate load for zero cache benefit.
+        assert_eq!(
+            stable_session_key(
+                &HeaderMap::new(),
+                PREFIX_ONLY_BODY,
+                None,
+                &Method::POST,
+                "/v1/messages/count_tokens",
+                true,
+            ),
+            None,
+            "/v1/messages/count_tokens must NOT prefix-match /v1/messages"
+        );
+        // Defense in depth: an unstripped query string must not match either,
+        // even though the real call site (`handle`) always passes an
+        // already-stripped path — this guards the match itself, not just the
+        // caller's discipline.
+        assert_eq!(
+            stable_session_key(
+                &HeaderMap::new(),
+                PREFIX_ONLY_BODY,
+                None,
+                &Method::POST,
+                "/v1/messages?beta=true",
+                true,
+            ),
+            None,
+            "a path carrying its query string must not match /v1/messages"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_requires_post() {
+        assert_eq!(
+            stable_session_key(
+                &HeaderMap::new(),
+                PREFIX_ONLY_BODY,
+                None,
+                &Method::GET,
+                "/v1/messages",
+                true,
+            ),
+            None,
+            "a GET must not pin on the cacheable prefix"
+        );
+    }
+
+    #[test]
+    fn stable_session_key_prefix_requires_loopback() {
+        // Tier 1 already refuses to key on x-api-key when it equals the shared
+        // proxy secret, precisely so remote clients sharing that secret don't
+        // collapse onto one account (`stable_session_key_skips_shared_proxy_key`
+        // above). Tier 3 has no secret to check, so without a loopback gate N
+        // remote callers sharing one system prompt would collapse through the
+        // same back door.
+        assert_eq!(
+            stable_session_key(
+                &HeaderMap::new(),
+                PREFIX_ONLY_BODY,
+                None,
+                &Method::POST,
+                "/v1/messages",
+                false,
+            ),
+            None,
+            "a non-loopback caller must not pin on the cacheable prefix"
+        );
+    }
+
+    /// End-to-end through the REAL router (`app()`, not the unit-tested
+    /// `stable_session_key` directly): a loopback `POST /v1/messages?beta=true`
+    /// — the exact shape live traffic sends, query string included — with no
+    /// `x-api-key` and no `metadata.user_id`, but a `system` field, must record
+    /// as `SessionKind::Prefix` in the manager's own session snapshot.
+    ///
+    /// This is the one seam the unit tests above cannot cover: they call
+    /// `stable_session_key` with a hand-fed `path`, which proves the MATCH
+    /// logic but nothing about which variable the real call site passes it.
+    /// `handle` has two candidates in scope — `path` (query-stripped) and
+    /// `path_and_query` (raw) — and passing the wrong one would silently
+    /// unpin 100% of real `/v1/messages?beta=true` traffic while every one of
+    /// those unit tests kept passing, because they never touch `handle` at
+    /// all. Driving a real request through `app()` with the query string
+    /// attached is what actually pins the wiring, not just the function.
+    #[tokio::test]
+    async fn real_request_through_app_pins_on_prefix_for_loopback_v1_messages() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tower::ServiceExt as _;
+
+        struct NoRefresh;
+        impl crate::oauth::TokenRefresher for NoRefresh {
+            fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
+                Box::pin(async { Err(crate::oauth::OAuthError::Transient("unused".into())) })
+            }
+        }
+
+        // Fake upstream: one connection, one 200 with a minimal usage body.
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = upstream.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = br#"{"usage":{"input_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
+            }
+        });
+
+        let config = dummy_config(None, &format!("http://{up_addr}"));
+        let manager = Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+
+        // No x-api-key, no metadata.user_id — only a `system` field. Real
+        // `/v1/messages` calls always carry the query string tacked on by
+        // live clients (`?beta=true`); this is not incidental to the test, it
+        // is the exact thing D1 exists to pin.
+        let body = serde_json::to_vec(&serde_json::json!({
+            "system": "You are a helpful assistant.",
+            "messages": [],
+        }))
+        .unwrap();
+
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/messages?beta=true")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("build request");
+        // Session affinity's feature flag (see `SessionKey`'s doc-comment) and
+        // the loopback proof `handle`'s auth gate and tier 3 both read — both
+        // injected by the hybrid listener per real connection; `app()` alone
+        // injects neither, so a request driven straight at it needs both by
+        // hand.
+        req.extensions_mut().insert(SessionKey(0xF00D));
+        req.extensions_mut().insert(ClientAddr(loopback_peer()));
+
+        let response = app(manager.clone()).oneshot(req).await.expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the request must actually reach and clear the fake upstream"
+        );
+
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        // Exactly one request was ever served by this manager, so its one
+        // session is the whole list — no need to reach for the private
+        // `short_session_id` helper `manager/mod.rs` uses to derive `s.id`.
+        let session = snap
+            .sessions
+            .first()
+            .expect("the request must have been tracked as a session");
+        assert_eq!(
+            session.kind,
+            SessionKind::Prefix,
+            "a loopback POST /v1/messages?beta=true with a system field and no \
+             identity must pin via tier 3 through the REAL call site, not just \
+             the unit-tested function"
         );
     }
 
