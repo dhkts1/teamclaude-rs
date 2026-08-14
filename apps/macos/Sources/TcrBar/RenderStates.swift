@@ -67,6 +67,7 @@ enum RenderStates {
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false),
             ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false),
+            ("04c-probed-then-broken-row", .loaded(fleet(probedThenBrokenJSON)), false),
             ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false),
             ("06-offline-source", .loaded(fleet(offlineJSON)), false),
             ("07-empty-fleet", .loaded(fleet("[]")), false),
@@ -284,5 +285,23 @@ enum RenderStates {
         let dave = account(
             "dave@example.com", quota: "null", state: "ok", probe: "never", status: "error")
         return "[\(alice),\(dave)]"
+    }
+
+    /// The blind spot an adversarial review found: `04b` above is the OTHER
+    /// way an account breaks — never probed, `quota: null`. This is the shape
+    /// that actually happens in production: a credential that dies AFTER
+    /// being probed keeps its last-learned `quota` and a real `probeStatus`
+    /// (`probe_account`, `src/manager/probing.rs:128-139`, early-returns on
+    /// an `Error` row instead of clearing anything; `refresh.rs:93-101` sets
+    /// only `status`). `carol@example.com` here carries `status:"error"` WITH
+    /// `quota:0.12` and `probeStatus:"ok"` — a real prior reading, not an
+    /// absent one — sat beside a genuinely healthy account so the header's
+    /// arithmetic ("1 of 2 ready · 1 need re-login", not "2 of 2 ready") is
+    /// reviewable in the same frame this scene renders.
+    private static var probedThenBrokenJSON: String {
+        let alice = account("alice@example.com", quota: "0.12", state: "ok")
+        let carol = account(
+            "carol@example.com", quota: "0.12", state: "ok", probe: "ok", status: "error")
+        return "[\(alice),\(carol)]"
     }
 }
