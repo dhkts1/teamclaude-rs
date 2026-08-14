@@ -353,6 +353,28 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let status: String
     public let disabled: Bool
 
+    /// The Rust side's `AccountStatus` (src/manager/mod.rs:182-198), decoded.
+    /// `.other` keeps an unknown future variant readable instead of asserting a
+    /// meaning this build cannot support.
+    public enum AccountHealth: Equatable, Sendable {
+        case active, throttled, needsRelogin
+        case other(String)
+    }
+
+    /// Computed from `status`, exact match, lowercase — never a substitute for
+    /// the raw field, which stays displayed verbatim elsewhere. `"error"` maps
+    /// to `.needsRelogin` rather than to a case named after Rust's own word: an
+    /// `error` account is what the UNMEASURED pill wears too, and the panel must
+    /// not use one word to mean two different facts.
+    public var health: AccountHealth {
+        switch status.lowercased() {
+        case "active": return .active
+        case "throttled": return .throttled
+        case "error": return .needsRelogin
+        default: return .other(status)
+        }
+    }
+
     /// The gating window — the most-spent of `5h`, `7d`, `7d_oi`. `null` on the
     /// wire, and `nil` here, when nothing has been learned about this account
     /// yet. Never render it as `0`.
@@ -400,14 +422,21 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// come first and the operator's own parked accounts sink to the bottom.
     /// `unmeasured` sits below `near` because an unprobed account is not capacity,
     /// and above `spent` because it is not known to be exhausted either.
+    ///
+    /// `needsRelogin` sits between `unknown` and `unmeasured`: it is actionable —
+    /// there is a real remedy, a click away — so it belongs above the other
+    /// non-serving rows and below anything that can still serve. `disabled` is
+    /// checked FIRST: a parked account is an operator decision, not a request for
+    /// action, so it always sinks to the bottom regardless of its health.
     public var displayOrder: Int {
-        if disabled { return 5 }
-        if !hasQuotaEvidence { return 3 }
+        if disabled { return 6 }
+        if health == .needsRelogin { return 3 }
+        if !hasQuotaEvidence { return 4 }
         switch quotaState {
         case .ok: return 0
         case .near: return 1
         case .unknown: return 2
-        case .spent: return 4
+        case .spent: return 5
         }
     }
 
@@ -458,6 +487,12 @@ public struct FleetTally: Equatable, Sendable {
         case near
         case spent
         case unknown
+        /// The refresh token was rejected — `AccountHealth.needsRelogin`. Its
+        /// own bucket, checked BEFORE `hasQuotaEvidence` in `init(account:)`:
+        /// these accounts also have no quota reading, and folding them into
+        /// `.unmeasured` would tell the operator to wait for a sweep that will
+        /// never fix a dead credential.
+        case needsRelogin
         /// Enabled, but nothing has ever been measured about it. Its own bucket
         /// because folding it into `ok` is precisely the overclaim this exists
         /// to stop, and folding it into `unknown` would conflate "a quota state
@@ -471,6 +506,7 @@ public struct FleetTally: Equatable, Sendable {
             case .near: return "near"
             case .spent: return "spent"
             case .unknown: return "unknown"
+            case .needsRelogin: return "need re-login"
             case .unmeasured: return "unmeasured"
             case .disabled: return "disabled"
             }
@@ -488,9 +524,16 @@ public struct FleetTally: Equatable, Sendable {
 
         /// The bucket an *enabled* account falls into, measurement included.
         /// An unmeasured account's `quotaState` is a default, so it never
-        /// reaches the quota-state mapping at all.
+        /// reaches the quota-state mapping at all. Health is checked BEFORE
+        /// `hasQuotaEvidence` — a broken account has no quota reading either,
+        /// and checking evidence first would land every one of them back in
+        /// `.unmeasured`.
         init(account: Account) {
-            self = account.hasQuotaEvidence ? Kind(quotaState: account.quotaState) : .unmeasured
+            if account.health == .needsRelogin {
+                self = .needsRelogin
+            } else {
+                self = account.hasQuotaEvidence ? Kind(quotaState: account.quotaState) : .unmeasured
+            }
         }
     }
 
@@ -649,8 +692,21 @@ public struct Fleet: Equatable, Sendable {
     /// Enabled accounts nothing is known about. Reported next to `readyCount`
     /// rather than folded into it: "unknown" and "not ready" are different
     /// answers and lead to different next actions.
+    ///
+    /// EXCLUDES `needsReloginCount`. A broken account also has no quota
+    /// reading, but "unmeasured" tells the operator to wait for a sweep that
+    /// will never fix a dead credential — this must stay a property of the
+    /// evidence a *live* account is missing, not a catch-all for "no reading".
     public var unmeasuredCount: Int {
-        enabledAccounts.filter { !$0.hasQuotaEvidence }.count
+        enabledAccounts.filter { !$0.hasQuotaEvidence && $0.health != .needsRelogin }.count
+    }
+
+    /// Enabled accounts whose refresh token was rejected — dead credentials,
+    /// hard-excluded from selection (`src/manager/select.rs:814`, `:931`).
+    /// Reported on the same footing as `unmeasuredCount`: both are reasons an
+    /// account is not ready, but they lead to different remedies.
+    public var needsReloginCount: Int {
+        enabledAccounts.filter { $0.health == .needsRelogin }.count
     }
 
     /// The denominator of the headline: accounts that *could* serve.
@@ -675,16 +731,17 @@ public struct Fleet: Equatable, Sendable {
     public var capacitySummary: String {
         if enabledAccounts.isEmpty { return "No enabled accounts" }
         let unmeasured = unmeasuredCount > 0 ? " · \(unmeasuredCount) unmeasured" : ""
-        if readyCount > 0 { return "\(readyCount) of \(enabledCount) ready\(unmeasured)" }
+        let needsRelogin = needsReloginCount > 0 ? " · \(needsReloginCount) need re-login" : ""
+        if readyCount > 0 { return "\(readyCount) of \(enabledCount) ready\(unmeasured)\(needsRelogin)" }
         if unmeasuredCount > 0 {
             guard let next = soonestRecovery else {
-                return "No confirmed capacity\(unmeasured)"
+                return "No confirmed capacity\(unmeasured)\(needsRelogin)"
             }
-            return "No confirmed capacity\(unmeasured) · next in "
+            return "No confirmed capacity\(unmeasured)\(needsRelogin) · next in "
                 + HeldWindow.duration(minutes: next.minutesUntilReset)
         }
-        guard let next = soonestRecovery else { return "No capacity" }
-        return "No capacity · next in \(HeldWindow.duration(minutes: next.minutesUntilReset))"
+        guard let next = soonestRecovery else { return "No capacity\(needsRelogin)" }
+        return "No capacity\(needsRelogin) · next in \(HeldWindow.duration(minutes: next.minutesUntilReset))"
     }
 
     /// Which tint the capacity line wears. Near-binary: there is capacity, there
@@ -736,7 +793,9 @@ public struct Fleet: Equatable, Sendable {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
         counts[.disabled] = disabledCount
-        let order: [FleetTally.Kind] = [.ok, .near, .spent, .unknown, .unmeasured, .disabled]
+        let order: [FleetTally.Kind] = [
+            .ok, .near, .spent, .unknown, .needsRelogin, .unmeasured, .disabled,
+        ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }
             return FleetTally(kind: kind, count: count)

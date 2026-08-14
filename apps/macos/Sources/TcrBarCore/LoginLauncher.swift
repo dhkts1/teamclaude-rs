@@ -8,11 +8,16 @@ import Foundation
 /// `tcr login` cannot run as a background subprocess of a GUI app, for two
 /// independent reasons, and both are in `tcr`'s own source rather than guesswork:
 ///
-///  1. **It refuses while a server holds the port** (`src/oauth.rs:752-757`):
-///     logging in then would be overwritten by the server's next token refresh.
-///     TcrBar exists because a proxy is always running, so that refusal is the
-///     normal case here, not an edge case. Its message names the pid and the
-///     stop-login-restart sequence — which is useful only if a human can read it.
+///  1. **An older `tcr` refuses while a server holds the port.** That used to be
+///     universal (`src/oauth.rs:752-757`, superseded), but `a385f0f`
+///     (2026-08-11, "feat: route tcr login through a live proxy instead of
+///     refusing") added a live route: `login_route` (`src/oauth.rs:953-997`)
+///     probes the running proxy and, on `AddCapability::Present`, takes the
+///     login live through the server instead of refusing. A modern proxy — the
+///     only kind this button needs to assume — accepts a login while serving.
+///     An old one still refuses, before any browser opens, and its message
+///     names the pid and the stop-login-restart sequence — which is useful
+///     only if a human can read it.
 ///  2. **It is interactive.** It prompts for an account name on stdin
 ///     (`src/oauth.rs:645`) and can take a pasted authorization code
 ///     (`src/oauth.rs:450`). With no TTY those prompts go nowhere and stdin hits
@@ -35,19 +40,48 @@ public enum LoginLauncher {
     ///
     /// Split out and pure so the quoting is testable: an install path containing a
     /// space or a quote must not become a broken or, worse, an injectable command.
-    public static func script(forExecutableAt path: String) -> String {
+    ///
+    /// `reloggingIn` is an optional account-name hint, `nil` by default so the
+    /// existing add-account call site is unchanged. When present, the script
+    /// echoes which account this re-login is for — honestly: `tcr login` takes
+    /// no account argument, it upserts by the profile identity the browser hands
+    /// back, so the label says the browser choice is what actually selects the
+    /// account, rather than implying this script can steer it there.
+    ///
+    /// Shell-quoted exactly like the path just below — POSIX `'\''` — because an
+    /// account name is attacker-adjacent input in principle, and unquoted
+    /// interpolation into a `.command` file is injection.
+    public static func script(forExecutableAt path: String, reloggingIn name: String? = nil) -> String {
         // Single-quote the path and escape any embedded single quote the POSIX
         // way ('\'') so the shell receives exactly one argument whatever the path
         // contains.
         let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let hint: String
+        if let name {
+            // The WHOLE message is the single-quoted argument, not the name
+            // alone inside a double-quoted one — a double-quoted echo still
+            // expands `$`, backticks and `\`, so quoting only the name would
+            // leave the rest of the line open to exactly the injection this
+            // quoting exists to close.
+            let message = "Re-logging in \(name) — choose that account in the browser."
+            let quotedMessage = "'" + message.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            hint = """
+                echo \(quotedMessage)
+                echo
+
+                """
+        } else {
+            hint = ""
+        }
         return """
             #!/bin/sh
             # Opened by TcrBar. `tcr login` needs a terminal: it prompts for an
-            # account name and may ask you to paste an authorization code, and it
+            # account name and may ask you to paste an authorization code. A
+            # modern proxy takes the login live even while serving; an older one
             # refuses outright while a proxy is holding the port.
             echo "Running tcr login — follow the prompts below."
             echo
-            exec \(quoted) login
+            \(hint)exec \(quoted) login
             """
     }
 
@@ -58,6 +92,7 @@ public enum LoginLauncher {
     /// would put a consent dialog between the operator and a login they asked for.
     @discardableResult
     public static func launch(
+        reloggingIn name: String? = nil,
         resolve: () -> Result<URL, TcrTool.NotFound> = { TcrTool.resolve() },
         open: (URL) -> Void = { NSWorkspace.shared.open($0) }
     ) -> Result<URL, Failure> {
@@ -67,7 +102,7 @@ public enum LoginLauncher {
         case .failure(let missing): return .failure(.toolMissing(searched: missing.searched))
         }
 
-        let script = script(forExecutableAt: executable.path)
+        let script = script(forExecutableAt: executable.path, reloggingIn: name)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("tcr-login.command")
 

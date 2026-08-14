@@ -199,7 +199,8 @@ struct FleetView: View {
                     account: account,
                     countersAreStructural: fleet.source.countersAreStructural,
                     accounts: accounts,
-                    onChanged: { await poller.pollOnce() }
+                    onChanged: { await poller.pollOnce() },
+                    onRelogin: { reloginAccount(account.name) }
                 )
             }
         }
@@ -286,33 +287,28 @@ struct FleetView: View {
                 Button("Start server") { server.start() }
             }
             Button("Refresh") { Task { await poller.pollOnce() } }
-            // Disabled while a proxy is serving, for the same reason
-            // "Take over port…" is disabled while we supervise one: the click
-            // cannot succeed, so offering it is a promise the panel cannot keep.
+            // Used to be disabled while a proxy served the port, enforcing a
+            // `tcr login` refusal that stopped existing 2026-08-11 (`a385f0f`,
+            // "feat: route tcr login through a live proxy instead of
+            // refusing"): `login_route` (src/oauth.rs:953-997) now probes the
+            // running proxy and, when it is a modern build, routes the
+            // finished credential *through* the server instead of refusing.
+            // Gil runs a modern proxy, so the gate this button enforced no
+            // longer applies to the only case that matters here — and a
+            // disabled button in front of a working flow is a worse defect
+            // than an occasional refusal from an older `tcr`.
             //
-            // `tcr login` refuses outright when something holds the port — the
-            // server's next token refresh would overwrite the credentials the
-            // login just wrote. That refusal is correct. What was wrong is that
-            // the panel offered the button anyway, with the reason in a `.help`
-            // tooltip nobody hovers before clicking, so the flow was: click,
-            // watch a Terminal open, read an error, work out the remedy
-            // yourself. Reported from live use, which is the only way it
-            // surfaces — the button renders identically either way, so no
-            // screenshot and no `--render-states` scene could show it.
-            //
-            // The remedy is two clicks away and both are in this footer, so the
-            // help names them rather than describing the failure.
+            // An older proxy still refuses, but it does so BEFORE any browser
+            // opens, and its message names the remedy — which is useful only
+            // if a human can read it, which is exactly what the Terminal
+            // hand-off gives them.
             Button("Add account…") { addAccount() }
-                .disabled(proxyHoldsThePort)
                 .help(
-                    proxyHoldsThePort
-                        ? "A proxy is serving on the port. `tcr login` refuses "
-                            + "while that is true, because the server's next token "
-                            + "refresh would overwrite the new credentials. Stop "
-                            + "the server, add the account, then start it again."
-                        : "Opens `tcr login` in a Terminal window. It needs one: it "
-                            + "prompts for a name, may ask for a pasted code, and "
-                            + "refuses while a proxy is holding the port."
+                    "Opens `tcr login` in a Terminal window. It needs one: it "
+                        + "prompts for a name and may ask for a pasted code. A "
+                        + "modern proxy takes the login live even while serving; "
+                        + "an older one refuses before any browser opens and "
+                        + "prints how to recover."
                 )
             Spacer()
         }
@@ -436,22 +432,6 @@ struct FleetView: View {
         }
     }
 
-    /// True when a proxy is actually serving the port — the condition under
-    /// which `tcr login` refuses.
-    ///
-    /// The case alone is NOT the test. An offline read also decodes to
-    /// ``PollState/loaded(_:)``: `tcr status` answers from config with no
-    /// server up, which is precisely the state where adding an account
-    /// *works*. Keying on `.loaded` would disable the button exactly when it is
-    /// usable, and the panel already distinguishes the two — `source` is why
-    /// `offlineNotice` exists.
-    private var proxyHoldsThePort: Bool {
-        if case .loaded(let fleet) = poller.state {
-            return !fleet.source.countersAreStructural
-        }
-        return false
-    }
-
     /// Hand `tcr login` to a Terminal window.
     ///
     /// Deliberately a hand-off, not an in-app flow. `tcr login` refuses while a
@@ -460,6 +440,23 @@ struct FleetView: View {
     /// in the label is doing real work: this opens something.
     private func addAccount() {
         if case .failure(let why) = LoginLauncher.launch() {
+            switch why {
+            case .toolMissing(let searched):
+                loginError = "tcr not found (searched \(searched.count) locations)."
+            case .couldNotWriteScript(let message):
+                loginError = "Could not open Terminal: \(message)"
+            }
+        } else {
+            loginError = nil
+        }
+    }
+
+    /// Same hand-off as ``addAccount()``, with the account name threaded
+    /// through so the Terminal script can name it. Surfaces a failure the same
+    /// way — a button that silently does nothing is worse than one that says
+    /// why.
+    private func reloginAccount(_ name: String) {
+        if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
             switch why {
             case .toolMissing(let searched):
                 loginError = "tcr not found (searched \(searched.count) locations)."
@@ -601,6 +598,9 @@ struct AccountRow: View {
     /// computed against — reading the poller's published `state` afterwards could
     /// pick up a different, later poll.
     let onChanged: () async -> PollState
+    /// Hands `tcr login` to a Terminal window for THIS account. Only drawn on a
+    /// `.needsRelogin` row.
+    let onRelogin: () -> Void
 
     /// The single tint for this row's quota evidence. The pill and the bar both
     /// read it, so the two can never disagree about whether a quota is known.
@@ -662,7 +662,14 @@ struct AccountRow: View {
         // Mirrors the pill's three cases. A VoiceOver user hearing "never
         // probed" about an account whose probe errored is told the same wrong
         // cause a sighted user was, with less to correct it from.
-        if account.hasQuotaEvidence {
+        // Broken beats the probe-based cases: a rejected refresh token is a
+        // known cause with a known remedy, and speaking "never probed" over it
+        // is the same wrong cause a sighted user was told, with less to correct
+        // it from.
+        if account.health == .needsRelogin {
+            parts.append(
+                "needs re-login, refresh token rejected, out of rotation until re-login")
+        } else if account.hasQuotaEvidence {
             parts.append("\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used")
         } else if account.probeStatus.isFailure {
             parts.append("quota probe \(account.probeStatus.token), quota unknown")
@@ -683,13 +690,35 @@ struct AccountRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: Tok.tightSpacing) {
-            information
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel(rowAccessibilityLabel)
-            toggleButton
+        // A broken row draws its two buttons on their OWN line, below the name
+        // and pills, rather than beside `information` the way `toggleButton`
+        // alone sits for every other row. Measured, not assumed: beside
+        // `information`, `ROTATING` + `NEEDS RE-LOGIN` + `Re-login…` +
+        // `Disable` do not fit in the row's 356pt (`fleetActions`'s own
+        // truncation bug, documented above, is exactly this failure mode) —
+        // the name collapsed to a single truncated character. Every other row
+        // keeps the original layout unchanged, because it already fits.
+        if account.health == .needsRelogin {
+            VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+                information
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(rowAccessibilityLabel)
+                HStack(spacing: Tok.tightSpacing) {
+                    Spacer()
+                    reloginButton
+                    toggleButton
+                }
+            }
+            .padding(.vertical, Tok.rowPaddingV)
+        } else {
+            HStack(alignment: .top, spacing: Tok.tightSpacing) {
+                information
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(rowAccessibilityLabel)
+                toggleButton
+            }
+            .padding(.vertical, Tok.rowPaddingV)
         }
-        .padding(.vertical, Tok.rowPaddingV)
     }
 
     private var information: some View {
@@ -719,7 +748,18 @@ struct AccountRow: View {
                 // palette reserves for *never probed* — telling the operator to
                 // wait for a sweep that had already run and failed. Observed
                 // live: a row reading UNMEASURED beside a status of `error`.
-                if account.hasQuotaEvidence {
+                // Broken beats every other case, including a stale
+                // "never probed" read: `status == "error"` paired with
+                // `probeStatus == .never` is the case actually occurring on
+                // the live fleet, and it is a known cause with a known remedy,
+                // not an absence of information.
+                if account.health == .needsRelogin {
+                    StatusPill("needs re-login", tint: Tok.spent)
+                        .help(
+                            "The refresh token was rejected — this account is out "
+                                + "of rotation and serves no traffic until you re-login."
+                        )
+                } else if account.hasQuotaEvidence {
                     StatusPill(account.quotaState.token, tint: quotaTint)
                 } else if account.probeStatus.isFailure {
                     // The probe's own word, so the row names the cause rather
@@ -760,7 +800,11 @@ struct AccountRow: View {
                 if !account.disabled {
                     Text(account.status)
                         .font(Tok.secondaryFont)
-                        .foregroundStyle(.secondary)
+                        // `active` and `error` must not be pixel-identical: an
+                        // `error` account is what the UNMEASURED pill used to
+                        // wear too, and the raw word alone drew in the same
+                        // grey as a healthy account right above it.
+                        .foregroundStyle(account.health == .needsRelogin ? Tok.spent : .secondary)
                         .lineLimit(1)
                 }
             }
@@ -834,6 +878,28 @@ struct AccountRow: View {
         // `Tok.ok`, which is the clean case's alone.
         case .spokeUp: return Tok.near
         }
+    }
+
+    /// Hands `tcr login` to a Terminal window, hinting at this account's name.
+    /// Drawn on a `.needsRelogin` row only, beside ``toggleButton``.
+    ///
+    /// `tcr login` takes no account argument — it upserts by the profile
+    /// identity the browser hands back — so this cannot re-authenticate the
+    /// row directly; it only opens the same flow ``addAccount()`` does, with a
+    /// name in the Terminal echo so the operator knows which browser account
+    /// to pick. `.accessibilityLabel` says exactly that, not "Re-login" alone,
+    /// which would promise more than a click here can do.
+    private var reloginButton: some View {
+        Button("Re-login…") { onRelogin() }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .font(Tok.detailFont)
+            .accessibilityLabel("Re-login \(account.name)")
+            .help(
+                "Opens `tcr login` in a Terminal window for this account. The "
+                    + "browser account you choose is what actually gets logged in — "
+                    + "`tcr login` takes no account argument."
+            )
     }
 
     /// `tcr enable <name>` / `tcr disable <name>`, keyed off the account's own

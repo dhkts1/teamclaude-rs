@@ -186,6 +186,177 @@ private func account(
     )
 }
 
+/// A dead-credential account: `status:"error"`, never probed — the live shape
+/// (`src/manager/refresh.rs:92-101` rejects the refresh token and sets
+/// `AccountStatus::Error`), not a hand-picked one. `quotaState` stays the
+/// Rust-side default `ok` and `quota` stays `nil`, exactly as `hasQuotaEvidence`
+/// expects for an account that has never been probed.
+private func brokenAccount(_ name: String, disabled: Bool = false) -> Account {
+    Account(
+        name: name,
+        priority: 1,
+        status: "error",
+        disabled: disabled,
+        quota: nil,
+        quotaState: .ok,
+        fiveHour: nil,
+        sevenDay: nil,
+        sevenDayOi: nil,
+        held: [],
+        requests: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheHitRatio: nil,
+        probeStatus: .never,
+        probeError: nil,
+        lastStreamError: nil,
+        streamErrorCount: 0,
+        source: .live,
+        serverSha: "abc1234",
+        serverDirty: false
+    )
+}
+
+/// The bug this whole change fixes: `status == "error"` paired with
+/// `probeStatus == .never` — a rejected refresh token, not an absence of
+/// probing — decoded and counted correctly.
+final class AccountHealthTests: XCTestCase {
+    func testErrorStatusIsNeedsRelogin() {
+        XCTAssertEqual(brokenAccount("dave@example.com").health, .needsRelogin)
+    }
+
+    func testActiveAndThrottledDecodeToTheirOwnCases() {
+        XCTAssertEqual(account("alice@example.com", state: .ok).health, .active)
+        let throttled = Account(
+            name: "bob@example.com", priority: 1, status: "throttled", disabled: false,
+            quota: 0.9, quotaState: .near, fiveHour: 0.9, sevenDay: 0.9, sevenDayOi: 0,
+            held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+            cacheHitRatio: nil, probeStatus: .ok, probeError: nil, lastStreamError: nil,
+            streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil
+        )
+        XCTAssertEqual(throttled.health, .throttled)
+    }
+
+    /// A future status this build has never seen degrades to `.other`, exactly
+    /// like `QuotaState.unknown` and `ProbeState.unknown` do — never a decode
+    /// failure, and it must not silently change any count.
+    func testUnknownFutureStatusDecodesToOtherAndChangesNoCount() {
+        let weird = Account(
+            name: "eve@example.com", priority: 1, status: "quarantined", disabled: false,
+            quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
+            held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+            cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,
+            streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil
+        )
+        XCTAssertEqual(weird.health, .other("quarantined"))
+        let fleet = Fleet(accounts: [weird])
+        // Not needs-relogin, so it falls through to the ordinary unmeasured
+        // path — an unrecognised status must not invent a new remedy.
+        XCTAssertEqual(fleet.needsReloginCount, 0)
+        XCTAssertEqual(fleet.unmeasuredCount, 1)
+    }
+}
+
+/// The invariant this whole change restores: a broken account is not
+/// "unmeasured" — it is a known, certain fact with its own bucket, its own
+/// count and a glyph that reflects the certainty rather than backing off to
+/// `.unknown`.
+final class FleetNeedsReloginTests: XCTestCase {
+    func testBrokenAccountIsNotCountedAsUnmeasured() {
+        let fleet = Fleet(accounts: [
+            account("alice@example.com", state: .ok),
+            brokenAccount("dave@example.com"),
+        ])
+        XCTAssertEqual(fleet.unmeasuredCount, 0, "an error account is not merely unprobed")
+        XCTAssertEqual(fleet.needsReloginCount, 1)
+    }
+
+    func testBrokenAccountGetsItsOwnBreakdownBucket() {
+        let fleet = Fleet(accounts: [
+            account("alice@example.com", state: .ok),
+            brokenAccount("dave@example.com"),
+            brokenAccount("erin@example.com"),
+        ])
+        XCTAssertEqual(fleet.breakdownLabel, "1 ok · 2 need re-login")
+    }
+
+    func testCapacitySummaryNamesTheBrokenAccounts() {
+        let fleet = Fleet(accounts: [
+            account("alice@example.com", state: .ok),
+            brokenAccount("dave@example.com"),
+        ])
+        XCTAssertEqual(fleet.capacitySummary, "1 of 2 ready · 1 need re-login")
+    }
+
+    /// The case that used to say "No confirmed capacity · 5 unmeasured" for a
+    /// fleet where nothing was actually unmeasured — five accounts were dead
+    /// credentials, a fact the fleet already knew and could have said.
+    func testCapacitySummaryOnAllBrokenFleetDoesNotClaimUnconfirmed() {
+        let fleet = Fleet(accounts: [
+            brokenAccount("dave@example.com"),
+            brokenAccount("erin@example.com"),
+        ])
+        XCTAssertEqual(fleet.capacitySummary, "No capacity · 2 need re-login")
+        XCTAssertFalse(
+            fleet.capacitySummary.contains("unmeasured"),
+            "nothing here is unmeasured — every account has a known, rejected credential"
+        )
+    }
+
+    /// The certainty a broken account earns: `.spent`, not `.unknown`. An
+    /// unprobed account still forces `.unknown`, because that one really is a
+    /// question mark — the two must not collapse into the same glyph.
+    func testGlyphIsSpentNotUnknownWhenOnlyBrokenAccountsAreNotReady() {
+        let brokenOnly = Fleet(accounts: [
+            brokenAccount("dave@example.com"),
+            brokenAccount("erin@example.com"),
+        ])
+        XCTAssertEqual(brokenOnly.capacityGlyphState, .spent)
+        XCTAssertEqual(brokenOnly.capacityState, .spent)
+
+        let unmeasuredOnly = Fleet(accounts: [
+            Account(
+                name: "frank@example.com", priority: 1, status: "active", disabled: false,
+                quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
+                held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+                cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,
+                streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil
+            )
+        ])
+        XCTAssertEqual(
+            unmeasuredOnly.capacityGlyphState, .unknown("unmeasured"),
+            "a genuinely never-probed account must still read as unknown, not spent"
+        )
+    }
+
+    /// Row order: usable first, broken above the merely-unmeasured and the
+    /// spent, parked last regardless of health.
+    func testDisplayOrderPutsBrokenAboveUnmeasuredAndBelowReady() {
+        let ready = account("alice@example.com", state: .ok)
+        let broken = brokenAccount("dave@example.com")
+        let neverProbed = Account(
+            name: "frank@example.com", priority: 1, status: "active", disabled: false,
+            quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
+            held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+            cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,
+            streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil
+        )
+        let spent = account("erin@example.com", state: .spent)
+        let parkedBroken = brokenAccount("parked@example.com", disabled: true)
+
+        let fleet = Fleet(accounts: [parkedBroken, spent, neverProbed, broken, ready])
+        let order = fleet.rowsInDisplayOrder.map(\.name)
+        XCTAssertEqual(
+            order,
+            [
+                "alice@example.com", "dave@example.com", "frank@example.com",
+                "erin@example.com", "parked@example.com",
+            ]
+        )
+    }
+}
+
 final class FleetCapacitySummaryTests: XCTestCase {
     func testHealthyFleetReadsAsAllOk() {
         let fleet = Fleet(accounts: (1...12).map { account("a\($0)@example.com", state: .ok) })

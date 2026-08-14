@@ -61,6 +61,41 @@ final class LoginLauncherTests: XCTestCase {
         XCTAssertNil(opened, "nothing should be opened when tcr was never found")
     }
 
+    /// The re-login hint is honest that the browser choice — not this script —
+    /// is what selects the account: `tcr login` takes no account argument.
+    func testReloginHintNamesTheAccountAndDefersToTheBrowser() {
+        let script = LoginLauncher.script(
+            forExecutableAt: "/opt/homebrew/bin/tcr", reloggingIn: "alice@example.com")
+        XCTAssertTrue(
+            script.contains(
+                "echo 'Re-logging in alice@example.com — choose that account in the browser.'"),
+            script
+        )
+    }
+
+    /// Omitting the hint must leave the existing add-account script unchanged.
+    func testNoHintByDefault() {
+        let script = LoginLauncher.script(forExecutableAt: "/opt/homebrew/bin/tcr")
+        XCTAssertFalse(script.contains("Re-logging in"), script)
+    }
+
+    /// The injection case for the account name: a single quote must not escape
+    /// the quoting and let anything after it run as its own command. Mirrors
+    /// ``testSingleQuoteInPathCannotEscapeTheQuoting`` for the path.
+    func testSingleQuoteInReloginNameCannotEscapeTheQuoting() {
+        let script = LoginLauncher.script(
+            forExecutableAt: "/opt/homebrew/bin/tcr", reloggingIn: "ev'il@example.com")
+        XCTAssertTrue(
+            script.contains(
+                #"echo 'Re-logging in ev'\''il@example.com — choose that account in the browser.'"#),
+            "a quote in the name must be escaped POSIX-style, got: \(script)"
+        )
+        // The whole message is one shell argument to `echo` — nothing after
+        // the closing quote on that line.
+        let echoLine = script.split(separator: "\n").first { $0.hasPrefix("echo 'Re-logging in") }
+        XCTAssertEqual(echoLine?.hasSuffix("browser.'"), true, "trailing text after the quoted message")
+    }
+
     func testSuccessWritesAnExecutableScriptAndOpensIt() throws {
         var opened: URL?
         let result = LoginLauncher.launch(
