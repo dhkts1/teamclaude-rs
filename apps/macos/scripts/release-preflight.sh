@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Refuse a release that is already known to fail. Runs in about a second and
-# asserts, before anything is built, signed, notarized or pushed, the five
+# asserts, before anything is built, signed, notarized or pushed, the six
 # conditions that have actually broken this project's releases.
 #
 #   apps/macos/scripts/release-preflight.sh v0.2.5
@@ -53,7 +53,14 @@
 #      with a signed 0.2.3 DMG already on the release. A dirty appcast at the
 #      START of a release means the PREVIOUS one is still half-finished.
 #
-# The rule those five encode, stated once: push a version tag ONLY in the
+#   6. TCRBAR_SPARKLE_PUBLIC_KEY unresolvable. A release cut 2026-08-14 came
+#      one unset environment variable from shipping a signed, notarized DMG
+#      whose app could never install an update — build-tcrbar.sh only WARNS
+#      and continues, and release-tcrbar.sh's own assert on this does not fire
+#      until stage 3.5, after the build. Catching it here costs nothing and
+#      catches it before twenty minutes of signing and notarizing are spent.
+#
+# The rule those six encode, stated once: push a version tag ONLY in the
 # operation that can immediately upload its assets, and never start a release on
 # top of an unfinished one.
 #
@@ -63,8 +70,14 @@
 # email or team id, and every path printed is relative to the repository root.
 #
 # Environment:
-#   RELEASE_REPO   owner/name for the GitHub Release. Defaults to whatever
-#                  `gh repo view` reports for this checkout.
+#   RELEASE_REPO             owner/name for the GitHub Release. Defaults to
+#                             whatever `gh repo view` reports for this checkout.
+#   TCRBAR_SPARKLE_PUBLIC_KEY  the Sparkle EdDSA public key. Check 6 accepts
+#                             either this being set directly, or TCRBAR_OP_ITEM
+#                             below being set so release-local.sh can fetch it.
+#   TCRBAR_OP_ITEM            1Password item release-local.sh reads
+#                             TCRBAR_SPARKLE_PUBLIC_KEY and other release
+#                             credentials from.
 set -euo pipefail
 
 usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
@@ -111,7 +124,7 @@ fail() {
 # Character-for-character the sed in release-tcrbar.sh:352 and .githooks/
 # pre-commit. Three copies is a real cost; a preflight that reads a DIFFERENT
 # number than the script it guards is worse than no preflight.
-check "1/5  the tag matches the version in Cargo.toml"
+check "1/6  the tag matches the version in Cargo.toml"
 # Two versions, deliberately. `version` is what the manifest claims; `release_version`
 # is what the TAG would publish, and every later check keys on the tag — because
 # a preflight whose other checks silently re-aim at a different number the moment
@@ -133,7 +146,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2 — the tag does not exist, locally OR on origin
 # ---------------------------------------------------------------------------
-check "2/5  the tag does not name a different commit"
+check "2/6  the tag does not name a different commit"
 # The guard is against a tag that names OTHER code, not against the tag
 # existing: the documented order pushes vX.Y.Z first, because that push is what
 # starts the release, and the local script then uploads onto the Release the
@@ -219,7 +232,7 @@ esac
 # file — so its own guard cannot fire, and this check is currently the only one
 # standing between a poisoned tree and a post-notarization abort. Fixing that
 # line is a separate change; do not delete this check when it lands.
-check "3/5  the appcast has no item for this version"
+check "3/6  the appcast has no item for this version"
 if [ ! -f "$appcast_path" ]; then
   ok "$appcast_rel does not exist yet (release-tcrbar.sh will create it)"
 elif grep -qF "sparkle:shortVersionString>$release_version<" "$appcast_path"; then
@@ -236,7 +249,7 @@ fi
 # ---------------------------------------------------------------------------
 # 4 — the update feed is not currently dark
 # ---------------------------------------------------------------------------
-check "4/5  no assetless GitHub Release is serving the update feed"
+check "4/6  no assetless GitHub Release is serving the update feed"
 repo="${RELEASE_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)}"
 if [ -z "$repo" ]; then
   fail "could not determine the GitHub repository." \
@@ -299,7 +312,7 @@ fi
 # ---------------------------------------------------------------------------
 # 5 — the previous release finished
 # ---------------------------------------------------------------------------
-check "5/5  $appcast_rel has no uncommitted changes"
+check "5/6  $appcast_rel has no uncommitted changes"
 dirty="$(git -C "$repo_root" status --porcelain -- "$appcast_rel")"
 if [ -n "$dirty" ]; then
   fail "$appcast_rel is uncommitted in the working tree." \
@@ -309,6 +322,29 @@ if [ -n "$dirty" ]; then
        "git status says: $dirty"
 else
   ok "$appcast_rel is clean"
+fi
+
+# ---------------------------------------------------------------------------
+# 6 — the Sparkle public key is resolvable
+# ---------------------------------------------------------------------------
+# Does not read the key's value, only whether one is reachable: this script
+# never prints a secret, and the value itself is public anyway (it ships in
+# every installed bundle) — what matters here is that release-tcrbar.sh's own
+# stage 3.5 assert will have something to embed. Either the environment
+# already carries it, or TCRBAR_OP_ITEM is set so release-local.sh's 1Password
+# fetch can populate it before calling release-tcrbar.sh.
+check "6/6  TCRBAR_SPARKLE_PUBLIC_KEY is resolvable"
+if [ -n "${TCRBAR_SPARKLE_PUBLIC_KEY:-}" ]; then
+  ok "TCRBAR_SPARKLE_PUBLIC_KEY is set in the environment"
+elif [ -n "${TCRBAR_OP_ITEM:-}" ]; then
+  ok "TCRBAR_OP_ITEM is set — release-local.sh will fetch the key from 1Password"
+else
+  fail "neither TCRBAR_SPARKLE_PUBLIC_KEY nor TCRBAR_OP_ITEM is set." \
+       "Without one of them the built app carries no SUPublicEDKey and can" \
+       "never install an update it downloads — release-tcrbar.sh stage 3.5" \
+       "will refuse, but only after the build has already run." \
+       "Fix: export TCRBAR_SPARKLE_PUBLIC_KEY=<the EdDSA public key> yourself," \
+       "or export TCRBAR_OP_ITEM='op://<vault>/<item>' and use release-local.sh."
 fi
 
 # ---------------------------------------------------------------------------
