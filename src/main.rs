@@ -169,6 +169,14 @@ struct LoginArgs {
     /// next token refresh can overwrite what was just written.
     #[arg(long)]
     force: bool,
+    /// Re-login a specific existing account. The identity that comes back must
+    /// match, or nothing is written.
+    #[arg(long)]
+    account: Option<String>,
+    /// Narrow an ambiguous `--account` match to a single org (name or uuid) —
+    /// the same flag `tcr enable`/`tcr disable`/`tcr remove`/`tcr priority` take.
+    #[arg(long)]
+    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -509,9 +517,14 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 /// in [`oauth::login`]; this just resolves the config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let name = oauth::login(&config_path, args.force)
-        .await
-        .context("OAuth login failed")?;
+    let name = oauth::login(
+        &config_path,
+        args.force,
+        args.account.as_deref(),
+        args.org.as_deref(),
+    )
+    .await
+    .context("OAuth login failed")?;
     println!("Logged in as '{name}'.");
     Ok(())
 }

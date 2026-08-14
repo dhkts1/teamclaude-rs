@@ -199,7 +199,8 @@ struct FleetView: View {
                     account: account,
                     countersAreStructural: fleet.source.countersAreStructural,
                     accounts: accounts,
-                    onChanged: { await poller.pollOnce() }
+                    onChanged: { await poller.pollOnce() },
+                    onRelogin: { reloginAccount(account.name) }
                 )
             }
         }
@@ -286,33 +287,28 @@ struct FleetView: View {
                 Button("Start server") { server.start() }
             }
             Button("Refresh") { Task { await poller.pollOnce() } }
-            // Disabled while a proxy is serving, for the same reason
-            // "Take over port…" is disabled while we supervise one: the click
-            // cannot succeed, so offering it is a promise the panel cannot keep.
+            // Used to be disabled while a proxy served the port, enforcing a
+            // `tcr login` refusal that stopped existing 2026-08-11 (`a385f0f`,
+            // "feat: route tcr login through a live proxy instead of
+            // refusing"): `login_route` (src/oauth.rs:966-1010) now probes the
+            // running proxy and, when it is a modern build, routes the
+            // finished credential *through* the server instead of refusing.
+            // Gil runs a modern proxy, so the gate this button enforced no
+            // longer applies to the only case that matters here — and a
+            // disabled button in front of a working flow is a worse defect
+            // than an occasional refusal from an older `tcr`.
             //
-            // `tcr login` refuses outright when something holds the port — the
-            // server's next token refresh would overwrite the credentials the
-            // login just wrote. That refusal is correct. What was wrong is that
-            // the panel offered the button anyway, with the reason in a `.help`
-            // tooltip nobody hovers before clicking, so the flow was: click,
-            // watch a Terminal open, read an error, work out the remedy
-            // yourself. Reported from live use, which is the only way it
-            // surfaces — the button renders identically either way, so no
-            // screenshot and no `--render-states` scene could show it.
-            //
-            // The remedy is two clicks away and both are in this footer, so the
-            // help names them rather than describing the failure.
+            // An older proxy still refuses, but it does so BEFORE any browser
+            // opens, and its message names the remedy — which is useful only
+            // if a human can read it, which is exactly what the Terminal
+            // hand-off gives them.
             Button("Add account…") { addAccount() }
-                .disabled(proxyHoldsThePort)
                 .help(
-                    proxyHoldsThePort
-                        ? "A proxy is serving on the port. `tcr login` refuses "
-                            + "while that is true, because the server's next token "
-                            + "refresh would overwrite the new credentials. Stop "
-                            + "the server, add the account, then start it again."
-                        : "Opens `tcr login` in a Terminal window. It needs one: it "
-                            + "prompts for a name, may ask for a pasted code, and "
-                            + "refuses while a proxy is holding the port."
+                    "Opens `tcr login` in a Terminal window. It needs one: it "
+                        + "prompts for a name and may ask for a pasted code. A "
+                        + "modern proxy takes the login live even while serving; "
+                        + "an older one refuses before any browser opens and "
+                        + "prints how to recover."
                 )
             Spacer()
         }
@@ -436,22 +432,6 @@ struct FleetView: View {
         }
     }
 
-    /// True when a proxy is actually serving the port — the condition under
-    /// which `tcr login` refuses.
-    ///
-    /// The case alone is NOT the test. An offline read also decodes to
-    /// ``PollState/loaded(_:)``: `tcr status` answers from config with no
-    /// server up, which is precisely the state where adding an account
-    /// *works*. Keying on `.loaded` would disable the button exactly when it is
-    /// usable, and the panel already distinguishes the two — `source` is why
-    /// `offlineNotice` exists.
-    private var proxyHoldsThePort: Bool {
-        if case .loaded(let fleet) = poller.state {
-            return !fleet.source.countersAreStructural
-        }
-        return false
-    }
-
     /// Hand `tcr login` to a Terminal window.
     ///
     /// Deliberately a hand-off, not an in-app flow. `tcr login` refuses while a
@@ -460,6 +440,23 @@ struct FleetView: View {
     /// in the label is doing real work: this opens something.
     private func addAccount() {
         if case .failure(let why) = LoginLauncher.launch() {
+            switch why {
+            case .toolMissing(let searched):
+                loginError = "tcr not found (searched \(searched.count) locations)."
+            case .couldNotWriteScript(let message):
+                loginError = "Could not open Terminal: \(message)"
+            }
+        } else {
+            loginError = nil
+        }
+    }
+
+    /// Same hand-off as ``addAccount()``, with the account name threaded
+    /// through so the Terminal script can name it. Surfaces a failure the same
+    /// way — a button that silently does nothing is worse than one that says
+    /// why.
+    private func reloginAccount(_ name: String) {
+        if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
             switch why {
             case .toolMissing(let searched):
                 loginError = "tcr not found (searched \(searched.count) locations)."
@@ -601,16 +598,61 @@ struct AccountRow: View {
     /// computed against — reading the poller's published `state` afterwards could
     /// pick up a different, later poll.
     let onChanged: () async -> PollState
+    /// Hands `tcr login` to a Terminal window for THIS account. Only drawn on a
+    /// `.needsRelogin` row.
+    let onRelogin: () -> Void
 
-    /// The single tint for this row's quota evidence. The pill and the bar both
-    /// read it, so the two can never disagree about whether a quota is known.
+    /// The single tint for this row's quota evidence. The bar and the
+    /// percentage run both read it, so the two can never disagree about
+    /// whether a quota is known — or, now, about whether it is still LIVE.
     ///
     /// `Tok.unmeasured`, not `Tok.unknown`: `FleetTally.Kind` documents these as
     /// deliberately separate — "a quota state this build cannot name" is not the
     /// same fact as "no quota state at all", and colouring them alike re-merges
     /// exactly what the optional model exists to keep apart.
+    ///
+    /// `.needsRelogin` is checked FIRST, ahead of `hasQuotaEvidence`, for a
+    /// reason that is not cosmetic. A broken account that died AFTER being
+    /// probed keeps its last-learned `quota` and `quotaState` — often `.ok` —
+    /// so `Tok.color(for: .ok)` would draw the SAME green a genuinely healthy
+    /// row draws. Green in this palette means "you can work right now"; this
+    /// account's apparent headroom is unreachable until re-login
+    /// (`src/manager/select.rs:931` sends it nothing), so drawing it green
+    /// overclaims exactly the way an unfilled bar overclaims for a nil
+    /// reading — the same reason `QuotaBar`'s own doc-comment makes a nil
+    /// draw DASHED rather than empty. Stale-versus-live is that distinction
+    /// one step over, and this row already committed to the principle.
+    ///
+    /// Neither existing hue fits the stale case. `Tok.unmeasured` is spoken
+    /// for by "never probed" — reusing it re-merges the two causes this
+    /// branch spent three rounds separating. Dashed/`Tok.unknown` would claim
+    /// no reading exists, which misattributes the cause exactly like the grey
+    /// `unmeasured` pill did before this branch started. Red (`Tok.spent`,
+    /// already worn by the pill and the status word on this row) would claim
+    /// the quota is EXHAUSTED, a different and equally false fact — the
+    /// number is real and is not zero. `Tok.disabled` is the closest existing
+    /// token in MEANING ("this row is not in play") even though its literal
+    /// cause (an operator's own choice) is not this row's cause; it is reused
+    /// rather than adding a colour, since this repo's palette is generated
+    /// and gated on WCAG contrast, and a new token is a heavier change than
+    /// muting a stale reading needs.
     private var quotaTint: Color {
-        account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
+        if hasStaleQuotaReading { return Tok.disabled }
+        return account.hasQuotaEvidence ? Tok.color(for: account.quotaState) : Tok.unmeasured
+    }
+
+    /// True for exactly the shape this whole round exists to demote: a
+    /// broken account that has a REAL last-learned quota reading, not an
+    /// absent one. Gated on `hasQuotaEvidence` as well as `health`, not
+    /// `health` alone — a broken account that was NEVER probed (the `04b`
+    /// scene) has nothing filled to overclaim with: its bar is already the
+    /// dashed "no reading" outline, unambiguous regardless of colour, and
+    /// its percentage already reads "n/a". Recolouring either would be a
+    /// change with nothing behind it, and `04b` stays byte-identical because
+    /// this stays false for it. Shared by `quotaTint`, the bar's `.help`, and
+    /// the two percentage runs, so all four demote together or not at all.
+    private var hasStaleQuotaReading: Bool {
+        account.health == .needsRelogin && account.hasQuotaEvidence
     }
 
     /// Whether this account is in the rotation, said in BOTH directions.
@@ -635,14 +677,49 @@ struct AccountRow: View {
     /// it is the normal state of twelve of thirteen rows, and colouring the
     /// unremarkable case would spend the panel's colour budget on it. Colour
     /// stays with quota, which is the thing worth scanning for.
+    ///
+    /// This pill answers ONE question — can this account be picked for
+    /// traffic — and there are at least THREE independent ways for the
+    /// answer to be no, only two of which this build can currently see:
+    /// `disabled` (an operator's own choice), `account.health ==
+    /// .needsRelogin` (`src/manager/select.rs:931` hard-excludes an
+    /// `AccountStatus::Error` account from selection exactly like a disabled
+    /// one, even though `disabled` itself reads false), and a THIRD gate this
+    /// pill cannot yet name: `select.rs:809-822` also excludes an account
+    /// whose `quota.status == Some("rejected")` — Anthropic's own verdict —
+    /// while the snapshot `status` this app decodes stays `"active"`
+    /// (`snapshot.rs:142-153` only ever rewrites `Throttled`). Drawing
+    /// "rotating" on THAT row is the same "misread as its own opposite"
+    /// defect the first two gates were fixed for, and TcrBar currently has no
+    /// way to catch it: `tcr status --json` emits no gate field at all. A
+    /// server-side `GateReason` in the status payload is the fix, tracked
+    /// through the lead rather than added here — decode it as an OPTIONAL
+    /// field when it lands, so an older server (absent field) degrades to
+    /// today's behaviour and never to a false claim in either direction.
+    ///
+    /// A row broken by the SECOND gate draws NEITHER "rotating" nor "parked":
+    /// "parked" claims an operator decision that never happened, and
+    /// "rotating" claims traffic can land here, which `select.rs` refuses.
+    /// Silence is the case this pill was rewritten to avoid, but the reason
+    /// silence used to be dangerous was that nothing nearby said the row
+    /// could not serve — here the red NEEDS RE-LOGIN pill already says
+    /// exactly that, unambiguously, so a second pill would only have two ways
+    /// left to be wrong.
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
+        } else if account.health == .needsRelogin {
+            EmptyView()
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
-                .help("In the rotation — this account can be picked for traffic.")
+                .help(
+                    "In the rotation — this account can be picked for traffic, as "
+                        + "far as this build can tell. A quota rejection from "
+                        + "Anthropic can also exclude an account without changing "
+                        + "its status; TcrBar cannot see that gate yet."
+                )
         }
     }
 
@@ -657,12 +734,47 @@ struct AccountRow: View {
         var parts = [account.name]
         // Spoken in both directions, for the same reason the pill is drawn in
         // both: silence is not a state, and a VoiceOver user has even less to
-        // infer it from than a sighted one.
-        parts.append(account.disabled ? "parked, out of rotation" : "rotating")
+        // infer it from than a sighted one. A broken row says neither
+        // "rotating" nor "parked" — same reason `rotationPill` draws neither:
+        // `disabled` reads false, so "parked" would claim an operator
+        // decision that never happened, and "rotating" would claim traffic
+        // can land here, which `src/manager/select.rs:931` refuses exactly
+        // like a disabled account. The detail below already names the real
+        // cause, so this element is not left silent either.
+        if account.disabled {
+            parts.append("parked, out of rotation")
+        } else if account.health == .needsRelogin {
+            parts.append("not in rotation")
+        } else {
+            parts.append("rotating")
+        }
         // Mirrors the pill's three cases. A VoiceOver user hearing "never
         // probed" about an account whose probe errored is told the same wrong
         // cause a sighted user was, with less to correct it from.
-        if account.hasQuotaEvidence {
+        // Broken beats the probe-based cases: a rejected refresh token is a
+        // known cause with a known remedy, and speaking "never probed" over it
+        // is the same wrong cause a sighted user was told, with less to correct
+        // it from.
+        if account.health == .needsRelogin {
+            // The spoken half of the same fix as `quotaTint`: dropping the
+            // number here (as an earlier round of this did) under-informs a
+            // VoiceOver user exactly where a sighted one still sees a muted
+            // bar and grey digits — deleting real information rather than
+            // demoting it. `hasQuotaEvidence` is false on the never-probed
+            // shape (the `04b` scene), where there truly is no number to
+            // qualify, so only the probed-then-broken shape (`04c`) gets the
+            // longer phrase.
+            if account.hasQuotaEvidence {
+                parts.append(
+                    "refresh token rejected, re-login to restore traffic. Last "
+                        + "reading before rejection: \(account.quotaState.token), "
+                        + "\(QuotaFormat.percent(account.quota)) used — unreachable "
+                        + "until re-login"
+                )
+            } else {
+                parts.append("refresh token rejected, re-login to restore traffic")
+            }
+        } else if account.hasQuotaEvidence {
             parts.append("\(account.quotaState.token), \(QuotaFormat.percent(account.quota)) used")
         } else if account.probeStatus.isFailure {
             parts.append("quota probe \(account.probeStatus.token), quota unknown")
@@ -683,13 +795,35 @@ struct AccountRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: Tok.tightSpacing) {
-            information
-                .accessibilityElement(children: .combine)
-                .accessibilityLabel(rowAccessibilityLabel)
-            toggleButton
+        // A broken row draws its two buttons on their OWN line, below the name
+        // and pills, rather than beside `information` the way `toggleButton`
+        // alone sits for every other row. Measured, not assumed: beside
+        // `information`, `ROTATING` + `NEEDS RE-LOGIN` + `Re-login…` +
+        // `Disable` do not fit in the row's 356pt (`fleetActions`'s own
+        // truncation bug, documented above, is exactly this failure mode) —
+        // the name collapsed to a single truncated character. Every other row
+        // keeps the original layout unchanged, because it already fits.
+        if account.health == .needsRelogin {
+            VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+                information
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(rowAccessibilityLabel)
+                HStack(spacing: Tok.tightSpacing) {
+                    Spacer()
+                    reloginButton
+                    toggleButton
+                }
+            }
+            .padding(.vertical, Tok.rowPaddingV)
+        } else {
+            HStack(alignment: .top, spacing: Tok.tightSpacing) {
+                information
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(rowAccessibilityLabel)
+                toggleButton
+            }
+            .padding(.vertical, Tok.rowPaddingV)
         }
-        .padding(.vertical, Tok.rowPaddingV)
     }
 
     private var information: some View {
@@ -719,7 +853,18 @@ struct AccountRow: View {
                 // palette reserves for *never probed* — telling the operator to
                 // wait for a sweep that had already run and failed. Observed
                 // live: a row reading UNMEASURED beside a status of `error`.
-                if account.hasQuotaEvidence {
+                // Broken beats every other case, including a stale
+                // "never probed" read: `status == "error"` paired with
+                // `probeStatus == .never` is the case actually occurring on
+                // the live fleet, and it is a known cause with a known remedy,
+                // not an absence of information.
+                if account.health == .needsRelogin {
+                    StatusPill("needs re-login", tint: Tok.spent)
+                        .help(
+                            "The refresh token was rejected — this account is out "
+                                + "of rotation and serves no traffic until you re-login."
+                        )
+                } else if account.hasQuotaEvidence {
                     StatusPill(account.quotaState.token, tint: quotaTint)
                 } else if account.probeStatus.isFailure {
                     // The probe's own word, so the row names the cause rather
@@ -740,16 +885,34 @@ struct AccountRow: View {
                 }
             }
             QuotaBar(fraction: account.quota, tint: quotaTint)
+                // Sighted-hover half of the same fix `quotaTint` makes for the
+                // fill colour: a muted bar alone can still read as "just a
+                // dim healthy bar" rather than "not live" without a word
+                // saying so on hover.
+                .help(
+                    hasStaleQuotaReading
+                        ? "The last reading taken before the credential was rejected. "
+                            + "This headroom is unreachable until you re-login."
+                        : ""
+                )
             HStack(spacing: Tok.tightSpacing) {
                 Text(QuotaFormat.percent(account.quota))
                     .font(Tok.secondaryDigitFont)
-                    .foregroundStyle(.secondary)
+                    // Demoted alongside the bar, not left `.secondary`: the
+                    // eye should group these digits as historical rather than
+                    // live, the same distinction `quotaTint` draws for the
+                    // fill. The number itself is unchanged — it is still
+                    // true, just no longer reachable.
+                    .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
                 Text(
                     "· 5h \(QuotaFormat.percent(account.fiveHour)) "
                         + "· 7d \(QuotaFormat.percent(account.sevenDay))"
                 )
                 .font(Tok.secondaryDigitFont)
-                .foregroundStyle(.secondary)
+                // Same demotion as the leading percentage — one run reading
+                // live and the other historical would be its own new
+                // contradiction inside a single line.
+                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
                 Spacer()
                 // `status` is the account's own field and it keeps saying
                 // "active" while `disabled` is true — verified against live
@@ -760,7 +923,11 @@ struct AccountRow: View {
                 if !account.disabled {
                     Text(account.status)
                         .font(Tok.secondaryFont)
-                        .foregroundStyle(.secondary)
+                        // `active` and `error` must not be pixel-identical: an
+                        // `error` account is what the UNMEASURED pill used to
+                        // wear too, and the raw word alone drew in the same
+                        // grey as a healthy account right above it.
+                        .foregroundStyle(account.health == .needsRelogin ? Tok.spent : .secondary)
                         .lineLimit(1)
                 }
             }
@@ -834,6 +1001,30 @@ struct AccountRow: View {
         // `Tok.ok`, which is the clean case's alone.
         case .spokeUp: return Tok.near
         }
+    }
+
+    /// Hands `tcr login --account <name>` to a Terminal window, targeting THIS
+    /// row's account. Drawn on a `.needsRelogin` row only, beside
+    /// ``toggleButton``.
+    ///
+    /// `--account` (`src/main.rs` / `src/oauth.rs`'s `login_hint`) requests
+    /// that specific identity and refuses to write anything if the browser
+    /// hands back a different one — this app used to say `tcr login` could
+    /// not be targeted at all, which stopped being true the moment that flag
+    /// shipped. Untargeted, the row's click could authenticate as whichever
+    /// account happened to be signed into the browser; targeted, a mismatch
+    /// refuses rather than overwriting the wrong account's credentials.
+    private var reloginButton: some View {
+        Button("Re-login…") { onRelogin() }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .font(Tok.detailFont)
+            .accessibilityLabel("Re-login \(account.name)")
+            .help(
+                "Opens `tcr login --account` in a Terminal window, requesting "
+                    + "this exact account. `tcr` refuses to save if the browser "
+                    + "hands back a different one."
+            )
     }
 
     /// `tcr enable <name>` / `tcr disable <name>`, keyed off the account's own

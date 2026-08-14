@@ -295,6 +295,11 @@ public enum Tok {
         case .near: return near
         case .spent: return spent
         case .unknown: return unknown
+        // Reuses `spent`, not a new token: a broken account is known-cannot-
+        // serve, the same certainty `spent` already carries, and this repo's
+        // colour palette is generated — a new token drags in a regeneration
+        // and two blocking gates for a fact this one already covers.
+        case .needsRelogin: return spent
         case .unmeasured: return unmeasured
         case .disabled: return disabled
         }

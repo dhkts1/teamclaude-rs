@@ -66,6 +66,8 @@ enum RenderStates {
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false),
+            ("04b-needs-relogin-row", .loaded(fleet(needsReloginJSON)), false),
+            ("04c-probed-then-broken-row", .loaded(fleet(probedThenBrokenJSON)), false),
             ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false),
             ("06-offline-source", .loaded(fleet(offlineJSON)), false),
             ("07-empty-fleet", .loaded(fleet("[]")), false),
@@ -221,10 +223,11 @@ enum RenderStates {
         disabled: Bool = false,
         probe: String = "ok",
         held: String = "[]",
-        source: String = "live"
+        source: String = "live",
+        status: String = "active"
     ) -> String {
         """
-        {"name":"\(name)","priority":0,"status":"active","disabled":\(disabled),
+        {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
          "quota":\(quota),"quotaState":"\(state)","fiveHour":\(quota),
          "sevenDay":\(quota),"sevenDayOi":0.0,"held":\(held),
          "requests":102,"inputTokens":8781926,"outputTokens":31860,
@@ -269,5 +272,36 @@ enum RenderStates {
 
     private static var offlineJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok", source: "offline"))]"
+    }
+
+    /// The bug this whole scene set exists for: a dead-credential account
+    /// (`status:"error"`, `probeStatus:"never"`) beside a healthy one, so the
+    /// pill, the status word's tint, the row order and the header clause are
+    /// all reviewable together. The Re-login button draws as a placeholder —
+    /// `ImageRenderer` cannot rasterise AppKit controls — but its presence
+    /// beside Disable still shows in the row's width.
+    private static var needsReloginJSON: String {
+        let alice = account("alice@example.com", quota: "0.12", state: "ok")
+        let dave = account(
+            "dave@example.com", quota: "null", state: "ok", probe: "never", status: "error")
+        return "[\(alice),\(dave)]"
+    }
+
+    /// The blind spot an adversarial review found: `04b` above is the OTHER
+    /// way an account breaks — never probed, `quota: null`. This is the shape
+    /// that actually happens in production: a credential that dies AFTER
+    /// being probed keeps its last-learned `quota` and a real `probeStatus`
+    /// (`probe_account`, `src/manager/probing.rs:128-139`, early-returns on
+    /// an `Error` row instead of clearing anything; `refresh.rs:93-101` sets
+    /// only `status`). `carol@example.com` here carries `status:"error"` WITH
+    /// `quota:0.12` and `probeStatus:"ok"` — a real prior reading, not an
+    /// absent one — sat beside a genuinely healthy account so the header's
+    /// arithmetic ("1 of 2 ready · 1 need re-login", not "2 of 2 ready") is
+    /// reviewable in the same frame this scene renders.
+    private static var probedThenBrokenJSON: String {
+        let alice = account("alice@example.com", quota: "0.12", state: "ok")
+        let carol = account(
+            "carol@example.com", quota: "0.12", state: "ok", probe: "ok", status: "error")
+        return "[\(alice),\(carol)]"
     }
 }

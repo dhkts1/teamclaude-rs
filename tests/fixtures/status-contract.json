@@ -5,6 +5,7 @@
     "disabled": false,
     "fiveHour": 0.04,
     "freeAtMs": null,
+    "gate": "ok",
     "held": [],
     "inputTokens": 8000000,
     "lastStreamError": "overloaded_error",
@@ -32,6 +33,7 @@
     "disabled": false,
     "fiveHour": 0.95,
     "freeAtMs": null,
+    "gate": "ok",
     "held": [
       {
         "minutesUntilReset": 0,
@@ -70,6 +72,7 @@
     "disabled": false,
     "fiveHour": 1.0,
     "freeAtMs": 1767312000000,
+    "gate": "ok",
     "held": [
       {
         "minutesUntilReset": 0,
@@ -108,6 +111,7 @@
     "disabled": true,
     "fiveHour": null,
     "freeAtMs": null,
+    "gate": "ok",
     "held": [],
     "inputTokens": 0,
     "lastStreamError": null,
