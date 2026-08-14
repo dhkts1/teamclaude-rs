@@ -13,6 +13,8 @@ struct FleetView: View {
     @ObservedObject var server: ServerController
     @ObservedObject var loginItem: LoginItem
     @ObservedObject var accounts: AccountController
+    /// The identity-bound control account. See ``ControlAccountController``.
+    @ObservedObject var control: ControlAccountController
     /// Owned by the app, for the same reason the poller is: the panel is a view
     /// and the mode is not, and an assertion released when the view went away
     /// would be a keep-awake control that keeps nothing awake. Under
@@ -198,6 +200,7 @@ struct FleetView: View {
                     account: account,
                     countersAreStructural: fleet.source.countersAreStructural,
                     accounts: accounts,
+                    control: control,
                     onChanged: { await poller.pollOnce() },
                     onRelogin: { reloginAccount(account.name) }
                 )
@@ -644,6 +647,8 @@ struct AccountRow: View {
     let account: Account
     let countersAreStructural: Bool
     @ObservedObject var accounts: AccountController
+    /// The identity-bound control account. See ``ControlAccountController``.
+    @ObservedObject var control: ControlAccountController
     /// Called after a successful toggle so the row re-reads reality. It returns
     /// the state of the read it just performed, which is what the verdict is
     /// computed against — reading the poller's published `state` afterwards could
@@ -756,6 +761,32 @@ struct AccountRow: View {
     /// could not serve — here the red NEEDS RE-LOGIN pill already says
     /// exactly that, unambiguously, so a second pill would only have two ways
     /// left to be wrong.
+    /// Row-level marker for the identity-bound control account, drawn beside
+    /// the name so it survives without opening the gear menu — the gear's own
+    /// checkmark state is one click away, and `ImageRenderer` cannot rasterise
+    /// a `Menu` at all (see the harness note on `--render-states`), so this is
+    /// also the only place this fact is ever visually verifiable outside a live
+    /// run.
+    ///
+    /// `Tok.accent` — the system control-accent colour, not one of the
+    /// quota/rotation status hues (`ok`/`near`/`spent`/`unmeasured`/`disabled`/
+    /// `unknown`) and not `Tok.awake` (already spoken for by keep-awake mode,
+    /// a genuinely different fact). "Control account" is a designation, not a
+    /// measured state, and `accent` is the one token in this palette already
+    /// reserved for exactly that distinction elsewhere in the app.
+    ///
+    /// Silent — not merely dim — when `control.unavailable` or nothing is set:
+    /// a phantom checkmark on an older `tcr` build (which cannot even confirm
+    /// the concept exists) would be worse than the feature simply not
+    /// appearing yet.
+    @ViewBuilder
+    private var controlIndicator: some View {
+        if control.isControl(account.name) {
+            StatusPill("control", tint: Tok.accent)
+                .help("This account is held out of rotation as the control account.")
+        }
+    }
+
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
@@ -783,6 +814,13 @@ struct AccountRow: View {
     /// actionable.
     private var rowAccessibilityLabel: String {
         var parts = [account.name]
+        // Spoken beside the name for the same reason `controlIndicator` is
+        // drawn beside it: this is an identity fact, not a rotation/quota one,
+        // and a VoiceOver user reaching the row should not have to open the
+        // gear menu to learn it.
+        if control.isControl(account.name) {
+            parts.append("control account")
+        }
         // Spoken in both directions, for the same reason the pill is drawn in
         // both: silence is not a state, and a VoiceOver user has even less to
         // infer it from than a sighted one. A broken row says neither
@@ -846,6 +884,33 @@ struct AccountRow: View {
     }
 
     var body: some View {
+        rowContent
+            // The card inset. Concentric with the border below it: the corner
+            // radius is `Tok.radiusMedium` and this is the padding that keeps
+            // that curve from clipping the account name or the toggle button —
+            // an outer radius with no matching inset draws a border that bites
+            // into its own content at the corners.
+            .padding(.horizontal, Tok.space3)
+            .padding(.vertical, Tok.space2)
+            .background(
+                RoundedRectangle(cornerRadius: Tok.radiusMedium)
+                    .fill(Tok.raised)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Tok.radiusMedium)
+                    .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
+            )
+            .contextMenu { contextMenuItems }
+    }
+
+    /// The row's own layout, unchanged from before the border was added except
+    /// for its name: this used to be `body` directly. Split out so the border
+    /// and the context menu are the ONE place that wraps every row shape,
+    /// rather than three copies of the same background/overlay/contextMenu
+    /// pair — the broken-row branch and the normal branch would otherwise have
+    /// to repeat it identically.
+    @ViewBuilder
+    private var rowContent: some View {
         // A broken row draws its two buttons on their OWN line, below the name
         // and pills, rather than beside `information` the way `toggleButton`
         // alone sits for every other row. Measured, not assumed: beside
@@ -871,10 +936,130 @@ struct AccountRow: View {
                 information
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel(rowAccessibilityLabel)
-                toggleButton
+                accountActionsMenu
             }
             .padding(.vertical, Tok.rowPaddingV)
         }
+    }
+
+    /// Actions beyond the single toggle, reached three ways: the gear menu
+    /// beside the row, right-click (or Control-click / two-finger click) for
+    /// a context menu, and — on a broken row only — the standalone
+    /// ``reloginButton``. Built from what ``AccountController`` and the
+    /// row's own `onRelogin` closure already expose — nothing here calls
+    /// anything new. All three routes share this one `@ViewBuilder` so the
+    /// gear and the context menu cannot drift into two different notions of
+    /// what the row can do.
+    ///
+    /// Deliberately does NOT add routing or pin controls: that is a separate
+    /// feature, not this row's to invent.
+    @ViewBuilder
+    private var contextMenuItems: some View {
+        let enabling = account.disabled
+        Button(enabling ? "Enable" : "Disable") {
+            Task { await performToggle(enabling: enabling) }
+        }
+        .disabled(accounts.isPending(account.name))
+        if account.health == .needsRelogin {
+            Button("Re-login…") { onRelogin() }
+        }
+        Divider()
+        // Hidden entirely while `control` cannot answer the question at all
+        // (``ControlAccountController/unavailable``) — an older `tcr` has no
+        // `control` subcommand, and an action this build cannot even read back
+        // is worse than no action: a click would exit non-zero with a message
+        // about a route that does not exist, on every single row, forever.
+        if !control.unavailable {
+            if control.isControl(account.name) {
+                Button("Clear Control Account") {
+                    Task { await performSetControl(name: nil, key: account.name) }
+                }
+                .disabled(control.isPending(account.name))
+            } else {
+                Button("Use as Control Account") {
+                    Task { await performSetControl(name: account.name, key: account.name) }
+                }
+                .disabled(control.isPending(account.name))
+            }
+        }
+        Divider()
+        Button("Copy Account Name") {
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(account.name, forType: .string)
+        }
+    }
+
+    /// The one place `tcr control` is actually run for this row — set when
+    /// picked from another row's menu, or cleared when picked from the row that
+    /// currently holds it. Mirrors ``performToggle(enabling:)``: exit 0 is
+    /// permission to re-read, never the outcome itself, so `control.refresh()`
+    /// runs afterward and the row draws whatever it actually says.
+    private func performSetControl(name: String?, key: String) async {
+        let attempt = await control.setControl(name: name, key: key)
+        guard case .accepted = attempt else { return }
+        await control.refresh()
+    }
+
+    /// The visible affordance for `contextMenuItems`. Right-click was the
+    /// only way to reach Enable/Disable, Re-login… and Copy Account Name
+    /// before this — undiscoverable, since nothing on the row hinted a menu
+    /// existed. Replaces the row's old trailing `toggleButton` text button
+    /// (still used, unchanged, on the `.needsRelogin` layout — see the
+    /// doc-comment there) so the account name also gets back the width that
+    /// button's text ("Disable"/"Enabling…") used to take, which matters
+    /// because the name already truncates.
+    ///
+    /// `.menuStyle(.borderlessButton)` rather than the `.bordered` style
+    /// every other control in this panel uses: those are all text buttons,
+    /// and a bordered icon-only control reads as heavier chrome than a
+    /// 13pt row wants. This is the one icon-only control in the panel, so
+    /// there is no existing icon-menu style to match instead.
+    private var accountActionsMenu: some View {
+        Menu {
+            contextMenuItems
+        } label: {
+            Image(systemName: "gearshape")
+                .font(Tok.bodyFont)
+                .foregroundStyle(.secondary)
+                // The Menu's own `.accessibilityLabel` below names the
+                // control; without hiding the glyph too, VoiceOver reads
+                // both the image ("gearshape, image") and the label,
+                // announcing the same control twice.
+                .accessibilityHidden(true)
+        }
+        .menuStyle(.borderlessButton)
+        .controlSize(.small)
+        .fixedSize()
+        .accessibilityLabel("Account actions for \(account.name)")
+        .help("Enable/disable, re-login, or copy the account name.")
+    }
+
+    /// The one place `tcr enable`/`tcr disable` is actually run. Shared by
+    /// ``toggleButton`` and the context menu's own entry so the two can never
+    /// drift into two different notions of what a toggle does — see the
+    /// doc-comment on `toggleButton`'s old inline `Task` for why the
+    /// read-back-and-record dance below is not optional.
+    private func performToggle(enabling: Bool) async {
+        // Exit 0 is not the outcome — it is permission to go and find out
+        // what the outcome was. The refresh's own result is compared
+        // against what was asked, and the row says which thing happened.
+        //
+        // `notice` is threaded through rather than dropped: `tcr` reports
+        // half-done work (a park the config cannot persist, a proxy too old
+        // for the route) on stderr while exiting 0, and the read-back
+        // cannot see it — `disabled` flipped, so the comparison confirms.
+        // Losing it here is what let the row stamp `parked ✓` on a change
+        // that would not survive a restart.
+        let attempt = await accounts.setEnabled(enabling, account: account.name)
+        guard case .accepted(let notice) = attempt else { return }
+        let readback = await onChanged()
+        accounts.record(
+            readback: readback,
+            requestedEnabled: enabling,
+            account: account.name,
+            notice: notice
+        )
     }
 
     private var information: some View {
@@ -891,6 +1076,7 @@ struct AccountRow: View {
                     .truncationMode(.middle)
                     .help(account.name)
                     .textSelection(.enabled)
+                controlIndicator
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
                 // A never-probed account's `quotaState` is Rust's default, not a
@@ -936,6 +1122,16 @@ struct AccountRow: View {
                 }
             }
             QuotaBar(fraction: account.quota, tint: quotaTint)
+                // `Tok.rowLineSpacing` (2pt, shared by every line in this
+                // column) put the bar visually inside the pills above it —
+                // the pills carry their own 2pt vertical padding on top of
+                // that gap, so the two collided. The fix is asymmetric, not
+                // a blanket increase to `rowLineSpacing`: the bar belongs
+                // WITH the percent/req-cache numbers beneath it (same fact,
+                // two notations, and already tight to them), not with the
+                // pills above. So only the bar gets extra top padding,
+                // leaving the numbers below it untouched.
+                .padding(.top, Tok.tightSpacing)
                 // Sighted-hover half of the same fix `quotaTint` makes for the
                 // fill colour: a muted bar alone can still read as "just a
                 // dim healthy bar" rather than "not live" without a word
@@ -1089,27 +1285,7 @@ struct AccountRow: View {
         let verb = enabling ? "Enable" : "Disable"
         let title = pending ? (enabling ? "Enabling…" : "Disabling…") : verb
         return Button(title) {
-            Task {
-                // Exit 0 is not the outcome — it is permission to go and find out
-                // what the outcome was. The refresh's own result is compared
-                // against what was asked, and the row says which thing happened.
-                //
-                // `notice` is threaded through rather than dropped: `tcr` reports
-                // half-done work (a park the config cannot persist, a proxy too old
-                // for the route) on stderr while exiting 0, and the read-back
-                // cannot see it — `disabled` flipped, so the comparison confirms.
-                // Losing it here is what let the row stamp `parked ✓` on a change
-                // that would not survive a restart.
-                let attempt = await accounts.setEnabled(enabling, account: account.name)
-                guard case .accepted(let notice) = attempt else { return }
-                let readback = await onChanged()
-                accounts.record(
-                    readback: readback,
-                    requestedEnabled: enabling,
-                    account: account.name,
-                    notice: notice
-                )
-            }
+            Task { await performToggle(enabling: enabling) }
         }
         // `.bordered`, not `.borderless`. Borderless draws the label as bare
         // text, so the ONE actionable control in the row looked exactly like

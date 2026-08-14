@@ -693,6 +693,17 @@ const LOCAL_PREFIX: &str = "/_tcr";
 ///   `mcp-proxy.anthropic.com` — a host the CONNECT path blind-tunnels, so it carries
 ///   the CLIENT's own token. A pooled list therefore hands the client ids its own
 ///   identity cannot resolve.
+/// - `/v1/sessions` is Remote Control's session record — read, `/archive`,
+///   `/unarchive`. Measured across all four rolling proxy logs
+///   (`~/.cache/teamclaude/logs/`), aggregating `upstream response account=… path=…
+///   status=…`: `/v1/sessions/<id>` and its sub-paths came back 404 on 7 of 7
+///   requests, spread over 6 different pooled accounts, and never once a 2xx from
+///   any pooled identity. The reason is visible in the ids: the same opaque suffix
+///   appears on both planes — `/v1/code/sessions/cse_<suffix>` (relayed,
+///   `mode=ClientCredential status=200`) and `/v1/sessions/session_<suffix>`
+///   (pooled, 404), for the SAME `<suffix>`. Three distinct ids matched this way. The session record is minted under the client identity
+///   by the `/v1/code` pairing, so reading or archiving it under a pooled token is a
+///   404 by construction — the same failure shape the `/v1/code` entry documents.
 ///
 /// Measured on the live log while every one of these still went through rotation:
 /// 13 of 57 sessionless requests came back 404 (22.8%), against 0 of 1556 pinned ones.
@@ -706,11 +717,12 @@ const LOCAL_PREFIX: &str = "/_tcr";
 /// Both edges of a raw `starts_with` were live defects: `"/api/oauth/file_upload"`
 /// (no terminator) also relayed `/api/oauth/file_upload_v2`, and `"/v1/code/"`
 /// (with one) missed the bare `/v1/code`.
-const CLIENT_CREDENTIAL_PREFIXES: [&str; 4] = [
+const CLIENT_CREDENTIAL_PREFIXES: [&str; 5] = [
     "/v1/code",
     "/api/oauth/files",
     "/api/oauth/file_upload",
     "/v1/mcp_servers",
+    "/v1/sessions",
 ];
 
 /// The CLIENT's own OAuth token refresh. Relayed raw — no auth header at all,
@@ -6745,6 +6757,7 @@ mod tests {
             "/api/oauth/files/file_0123",
             "/api/oauth/file_upload",
             "/v1/mcp_servers",
+            "/v1/sessions/session_abc/archive",
         ] {
             assert_eq!(
                 relay_mode(&Method::POST, path),
@@ -6787,6 +6800,7 @@ mod tests {
             "/api/oauth/files",
             "/api/oauth/file_upload",
             "/v1/mcp_servers",
+            "/v1/sessions",
         ] {
             assert_eq!(
                 relay_mode(&Method::POST, path),
@@ -6794,6 +6808,11 @@ mod tests {
                 "the bare {path} is the same route as {path}/"
             );
         }
+        assert_eq!(
+            relay_mode(&Method::POST, "/v1/sessions/session_abc/archive"),
+            Some(RelayMode::ClientCredential),
+            "a session sub-path is still client-credential"
+        );
         // Longer identifiers: NOT the route, previously swallowed by the entry that
         // carried no terminator.
         for path in [
@@ -6801,6 +6820,7 @@ mod tests {
             "/api/oauth/file_upload_v2",
             "/api/oauth/file_uploadX",
             "/api/oauth/filesystem",
+            "/v1/sessions_v2",
         ] {
             assert_eq!(
                 relay_mode(&Method::POST, path),
