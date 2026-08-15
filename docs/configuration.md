@@ -188,6 +188,7 @@ Consequences worth knowing before you tune either number:
 | `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
+| `throttleExemptNoise` | bool | **`false`** (OFF) | no | skip the fleet-wide GCRA entirely for `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) instead of making it queue behind inference |
 
 ### `sessionAffinity` also pins identity-less loopback requests
 
@@ -221,10 +222,10 @@ that off turns this off too.
 
 ### Which knobs are opt-in and which are opt-out
 
-Five knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
-`loadBalanceMigration`, `pacing`, `lockAccount` and `http1Only`. (An older README said three;
-`pacing` and `lockAccount` were missing from that list. `sessionAffinity` was a sixth until
-it flipped to default ON — see below.)
+Six knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
+`loadBalanceMigration`, `pacing`, `lockAccount`, `http1Only` and `throttleExemptNoise`. (An
+older README said three; `pacing` and `lockAccount` were missing from that list.
+`sessionAffinity` was on this list too until it flipped to default ON — see below.)
 
 Two knobs ship ON and are opt-**out**: `revalidationServe`, default `true`, disabled by
 writing `"revalidationServe": false`; and `sessionAffinity`, also default `true`, disabled by
