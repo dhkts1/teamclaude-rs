@@ -1566,6 +1566,37 @@ impl Manager {
             .map(|a| a.name.clone())
     }
 
+    /// The resolved `lockAccount` name, or `None` when unlocked / the name did
+    /// not match any account. `locked_idx` is fixed at construction (see
+    /// [`Self::assemble`]), so this is a plain resolve against the live
+    /// `accounts` vec — no lock ordering concerns beyond the read itself.
+    /// Read by the boot-line log in `server.rs` so a hard lock is visible from
+    /// outside the process, the same reasoning as `http1_only` on that line.
+    pub fn locked_account_name(&self) -> Option<String> {
+        let idx = self.locked_idx?;
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .map(|a| a.name.clone())
+    }
+
+    /// Whether per-account request pacing does anything (see
+    /// [`config::PacingConfig::is_active`]). Read by the boot-line log in
+    /// `server.rs`, not the request path — [`Self::eligible`] reads
+    /// `self.pacing` directly.
+    pub fn pacing_active(&self) -> bool {
+        self.pacing.is_active()
+    }
+
+    /// Whether the global outbound throttle does anything (see
+    /// [`config::ThrottleConfig::is_active`]). Read by the boot-line log in
+    /// `server.rs`, not the request path — [`Self::throttle_send`] reads
+    /// `self.throttle` directly.
+    pub fn throttle_active(&self) -> bool {
+        self.throttle.is_active()
+    }
+
     /// Persist ONLY the top-level `controlAccount` key, via
     /// [`config::save_control_account`] — never the whole config (see
     /// [`Self::persist_disabled`]'s doc-comment for why: the in-memory
