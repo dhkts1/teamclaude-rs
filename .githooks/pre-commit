@@ -276,50 +276,29 @@ fi
 # compiles it. Widen this to `apps/macos/scripts/**` and both slip through
 # under an already-released version; add new preflight-only scripts here by
 # name, the same way, never by loosening the directory.
-staged_shippable="$(git diff --cached --name-only --diff-filter=ACMR -- . \
-                    ':(exclude)*.md' \
-                    ':(exclude)docs/**' \
-                    ':(exclude)assets/**' \
-                    ':(exclude).github/**' \
-                    ':(exclude).githooks/**' \
-                    ':(exclude)apps/macos/appcast.xml' \
-                    ':(exclude)apps/macos/scripts/release-preflight.sh' || true)"
+# The pathspec exclusion and version-already-tagged check are both delegated
+# to scripts/check-release-version.sh, which is also called from
+# .github/workflows/ci.yml on pull_request — the commit-time hook only ever
+# sees the tags that exist AT COMMIT TIME, so it cannot catch two branches
+# that each legitimately bump to the same next version and merge with no
+# conflict. The CI job re-runs this same check at merge time, against a fully
+# fetched tag list, which is when the second branch's tag collision actually
+# exists to be seen. See that script's header for the full story.
+mapfile -t staged_files < <(git diff --cached --name-only --diff-filter=ACMR -- . || true)
 
-if [ -n "$staged_shippable" ]; then
-  # Read the INDEX (`:Cargo.toml`), not the working tree: that is what this
-  # commit will actually contain, and it falls back to HEAD's copy when
-  # Cargo.toml is not staged — which is precisely the case this gate catches.
-  #
-  # The sed is character-for-character the one in `build-tcrbar.sh:98`. Two
-  # copies of one expression is a real cost, but the alternative is this hook
-  # and the build script disagreeing about what the version IS, and a gate that
-  # reads a different number than the thing it guards is worse than no gate.
-  staged_version="$(git show :Cargo.toml 2>/dev/null \
-                    | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9][^"]*\)".*/\1/p' \
-                    | head -1 || true)"
-
-  if [ -z "$staged_version" ]; then
-    # Say so rather than pass silently. A gate that cannot read its input has
-    # not checked anything, and must not look like it did.
-    echo "pre-commit: could not read a version from the staged Cargo.toml — release-version gate SKIPPED." >&2
-  elif git rev-parse -q --verify "refs/tags/v$staged_version" >/dev/null 2>&1; then
+if [ "${#staged_files[@]}" -gt 0 ]; then
+  # git runs hooks from the repo root (see the gitleaks block above), so
+  # scripts/check-release-version.sh resolves without needing $0's dirname.
+  if ! scripts/check-release-version.sh --source=index "${staged_files[@]}"; then
     echo "" >&2
-    echo "pre-commit: BLOCKED — v$staged_version is already a released tag." >&2
-    echo "" >&2
-    echo "  This commit changes shipped files but leaves Cargo.toml at $staged_version," >&2
-    echo "  a version that has already been tagged and published. Everything built" >&2
-    echo "  from here would claim to be $staged_version while not being it." >&2
-    echo "" >&2
+    echo "  Staged files that triggered this are listed above." >&2
     echo "  Bump the version in Cargo.toml, stage it, and commit again:" >&2
     echo "" >&2
-    echo "      \$EDITOR Cargo.toml    # version = \"$staged_version\"  ->  the next one" >&2
+    echo "      \$EDITOR Cargo.toml    # bump the version field" >&2
     echo "      git add Cargo.toml" >&2
     echo "" >&2
-    echo "  Staged files that triggered this:" >&2
-    printf '%s\n' "$staged_shippable" | sed 's/^/      /' >&2
-    echo "" >&2
     echo "  Commits that install nothing (*.md, docs/, assets/, .github/, .githooks/) are exempt." >&2
-    echo "  If this genuinely should ship under $staged_version:  git commit --no-verify" >&2
+    echo "  If this genuinely should ship under the already-released version:  git commit --no-verify" >&2
     exit 1
   fi
 fi

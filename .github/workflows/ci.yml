@@ -163,6 +163,43 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  # ── release-version (merge-time) ──────────────────────────────────────────
+  # .githooks/pre-commit runs the same check, but it can only ever see the
+  # tags that exist AT COMMIT TIME: the tag that actually invalidates a
+  # branch is created later, at release. Two branches can each legitimately
+  # bump to the same next version, both pass the commit-time hook, and merge
+  # with no conflict at all (same line, same value) — nothing for a human to
+  # notice. This job re-runs scripts/check-release-version.sh here, at PR
+  # time, against a fully fetched tag list, which is when that collision
+  # actually exists to be seen.
+  #
+  # NOT wired into branch protection by this change — see the PR body. A
+  # non-required check is advisory only; it must be added to the required
+  # checks list (alongside ci, audit, macos) to actually block a merge.
+  release-version:
+    name: release-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # A shallow clone has no tags, and the check would silently pass —
+          # full history plus explicit tag fetch is load-bearing here, not
+          # a nicety.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Check release version
+        run: |
+          mapfile -t changed_files < <(git diff --name-only --diff-filter=ACMR \
+            "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" -- .)
+          if [ "${#changed_files[@]}" -eq 0 ]; then
+            echo "release-version: no changed files in this PR — nothing to check."
+            exit 0
+          fi
+          scripts/check-release-version.sh --source=worktree "${changed_files[@]}"
+
   tsan:
     name: tsan
     runs-on: ubuntu-latest
