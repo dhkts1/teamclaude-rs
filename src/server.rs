@@ -804,6 +804,11 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // already guaranteed to log — not adding a second line an operator has to
     // know to look for. See `Config::http1_only`.
     let http1_only = manager.http1_only();
+    // `throttle_exempt_noise` rides on this same line for the same reason as
+    // `http1_only` above: it is a default-OFF knob (see
+    // `Manager::throttle_exempt_noise_enabled`) and this is the one place
+    // every boot is already guaranteed to log.
+    let throttle_exempt_noise = manager.throttle_exempt_noise_enabled();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         sha = build_info::SHA,
@@ -812,6 +817,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         pid = std::process::id(),
         port = bound.port(),
         http1_only,
+        throttle_exempt_noise,
         "server started"
     );
 
