@@ -912,6 +912,68 @@ fn render_window(
     }
 }
 
+/// Minimum served requests before [`cache_hit_ratio`] reports a number rather
+/// than no-signal.
+///
+/// Grounded in two read measurements, not taste: `docs/plans/divert-budget-swarm-state.md`
+/// records the median distinct divert destinations per hold episode as 2.0, so
+/// an account whose only traffic is "a few cold diverts" sits at single-digit
+/// requests; a live read of the running fleet on 2026-08-15 (`tcr status
+/// --json`) showed every account with a real, sustained cache ratio at 376+
+/// requests, three orders of magnitude above that. 20 sits comfortably above
+/// the divert-only noise floor and nowhere near real serving volume, so it
+/// cannot suppress an actual measurement while it reliably catches the
+/// near-empty-denominator case this constant exists to silence. This is a
+/// design judgment (σ2 — architecturally grounded in real data, not a
+/// controlled A/B against the incident it targets), not a derived fact.
+const CACHE_SIGNAL_FLOOR_REQUESTS: u64 = 20;
+
+/// The account's prompt-cache hit ratio, or `None` when there is nothing
+/// reliable to report — never a placeholder number.
+///
+/// Two distinct reasons collapse to the same `None`, deliberately: nothing to
+/// divide by (`input_tokens == 0` — the offline / never-served case, the
+/// original honesty fix) and too little served to trust the ratio
+/// (`requests` under [`CACHE_SIGNAL_FLOOR_REQUESTS`] — an account whose only
+/// real traffic was a handful of cold diverts, which is what "the low
+/// `cacheHitRatio` means the cache is broken" falsely read as). Both are "not
+/// a measurement", and the wire's existing contract — `null`, never a
+/// placeholder `0.0` — already reads as unambiguously distinct from a real 0%
+/// to every consumer (`offline_status_reports_null_not_zero_hit_ratio`), so
+/// folding the floor into the same `None` needs no new field on the wire: a
+/// no-signal account and an offline account both render `"cacheHitRatio":
+/// null`, and a consumer that already treats null as "not measured" handles
+/// both without a code change.
+///
+/// The ratio itself is unchanged from the original fix — `cache_read_tokens /
+/// input_tokens`. `input_tokens`/`cache_read_tokens` are populated
+/// exclusively from served-request usage (`Manager::update_usage`, called
+/// only from real proxied responses in `proxy.rs`); the background quota
+/// prober and keep-warm path update `apply_usage`/`update_quota` instead,
+/// which never touch these counters (verified by reading every call site,
+/// 2026-08-15). So the denominator was already inference-only traffic before
+/// this change — the false "cache is broken" signal was a sample-size
+/// problem, not a wrong-traffic-class problem, and the floor above is the
+/// fix for it.
+///
+/// Takes `source` and checks it FIRST, ahead of the floor: an offline
+/// snapshot's counters are structurally zero regardless of `requests`, so the
+/// floor check alone happened to null them too — but relying on that
+/// coincidence would leave the two guards silently redundant instead of each
+/// covering the case it names. Checking `source` first also makes the
+/// contract order-independent of any future change to what "offline" counts
+/// as zero: the moment `source` says "not the serving process", nothing else
+/// about the row's numbers matters.
+fn cache_hit_ratio(a: &AccountSnapshot, source: StatusSource) -> Option<f64> {
+    if source == StatusSource::Offline {
+        return None;
+    }
+    if a.input_tokens == 0 || a.requests < CACHE_SIGNAL_FLOOR_REQUESTS {
+        return None;
+    }
+    Some(a.cache_read_tokens as f64 / a.input_tokens as f64)
+}
+
 /// Render a [`StatsSnapshot`] as plain text — ONE LINE PER ACCOUNT — so the
 /// output is greppable (`account NAME priority=P quota=Q% status=S ...`). The
 /// ratatui TUI renderer is unusable for stdout, and per Gil's greppable-output
@@ -942,19 +1004,18 @@ pub fn render_accounts(
             Some(u) => format!(" fable={:.0}%", u * 100.0),
             None => String::new(),
         };
-        // Prompt-cache hit ratio. `n/a` — never `0%` — when there is no input to
-        // divide by (R3: no NaN), matching the `5h=n/a` / `wk=n/a` idiom: an
-        // OFFLINE snapshot's counters live in the server's process and are
-        // structurally zero here, and rendering that as a measured 0% is exactly
-        // the lie that hid a real prompt-cache catastrophe. Greppable `cache=NN%`
-        // token for parity with the JSON field.
-        let cache = if a.input_tokens == 0 {
-            " cache=n/a".to_string()
-        } else {
-            format!(
-                " cache={:.0}%",
-                a.cache_read_tokens as f64 / a.input_tokens as f64 * 100.0
-            )
+        // Prompt-cache hit ratio. `n/a` — never `0%` — when there is no signal
+        // to report (R3: no NaN either): see [`cache_hit_ratio`] for the two
+        // cases that collapse to it, matching the `5h=n/a` / `wk=n/a` idiom.
+        // An OFFLINE snapshot's counters live in the server's process and are
+        // structurally zero here, and rendering that as a measured 0% is
+        // exactly the lie that hid a real prompt-cache catastrophe — same
+        // reasoning extends to a live account whose only traffic was a
+        // handful of cold diverts. Greppable `cache=NN%` token for parity
+        // with the JSON field.
+        let cache = match cache_hit_ratio(a, source) {
+            None => " cache=n/a".to_string(),
+            Some(ratio) => format!(" cache={:.0}%", ratio * 100.0),
         };
         // Stream failures this account's streams carried (decayed window): an
         // in-band SSE `error` event, or a stream that hit EOF without Anthropic's
@@ -1115,26 +1176,78 @@ fn render_accounts_json(
                 "fiveHour": a.five_hour,
                 "sevenDay": a.seven_day,
                 "sevenDayOi": a.seven_day_oi,
-                "requests": a.requests,
-                "inputTokens": a.input_tokens,
-                "outputTokens": a.output_tokens,
-                "cacheReadTokens": a.cache_read_tokens,
-                // Prompt-cache hit ratio (0.0–1.0): cache_read / input_total, and
-                // `null` — NEVER a literal 0.0 — when `inputTokens` is 0 and there
-                // is nothing to divide by (also keeps NaN out — R3).
-                //
-                // The null is the honesty fix. `source: "offline"` means these
-                // counters come from a fresh process, not the serving one, so they
-                // are structurally zero; emitting `0.0` there published an
-                // unmeasured number as a measured "0% cache hits" for every account
-                // forever, and that false zero is precisely why a real prompt-cache
-                // catastrophe went unseen. `null` says "not measured"; `source`
-                // says which process would have measured it.
-                "cacheHitRatio": if a.input_tokens == 0 {
-                    serde_json::Value::Null
-                } else {
-                    serde_json::json!(a.cache_read_tokens as f64 / a.input_tokens as f64)
+                // `null` — NEVER `0` — on the OFFLINE path, same idiom as
+                // `streamErrorCount`/`cacheHitRatio` below and for the same
+                // reason: these four are pure serving counters that live in
+                // the SERVING process, so a fresh offline `Manager` reads
+                // them structurally zero. That used to render as a real `0`,
+                // and offline is not only the no-server case — `fetch_live_status`
+                // falls back to it on NoAnswer/Unusable too (a slow, wedged,
+                // or restarting proxy), which are ordinary states here and
+                // ones a human or a `jq` one-liner polling this JSON every few
+                // seconds would misread as "this account served nothing"
+                // instead of "not measured right now". `fiveHour`/`sevenDay`/
+                // `quota` above are deliberately NOT guarded the same way —
+                // they come from a live probe the offline path genuinely runs
+                // itself, not from the serving Manager's counters, so they are
+                // real numbers on both paths.
+                "requests": match source {
+                    StatusSource::Offline => serde_json::Value::Null,
+                    StatusSource::Live => serde_json::json!(a.requests),
                 },
+                "inputTokens": match source {
+                    StatusSource::Offline => serde_json::Value::Null,
+                    StatusSource::Live => serde_json::json!(a.input_tokens),
+                },
+                "outputTokens": match source {
+                    StatusSource::Offline => serde_json::Value::Null,
+                    StatusSource::Live => serde_json::json!(a.output_tokens),
+                },
+                "cacheReadTokens": match source {
+                    StatusSource::Offline => serde_json::Value::Null,
+                    StatusSource::Live => serde_json::json!(a.cache_read_tokens),
+                },
+                // Prompt-cache hit ratio (0.0-1.0): cache_read / input_total, and
+                // `null` — NEVER a literal 0.0 — when there is no reliable signal:
+                // offline (see the four fields above), or `inputTokens` is 0 and
+                // there is nothing to divide by (also keeps NaN out — R3), or
+                // `requests` sits under `CACHE_SIGNAL_FLOOR_REQUESTS` and the
+                // ratio would be measuring a near-empty denominator. See
+                // [`cache_hit_ratio`], which checks `source` FIRST.
+                //
+                // The null is the honesty fix, twice over. `source: "offline"`
+                // means these counters come from a fresh process, not the serving
+                // one, so they are structurally zero; emitting `0.0` there
+                // published an unmeasured number as a measured "0% cache hits" for
+                // every account forever, and that false zero is precisely why a
+                // real prompt-cache catastrophe went unseen. The same false
+                // reading recurs on a LIVE account whose only traffic was a
+                // handful of cold diverts — a real but statistically meaningless
+                // low ratio reads exactly like "the cache is broken" to anyone
+                // watching this field. `null` says "not measured"; `source` says
+                // which process would have measured it, when it could have.
+                "cacheHitRatio": match cache_hit_ratio(a, source) {
+                    None => serde_json::Value::Null,
+                    Some(ratio) => serde_json::json!(ratio),
+                },
+                // When the background quota probe last ran for this account
+                // (`AccountSnapshot::last_probe`), Unix milliseconds like every
+                // other timestamp on this wire. Already crosses the
+                // server<->CLI boundary (`status.rs`'s `AccountStatus`
+                // reconstructs it) and the TUI already renders it
+                // (`tui.rs`'s `ok 45s` age column) — this was simply never
+                // added to the JSON output. It matters here specifically: an
+                // idle account's quota probe runs on a randomized ~300s
+                // cadence, but TcrBar polls this JSON every ~3s, so without
+                // this field a stale probe (proxy wedged, probe target
+                // unreachable) is invisible to any consumer — the quota bars
+                // just silently stop moving with no timestamp to notice by.
+                // Real on BOTH paths, like `fiveHour`/`quota` above: the
+                // offline path runs its own live probe, so this is not a
+                // serving counter and gets no null-on-offline guard.
+                "lastProbeMs": a
+                    .last_probe
+                    .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
                 "probeStatus": a.probe_status.as_str(),
                 "probeError": a.probe_error,
                 // Decayed count of stream failures — an in-band SSE `error` event,
@@ -2180,11 +2293,26 @@ mod tests {
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
-        for row in &rows {
+        for (i, row) in rows.iter().enumerate() {
             assert_eq!(
-                row["inputTokens"], 0,
+                snapshot.accounts[i].input_tokens, 0,
                 "the premise: an offline snapshot has counted nothing"
             );
+            // The four serving counters read `null` on the offline path, not
+            // a real `0` — same false-zero fix as `cacheHitRatio` below, one
+            // field family over: these live in the SERVING process, so a
+            // fresh offline `Manager` has structurally never measured them.
+            for key in ["requests", "inputTokens", "outputTokens", "cacheReadTokens"] {
+                assert!(
+                    row[key].is_null(),
+                    "{key} is unmeasured on the offline path, never a false 0: {row}"
+                );
+                assert_ne!(
+                    row[key],
+                    serde_json::json!(0),
+                    "the literal 0 that would masquerade as a measurement is gone: {row}"
+                );
+            }
             assert!(
                 row["cacheHitRatio"].is_null(),
                 "an uncounted ratio is null, not a number: {row}"
@@ -2201,8 +2329,11 @@ mod tests {
         }
 
         // A ratio that IS measured still renders as a number — the null is about
-        // absence of data, not a blanket suppression.
+        // absence of data, not a blanket suppression. `requests` must clear
+        // `CACHE_SIGNAL_FLOOR_REQUESTS` too, or the floor added below would
+        // null this out regardless of the token counts.
         let mut counted = snapshot.clone();
+        counted.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
         let live =
@@ -2228,6 +2359,90 @@ mod tests {
         assert!(
             render_accounts(&counted, &thresholds, StatusSource::Live).contains("cache=75%"),
             "a measured ratio still renders as a percentage"
+        );
+    }
+
+    /// THE SIGNAL-FLOOR TEST. An account whose only real traffic is a
+    /// handful of cold diverts has genuinely nonzero, genuinely LIVE token
+    /// counters — this is not the `input_tokens == 0` case above — but too
+    /// few served requests to trust the ratio it would produce. Before this
+    /// fix, `tcr status` reported that account's near-empty-denominator ratio
+    /// as a confident measured number (as low as single digits of percent),
+    /// which read exactly like "this account's cache is broken" and sent a
+    /// lead chasing a regression that was never there
+    /// (`docs/plans/divert-budget-swarm-state.md`, "Falsified on the way").
+    /// This pins the fix: under `CACHE_SIGNAL_FLOOR_REQUESTS`, the ratio is
+    /// `null`/`n/a` — no-signal — same as the honest-zero case, never a
+    /// number.
+    #[tokio::test]
+    async fn an_account_under_the_signal_floor_reports_no_signal_not_a_number() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(FixedProber { util: 0.25 }),
+            true,
+        )
+        .await;
+
+        // Real, live, nonzero tokens — a genuine measurement, not an unset
+        // counter — but ONE below the floor's request count. A single cold
+        // divert can plausibly write tens of thousands of cache_creation
+        // tokens in one request, so a small `requests` count with a large
+        // token count is exactly the shape this guards, not a fixture
+        // artefact.
+        let mut sparse = snapshot.clone();
+        sparse.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS - 1;
+        sparse.accounts[0].input_tokens = 42_000;
+        sparse.accounts[0].cache_read_tokens = 100;
+
+        let live =
+            render_accounts_json(&sparse, &thresholds, StatusSource::Live, None, false, None);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
+        assert!(
+            rows[0]["cacheHitRatio"].is_null(),
+            "under the floor, a real nonzero ratio still reads as no-signal, \
+             not a misleadingly precise number: {}",
+            rows[0]
+        );
+        assert_ne!(
+            rows[0]["cacheHitRatio"],
+            serde_json::json!(0.0),
+            "no-signal must never collapse to the false '0% cache hits' this \
+             module already fixed once: {}",
+            rows[0]
+        );
+
+        let text = render_accounts(&sparse, &thresholds, StatusSource::Live);
+        let line = text
+            .lines()
+            .find(|l| l.contains(&sparse.accounts[0].name))
+            .expect("the sparse account's line");
+        assert!(
+            line.contains("cache=n/a"),
+            "the human view reports the same no-signal state: {line}"
+        );
+
+        // One request OVER the floor, same tokens: the ratio is measured and
+        // renders as the real number — this is the boundary, not a blanket
+        // suppression of light accounts.
+        let mut at_floor = sparse.clone();
+        at_floor.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
+        let live = render_accounts_json(
+            &at_floor,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
+        assert_eq!(
+            rows[0]["cacheHitRatio"],
+            serde_json::json!(100.0 / 42_000.0),
+            "at the floor the same tokens now render as a real measurement: {}",
+            rows[0]
         );
     }
 
@@ -2342,8 +2557,15 @@ mod tests {
 
         let manager = Manager::with_live_refresher(config.clone(), None);
         // 750 of 1000 input tokens were prompt-cache reads: a real 75% hit ratio,
-        // held in this process only.
+        // held in this process only. `record_served` clears
+        // `CACHE_SIGNAL_FLOOR_REQUESTS` so the ratio below is a reported number,
+        // not the new floor's no-signal null — this test is about the ratio
+        // crossing the wire from the live server, not about the floor itself.
         manager.update_usage(0, 1_000, 200, 750, 50);
+        let now = OffsetDateTime::now_utc();
+        for _ in 0..CACHE_SIGNAL_FLOOR_REQUESTS {
+            manager.record_served(0, now, None, crate::stats::SessionKind::Fallback);
+        }
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
         let payload = match fetch_live_status(&config).await {

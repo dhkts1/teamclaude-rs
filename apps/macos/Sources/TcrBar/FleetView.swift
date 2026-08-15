@@ -1195,12 +1195,21 @@ struct AccountRow: View {
                     .foregroundStyle(Tok.near)
             }
             if !countersAreStructural {
-                Text("\(account.requests) req · cache \(cacheLabel)")
+                Text("\(QuotaFormat.count(account.requests)) req · cache \(cacheLabel)")
                     .font(Tok.detailDigitFont)
                     .foregroundStyle(.tertiary)
             }
             if let error = account.lastStreamError, !error.isEmpty {
-                Text("\(account.streamErrorCount)× \(error)")
+                // A nil count here is not a quantity with an unknown value —
+                // unlike `account.requests` above, this number is a MODIFIER
+                // on the error string that is already being displayed, and
+                // the error alone is the actionable fact regardless of how
+                // many times it happened. See
+                // `QuotaFormat.streamErrorLabel(count:error:)`'s doc comment
+                // for why this suppresses the multiplier on `nil` instead of
+                // following `QuotaFormat.count`'s "n/a" the way the line
+                // above does.
+                Text(QuotaFormat.streamErrorLabel(count: account.streamErrorCount, error: error))
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.spent)
                     .lineLimit(2)

@@ -27,6 +27,29 @@ import Foundation
 //     destroy all thirteen — a wildly disproportionate failure for a panel whose
 //     entire job is to keep showing the fleet. A row that will not decode is
 //     counted and surfaced (``Fleet/unreadable``), never silently dropped.
+//  5. `cacheHitRatio` staying `null` is also how this file expects the divert
+//     budget work to say "too little traffic to trust a ratio" — an account
+//     that has taken a handful of requests can compute a real-looking 33% or
+//     100% from one or two samples, and that is not a measurement, it is
+//     noise wearing a percent sign. The Rust side (`src/cli.rs`) owns the
+//     threshold that decides when there is enough traffic to say anything;
+//     this file's contract is only that whatever it decides is "not enough"
+//     arrives as `null`, same as a genuinely traffic-free account already
+//     does. No second wire shape and no second Swift type: the existing
+//     nil-means-absent idiom this file already carries end to end —
+//     ``QuotaFormat/percent(_:)`` refusing to print `"0%"` for a nil input,
+//     ``QuotaFormat/barFill(_:)`` drawing an explicit empty track instead of a
+//     zero-width fill — already renders "we don't know" distinctly from "we
+//     measured zero" for every caller of this type, with no view change
+//     required. Introducing a second word for the same fact ("no signal"
+//     beside "n/a") would teach an operator two labels to learn instead of
+//     one, for a distinction (never-probed vs. probed-but-not-enough-data)
+//     that changes nothing about what they should do next: wait for more
+//     signal. If a future wire format needs to keep the *raw* ratio around
+//     for diagnostics while still telling the client not to trust it (a
+//     companion boolean/string rather than reusing `null`), that decode
+//     lives here and should degrade the same way every other unrecognised
+//     shape in this file does — never a thrown row.
 
 /// How close an account is to its own switch threshold.
 ///
@@ -220,6 +243,49 @@ public enum QuotaFormat {
         return "\(Int((value * 100).rounded()))%"
     }
 
+    /// `102` → `"102"`; `nil` → `"n/a"`.
+    ///
+    /// The `Int` counterpart to ``percent(_:)``, for a serving counter that
+    /// is a QUANTITY in its own right — `requests` on the wire, `null` on
+    /// `source == "offline"` — same honesty rule, same reason: `nil` means
+    /// "not measured right now", and defaulting it to `0` at the call site
+    /// (`\(value ?? 0)`) would silently turn that absence into a claimed
+    /// zero-traffic reading, the exact mistake this whole formatter family
+    /// exists to rule out. It also exists so `FleetView.swift` never
+    /// interpolates a raw `Int?` directly — Swift's default `Optional`
+    /// interpolation prints `"Optional(102)"`, a warning-flagged bug that
+    /// fires on the STATIC type regardless of whether the value is present,
+    /// so `guard`-and-format here is not only the honest choice but the only
+    /// one the compiler doesn't complain about.
+    ///
+    /// NOT used for `streamErrorCount`: that field is a MODIFIER on an error
+    /// string already being displayed, not a quantity worth naming on its
+    /// own, so its call site suppresses the count entirely on `nil` rather
+    /// than printing `"n/a×"` — see the comment at that call site.
+    public static func count(_ value: Int?) -> String {
+        guard let value else { return notMeasured }
+        return "\(value)"
+    }
+
+    /// `(3, "overloaded_error")` → `"3× overloaded_error"`;
+    /// `(nil, "overloaded_error")` → `"overloaded_error"`.
+    ///
+    /// Deliberately NOT ``count(_:)`` plus a literal `"×"`: a stream-error
+    /// count is a MODIFIER on the error string already being displayed, not
+    /// a quantity worth naming when it is absent. The error alone is the
+    /// actionable fact regardless of how many times it happened, so an
+    /// unmeasured count suppresses the multiplier — `"overloaded_error"` —
+    /// rather than rendering ``count(_:)``'s `"n/a"` idiom here, which would
+    /// read as the broken-English `"n/a× overloaded_error"` and say nothing
+    /// `error` alone doesn't already say. Lives here, not inline in the
+    /// view, for the same reason every formatter in this enum does: so the
+    /// rendered string is a property of the model a test can assert on
+    /// directly.
+    public static func streamErrorLabel(count: Int?, error: String) -> String {
+        guard let count else { return error }
+        return "\(count)× \(error)"
+    }
+
     /// What the quota bar should draw for a fraction.
     ///
     /// The view routes through this rather than branching on the optional
@@ -385,17 +451,37 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let sevenDayOi: Double?
     public let held: [HeldWindow]
 
-    public let requests: Int
-    public let inputTokens: Int
-    public let outputTokens: Int
-    public let cacheReadTokens: Int
+    /// Pure serving counters. `null` on the wire — and `nil` here, NEVER `0` —
+    /// on `source == .offline`: these four live in the SERVING process
+    /// (`src/cli.rs:1179-1209`), so a fresh offline `Manager` has nothing to
+    /// report about them, and `0` would read as "this account served nothing"
+    /// rather than "not measured right now". Was `Int`, non-optional, until a
+    /// synthesized `Decodable` threw `valueNotFound` on the very first offline
+    /// row this shipped against — every account on the offline path failed to
+    /// decode at once, exactly the failure mode decision #4 above exists to
+    /// contain for one bad row, not for every row failing identically.
+    /// `fetch_live_status` (Rust) falls back to `offline` on `NoAnswer`/
+    /// `Unusable` too, not only `NoServer` — a slow or wedged proxy, i.e.
+    /// precisely when an operator most needs the panel to say something.
+    public let requests: Int?
+    public let inputTokens: Int?
+    public let outputTokens: Int?
+    public let cacheReadTokens: Int?
     /// `null` when `inputTokens` is 0 — an absence, not a measured zero.
     public let cacheHitRatio: Double?
 
     public let probeStatus: ProbeState
     public let probeError: String?
     public let lastStreamError: String?
-    public let streamErrorCount: Int
+    /// Same offline-null idiom as ``requests`` and friends above, and the
+    /// field the repo's own `src/cli.rs` test
+    /// (`offline_status_reports_null_not_zero_stream_errors`) was written to
+    /// guard: `0` on an ERROR counter is an affirmative all-clear, so an
+    /// unmeasured `0` here would publish "no truncated streams" about a
+    /// process this build never spoke to. Already nullable on the wire before
+    /// the four counters above joined it — was already the one field this
+    /// struct decoded wrong.
+    public let streamErrorCount: Int?
 
     public let source: StatusSource
     public let serverSha: String?

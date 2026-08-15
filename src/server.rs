@@ -802,13 +802,17 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // default-off knob whose state was invisible from outside the process,
     // and the fix is making the state show up at the one place every boot is
     // already guaranteed to log — not adding a second line an operator has to
-    // know to look for. See `Config::http1_only`.
+    // know to look for. See `Config::http1_only`. `divert_budget` rides the same
+    // line for the same reason: `0` (unlimited, today's behaviour) and a nonzero
+    // budget are both silent from outside the process otherwise. See
+    // `Manager::divert_budget` and the divert-budget design notes §4.7.
     let http1_only = manager.http1_only();
     // `throttle_exempt_noise` rides on this same line for the same reason as
     // `http1_only` above: it is a default-OFF knob (see
     // `Manager::throttle_exempt_noise_enabled`) and this is the one place
     // every boot is already guaranteed to log.
     let throttle_exempt_noise = manager.throttle_exempt_noise_enabled();
+    let divert_budget = manager.divert_budget();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         sha = build_info::SHA,
@@ -818,6 +822,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         port = bound.port(),
         http1_only,
         throttle_exempt_noise,
+        divert_budget,
         "server started"
     );
 
