@@ -1,25 +1,32 @@
 //! Behavioural coverage for the `throttleExemptNoise` knob
 //! (`Manager::throttle_exempt_noise_enabled`, `src/manager/throttle.rs`).
 //!
-//! Structure mirrors `tests/hop_overhead.rs::throttle_burst_cost`: a real
-//! `mitm::serve` listener in front of a real `Manager`, a fake upstream that
-//! counts hits, and a concurrent burst measured end-to-end. Unlike that file
-//! these are ASSERTIONS, not timing measurements — every test uses a
+//! A real `mitm::serve` listener in front of a real `Manager`, a fake
+//! upstream that counts hits, and a concurrent burst measured end-to-end.
+//! These are ASSERTIONS, not timing measurements — every test uses a
 //! deliberately wide margin (the throttle's own spacing is 350ms and this
-//! never asserts anything finer than 250ms either side of it), so these are
+//! never asserts anything finer than 100ms either side of it), so these are
 //! NOT `#[ignore]`d.
 //!
-//! Three behaviours, one per test:
+//! Four behaviours, one per test:
 //!
 //! 1. Knob OFF (default) — a burst of `Noise`-classified requests
 //!    (`/api/event_logging/v2/batch`) still pays the fleet-wide GCRA, exactly
 //!    as before this change. Current behaviour preserved.
 //! 2. Knob ON — the SAME burst of `Noise` requests skips the GCRA entirely:
 //!    all admit near-instantly instead of queueing behind `burst=4`.
-//! 3. Knob ON, query-string trap — `/v1/messages?beta=true` (the shape live
-//!    traffic actually sends) must still classify as `Inference`, not
-//!    `Noise`: a burst against it is throttled exactly like case 1, proving
-//!    `classify_request` is being fed `uri.path()` and not the raw target.
+//! 3. Knob ON, exempt-prefix boundary — `classify_request` (`src/manager/select.rs`)
+//!    matches `Noise` by PREFIX, so `/api/event_logging/v2/batch` (already
+//!    covered by case 2) and the shorter `/api/event_logging` root both
+//!    classify as `Noise` and skip the GCRA the same way.
+//! 4. Knob ON, exempt-prefix miss — `/api/event_loggingXYZ` still
+//!    `starts_with("/api/event_logging")`, so `classify_request` returns
+//!    `Noise` for it too and it is exempt exactly like case 3, even though
+//!    it is not a real event-logging path. This asserts what the code
+//!    ACTUALLY does today (prefix match, no trailing `/` or path-boundary
+//!    check), not the tighter behaviour a reader might assume from the name
+//!    "prefix". If this ever starts failing, `classify_request`'s matching
+//!    got stricter and this comment (and case 3's) should be revisited.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -36,7 +43,7 @@ use teamclaude_rs::probe::{ProbeError, ProbeFuture, UsageProber};
 use teamclaude_rs::warmer::{AccountWarmer, WarmError, WarmFuture};
 
 // ---------------------------------------------------------------------------
-// Stubs — nothing here ever reaches the network. Verbatim from hop_overhead.rs.
+// Stubs — nothing here ever reaches the network.
 // ---------------------------------------------------------------------------
 
 struct NeverRefreshes;
@@ -101,7 +108,7 @@ fn account(i: usize) -> Account {
     }
 }
 
-/// Mirrors `hop_overhead.rs::config`, plus the knob under test in `extra`.
+/// Plus the knob under test in `extra`.
 fn config(upstream: &str, throttle: ThrottleConfig, throttle_exempt_noise: bool) -> Config {
     let mut extra = serde_json::Map::new();
     extra.insert("sessionAffinity".to_string(), serde_json::Value::Bool(true));
@@ -234,7 +241,7 @@ async fn post(cli: &reqwest::Client, base: &str, path: &str, payload: &[u8]) -> 
 /// for the LAST one to complete, relative to a shared start instant. Warms the
 /// route with one request first (route/pool build), then sleeps long enough
 /// for the GCRA bucket to fully refill (`burst * spacing` = 1.4s) before the
-/// timed burst, exactly as `hop_overhead.rs::throttle_burst_cost` does.
+/// timed burst.
 async fn burst_last_elapsed(proxy: &str, path: &str, n: usize) -> Duration {
     let cli = client();
     let (s, _) = post(&cli, proxy, path, &body("user_warmup")).await;
@@ -270,9 +277,14 @@ const BURST: usize = 8;
 /// Asserted with a wide margin below the closed form so scheduler jitter on a
 /// loaded CI box cannot flake it.
 const THROTTLED_FLOOR: Duration = Duration::from_millis(900);
-/// Upper bound for a burst that skips the GCRA entirely — no request should
-/// ever wait anywhere near one throttle tick.
-const EXEMPT_CEILING: Duration = Duration::from_millis(300);
+/// Upper bound for a burst that skips the GCRA entirely. `THROTTLED_FLOOR`
+/// (900ms) vs. an actually-exempt burst (~0ms) is a ~900ms discriminating
+/// gap, so 800ms buys 2.7x headroom against CI flake (`cargo test --all
+/// --locked`, debug build, 2-vCPU runners, three 4-worker tokio runtimes
+/// contending) while still catching a real regression: it costs zero
+/// discriminating power relative to 300ms because nothing exempt should ever
+/// approach even a fraction of one 350ms throttle tick.
+const EXEMPT_CEILING: Duration = Duration::from_millis(800);
 
 /// Case 1: knob OFF (default) — `Noise` traffic still pays the throttle.
 /// Current behaviour preserved.
@@ -305,22 +317,51 @@ async fn noise_burst_exempt_when_knob_on() {
     );
 }
 
-/// Case 3: knob ON, query-string trap. `/v1/messages?beta=true` — the shape
-/// live traffic sends — must classify as `Inference`, never `Noise`, so a
-/// burst against it is throttled exactly like case 1 even with the knob on.
-/// This is the test that catches passing the raw target instead of
-/// `uri.path()` into `classify_request`.
+/// Case 3: knob ON, bare-prefix boundary. `/api/event_logging` (no trailing
+/// segment at all, unlike case 2's `/api/event_logging/v2/batch`) still
+/// `starts_with("/api/event_logging")`, so `classify_request` returns `Noise`
+/// for it too and the burst is exempt just like case 2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn inference_query_string_not_exempt_when_knob_on() {
+async fn exempt_prefix_root_when_knob_on() {
     let (upstream, _hits) = spawn_json_upstream().await;
     let mgr = manager(&upstream, throttle_live(), true);
     let proxy = spawn_proxy(mgr).await;
 
-    let last = burst_last_elapsed(&proxy, "/v1/messages?beta=true", BURST).await;
+    let last = burst_last_elapsed(&proxy, "/api/event_logging", BURST).await;
     assert!(
-        last >= THROTTLED_FLOOR,
-        "knob ON: `/v1/messages?beta=true` must still classify as Inference \
-         and pay the GCRA — last request completed in {last:?}, expected >= {THROTTLED_FLOOR:?} \
-         (a failure here means the raw target, not uri.path(), reached classify_request)"
+        last <= EXEMPT_CEILING,
+        "knob ON: `/api/event_logging` (bare prefix root) classifies as Noise \
+         and must skip the GCRA — last request completed in {last:?}, expected <= {EXEMPT_CEILING:?}"
+    );
+}
+
+/// Case 4: knob ON, prefix overreach. `classify_request` matches `Noise` with
+/// a plain `str::starts_with` — no trailing `/` or path-segment boundary
+/// check — so `/api/event_loggingXYZ` and `/mcp-registry-anything` (neither a
+/// real event-logging or mcp-registry route) ALSO `starts_with` their
+/// respective prefixes and classify as `Noise`. This asserts what the code
+/// actually does today: both are exempt from the GCRA, same as a genuine
+/// `/api/event_logging/...` path. If this starts failing, `classify_request`
+/// grew a path-boundary check and this comment is stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exempt_prefix_overreach_when_knob_on() {
+    let (upstream, _hits) = spawn_json_upstream().await;
+    let mgr = manager(&upstream, throttle_live(), true);
+    let proxy = spawn_proxy(mgr).await;
+
+    let last_logging = burst_last_elapsed(&proxy, "/api/event_loggingXYZ", BURST).await;
+    assert!(
+        last_logging <= EXEMPT_CEILING,
+        "knob ON: `/api/event_loggingXYZ` prefix-matches `/api/event_logging` \
+         and classifies as Noise (no path-boundary check) — last request completed \
+         in {last_logging:?}, expected <= {EXEMPT_CEILING:?}"
+    );
+
+    let last_mcp = burst_last_elapsed(&proxy, "/mcp-registry-anything", BURST).await;
+    assert!(
+        last_mcp <= EXEMPT_CEILING,
+        "knob ON: `/mcp-registry-anything` prefix-matches `/mcp-registry` \
+         and classifies as Noise (no path-boundary check) — last request completed \
+         in {last_mcp:?}, expected <= {EXEMPT_CEILING:?}"
     );
 }

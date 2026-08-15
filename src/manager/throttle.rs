@@ -3,6 +3,29 @@
 use super::select::{classify_request, RequestClass};
 use super::*;
 
+/// Whether a [`RequestClass`] is exempt from the fleet-wide GCRA when
+/// [`Manager::throttle_exempt_noise_enabled`] is on. Today this is a single
+/// `== RequestClass::Noise` comparison, but it is named rather than inlined at
+/// the call site because of a load-bearing fact [`classify_request`]'s own
+/// doc-comment states for the SELECTION side and this file depends on too:
+/// `classify_request` **fails safe toward `ControlPreferred`** for any unknown
+/// path. For throttling specifically, `ControlPreferred` is one of the two
+/// classes that stays throttled (along with `Inference`) — so the
+/// selection-side fail-safe direction happens to also be the throttle-side
+/// fail-safe direction: an unrecognised path degrades to "still throttled",
+/// never to "silently exempt". That agreement is a happy accident nobody had
+/// written down before this comment.
+///
+/// The other reason this is named: `classify_request` now drives TWO
+/// independent policies — account selection (`src/manager/select.rs`) and
+/// throttling (here). Changing its `Noise` arm for a selection reason (e.g.
+/// widening or narrowing the `/api/event_logging*` / `/mcp-registry*` prefix
+/// match) silently changes which traffic this predicate exempts too. There is
+/// no compiler check tying the two together — only this comment.
+fn throttle_exempt(class: RequestClass) -> bool {
+    class == RequestClass::Noise
+}
+
 impl Manager {
     /// Whether `Noise`-classified traffic (`/api/event_logging*`,
     /// `/mcp-registry*` — see [`classify_request`]) skips the fleet-wide GCRA
@@ -40,7 +63,7 @@ impl Manager {
     /// immediately without consuming a GCRA slot — telemetry stops queueing
     /// behind inference, but only once explicitly opted in.
     pub async fn throttle_send(&self, path: &str) {
-        if self.throttle_exempt_noise_enabled() && classify_request(path) == RequestClass::Noise {
+        if self.throttle_exempt_noise_enabled() && throttle_exempt(classify_request(path)) {
             return;
         }
         let Some(spacing_ms) = self.throttle.effective_min_spacing() else {
