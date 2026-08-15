@@ -150,6 +150,183 @@ final class FleetStatusTests: XCTestCase {
         XCTAssertTrue(fleet.accounts.isEmpty)
         XCTAssertEqual(fleet.source, .unknown("none"))
     }
+
+    /// The exact bug the divert-budget no-signal work exists to fix: an
+    /// account that took real traffic (nonzero `requests`/`inputTokens`, so
+    /// this is NOT the already-covered "zero traffic" case in
+    /// ``testNullCacheRatioStaysNilRatherThanZero``) but not enough of it to
+    /// trust a ratio. `cacheHitRatio: null` here is a low-sample account the
+    /// Rust side has decided not to make a claim about — decoding it to
+    /// anything other than `nil` would silently turn "not enough signal"
+    /// back into "a measured percentage", which is precisely what a human
+    /// glancing at the panel must not see.
+    func testLowTrafficAccountWithNullRatioStaysNilNotZero() throws {
+        let json = """
+            [
+              {
+                "source": "live", "serverSha": "abc1234", "serverDirty": false,
+                "name": "dana@example.com", "priority": 4, "status": "active",
+                "disabled": false, "quota": 0.1, "quotaState": "ok",
+                "fiveHour": 0.1, "sevenDay": 0.1, "sevenDayOi": 0.0, "held": [],
+                "requests": 2, "inputTokens": 64, "outputTokens": 8,
+                "cacheReadTokens": 1, "cacheHitRatio": null,
+                "probeStatus": "ok", "probeError": null, "lastStreamError": null,
+                "streamErrorCount": 0
+              }
+            ]
+            """
+        let decoded = try fleet(json)
+        let dana = decoded.accounts[0]
+        XCTAssertGreaterThan(
+            dana.requests ?? 0, 0,
+            "this fixture must exercise real traffic, not the zero-traffic case")
+        XCTAssertNil(dana.cacheHitRatio)
+        XCTAssertEqual(QuotaFormat.percent(dana.cacheHitRatio), QuotaFormat.notMeasured)
+    }
+
+    /// Round 2: `requests`/`inputTokens`/`outputTokens`/`cacheReadTokens`/
+    /// `streamErrorCount` are now `null` on the wire whenever `source ==
+    /// "offline"` (`src/cli.rs:1194-1263`) — `fetch_live_status` falls back to
+    /// offline on `NoAnswer`/`Unusable` too, not just `NoServer`, so this is an
+    /// ordinary state, not a rare one. Before these five fields became
+    /// `Int?`, a synthesized `Decodable` threw `valueNotFound` on the first
+    /// one it hit, and — because `Fleet.decode` decodes row-by-row —
+    /// EVERY offline row failed identically, landing the whole fleet in
+    /// `unreadable` instead of `accounts`. This is the test that would have
+    /// caught it: it goes through the real `Fleet.decode` path, on an
+    /// otherwise-valid row, exercising exactly the shape `tcr status --json`
+    /// emits when offline.
+    func testOfflineNullCountersDecodeTheRowInsteadOfFailingIt() throws {
+        let json = """
+            [
+              {
+                "source": "offline", "serverSha": null, "serverDirty": null,
+                "name": "eli@example.com", "priority": 5, "status": "active",
+                "disabled": false, "quota": null, "quotaState": "ok",
+                "fiveHour": null, "sevenDay": null, "sevenDayOi": null, "held": [],
+                "requests": null, "inputTokens": null, "outputTokens": null,
+                "cacheReadTokens": null, "cacheHitRatio": null,
+                "probeStatus": "skipped", "probeError": "no server",
+                "lastStreamError": null, "streamErrorCount": null
+              }
+            ]
+            """
+        let decoded = try fleet(json)
+        XCTAssertEqual(
+            decoded.unreadableCount, 0,
+            "the row must decode, not land in unreadable: \(decoded.unreadable)"
+        )
+        XCTAssertEqual(decoded.accounts.count, 1)
+        let eli = decoded.accounts[0]
+        XCTAssertNil(eli.requests)
+        XCTAssertNil(eli.inputTokens)
+        XCTAssertNil(eli.outputTokens)
+        XCTAssertNil(eli.cacheReadTokens)
+        XCTAssertNil(eli.streamErrorCount)
+    }
+
+    /// Round 3 fixed the compiler warning with `?? 0`, which silently turned
+    /// an offline "not measured" row into a claimed zero-traffic reading —
+    /// exactly the mistake ``QuotaFormat/percent(_:)``'s own doc comment
+    /// names for the sibling `Double?` fields. This is the seam the
+    /// coordinator asked for: `QuotaFormat.count(_:)` is the exact function
+    /// both `FleetView.swift` call sites now route through, so asserting on
+    /// its output here IS asserting on the rendered string, without a
+    /// SwiftUI rendering harness.
+    func testRenderedCountStringForPopulatedAndNullRows() throws {
+        // Populated: alice (liveFixture) carries real, nonzero counters.
+        let alice = try fleet(liveFixture).accounts[0]
+        XCTAssertEqual(alice.requests, 128)
+        XCTAssertEqual(QuotaFormat.count(alice.requests), "128")
+        // bob (liveFixture) has streamErrorCount: 3, lastStreamError:
+        // "overloaded_error" — the modifier-on-an-error case, which routes
+        // through `streamErrorLabel(count:error:)` rather than `count(_:)`.
+        let bob = try fleet(liveFixture).accounts[1]
+        XCTAssertEqual(bob.streamErrorCount, 3)
+        XCTAssertEqual(bob.lastStreamError, "overloaded_error")
+        XCTAssertEqual(
+            QuotaFormat.streamErrorLabel(count: bob.streamErrorCount, error: bob.lastStreamError!),
+            "3× overloaded_error"
+        )
+
+        // Null: an offline row, same shape as the decode test above.
+        let offlineJSON = """
+            [
+              {
+                "source": "offline", "serverSha": null, "serverDirty": null,
+                "name": "finn@example.com", "priority": 6, "status": "active",
+                "disabled": false, "quota": null, "quotaState": "ok",
+                "fiveHour": null, "sevenDay": null, "sevenDayOi": null, "held": [],
+                "requests": null, "inputTokens": null, "outputTokens": null,
+                "cacheReadTokens": null, "cacheHitRatio": null,
+                "probeStatus": "skipped", "probeError": "no server",
+                "lastStreamError": null, "streamErrorCount": null
+              }
+            ]
+            """
+        let finn = try fleet(offlineJSON).accounts[0]
+        XCTAssertEqual(QuotaFormat.count(finn.requests), QuotaFormat.notMeasured)
+        XCTAssertNotEqual(
+            QuotaFormat.count(finn.requests), "0",
+            "an offline account must never render as a measured zero-traffic row"
+        )
+        // The stream-error line makes a different, deliberate choice: a nil
+        // count suppresses the multiplier rather than saying "n/a" — the
+        // error string alone is still the actionable fact.
+        XCTAssertEqual(
+            QuotaFormat.streamErrorLabel(count: finn.streamErrorCount, error: "overloaded_error"),
+            "overloaded_error"
+        )
+        XCTAssertFalse(
+            QuotaFormat.streamErrorLabel(count: finn.streamErrorCount, error: "overloaded_error")
+                .hasPrefix("n/a"),
+            "a nil stream-error count must never render as the broken-English \"n/a×\""
+        )
+    }
+}
+
+/// ``QuotaFormat`` carries the one honesty rule this whole task is about — a
+/// nil measurement must never print or draw as a real zero — and until now
+/// nothing exercised it directly; every existing test only asserted on the
+/// upstream `Double?`, never on what the formatter turns it into.
+final class QuotaFormatTests: XCTestCase {
+    func testNilPercentIsNotMeasuredNeverZeroPercent() {
+        XCTAssertEqual(QuotaFormat.percent(nil), "n/a")
+        XCTAssertNotEqual(QuotaFormat.percent(nil), "0%")
+    }
+
+    func testRealZeroStillPrintsAsZeroPercent() {
+        // The other half of the same contract: a genuine zero is a
+        // measurement and must keep looking like one, or "0%" would stop
+        // being trustworthy too.
+        XCTAssertEqual(QuotaFormat.percent(0.0), "0%")
+    }
+
+    func testMeasuredPercentRounds() {
+        XCTAssertEqual(QuotaFormat.percent(0.415), "42%")
+        XCTAssertEqual(QuotaFormat.percent(1.0), "100%")
+    }
+
+    func testBarFillDistinguishesNilFromZero() {
+        XCTAssertEqual(QuotaFormat.barFill(nil), .unmeasured)
+        XCTAssertEqual(QuotaFormat.barFill(0.0), .measured(0.0))
+        XCTAssertNotEqual(QuotaFormat.barFill(nil), QuotaFormat.barFill(0.0))
+    }
+
+    func testBarFillClampsOutOfRangeValues() {
+        XCTAssertEqual(QuotaFormat.barFill(1.4), .measured(1.0))
+        XCTAssertEqual(QuotaFormat.barFill(-0.2), .measured(0.0))
+    }
+
+    func testCountFormatsPresentValueVerbatim() {
+        XCTAssertEqual(QuotaFormat.count(102), "102")
+        XCTAssertEqual(QuotaFormat.count(0), "0")
+    }
+
+    func testNilCountIsNotMeasuredNeverZero() {
+        XCTAssertEqual(QuotaFormat.count(nil), "n/a")
+        XCTAssertNotEqual(QuotaFormat.count(nil), "0")
+    }
 }
 
 /// Hand-built accounts for the capacity aggregates. Only the fields the

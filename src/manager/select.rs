@@ -50,6 +50,79 @@ pub(super) fn classify_request(path: &str) -> RequestClass {
     }
 }
 
+/// Bound on [`Manager::divert_ledger`] — same cap `select()`'s `AFFINITY_CAP`
+/// applies to `self.affinity` (`:664-675`). [`DivertEpisode`] carries no
+/// separate last-touch stamp (§4.1's struct is quoted verbatim from the
+/// design doc), so `until_ms` is the eviction sort key here — the closest
+/// available recency proxy, not a perfect one. A session that never diverts
+/// again after arming a short hold ages out of this bound the same way a
+/// long-idle `affinity` entry does.
+const DIVERT_LEDGER_CAP: usize = 1024;
+
+/// The three-way verdict [`divert_verdict`] hands back for one divert
+/// decision. `Fresh` and `Sticky` are consulted every divert regardless of
+/// budget (§4.3 — "stickiness does not consult the budget at all"); `Block`
+/// only becomes reachable once a caller passes a nonzero `budget` (unit E's
+/// job, §4.4) — `select()`'s own call site always passes `0` in this phase,
+/// so `Block` cannot be produced from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DivertVerdict {
+    /// No episode for this session matches `(pin, until_ms)` — either there
+    /// is none yet, or the live `(pin, until_ms)` differs from the stored
+    /// one (a new hold on the same pin, or a different pin entirely). This
+    /// divert is free to land on any eligible account; whichever one it
+    /// picks becomes this episode's sticky destination.
+    Fresh,
+    /// The episode matches and already has a known-warm destination — reuse
+    /// it. Offered unconditionally (budget plays no part in this arm): a
+    /// repeat divert to an already-touched account costs nothing new.
+    Sticky(usize),
+    /// The episode matches, `budget != 0`, and its distinct-destination
+    /// count is already at or over that budget. Reserved for unit E's
+    /// blocking half (§4.4) — never produced while every call site passes
+    /// `budget = 0`.
+    Block,
+}
+
+/// The chain-head predicate (§4.4): given this session's current divert
+/// episode (or `None`), the pin and hold-deadline of the divert being
+/// decided right now, and a distinct-destination `budget` (`0` = unlimited),
+/// decide whether to reuse a known destination, allow a fresh pick, or (once
+/// a nonzero budget is wired in) block. Pure function over its four
+/// arguments — no lock, no I/O — so unit F's replay harness can run this
+/// EXACT code over reconstructed log sequences (§6) rather than a
+/// reimplementation.
+///
+/// Episode identity is `(pin, until_ms)`, not the session key alone: a
+/// mismatch on either field means the stored episode is stale (a new hold,
+/// or the pin itself changed) and is treated as no episode at all — the
+/// caller is expected to overwrite the ledger entry from scratch on the next
+/// `record_divert` (§4.1, "reset is structural, not timed").
+///
+/// `Block` fires only when `budget != 0` (the kill-switch: `0` never
+/// blocks) and the episode's `destinations.count_ones() >= budget`. This
+/// phase's own `select()` call site always passes `0`, so `Block` is
+/// unreachable from production code today; unit E wires a real budget in at
+/// its own call site(s) and is responsible for deciding, at THAT call site,
+/// whether a `Sticky` destination should still be attempted before honouring
+/// `Block` — this function does not know whether the caller has already
+/// tried and rejected the sticky account.
+pub fn divert_verdict(
+    ep: Option<DivertEpisode>,
+    pin: usize,
+    until_ms: i64,
+    budget: u32,
+) -> DivertVerdict {
+    let Some(episode) = ep.filter(|e| e.pin == pin && e.until_ms == until_ms) else {
+        return DivertVerdict::Fresh;
+    };
+    if budget != 0 && episode.destinations.count_ones() >= budget {
+        DivertVerdict::Block
+    } else {
+        DivertVerdict::Sticky(episode.sticky)
+    }
+}
+
 /// `threshold − reserve` (floored at 0.0) when `allow_reserve` is true — the
 /// effective switch threshold a GENERAL (non-control-preferred) pick applies
 /// to the control account specifically, so ordinary pool traffic leaves it
@@ -194,6 +267,13 @@ impl Manager {
         // account actually serving known. `None` means no divert happened. Purely
         // for the log line — nothing branches on it.
         let mut divert_reason: Option<&'static str> = None;
+        // The pin's `rate_limited_until_ms` at the moment `keep_pin` was set —
+        // the divert episode's identity half (§4.1), captured once here under
+        // whichever accounts guard was already held at that site rather than
+        // taking a second lock later. `0` when the pin has no live hold (a
+        // paced/model-class/pin-tried divert): a stable sentinel, not a real
+        // deadline, so those diverts still key one shared episode per pin.
+        let mut divert_until_ms: i64 = 0;
 
         // Affinity fast-path: honour an existing pin when it is still usable. Read
         // the pin under the affinity lock, then DROP that lock before taking the
@@ -232,6 +312,10 @@ impl Manager {
                     {
                         keep_pin = Some(idx);
                         divert_reason = Some("pin-tried");
+                        divert_until_ms = accounts
+                            .get(idx)
+                            .and_then(|a| a.rate_limited_until_ms)
+                            .unwrap_or(0);
                     }
                 } else {
                     let count_x = counts.get(&idx).copied().unwrap_or(0);
@@ -346,6 +430,10 @@ impl Manager {
                                 } else {
                                     "paced"
                                 });
+                                divert_until_ms = accounts
+                                    .get(idx)
+                                    .and_then(|a| a.rate_limited_until_ms)
+                                    .unwrap_or(0);
                                 None
                             } else {
                                 let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
@@ -581,10 +669,64 @@ impl Manager {
             }
         }
 
+        // Sticky-destination overlay (§4.3): when this request diverted
+        // (`keep_pin` is `Some` — the exact mirror of the control-routing
+        // overlay above, which is gated on `keep_pin.is_none()` and is
+        // therefore already skipped for every divert), prefer this episode's
+        // already-warmed destination over spending a fresh one. Shape copied
+        // from the NOISE overlay (`:506-548` pre-this-change): read the
+        // remembered index, check `!tried.contains` and `eligible`; otherwise
+        // fall through to the normal pick below, which records the winner as
+        // this episode's destination on the way out (§4.2).
+        //
+        // The ledger is read here in its OWN critical section — no accounts
+        // or affinity lock is held at this point (both dropped above) — and
+        // `budget = 0` is hardcoded: stickiness never consults the budget
+        // (see this file's `divert_verdict` doc-comment); the real
+        // `divert_budget()` read is unit E's, at its own (blocking) call
+        // site.
+        let sticky_pick: Option<usize> = if let Some(pin_idx) = keep_pin {
+            let episode = affinity.and_then(|key| {
+                self.divert_ledger
+                    .lock()
+                    .expect("divert ledger lock poisoned")
+                    .get(&key)
+                    .copied()
+            });
+            match divert_verdict(episode, pin_idx, divert_until_ms, 0) {
+                DivertVerdict::Sticky(sticky) if !tried.contains(&sticky) => {
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    let usable = accounts.get(sticky).is_some_and(|a| {
+                        Self::eligible(
+                            a,
+                            self.global_threshold,
+                            &self.pacing,
+                            true,
+                            now,
+                            now_ms,
+                            is_fable,
+                        )
+                    });
+                    usable.then_some(sticky)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let via_sticky = sticky_pick.is_some();
+
         // Normal LRU/priority pick (identical to the pre-affinity path when no
         // control account is set). The accounts lock is scoped so it is released
         // before we touch the affinity lock again for the re-pin below.
-        let best = {
+        let best = if let Some(sticky) = sticky_pick {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+            if let Some(account) = accounts.get_mut(sticky) {
+                account.last_selected_seq = tick;
+            }
+            Some(sticky)
+        } else {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
 
             // Inference must NEVER select the control account, even one that is
@@ -644,6 +786,15 @@ impl Manager {
             }
             best
         };
+
+        // Record this divert's destination in the episode ledger (§4.2 rule
+        // 3: written only after the affinity guard below has dropped, in its
+        // own critical section — never nested under it). Every divert
+        // records, not just sticky ones, so a fresh divert's destination
+        // becomes the NEXT divert's sticky offer.
+        if let (Some(key), Some(pin_idx), Some(dest)) = (affinity, keep_pin, best) {
+            self.record_divert(key, pin_idx, divert_until_ms, dest, now_ms);
+        }
 
         // Record the pick as this session's pin (initial pin, or re-pin on
         // migration). Skipped entirely when affinity is off, so the map stays
@@ -713,6 +864,19 @@ impl Manager {
                     serve_name,
                     reason
                 );
+                // A SIBLING line, not a replacement (§4.8): the line above is a
+                // parsed interface (`divert-history.py:33-36`) and stays exactly
+                // as it was. This one exists only to prove fan-out was avoided —
+                // the same regex cannot match it (different second word).
+                if via_sticky {
+                    tracing::info!(
+                        "affinity: divert-sticky session {} pin {} -> reusing {} (reason={}, warm=true)",
+                        short_session_id(key),
+                        pin_name,
+                        serve_name,
+                        reason
+                    );
+                }
             }
         }
 
@@ -795,6 +959,11 @@ impl Manager {
         // that reaches this path re-keys the session and the next Opus turn pays a
         // cold prefix — the same defect this file fixed in `select()`, one path over.
         let mut keep_pin: Option<usize> = None;
+        // The pin's `rate_limited_until_ms` at the moment `keep_pin` was set — the
+        // other half of the divert episode's identity (`select()`'s
+        // `divert_until_ms`, mirrored here). Only meaningful when `keep_pin` is
+        // `Some`; `divert_verdict` is never consulted otherwise.
+        let mut pin_until_ms: i64 = 0;
 
         // (A) PIN-HONOR — read the pin under the affinity lock, DROP it, then check
         // the pin's HARD gates under the accounts lock (never nested). No throttle.
@@ -847,32 +1016,76 @@ impl Manager {
                     .is_some_and(|a| Self::account_hard_ok(a, now_ms))
                 {
                     keep_pin = Some(idx);
+                    pin_until_ms = accounts
+                        .get(idx)
+                        .and_then(|a| a.rate_limited_until_ms)
+                        .unwrap_or(0);
                 }
             }
         }
 
+        // Sticky-destination reuse for the FALLBACK path (design doc §4.4,
+        // do-not #7: "not a second copy of the rule" — same ledger, same
+        // `divert_verdict` predicate `select()`'s sticky overlay uses, one call
+        // site here). Read the episode BEFORE the fallback's accounts lock is
+        // taken below — the accounts lock PIN-HONOR held has already dropped
+        // (its scope ended above), so this ledger read nests under neither
+        // (§4.2 rule 1).
+        //
+        // `budget = 0`: stickiness never consults the budget (unit E wires the
+        // real `divert_budget()` in for the blocking half at this same site).
+        // Sticky-before-Block decision (documented in this unit's FINAL-REPORT):
+        // this call site always offers Sticky first — `divert_verdict` itself
+        // only returns `Block` once a caller passes a nonzero budget, which
+        // this phase never does, so the "try Sticky before honouring Block"
+        // question is moot AT budget=0, but the shape here is the one E's
+        // budget wiring extends without a second rewrite: E swaps the `0`
+        // for `self.divert_budget()` and adds a branch on `DivertVerdict::Block`
+        // immediately after this match — sticky is already tried first because
+        // it's a separate, unconditional arm of the same predicate.
+        let sticky_pick: Option<usize> = keep_pin.and_then(|pin_idx| {
+            let episode = affinity.and_then(|key| {
+                self.divert_ledger
+                    .lock()
+                    .expect("divert ledger lock poisoned")
+                    .get(&key)
+                    .copied()
+            });
+            match divert_verdict(episode, pin_idx, pin_until_ms, 0) {
+                DivertVerdict::Sticky(sticky) if !tried.contains(&sticky) => Some(sticky),
+                _ => None,
+            }
+        });
+
         // (B) FALLBACK — least-utilized surviving account, throttled, then re-pinned.
+        let via_sticky;
         let idx = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
 
-            let mut best: Option<usize> = None;
-            // (util as ordered bits, last_selected_seq) — utilizations are finite and
-            // non-negative here (NaN/inf headers filtered at parse), so the raw bit
-            // pattern orders correctly for ascending "least utilized first".
-            let mut best_key: Option<(u64, u64)> = None;
-            for (i, account) in accounts.iter().enumerate() {
-                if tried.contains(&i) || !hard_ok(account) {
-                    continue;
-                }
-                let util = account.quota.max_utilization(now, is_fable);
-                let key = (util.to_bits(), account.last_selected_seq);
-                if best_key.is_none_or(|b| key < b) {
-                    best = Some(i);
-                    best_key = Some(key);
-                }
-            }
+            let sticky_usable = sticky_pick.filter(|&s| accounts.get(s).is_some_and(&hard_ok));
+            via_sticky = sticky_usable.is_some();
 
-            let idx = best?;
+            let idx = if let Some(sticky) = sticky_usable {
+                sticky
+            } else {
+                let mut best: Option<usize> = None;
+                // (util as ordered bits, last_selected_seq) — utilizations are finite and
+                // non-negative here (NaN/inf headers filtered at parse), so the raw bit
+                // pattern orders correctly for ascending "least utilized first".
+                let mut best_key: Option<(u64, u64)> = None;
+                for (i, account) in accounts.iter().enumerate() {
+                    if tried.contains(&i) || !hard_ok(account) {
+                        continue;
+                    }
+                    let util = account.quota.max_utilization(now, is_fable);
+                    let key = (util.to_bits(), account.last_selected_seq);
+                    if best_key.is_none_or(|b| key < b) {
+                        best = Some(i);
+                        best_key = Some(key);
+                    }
+                }
+                best?
+            };
 
             // A servable candidate exists — spend the anti-storm window now (after
             // selection, so a fleet with nothing to serve never burns the valve).
@@ -890,12 +1103,21 @@ impl Manager {
                 .unwrap_or_default();
             if let Some(account) = accounts.get_mut(idx) {
                 account.last_selected_seq = tick;
-                tracing::info!(
-                    account = %account.name,
-                    utilization = util,
-                    is_fable,
-                    "revalidation-serve (fallback): whole fleet over soft threshold — serving least-utilized allowed account"
-                );
+                if via_sticky {
+                    tracing::info!(
+                        account = %account.name,
+                        utilization = util,
+                        is_fable,
+                        "revalidation-serve (fallback, sticky): reusing this episode's already-warmed destination"
+                    );
+                } else {
+                    tracing::info!(
+                        account = %account.name,
+                        utilization = util,
+                        is_fable,
+                        "revalidation-serve (fallback): whole fleet over soft threshold — serving least-utilized allowed account"
+                    );
+                }
             }
             idx
         };
@@ -914,6 +1136,15 @@ impl Manager {
                 self.mark_affinity_dirty();
                 previous
             };
+            // Record this fallback serve in the episode ledger (§4.2 rule 3: written
+            // only after the affinity guard above has dropped, its own critical
+            // section, never nested under it or the accounts lock below). Only when
+            // `keep_pin` was set — i.e. the pin stayed and this is genuinely a
+            // divert, not a hard re-key onto a fresh home with no live hold to key
+            // an episode on. Mirrors `select()`'s own record-divert guard.
+            if let Some(pin_idx) = keep_pin {
+                self.record_divert(key, pin_idx, pin_until_ms, idx, now_ms);
+            }
             // Until now this arm emitted nothing, so a request served off-pin by the
             // fallback was unattributable: the logs showed a serve on an account the
             // session was not pinned to and no line explaining it. One greppable line
@@ -1518,6 +1749,77 @@ impl Manager {
             }
         }
     }
+
+    /// Write half of [`Manager::divert_ledger`] (§4.1/§4.2): record `dest` as
+    /// a destination this session was diverted to, in the episode identified
+    /// by `(pin, until_ms)`. Called only AFTER the affinity guard for this
+    /// request has already dropped — never nested under it or the accounts
+    /// lock (§4.2 rule 3; this method takes only the ledger's own lock).
+    ///
+    /// Reset is structural, not timed (§4.1): if the stored entry's
+    /// `(pin, until_ms)` no longer matches, it is a stale episode and is
+    /// overwritten from scratch rather than merged into. On a genuinely new
+    /// episode (or after that reset) the first `dest` recorded becomes
+    /// [`DivertEpisode::sticky`]; every later `dest` in the same episode only
+    /// grows the `destinations` mask — `sticky` stays the FIRST destination,
+    /// by design (§4.1: "so the sticky overlay has a single preferred index
+    /// without scanning the mask").
+    ///
+    /// Bounded by [`DIVERT_LEDGER_CAP`] + LRU-by-`until_ms` eviction, mirroring
+    /// `select()`'s `AFFINITY_CAP` pattern (`:664-675`) on this separate,
+    /// never-persisted map.
+    pub(super) fn record_divert(
+        &self,
+        session_key: u64,
+        pin: usize,
+        until_ms: i64,
+        dest: usize,
+        _now_ms: i64,
+    ) {
+        // The mask is a u64; `DivertEpisode::destinations`' own doc-comment
+        // caps this at 64 accounts, "nowhere near" the fleet size. Fail safe
+        // rather than panic on an out-of-range shift: the episode simply
+        // isn't recorded for this one destination, so sticky never offers it
+        // (it would have failed the ordinary eligibility gate anyway once the
+        // fleet ever did reach 64 accounts).
+        let Some(bit) = 1u64.checked_shl(dest as u32) else {
+            return;
+        };
+        let mut ledger = self
+            .divert_ledger
+            .lock()
+            .expect("divert ledger lock poisoned");
+        let entry = ledger
+            .entry(session_key)
+            .and_modify(|e| {
+                if e.pin != pin || e.until_ms != until_ms {
+                    *e = DivertEpisode {
+                        pin,
+                        until_ms,
+                        destinations: 0,
+                        sticky: dest,
+                    };
+                }
+            })
+            .or_insert(DivertEpisode {
+                pin,
+                until_ms,
+                destinations: 0,
+                sticky: dest,
+            });
+        if entry.destinations == 0 {
+            entry.sticky = dest;
+        }
+        entry.destinations |= bit;
+
+        if ledger.len() > DIVERT_LEDGER_CAP {
+            if let Some((&oldest, _)) = ledger.iter().min_by_key(|(_, e)| e.until_ms) {
+                if oldest != session_key {
+                    ledger.remove(&oldest);
+                }
+            }
+        }
+    }
 }
 
 /// Sort key for a gate's clear-instant that ranks an unknown reset (`None`) after
@@ -1529,5 +1831,229 @@ fn gate_clear_key(at: Option<OffsetDateTime>) -> (u8, OffsetDateTime) {
     match at {
         Some(t) => (0, t),
         None => (1, OffsetDateTime::UNIX_EPOCH),
+    }
+}
+
+#[cfg(test)]
+mod divert_verdict_tests {
+    //! Pure-function tests for [`divert_verdict`] (the divert-budget design notes
+    //! §4.4) — all three arms, driven by explicit `budget` values, exactly as
+    //! the brief requires. These are a SELF-authored oracle (this module wrote
+    //! both the fix and the test), so they cap at σ2: sensitivity to the
+    //! change is not independence. Unit F's replay over the retained logs
+    //! (§6) is the independent oracle that can promote this past σ2.
+    use super::*;
+
+    fn ep(pin: usize, until_ms: i64, destinations: u64, sticky: usize) -> DivertEpisode {
+        DivertEpisode {
+            pin,
+            until_ms,
+            destinations,
+            sticky,
+        }
+    }
+
+    #[test]
+    fn no_episode_is_fresh() {
+        assert_eq!(divert_verdict(None, 0, 1_000, 1), DivertVerdict::Fresh);
+    }
+
+    #[test]
+    fn mismatched_pin_is_fresh_even_with_a_recorded_episode() {
+        let episode = ep(0, 1_000, 0b10, 1);
+        // Same deadline, different pin: a different account is now held, so
+        // this is not a continuation of the same episode.
+        assert_eq!(
+            divert_verdict(Some(episode), 2, 1_000, 1),
+            DivertVerdict::Fresh
+        );
+    }
+
+    #[test]
+    fn mismatched_deadline_is_fresh_even_with_the_same_pin() {
+        let episode = ep(0, 1_000, 0b10, 1);
+        // Same pin, different deadline: a NEW hold on the same account — the
+        // whole point of keying the episode on `(pin, until_ms)` rather than
+        // the pin alone (§4.1).
+        assert_eq!(
+            divert_verdict(Some(episode), 0, 2_000, 1),
+            DivertVerdict::Fresh
+        );
+    }
+
+    #[test]
+    fn matching_episode_under_unlimited_budget_offers_sticky() {
+        let episode = ep(0, 1_000, 0b10, 1);
+        // budget = 0 is the kill switch (§4.6): never Block, regardless of
+        // how many distinct destinations are already recorded.
+        assert_eq!(
+            divert_verdict(Some(episode), 0, 1_000, 0),
+            DivertVerdict::Sticky(1)
+        );
+    }
+
+    #[test]
+    fn matching_episode_under_a_nonzero_budget_offers_sticky() {
+        let episode = ep(0, 1_000, 0b10, 1); // one destination recorded
+        assert_eq!(
+            divert_verdict(Some(episode), 0, 1_000, 2),
+            DivertVerdict::Sticky(1)
+        );
+    }
+
+    #[test]
+    fn matching_episode_at_the_budget_cap_blocks() {
+        let episode = ep(0, 1_000, 0b10, 1); // count_ones() == 1
+        assert_eq!(
+            divert_verdict(Some(episode), 0, 1_000, 1),
+            DivertVerdict::Block
+        );
+    }
+
+    #[test]
+    fn matching_episode_over_the_budget_cap_blocks() {
+        // Two distinct destinations already recorded (bits 1 and 3), budget 1.
+        let episode = ep(0, 1_000, 0b1010, 1);
+        assert_eq!(
+            divert_verdict(Some(episode), 0, 1_000, 1),
+            DivertVerdict::Block
+        );
+    }
+}
+
+/// Unit D's gate (the divert-budget design notes §4.4, do-not #7): does
+/// `select_revalidation`'s FALLBACK arm (`:934-` in this file) consult the SAME
+/// episode ledger and `divert_verdict` predicate B wired into `select()`, or
+/// does it still spend a fresh least-utilised account every time?
+///
+/// These are full `Manager` integration tests, so the helpers below are
+/// deliberately minimal, standalone re-implementations of `mod.rs`'s
+/// `mod tests` fixtures (`account`/`config_with`/`build_manager`) rather than
+/// imports — this unit's brief is `src/manager/select.rs` ONLY, and those
+/// helpers are private to `crate::manager::tests`, a sibling module this file
+/// cannot reach into. `LiveUsageProber`/`LiveWarmer`/`NoRefresh` are the real,
+/// non-test, already-`pub` production types: `select_revalidation` never
+/// calls `probe()`/`warm()`, so wiring the live (never-invoked) impls in is
+/// safe and avoids yet another local test double.
+///
+/// Self-authored oracle — σ2. Sensitivity ("fails without the fix, passes
+/// with it") is demonstrated in this unit's FINAL-REPORT via a break/restore
+/// cycle, not by this file, per `CLAUDE.md` § "Verifying a change".
+#[cfg(test)]
+mod revalidation_sticky_tests {
+    use super::*;
+    use crate::config::{Account, ProxyConfig};
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::warmer::LiveWarmer;
+    use std::collections::HashSet;
+
+    fn account(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn config_with(accounts: Vec<Account>) -> Config {
+        Config {
+            proxy: ProxyConfig::default(),
+            upstream: "https://api.anthropic.com".to_string(),
+            switch_threshold: 0.90,
+            pacing: PacingConfig::default(),
+            throttle: ThrottleConfig::default(),
+            lock_account: None,
+            control_account: None,
+            control_reserve: 0.05,
+            http1_only: false,
+            accounts,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn build_manager(config: Config) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// The headline claim: after `select()` diverts and records this
+    /// episode's sticky destination in `Manager::divert_ledger`, a request
+    /// that reaches `select_revalidation`'s FALLBACK arm for the SAME
+    /// episode must reuse that same destination — not the fleet's
+    /// least-utilised account, which (three accounts, mirroring B's own
+    /// anti-churn-defeating fixture) would otherwise be the OTHER alternate.
+    #[test]
+    fn revalidation_fallback_reuses_the_episode_sticky_destination() {
+        let manager = build_manager(config_with(vec![
+            account("home"),
+            account("alt1"),
+            account("alt2"),
+        ]));
+        let now = OffsetDateTime::now_utc();
+        let key = 636_363u64;
+
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an account is eligible");
+        // A long hold: outlives the soft-wait ceiling in the real ladder
+        // (§1.2), which is exactly the case this design's §1.2 "revalidation
+        // leak" is about — but `select_revalidation` itself takes no ceiling,
+        // so any hold that keeps `home` HARD-ok-but-rate-limited exercises
+        // the same PIN-HONOR-falls-through-to-FALLBACK path.
+        manager.mark_rate_limited(home, 120);
+
+        // `select()` diverts and records the episode's sticky destination —
+        // this is the ledger entry `select_revalidation` must now consult.
+        let sticky_dest = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an un-held alternate serves this divert");
+        assert_ne!(sticky_dest, home);
+
+        // `select_revalidation`'s FALLBACK must reuse `sticky_dest`, not the
+        // OTHER un-held alternate — the assertion three accounts (not two)
+        // makes real, per B's own fixture comment.
+        let served = manager
+            .select_revalidation(&HashSet::new(), now, None, Some(key))
+            .expect("an un-held alternate serves this revalidation request");
+        assert_eq!(
+            served, sticky_dest,
+            "select_revalidation's FALLBACK must consult the same episode \
+             ledger `select()` populated, reusing its sticky destination \
+             instead of spending a fresh least-utilised account"
+        );
+
+        // The episode ledger must record the FALLBACK's own serve too (§4.2:
+        // "every divert records, not just sticky ones"), same destination,
+        // still one distinct destination.
+        let episode = manager
+            .divert_ledger
+            .lock()
+            .expect("divert ledger lock poisoned")
+            .get(&key)
+            .copied()
+            .expect("episode recorded");
+        assert_eq!(episode.pin, home);
+        assert_eq!(episode.sticky, sticky_dest);
+        assert_eq!(
+            episode.destinations.count_ones(),
+            1,
+            "select() and select_revalidation reusing the SAME destination \
+             is one distinct destination, not two"
+        );
     }
 }

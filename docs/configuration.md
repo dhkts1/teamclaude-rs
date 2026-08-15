@@ -30,7 +30,7 @@ writes the account for you. Hand-editing is for the *settings* keys below.
 
 The document deserializes into `Config` with `#[serde(rename_all = "camelCase")]`, so every
 key is camelCase. Unmodelled keys are preserved verbatim across a load→save round trip
-rather than dropped, but five of them are also *read*, and are documented in their own
+rather than dropped, but seven of them are also *read*, and are documented in their own
 section below.
 
 ## Top level
@@ -155,9 +155,10 @@ is clamped to `1` (strict spacing), not to 4.
 
 ## Keys read from the unmodelled map
 
-These five are not fields of `Config`. They land in the flattened `extra` map and are read
-back out by name in `src/manager/state.rs`. They are fully live config with a caller in the
-boot or request path, not compatibility leftovers.
+These seven are not fields of `Config`. They land in the flattened `extra` map and are read
+back out by name across the manager (see `src/manager/state.rs` and `src/manager/throttle.rs`).
+They are fully live config with a caller in the boot or request path, not compatibility
+leftovers.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
@@ -189,6 +190,7 @@ Consequences worth knowing before you tune either number:
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
 | `throttleExemptNoise` | bool | **`false`** (OFF) | no | skip the fleet-wide GCRA entirely for `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) instead of making it queue behind inference |
+| `divertBudget` | u32 | **`0`** (unlimited) | no | max distinct destination accounts one session may be diverted to inside a single hold episode; `0` = unlimited, today's behaviour byte-for-byte |
 
 ### `sessionAffinity` also pins identity-less loopback requests
 
@@ -222,10 +224,11 @@ that off turns this off too.
 
 ### Which knobs are opt-in and which are opt-out
 
-Six knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
-`loadBalanceMigration`, `pacing`, `lockAccount`, `http1Only` and `throttleExemptNoise`. (An
-older README said three; `pacing` and `lockAccount` were missing from that list.
-`sessionAffinity` was on this list too until it flipped to default ON — see below.)
+Seven knobs ship OFF and must be turned on deliberately: `warmupSeconds`,
+`loadBalanceMigration`, `pacing`, `lockAccount`, `http1Only`, `throttleExemptNoise` and
+`divertBudget` (whose off state is `0`, unlimited, today's behaviour). (An older README said
+three; `pacing` and `lockAccount` were missing from that list. `sessionAffinity` was on this
+list too until it flipped to default ON — see below.)
 
 Two knobs ship ON and are opt-**out**: `revalidationServe`, default `true`, disabled by
 writing `"revalidationServe": false`; and `sessionAffinity`, also default `true`, disabled by

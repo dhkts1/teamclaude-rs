@@ -48,6 +48,11 @@ mod throttle;
 mod usage;
 mod warm;
 
+// Re-exported so unit F's replay harness (`tests/`) can call the SAME
+// production predicate rather than a reimplementation — see
+// the divert-budget design notes §6. Import path: `teamclaude_rs::manager::{divert_verdict, DivertVerdict}`.
+pub use select::{divert_verdict, DivertVerdict};
+
 const REQUEST_LOG_CAPACITY: usize = 200;
 
 /// Upper bound on a single rate-limit hold. A 429 `retry-after` larger than this
@@ -736,6 +741,49 @@ struct SessionStat {
     kind: SessionKind,
 }
 
+/// One session's divert fan-out inside ONE hold episode. Keyed on the EPISODE,
+/// not on wall-clock: a session that diverts three times across three separate
+/// holds hours apart is healthy and must start each one with a full budget.
+/// See the divert-budget design notes §4.1.
+/// `pub` (not `pub(super)`) and every field `pub`, deliberately: unit F's
+/// replay harness (the divert-budget design notes §6) reconstructs episodes
+/// from retained logs and must be able to build a `DivertEpisode` directly to
+/// feed [`select::divert_verdict`], the SAME predicate production calls —
+/// "not a reimplementation" is the whole point of the gate. See that
+/// function's re-export at the bottom of this file for the exact import path.
+#[derive(Debug, Clone, Copy)]
+pub struct DivertEpisode {
+    /// The pinned account the episode is about.
+    pub pin: usize,
+    /// The pin's `rate_limited_until_ms` at the time of the first divert. This
+    /// value IS the episode identity — every divert inside one hold observes the
+    /// same deadline, and a new hold necessarily carries a different one. A
+    /// mismatch against the live value on a later divert (different pin, or the
+    /// same pin with a different `until_ms`) means the ledger entry is stale and
+    /// is overwritten from scratch — no timer, no sweeper.
+    ///
+    /// **Considered and accepted: two genuinely distinct holds on the same pin
+    /// CAN collide on this value** (a second 429 arriving with the identical
+    /// millisecond deadline as the first, or two holds both clamped to the
+    /// same `MAX_RATE_LIMIT_HOLD_SECONDS` ceiling). When that happens the mask
+    /// does NOT reset — the two holds are treated as one episode. This is
+    /// deliberately left as-is rather than defended against: a same-deadline
+    /// collision means the session is still inside a hold window with the
+    /// identical clear-instant in every way that matters to the sticky
+    /// policy, so reusing the prior destination is still the right call, not
+    /// a bug. No counter or nonce was added to disambiguate same-`until_ms`
+    /// holds — that would widen a persisted-adjacent structure to defend
+    /// against a hypothetical with no observed real case.
+    pub until_ms: i64,
+    /// Bitmask of destination account indices already served for this session in
+    /// this episode. `count_ones()` is the distinct-destination count; capped at
+    /// 64 accounts, which the fleet is nowhere near.
+    pub destinations: u64,
+    /// The first destination, so the sticky overlay has a single preferred index
+    /// without scanning the mask.
+    pub sticky: usize,
+}
+
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
 pub struct Manager {
     accounts: RwLock<Vec<AccountRuntime>>,
@@ -866,6 +914,18 @@ pub struct Manager {
     /// Guarded the same way as `affinity` — never held while the accounts lock
     /// is taken.
     conn_affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    /// One [`DivertEpisode`] per session currently mid-hold, session key ->
+    /// episode. See the divert-budget design notes §4.1/§4.2.
+    ///
+    /// Guarded the same way as `affinity` and `conn_affinity` — **read before any
+    /// accounts lock is taken, written only after the affinity guard has
+    /// dropped, never nested inside either.** Not persisted (deliberately: after
+    /// a restart the pins are restored but no hold is, so every session
+    /// legitimately starts a fresh episode) and bounded the same way `affinity`
+    /// is — a size cap + LRU-by-last-touch eviction, keyed on `until_ms` as the
+    /// episode's own last-touch (see [`select`]'s `AFFINITY_CAP` eviction for the
+    /// pattern this mirrors).
+    pub(super) divert_ledger: Mutex<HashMap<u64, DivertEpisode>>,
     /// Per-account quota headroom reserved for the control account (§3, part 2
     /// of the control-account feature) — `switchThreshold`/`global_threshold`
     /// minus this, applied ONLY when a general (non-control-preferred) pick
@@ -1048,6 +1108,7 @@ impl Manager {
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             conn_affinity: Mutex::new(HashMap::new()),
+            divert_ledger: Mutex::new(HashMap::new()),
             control_reserve,
         });
 
@@ -5595,6 +5656,164 @@ mod tests {
             manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None),
             Some(served),
             "the session must not snap back to the held account"
+        );
+    }
+
+    /// Read the divert episode currently recorded for a session key, if any.
+    fn divert_episode_of(manager: &Manager, key: u64) -> Option<DivertEpisode> {
+        manager
+            .divert_ledger
+            .lock()
+            .expect("divert ledger lock poisoned")
+            .get(&key)
+            .copied()
+    }
+
+    /// Phase 1's headline claim (the divert-budget design notes §4.3, Phase 1
+    /// test list): a SECOND divert inside the SAME hold episode reuses the
+    /// FIRST divert's destination, rather than the normal LRU spread's own
+    /// anti-churn steering it onto a *different* alternate. Three accounts
+    /// (not two) so this is a real assertion: with only one alternate
+    /// available, "the second divert lands on the same account" would be true
+    /// with or without stickiness.
+    #[test]
+    fn sticky_divert_reuses_first_destination() {
+        let manager = build_manager(
+            config_with(vec![
+                account("home", 0),
+                account("alt1", 0),
+                account("alt2", 0),
+            ]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let key = 616_161u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an account is eligible");
+        manager.mark_rate_limited(home, SHORT_HOLD_SECS);
+
+        let first_dest = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an un-held alternate serves this request");
+        assert_ne!(first_dest, home, "the held pin cannot serve THIS request");
+
+        // Without stickiness, the normal LRU/priority pick's own anti-churn
+        // (`select()`'s doc-comment: "consecutive requests fan out instead of
+        // hammering one account") would steer the SECOND divert onto the
+        // account that was NOT just selected. With the sticky overlay it must
+        // land back on `first_dest` instead.
+        let second_dest = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an un-held alternate serves this request");
+        assert_eq!(
+            second_dest, first_dest,
+            "a second divert in the same hold episode must reuse the first \
+             divert's destination, not spend a second fresh account"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(home),
+            "sticky reuse is a divert, not a re-key — the pin stays home"
+        );
+
+        let episode = divert_episode_of(&manager, key).expect("episode recorded");
+        assert_eq!(episode.pin, home);
+        assert_eq!(episode.sticky, first_dest);
+        assert_eq!(
+            episode.destinations.count_ones(),
+            1,
+            "two diverts reusing the SAME destination is one distinct \
+             destination, not two"
+        );
+    }
+
+    /// Episode boundary (the divert-budget design notes §4.1: "Reset is
+    /// structural, not timed"): a session that diverts, recovers, and is then
+    /// held AGAIN on a later, distinct hold must start the second episode
+    /// with a clean mask — the earlier hold's destination must not leak in as
+    /// a stale sticky pick for a hold it never happened during.
+    #[test]
+    fn new_hold_deadline_resets_the_episode() {
+        let manager = build_manager(
+            config_with(vec![
+                account("home", 0),
+                account("alt1", 0),
+                account("alt2", 0),
+            ]),
+            pacing_refresher(),
+        );
+        // A single wall-clock read for the whole test — both hold deadlines
+        // below are EXPLICIT, fixed offsets from this one `now_ms`, never
+        // from `mark_rate_limited` (which takes its own, separate real-clock
+        // read via `crate::now_ms()`). Mixing two independent clock reads is
+        // exactly what made an earlier version of this test flaky: two reads
+        // microseconds apart are USUALLY distinguishable at millisecond
+        // resolution, but "usually" is not a gate. Deterministic by
+        // construction now, not by luck.
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let key = 626_262u64;
+        let home = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an account is eligible");
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[home].rate_limited_until_ms = Some(now_ms + SHORT_HOLD_SECS * 1000);
+        }
+        manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an un-held alternate serves this request");
+        let episode_one = divert_episode_of(&manager, key).expect("episode recorded");
+
+        // Let the first hold clear and the session come home.
+        let after = now + Duration::seconds(SHORT_HOLD_SECS + 5);
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                after,
+                None,
+                Some(key),
+                "/v1/messages",
+                None
+            ),
+            Some(home),
+            "the hold cleared — the session returns to its warm pin"
+        );
+
+        // A SECOND, later hold on the SAME account: a different
+        // `rate_limited_until_ms`, therefore a different episode identity.
+        // Still derived from the SAME `now_ms` capture above, at a
+        // deliberately distinct explicit offset — see
+        // `DivertEpisode::until_ms`'s doc comment for why an ACCIDENTAL
+        // collision between two real holds would be benign; this test simply
+        // does not rely on one.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[home].rate_limited_until_ms =
+                Some(now_ms + (SHORT_HOLD_SECS + 5) * 1000 + SHORT_HOLD_SECS * 1000);
+        }
+        manager
+            .select(
+                &HashSet::new(),
+                after,
+                None,
+                Some(key),
+                "/v1/messages",
+                None,
+            )
+            .expect("an un-held alternate serves this request");
+        let episode_two = divert_episode_of(&manager, key).expect("episode recorded");
+
+        assert_ne!(
+            episode_one.until_ms, episode_two.until_ms,
+            "two separate holds on the same account carry two different deadlines"
+        );
+        assert_eq!(
+            episode_two.destinations.count_ones(),
+            1,
+            "the new episode starts with a FULL budget — a clean, single-bit \
+             mask, not the first episode's carried-over distinct-destination count"
         );
     }
 

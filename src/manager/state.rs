@@ -88,6 +88,28 @@ impl Manager {
             .unwrap_or(false)
     }
 
+    /// Max DISTINCT destination accounts one session may be diverted to inside a
+    /// single hold episode, read from the config's unmodelled top-level
+    /// `divertBudget`. Same read pattern as [`Self::session_affinity_enabled`].
+    ///
+    /// **Default `0` = unlimited = today's behaviour byte-for-byte.** This is
+    /// the kill switch: an unbounded budget never blocks a divert, so shipping
+    /// it means every existing divert path is untouched until someone opts in
+    /// with `"divertBudget": N`. It stays `0` rather than a small nonzero
+    /// default because flipping it is a production-traffic decision (a nonzero
+    /// budget can turn a would-have-served divert into a `None`, which is new
+    /// client-visible behaviour) that must follow the live measurement, not
+    /// accompany it — see the divert-budget design notes §4.6.
+    pub fn divert_budget(&self) -> u32 {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .extra
+            .get("divertBudget")
+            .and_then(|v| v.as_u64())
+            .map_or(0, |v| v.min(u64::from(u32::MAX)) as u32)
+    }
+
     /// The keep-warm wake signal. The warm loop `select!`s over its own ticker and
     /// `warm_wake().notified()`, so the first sweep after boot happens as soon as
     /// the probe has read some quota rather than a full `warmupSeconds` later. See
