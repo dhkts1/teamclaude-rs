@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use futures::FutureExt as _;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -548,6 +549,53 @@ impl Drop for ServerHandle {
     }
 }
 
+/// Extract a human-readable message from a caught panic payload. Panics carry
+/// either a `&'static str` (the common `panic!("literal")` case) or a `String`
+/// (`panic!("{}", x)`, `.unwrap()`'s formatted message); anything else falls
+/// back to a fixed string rather than failing to log at all.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Supervise a background loop: log (via `tracing::error!`) if it ends by
+/// panicking, and otherwise do nothing else — it is NOT restarted. This repo's
+/// three background loops (affinity flusher, quota prober, keep-warm) run
+/// forever until the shutdown signal, and until now nothing observed them
+/// while serving: a panic inside one silently stopped it forever with no
+/// signal anywhere, and whatever it was keeping current (quota data, pin
+/// flushes, keep-warm sweeps) then froze at its last value while `tcr status`
+/// kept rendering it as live.
+///
+/// Catching the panic HERE, inside the task body, rather than adding a second
+/// watcher task over the `JoinHandle` outside it, is deliberate: a watcher that
+/// merely awaited the real task's `JoinHandle` would need to be the thing
+/// stored in `background` for `ServerHandle::shutdown_within`/`Drop` to
+/// join/abort — and aborting the WATCHER does not abort the task it was
+/// watching, silently detaching it. Catching the panic in-place instead means
+/// the spawned task's own `JoinHandle` always completes normally, so every
+/// existing join/abort site in this file needs no change at all, and
+/// `tasks_joined`/`tasks_aborted` accounting stays exactly as before.
+///
+/// `task` identifies which loop died, so the log line is actionable without
+/// re-deriving it from a bare panic backtrace.
+async fn supervise(task: &'static str, fut: impl std::future::Future<Output = ()>) {
+    if let Err(payload) = std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+        let reason = panic_message(&*payload);
+        tracing::error!(
+            task,
+            reason,
+            "background task panicked and stopped; it will NOT be restarted \
+             — whatever it was keeping current is now frozen at its last value"
+        );
+    }
+}
+
 /// Boot the proxy and return once the listener is bound.
 ///
 /// Returns [`ServeOutcome::StoodDown`] rather than exiting when a recognized
@@ -671,7 +719,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         let flusher = manager.clone();
         let flush_path = affinity_path.clone();
         let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(async move {
+        background.push(tokio::spawn(supervise("affinity-flusher", async move {
             let flush = async {
                 let mut ticker = tokio::time::interval(Duration::from_secs(5));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -696,7 +744,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
                 _ = flush => {}
                 _ = stop.changed() => {}
             }
-        }));
+        })));
     }
 
     // Background probe: refresh every account's quota around the configured
@@ -714,7 +762,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     if probe_seconds > 0 {
         let prober = manager.clone();
         let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(async move {
+        background.push(tokio::spawn(supervise("quota-prober", async move {
             let probe = async {
                 prober.probe_all().await;
                 crate::schedule::run(prober.clone(), crate::schedule::Job::Probe, probe_seconds)
@@ -724,7 +772,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
                 _ = probe => {}
                 _ = stop.changed() => {}
             }
-        }));
+        })));
     }
 
     // Opt-in keep-warm loop: periodically warm idle accounts so their 5h session
@@ -746,13 +794,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     if warmup_seconds > 0 {
         let m = manager.clone();
         let mut stop = shutdown_tx.subscribe();
-        background.push(tokio::spawn(async move {
+        background.push(tokio::spawn(supervise("keep-warm", async move {
             let warm = crate::schedule::run(m, crate::schedule::Job::Warm, warmup_seconds);
             tokio::select! {
                 _ = warm => {}
                 _ = stop.changed() => {}
             }
-        }));
+        })));
     }
 
     // Load the MITM TLS material (reuse the existing leaf, else mint one). A
@@ -813,6 +861,28 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // every boot is already guaranteed to log.
     let throttle_exempt_noise = manager.throttle_exempt_noise_enabled();
     let divert_budget = manager.divert_budget();
+    // Every other load-bearing knob rides this same line for the same reason:
+    // `sessionAffinity`, `revalidationServe` and `loadBalanceMigration` are
+    // each default-ON opt-OUT switches (a config that silently disables one
+    // reads identically to the feature working, from outside the process);
+    // `quotaProbeSeconds`/`warmupSeconds` decide whether the two timer loops
+    // spawned above exist at all; `pacing`/`throttle` are each all-`None`
+    // (inert) unless the operator opted in, and a `PacingConfig`/
+    // `ThrottleConfig` typo that resolves to "still inert" is otherwise
+    // invisible; `lockAccount`/`controlAccount` resolve a NAME to an account
+    // index at construction and log an `error!`/nothing respectively on a
+    // typo, but neither of those lines carries the RESOLVED identity next to
+    // the rest of the boot state.
+    let session_affinity = manager.session_affinity_enabled();
+    let revalidation_serve = manager.revalidation_serve_enabled();
+    let load_balance_migration = manager.load_balance_migration_enabled();
+    // Reuse the bindings the probe/warm spawn gates above already computed
+    // rather than reading the manager twice for the same values.
+    let quota_probe_seconds = probe_seconds;
+    let pacing_active = manager.pacing_active();
+    let throttle_active = manager.throttle_active();
+    let lock_account = manager.locked_account_name();
+    let control_account = manager.control_name();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         sha = build_info::SHA,
@@ -823,6 +893,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         http1_only,
         throttle_exempt_noise,
         divert_budget,
+        session_affinity,
+        revalidation_serve,
+        load_balance_migration,
+        quota_probe_seconds,
+        warmup_seconds,
+        pacing_active,
+        throttle_active,
+        lock_account,
+        control_account,
         "server started"
     );
 
@@ -1218,5 +1297,196 @@ mod tests {
             panic!("{live} task(s) never saw the shutdown signal");
         }
         drop(keepalive);
+    }
+
+    // --- background task supervision (part 1) --------------------------------
+
+    /// A `MakeWriter` that keeps what was written, so a test can inspect
+    /// tracing output without capturing the process's real stdout. Same shape
+    /// as `main.rs`'s/`proxy.rs`'s `SharedBuf` — duplicated locally because
+    /// those are private to their own test modules.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().expect("shared buffer poisoned").clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// THE catch: `supervise` must swallow a panic from the wrapped future so
+    /// the spawned task's own `JoinHandle` completes **normally** (this is
+    /// what lets `ServerHandle::shutdown_within`/`Drop` stay unchanged — see
+    /// `supervise`'s doc-comment) while still logging which task died and why,
+    /// via `tracing::error!`. `#[tokio::test]` defaults to current-thread, so
+    /// the thread-local subscriber set below stays in effect for the spawned
+    /// task too (same reasoning as `proxy.rs`'s usage-log test).
+    #[tokio::test]
+    async fn a_panicking_background_task_is_logged_and_not_respawned() {
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let handle = tokio::spawn(supervise("test-quota-prober", async {
+            panic!("boom: deliberate test panic");
+        }));
+
+        let result = handle.await;
+        assert!(
+            result.is_ok(),
+            "supervise() must catch the panic so the spawned task's own \
+             JoinHandle completes normally instead of returning a JoinError; \
+             saw {result:?}"
+        );
+
+        let log = sink.contents();
+        assert!(
+            log.contains("test-quota-prober"),
+            "the log line must name which task died: {log:?}"
+        );
+        assert!(
+            log.contains("background task panicked"),
+            "the log line must say the task panicked: {log:?}"
+        );
+        assert!(
+            log.contains("boom: deliberate test panic"),
+            "the log line must carry the panic message: {log:?}"
+        );
+    }
+
+    /// A task that finishes WITHOUT panicking must log nothing — `supervise`
+    /// only reacts to a panic, never to an ordinary return (which is exactly
+    /// what every one of these loops does today on a clean shutdown: the
+    /// `tokio::select!` around `stop.changed()` returns `()`, not a panic).
+    #[tokio::test]
+    async fn a_clean_return_is_not_logged_as_a_panic() {
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let handle = tokio::spawn(supervise("test-clean-task", async {}));
+        handle
+            .await
+            .expect("a non-panicking task never returns a JoinError");
+
+        assert!(
+            sink.contents().is_empty(),
+            "a clean return must not be logged as a panic: {:?}",
+            sink.contents()
+        );
+    }
+
+    // --- boot-line knob completeness (part 2) ---------------------------------
+
+    /// A config with every new boot-line knob set to a **non-default** value,
+    /// plus one fabricated (non-real) account so `lockAccount`/`controlAccount`
+    /// each resolve to a real index instead of logging the "did not match any
+    /// account" error path. Port 0 (ephemeral) so this test can never contend
+    /// the live proxy's port, and `tls: Disabled` so it touches no TLS material
+    /// on disk. `access_token` is a fixed non-secret placeholder — this repo is
+    /// public (see `CLAUDE.md`).
+    fn boot_line_test_config() -> Config {
+        serde_json::from_str(
+            r#"{
+                "proxy": { "port": 0 },
+                "sessionAffinity": false,
+                "revalidationServe": false,
+                "loadBalanceMigration": true,
+                "quotaProbeSeconds": 1234,
+                "warmupSeconds": 777,
+                "pacing": { "minSpacingMs": 500 },
+                "throttle": {},
+                "lockAccount": "test-fixture-account",
+                "controlAccount": "test-fixture-account",
+                "accounts": [
+                    {
+                        "name": "test-fixture-account",
+                        "accessToken": "not-a-real-token"
+                    }
+                ]
+            }"#,
+        )
+        .expect("the inline test config parses")
+    }
+
+    /// THE bite: every knob this unit added to the "server started" boot line
+    /// must actually be ON that line, with the value this config set — not
+    /// merely present in config/`Manager`. A caller diagnosing a cold-cache
+    /// incident reads this ONE line (see the module doc-comment on why it is
+    /// one line, not several); a knob resolved correctly but never logged is
+    /// invisible to exactly that read.
+    #[tokio::test]
+    async fn boot_line_carries_every_new_knob_with_its_configured_value() {
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut handle = serve(ServeOptions {
+            tls: TlsSetup::Disabled,
+            ..ServeOptions::new(boot_line_test_config())
+        })
+        .await
+        .expect("bind must succeed on an ephemeral port")
+        .expect_started();
+
+        let log = sink.contents();
+        let boot_line = log
+            .lines()
+            .find(|line| line.contains("server started"))
+            .unwrap_or_else(|| panic!("no \"server started\" line in captured log: {log:?}"));
+
+        for expected in [
+            "session_affinity=false",
+            "revalidation_serve=false",
+            "load_balance_migration=true",
+            "quota_probe_seconds=1234",
+            "warmup_seconds=777",
+            "pacing_active=true",
+            // The empty `"throttle": {}` object is the documented escape
+            // hatch (see `ThrottleConfig`'s doc-comment) — it overrides the
+            // default-ON throttle to fully inert, so `false` here IS the
+            // non-default assertion: the default build's boot line reads
+            // `throttle_active=true`.
+            "throttle_active=false",
+            "lock_account=\"test-fixture-account\"",
+            "control_account=\"test-fixture-account\"",
+        ] {
+            assert!(
+                boot_line.contains(expected),
+                "boot line missing {expected:?}; full line: {boot_line:?}"
+            );
+        }
+
+        handle.shutdown().await;
     }
 }

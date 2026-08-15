@@ -2637,6 +2637,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             let evidence_dropped_reader = Arc::clone(&evidence_dropped);
             let manager_side = manager.clone();
             let status_is_success = status.is_success();
+            // Cloned, not moved: `account_name` (the original) is still moved
+            // into `TeeState` further below, in this same iteration — see the
+            // comment there. This clone is ONLY for the per-request usage log
+            // line inside the spawned parser task.
+            let account_name_for_log = account_name.clone();
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -2651,6 +2656,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         parsed.output,
                         parsed.cache_read,
                         parsed.cache_creation,
+                    );
+                    // One line per terminal request, never per SSE event — a
+                    // per-event log here would be the same flood vector the
+                    // stream-error path above is careful to avoid on a long
+                    // erroring stream.
+                    tracing::info!(
+                        account = account_name_for_log.as_deref().unwrap_or("?"),
+                        session = ?session_key,
+                        cache_read_tokens = parsed.cache_read,
+                        cache_creation_tokens = parsed.cache_creation,
+                        input_tokens = parsed.input_total,
+                        output_tokens = parsed.output,
+                        "request usage"
                     );
                 }
                 // Sibling of the usage guard above, not nested in it: an error
@@ -2839,6 +2857,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     parsed.output,
                     parsed.cache_read,
                     parsed.cache_creation,
+                );
+                // One line per terminal (non-streamed) request — see the
+                // matching log line on the streaming arm above.
+                tracing::info!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    session = ?session_key,
+                    cache_read_tokens = parsed.cache_read,
+                    cache_creation_tokens = parsed.cache_creation,
+                    input_tokens = parsed.input_total,
+                    output_tokens = parsed.output,
+                    "request usage"
                 );
             }
         }
@@ -7785,6 +7814,116 @@ mod tests {
             manager.snapshot(OffsetDateTime::now_utc()).accounts[0].requests,
             1,
             "the request-served counter is untouched by this fix"
+        );
+    }
+
+    // --- per-request usage log line -----------------------------------------
+
+    /// A `MakeWriter` that keeps what was written, so a test can inspect
+    /// tracing output without capturing the process's real stdout. Same shape
+    /// as `main.rs`'s `SharedBuf` — duplicated locally because that one is
+    /// private to `main.rs`'s own test module.
+    #[derive(Clone, Default)]
+    struct SharedBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl SharedBuf {
+        fn contents(&self) -> String {
+            let bytes = self.0.lock().expect("shared buffer poisoned").clone();
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+    }
+
+    impl std::io::Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("shared buffer poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// THE BITING TEST for the per-request usage log line: a real request
+    /// through the buffered (non-streaming) path, against a real fake
+    /// upstream returning real usage numbers, must produce a `tracing::info!`
+    /// line carrying those exact numbers — not zeros, not a per-chunk flood.
+    /// `#[tokio::test]` defaults to the current-thread flavor, so the
+    /// thread-local subscriber set below stays in effect across every await
+    /// point in the request, including the buffered-arm log call in `handle`.
+    #[tokio::test]
+    async fn buffered_request_logs_usage_line_with_real_token_counts() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = br#"{"usage":{"input_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":90,"output_tokens":11}}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        let _ = resp.bytes().await.unwrap();
+
+        let log = sink.contents();
+        assert!(
+            log.contains("cache_read_tokens=90")
+                && log.contains("cache_creation_tokens=3")
+                // `input_tokens` on the wire is 7, but `usage_from_json`'s
+                // `input_total` is base + both cache components (7+3+90=100,
+                // see `sum_input_tokens`) — the same total the streaming arm
+                // and `status_endpoint_returns_live_counters` use.
+                && log.contains("input_tokens=100")
+                && log.contains("output_tokens=11"),
+            "expected a usage log line carrying the real synthesized token \
+             counts (cache_read=90, cache_creation=3, input_total=100, output=11), \
+             got: {log:?}"
         );
     }
 
