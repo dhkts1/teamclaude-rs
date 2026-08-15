@@ -515,7 +515,45 @@ main() {
     --icon "$app_name.app" 130 170 \
     --app-drop-link 390 170 \
     --hdiutil-quiet \
-    "$dmg" "$app_dir" || [ -f "$dmg" ] || die "create-dmg produced no image at $dmg."
+    "$dmg" "$app_dir" || true
+
+  # FALLBACK — because the tolerant `|| [ -f "$dmg" ]` above is not enough.
+  #
+  # create-dmg styles the image by driving Finder over AppleScript. That step can
+  # fail OUTRIGHT rather than cosmetically, and when it does it aborts before the
+  # image is finalised — so there is no file left to tolerate and the whole release
+  # dies on presentation. Measured 2026-08-15 on v0.2.12, twice in a row, with
+  # Finder reachable and the screen unlocked:
+  #
+  #   execution error: Finder got an error: Can't set statusbar visible of
+  #   container window of disk "dmg.bB4bq2" to false. (-10006)
+  #
+  # Nothing downstream cares what the window looks like: codesign, notarytool,
+  # stapler and Sparkle all operate on the image, not on its Finder presentation.
+  # Losing a release to a drag-and-drop background is the wrong trade, so fall back
+  # to a plain image — and say so loudly, because the DMG a user opens will look
+  # different from every previous one and that must not be a silent change.
+  #
+  # The staging dir reproduces the one affordance that matters, the Applications
+  # symlink, so the fallback image is still usable by hand. `ditto` rather than
+  # `cp -R`: it preserves the extended attributes and the code signature, which a
+  # naive copy can strip — and an unsigned app inside a signed image fails
+  # notarization for a reason that looks nothing like its cause.
+  if [ ! -f "$dmg" ]; then
+    printf 'WARNING: create-dmg produced no image — falling back to an UNSTYLED hdiutil image.\n' >&2
+    printf 'WARNING:   the drag-to-Applications window layout will be missing.\n' >&2
+    printf 'WARNING:   signing, notarization, stapling and the Sparkle feed are unaffected.\n' >&2
+    dmg_stage="$(mktemp -d)"
+    ditto "$app_dir" "$dmg_stage/$(basename "$app_dir")" \
+      || die "could not stage $app_dir for the fallback image."
+    ln -s /Applications "$dmg_stage/Applications" \
+      || die "could not create the Applications symlink for the fallback image."
+    hdiutil create -quiet -srcfolder "$dmg_stage" -volname "$app_name $version" \
+      -fs HFS+ -format UDZO "$dmg" \
+      || { rm -rf "$dmg_stage"; die "hdiutil could not create $dmg either."; }
+    rm -rf "$dmg_stage"
+  fi
+  [ -f "$dmg" ] || die "no image at $dmg after create-dmg and the hdiutil fallback."
   note "dmg: $dmg"
 
   # The DMG is signed too: an unsigned disk image gets its own Gatekeeper
