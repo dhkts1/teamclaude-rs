@@ -378,6 +378,7 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
 
     let mut cmd = std::process::Command::new("claude");
     cmd.args(&args.args);
+    mark_run_active(&mut cmd);
 
     if cli::proxy_is_up(port) {
         if let Some(notice) = withheld_api_key_notice(
@@ -402,6 +403,37 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The marker `tcr run` leaves on its child: **a `tcr run` is already above you
+/// in this process chain, so do not start another one.**
+///
+/// `tcr run` resolves `claude` from `PATH`, and on a machine where something else
+/// also wraps `claude` that lookup can land back on a launcher that wraps in
+/// `tcr run` — which then resolves `claude` from `PATH` again. The chain still
+/// terminates and the routing environment applied twice is identical, so nothing
+/// breaks; what you see is every startup line printed twice and a second `tcr`
+/// process parked in the tree for the life of the session. Measured 2026-08-17
+/// inside a cmux pane: a hand-typed `tcr run` produced two see-through banners,
+/// and dropping cmux's shim directory from `PATH` produced one.
+///
+/// A launcher cannot infer this from the routing variables — those are also what
+/// a `tcr`-launched shell exports to everything it runs — so we state it, and a
+/// wrapper that understands the marker hands off instead of wrapping again.
+///
+/// The name is deliberately **not** `CMUX_`-prefixed. cmux's own claude wrapper
+/// clears every variable matching that prefix before exec'ing the real binary, so
+/// a marker named for the wrapper it has to survive would be erased in transit by
+/// exactly the process it exists to inform. [`marker_survives_the_cmux_prefix_sweep`]
+/// pins that.
+const RUN_ACTIVE_ENV: &str = "TCR_RUN_ACTIVE";
+
+/// Set on **every** `tcr run` child, including the proxy-down passthrough: the
+/// claim is about this chain already containing a `tcr run`, which is true there
+/// too, and a launcher re-wrapping that case just prints the passthrough notice
+/// twice instead of the routing banner.
+fn mark_run_active(cmd: &mut std::process::Command) {
+    cmd.env(RUN_ACTIVE_ENV, "1");
 }
 
 /// The CA to advertise for see-through mode, or `None` when we must fall back to
@@ -1075,6 +1107,30 @@ mod tests {
                  login and disables every claude.ai connector"
             );
         }
+    }
+
+    /// The re-entry marker must reach the child, and must not be named such that
+    /// the wrapper it informs deletes it on the way.
+    ///
+    /// cmux's claude wrapper runs `for k in ${!CMUX_@}; do unset "$k"; done` before
+    /// exec'ing the real binary. A marker under that prefix would be swept exactly
+    /// where it is needed, and the double-wrap would come back looking like a bug
+    /// in the launcher rather than in the name.
+    #[test]
+    fn marker_survives_the_cmux_prefix_sweep() {
+        assert!(
+            !RUN_ACTIVE_ENV.starts_with("CMUX_"),
+            "{RUN_ACTIVE_ENV} would be erased by cmux's own CMUX_* sweep before the \
+             launcher that reads it ever runs"
+        );
+
+        let mut cmd = std::process::Command::new("claude");
+        mark_run_active(&mut cmd);
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == RUN_ACTIVE_ENV && v == Some("1".as_ref())),
+            "every `tcr run` child must carry {RUN_ACTIVE_ENV}"
+        );
     }
 
     /// A WEDGED INCUMBENT MUST NOT BE OFFERED A RECOVERY THAT CANNOT WORK.
