@@ -31,6 +31,9 @@
 #
 #   --dry-run       do everything except notarize and upload. This is how the
 #                   pipeline is exercised on a machine with no credentials.
+#                   Leaves apps/macos/appcast.xml byte-identical: the appcast
+#                   item is built and validated against a scratch copy, never
+#                   the tracked file.
 #   --skip-notarize skip notarization and stapling only. The DMG is still built
 #                   and signed; it will be Gatekeeper-quarantined on download.
 #   --tag           the release tag. Defaults to v<Cargo.toml version> and must
@@ -38,6 +41,11 @@
 #                   this script exists to prevent, not to tolerate.
 #   --verify-only   run the signature asserts (stages 2 and 3) against an
 #                   already-built bundle and exit. Builds nothing.
+#
+# Exit status: 0 whenever publishing itself succeeded, including the case
+# where apps/macos/appcast.xml is left uncommitted afterward — that is an
+# outstanding manual step, not a failed release, and the closing message
+# says so loudly (grep for "UNCOMMITTED") rather than the exit code doing it.
 #
 # Environment:
 #   APPLE_API_KEY_PATH    path to the App Store Connect .p8 private key
@@ -304,8 +312,9 @@ sparkle_sign() {
 readonly appcast_marker='<!-- release-tcrbar.sh inserts new items directly below this line -->'
 
 ensure_appcast() {
-  [ -f "$appcast_path" ] && return 0
-  cat >"$appcast_path" <<XML
+  local target="$1"
+  [ -f "$target" ] && return 0
+  cat >"$target" <<XML
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
   <channel>
@@ -316,7 +325,7 @@ ensure_appcast() {
   </channel>
 </rss>
 XML
-  note "appcast: created $appcast_path"
+  note "appcast: created $target"
 }
 
 # Insert the item at a FIXED marker rather than "after <channel>" or "before
@@ -332,11 +341,11 @@ XML
 # user they are up to date forever. Hence also the post-insert assert below: a
 # silent, well-formed, wrong result is the failure mode this function has.
 appcast_insert() {
-  local item="$1" tmp itemfile before after
-  grep -qF "$appcast_marker" "$appcast_path" \
+  local target="$1" item="$2" tmp itemfile before after
+  grep -qF "$appcast_marker" "$target" \
     || die "$appcast_path has no insertion marker. Restore this line inside <channel>:" \
            "  $appcast_marker"
-  before="$(grep -c '<item>' "$appcast_path" || true)"
+  before="$(grep -c '<item>' "$target" || true)"
   tmp="$(mktemp)"
   itemfile="$(mktemp)"
   printf '%s\n' "$item" >"$itemfile"
@@ -347,13 +356,13 @@ appcast_insert() {
       close(itemfile)
       done = 1
     }
-  ' "$appcast_path" >"$tmp" || { rm -f "$tmp" "$itemfile"; die "appcast: awk failed to insert the item."; }
+  ' "$target" >"$tmp" || { rm -f "$tmp" "$itemfile"; die "appcast: awk failed to insert the item."; }
   rm -f "$itemfile"
   after="$(grep -c '<item>' "$tmp" || true)"
   [ "$after" -eq $((before + 1)) ] \
     || { rm -f "$tmp"; die "appcast: insert produced $after <item> elements, expected $((before + 1))." \
                            "Refusing to publish a feed that lost or duplicated a release."; }
-  mv "$tmp" "$appcast_path"
+  mv "$tmp" "$target"
 }
 
 # ---------------------------------------------------------------------------
@@ -434,7 +443,7 @@ stop_quarantine_watcher() {
 usage() { sed -n '2,60p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 main() {
-  local dry_run=0 skip_notarize=0 tag="" verify_only=""
+  local dry_run=0 skip_notarize=0 tag="" verify_only="" appcast_target=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run)       dry_run=1 ;;
@@ -481,8 +490,25 @@ main() {
   # reason — skip it.
   if [ "$dry_run" != 1 ]; then
     start_quarantine_watcher "$tag" "$repo"
-    trap stop_quarantine_watcher EXIT
   fi
+
+  # One trap, set unconditionally, that always runs on every exit path
+  # (success, `die`, an interrupted build) rather than two competing ones. It
+  # is safe to call stop_quarantine_watcher even when no watcher was started
+  # — it no-ops on an empty $quarantine_watcher_pid — and it is safe to `rm`
+  # $appcast_target even when stage 8 never ran or never set it, because that
+  # happens with the shell's own unset-variable check under `set -u`, which
+  # is why the guard below reads it through `${appcast_target:-}` rather than
+  # assuming stage 8 already ran.
+  #
+  # $appcast_target is only ever a scratch mktemp file when it differs from
+  # $appcast_path (the --dry-run case); the real file is never `rm`'d here.
+  trap '
+    stop_quarantine_watcher
+    if [ -n "${appcast_target:-}" ] && [ "$appcast_target" != "$appcast_path" ]; then
+      rm -f "$appcast_target"
+    fi
+  ' EXIT
 
   # ---- stage 1: build -----------------------------------------------------
   stage "stage 1/9  build (apps/macos/scripts/build-tcrbar.sh)"
@@ -610,7 +636,45 @@ main() {
   build_number="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_dir/Contents/Info.plist")"
   pubdate="$(LC_ALL=C date -u '+%a, %d %b %Y %H:%M:%S +0000')"
   url="https://github.com/$repo/releases/download/$tag/$(basename "$dmg")"
-  ensure_appcast
+
+  # A --dry-run must leave the TRACKED $appcast_path byte-identical. It used
+  # not to: stage 8 always ran ensure_appcast/appcast_insert against the real
+  # file and only stage 9's upload was skipped under --dry-run, so a
+  # rehearsal wrote a real <item> into the tracked file every time. That is
+  # how a rehearsal poisons the following real run — the duplicate-item guard
+  # below would then see the rehearsal's own entry and die (the documented
+  # failure mode is dying here AFTER notarizing, the expensive stages). It is
+  # also how the appcast entry twice ended up stranded uncommitted:
+  # 0.2.15 (c47aa99, #119) and 0.2.17 (PR #121) each needed a follow-up
+  # commit, and release-preflight.sh check 5/6 only ever catches this one
+  # release too late. Below, ensure_appcast, the duplicate guard and
+  # appcast_insert all run against $appcast_target — a scratch copy of the
+  # real file under --dry-run, and the real file itself otherwise — so a
+  # rehearsal builds and validates the exact same item without ever touching
+  # the tracked file. $appcast_target was declared (empty) at the top of
+  # main() so the EXIT trap can always see it, even if this stage dies before
+  # reassigning it.
+  #
+  # `mktemp` CREATES its file, at zero bytes, before we ever get to decide
+  # whether to seed it. Left as-is, that empty file makes `ensure_appcast`'s
+  # `[ -f "$target" ] && return 0` treat a brand-new appcast as "already
+  # there" and skip writing the RSS skeleton — so a rehearsal of a
+  # first-ever release (no tracked appcast.xml yet) would die on "no
+  # insertion marker" in exactly the case where the real run succeeds and
+  # prints "appcast: created". `rm -f` the just-created empty file whenever
+  # there is nothing real to seed it from, so `ensure_appcast` sees a genuine
+  # absence and creates the skeleton — the same thing the real path does.
+  appcast_target="$appcast_path"
+  if [ "$dry_run" = 1 ]; then
+    appcast_target="$(mktemp "${TMPDIR:-/tmp}/release-tcrbar-appcast-dry-run.XXXXXX")"
+    if [ -f "$appcast_path" ]; then
+      cp "$appcast_path" "$appcast_target"
+    else
+      rm -f "$appcast_target"
+    fi
+  fi
+
+  ensure_appcast "$appcast_target"
   item="    <item>
       <title>$app_name $version</title>
       <link>https://github.com/$repo/releases/tag/$tag</link>
@@ -627,10 +691,7 @@ main() {
   # ATTRIBUTE form — sitting four lines above the `item` block that writes the
   # ELEMENT form. No item this script has ever produced could match it, so the
   # guard was dead from the day it was written and the "dies at stage 8" it
-  # promises never once happened. That matters because a `--dry-run` writes the
-  # entry too: the documented failure mode is a real run aborting here AFTER
-  # notarizing, and instead it would have appended a second item for the same
-  # version.
+  # promises never once happened.
   #
   # Restating the shape in a second place is what allowed the drift, so this no
   # longer restates it. The needle is extracted from `$item` itself, matched with
@@ -642,14 +703,20 @@ main() {
   [ -n "$version_needle" ] \
     || die "internal: could not derive the version line from the appcast item." \
            "The item template changed; update the guard in stage 8."
-  if grep -qF "$version_needle" "$appcast_path"; then
+  # No manual cleanup of $appcast_target here or below: the EXIT trap set
+  # earlier in main() removes the scratch copy on every exit path, `die`
+  # included, so a die() here can't leak it into $TMPDIR.
+  if grep -qF "$version_needle" "$appcast_target"; then
     die "$appcast_path already has an item for version $version." \
-        "Bump the version in Cargo.toml rather than republishing one." \
-        "A --dry-run also writes this entry; drop it before a real run."
+        "Bump the version in Cargo.toml rather than republishing one."
   fi
 
-  appcast_insert "$item"
-  note "appcast: added $version ($build_number) -> $appcast_path"
+  appcast_insert "$appcast_target" "$item"
+  if [ "$dry_run" = 1 ]; then
+    note "appcast: would add $version ($build_number) -> $appcast_path (dry run; $appcast_path left untouched)"
+  else
+    note "appcast: added $version ($build_number) -> $appcast_path"
+  fi
 
   # ---- stage 9: publish ---------------------------------------------------
   if [ "$dry_run" = 1 ]; then
@@ -738,7 +805,65 @@ main() {
     note "uploaded to https://github.com/$repo/releases/tag/$tag"
   fi
 
-  printf '\nrelease %s: done%s\n' "$tag" "$([ "$dry_run" = 1 ] && echo ' (dry run)' || echo '')"
+  report_release_outcome "$tag" "$dry_run"
+}
+
+# ---------------------------------------------------------------------------
+# Closing message
+# ---------------------------------------------------------------------------
+
+# This script performs no git writes — it never commits, branches or pushes
+# (see the module header). That is deliberate: main is protected, and this
+# checkout routinely holds sibling sessions' uncommitted work, so an
+# auto-commit here is a collision hazard, not a convenience. But stage 8 just
+# wrote a real <item> into the TRACKED $appcast_path (skipped under
+# --dry-run — see appcast_target above), and until now the closing message
+# never said so. Two releases in a row read a bare "done", walked away, and
+# left the entry stranded — 0.2.15 (c47aa99, #119) and 0.2.17 (PR #121) both
+# needed a follow-up commit to land it. release-preflight.sh check 5/6
+# already detects the dirty appcast on the NEXT release; that is the safety
+# net, not the fix — it fires one release too late to stop the strand. The
+# fix is that this script cannot itself claim plain success while it
+# happened.
+#
+# Publishing genuinely succeeded, so this keeps a 0 exit status — turning a
+# successful release into a failure exit would be worse than the silence it
+# replaces (see the Exit status note in the usage block). It resolves the
+# repo root from git itself rather than string-munging $appcast_path, for the
+# same reason every other path in this script does.
+#
+# A standalone function (rather than inline in main) so a fixture can call it
+# directly against a real git repo without driving the whole build/sign/
+# notarize pipeline.
+report_release_outcome() {
+  local tag="$1" dry_run="$2" repo_root_for_check appcast_git_status
+
+  # Every other fallible call in this file dies with a message explaining
+  # what to do; these two `git` calls did not, so a checkout with no `.git`
+  # (or any other git failure) aborted the whole script with a raw `fatal:`
+  # and exit 128 from `set -e` — printed as if PUBLISHING had failed, when
+  # by this point it had already succeeded. Wrap both explicitly and say so.
+  repo_root_for_check="$(git -C "$(dirname "$appcast_path")" rev-parse --show-toplevel 2>&1)" \
+    || die "release $tag published, but could not resolve the repo root to check" \
+           "whether $appcast_path is committed:" \
+           "  $repo_root_for_check" \
+           "Check by hand: git -C \"$(dirname "$appcast_path")\" status --porcelain -- \"$appcast_path\""
+  appcast_git_status="$(git -C "$repo_root_for_check" status --porcelain -- "$appcast_path" 2>&1)" \
+    || die "release $tag published, but 'git status' on $appcast_path failed:" \
+           "  $appcast_git_status" \
+           "Check by hand: git -C \"$repo_root_for_check\" status --porcelain -- \"$appcast_path\""
+
+  if [ -n "$appcast_git_status" ]; then
+    stage "appcast entry left uncommitted"
+    note "release $tag published, but $appcast_path is not committed."
+    note "This script does not commit, branch, or push — see the module header."
+    note "Land it by hand:"
+    note "  git -C \"$repo_root_for_check\" commit -- \"$appcast_path\""
+    note "  git -C \"$repo_root_for_check\" push && gh pr create --base main"
+    printf '\nrelease %s: done, BUT %s is UNCOMMITTED — see above\n' "$tag" "$appcast_path"
+  else
+    printf '\nrelease %s: done%s\n' "$tag" "$([ "$dry_run" = 1 ] && echo ' (dry run)' || echo '')"
+  fi
 }
 
 # Guarded so the asserts above can be sourced and exercised in isolation.
