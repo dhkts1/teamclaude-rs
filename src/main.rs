@@ -697,10 +697,44 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let mut handle = handle;
     if args.headless {
         tracing::info!("teamclaude-rs listening on http://{bound} (headless)");
-        // Block until Ctrl-C or the server task exits.
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received"),
-            () = handle.serving_stopped() => {}
+        // Block until Ctrl-C, SIGTERM, or the server task exits.
+        //
+        // TcrBar always launches this process with `--headless` and stops it
+        // with `process.terminate()` — a SIGTERM, not Ctrl-C
+        // (`apps/macos/.../ServerController.swift`). Without a handler
+        // installed here the default disposition kills the process
+        // immediately, skipping `handle.shutdown()` below entirely: no
+        // drain, no final session->account pin flush, no owner-file
+        // removal. Mirror the TUI branch's SIGTERM handling (below) so a
+        // supervised stop falls through to the same shared cleanup instead
+        // of a hard kill.
+        //
+        // This cannot turn into an unkillable process: `handle.shutdown()`
+        // is `shutdown_within(DEFAULT_SHUTDOWN_GRACE)` (5s, see
+        // `server::DEFAULT_SHUTDOWN_GRACE`), documented as bounded — tasks
+        // that miss the grace are aborted and counted in
+        // `report.tasks_aborted`, warned about just below.
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        if sigterm.is_none() {
+            tracing::warn!("could not install SIGTERM handler; a supervised stop will kill this process without draining");
+        }
+        let trigger = tokio::select! {
+            _ = tokio::signal::ctrl_c() => ShutdownTrigger::CtrlC,
+            _ = async {
+                match sigterm.as_mut() {
+                    Some(sig) => {
+                        sig.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => ShutdownTrigger::Sigterm,
+            () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
+        };
+        match trigger {
+            ShutdownTrigger::CtrlC => tracing::info!("shutdown signal received"),
+            ShutdownTrigger::Sigterm => tracing::info!("SIGTERM received; shutting down"),
+            ShutdownTrigger::ServingStopped => {}
         }
     } else {
         // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
@@ -750,6 +784,37 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Which event broke the headless `select!` in [`run_server`] out of its
+/// wait, so it can fall through to the shared `handle.shutdown()` below.
+/// Kept as a plain enum the `select!` arms produce, rather than matching
+/// inline in each arm, so the mapping from event to log message lives in
+/// one `match` and the SET of events the mode reacts to
+/// ([`headless_shutdown_triggers`], test-only) is assertable without
+/// installing a real OS signal handler — that is process-wide state
+/// (`tokio::signal::unix::signal` changes the process's disposition for as
+/// long as the stream lives) and unreliable under `cargo test`'s parallel
+/// harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownTrigger {
+    CtrlC,
+    Sigterm,
+    ServingStopped,
+}
+
+/// The triggers the headless `select!` above races, listed in the same
+/// order as its arms. Test-only: exists so a future edit that adds or
+/// removes an arm there without updating this list — or the reverse — has
+/// somewhere to be caught, keeping the SIGTERM regression this module
+/// fixes from silently reverting.
+#[cfg(test)]
+fn headless_shutdown_triggers() -> &'static [ShutdownTrigger] {
+    &[
+        ShutdownTrigger::CtrlC,
+        ShutdownTrigger::Sigterm,
+        ShutdownTrigger::ServingStopped,
+    ]
 }
 
 /// How to recover from a WEDGED incumbent — the half of the not-answering warning
@@ -1056,6 +1121,28 @@ mod tests {
         cli::Liveness::Silent {
             why: "the server did not answer within 5s".to_string(),
         }
+    }
+
+    /// TcrBar always launches `--headless` and stops it with
+    /// `process.terminate()` (SIGTERM), never Ctrl-C. If the headless
+    /// `select!` in `run_server` ever loses its SIGTERM arm again — the
+    /// regression this module fixes — a supervised stop goes back to
+    /// killing the process before `handle.shutdown()` runs: no drain, no
+    /// final pin flush, no owner-file removal.
+    #[test]
+    fn headless_mode_reacts_to_sigterm_not_just_ctrl_c() {
+        let triggers = headless_shutdown_triggers();
+        assert!(
+            triggers.contains(&ShutdownTrigger::Sigterm),
+            "headless must fall through to handle.shutdown() on SIGTERM \
+             (TcrBar's process.terminate()), not just Ctrl-C: {triggers:?}"
+        );
+        // Ctrl-C is the pre-existing arm; assert it stays too, so this test
+        // cannot be satisfied by silently dropping it in favor of SIGTERM.
+        assert!(
+            triggers.contains(&ShutdownTrigger::CtrlC),
+            "headless must still react to Ctrl-C: {triggers:?}"
+        );
     }
 
     /// Pins that a configured proxy key is withheld from `claude`, and says why.
