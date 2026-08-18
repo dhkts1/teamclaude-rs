@@ -790,31 +790,22 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
 /// wait, so it can fall through to the shared `handle.shutdown()` below.
 /// Kept as a plain enum the `select!` arms produce, rather than matching
 /// inline in each arm, so the mapping from event to log message lives in
-/// one `match` and the SET of events the mode reacts to
-/// ([`headless_shutdown_triggers`], test-only) is assertable without
-/// installing a real OS signal handler — that is process-wide state
-/// (`tokio::signal::unix::signal` changes the process's disposition for as
-/// long as the stream lives) and unreliable under `cargo test`'s parallel
-/// harness.
+/// one `match`.
+///
+/// The coverage claim — that SIGTERM is actually one of these triggers —
+/// is NOT proven by a list living beside this enum: a hand-written list
+/// can drift from the `select!` arms with nothing to notice, which is
+/// exactly the shape of gate that cannot fail for the defect it exists to
+/// catch. It is proven by `tests/headless_sigterm.rs`, which spawns the
+/// real binary, sends it a real SIGTERM, and asserts on the externally
+/// observable effects of a graceful shutdown (the log line and the
+/// port-owner claim being withdrawn) — deleting the SIGTERM arm here makes
+/// that test fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownTrigger {
     CtrlC,
     Sigterm,
     ServingStopped,
-}
-
-/// The triggers the headless `select!` above races, listed in the same
-/// order as its arms. Test-only: exists so a future edit that adds or
-/// removes an arm there without updating this list — or the reverse — has
-/// somewhere to be caught, keeping the SIGTERM regression this module
-/// fixes from silently reverting.
-#[cfg(test)]
-fn headless_shutdown_triggers() -> &'static [ShutdownTrigger] {
-    &[
-        ShutdownTrigger::CtrlC,
-        ShutdownTrigger::Sigterm,
-        ShutdownTrigger::ServingStopped,
-    ]
 }
 
 /// How to recover from a WEDGED incumbent — the half of the not-answering warning
@@ -1121,28 +1112,6 @@ mod tests {
         cli::Liveness::Silent {
             why: "the server did not answer within 5s".to_string(),
         }
-    }
-
-    /// TcrBar always launches `--headless` and stops it with
-    /// `process.terminate()` (SIGTERM), never Ctrl-C. If the headless
-    /// `select!` in `run_server` ever loses its SIGTERM arm again — the
-    /// regression this module fixes — a supervised stop goes back to
-    /// killing the process before `handle.shutdown()` runs: no drain, no
-    /// final pin flush, no owner-file removal.
-    #[test]
-    fn headless_mode_reacts_to_sigterm_not_just_ctrl_c() {
-        let triggers = headless_shutdown_triggers();
-        assert!(
-            triggers.contains(&ShutdownTrigger::Sigterm),
-            "headless must fall through to handle.shutdown() on SIGTERM \
-             (TcrBar's process.terminate()), not just Ctrl-C: {triggers:?}"
-        );
-        // Ctrl-C is the pre-existing arm; assert it stays too, so this test
-        // cannot be satisfied by silently dropping it in favor of SIGTERM.
-        assert!(
-            triggers.contains(&ShutdownTrigger::CtrlC),
-            "headless must still react to Ctrl-C: {triggers:?}"
-        );
     }
 
     /// Pins that a configured proxy key is withheld from `claude`, and says why.
