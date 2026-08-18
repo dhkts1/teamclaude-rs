@@ -64,6 +64,7 @@ enum RenderStates {
         [
             ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),
             ("01c-divergent-windows", .loaded(fleet(divergentWindowsJSON)), false, nil),
+            ("01d-unmeasured-window-proof", .loaded(fleet(unmeasuredWindowJSON)), false, nil),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
@@ -252,10 +253,21 @@ enum RenderStates {
         let fhState = fiveHourState ?? state
         let sd = sevenDay ?? quota
         let sdState = sevenDayState ?? state
+        // `fiveHourState`/`sevenDayState` are JSON string fields on the wire
+        // ("ok"/"near"/"spent") but the proof fixture for the unmeasured-
+        // window overclaim needs to write a genuine JSON `null`, not the
+        // string `"null"` — `QuotaState?` decodes the STRING "null" as
+        // `.unknown("null")`, a real (if odd) value, which would silently
+        // defeat the one scene built to prove a window has NO reading.
+        // `quote(_:)` keeps every other call site (a real state word)
+        // wrapped in quotes and only passes `null` through bare.
+        func quote(_ raw: String) -> String {
+            raw == "null" ? "null" : "\"\(raw)\""
+        }
         return """
             {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
-             "fiveHourState":"\(fhState)","sevenDay":\(sd),"sevenDayState":"\(sdState)",
+             "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
              "sevenDayOi":0.0,"held":\(held),
              "requests":102,"inputTokens":8781926,"outputTokens":31860,
              "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
@@ -304,6 +316,22 @@ enum RenderStates {
             fiveHour: "0.99", fiveHourState: "near",
             sevenDay: "0.15", sevenDayState: "ok")
         return "[\(lowHigh),\(highLow)]"
+    }
+
+    /// PROOF fixture for the unmeasured-window overclaim: `sevenDay` is
+    /// genuinely spent (1.0/"spent") while `fiveHour`/`fiveHourState` are
+    /// BOTH absent — the shape `src/quota.rs` produces whenever the 5h
+    /// window has not reported yet but the 7d window already has (the two
+    /// populate independently from separate response headers). The 5h bar
+    /// must render as a NEUTRAL dashed outline (no reading), never inheriting
+    /// the 7d window's red — that is the exact overclaim this whole feature
+    /// exists to prevent.
+    private static var unmeasuredWindowJSON: String {
+        let row = account(
+            "unmeasured-5h@example.com", quota: "1.0", state: "spent",
+            fiveHour: "null", fiveHourState: "null",
+            sevenDay: "1.0", sevenDayState: "spent")
+        return "[\(row)]"
     }
 
     /// The shape that broke: thirteen rows, mixed states, one never-probed.

@@ -657,23 +657,61 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         case sevenDay
     }
 
-    /// The state that SHOULD tint the given window's bar — the per-window
-    /// field when present, else the shared composite `quotaState` (an older
-    /// `tcr` this build talks to, or a window with no reading yet). This is
-    /// the exact selection `FleetView`'s `fiveHourTint`/`sevenDayTint` key
-    /// off, factored out here — pure, no SwiftUI — so a swapped `fiveHour` /
-    /// `sevenDay` binding (5h wired to `sevenDayState`, or both windows
-    /// reading the same field) is catchable by a plain unit test instead of
-    /// only by eyeballing a rendered scene, where the two bars can look
-    /// identical to the correct code whenever a fixture happens to set both
-    /// windows to the same value — as every scene except
-    /// `01c-divergent-windows` does.
+    /// The per-window state word when present, else the shared composite
+    /// `quotaState`. NOT by itself the answer to "what should this window's
+    /// bar look like" — `fiveHourState`/`sevenDayState` are `nil` both when
+    /// this window genuinely has no reading AND when an older `tcr` never
+    /// sent the field at all (`decodeIfPresent` collapses both), so on its
+    /// own this function cannot tell "no reading, paint neutral" from "old
+    /// server, borrow the composite state" and must not be called before
+    /// that distinction is made — see ``quotaBarTintSource(for:)``, which
+    /// makes it and is what callers outside this file should actually use.
+    /// Kept internal-facing (not deprecated/removed) because
+    /// `quotaBarTintSource(for:)` still needs exactly this fallback for the
+    /// genuine old-server case: a fraction present, its state word absent.
     public func effectiveQuotaState(for window: QuotaWindow) -> QuotaState {
         switch window {
         case .fiveHour: return fiveHourState ?? quotaState
         case .sevenDay: return sevenDayState ?? quotaState
         }
     }
+
+    /// What a window's bar should be tinted with — the answer
+    /// `effectiveQuotaState(for:)` alone cannot give. `.unmeasured` when this
+    /// window has NO reading (`fiveHour`/`sevenDay` fraction is `nil` — the
+    /// same per-window fraction ``hasQuotaEvidence`` reads for the composite
+    /// bar, populated on old and new wire alike), `.state` otherwise.
+    ///
+    /// This is the fix for a real bug: `FleetView`'s `fiveHourTint`/
+    /// `sevenDayTint` used to call `effectiveQuotaState(for:)` directly, so
+    /// an account whose 7-day window was genuinely spent and whose 5-hour
+    /// window had never reported fell through `fiveHourState ?? quotaState`
+    /// to the COMPOSITE (7d-driven) state and painted the empty 5h bar red —
+    /// exactly the overclaim two-window tinting exists to prevent, and not
+    /// exotic: `src/quota.rs` populates the two windows independently from
+    /// separate response headers, so one sitting at `None` while its sibling
+    /// accumulates is ordinary. Proven with the `01d-unmeasured-window-proof`
+    /// golden scene before the fix landed (the 5h outline rendered red) and
+    /// pinned here by ``QuotaWindowStateTests``.
+    public func quotaBarTintSource(for window: QuotaWindow) -> QuotaBarTintSource {
+        let fraction: Double? = {
+            switch window {
+            case .fiveHour: return fiveHour
+            case .sevenDay: return sevenDay
+            }
+        }()
+        guard fraction != nil else { return .unmeasured }
+        return .state(effectiveQuotaState(for: window))
+    }
+}
+
+/// The two things a quota bar's fill/outline can honestly show: no reading
+/// at all, or a real per-window state. Kept distinct from a bare
+/// `QuotaState?` so a caller cannot accidentally collapse "unmeasured" into
+/// some default `QuotaState` case — the type itself forces handling both.
+public enum QuotaBarTintSource: Equatable, Sendable {
+    case unmeasured
+    case state(QuotaState)
 }
 
 /// One bucket of the fleet breakdown line.

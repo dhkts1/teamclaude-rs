@@ -382,6 +382,94 @@ final class QuotaWindowStateTests: XCTestCase {
     }
 }
 
+/// ``Account/quotaBarTintSource(for:)`` — the fix for a real bug found on
+/// pre-merge review: an account whose 7-day window is genuinely spent and
+/// whose 5-hour window has never reported must show a NEUTRAL 5h bar, not
+/// one inheriting the 7d window's red. `effectiveQuotaState(for:)` alone
+/// cannot make this call — `fiveHourState == nil` cannot distinguish "no
+/// reading" from "old server, field absent" — so `quotaBarTintSource` gates
+/// on the FRACTION (`fiveHour`/`sevenDay`, populated on old and new wire
+/// alike) instead. Golden-scene proof: `01d-unmeasured-window-proof`.
+final class QuotaBarTintSourceTests: XCTestCase {
+    private func account(
+        quotaState: QuotaState,
+        fiveHour: Double?,
+        fiveHourState: QuotaState?,
+        sevenDay: Double?,
+        sevenDayState: QuotaState?
+    ) -> Account {
+        Account(
+            name: "tint-source@example.com",
+            priority: 0,
+            status: "active",
+            disabled: false,
+            quota: sevenDay ?? fiveHour,
+            quotaState: quotaState,
+            fiveHour: fiveHour,
+            sevenDay: sevenDay,
+            sevenDayOi: 0.0,
+            fiveHourState: fiveHourState,
+            sevenDayState: sevenDayState,
+            held: [],
+            requests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheHitRatio: nil,
+            probeStatus: .ok,
+            probeError: nil,
+            lastStreamError: nil,
+            streamErrorCount: 0,
+            source: .live,
+            serverSha: "abc1234",
+            serverDirty: false
+        )
+    }
+
+    /// The exact bug: 7d genuinely spent, 5h has never reported a fraction
+    /// at all. The 5h bar must be `.unmeasured`, never `.state(.spent)`
+    /// borrowed from the composite/7d state.
+    func testAWindowWithNoFractionIsUnmeasuredNotBorrowedFromItsSibling() {
+        let a = account(
+            quotaState: .spent,
+            fiveHour: nil, fiveHourState: nil,
+            sevenDay: 1.0, sevenDayState: .spent)
+        XCTAssertEqual(a.quotaBarTintSource(for: .fiveHour), .unmeasured)
+        // The failure mode this guards: reading `effectiveQuotaState`
+        // directly (the pre-fix code path) would return `.state(.spent)`
+        // here instead, since `fiveHourState ?? quotaState` falls through to
+        // the composite `.spent`.
+        XCTAssertNotEqual(a.quotaBarTintSource(for: .fiveHour), .state(.spent))
+        // The sibling with a real reading still reports its own state.
+        XCTAssertEqual(a.quotaBarTintSource(for: .sevenDay), .state(.spent))
+    }
+
+    /// The inverse shape, for symmetry: 5h has a real spent reading, 7d has
+    /// never reported.
+    func testTheOtherWindowWithNoFractionIsAlsoUnmeasured() {
+        let a = account(
+            quotaState: .spent,
+            fiveHour: 1.0, fiveHourState: .spent,
+            sevenDay: nil, sevenDayState: nil)
+        XCTAssertEqual(a.quotaBarTintSource(for: .fiveHour), .state(.spent))
+        XCTAssertEqual(a.quotaBarTintSource(for: .sevenDay), .unmeasured)
+        XCTAssertNotEqual(a.quotaBarTintSource(for: .sevenDay), .state(.spent))
+    }
+
+    /// The genuine old-server shape this fallback still needs to serve: a
+    /// fraction IS present (not nil), only the state WORD is missing —
+    /// `quotaBarTintSource` must still borrow the composite state here,
+    /// exactly as `effectiveQuotaState` always has.
+    func testAPresentFractionWithNoStateWordStillBorrowsTheComposite() {
+        let a = account(
+            quotaState: .near,
+            fiveHour: 0.5, fiveHourState: nil,
+            sevenDay: 0.5, sevenDayState: nil)
+        XCTAssertEqual(a.quotaBarTintSource(for: .fiveHour), .state(.near))
+        XCTAssertEqual(a.quotaBarTintSource(for: .sevenDay), .state(.near))
+    }
+}
+
 /// ``QuotaFormat`` carries the one honesty rule this whole task is about — a
 /// nil measurement must never print or draw as a real zero — and until now
 /// nothing exercised it directly; every existing test only asserted on the

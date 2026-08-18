@@ -709,27 +709,42 @@ struct AccountRow: View {
     }
 
     /// The 5-hour bar's OWN tint — Gil's explicit call: a 7d-red account with an
-    /// empty 5h window must not paint its 5h bar red. `account.fiveHourState`
-    /// is `nil` both when the field is absent on the wire (an older `tcr`) and
-    /// when this window has no reading yet, and either way the honest fallback
-    /// is the shared `quotaTint` this row already computed, not a bespoke
-    /// "unknown" branch — so an old server or a never-probed window degrades to
-    /// today's single-bar behaviour rather than a new, undocumented look.
+    /// empty 5h window must not paint its 5h bar red.
+    ///
+    /// Routes through `Account.quotaBarTintSource(for:)`
+    /// (`TcrBarCore/FleetStatus.swift`) rather than reading
+    /// `effectiveQuotaState(for:)` directly — that was the bug this comment
+    /// used to describe incorrectly: `effectiveQuotaState` alone cannot tell
+    /// "this window has no reading" from "old server, borrow the composite
+    /// state", so a naive call fell through to the COMPOSITE (7d-driven)
+    /// state and painted an empty 5h bar red whenever the 7d window was
+    /// spent — the exact overclaim two-window tinting exists to prevent, and
+    /// an ordinary state, not an exotic one (`src/quota.rs` populates the two
+    /// windows independently from separate response headers, so one sitting
+    /// at `None` while its sibling accumulates happens routinely). Proven
+    /// with the `01d-unmeasured-window-proof` golden scene before the fix
+    /// landed: the 5h outline rendered red. `quotaBarTintSource` makes the
+    /// no-reading-vs-old-server distinction correctly (gates on the
+    /// FRACTION, not the state word — see its own doc-comment) and is pinned
+    /// by `QuotaWindowStateTests`.
+    ///
     /// `hasStaleQuotaReading` demotes BOTH bars together, same as `quotaTint`.
     private var fiveHourTint: Color {
         if hasStaleQuotaReading { return Tok.disabled }
-        return Tok.color(for: account.effectiveQuotaState(for: .fiveHour))
+        switch account.quotaBarTintSource(for: .fiveHour) {
+        case .unmeasured: return Tok.unmeasured
+        case .state(let state): return Tok.color(for: state)
+        }
     }
 
     /// The 7-day bar's own tint — the 5h counterpart to ``fiveHourTint``, same
-    /// fallback and same stale-demotion rule. Both route through
-    /// `Account.effectiveQuotaState(for:)` (`TcrBarCore/FleetStatus.swift`) —
-    /// the per-window-field-else-composite selection lives there, pure and
-    /// unit-tested, precisely so a swapped `fiveHour`/`sevenDay` binding here
-    /// would be a test failure, not just a hoped-for eyeball catch.
+    /// `quotaBarTintSource` routing and same stale-demotion rule.
     private var sevenDayTint: Color {
         if hasStaleQuotaReading { return Tok.disabled }
-        return Tok.color(for: account.effectiveQuotaState(for: .sevenDay))
+        switch account.quotaBarTintSource(for: .sevenDay) {
+        case .unmeasured: return Tok.unmeasured
+        case .state(let state): return Tok.color(for: state)
+        }
     }
 
     /// True for exactly the shape this whole round exists to demote: a
