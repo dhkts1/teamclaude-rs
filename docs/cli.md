@@ -107,6 +107,16 @@ A value **you** exported is inherited untouched: an explicit choice wins, and it
 escape hatch for a `claude` with no claude.ai login of its own, which does need some
 credential to start. The process exits with `claude`'s own exit code.
 
+Every child also gets `TCR_RUN_ACTIVE=1`, on all three paths including the proxy-down
+passthrough. It means one thing: **a `tcr run` is already above you in this chain.**
+`tcr run` finds `claude` on `PATH`, so on a machine where something else also wraps
+`claude` that lookup can land on a launcher which wraps in `tcr run` again — the routing
+environment applied twice is identical and nothing breaks, but every startup line prints
+twice and a second `tcr` sits in the process tree for the session. A launcher that checks
+this variable hands off to the real `claude` instead. The name avoids the `CMUX_` prefix
+on purpose: cmux's own claude wrapper clears every `CMUX_*` variable before exec, so a
+marker named after it would be erased in transit.
+
 ---
 
 ## `tcr login`
