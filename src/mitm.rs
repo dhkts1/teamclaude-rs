@@ -6,18 +6,28 @@
 //! How a request flows (mirrors `teamclaude/src/mitm.js`, reusing `tcr`'s
 //! account-selection + token-injection instead of reimplementing the forward):
 //!   1. A client sends `CONNECT <host>:<port>`. We peek the request line.
-//!   2. `api.anthropic.com` (+ the OAuth hosts) is MITM-terminated: we reply
-//!      `200 Connection Established`, TLS-accept with our leaf (a cert the client
-//!      already trusts via its CA), then serve HTTP over the TLS stream
-//!      through the SAME axum router as base-URL mode — authenticate, select an
-//!      account, inject the pooled `Bearer`, forward to the real upstream.
-//!   3. Every OTHER host is **blind-tunneled**: a raw TCP byte-pipe to
+//!   2. `api.anthropic.com` and `platform.claude.com` (Claude Code's own OAuth
+//!      refresh host, `POST /v1/oauth/token`) are MITM-terminated **only when
+//!      the leaf certificate actually loaded for this process covers that
+//!      host** — see [`host_allowed`] (policy) and
+//!      [`host_covered_by_loaded_leaf`] (SAN truthfulness) below, both of which
+//!      must agree. When they do: we reply `200 Connection Established`,
+//!      TLS-accept with our leaf (a cert the client already trusts via its
+//!      CA), then serve HTTP over the TLS stream through the SAME axum router
+//!      as base-URL mode — authenticate, select an account, inject the pooled
+//!      `Bearer`, forward to the real upstream.
+//!   3. Every OTHER host — and any policy-allowed host the loaded leaf does
+//!      NOT cover — is **blind-tunneled**: a raw TCP byte-pipe to
 //!      `<host>:<port>` with TLS left untouched (we never see plaintext and
-//!      inject nothing). This matches the JS proxy's open tunnel, which Claude
-//!      Code depends on to reach `platform.claude.com`, its bridge, and telemetry
-//!      through the same `HTTPS_PROXY`. Safe here because `tcr` binds `127.0.0.1`
-//!      only — reachable solely by the local user, who can already open any
-//!      connection directly, so it is no wider a surface than the shell itself.
+//!      inject nothing). This matches the JS proxy's open tunnel for
+//!      everything else Claude Code needs (its bridge, telemetry) through the
+//!      same `HTTPS_PROXY`, and it is ALSO the anti-outage fallback for a host
+//!      we intend to intercept but whose currently-loaded cert cannot present:
+//!      claiming a host and then failing the TLS handshake is strictly worse
+//!      than tunneling it untouched. Safe here because `tcr` binds
+//!      `127.0.0.1` only — reachable solely by the local user, who can already
+//!      open any connection directly, so it is no wider a surface than the
+//!      shell itself.
 //!
 //! The decrypted request arrives in origin form (`POST /v1/messages` with
 //! `Host: api.anthropic.com`), so the router routes it to `manager.upstream()`
@@ -28,7 +38,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -38,28 +48,74 @@ use tower::ServiceExt as _;
 
 use crate::manager::Manager;
 
-/// Hosts we MITM-terminate + inject tokens for. Anything else on `CONNECT` is
-/// blind-tunneled (a raw byte-pipe, no interception), so this is the set we
-/// decrypt — NOT a firewall: non-Anthropic hosts still pass straight through.
+/// Hosts we intend to MITM-terminate + inject tokens for — a POLICY list, not
+/// a firewall (everything else on `CONNECT` is blind-tunneled, no
+/// interception). This is necessary but not sufficient for interception:
+/// [`handle_connect`] additionally requires [`host_covered_by_loaded_leaf`],
+/// because being on this list says nothing about whether the leaf actually
+/// loaded for this process can present a valid certificate for the host — see
+/// the module doc comment and [`load_tls_in`]'s design comment.
 ///
-/// The reused `teamclaude-leaf.pem` has SAN only for `api.anthropic.com` (+ the
-/// built-in test host), so in practice only `api.anthropic.com` completes a TLS
-/// handshake; the OAuth hosts are listed because the design allows them and the
-/// rcgen fallback mints a leaf covering all of them.
-pub const ALLOWED_HOSTS: &[&str] = &[
-    "api.anthropic.com",
-    "console.anthropic.com",
-    "platform.anthropic.com",
-];
+/// `console.anthropic.com` and `platform.anthropic.com` were removed 2026-08:
+/// measured zero references in three consecutive Claude Code releases
+/// (2.1.232-234) against the shipped binary, i.e. dead. `platform.claude.com`
+/// was added in their place: it is the host Claude Code's own OAuth refresh
+/// (`POST /v1/oauth/token`) targets — 2 occurrences in the same binary — and
+/// `src/proxy.rs`'s `RelayMode::Raw` handling for that path was unreachable in
+/// MITM mode without it.
+pub const ALLOWED_HOSTS: &[&str] = &["api.anthropic.com", "platform.claude.com"];
 
-/// SAN list for the rcgen fallback leaf (allowlist + the JS test host, kept so a
-/// regenerated chain still answers the credential-free `www.example.org` probe).
+/// SAN list for the rcgen fallback leaf (the policy allowlist + the JS test
+/// host, kept so a regenerated chain still answers the credential-free
+/// `www.example.org` probe). This is also the REQUIRED coverage set: a
+/// persisted leaf whose sidecar (see [`load_tls_in`]) does not match this
+/// exactly is treated as stale and re-minted.
 const FALLBACK_LEAF_SANS: &[&str] = &[
     "api.anthropic.com",
-    "console.anthropic.com",
-    "platform.anthropic.com",
+    "platform.claude.com",
     "www.example.org",
 ];
+
+/// Process-wide snapshot of the SAN coverage of whatever leaf [`load_tls`]
+/// most recently loaded for this process, populated by [`load_tls_in`] as a
+/// side effect on every successful return. This exists ONLY because the
+/// `tls: Option<Arc<TlsAcceptor>>` threaded from `server.rs` through
+/// `serve`/`serve_with_shutdown`/`handle_conn`/`handle_connect` carries just
+/// the acceptor, not the `TlsAssets` it came from — so [`handle_connect`],
+/// which has no other way to reach the coverage of the leaf it is about to
+/// present, reads it here via [`host_covered_by_loaded_leaf`]. Tests do NOT
+/// rely on this global: they read [`TlsAssets::covered_hosts`] directly off
+/// the value `load_tls_in` returns, so they stay deterministic under parallel
+/// test execution in the same binary. Starts empty — "nothing loaded yet" —
+/// which is the safe default: under-claiming coverage means blind-tunnel,
+/// never a broken handshake.
+static COVERED_HOSTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn set_covered_hosts(hosts: &[String]) {
+    if let Ok(mut guard) = COVERED_HOSTS.lock() {
+        *guard = hosts.to_vec();
+    }
+}
+
+/// Is `host` present (case-insensitively) in `covered`, the SAN set of one
+/// particular loaded leaf? Pure and parameterized so tests can assert against
+/// [`TlsAssets::covered_hosts`] directly, without touching the process-wide
+/// snapshot [`host_covered_by_loaded_leaf`] reads from in production.
+fn leaf_covers(covered: &[String], host: &str) -> bool {
+    covered.iter().any(|h| h.eq_ignore_ascii_case(host))
+}
+
+/// Is `host` covered by the SAN set of the leaf actually loaded for THIS
+/// process, per the most recent [`load_tls`]/[`load_tls_in`] call? This is
+/// independent of [`host_allowed`]'s policy question — a host can be
+/// policy-allowed and still fail this, e.g. right after a SAN change and
+/// before a re-mint completes, or when the reused JS leaf's coverage is
+/// unknown (see the conservative branch-A default in [`load_tls_in`]).
+fn host_covered_by_loaded_leaf(host: &str) -> bool {
+    COVERED_HOSTS
+        .lock()
+        .is_ok_and(|hosts| leaf_covers(&hosts, host))
+}
 
 const RESP_CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const RESP_BAD_REQUEST: &[u8] =
@@ -76,9 +132,25 @@ pub struct TlsAssets {
     /// mode in `tcr run`) treat `None` as "cannot do that", not as "no CA needed":
     /// an unnameable CA may still be trusted ambiently, but we cannot prove it.
     pub ca_path: Option<PathBuf>,
+    /// SAN coverage of [`Self::acceptor`]'s leaf, as actually loaded — not
+    /// derived from [`ALLOWED_HOSTS`] or [`FALLBACK_LEAF_SANS`], because which
+    /// branch [`load_tls_in`] took determines what this really is (see its
+    /// design comment). This is the field that makes the CONNECT interception
+    /// decision SAN-truthful: [`host_covered_by_loaded_leaf`] reads a
+    /// process-wide snapshot of it.
+    pub covered_hosts: Vec<String>,
 }
 
-/// Is `host` one we will MITM-terminate? Case-insensitive.
+/// Is `host` one we intend to MITM-terminate, by POLICY? Case-insensitive.
+///
+/// This alone does not mean we WILL intercept `host` — the interception
+/// decision in [`handle_connect`] additionally requires
+/// [`host_covered_by_loaded_leaf`], because this function says nothing about
+/// whether the leaf loaded for this process can actually present a valid
+/// certificate for it. Kept as a standalone, TLS-independent check because
+/// `src/proxy.rs`'s base-URL-mode misroute guard also calls it, on a plain-HTTP
+/// path where no TLS handshake — and therefore no SAN coverage question —
+/// exists at all.
 pub fn host_allowed(host: &str) -> bool {
     ALLOWED_HOSTS.iter().any(|h| h.eq_ignore_ascii_case(host))
 }
@@ -124,22 +196,86 @@ fn ensure_crypto_provider() {
 /// every restart re-minted the CA out from under `NODE_EXTRA_CA_CERTS`).
 struct MintedPaths {
     ca: PathBuf,
+    /// The CA's private key — persisted (mode `0600`) so a future leaf SAN
+    /// change re-mints only the leaf under the SAME CA, never rotating
+    /// `NODE_EXTRA_CA_CERTS` out from under a client that already trusts it.
+    /// Absent on any chain minted before this field existed; that absence is
+    /// exactly what forces one unavoidable CA rotation the first time this
+    /// runs against an older-minted chain (see [`load_tls_in`]).
+    ca_key: PathBuf,
     leaf_cert: PathBuf,
     leaf_key: PathBuf,
+    /// One host per line, the SAN set [`leaf_cert`](Self::leaf_cert) was
+    /// minted with. Not a certificate field we could read back — a sidecar,
+    /// deliberately, so drift detection needs no x509 parser: see the design
+    /// comment on [`load_tls_in`] for why an x509 parser was ruled out (no new
+    /// dependency, and the parse-then-compare shape is strictly more code and
+    /// more attack surface than a one-host-per-line text file we wrote
+    /// ourselves). A missing sidecar means "minted before this change", which
+    /// is treated the same as a mismatch: coverage unknown → drifted →
+    /// re-mint.
+    sans: PathBuf,
 }
 
 impl MintedPaths {
     fn in_dir(dir: &Path) -> Self {
         Self {
             ca: dir.join("tcr-ca.pem"),
+            ca_key: dir.join("tcr-ca.key"),
             leaf_cert: dir.join("tcr-leaf.pem"),
             leaf_key: dir.join("tcr-leaf.key"),
+            sans: dir.join("tcr-leaf.sans"),
         }
     }
 
     fn all_present(&self) -> bool {
         self.ca.is_file() && self.leaf_cert.is_file() && self.leaf_key.is_file()
     }
+}
+
+fn fallback_hosts_vec() -> Vec<String> {
+    FALLBACK_LEAF_SANS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Write `hosts`, one per line, to `path` (mode `0644` — not secret, just a
+/// coverage record).
+fn write_sans_sidecar(path: &Path, hosts: &[&str]) -> io::Result<()> {
+    let mut content = String::new();
+    for host in hosts {
+        content.push_str(host);
+        content.push('\n');
+    }
+    write_file(path, content.as_bytes(), 0o644)
+}
+
+/// Read a SAN sidecar written by [`write_sans_sidecar`]. `None` on any read
+/// failure (including "does not exist") — callers treat that identically to a
+/// present-but-mismatched sidecar: coverage unknown, so stale.
+fn read_sans_sidecar(path: &Path) -> Option<Vec<String>> {
+    let data = std::fs::read_to_string(path).ok()?;
+    Some(
+        data.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+/// Set-equality (case-insensitive, order-independent) between a sidecar's
+/// recorded hosts and the currently `required` coverage.
+fn sans_match(sidecar: &[String], required: &[&str]) -> bool {
+    if sidecar.len() != required.len() {
+        return false;
+    }
+    let mut have: Vec<String> = sidecar.iter().map(|h| h.to_ascii_lowercase()).collect();
+    let mut want: Vec<String> = required.iter().map(|h| h.to_ascii_lowercase()).collect();
+    have.sort();
+    want.sort();
+    have == want
 }
 
 /// Load the TLS material for MITM: reuse `~/.config/teamclaude-leaf.pem` +
@@ -151,6 +287,36 @@ pub fn load_tls() -> anyhow::Result<TlsAssets> {
 }
 
 /// [`load_tls`] against an explicit config dir (for tests).
+///
+/// Three branches, in order, and this is the function that makes the whole
+/// module SAN-truthful — every return path sets `covered_hosts` to what the
+/// chosen leaf can ACTUALLY present, never to the policy list:
+///
+/// - **A: the JS proxy's `teamclaude-leaf.pem`.** Its SAN coverage is
+///   unknowable here without an x509 parser (deliberately not added — see
+///   below), so `covered_hosts` is the single conservative entry
+///   `api.anthropic.com`: under-claiming means a blind tunnel for
+///   `platform.claude.com` (today's safe behavior on this path), while
+///   over-claiming would mean presenting this leaf for a host it may not
+///   cover, breaking the TLS handshake outright — a live OAuth-refresh
+///   outage. Asymmetric costs, so the conservative side is the only side.
+/// - **B: our own previously-minted chain.** Reused ONLY when a sidecar file
+///   beside it (`tcr-leaf.sans`, one host per line, written by every mint)
+///   matches [`FALLBACK_LEAF_SANS`] exactly. A leaf minted before this SAN set
+///   changed carries the OLD coverage — reusing it unconditionally is exactly
+///   the bug this change exists to fix (see the module doc comment): it is
+///   what let a "just add the host to a const" change silently break the
+///   handshake. A sidecar, not a parsed certificate extension, because rcgen's
+///   x509-parser feature is a new (transitive) dependency this change is not
+///   approved to add, and re-deriving trust from a file we ourselves wrote is
+///   simpler and no less trustworthy than parsing DER we ourselves wrote.
+///   Mismatch (or a missing sidecar, meaning "minted before this field
+///   existed") re-mints the leaf — reusing the persisted CA key when present,
+///   so `NODE_EXTRA_CA_CERTS` survives (branch D); a chain minted before the
+///   CA key was persisted forces exactly one more CA rotation, never more
+///   than one.
+/// - **C: mint fresh.** `covered_hosts` is `FALLBACK_LEAF_SANS`, known by
+///   construction.
 fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
     ensure_crypto_provider();
     let leaf_cert = dir.join("teamclaude-leaf.pem");
@@ -167,12 +333,21 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
                 // sitting one `join` away. Absent → `None`, same as before.
                 let companion_ca = dir.join("teamclaude-ca.pem");
                 let ca_path = companion_ca.is_file().then_some(companion_ca);
+                // Conservative: this leaf's real SAN set is unknown, so claim
+                // only the one host we know every such leaf has always carried.
+                let covered_hosts = vec!["api.anthropic.com".to_string()];
+                set_covered_hosts(&covered_hosts);
                 tracing::info!(
                     cert = %leaf_cert.display(),
                     ca = ca_path.as_ref().map_or_else(String::new, |p| p.display().to_string()),
-                    "MITM: reusing existing leaf certificate"
+                    hosts = ?covered_hosts,
+                    "MITM: reusing existing leaf certificate (conservative SAN coverage — unknown leaf)"
                 );
-                return Ok(TlsAssets { acceptor, ca_path });
+                return Ok(TlsAssets {
+                    acceptor,
+                    ca_path,
+                    covered_hosts,
+                });
             }
             Err(err) => {
                 tracing::warn!(error = %err, "MITM: reusing leaf failed — trying our own minted chain");
@@ -180,27 +355,89 @@ fn load_tls_in(dir: &Path) -> anyhow::Result<TlsAssets> {
         }
     }
 
-    // Reuse the chain from an earlier mint. Without this the CA is re-minted on
-    // every restart, silently invalidating the NODE_EXTRA_CA_CERTS the user was
-    // told to export the first time. rcgen's default validity runs to 4096, so a
-    // persisted leaf never ages out.
+    // Reuse the chain from an earlier mint, but only when its recorded SAN
+    // coverage still matches what we require today — see the branch-B design
+    // note above. Without the sidecar check this branch would (and did) serve
+    // a stale leaf forever: `MintedPaths::all_present` says nothing about
+    // WHAT the leaf covers, only that files exist.
     let minted = MintedPaths::in_dir(dir);
     if minted.all_present() {
-        match build_acceptor(&minted.leaf_cert, &minted.leaf_key) {
-            Ok(acceptor) => {
-                tracing::info!(cert = %minted.leaf_cert.display(), "MITM: reusing minted leaf certificate");
-                return Ok(TlsAssets {
-                    acceptor,
-                    ca_path: Some(minted.ca),
-                });
+        let fresh = read_sans_sidecar(&minted.sans)
+            .is_some_and(|sans| sans_match(&sans, FALLBACK_LEAF_SANS));
+        if fresh {
+            match build_acceptor(&minted.leaf_cert, &minted.leaf_key) {
+                Ok(acceptor) => {
+                    let covered_hosts = fallback_hosts_vec();
+                    set_covered_hosts(&covered_hosts);
+                    tracing::info!(cert = %minted.leaf_cert.display(), hosts = ?covered_hosts, "MITM: reusing minted leaf certificate");
+                    return Ok(TlsAssets {
+                        acceptor,
+                        ca_path: Some(minted.ca),
+                        covered_hosts,
+                    });
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "MITM: reusing minted leaf failed — re-minting");
+                }
             }
-            Err(err) => {
-                tracing::warn!(error = %err, "MITM: reusing minted leaf failed — regenerating a fresh CA+leaf");
-            }
+        } else {
+            tracing::info!(
+                cert = %minted.leaf_cert.display(),
+                "MITM: persisted leaf SAN coverage is stale (or from before this field existed) — re-minting"
+            );
+        }
+
+        if let Some(assets) = remint_leaf_under_persisted_ca(&minted) {
+            return Ok(assets);
         }
     }
 
     generate_and_persist(dir)
+}
+
+/// Branch D: sign a fresh leaf under the CA key already persisted beside
+/// `minted`, when both the CA cert and CA key are on disk. `None` when there
+/// is no persisted CA key to reuse (a chain minted before this field existed,
+/// or any read/sign failure) — the caller falls through to
+/// [`generate_and_persist`], which mints a brand-new CA. That fallback is the
+/// one unavoidable CA rotation described on [`MintedPaths::ca_key`]; after it,
+/// this branch is what keeps every later SAN change from rotating the CA
+/// again.
+fn remint_leaf_under_persisted_ca(minted: &MintedPaths) -> Option<TlsAssets> {
+    if !(minted.ca.is_file() && minted.ca_key.is_file()) {
+        return None;
+    }
+    let result = (|| -> anyhow::Result<TlsAssets> {
+        let ca_key_pem = std::fs::read_to_string(&minted.ca_key)?;
+        let ca = CaChain {
+            cert_pem: None,
+            key_pem: ca_key_pem,
+        };
+        let (leaf_pem, leaf_key_pem) = sign_leaf(FALLBACK_LEAF_SANS, &ca)?;
+        write_file(&minted.leaf_cert, leaf_pem.as_bytes(), 0o644)?;
+        write_file(&minted.leaf_key, leaf_key_pem.as_bytes(), 0o600)?;
+        write_sans_sidecar(&minted.sans, FALLBACK_LEAF_SANS)?;
+        let acceptor = build_acceptor(&minted.leaf_cert, &minted.leaf_key)?;
+        let covered_hosts = fallback_hosts_vec();
+        set_covered_hosts(&covered_hosts);
+        tracing::info!(
+            cert = %minted.leaf_cert.display(),
+            hosts = ?covered_hosts,
+            "MITM: re-minted leaf under the persisted CA — NODE_EXTRA_CA_CERTS stays valid"
+        );
+        Ok(TlsAssets {
+            acceptor,
+            ca_path: Some(minted.ca.clone()),
+            covered_hosts,
+        })
+    })();
+    match result {
+        Ok(assets) => Some(assets),
+        Err(err) => {
+            tracing::warn!(error = %err, "MITM: re-mint under persisted CA failed — minting a fresh CA instead");
+            None
+        }
+    }
 }
 
 /// Build a rustls `TlsAcceptor` presenting the leaf at `cert_path`/`key_path`.
@@ -230,58 +467,113 @@ fn load_key(path: &Path) -> anyhow::Result<rustls::pki_types::PrivateKeyDer<'sta
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
 }
 
-/// rcgen fallback: mint a CA + a leaf covering [`FALLBACK_LEAF_SANS`], persist
-/// them to `~/.config/tcr-{ca,leaf}.pem` + `tcr-leaf.key` (key `0600`), and hand
-/// back an acceptor over the fresh leaf. The CA path is advertised so the user
-/// can `export NODE_EXTRA_CA_CERTS=<ca>`.
+/// rcgen fallback: mint a fresh CA + a leaf covering [`FALLBACK_LEAF_SANS`],
+/// persist them to `~/.config/tcr-{ca,leaf}.pem` + `tcr-ca.key` + `tcr-leaf.key`
+/// (both keys `0600`) plus the `tcr-leaf.sans` coverage sidecar, and hand back
+/// an acceptor over the fresh leaf. The CA path is advertised so the user can
+/// `export NODE_EXTRA_CA_CERTS=<ca>`.
+///
+/// Only ever mints a NEW CA — reusing an existing one is
+/// [`remint_leaf_under_persisted_ca`]'s job, tried first by [`load_tls_in`].
+/// This is the path that used to re-mint (and thus rotate) the CA on every
+/// SAN change; persisting `tcr-ca.key` here is what makes that a one-time
+/// cost instead of a recurring one.
 fn generate_and_persist(dir: &Path) -> anyhow::Result<TlsAssets> {
-    let (ca_pem, leaf_pem, leaf_key_pem) = generate_chain(FALLBACK_LEAF_SANS)?;
+    let ca = generate_ca()?;
+    let ca_cert_pem = ca
+        .cert_pem
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("generate_ca must always mint a cert_pem"))?;
+    let (leaf_pem, leaf_key_pem) = sign_leaf(FALLBACK_LEAF_SANS, &ca)?;
 
     std::fs::create_dir_all(dir)?;
-    let MintedPaths {
-        ca: ca_path,
-        leaf_cert: leaf_cert_path,
-        leaf_key: leaf_key_path,
-    } = MintedPaths::in_dir(dir);
-    write_file(&ca_path, ca_pem.as_bytes(), 0o644)?;
-    write_file(&leaf_cert_path, leaf_pem.as_bytes(), 0o644)?;
-    write_file(&leaf_key_path, leaf_key_pem.as_bytes(), 0o600)?;
+    let minted = MintedPaths::in_dir(dir);
+    write_file(&minted.ca, ca_cert_pem.as_bytes(), 0o644)?;
+    write_file(&minted.ca_key, ca.key_pem.as_bytes(), 0o600)?;
+    write_file(&minted.leaf_cert, leaf_pem.as_bytes(), 0o644)?;
+    write_file(&minted.leaf_key, leaf_key_pem.as_bytes(), 0o600)?;
+    write_sans_sidecar(&minted.sans, FALLBACK_LEAF_SANS)?;
 
-    let acceptor = build_acceptor(&leaf_cert_path, &leaf_key_path)?;
+    let acceptor = build_acceptor(&minted.leaf_cert, &minted.leaf_key)?;
+    let covered_hosts = fallback_hosts_vec();
+    set_covered_hosts(&covered_hosts);
     eprintln!(
         "[tcr] minted a fresh MITM CA — trust it with:\n         export NODE_EXTRA_CA_CERTS={}",
-        ca_path.display()
+        minted.ca.display()
     );
+    tracing::info!(hosts = ?covered_hosts, "MITM: minted a fresh CA + leaf");
     Ok(TlsAssets {
         acceptor,
-        ca_path: Some(ca_path),
+        ca_path: Some(minted.ca),
+        covered_hosts,
     })
 }
 
-/// Generate a CA + a leaf for `hosts` with rcgen. Returns
-/// `(ca_cert_pem, leaf_cert_pem, leaf_key_pem)`.
-fn generate_chain(hosts: &[&str]) -> anyhow::Result<(String, String, String)> {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
-        KeyPair, KeyUsagePurpose,
-    };
+/// A CA's private key, PEM-encoded, plus its cert PEM when we happen to have
+/// just minted it. `cert_pem` is carried ONLY for the freshly-minted case
+/// ([`generate_ca`]) so [`generate_and_persist`] has something to write to
+/// disk; re-signing a leaf under an already-persisted CA
+/// ([`remint_leaf_under_persisted_ca`]) never reads or needs it — it re-derives
+/// the issuer from [`ca_params`] instead, which is what lets that path skip
+/// parsing the persisted cert back (no x509 parser dependency).
+struct CaChain {
+    cert_pem: Option<String>,
+    key_pem: String,
+}
 
-    let ca_key = KeyPair::generate()?;
-    let mut ca_params = CertificateParams::new(Vec::new())?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params
+/// The CA's parameters, reconstructed identically on every mint AND every
+/// leaf re-mint — never parsed back from a persisted certificate. This is the
+/// mechanism that lets [`sign_leaf`] sign a fresh leaf under a previously
+/// generated CA key (branch D) with no x509 parser: [`Issuer::from_params`]
+/// only needs a `CertificateParams` + the signing key, and as long as this
+/// function is the ONLY place those params are constructed, a re-mint's
+/// issuer always matches the CA already on disk — same distinguished name,
+/// same key usages, same `is_ca` — because a self-signed cert's subject IS
+/// those same params, whichever call minted it. (`Issuer::from_ca_cert_pem`
+/// would let a re-mint parse the persisted CA cert directly instead, but that
+/// method is gated behind rcgen's `x509-parser` feature, a new transitive
+/// dependency not approved for this change.)
+fn ca_params() -> anyhow::Result<rcgen::CertificateParams> {
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyUsagePurpose};
+    let mut params = CertificateParams::new(Vec::new())?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params
         .distinguished_name
         .push(DnType::CommonName, "tcr Local CA");
-    ca_params.key_usages = vec![
+    params.key_usages = vec![
         KeyUsagePurpose::DigitalSignature,
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
     ];
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    let issuer = Issuer::from_params(&ca_params, &ca_key);
+    Ok(params)
+}
+
+/// Mint a brand-new CA key + self-signed cert.
+fn generate_ca() -> anyhow::Result<CaChain> {
+    let ca_key = rcgen::KeyPair::generate()?;
+    let params = ca_params()?;
+    let ca_cert = params.self_signed(&ca_key)?;
+    Ok(CaChain {
+        cert_pem: Some(ca_cert.pem()),
+        key_pem: ca_key.serialize_pem(),
+    })
+}
+
+/// Sign a fresh leaf for `hosts` under `ca`'s key, reconstructing the SAME CA
+/// params [`generate_ca`] used (via [`ca_params`]) so the leaf's issuer
+/// matches whatever CA certificate is already persisted on disk, without ever
+/// parsing it back.
+fn sign_leaf(hosts: &[&str], ca: &CaChain) -> anyhow::Result<(String, String)> {
+    use rcgen::{
+        CertificateParams, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair, KeyUsagePurpose,
+    };
+
+    let ca_key = KeyPair::from_pem(&ca.key_pem)?;
+    let issuer_params = ca_params()?;
+    let issuer = Issuer::from_params(&issuer_params, ca_key);
 
     let leaf_key = KeyPair::generate()?;
-    let san_list: Vec<String> = hosts.iter().map(|s| s.to_string()).collect();
+    let san_list: Vec<String> = hosts.iter().map(|s| (*s).to_string()).collect();
     let mut leaf_params = CertificateParams::new(san_list)?;
     leaf_params
         .distinguished_name
@@ -293,7 +585,24 @@ fn generate_chain(hosts: &[&str]) -> anyhow::Result<(String, String, String)> {
     leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer)?;
 
-    Ok((ca_cert.pem(), leaf_cert.pem(), leaf_key.serialize_pem()))
+    Ok((leaf_cert.pem(), leaf_key.serialize_pem()))
+}
+
+/// Generate a fresh CA + a leaf for `hosts` with rcgen. Returns
+/// `(ca_cert_pem, leaf_cert_pem, leaf_key_pem, ca_key_pem)`. A thin
+/// convenience over [`generate_ca`] + [`sign_leaf`] for call sites that want a
+/// complete standalone chain in one call — test-only: production always goes
+/// through [`generate_ca`]/[`sign_leaf`] directly ([`generate_and_persist`],
+/// [`remint_leaf_under_persisted_ca`]) so a re-mint never needs a NEW CA cert.
+#[cfg(test)]
+fn generate_chain(hosts: &[&str]) -> anyhow::Result<(String, String, String, String)> {
+    let ca = generate_ca()?;
+    let ca_cert_pem = ca
+        .cert_pem
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("generate_ca must always mint a cert_pem"))?;
+    let (leaf_pem, leaf_key_pem) = sign_leaf(hosts, &ca)?;
+    Ok((ca_cert_pem, leaf_pem, leaf_key_pem, ca.key_pem))
 }
 
 /// Write `data` to `path` at exactly `mode`, whether or not `path` already exists.
@@ -442,12 +751,26 @@ async fn handle_connect(
         return Ok(());
     };
 
-    // Non-allowlisted host → blind tunnel (raw byte-pipe, no interception). This
-    // is the open-tunnel behavior the JS proxy provides and Claude Code relies on
-    // to reach platform.claude.com, its bridge, and telemetry through the same
-    // HTTPS_PROXY. TLS is never terminated here, so nothing is decrypted or
-    // injected — just forwarded end-to-end.
+    // A non-policy-allowed host → blind tunnel (raw byte-pipe, no
+    // interception). This is the open-tunnel behavior the JS proxy provides
+    // and Claude Code relies on to reach its bridge and telemetry through the
+    // same HTTPS_PROXY. TLS is never terminated here, so nothing is decrypted
+    // or injected — just forwarded end-to-end.
+    //
+    // A policy-allowed host the LOADED LEAF does not cover takes the same
+    // fallback — this is the SAN-truthfulness check (see the module doc
+    // comment and `load_tls_in`'s design comment). Presenting a leaf for a
+    // host it cannot cover fails the client's TLS handshake outright; blind-
+    // tunneling it is strictly safer, and it is exactly today's behavior for
+    // an uncovered host, not a new failure mode.
     if !host_allowed(&host) {
+        return tunnel(stream, &host, port).await;
+    }
+    if !host_covered_by_loaded_leaf(&host) {
+        tracing::debug!(
+            %host,
+            "MITM: host is policy-allowed but the loaded leaf does not cover it — blind-tunneling instead of a broken handshake"
+        );
         return tunnel(stream, &host, port).await;
     }
 
@@ -664,7 +987,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
 
-        let (_ca, leaf, key) = generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS leaf");
+        let (_ca, leaf, key, _ca_key) =
+            generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS leaf");
         write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
         write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
 
@@ -691,7 +1015,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
 
-        let (ca, leaf, key) = generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS chain");
+        let (ca, leaf, key, _ca_key) =
+            generate_chain(FALLBACK_LEAF_SANS).expect("mint a stand-in JS chain");
         write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
         write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
         write_file(&dir.join("teamclaude-ca.pem"), ca.as_bytes(), 0o644).expect("write ca");
@@ -732,16 +1057,224 @@ mod tests {
     fn host_allowlist_is_case_insensitive_and_closed() {
         assert!(host_allowed("api.anthropic.com"));
         assert!(host_allowed("API.Anthropic.COM"));
-        assert!(host_allowed("console.anthropic.com"));
-        assert!(host_allowed("platform.anthropic.com"));
+        // platform.claude.com replaced the two dead OAuth hosts below — see
+        // ALLOWED_HOSTS's doc comment for the measured evidence.
+        assert!(host_allowed("platform.claude.com"));
+        assert!(host_allowed("Platform.Claude.COM"));
+        // console.anthropic.com / platform.anthropic.com are dead in current
+        // Claude Code (measured zero references across three releases) and must
+        // no longer be policy-allowed.
+        assert!(!host_allowed("console.anthropic.com"));
+        assert!(!host_allowed("platform.anthropic.com"));
         // Everything else is NOT MITM-terminated — it is blind-tunneled instead
         // (host_allowed decides "decrypt + inject" vs "pass through", not allow
         // vs deny), so these all read false and take the tunnel path.
         assert!(!host_allowed("example.com"));
-        assert!(!host_allowed("platform.claude.com"));
         assert!(!host_allowed("evil.api.anthropic.com.attacker.net"));
         assert!(!host_allowed("localhost"));
         assert!(!host_allowed(""));
+    }
+
+    /// The load-bearing property: `platform.claude.com` is policy-allowed AND
+    /// covered by a freshly-minted leaf (branch C, [`FALLBACK_LEAF_SANS`]), so
+    /// it is intercepted.
+    #[test]
+    fn platform_claude_com_is_intercepted_when_the_loaded_leaf_covers_it() {
+        let dir = std::env::temp_dir().join(format!("tcr-mitm-covers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let assets = load_tls_in(&dir).expect("mints a fresh chain covering FALLBACK_LEAF_SANS");
+        assert!(
+            host_allowed("platform.claude.com"),
+            "platform.claude.com must be policy-allowed"
+        );
+        assert!(
+            leaf_covers(&assets.covered_hosts, "platform.claude.com"),
+            "a freshly minted leaf must cover platform.claude.com: {:?}",
+            assets.covered_hosts
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The anti-outage property, and the most important test in this file: a
+    /// policy-allowed host whose coverage is UNKNOWN (branch A, the reused JS
+    /// leaf) must read as NOT covered, so `handle_connect` blind-tunnels it
+    /// instead of presenting a leaf that will fail the TLS handshake.
+    #[test]
+    fn platform_claude_com_is_not_intercepted_when_the_loaded_leaf_lacks_it() {
+        let dir = std::env::temp_dir().join(format!("tcr-mitm-uncovered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Stand in for a foreign/JS leaf whose SAN coverage tcr cannot verify —
+        // realistically one that covers only api.anthropic.com.
+        let (_ca, leaf, key, _ca_key) =
+            generate_chain(&["api.anthropic.com"]).expect("mint a narrow stand-in leaf");
+        write_file(&dir.join("teamclaude-leaf.pem"), leaf.as_bytes(), 0o644).expect("write leaf");
+        write_file(&dir.join("teamclaude-leaf.key"), key.as_bytes(), 0o600).expect("write key");
+
+        let assets = load_tls_in(&dir).expect("load");
+        assert!(
+            host_allowed("platform.claude.com"),
+            "policy still allows it — the point is the SAN check catches what policy cannot"
+        );
+        assert!(
+            !leaf_covers(&assets.covered_hosts, "platform.claude.com"),
+            "branch A must not claim coverage it cannot verify: {:?}",
+            assets.covered_hosts
+        );
+        assert!(
+            leaf_covers(&assets.covered_hosts, "api.anthropic.com"),
+            "branch A's one known-safe claim must still hold"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A persisted leaf whose sidecar SAN set does not match what we require
+    /// today (or has no sidecar at all — a leaf minted before this field
+    /// existed) must be re-minted, not served stale.
+    #[test]
+    fn a_stale_or_missing_sidecar_forces_a_remint() {
+        let dir =
+            std::env::temp_dir().join(format!("tcr-mitm-stale-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first = load_tls_in(&dir).expect("first load mints a chain");
+        let leaf_before = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf persisted");
+
+        // Simulate a leaf minted under the OLD (pre-change) SAN set.
+        write_sans_sidecar(
+            &dir.join("tcr-leaf.sans"),
+            &[
+                "api.anthropic.com",
+                "console.anthropic.com",
+                "platform.anthropic.com",
+                "www.example.org",
+            ],
+        )
+        .expect("write stale sidecar");
+
+        let second = load_tls_in(&dir).expect("second load re-mints on SAN drift");
+        let leaf_after_drift = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf still there");
+        assert_ne!(
+            leaf_before, leaf_after_drift,
+            "a SAN-drifted sidecar must trigger a fresh leaf, not a stale reuse"
+        );
+        assert!(leaf_covers(&second.covered_hosts, "platform.claude.com"));
+        assert_eq!(
+            first.ca_path, second.ca_path,
+            "a leaf re-mint must not change which CA path is advertised"
+        );
+
+        // Now simulate a leaf minted before the sidecar field existed at all.
+        std::fs::remove_file(dir.join("tcr-leaf.sans")).expect("remove sidecar");
+        let third = load_tls_in(&dir).expect("third load re-mints on a missing sidecar");
+        let leaf_after_missing = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf still there");
+        assert_ne!(
+            leaf_after_drift, leaf_after_missing,
+            "a missing sidecar (pre-change leaf) must re-mint, not silently reuse unknown coverage"
+        );
+        assert!(leaf_covers(&third.covered_hosts, "platform.claude.com"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A persisted leaf whose sidecar MATCHES the required coverage is reused
+    /// as-is — no gratuitous re-mint (already covered by
+    /// `load_tls_reuses_a_minted_chain_across_restarts` above; this asserts
+    /// the sidecar specifically is what's being checked, not just presence).
+    #[test]
+    fn a_matching_sidecar_is_reused_without_a_remint() {
+        let dir =
+            std::env::temp_dir().join(format!("tcr-mitm-fresh-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let _first = load_tls_in(&dir).expect("first load mints a chain + matching sidecar");
+        let leaf_before = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf persisted");
+        let ca_key_before =
+            std::fs::read(dir.join("tcr-ca.key")).expect("CA key persisted on first mint");
+
+        let _second = load_tls_in(&dir).expect("second load reuses the chain");
+        let leaf_after = std::fs::read(dir.join("tcr-leaf.pem")).expect("leaf still there");
+        let ca_key_after = std::fs::read(dir.join("tcr-ca.key")).expect("CA key still there");
+
+        assert_eq!(
+            leaf_before, leaf_after,
+            "a matching sidecar must not trigger a re-mint"
+        );
+        assert_eq!(
+            ca_key_before, ca_key_after,
+            "no CA rotation should happen when nothing drifted"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Branch D end-to-end: after a SAN-drift re-mint, the CA cert stays byte-
+    /// identical (no rotation), AND a client trusting ONLY the persisted CA
+    /// completes a real TLS handshake against the newly re-minted leaf — the
+    /// strongest available proof the re-mint actually reused the persisted CA
+    /// key rather than silently minting a new CA.
+    #[tokio::test]
+    async fn remint_after_san_drift_reuses_the_persisted_ca_key() {
+        let dir = std::env::temp_dir().join(format!("tcr-mitm-ca-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first = load_tls_in(&dir).expect("first load mints CA + leaf");
+        let ca_pem_before = std::fs::read(dir.join("tcr-ca.pem")).expect("CA cert persisted");
+
+        // Force a SAN drift so the next load must re-mint the leaf.
+        write_sans_sidecar(&dir.join("tcr-leaf.sans"), &["api.anthropic.com"])
+            .expect("write drifted sidecar");
+        let second = load_tls_in(&dir).expect("second load re-mints under the SAME CA");
+        let ca_pem_after = std::fs::read(dir.join("tcr-ca.pem")).expect("CA cert still there");
+
+        assert_eq!(
+            ca_pem_before, ca_pem_after,
+            "a leaf re-mint must not rotate the CA cert"
+        );
+        assert_eq!(first.ca_path, second.ca_path);
+
+        // Cryptographic proof: a client trusting ONLY the persisted CA must
+        // complete a real TLS handshake against the re-minted leaf.
+        ensure_crypto_provider();
+        let mut roots = rustls::RootCertStore::empty();
+        let mut reader = std::io::BufReader::new(&ca_pem_after[..]);
+        for cert in rustls_pemfile::certs(&mut reader) {
+            roots
+                .add(cert.expect("parse persisted CA cert"))
+                .expect("add CA to root store");
+        }
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = second.acceptor;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            acceptor
+                .accept(stream)
+                .await
+                .expect("server-side handshake over the re-minted leaf must succeed")
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("api.anthropic.com")
+            .expect("valid DNS name")
+            .to_owned();
+        let client_tls = connector
+            .connect(server_name, client_stream)
+            .await
+            .expect("a client trusting the persisted CA must accept the re-minted leaf");
+        drop(client_tls);
+        server.await.expect("server task must complete");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The blind tunnel pipes bytes to the requested upstream and back, and first
@@ -790,11 +1323,12 @@ mod tests {
     #[test]
     fn generated_chain_loads_into_acceptor() {
         ensure_crypto_provider();
-        let (ca_pem, leaf_pem, leaf_key_pem) =
+        let (ca_pem, leaf_pem, leaf_key_pem, ca_key_pem) =
             generate_chain(FALLBACK_LEAF_SANS).expect("generate chain");
         assert!(ca_pem.contains("BEGIN CERTIFICATE"));
         assert!(leaf_pem.contains("BEGIN CERTIFICATE"));
         assert!(leaf_key_pem.contains("PRIVATE KEY"));
+        assert!(ca_key_pem.contains("PRIVATE KEY"));
 
         let dir = std::env::temp_dir().join(format!("tcr-mitm-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
