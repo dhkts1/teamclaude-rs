@@ -281,18 +281,27 @@ enum RenderStates {
     /// other scene — this is the one scene that can actually distinguish
     /// them. Two rows, each diverging the OTHER way:
     ///
-    ///  - `divergent-low-high`: 5h ~8% (green, `ok`) under 7d ~96% (red,
-    ///    `spent`) — the top bar must stay green while the bottom is red.
-    ///  - `divergent-high-low`: 5h ~99% (red, `spent`) under 7d ~15% (green,
-    ///    `ok`) — the top bar must be red while the bottom stays green.
+    ///  - `divergent-low-high`: 5h ~8% (green, `ok`) under 7d ~96% (amber,
+    ///    `near`) — the top bar must stay green while the bottom is amber.
+    ///  - `divergent-high-low`: 5h ~99% (amber, `near`) over 7d ~15% (green,
+    ///    `ok`) — the top bar must be amber while the bottom stays green.
+    ///
+    /// `near`, not `spent`: the server's own rule (`src/manager/snapshot.rs`)
+    /// is `>= 1.0 => Exhausted`, `>= threshold => NearLimit`, else `Normal` —
+    /// 0.96 and 0.99 are both under 1.0, so the server can never emit
+    /// `"spent"` for them. An earlier version of this fixture painted them
+    /// `"spent"` anyway, which is a state the real server cannot produce and
+    /// would have taught a future reader a threshold that doesn't exist. The
+    /// swap this scene exists to catch shows just as clearly at `near`
+    /// (amber) against `ok` (green) as it would at `spent` (red).
     private static var divergentWindowsJSON: String {
         let lowHigh = account(
-            "divergent-low-high@example.com", quota: "0.96", state: "spent",
+            "divergent-low-high@example.com", quota: "0.96", state: "near",
             fiveHour: "0.08", fiveHourState: "ok",
-            sevenDay: "0.96", sevenDayState: "spent")
+            sevenDay: "0.96", sevenDayState: "near")
         let highLow = account(
-            "divergent-high-low@example.com", quota: "0.99", state: "spent",
-            fiveHour: "0.99", fiveHourState: "spent",
+            "divergent-high-low@example.com", quota: "0.99", state: "near",
+            fiveHour: "0.99", fiveHourState: "near",
             sevenDay: "0.15", sevenDayState: "ok")
         return "[\(lowHigh),\(highLow)]"
     }
