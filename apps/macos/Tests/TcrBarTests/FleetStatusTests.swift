@@ -285,6 +285,103 @@ final class FleetStatusTests: XCTestCase {
     }
 }
 
+/// ``Account/effectiveQuotaState(for:)`` is the pure selection
+/// `FleetView`'s `fiveHourTint`/`sevenDayTint` key off — the per-window
+/// field when present, else the shared composite `quotaState`. A fixture
+/// where BOTH windows carry the same state (every other fixture in this
+/// file, and every golden scene but `01c-divergent-windows`) cannot catch
+/// a swapped `fiveHour`/`sevenDay` binding: reading the wrong field back
+/// would still equal the right answer. These fixtures deliberately set
+/// `fiveHourState` and `sevenDayState` to DIFFERENT values so a swap fails
+/// loudly instead of rendering byte-identical to the correct code.
+final class QuotaWindowStateTests: XCTestCase {
+    private func account(fiveHourState: QuotaState, sevenDayState: QuotaState) -> Account {
+        Account(
+            name: "diverge@example.com",
+            priority: 0,
+            status: "active",
+            disabled: false,
+            quota: 0.5,
+            quotaState: .near,
+            fiveHour: 0.08,
+            sevenDay: 0.96,
+            sevenDayOi: 0.0,
+            fiveHourState: fiveHourState,
+            sevenDayState: sevenDayState,
+            held: [],
+            requests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheHitRatio: nil,
+            probeStatus: .ok,
+            probeError: nil,
+            lastStreamError: nil,
+            streamErrorCount: 0,
+            source: .live,
+            serverSha: "abc1234",
+            serverDirty: false
+        )
+    }
+
+    func testFiveHourWindowReadsItsOwnFieldNotSevenDays() {
+        let a = account(fiveHourState: .ok, sevenDayState: .spent)
+        XCTAssertEqual(a.effectiveQuotaState(for: .fiveHour), .ok)
+        // The failure mode this guards: a binding that reads `sevenDayState`
+        // for the 5h bar would return `.spent` here instead.
+        XCTAssertNotEqual(a.effectiveQuotaState(for: .fiveHour), a.sevenDayState)
+    }
+
+    func testSevenDayWindowReadsItsOwnFieldNotFiveHours() {
+        let a = account(fiveHourState: .ok, sevenDayState: .spent)
+        XCTAssertEqual(a.effectiveQuotaState(for: .sevenDay), .spent)
+        // The failure mode this guards: a binding that reads `fiveHourState`
+        // for the 7d bar would return `.ok` here instead.
+        XCTAssertNotEqual(a.effectiveQuotaState(for: .sevenDay), a.fiveHourState)
+    }
+
+    func testBothWindowsDivergeFromEachOtherInTheFixture() {
+        // Belt-and-suspenders on the fixture itself: if a future edit ever
+        // let these two collapse to the same value, the two tests above
+        // would stop being able to catch a swap at all, silently.
+        let a = account(fiveHourState: .ok, sevenDayState: .spent)
+        XCTAssertNotEqual(a.fiveHourState, a.sevenDayState)
+    }
+
+    func testAbsentPerWindowFieldFallsBackToTheCompositeState() {
+        // Older `tcr`: the per-window fields are absent (`nil`), not merely
+        // unset in this fixture. Both windows must fall back to the shared
+        // `quotaState` — the pre-existing single-bar behaviour — rather than
+        // some other default.
+        let a = Account(
+            name: "legacy@example.com",
+            priority: 0,
+            status: "active",
+            disabled: false,
+            quota: 0.5,
+            quotaState: .near,
+            fiveHour: 0.5,
+            sevenDay: 0.5,
+            sevenDayOi: 0.0,
+            held: [],
+            requests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheHitRatio: nil,
+            probeStatus: .ok,
+            probeError: nil,
+            lastStreamError: nil,
+            streamErrorCount: 0,
+            source: .live,
+            serverSha: "abc1234",
+            serverDirty: false
+        )
+        XCTAssertEqual(a.effectiveQuotaState(for: .fiveHour), .near)
+        XCTAssertEqual(a.effectiveQuotaState(for: .sevenDay), .near)
+    }
+}
+
 /// ``QuotaFormat`` carries the one honesty rule this whole task is about — a
 /// nil measurement must never print or draw as a real zero — and until now
 /// nothing exercised it directly; every existing test only asserted on the

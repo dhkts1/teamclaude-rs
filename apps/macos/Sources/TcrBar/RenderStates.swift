@@ -63,6 +63,7 @@ enum RenderStates {
     private static var scenes: [(name: String, state: PollState, awake: Bool, control: String?)] {
         [
             ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),
+            ("01c-divergent-windows", .loaded(fleet(divergentWindowsJSON)), false, nil),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
@@ -71,7 +72,10 @@ enum RenderStates {
             ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false, nil),
             ("06-offline-source", .loaded(fleet(offlineJSON)), false, nil),
             ("07-empty-fleet", .loaded(fleet("[]")), false, nil),
-            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]), false, nil),
+            (
+                "08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]),
+                false, nil
+            ),
             ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused"), false, nil),
             ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false, nil),
             ("11-pending", .pending, false, nil),
@@ -231,17 +235,33 @@ enum RenderStates {
         probe: String = "ok",
         held: String = "[]",
         source: String = "live",
-        status: String = "active"
+        status: String = "active",
+        // Per-window overrides, all defaulting to the composite `quota`/`state`
+        // — every EXISTING call site keeps rendering exactly the "5h == 7d"
+        // fixture it always has. Only `divergentWindowsJSON` below passes
+        // these explicitly, to build the ONE scene where the two windows
+        // genuinely disagree — the shape every other fixture here cannot
+        // exercise and a swapped 5h/7d binding would render identically to
+        // the correct one against.
+        fiveHour: String? = nil,
+        fiveHourState: String? = nil,
+        sevenDay: String? = nil,
+        sevenDayState: String? = nil
     ) -> String {
-        """
-        {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
-         "quota":\(quota),"quotaState":"\(state)","fiveHour":\(quota),
-         "sevenDay":\(quota),"sevenDayOi":0.0,"held":\(held),
-         "requests":102,"inputTokens":8781926,"outputTokens":31860,
-         "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
-         "probeError":null,"lastStreamError":null,"streamErrorCount":0,
-         "source":"\(source)","serverSha":"abc1234","serverDirty":false}
-        """
+        let fh = fiveHour ?? quota
+        let fhState = fiveHourState ?? state
+        let sd = sevenDay ?? quota
+        let sdState = sevenDayState ?? state
+        return """
+            {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
+             "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
+             "fiveHourState":"\(fhState)","sevenDay":\(sd),"sevenDayState":"\(sdState)",
+             "sevenDayOi":0.0,"held":\(held),
+             "requests":102,"inputTokens":8781926,"outputTokens":31860,
+             "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
+             "probeError":null,"lastStreamError":null,"streamErrorCount":0,
+             "source":"\(source)","serverSha":"abc1234","serverDirty":false}
+            """
     }
 
     private static let hold =
@@ -250,6 +270,31 @@ enum RenderStates {
     private static var healthyJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok")),"
             + "\(account("bob@example.com", quota: "0.31", state: "ok"))]"
+    }
+
+    /// The bug this scene exists to catch: a 7d-red account must not paint
+    /// its 5h bar red, and the inverse — a 5h-red account must not paint its
+    /// 7d bar red. Every OTHER fixture in this file sets `fiveHour` and
+    /// `sevenDay` to the same value as the composite `quota`, so a binding
+    /// bug (5h fraction wired to the 7d bar, or both bars reading the same
+    /// state) would render byte-identical to the correct code against every
+    /// other scene — this is the one scene that can actually distinguish
+    /// them. Two rows, each diverging the OTHER way:
+    ///
+    ///  - `divergent-low-high`: 5h ~8% (green, `ok`) under 7d ~96% (red,
+    ///    `spent`) — the top bar must stay green while the bottom is red.
+    ///  - `divergent-high-low`: 5h ~99% (red, `spent`) under 7d ~15% (green,
+    ///    `ok`) — the top bar must be red while the bottom stays green.
+    private static var divergentWindowsJSON: String {
+        let lowHigh = account(
+            "divergent-low-high@example.com", quota: "0.96", state: "spent",
+            fiveHour: "0.08", fiveHourState: "ok",
+            sevenDay: "0.96", sevenDayState: "spent")
+        let highLow = account(
+            "divergent-high-low@example.com", quota: "0.99", state: "spent",
+            fiveHour: "0.99", fiveHourState: "spent",
+            sevenDay: "0.15", sevenDayState: "ok")
+        return "[\(lowHigh),\(highLow)]"
     }
 
     /// The shape that broke: thirteen rows, mixed states, one never-probed.
@@ -262,8 +307,9 @@ enum RenderStates {
             account("spent-\($0)@example.com", quota: "1.0", state: "spent", held: hold)
         }
         rows.append(
-            account("never@example.com", quota: "null", state: "ok",
-                    disabled: true, probe: "never"))
+            account(
+                "never@example.com", quota: "null", state: "ok",
+                disabled: true, probe: "never"))
         rows.append(account("parked@example.com", quota: "0.2", state: "ok", disabled: true))
         return "[\(rows.joined(separator: ","))]"
     }

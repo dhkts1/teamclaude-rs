@@ -650,6 +650,30 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public var isReady: Bool {
         !disabled && health != .needsRelogin && quotaState == .ok && hasQuotaEvidence
     }
+
+    /// Which window a per-window quota state or bar belongs to.
+    public enum QuotaWindow: Equatable, Sendable {
+        case fiveHour
+        case sevenDay
+    }
+
+    /// The state that SHOULD tint the given window's bar — the per-window
+    /// field when present, else the shared composite `quotaState` (an older
+    /// `tcr` this build talks to, or a window with no reading yet). This is
+    /// the exact selection `FleetView`'s `fiveHourTint`/`sevenDayTint` key
+    /// off, factored out here — pure, no SwiftUI — so a swapped `fiveHour` /
+    /// `sevenDay` binding (5h wired to `sevenDayState`, or both windows
+    /// reading the same field) is catchable by a plain unit test instead of
+    /// only by eyeballing a rendered scene, where the two bars can look
+    /// identical to the correct code whenever a fixture happens to set both
+    /// windows to the same value — as every scene except
+    /// `01c-divergent-windows` does.
+    public func effectiveQuotaState(for window: QuotaWindow) -> QuotaState {
+        switch window {
+        case .fiveHour: return fiveHourState ?? quotaState
+        case .sevenDay: return sevenDayState ?? quotaState
+        }
+    }
 }
 
 /// One bucket of the fleet breakdown line.

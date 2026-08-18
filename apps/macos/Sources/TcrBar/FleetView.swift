@@ -718,16 +718,18 @@ struct AccountRow: View {
     /// `hasStaleQuotaReading` demotes BOTH bars together, same as `quotaTint`.
     private var fiveHourTint: Color {
         if hasStaleQuotaReading { return Tok.disabled }
-        guard let state = account.fiveHourState else { return quotaTint }
-        return Tok.color(for: state)
+        return Tok.color(for: account.effectiveQuotaState(for: .fiveHour))
     }
 
     /// The 7-day bar's own tint — the 5h counterpart to ``fiveHourTint``, same
-    /// fallback and same stale-demotion rule.
+    /// fallback and same stale-demotion rule. Both route through
+    /// `Account.effectiveQuotaState(for:)` (`TcrBarCore/FleetStatus.swift`) —
+    /// the per-window-field-else-composite selection lives there, pure and
+    /// unit-tested, precisely so a swapped `fiveHour`/`sevenDay` binding here
+    /// would be a test failure, not just a hoped-for eyeball catch.
     private var sevenDayTint: Color {
         if hasStaleQuotaReading { return Tok.disabled }
-        guard let state = account.sevenDayState else { return quotaTint }
-        return Tok.color(for: state)
+        return Tok.color(for: account.effectiveQuotaState(for: .sevenDay))
     }
 
     /// True for exactly the shape this whole round exists to demote: a
@@ -1164,36 +1166,37 @@ struct AccountRow: View {
             // display stops using them, since with both windows drawn and
             // numbered here, a third "most-spent-of-both" percentage would be
             // the same fact restated rather than new information.
+            //
+            // The label sits ABOVE its own bar, not below — a first attempt put
+            // "5h X%" underneath the 5h bar and "7d Y%" underneath the 7d bar,
+            // which reads as a column of bar / label / bar / label with no
+            // visual rule saying which label belongs to which neighbour. Above
+            // reads unambiguously: "5h X%" immediately precedes the bar it
+            // describes, with the PRIOR bar a full row away.
+            // `Tok.rowLineSpacing` (2pt, shared by every line in this column)
+            // put this label line visually inside the pills above it — the
+            // pills carry their own 2pt vertical padding on top of that gap,
+            // so the two collided. The fix is asymmetric, not a blanket
+            // increase to `rowLineSpacing`: only this label line, right below
+            // the pills, gets extra top padding, leaving the rest of the
+            // column untouched.
+            HStack(spacing: Tok.tightSpacing) {
+                Text("5h \(QuotaFormat.percent(account.fiveHour))")
+                    .font(Tok.secondaryDigitFont)
+                    // Demoted alongside the bar, not left `.secondary`: the eye
+                    // should group these digits as historical rather than live,
+                    // the same distinction `fiveHourTint` draws for the fill.
+                    // The number itself is unchanged — it is still true, just
+                    // no longer reachable.
+                    .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
+                Spacer()
+            }
+            .padding(.top, Tok.tightSpacing)
             QuotaBar(fraction: account.fiveHour, tint: fiveHourTint, label: "5-hour quota")
-                // `Tok.rowLineSpacing` (2pt, shared by every line in this
-                // column) put the bar visually inside the pills above it —
-                // the pills carry their own 2pt vertical padding on top of
-                // that gap, so the two collided. The fix is asymmetric, not
-                // a blanket increase to `rowLineSpacing`: the bar belongs
-                // WITH the percent number beneath it (same fact, two
-                // notations, and already tight to them), not with the pills
-                // above. So only the first bar gets extra top padding,
-                // leaving the numbers below it untouched.
-                .padding(.top, Tok.tightSpacing)
                 // Sighted-hover half of the same fix `quotaTint`/`fiveHourTint`
                 // make for the fill colour: a muted bar alone can still read
                 // as "just a dim healthy bar" rather than "not live" without a
                 // word saying so on hover.
-                .help(
-                    hasStaleQuotaReading
-                        ? "The last reading taken before the credential was rejected. "
-                            + "This headroom is unreachable until you re-login."
-                        : ""
-                )
-            Text("5h \(QuotaFormat.percent(account.fiveHour))")
-                .font(Tok.secondaryDigitFont)
-                // Demoted alongside the bar, not left `.secondary`: the eye
-                // should group these digits as historical rather than live,
-                // the same distinction `fiveHourTint` draws for the fill. The
-                // number itself is unchanged — it is still true, just no
-                // longer reachable.
-                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
-            QuotaBar(fraction: account.sevenDay, tint: sevenDayTint, label: "7-day quota")
                 .help(
                     hasStaleQuotaReading
                         ? "The last reading taken before the credential was rejected. "
@@ -1225,6 +1228,13 @@ struct AccountRow: View {
                         .lineLimit(1)
                 }
             }
+            QuotaBar(fraction: account.sevenDay, tint: sevenDayTint, label: "7-day quota")
+                .help(
+                    hasStaleQuotaReading
+                        ? "The last reading taken before the credential was rejected. "
+                            + "This headroom is unreachable until you re-login."
+                        : ""
+                )
             if let hold = account.soonestHold {
                 Label(hold.countdownLabel, systemImage: "hourglass")
                     .font(Tok.secondaryFont)
