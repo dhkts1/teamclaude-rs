@@ -1176,6 +1176,22 @@ fn render_accounts_json(
                 "fiveHour": a.five_hour,
                 "sevenDay": a.seven_day,
                 "sevenDayOi": a.seven_day_oi,
+                // Per-window state, additive alongside the existing combined
+                // `quotaState` above (which stays the most-spent-of-both gating
+                // verdict and is UNCHANGED by this field's addition — nothing
+                // that reads `quota`/`quotaState` today observes a different
+                // value). `null` when that window has no reading yet — same
+                // "not measured" idiom as `serverSha`/`cacheHitRatio` elsewhere
+                // in this row, never a fabricated "ok". Lets TcrBar tint each of
+                // the two per-window quota bars independently instead of both
+                // by the shared gating state, so a 7d-red account with an empty
+                // 5h window doesn't paint its 5h bar red.
+                "fiveHourState": a.five_hour.map(|u| {
+                    quota_state_token(crate::stats::QuotaState::from_utilization(Some(u), threshold))
+                }),
+                "sevenDayState": a.seven_day.map(|u| {
+                    quota_state_token(crate::stats::QuotaState::from_utilization(Some(u), threshold))
+                }),
                 // `null` — NEVER `0` — on the OFFLINE path, same idiom as
                 // `streamErrorCount`/`cacheHitRatio` below and for the same
                 // reason: these four are pure serving counters that live in

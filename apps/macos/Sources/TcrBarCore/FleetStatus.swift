@@ -449,6 +449,16 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let fiveHour: Double?
     public let sevenDay: Double?
     public let sevenDayOi: Double?
+    /// Per-window quota state, additive alongside `quotaState` (which stays the
+    /// combined most-spent-of-both gating verdict). `nil` both when the wire
+    /// field is absent — an older `tcr` this newer TcrBar talks to, same
+    /// forward-compat contract every other field in this struct follows, see
+    /// decision \#3 above — and when the window itself has no reading yet.
+    /// Synthesized `Decodable` already calls `decodeIfPresent` for an
+    /// `Optional` property, so no field is ever missing from a decode; a
+    /// `nil` here falls back to the shared `quotaState` tint for that bar.
+    public let fiveHourState: QuotaState?
+    public let sevenDayState: QuotaState?
     public let held: [HeldWindow]
 
     /// Pure serving counters. `null` on the wire — and `nil` here, NEVER `0` —
@@ -486,6 +496,65 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let source: StatusSource
     public let serverSha: String?
     public let serverDirty: Bool?
+
+    /// Explicit memberwise init, needed only because adding `fiveHourState`/
+    /// `sevenDayState` after the struct already had test fixtures constructing
+    /// it directly would otherwise force every one of them to grow two new
+    /// arguments. Both default to `nil` — the same "no per-window reading"
+    /// value the wire's absent-field case decodes to — so every pre-existing
+    /// call site keeps compiling unchanged. `Decodable` synthesis is untouched
+    /// by this: it is generated independently of this initializer.
+    public init(
+        name: String,
+        priority: Int,
+        status: String,
+        disabled: Bool,
+        quota: Double?,
+        quotaState: QuotaState,
+        fiveHour: Double?,
+        sevenDay: Double?,
+        sevenDayOi: Double?,
+        fiveHourState: QuotaState? = nil,
+        sevenDayState: QuotaState? = nil,
+        held: [HeldWindow],
+        requests: Int?,
+        inputTokens: Int?,
+        outputTokens: Int?,
+        cacheReadTokens: Int?,
+        cacheHitRatio: Double?,
+        probeStatus: ProbeState,
+        probeError: String?,
+        lastStreamError: String?,
+        streamErrorCount: Int?,
+        source: StatusSource,
+        serverSha: String?,
+        serverDirty: Bool?
+    ) {
+        self.name = name
+        self.priority = priority
+        self.status = status
+        self.disabled = disabled
+        self.quota = quota
+        self.quotaState = quotaState
+        self.fiveHour = fiveHour
+        self.sevenDay = sevenDay
+        self.sevenDayOi = sevenDayOi
+        self.fiveHourState = fiveHourState
+        self.sevenDayState = sevenDayState
+        self.held = held
+        self.requests = requests
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheHitRatio = cacheHitRatio
+        self.probeStatus = probeStatus
+        self.probeError = probeError
+        self.lastStreamError = lastStreamError
+        self.streamErrorCount = streamErrorCount
+        self.source = source
+        self.serverSha = serverSha
+        self.serverDirty = serverDirty
+    }
 
     public var id: String { name }
 

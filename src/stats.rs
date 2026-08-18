@@ -39,6 +39,25 @@ pub enum QuotaState {
     Exhausted,
 }
 
+impl QuotaState {
+    /// The one place the `>=1.0 => Exhausted`, `>=threshold => NearLimit`, else
+    /// `Normal` rule lives. Takes an already-`Option`-flattened utilization —
+    /// `None` (window has no reading yet) maps to `Normal`, matching the
+    /// pre-existing gating computation in
+    /// [`crate::manager::Manager::snapshot`], which folds a `None` window out of
+    /// the `reduce(f64::max)` before ever reaching this match. Shared by the
+    /// combined gating state (`snapshot.rs`) and the per-window state now
+    /// surfaced in the accounts JSON (`cli.rs`), so the threshold logic exists
+    /// exactly once.
+    pub fn from_utilization(util: Option<f64>, threshold: f64) -> Self {
+        match util {
+            Some(u) if u >= 1.0 => QuotaState::Exhausted,
+            Some(u) if u >= threshold => QuotaState::NearLimit,
+            _ => QuotaState::Normal,
+        }
+    }
+}
+
 /// Why an account is currently out of rotation, mirroring the hard gates
 /// [`crate::manager::Manager::eligible`] applies — the single source of truth is
 /// [`crate::manager::Manager::account_gate`], which computes this alongside a
