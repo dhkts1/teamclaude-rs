@@ -5,6 +5,7 @@
     "control": false,
     "disabled": false,
     "fiveHour": 0.04,
+    "fiveHourState": "ok",
     "freeAtMs": null,
     "gate": "ok",
     "held": [],
@@ -26,6 +27,7 @@
     "serverSha": "abc1234",
     "sevenDay": 0.01,
     "sevenDayOi": 0.0,
+    "sevenDayState": "ok",
     "source": "live",
     "status": "active",
     "streamErrorCount": 2
@@ -36,6 +38,7 @@
     "control": false,
     "disabled": false,
     "fiveHour": 0.95,
+    "fiveHourState": "near",
     "freeAtMs": null,
     "gate": "ok",
     "held": [
@@ -68,6 +71,7 @@
     "serverSha": "abc1234",
     "sevenDay": 0.91,
     "sevenDayOi": 0.1,
+    "sevenDayState": "near",
     "source": "live",
     "status": "active",
     "streamErrorCount": 2
@@ -78,6 +82,7 @@
     "control": false,
     "disabled": false,
     "fiveHour": 1.0,
+    "fiveHourState": "spent",
     "freeAtMs": 1767312000000,
     "gate": "ok",
     "held": [
@@ -110,6 +115,7 @@
     "serverSha": "abc1234",
     "sevenDay": 1.0,
     "sevenDayOi": 0.5,
+    "sevenDayState": "spent",
     "source": "live",
     "status": "throttled",
     "streamErrorCount": 2
@@ -120,6 +126,7 @@
     "control": false,
     "disabled": true,
     "fiveHour": null,
+    "fiveHourState": null,
     "freeAtMs": null,
     "gate": "ok",
     "held": [],
@@ -141,6 +148,7 @@
     "serverSha": "abc1234",
     "sevenDay": null,
     "sevenDayOi": null,
+    "sevenDayState": null,
     "source": "live",
     "status": "active",
     "streamErrorCount": 0

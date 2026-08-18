@@ -130,11 +130,7 @@ impl Manager {
                     .into_iter()
                     .flatten()
                     .reduce(f64::max);
-                let quota_state = match gating {
-                    Some(u) if u >= 1.0 => crate::stats::QuotaState::Exhausted,
-                    Some(u) if u >= threshold => crate::stats::QuotaState::NearLimit,
-                    _ => crate::stats::QuotaState::Normal,
-                };
+                let quota_state = crate::stats::QuotaState::from_utilization(gating, threshold);
                 // Why this account is out and when it clears — the GENERAL
                 // (non-Fable) view: `is_fable = false`, so the model-scoped weekly
                 // never gates a general fleet row (an account spent only on its

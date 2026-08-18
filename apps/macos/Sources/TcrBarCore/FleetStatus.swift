@@ -449,6 +449,16 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let fiveHour: Double?
     public let sevenDay: Double?
     public let sevenDayOi: Double?
+    /// Per-window quota state, additive alongside `quotaState` (which stays the
+    /// combined most-spent-of-both gating verdict). `nil` both when the wire
+    /// field is absent — an older `tcr` this newer TcrBar talks to, same
+    /// forward-compat contract every other field in this struct follows, see
+    /// decision \#3 above — and when the window itself has no reading yet.
+    /// Synthesized `Decodable` already calls `decodeIfPresent` for an
+    /// `Optional` property, so no field is ever missing from a decode; a
+    /// `nil` here falls back to the shared `quotaState` tint for that bar.
+    public let fiveHourState: QuotaState?
+    public let sevenDayState: QuotaState?
     public let held: [HeldWindow]
 
     /// Pure serving counters. `null` on the wire — and `nil` here, NEVER `0` —
@@ -486,6 +496,65 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let source: StatusSource
     public let serverSha: String?
     public let serverDirty: Bool?
+
+    /// Explicit memberwise init, needed only because adding `fiveHourState`/
+    /// `sevenDayState` after the struct already had test fixtures constructing
+    /// it directly would otherwise force every one of them to grow two new
+    /// arguments. Both default to `nil` — the same "no per-window reading"
+    /// value the wire's absent-field case decodes to — so every pre-existing
+    /// call site keeps compiling unchanged. `Decodable` synthesis is untouched
+    /// by this: it is generated independently of this initializer.
+    public init(
+        name: String,
+        priority: Int,
+        status: String,
+        disabled: Bool,
+        quota: Double?,
+        quotaState: QuotaState,
+        fiveHour: Double?,
+        sevenDay: Double?,
+        sevenDayOi: Double?,
+        fiveHourState: QuotaState? = nil,
+        sevenDayState: QuotaState? = nil,
+        held: [HeldWindow],
+        requests: Int?,
+        inputTokens: Int?,
+        outputTokens: Int?,
+        cacheReadTokens: Int?,
+        cacheHitRatio: Double?,
+        probeStatus: ProbeState,
+        probeError: String?,
+        lastStreamError: String?,
+        streamErrorCount: Int?,
+        source: StatusSource,
+        serverSha: String?,
+        serverDirty: Bool?
+    ) {
+        self.name = name
+        self.priority = priority
+        self.status = status
+        self.disabled = disabled
+        self.quota = quota
+        self.quotaState = quotaState
+        self.fiveHour = fiveHour
+        self.sevenDay = sevenDay
+        self.sevenDayOi = sevenDayOi
+        self.fiveHourState = fiveHourState
+        self.sevenDayState = sevenDayState
+        self.held = held
+        self.requests = requests
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.cacheHitRatio = cacheHitRatio
+        self.probeStatus = probeStatus
+        self.probeError = probeError
+        self.lastStreamError = lastStreamError
+        self.streamErrorCount = streamErrorCount
+        self.source = source
+        self.serverSha = serverSha
+        self.serverDirty = serverDirty
+    }
 
     public var id: String { name }
 
@@ -581,6 +650,68 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public var isReady: Bool {
         !disabled && health != .needsRelogin && quotaState == .ok && hasQuotaEvidence
     }
+
+    /// Which window a per-window quota state or bar belongs to.
+    public enum QuotaWindow: Equatable, Sendable {
+        case fiveHour
+        case sevenDay
+    }
+
+    /// The per-window state word when present, else the shared composite
+    /// `quotaState`. NOT by itself the answer to "what should this window's
+    /// bar look like" — `fiveHourState`/`sevenDayState` are `nil` both when
+    /// this window genuinely has no reading AND when an older `tcr` never
+    /// sent the field at all (`decodeIfPresent` collapses both), so on its
+    /// own this function cannot tell "no reading, paint neutral" from "old
+    /// server, borrow the composite state" and must not be called before
+    /// that distinction is made — see ``quotaBarTintSource(for:)``, which
+    /// makes it and is what callers outside this file should actually use.
+    /// Kept internal-facing (not deprecated/removed) because
+    /// `quotaBarTintSource(for:)` still needs exactly this fallback for the
+    /// genuine old-server case: a fraction present, its state word absent.
+    public func effectiveQuotaState(for window: QuotaWindow) -> QuotaState {
+        switch window {
+        case .fiveHour: return fiveHourState ?? quotaState
+        case .sevenDay: return sevenDayState ?? quotaState
+        }
+    }
+
+    /// What a window's bar should be tinted with — the answer
+    /// `effectiveQuotaState(for:)` alone cannot give. `.unmeasured` when this
+    /// window has NO reading (`fiveHour`/`sevenDay` fraction is `nil` — the
+    /// same per-window fraction ``hasQuotaEvidence`` reads for the composite
+    /// bar, populated on old and new wire alike), `.state` otherwise.
+    ///
+    /// This is the fix for a real bug: `FleetView`'s `fiveHourTint`/
+    /// `sevenDayTint` used to call `effectiveQuotaState(for:)` directly, so
+    /// an account whose 7-day window was genuinely spent and whose 5-hour
+    /// window had never reported fell through `fiveHourState ?? quotaState`
+    /// to the COMPOSITE (7d-driven) state and painted the empty 5h bar red —
+    /// exactly the overclaim two-window tinting exists to prevent, and not
+    /// exotic: `src/quota.rs` populates the two windows independently from
+    /// separate response headers, so one sitting at `None` while its sibling
+    /// accumulates is ordinary. Proven with the `01d-unmeasured-window-proof`
+    /// golden scene before the fix landed (the 5h outline rendered red) and
+    /// pinned here by ``QuotaWindowStateTests``.
+    public func quotaBarTintSource(for window: QuotaWindow) -> QuotaBarTintSource {
+        let fraction: Double? = {
+            switch window {
+            case .fiveHour: return fiveHour
+            case .sevenDay: return sevenDay
+            }
+        }()
+        guard fraction != nil else { return .unmeasured }
+        return .state(effectiveQuotaState(for: window))
+    }
+}
+
+/// The two things a quota bar's fill/outline can honestly show: no reading
+/// at all, or a real per-window state. Kept distinct from a bare
+/// `QuotaState?` so a caller cannot accidentally collapse "unmeasured" into
+/// some default `QuotaState` case — the type itself forces handling both.
+public enum QuotaBarTintSource: Equatable, Sendable {
+    case unmeasured
+    case state(QuotaState)
 }
 
 /// One bucket of the fleet breakdown line.

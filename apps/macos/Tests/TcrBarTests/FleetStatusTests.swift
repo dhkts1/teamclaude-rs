@@ -285,6 +285,191 @@ final class FleetStatusTests: XCTestCase {
     }
 }
 
+/// ``Account/effectiveQuotaState(for:)`` is the pure selection
+/// `FleetView`'s `fiveHourTint`/`sevenDayTint` key off — the per-window
+/// field when present, else the shared composite `quotaState`. A fixture
+/// where BOTH windows carry the same state (every other fixture in this
+/// file, and every golden scene but `01c-divergent-windows`) cannot catch
+/// a swapped `fiveHour`/`sevenDay` binding: reading the wrong field back
+/// would still equal the right answer. These fixtures deliberately set
+/// `fiveHourState` and `sevenDayState` to DIFFERENT values so a swap fails
+/// loudly instead of rendering byte-identical to the correct code.
+final class QuotaWindowStateTests: XCTestCase {
+    private func account(fiveHourState: QuotaState, sevenDayState: QuotaState) -> Account {
+        Account(
+            name: "diverge@example.com",
+            priority: 0,
+            status: "active",
+            disabled: false,
+            quota: 0.5,
+            quotaState: .near,
+            fiveHour: 0.08,
+            sevenDay: 0.96,
+            sevenDayOi: 0.0,
+            fiveHourState: fiveHourState,
+            sevenDayState: sevenDayState,
+            held: [],
+            requests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheHitRatio: nil,
+            probeStatus: .ok,
+            probeError: nil,
+            lastStreamError: nil,
+            streamErrorCount: 0,
+            source: .live,
+            serverSha: "abc1234",
+            serverDirty: false
+        )
+    }
+
+    func testFiveHourWindowReadsItsOwnFieldNotSevenDays() {
+        let a = account(fiveHourState: .ok, sevenDayState: .spent)
+        XCTAssertEqual(a.effectiveQuotaState(for: .fiveHour), .ok)
+        // The failure mode this guards: a binding that reads `sevenDayState`
+        // for the 5h bar would return `.spent` here instead.
+        XCTAssertNotEqual(a.effectiveQuotaState(for: .fiveHour), a.sevenDayState)
+    }
+
+    func testSevenDayWindowReadsItsOwnFieldNotFiveHours() {
+        let a = account(fiveHourState: .ok, sevenDayState: .spent)
+        XCTAssertEqual(a.effectiveQuotaState(for: .sevenDay), .spent)
+        // The failure mode this guards: a binding that reads `fiveHourState`
+        // for the 7d bar would return `.ok` here instead.
+        XCTAssertNotEqual(a.effectiveQuotaState(for: .sevenDay), a.fiveHourState)
+    }
+
+    func testBothWindowsDivergeFromEachOtherInTheFixture() {
+        // Belt-and-suspenders on the fixture itself: if a future edit ever
+        // let these two collapse to the same value, the two tests above
+        // would stop being able to catch a swap at all, silently.
+        let a = account(fiveHourState: .ok, sevenDayState: .spent)
+        XCTAssertNotEqual(a.fiveHourState, a.sevenDayState)
+    }
+
+    func testAbsentPerWindowFieldFallsBackToTheCompositeState() {
+        // Older `tcr`: the per-window fields are absent (`nil`), not merely
+        // unset in this fixture. Both windows must fall back to the shared
+        // `quotaState` — the pre-existing single-bar behaviour — rather than
+        // some other default.
+        let a = Account(
+            name: "legacy@example.com",
+            priority: 0,
+            status: "active",
+            disabled: false,
+            quota: 0.5,
+            quotaState: .near,
+            fiveHour: 0.5,
+            sevenDay: 0.5,
+            sevenDayOi: 0.0,
+            held: [],
+            requests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheHitRatio: nil,
+            probeStatus: .ok,
+            probeError: nil,
+            lastStreamError: nil,
+            streamErrorCount: 0,
+            source: .live,
+            serverSha: "abc1234",
+            serverDirty: false
+        )
+        XCTAssertEqual(a.effectiveQuotaState(for: .fiveHour), .near)
+        XCTAssertEqual(a.effectiveQuotaState(for: .sevenDay), .near)
+    }
+}
+
+/// ``Account/quotaBarTintSource(for:)`` — the fix for a real bug found on
+/// pre-merge review: an account whose 7-day window is genuinely spent and
+/// whose 5-hour window has never reported must show a NEUTRAL 5h bar, not
+/// one inheriting the 7d window's red. `effectiveQuotaState(for:)` alone
+/// cannot make this call — `fiveHourState == nil` cannot distinguish "no
+/// reading" from "old server, field absent" — so `quotaBarTintSource` gates
+/// on the FRACTION (`fiveHour`/`sevenDay`, populated on old and new wire
+/// alike) instead. Golden-scene proof: `01d-unmeasured-window-proof`.
+final class QuotaBarTintSourceTests: XCTestCase {
+    private func account(
+        quotaState: QuotaState,
+        fiveHour: Double?,
+        fiveHourState: QuotaState?,
+        sevenDay: Double?,
+        sevenDayState: QuotaState?
+    ) -> Account {
+        Account(
+            name: "tint-source@example.com",
+            priority: 0,
+            status: "active",
+            disabled: false,
+            quota: sevenDay ?? fiveHour,
+            quotaState: quotaState,
+            fiveHour: fiveHour,
+            sevenDay: sevenDay,
+            sevenDayOi: 0.0,
+            fiveHourState: fiveHourState,
+            sevenDayState: sevenDayState,
+            held: [],
+            requests: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheReadTokens: 0,
+            cacheHitRatio: nil,
+            probeStatus: .ok,
+            probeError: nil,
+            lastStreamError: nil,
+            streamErrorCount: 0,
+            source: .live,
+            serverSha: "abc1234",
+            serverDirty: false
+        )
+    }
+
+    /// The exact bug: 7d genuinely spent, 5h has never reported a fraction
+    /// at all. The 5h bar must be `.unmeasured`, never `.state(.spent)`
+    /// borrowed from the composite/7d state.
+    func testAWindowWithNoFractionIsUnmeasuredNotBorrowedFromItsSibling() {
+        let a = account(
+            quotaState: .spent,
+            fiveHour: nil, fiveHourState: nil,
+            sevenDay: 1.0, sevenDayState: .spent)
+        XCTAssertEqual(a.quotaBarTintSource(for: .fiveHour), .unmeasured)
+        // The failure mode this guards: reading `effectiveQuotaState`
+        // directly (the pre-fix code path) would return `.state(.spent)`
+        // here instead, since `fiveHourState ?? quotaState` falls through to
+        // the composite `.spent`.
+        XCTAssertNotEqual(a.quotaBarTintSource(for: .fiveHour), .state(.spent))
+        // The sibling with a real reading still reports its own state.
+        XCTAssertEqual(a.quotaBarTintSource(for: .sevenDay), .state(.spent))
+    }
+
+    /// The inverse shape, for symmetry: 5h has a real spent reading, 7d has
+    /// never reported.
+    func testTheOtherWindowWithNoFractionIsAlsoUnmeasured() {
+        let a = account(
+            quotaState: .spent,
+            fiveHour: 1.0, fiveHourState: .spent,
+            sevenDay: nil, sevenDayState: nil)
+        XCTAssertEqual(a.quotaBarTintSource(for: .fiveHour), .state(.spent))
+        XCTAssertEqual(a.quotaBarTintSource(for: .sevenDay), .unmeasured)
+        XCTAssertNotEqual(a.quotaBarTintSource(for: .sevenDay), .state(.spent))
+    }
+
+    /// The genuine old-server shape this fallback still needs to serve: a
+    /// fraction IS present (not nil), only the state WORD is missing —
+    /// `quotaBarTintSource` must still borrow the composite state here,
+    /// exactly as `effectiveQuotaState` always has.
+    func testAPresentFractionWithNoStateWordStillBorrowsTheComposite() {
+        let a = account(
+            quotaState: .near,
+            fiveHour: 0.5, fiveHourState: nil,
+            sevenDay: 0.5, sevenDayState: nil)
+        XCTAssertEqual(a.quotaBarTintSource(for: .fiveHour), .state(.near))
+        XCTAssertEqual(a.quotaBarTintSource(for: .sevenDay), .state(.near))
+    }
+}
+
 /// ``QuotaFormat`` carries the one honesty rule this whole task is about — a
 /// nil measurement must never print or draw as a real zero — and until now
 /// nothing exercised it directly; every existing test only asserted on the

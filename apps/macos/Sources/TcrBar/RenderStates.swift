@@ -63,6 +63,8 @@ enum RenderStates {
     private static var scenes: [(name: String, state: PollState, awake: Bool, control: String?)] {
         [
             ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),
+            ("01c-divergent-windows", .loaded(fleet(divergentWindowsJSON)), false, nil),
+            ("01d-unmeasured-window-proof", .loaded(fleet(unmeasuredWindowJSON)), false, nil),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
@@ -71,7 +73,10 @@ enum RenderStates {
             ("05-unreadable-row", .loaded(partiallyUnreadableFleet()), false, nil),
             ("06-offline-source", .loaded(fleet(offlineJSON)), false, nil),
             ("07-empty-fleet", .loaded(fleet("[]")), false, nil),
-            ("08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]), false, nil),
+            (
+                "08-tool-missing", .toolMissing(searched: ["/usr/local/bin/tcr", "/opt/homebrew/bin/tcr"]),
+                false, nil
+            ),
             ("09-command-failed", .commandFailed(exitCode: 1, message: "connection refused"), false, nil),
             ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false, nil),
             ("11-pending", .pending, false, nil),
@@ -231,17 +236,44 @@ enum RenderStates {
         probe: String = "ok",
         held: String = "[]",
         source: String = "live",
-        status: String = "active"
+        status: String = "active",
+        // Per-window overrides, all defaulting to the composite `quota`/`state`
+        // — every EXISTING call site keeps rendering exactly the "5h == 7d"
+        // fixture it always has. Only `divergentWindowsJSON` below passes
+        // these explicitly, to build the ONE scene where the two windows
+        // genuinely disagree — the shape every other fixture here cannot
+        // exercise and a swapped 5h/7d binding would render identically to
+        // the correct one against.
+        fiveHour: String? = nil,
+        fiveHourState: String? = nil,
+        sevenDay: String? = nil,
+        sevenDayState: String? = nil
     ) -> String {
-        """
-        {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
-         "quota":\(quota),"quotaState":"\(state)","fiveHour":\(quota),
-         "sevenDay":\(quota),"sevenDayOi":0.0,"held":\(held),
-         "requests":102,"inputTokens":8781926,"outputTokens":31860,
-         "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
-         "probeError":null,"lastStreamError":null,"streamErrorCount":0,
-         "source":"\(source)","serverSha":"abc1234","serverDirty":false}
-        """
+        let fh = fiveHour ?? quota
+        let fhState = fiveHourState ?? state
+        let sd = sevenDay ?? quota
+        let sdState = sevenDayState ?? state
+        // `fiveHourState`/`sevenDayState` are JSON string fields on the wire
+        // ("ok"/"near"/"spent") but the proof fixture for the unmeasured-
+        // window overclaim needs to write a genuine JSON `null`, not the
+        // string `"null"` — `QuotaState?` decodes the STRING "null" as
+        // `.unknown("null")`, a real (if odd) value, which would silently
+        // defeat the one scene built to prove a window has NO reading.
+        // `quote(_:)` keeps every other call site (a real state word)
+        // wrapped in quotes and only passes `null` through bare.
+        func quote(_ raw: String) -> String {
+            raw == "null" ? "null" : "\"\(raw)\""
+        }
+        return """
+            {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
+             "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
+             "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
+             "sevenDayOi":0.0,"held":\(held),
+             "requests":102,"inputTokens":8781926,"outputTokens":31860,
+             "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
+             "probeError":null,"lastStreamError":null,"streamErrorCount":0,
+             "source":"\(source)","serverSha":"abc1234","serverDirty":false}
+            """
     }
 
     private static let hold =
@@ -250,6 +282,56 @@ enum RenderStates {
     private static var healthyJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok")),"
             + "\(account("bob@example.com", quota: "0.31", state: "ok"))]"
+    }
+
+    /// The bug this scene exists to catch: a 7d-red account must not paint
+    /// its 5h bar red, and the inverse — a 5h-red account must not paint its
+    /// 7d bar red. Every OTHER fixture in this file sets `fiveHour` and
+    /// `sevenDay` to the same value as the composite `quota`, so a binding
+    /// bug (5h fraction wired to the 7d bar, or both bars reading the same
+    /// state) would render byte-identical to the correct code against every
+    /// other scene — this is the one scene that can actually distinguish
+    /// them. Two rows, each diverging the OTHER way:
+    ///
+    ///  - `divergent-low-high`: 5h ~8% (green, `ok`) under 7d ~96% (amber,
+    ///    `near`) — the top bar must stay green while the bottom is amber.
+    ///  - `divergent-high-low`: 5h ~99% (amber, `near`) over 7d ~15% (green,
+    ///    `ok`) — the top bar must be amber while the bottom stays green.
+    ///
+    /// `near`, not `spent`: the server's own rule (`src/manager/snapshot.rs`)
+    /// is `>= 1.0 => Exhausted`, `>= threshold => NearLimit`, else `Normal` —
+    /// 0.96 and 0.99 are both under 1.0, so the server can never emit
+    /// `"spent"` for them. An earlier version of this fixture painted them
+    /// `"spent"` anyway, which is a state the real server cannot produce and
+    /// would have taught a future reader a threshold that doesn't exist. The
+    /// swap this scene exists to catch shows just as clearly at `near`
+    /// (amber) against `ok` (green) as it would at `spent` (red).
+    private static var divergentWindowsJSON: String {
+        let lowHigh = account(
+            "divergent-low-high@example.com", quota: "0.96", state: "near",
+            fiveHour: "0.08", fiveHourState: "ok",
+            sevenDay: "0.96", sevenDayState: "near")
+        let highLow = account(
+            "divergent-high-low@example.com", quota: "0.99", state: "near",
+            fiveHour: "0.99", fiveHourState: "near",
+            sevenDay: "0.15", sevenDayState: "ok")
+        return "[\(lowHigh),\(highLow)]"
+    }
+
+    /// PROOF fixture for the unmeasured-window overclaim: `sevenDay` is
+    /// genuinely spent (1.0/"spent") while `fiveHour`/`fiveHourState` are
+    /// BOTH absent — the shape `src/quota.rs` produces whenever the 5h
+    /// window has not reported yet but the 7d window already has (the two
+    /// populate independently from separate response headers). The 5h bar
+    /// must render as a NEUTRAL dashed outline (no reading), never inheriting
+    /// the 7d window's red — that is the exact overclaim this whole feature
+    /// exists to prevent.
+    private static var unmeasuredWindowJSON: String {
+        let row = account(
+            "unmeasured-5h@example.com", quota: "1.0", state: "spent",
+            fiveHour: "null", fiveHourState: "null",
+            sevenDay: "1.0", sevenDayState: "spent")
+        return "[\(row)]"
     }
 
     /// The shape that broke: thirteen rows, mixed states, one never-probed.
@@ -262,8 +344,9 @@ enum RenderStates {
             account("spent-\($0)@example.com", quota: "1.0", state: "spent", held: hold)
         }
         rows.append(
-            account("never@example.com", quota: "null", state: "ok",
-                    disabled: true, probe: "never"))
+            account(
+                "never@example.com", quota: "null", state: "ok",
+                disabled: true, probe: "never"))
         rows.append(account("parked@example.com", quota: "0.2", state: "ok", disabled: true))
         return "[\(rows.joined(separator: ","))]"
     }
