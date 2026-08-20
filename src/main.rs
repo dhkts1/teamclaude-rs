@@ -18,6 +18,7 @@ use clap::{Parser, Subcommand};
 
 use teamclaude_rs::cli::{self, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
+use teamclaude_rs::proxy::GROUP_HEADER_NAME;
 use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, server, singleton, tui, update};
 
 #[derive(Parser)]
@@ -206,6 +207,12 @@ struct RunArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Route this session to accounts labelled with this group. PREFER
+    /// semantics only (Phase 1): serves from the group when it has capacity,
+    /// falls back to the whole pool otherwise. The restricting form
+    /// (routing ONLY within the group, never falling back) is Phase 2.
+    #[arg(long)]
+    group: Option<String>,
     /// Args passed verbatim to `claude` (e.g. `tcr run -- -p "hi"`).
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -376,9 +383,51 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
     let (config, _) = load_config(&config_path);
     let port = config.proxy.port;
 
+    // `--group`: validate the name and the claude version BEFORE spawning
+    // anything, in this order — a. name, b. version — so a typo or too-old
+    // `claude` never launches a session silently ungrouped.
+    if let Some(group) = args.group.as_deref() {
+        validate_group(&config, group)?;
+        match check_claude_version() {
+            ClaudeVersionCheck::TooOld(found) => {
+                anyhow::bail!(
+                    "claude {found} is older than {MIN_CLAUDE_VERSION_FOR_GROUP_STR}, the minimum \
+                     that forwards ANTHROPIC_CUSTOM_HEADERS as a real request header — `--group` \
+                     cannot work on this install. Upgrade claude and retry."
+                );
+            }
+            // Phase 1 is PREFER-only, so degrading to ordinary (ungrouped) routing on an
+            // unreadable/missing `claude` is safe — warn and continue rather than refuse.
+            // Phase 2's `--only` must refuse here instead: there the operator believes
+            // they are CONTAINED to the group, and silently routing everywhere is the
+            // wrong kind of wrong for that contract.
+            ClaudeVersionCheck::Unknown => {
+                eprintln!(
+                    "[tcr] --group {group}: could not determine the installed claude version \
+                     (need >= {MIN_CLAUDE_VERSION_FOR_GROUP_STR} for ANTHROPIC_CUSTOM_HEADERS) — \
+                     proceeding, but if it is too old this session will silently route to the \
+                     whole pool instead of the group"
+                );
+            }
+            ClaudeVersionCheck::Ok => {}
+        }
+    }
+
     let mut cmd = std::process::Command::new("claude");
     cmd.args(&args.args);
     mark_run_active(&mut cmd);
+
+    // c/d. Compose and set the group header — merging with, never clobbering,
+    // whatever `ANTHROPIC_CUSTOM_HEADERS` this process already inherited (a
+    // user's own headers, or an outer `tcr run`'s — see [`RUN_ACTIVE_ENV`]).
+    // Set unconditionally of see-through vs base-URL mode below: both apply
+    // env to the same `cmd`, and this line runs before either.
+    if let Some(group) = args.group.as_deref() {
+        let inherited = std::env::var("ANTHROPIC_CUSTOM_HEADERS").ok();
+        let composed = compose_group_header(inherited.as_deref(), group);
+        cmd.env("ANTHROPIC_CUSTOM_HEADERS", &composed);
+        eprintln!("[tcr] --group {group}: routing this session via {GROUP_HEADER_NAME}");
+    }
 
     if cli::proxy_is_up(port) {
         if let Some(notice) = withheld_api_key_notice(
@@ -403,6 +452,127 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         .status()
         .context("failed to launch `claude` — is it on PATH?")?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// The oldest Claude Code that forwards `ANTHROPIC_CUSTOM_HEADERS` as a real
+/// outbound header on every `/v1/messages` request — verified against
+/// Anthropic's gateway-protocol documentation. Older than this, `--group`
+/// would set an env var claude silently never sends.
+const MIN_CLAUDE_VERSION_FOR_GROUP: (u64, u64, u64) = (2, 1, 227);
+const MIN_CLAUDE_VERSION_FOR_GROUP_STR: &str = "2.1.227";
+
+/// `--group`'s validation half (step a): the requested name must be a label
+/// SOME configured account actually carries. A typo must never resolve to an
+/// empty set — with Phase 1's prefer-only semantics that would silently route
+/// every session across the whole pool with no error at all, which is the
+/// quiet-wrong-answer this refusal exists to prevent.
+fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
+    let mut configured: Vec<&str> = config
+        .accounts
+        .iter()
+        .filter_map(|a| a.groups.as_ref())
+        .flatten()
+        .map(String::as_str)
+        .collect();
+    configured.sort_unstable();
+    configured.dedup();
+
+    if configured.contains(&group) {
+        return Ok(());
+    }
+    if configured.is_empty() {
+        anyhow::bail!(
+            "--group {group}: no account in the config carries a `groups` label — nothing to route to"
+        );
+    }
+    anyhow::bail!(
+        "--group {group}: not a configured group. Configured groups: {}",
+        configured.join(", ")
+    );
+}
+
+/// Three-state result of checking the installed `claude` against
+/// [`MIN_CLAUDE_VERSION_FOR_GROUP`] — kept distinct from a plain bool even
+/// though Phase 1 collapses `TooOld` and `Unknown` to different outcomes,
+/// because Phase 2's `--only` must refuse on BOTH: there, degrading silently
+/// on an unreadable version would tell the operator they were contained to
+/// the group while the session actually ran across the whole fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClaudeVersionCheck {
+    Ok,
+    /// The parsed version, for the error message.
+    TooOld(String),
+    /// `claude --version` failed to run, exited non-zero, or its output did
+    /// not parse as `MAJOR.MINOR.PATCH …`.
+    Unknown,
+}
+
+fn check_claude_version() -> ClaudeVersionCheck {
+    let output = match std::process::Command::new("claude")
+        .arg("--version")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return ClaudeVersionCheck::Unknown,
+    };
+    classify_claude_version_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// [`check_claude_version`]'s classification half, split out so it is testable
+/// without spawning a `claude` process: feed it `claude --version`'s stdout
+/// directly.
+fn classify_claude_version_output(stdout: &str) -> ClaudeVersionCheck {
+    match parse_claude_version(stdout) {
+        Some(found) if found >= MIN_CLAUDE_VERSION_FOR_GROUP => ClaudeVersionCheck::Ok,
+        Some((maj, min, patch)) => ClaudeVersionCheck::TooOld(format!("{maj}.{min}.{patch}")),
+        None => ClaudeVersionCheck::Unknown,
+    }
+}
+
+/// Parse the leading `MAJOR.MINOR.PATCH` off `claude --version`'s output
+/// (observed shape: `"2.1.237 (Claude Code)"`, first token before whitespace).
+/// `None` on anything else — garbage, a `v`-prefixed or two-component
+/// version, empty output — which is exactly what routes [`check_claude_version`]
+/// to `Unknown` rather than a wrong guess.
+fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
+    let first_token = output.split_whitespace().next()?;
+    let mut parts = first_token.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// `--group`'s header-composition half (steps c/d): the new value for
+/// `ANTHROPIC_CUSTOM_HEADERS`, merging with whatever this process already
+/// inherited rather than clobbering it — a user may have set their own
+/// headers, and silently dropping them is a bug.
+///
+///  - No inherited value (or an empty one) → just `x-tcr-group: <name>`.
+///  - Inherited value present → append ours on a new line.
+///  - Inherited value already carries an `x-tcr-group` line (matched
+///    case-insensitively on the header NAME) → that line is replaced, not
+///    duplicated. Not hypothetical: `tcr run` nests (see `mark_run_active` /
+///    [`RUN_ACTIVE_ENV`]), and two conflicting group headers on one request
+///    is a worse failure than either value alone.
+///  - Every OTHER inherited line's text and order is preserved exactly.
+///
+/// Pure — takes the inherited value and the group name, returns the new
+/// value — so all of the above is testable without spawning a process.
+fn compose_group_header(inherited: Option<&str>, group: &str) -> String {
+    let ours = format!("{GROUP_HEADER_NAME}: {group}");
+    let Some(inherited) = inherited.filter(|s| !s.is_empty()) else {
+        return ours;
+    };
+    let mut lines: Vec<&str> = inherited
+        .lines()
+        .filter(|line| {
+            let name = line.split(':').next().unwrap_or(line).trim();
+            !name.eq_ignore_ascii_case(GROUP_HEADER_NAME)
+        })
+        .collect();
+    lines.push(&ours);
+    lines.join("\n")
 }
 
 /// The marker `tcr run` leaves on its child: **a `tcr run` is already above you
@@ -1679,5 +1849,168 @@ mod tests {
                 "pre-existing file {date} must survive pruning: {remaining:?}"
             );
         }
+    }
+
+    // ---- `--group` header composition (`compose_group_header`) ----------------
+
+    #[test]
+    fn group_header_with_no_inherited_value_is_just_ours() {
+        assert_eq!(
+            compose_group_header(None, "codereview"),
+            "x-tcr-group: codereview"
+        );
+        // Empty is treated the same as absent.
+        assert_eq!(
+            compose_group_header(Some(""), "codereview"),
+            "x-tcr-group: codereview"
+        );
+    }
+
+    #[test]
+    fn group_header_appends_to_unrelated_inherited_headers() {
+        let composed = compose_group_header(Some("X-Custom: yes"), "codereview");
+        assert_eq!(composed, "X-Custom: yes\nx-tcr-group: codereview");
+    }
+
+    #[test]
+    fn group_header_replaces_rather_than_duplicates_an_existing_group_line() {
+        let composed = compose_group_header(
+            Some("X-Custom: yes\nx-tcr-group: stale\nX-Other: also-kept"),
+            "codereview",
+        );
+        assert_eq!(
+            composed, "X-Custom: yes\nX-Other: also-kept\nx-tcr-group: codereview",
+            "the stale line is replaced in place at the END, never duplicated, \
+             and every unrelated line's text and order survive"
+        );
+        assert_eq!(
+            composed.matches("x-tcr-group").count(),
+            1,
+            "must never carry two group headers"
+        );
+    }
+
+    #[test]
+    fn group_header_replacement_matches_the_name_case_insensitively() {
+        let composed = compose_group_header(Some("X-TCR-Group: stale"), "codereview");
+        assert_eq!(composed, "x-tcr-group: codereview");
+    }
+
+    // ---- `--group` claude version gate (`classify_claude_version_output`) -----
+
+    #[test]
+    fn claude_version_parses_the_real_output_shape() {
+        assert_eq!(
+            parse_claude_version("2.1.237 (Claude Code)"),
+            Some((2, 1, 237))
+        );
+        assert_eq!(parse_claude_version("2.1.237"), Some((2, 1, 237)));
+    }
+
+    #[test]
+    fn claude_version_parse_fails_closed_on_garbage() {
+        for garbage in ["", "not a version", "v2.1.237", "2.1", "2.1.abc"] {
+            assert_eq!(
+                parse_claude_version(garbage),
+                None,
+                "{garbage:?} must not parse as a version"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_version_too_old_refuses() {
+        assert_eq!(
+            classify_claude_version_output("2.1.226 (Claude Code)"),
+            ClaudeVersionCheck::TooOld("2.1.226".to_string())
+        );
+        assert_eq!(
+            classify_claude_version_output("1.9.999 (Claude Code)"),
+            ClaudeVersionCheck::TooOld("1.9.999".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_version_at_or_above_minimum_is_ok() {
+        assert_eq!(
+            classify_claude_version_output("2.1.227 (Claude Code)"),
+            ClaudeVersionCheck::Ok
+        );
+        assert_eq!(
+            classify_claude_version_output("2.1.237 (Claude Code)"),
+            ClaudeVersionCheck::Ok
+        );
+        assert_eq!(
+            classify_claude_version_output("3.0.0 (Claude Code)"),
+            ClaudeVersionCheck::Ok
+        );
+    }
+
+    #[test]
+    fn claude_version_unparseable_output_warns_and_proceeds() {
+        assert_eq!(
+            classify_claude_version_output("garbage"),
+            ClaudeVersionCheck::Unknown
+        );
+        assert_eq!(
+            classify_claude_version_output(""),
+            ClaudeVersionCheck::Unknown
+        );
+    }
+
+    // ---- `--group` name validation (`validate_group`) --------------------------
+
+    fn account_with_groups(name: &str, groups: Option<&[&str]>) -> config::Account {
+        config::Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: groups.map(|gs| gs.iter().map(|g| g.to_string()).collect()),
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn validate_group_accepts_a_configured_group() {
+        let mut config = default_config();
+        config.accounts = vec![
+            account_with_groups("alice", Some(&["codereview"])),
+            account_with_groups("bob", None),
+        ];
+        assert!(validate_group(&config, "codereview").is_ok());
+    }
+
+    #[test]
+    fn validate_group_rejects_an_unknown_name_and_lists_the_configured_groups() {
+        let mut config = default_config();
+        config.accounts = vec![
+            account_with_groups("alice", Some(&["codereview", "burst"])),
+            account_with_groups("bob", Some(&["burst"])),
+        ];
+        let err = validate_group(&config, "typo-group")
+            .expect_err("an unconfigured group name must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("burst") && msg.contains("codereview"),
+            "the error must name every configured group so the operator can fix the typo: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_group_rejects_when_no_account_has_any_group() {
+        let mut config = default_config();
+        config.accounts = vec![account_with_groups("alice", None)];
+        assert!(
+            validate_group(&config, "codereview").is_err(),
+            "a typo must never silently resolve to the empty set — that routes everywhere"
+        );
     }
 }
