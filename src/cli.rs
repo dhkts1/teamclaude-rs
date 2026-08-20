@@ -274,7 +274,19 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
-    let config = load_for_edit(config_path)?;
+    // Deliberately NOT `load_for_edit` — that helper's warning ("a proxy is
+    // already listening — it may overwrite this edit when it flushes the
+    // config on exit") describes a hazard THIS write does not have.
+    // `Manager::persist_now` flushes via `config::save_tokens`, not a whole
+    // `config::save` of its boot-time snapshot (see persist_now's and
+    // save_tokens' doc-comments) — it re-reads the CURRENT on-disk document
+    // at shutdown and merges in only the token fields, so a group label this
+    // surgical write already put on disk survives that flush untouched. The
+    // warning would be false on every ordinary run, and TcrBar calls this
+    // command with the proxy always up, which is exactly the case that makes
+    // a false-but-constant warning turn into wallpaper.
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
     let idx = find_account_by_name(&config.accounts, account)?;
     let target = &config.accounts[idx];
     let outcome = config::save_group_membership(config_path, target, group, true)
@@ -316,7 +328,11 @@ pub fn remove_from_group(
     account: Option<&str>,
     all: bool,
 ) -> anyhow::Result<()> {
-    let config = load_for_edit(config_path)?;
+    // Same reasoning as `add_to_group`: no `load_for_edit` warning here either
+    // — `save_group_membership`'s surgical write survives the proxy's
+    // shutdown flush (`persist_now` -> `save_tokens`) for the same reason.
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
 
     if all {
         let mut removed_from: Vec<String> = Vec::new();
