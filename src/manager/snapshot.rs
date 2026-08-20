@@ -184,6 +184,7 @@ impl Manager {
                         now_ms,
                     ),
                     last_stream_error: a.last_stream_error.clone(),
+                    groups: a.groups.clone(),
                 }
             })
             .collect();

@@ -202,6 +202,13 @@ pub struct AccountStatus {
     /// The most recent stream error's type, alongside the count above. Same
     /// on-the-wire decision as `stream_error_count`; rendered as `lastStreamError`.
     pub last_stream_error: Option<String>,
+    /// Group labels for this account, mirroring [`AccountSnapshot::groups`].
+    /// `#[serde(default)]` for the same forward-compat reason as
+    /// `stream_error_count`: an older server that predates groups omits the
+    /// field, and a newer client must still deserialize its payload rather than
+    /// falling back to a fabricated offline snapshot.
+    #[serde(default)]
+    pub groups: Vec<String>,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -256,6 +263,7 @@ impl StatusPayload {
                 threshold: thresholds.get(i).copied().unwrap_or(1.0),
                 stream_error_count: a.stream_error_count,
                 last_stream_error: a.last_stream_error.clone(),
+                groups: a.groups.clone(),
             })
             .collect();
         Self {
@@ -308,6 +316,7 @@ impl StatusPayload {
                     free_at: a.free_at_ms.and_then(from_ms),
                     stream_error_count: a.stream_error_count,
                     last_stream_error: a.last_stream_error,
+                    groups: a.groups,
                 }
             })
             .collect();
@@ -354,6 +363,7 @@ mod tests {
                 free_at: None,
                 stream_error_count: 0,
                 last_stream_error: None,
+                groups: vec!["codereview".to_string()],
             }],
             current: Some(0),
             recent: Vec::new(),
@@ -396,6 +406,39 @@ mod tests {
         assert_eq!(after.probe_status, before.probe_status);
         assert_eq!(after.quota_state, before.quota_state);
         assert_eq!(after.gate, before.gate);
+        assert_eq!(after.groups, before.groups, "groups rides the wire intact");
+    }
+
+    /// A payload from an older server that predates `groups` still deserializes,
+    /// with the field defaulting to empty — the same forward-compat contract
+    /// `stream_error_count` already relies on.
+    #[test]
+    fn payload_without_groups_field_still_deserializes() {
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+        ))
+        .expect("serialize");
+        // Simulate an older server: strip every `"groups":[...]` occurrence from
+        // the account object rather than hand-writing a whole payload, so this
+        // test tracks the real field name if it ever changes.
+        let mut value: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        for account in value["accounts"].as_array_mut().expect("accounts array") {
+            account
+                .as_object_mut()
+                .expect("account object")
+                .remove("groups");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let back: StatusPayload =
+            serde_json::from_str(&stripped).expect("deserialize without groups field");
+        assert_eq!(
+            back.accounts[0].groups,
+            Vec::<String>::new(),
+            "missing groups field on the wire defaults to empty, not a decode error"
+        );
     }
 
     /// The server's build stamp rides along and survives the wire.

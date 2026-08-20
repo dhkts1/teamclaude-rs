@@ -559,7 +559,8 @@ private func account(
     _ name: String,
     state: QuotaState,
     disabled: Bool = false,
-    held: [HeldWindow] = []
+    held: [HeldWindow] = [],
+    groups: [String]? = nil
 ) -> Account {
     Account(
         name: name,
@@ -583,7 +584,8 @@ private func account(
         streamErrorCount: 0,
         source: .live,
         serverSha: "abc1234",
-        serverDirty: false
+        serverDirty: false,
+        groups: groups
     )
 }
 
@@ -1035,6 +1037,82 @@ final class FleetCapacitySummaryTests: XCTestCase {
         XCTAssertEqual(fleet.breakdownLabel, "4 ok · 1 near · 7 spent · 1 disabled")
         XCTAssertEqual(fleet.breakdown.map(\.count).reduce(0, +), fleet.accounts.count)
         XCTAssertEqual(fleet.soonestRecovery?.minutesUntilReset, 168)
+    }
+
+    /// An account in TWO groups counts in both — membership is a set, not a
+    /// partition, unlike `breakdown`'s buckets.
+    func testAccountInTwoGroupsCountsInBoth() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .ok, groups: ["codereview", "dev"])
+        ])
+        XCTAssertEqual(
+            fleet.groupBreakdown,
+            [GroupTally(name: "codereview", free: 1, total: 1), GroupTally(name: "dev", free: 1, total: 1)]
+        )
+    }
+
+    /// A group with zero free accounts still appears, so a starved group is
+    /// visible rather than silently omitted.
+    func testGroupWithZeroFreeStillAppears() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .spent, groups: ["codereview"])
+        ])
+        XCTAssertEqual(fleet.groupBreakdown, [GroupTally(name: "codereview", free: 0, total: 1)])
+    }
+
+    /// The `ungrouped` bucket is synthetic, appears LAST, and only when at
+    /// least one account carries no label.
+    func testUngroupedBucketPresentAndLast() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .ok, groups: ["dev"]),
+            account("b@example.com", state: .ok, groups: nil),
+        ])
+        XCTAssertEqual(
+            fleet.groupBreakdown,
+            [GroupTally(name: "dev", free: 1, total: 1), GroupTally(name: "ungrouped", free: 1, total: 1)]
+        )
+        XCTAssertEqual(fleet.groupBreakdownLabel, "dev 1/1 · ungrouped 1/1")
+    }
+
+    /// Groups sort alphabetically before `ungrouped`, so the rendering is
+    /// deterministic.
+    func testGroupsSortAlphabeticallyBeforeUngrouped() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .ok, groups: ["zebra"]),
+            account("b@example.com", state: .ok, groups: ["alpha"]),
+            account("c@example.com", state: .ok, groups: nil),
+        ])
+        XCTAssertEqual(fleet.groupBreakdown.map(\.name), ["alpha", "zebra", "ungrouped"])
+    }
+
+    /// `total` counts DISABLED accounts too — group membership is config, not
+    /// a serving fact — but `free` excludes them.
+    func testTotalCountsDisabledFreeDoesNot() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .ok, groups: ["dev"]),
+            account("b@example.com", state: .ok, disabled: true, groups: ["dev"]),
+        ])
+        XCTAssertEqual(fleet.groupBreakdown, [GroupTally(name: "dev", free: 1, total: 2)])
+    }
+
+    /// A `.near` account still serves, so it counts as free exactly as it does
+    /// in the top-line breakdown.
+    func testNearAccountCountsAsFree() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .near, groups: ["dev"])
+        ])
+        XCTAssertEqual(fleet.groupBreakdown, [GroupTally(name: "dev", free: 1, total: 1)])
+    }
+
+    /// A fleet where no account anywhere carries a label renders NOTHING at
+    /// all — not an all-`ungrouped` line.
+    func testEmptyWhenNoAccountAnywhereCarriesALabel() {
+        let fleet = Fleet(accounts: [
+            account("a@example.com", state: .ok, groups: nil),
+            account("b@example.com", state: .ok, groups: []),
+        ])
+        XCTAssertEqual(fleet.groupBreakdown, [])
+        XCTAssertEqual(fleet.groupBreakdownLabel, "")
     }
 
     func testDisabledAccountsAreNeverCapacity() {
