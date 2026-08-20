@@ -890,21 +890,21 @@ fn quota_state_token(state: QuotaState) -> &'static str {
 }
 
 /// Render one quota window as a `key=value` token: `5h=100%(+93m)`, `wk=67%`, or
-/// `5h=n/a`. The inline `(+countdown)` appears ONLY when the window is a binding
-/// hold — util known, at/over its threshold, and a future reset to count down to.
+/// `5h=n/a`. The inline `(+countdown)` appears whenever the window has a live
+/// (future) reset — a window's reset is a property of the window, not of
+/// whether it is currently a binding hold, so it is no longer gated on the
+/// account's threshold.
 fn render_window(
     label: &str,
     util: Option<f64>,
     reset: Option<OffsetDateTime>,
-    threshold: f64,
     now: OffsetDateTime,
 ) -> String {
     match util {
         None => format!("{label}=n/a"),
         Some(u) => {
-            let held = u >= threshold && reset.is_some_and(|r| r > now);
-            let hold = match (held, reset) {
-                (true, Some(r)) => format!("({})", format_reset_countdown(r, now)),
+            let hold = match reset {
+                Some(r) if r > now => format!("({})", format_reset_countdown(r, now)),
                 _ => String::new(),
             };
             format!("{label}={:.0}%{hold}", u * 100.0)
@@ -982,22 +982,21 @@ fn cache_hit_ratio(a: &AccountSnapshot, source: StatusSource) -> Option<f64> {
 /// `source` is taken rather than inferred because one token depends on it:
 /// `stream_errors` is a SERVING counter, so an offline snapshot's zero is
 /// structurally unmeasured (see [`StatusSource`]) and renders `n/a`, never `0`.
-pub fn render_accounts(
-    snapshot: &StatsSnapshot,
-    thresholds: &[f64],
-    source: StatusSource,
-) -> String {
+///
+/// Takes no per-account threshold: the inline `(+countdown)` on each window
+/// token is now a function of "does this window have a live reset", not of
+/// whether it is a binding hold, so there is nothing left in this renderer to
+/// gate on it. `held_windows`/`held[]` (JSON) keep their own threshold — a
+/// different question this text line never answered.
+pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String {
     if snapshot.accounts.is_empty() {
         return "no accounts configured\n".to_string();
     }
     let now = OffsetDateTime::now_utc();
     let mut out = String::new();
-    for (i, a) in snapshot.accounts.iter().enumerate() {
-        // A missing threshold (slice shorter than accounts) can only fail closed:
-        // 1.0 means "only a fully-exhausted window reads as held", never a false hold.
-        let threshold = thresholds.get(i).copied().unwrap_or(1.0);
-        let five_hour = render_window("5h", a.five_hour, a.five_hour_reset, threshold, now);
-        let seven_day = render_window("wk", a.seven_day, a.seven_day_reset, threshold, now);
+    for a in snapshot.accounts.iter() {
+        let five_hour = render_window("5h", a.five_hour, a.five_hour_reset, now);
+        let seven_day = render_window("wk", a.seven_day, a.seven_day_reset, now);
         // Fable's model-scoped weekly never gates the general view: no reset field,
         // no countdown, and the whole token is omitted when it was never learned.
         let fable = match a.seven_day_oi {
@@ -1338,7 +1337,6 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
-    let thresholds = resolve_thresholds(&config);
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -1349,10 +1347,7 @@ pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()
     // `tcr accounts` is the offline verb by construction — it builds its own
     // Manager and never asks the server — so its serving counters are structurally
     // zero and must render as unmeasured, not as a measurement.
-    print!(
-        "{}",
-        render_accounts(&snapshot, &thresholds, StatusSource::Offline)
-    );
+    print!("{}", render_accounts(&snapshot, StatusSource::Offline));
     Ok(())
 }
 
@@ -1635,7 +1630,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             build_fields(server_build.as_ref()),
             http1_only,
         );
-        print!("{}", render_accounts(&snapshot, &thresholds, source));
+        print!("{}", render_accounts(&snapshot, source));
     }
     Ok(())
 }
@@ -2243,7 +2238,6 @@ mod tests {
     #[tokio::test]
     async fn render_accounts_emits_one_greppable_line_per_account() {
         let config = load_from(TWO_ACCOUNTS);
-        let thresholds = resolve_thresholds(&config);
         let snapshot = snapshot_offline(
             config,
             Arc::new(NoRefresh),
@@ -2255,7 +2249,7 @@ mod tests {
         // and it is the exact line shape `tcr accounts` emits — that verb is
         // offline by construction, so this is the greppable line a human reads
         // most often.
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
+        let text = render_accounts(&snapshot, StatusSource::Offline);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "one line per account");
         // Each line is greppable: name + priority + per-window utilization.
@@ -2270,11 +2264,14 @@ mod tests {
         assert!(lines[0].contains("state=ok"), "healthy state: {}", lines[0]);
         assert!(lines[1].contains("bob@example.com"));
         assert!(lines[1].contains("priority=1"));
-        // At 25% util no window is a binding hold → no inline countdown, and the
-        // legacy `held=`/`quota=`/`quota_state=` fields are gone for good.
+        // At 25% util no window is a binding hold, but it still has a live
+        // reset — and a window's reset is a property of the window, not of
+        // whether it is pinning the account, so the inline countdown still
+        // shows. The legacy `held=`/`quota=`/`quota_state=` fields are gone
+        // for good.
         assert!(
-            !text.contains("(+"),
-            "under-threshold accounts show no countdown: {text}"
+            text.contains("5h=25%(+"),
+            "under-threshold accounts still carry their window's countdown: {text}"
         );
         assert!(
             !text.contains("held=") && !text.contains("quota="),
@@ -2379,7 +2376,7 @@ mod tests {
         );
 
         // The human view uses the same `n/a` idiom the unknown quota windows use.
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
+        let text = render_accounts(&snapshot, StatusSource::Offline);
         for line in text.lines() {
             assert!(
                 line.contains("cache=n/a"),
@@ -2388,7 +2385,7 @@ mod tests {
             assert!(!line.contains("cache=0%"), "no false measured zero: {line}");
         }
         assert!(
-            render_accounts(&counted, &thresholds, StatusSource::Live).contains("cache=75%"),
+            render_accounts(&counted, StatusSource::Live).contains("cache=75%"),
             "a measured ratio still renders as a percentage"
         );
     }
@@ -2445,7 +2442,7 @@ mod tests {
             rows[0]
         );
 
-        let text = render_accounts(&sparse, &thresholds, StatusSource::Live);
+        let text = render_accounts(&sparse, StatusSource::Live);
         let line = text
             .lines()
             .find(|l| l.contains(&sparse.accounts[0].name))
@@ -2545,7 +2542,7 @@ mod tests {
         );
 
         // The text view carries the same three states as greppable tokens.
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
+        let text = render_accounts(&snapshot, StatusSource::Offline);
         for line in text.lines() {
             assert!(
                 line.contains("stream_errors=n/a"),
@@ -2557,10 +2554,10 @@ mod tests {
             );
         }
         assert!(
-            render_accounts(&snapshot, &thresholds, StatusSource::Live).contains("stream_errors=0"),
+            render_accounts(&snapshot, StatusSource::Live).contains("stream_errors=0"),
             "a measured clean fleet still renders a real 0"
         );
-        let text = render_accounts(&errored, &thresholds, StatusSource::Live);
+        let text = render_accounts(&errored, StatusSource::Live);
         assert!(
             text.contains("stream_errors=3"),
             "the count is greppable: {text}"
@@ -2909,13 +2906,12 @@ mod tests {
         let path = write_config("expired", EXPIRED_ACCOUNT);
         let before = fs::read_to_string(&path).unwrap();
         let config = load(&path);
-        let thresholds = resolve_thresholds(&config);
         let calls = Arc::new(AtomicU64::new(0));
         let refresher = Arc::new(RecordingRefresher {
             calls: calls.clone(),
         });
         let snapshot = snapshot_offline(config, refresher, Arc::new(RejectingProber), true).await;
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Offline);
+        let text = render_accounts(&snapshot, StatusSource::Offline);
         assert!(
             text.contains("stale@example.com"),
             "renders the account: {text}"
@@ -2979,7 +2975,7 @@ mod tests {
         let thresholds = resolve_thresholds(&config);
         let gated =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
-        let text = render_accounts(&gated, &thresholds, StatusSource::Live);
+        let text = render_accounts(&gated, StatusSource::Live);
         for line in text.lines() {
             assert!(
                 line.contains("free_in="),
@@ -3008,7 +3004,6 @@ mod tests {
         // OMITTED, never rendered as zero — `free_in=0s` would read as "returns
         // now", which is the same false promise `free_at = None` exists to avoid.
         let config = load_from(TWO_ACCOUNTS);
-        let thresholds = resolve_thresholds(&config);
         let open = snapshot_offline(
             config,
             Arc::new(NoRefresh),
@@ -3016,7 +3011,7 @@ mod tests {
             true,
         )
         .await;
-        let text = render_accounts(&open, &thresholds, StatusSource::Live);
+        let text = render_accounts(&open, StatusSource::Live);
         assert!(
             !text.contains("free_in="),
             "an account in rotation promises nothing: {text}"
@@ -3072,7 +3067,7 @@ mod tests {
         let thresholds = resolve_thresholds(&config);
         let snapshot =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Live);
+        let text = render_accounts(&snapshot, StatusSource::Live);
         let alice = text
             .lines()
             .find(|l| l.contains("alice@example.com"))
@@ -3286,6 +3281,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn render_accounts_text_carries_countdown_for_a_below_threshold_window() {
+        // The text-line half of the same restored invariant: a window well
+        // under its threshold still has a live reset, so the greppable status
+        // line must carry its `(+countdown)` even though the window never
+        // binds a hold.
+        let config = load_from(TWO_ACCOUNTS);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(BelowThresholdWindowProber),
+            true,
+        )
+        .await;
+        let text = render_accounts(&snapshot, StatusSource::Live);
+        let alice = text
+            .lines()
+            .find(|l| l.contains("alice@example.com"))
+            .expect("alice line");
+        assert!(
+            alice.contains("5h=30%(+"),
+            "below-threshold window still carries a countdown: {alice}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_accounts_text_omits_countdown_when_no_live_reset_exists() {
+        let config = load_from(TWO_ACCOUNTS);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(BelowThresholdWindowProber),
+            true,
+        )
+        .await;
+        let text = render_accounts(&snapshot, StatusSource::Live);
+        let bob = text
+            .lines()
+            .find(|l| l.contains("bob@example.com"))
+            .expect("bob line");
+        // bob's 5h window was never learned at all: n/a, no `(+…)` token.
+        assert!(bob.contains("5h=n/a"), "unlearned window reads n/a: {bob}");
+        assert!(
+            !bob.contains("5h=n/a("),
+            "no countdown token on an unlearned window: {bob}"
+        );
+    }
+
     /// A prober that drives every account's 5h window fully over the 1.0
     /// exhaustion line, with a future reset — so the window binds and reads `spent`.
     struct ExhaustedProber;
@@ -3308,10 +3351,9 @@ mod tests {
     #[tokio::test]
     async fn render_accounts_marks_fully_exhausted_account_as_spent_with_countdown() {
         let config = load_from(TWO_ACCOUNTS);
-        let thresholds = resolve_thresholds(&config);
         let snapshot =
             snapshot_offline(config, Arc::new(NoRefresh), Arc::new(ExhaustedProber), true).await;
-        let text = render_accounts(&snapshot, &thresholds, StatusSource::Live);
+        let text = render_accounts(&snapshot, StatusSource::Live);
         let line = text
             .lines()
             .find(|l| l.contains("alice@example.com"))
