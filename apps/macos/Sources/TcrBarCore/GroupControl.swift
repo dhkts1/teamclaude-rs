@@ -33,6 +33,29 @@ public enum GroupCommand {
         ["group", "rm", group, "--all"]
     }
 
+    /// Shell-quotes a single argument for a copy-pasteable command line.
+    /// Left bare when it is already safe unquoted (an email like
+    /// `alice@example.com` reads better that way) — otherwise wrapped in
+    /// single quotes with any embedded single quote escaped the POSIX way.
+    /// The function must not simply assume an account name is safe: this is
+    /// the one place that decides, not the call site.
+    public static func shellQuote(_ argument: String) -> String {
+        let safe = argument.range(of: "^[A-Za-z0-9_.@%+=:,/-]+$", options: .regularExpression) != nil
+        if safe { return argument }
+        let escaped = argument.replacingOccurrences(of: "'", with: "'\\''")
+        return "'\(escaped)'"
+    }
+
+    /// The full command line a user can paste into a shell, e.g.
+    /// `tcr group rm dev henry2@example.com`. Built by quoting the SAME argv
+    /// an actual call runs — ``removeArguments(group:account:)`` and friends
+    /// — never formatted from the group/account strings a second time, so
+    /// this text and the action sitting next to it in the menu can never
+    /// drift apart.
+    public static func commandLine(arguments: [String]) -> String {
+        (["tcr"] + arguments).map(shellQuote).joined(separator: " ")
+    }
+
     /// Why a group command did not happen. Carries `tcr`'s own words verbatim,
     /// same posture as ``AccountCommand/Failure``.
     public struct Failure: Error, Equatable, Sendable {
@@ -118,6 +141,43 @@ public enum GroupNameValidation {
         case .empty: return "Group name cannot be empty."
         case .controlCharacter: return "Group name cannot contain control characters."
         case .aboveLatin1: return "Group name cannot contain characters above U+00FF."
+        }
+    }
+}
+
+/// Whether a typed name can be used to CREATE a new group — the CLI's
+/// character rule, plus one more check only this call site needs: since a
+/// group exists only while some account carries its label, "create a group"
+/// and "add this account to an existing group" are the same server call
+/// (`GroupCommand.addArguments`). Typing a name that already names a group
+/// must not be allowed to silently take that second path — the account would
+/// join an existing group while the operator believes they made a new one.
+public enum NewGroupName: Equatable, Sendable {
+    case rejected(GroupNameValidation.Failure)
+    case duplicate
+    case valid(String)
+
+    /// `existingGroups` is the fleet-wide set, not just this account's own —
+    /// the whole point is to catch a name that already belongs to someone
+    /// else's membership.
+    public static func evaluate(_ raw: String, existingGroups: Set<String>) -> NewGroupName {
+        if let failure = GroupNameValidation.validate(raw) {
+            return .rejected(failure)
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if existingGroups.contains(trimmed) {
+            return .duplicate
+        }
+        return .valid(trimmed)
+    }
+
+    /// `nil` when the name is usable; otherwise the reason, safe to render
+    /// beside the text field.
+    public var rejectionMessage: String? {
+        switch self {
+        case .rejected(let failure): return GroupNameValidation.message(for: failure)
+        case .duplicate: return "A group named that already exists."
+        case .valid: return nil
         }
     }
 }

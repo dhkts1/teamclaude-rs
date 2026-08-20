@@ -1057,9 +1057,7 @@ struct AccountRow: View {
         }
         Divider()
         Button("Copy Account Name") {
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.setString(account.name, forType: .string)
+            copyToPasteboard(account.name)
         }
         Divider()
         groupMenuItems
@@ -1079,6 +1077,11 @@ struct AccountRow: View {
             case .remove(let group):
                 Button("Remove from \(group)") {
                     Task { await groupController.remove(account: account.name, from: group) }
+                }
+                Button("Copy tcr group Command") {
+                    copyToPasteboard(
+                        GroupCommand.commandLine(
+                            arguments: GroupCommand.removeArguments(group: group, account: account.name)))
                 }
             case .removeAll:
                 Button("Remove from all groups") {
@@ -1105,13 +1108,15 @@ struct AccountRow: View {
         return everyGroup.subtracting(existing).sorted()
     }
 
+    /// Never disabled, unlike before this round: "New group…" is always a
+    /// usable entry even for a fleet with no groups at all yet, which is the
+    /// exact gap this menu exists to close.
     @ViewBuilder
     private var addToGroupMenu: some View {
-        if candidateGroupsToAdd.isEmpty {
-            Button("Add to group…") {}
-                .disabled(true)
-        } else {
-            Menu("Add to group…") {
+        Menu("Add to group…") {
+            Button("New group…") { presentNewGroupPrompt() }
+            if !candidateGroupsToAdd.isEmpty {
+                Divider()
                 ForEach(candidateGroupsToAdd, id: \.self) { group in
                     Button(group) {
                         Task { await groupController.add(account: account.name, to: group) }
@@ -1119,6 +1124,58 @@ struct AccountRow: View {
                 }
             }
         }
+    }
+
+    /// Every group anywhere in the fleet, not just this account's own —
+    /// what ``NewGroupName/evaluate(_:existingGroups:)`` checks a typed name
+    /// against so creating a group can never silently become a plain add
+    /// into one that already exists.
+    private var everyGroupFleetWide: Set<String> {
+        Set(allAccounts.flatMap { $0.groups ?? [] })
+    }
+
+    /// Prompts for a new group's name with the same accessory-text-field
+    /// `NSAlert` shape as ``confirmTakeover()`` elsewhere in this file —
+    /// there is no other text-entry affordance in this panel to reuse.
+    /// Re-prompts on an invalid or duplicate name so a typo does not have to
+    /// be re-triggered from the context menu; Escape or Cancel back out with
+    /// no call made.
+    private func presentNewGroupPrompt() {
+        let alert = NSAlert()
+        alert.messageText = "New group"
+        alert.informativeText = "This account is added to the group as soon as it's created."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        field.placeholderString = "Group name"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        let create = alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.last?.keyEquivalent = "\u{1b}"
+        create.keyEquivalent = "\r"
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let typed = field.stringValue
+        let outcome = NewGroupName.evaluate(typed, existingGroups: everyGroupFleetWide)
+        switch outcome {
+        case .valid(let name):
+            Task { await groupController.add(account: account.name, to: name) }
+        case .rejected, .duplicate:
+            let failureAlert = NSAlert()
+            failureAlert.alertStyle = .warning
+            failureAlert.messageText = "Can't create that group"
+            failureAlert.informativeText = outcome.rejectionMessage ?? "That name isn't usable."
+            failureAlert.addButton(withTitle: "OK")
+            failureAlert.runModal()
+        }
+    }
+
+    /// Shared by "Copy Account Name" and the per-group command copy — one
+    /// place that clears then sets, so every copy in this menu behaves the
+    /// same way.
+    private func copyToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 
     /// The one place `tcr control` is actually run for this row — set when
