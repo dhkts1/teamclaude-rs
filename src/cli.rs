@@ -1192,6 +1192,21 @@ fn render_accounts_json(
                 "sevenDayState": a.seven_day.map(|u| {
                     quota_state_token(crate::stats::QuotaState::from_utilization(Some(u), threshold))
                 }),
+                // A window's reset is a property of the window, not of whether
+                // it is currently pinning the account — UNCONDITIONAL, no
+                // threshold gate. `held[]` below stays exactly as it is; it
+                // answers a different question ("which window is holding this
+                // account out of rotation"). `null` — never `0`, never a
+                // fabricated instant — is the same "not measured" idiom as
+                // `serverSha`/`cacheHitRatio`/`fiveHourState` above, and
+                // collapses two distinct honest cases: the window's reset has
+                // already elapsed with nothing learned since, or no reset was
+                // ever learned. No `minutesUntilReset` companion (unlike
+                // `held[]`) — a server-computed relative figure goes stale
+                // between polls, so the client derives the countdown from the
+                // timestamp against its own clock instead.
+                "fiveHourResetAtMs": a.five_hour_reset.map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
+                "sevenDayResetAtMs": a.seven_day_reset.map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
                 // `null` — NEVER `0` — on the OFFLINE path, same idiom as
                 // `streamErrorCount`/`cacheHitRatio` below and for the same
                 // reason: these four are pure serving counters that live in
@@ -3108,6 +3123,166 @@ mod tests {
         assert!(
             json.contains("minutesUntilReset"),
             "json carries the countdown: {json}"
+        );
+    }
+
+    /// A prober that puts alice's 5h window comfortably BELOW her threshold (a
+    /// live reset that was previously invisible on the wire), and leaves bob's
+    /// 5h window entirely unlearned (no live reset at all — the other
+    /// invisible case).
+    struct BelowThresholdWindowProber;
+    impl UsageProber for BelowThresholdWindowProber {
+        fn probe(&self, access_token: String) -> ProbeFuture {
+            let now = crate::now_ms();
+            Box::pin(async move {
+                if access_token == "at-a" {
+                    Ok(Usage {
+                        five_hour: Some(UsageBucket {
+                            utilization: Some(0.3),
+                            reset_at_ms: Some(now + 42 * 60 * 1000),
+                        }),
+                        seven_day: None,
+                        seven_day_oi: None,
+                    })
+                } else {
+                    Ok(Usage {
+                        five_hour: None,
+                        seven_day: None,
+                        seven_day_oi: None,
+                    })
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn render_accounts_json_carries_reset_for_a_below_threshold_window() {
+        // This is the exact case the fix restores: a window well under its
+        // threshold (so it never appears in `held[]`) still has a live reset,
+        // and that reset must now reach the JSON wire unconditionally.
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(BelowThresholdWindowProber),
+            true,
+        )
+        .await;
+
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("json is a bare array");
+        let alice_row = rows
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        // 0.3 is far under the 0.9 default threshold, so alice's 5h window is
+        // never a binding hold, yet its reset must still reach the wire.
+        assert!(
+            alice_row["fiveHourResetAtMs"].is_i64(),
+            "below-threshold window's reset reaches the wire: {alice_row}"
+        );
+        // The below-threshold window never binds, so it is absent from `held[]`
+        // even though its reset is now unconditionally on the wire.
+        assert!(
+            alice_row["held"]
+                .as_array()
+                .expect("held is an array")
+                .is_empty(),
+            "held[] stays empty for a non-binding window: {alice_row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_accounts_json_omits_reset_when_no_live_reset_exists() {
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot = snapshot_offline(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(BelowThresholdWindowProber),
+            true,
+        )
+        .await;
+
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("json is a bare array");
+        let bob_row = rows
+            .iter()
+            .find(|r| r["name"] == "bob@example.com")
+            .expect("bob row");
+        assert_eq!(
+            bob_row["fiveHourResetAtMs"],
+            serde_json::Value::Null,
+            "no live reset renders as null, never 0 or a fabricated instant: {bob_row}"
+        );
+        assert_eq!(
+            bob_row["sevenDayResetAtMs"],
+            serde_json::Value::Null,
+            "no live reset renders as null, never 0 or a fabricated instant: {bob_row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn render_accounts_json_held_array_is_unchanged_for_over_threshold_account() {
+        // The additive claim, asserted rather than assumed: adding the two new
+        // reset fields must not change a single byte of the existing `held[]`
+        // shape for an account whose window WAS already binding.
+        let config = load_from(TWO_ACCOUNTS);
+        let thresholds = resolve_thresholds(&config);
+        let snapshot =
+            snapshot_offline(config, Arc::new(NoRefresh), Arc::new(WindowProber), true).await;
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+        );
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&json).expect("json is a bare array");
+        let alice_row = rows
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        let held = alice_row["held"].as_array().expect("held is an array");
+        assert_eq!(
+            held.len(),
+            1,
+            "alice's 5h window is the sole hold: {held:?}"
+        );
+        let entry = &held[0];
+        assert_eq!(entry["window"], "5h");
+        assert!(
+            entry["resetAtMs"].is_i64(),
+            "held entry keeps resetAtMs: {entry}"
+        );
+        assert!(
+            entry["minutesUntilReset"].is_i64(),
+            "held entry keeps minutesUntilReset: {entry}"
+        );
+        // held[]'s own two keys are unaffected by the new top-level fields.
+        assert_eq!(
+            entry.as_object().expect("held entry is an object").len(),
+            3,
+            "held entry shape (window/resetAtMs/minutesUntilReset) is unchanged: {entry}"
         );
     }
 
