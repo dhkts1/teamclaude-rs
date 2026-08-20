@@ -119,6 +119,21 @@ final class RealWorldDecodeTests: XCTestCase {
         )
     }
 
+    /// `realWorldFixture` predates `fiveHourResetAtMs`/`sevenDayResetAtMs` — it
+    /// has neither key, the shape an older `tcr` this newer TcrBar talks to
+    /// would still emit. Both fields must decode to `nil`, not throw.
+    func testMissingResetAtMsFieldsDecodeToNilNotAThrow() throws {
+        let fleet = try fleet()
+        XCTAssertTrue(
+            fleet.unreadable.isEmpty,
+            "an older tcr without the reset fields must still decode every row"
+        )
+        for account in fleet.accounts {
+            XCTAssertNil(account.fiveHourResetAtMs)
+            XCTAssertNil(account.sevenDayResetAtMs)
+        }
+    }
+
     /// One null field must not cost the other rows. Before per-row decoding, the
     /// array decoded atomically and a single null erased all thirteen accounts.
     func testTheNeverProbedRowKeepsItsNullsAndCostsNoOtherRow() throws {
@@ -298,6 +313,9 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertTrue(ok.hasQuotaEvidence)
         XCTAssertTrue(ok.isReady)
         XCTAssertTrue(ok.held.isEmpty)
+        // A row WITH the new per-window reset fields populates them.
+        XCTAssertEqual(ok.fiveHourResetAtMs, 1_767_225_600_000)
+        XCTAssertEqual(ok.sevenDayResetAtMs, 1_767_312_000_000)
 
         // `near`: the only shape carrying the nested `held` objects.
         let near = try XCTUnwrap(byName["bob@example.com"])

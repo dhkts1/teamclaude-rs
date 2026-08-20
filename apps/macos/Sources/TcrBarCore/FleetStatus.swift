@@ -307,6 +307,28 @@ public enum QuotaFormat {
         guard let value else { return .unmeasured }
         return .measured(min(max(value, 0), 1))
     }
+
+    /// `"resets in 2h 14m"`, or nil when there is nothing to count down to.
+    ///
+    /// `nil` in → `nil` out — never a placeholder — the same house rule
+    /// ``percent(_:)`` states above: an absent measurement never renders as
+    /// a fabricated value. A reset at or before `now` also yields `nil`: the
+    /// Rust side only ever sends future resets, but a wire value can age
+    /// between poll and draw, so this formatter enforces the same "future
+    /// only" rule the server already applies, rather than trusting the wire.
+    /// Routes through ``HeldWindow/duration(minutes:)`` — the codebase's
+    /// single answer to "how long" — instead of growing a second duration
+    /// formatter. `now` is a required parameter, not a default, so every
+    /// test stays deterministic.
+    public static func resetCaption(resetAtMs: Int64?, now: Date) -> String? {
+        guard let resetAtMs else { return nil }
+        let resetAt = Date(timeIntervalSince1970: Double(resetAtMs) / 1000)
+        let seconds = resetAt.timeIntervalSince(now)
+        guard seconds > 0 else { return nil }
+        let minutes = Int((seconds / 60).rounded())
+        guard minutes > 0 else { return nil }
+        return "resets in \(HeldWindow.duration(minutes: minutes))"
+    }
 }
 
 /// One rate-limit window currently holding an account out of rotation.
@@ -459,6 +481,15 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// `nil` here falls back to the shared `quotaState` tint for that bar.
     public let fiveHourState: QuotaState?
     public let sevenDayState: QuotaState?
+    /// Each window's own reset instant, UNCONDITIONAL — carried whenever the
+    /// window has a live reset, regardless of whether it is currently a
+    /// binding hold (`held`, below, still gates on threshold and answers a
+    /// different question). `nil` both when the wire field is absent — an
+    /// older `tcr` this newer TcrBar talks to, same forward-compat contract
+    /// every other field in this struct follows — and when there is no live
+    /// reset to report (`src/cli.rs`'s `fiveHourResetAtMs`/`sevenDayResetAtMs`).
+    public let fiveHourResetAtMs: Int64?
+    public let sevenDayResetAtMs: Int64?
     public let held: [HeldWindow]
 
     /// Pure serving counters. `null` on the wire — and `nil` here, NEVER `0` —
@@ -516,6 +547,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         sevenDayOi: Double?,
         fiveHourState: QuotaState? = nil,
         sevenDayState: QuotaState? = nil,
+        fiveHourResetAtMs: Int64? = nil,
+        sevenDayResetAtMs: Int64? = nil,
         held: [HeldWindow],
         requests: Int?,
         inputTokens: Int?,
@@ -541,6 +574,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.sevenDayOi = sevenDayOi
         self.fiveHourState = fiveHourState
         self.sevenDayState = sevenDayState
+        self.fiveHourResetAtMs = fiveHourResetAtMs
+        self.sevenDayResetAtMs = sevenDayResetAtMs
         self.held = held
         self.requests = requests
         self.inputTokens = inputTokens

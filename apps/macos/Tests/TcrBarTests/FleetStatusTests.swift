@@ -512,6 +512,45 @@ final class QuotaFormatTests: XCTestCase {
         XCTAssertEqual(QuotaFormat.count(nil), "n/a")
         XCTAssertNotEqual(QuotaFormat.count(nil), "0")
     }
+
+    func testNilResetAtMsIsNeverAPlaceholderCaption() {
+        XCTAssertNil(QuotaFormat.resetCaption(resetAtMs: nil, now: Date()))
+    }
+
+    func testPastResetYieldsNilNotANegativeCaption() {
+        let now = Date()
+        let past = now.addingTimeInterval(-60)
+        XCTAssertNil(
+            QuotaFormat.resetCaption(resetAtMs: Int64(past.timeIntervalSince1970 * 1000), now: now)
+        )
+    }
+
+    func testResetCaptionMinutesTier() {
+        let now = Date()
+        let reset = now.addingTimeInterval(45 * 60)
+        XCTAssertEqual(
+            QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
+            "resets in 45m"
+        )
+    }
+
+    func testResetCaptionHoursAndMinutesTier() {
+        let now = Date()
+        let reset = now.addingTimeInterval((2 * 60 + 14) * 60)
+        XCTAssertEqual(
+            QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
+            "resets in 2h 14m"
+        )
+    }
+
+    func testResetCaptionDaysAndHoursTier() {
+        let now = Date()
+        let reset = now.addingTimeInterval((4 * 24 * 60 + 12 * 60) * 60)
+        XCTAssertEqual(
+            QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
+            "resets in 4d 12h"
+        )
+    }
 }
 
 /// Hand-built accounts for the capacity aggregates. Only the fields the

@@ -1204,6 +1204,22 @@ struct AccountRow: View {
                     // The number itself is unchanged — it is still true, just
                     // no longer reachable.
                     .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
+                // `Tok.inkFaint` ("tertiary text and hints" in this design
+                // system — see Tokens.swift), not `.secondary` — the
+                // percentage above is the primary fact on this line, and the
+                // countdown is context; it must not compete with the number.
+                // Demoted alongside `hasStaleQuotaReading` for the same
+                // reason the percentage is: one half of a line reading live
+                // and the other historical makes the row argue with itself.
+                if let caption = QuotaFormat.resetCaption(
+                    resetAtMs: account.fiveHourResetAtMs,
+                    now: Date()
+                ) {
+                    Text("· \(caption)")
+                        .font(Tok.secondaryFont)
+                        .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint)
+                        .lineLimit(1)
+                }
                 Spacer()
             }
             .padding(.top, Tok.tightSpacing)
@@ -1225,6 +1241,17 @@ struct AccountRow: View {
                     // live and the other historical would be its own new
                     // contradiction inside a single row.
                     .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
+                // Same inline placement and `Tok.inkFaint` demotion as the 5h
+                // caption above — see that comment for why.
+                if let caption = QuotaFormat.resetCaption(
+                    resetAtMs: account.sevenDayResetAtMs,
+                    now: Date()
+                ) {
+                    Text("· \(caption)")
+                        .font(Tok.secondaryFont)
+                        .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint)
+                        .lineLimit(1)
+                }
                 Spacer()
                 // `status` is the account's own field and it keeps saying
                 // "active" while `disabled` is true — verified against live
