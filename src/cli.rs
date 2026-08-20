@@ -33,6 +33,40 @@ use crate::probe::{LiveUsageProber, UsageProber};
 use crate::stats::{AccountSnapshot, QuotaState, StatsSnapshot};
 use crate::status::{StatusPayload, STATUS_KIND};
 
+/// Reject a group label whose CONTENT could corrupt header composition
+/// (`main.rs`'s `compose_group_header`) or a config write — a literal newline,
+/// any other control character, or a codepoint above U+00FF — and reject
+/// empty/whitespace-only.
+///
+/// The Phase 1 validator (moved here from `main.rs` so `tcr group add`'s
+/// surgical write and `tcr run --group`'s header composition share exactly one
+/// definition — two validators drift and then disagree). Defense in depth, not
+/// a fix for a live vulnerability: Claude Code's own header-value parser
+/// already hard-errors on a header value containing a line break, NUL, or a
+/// codepoint above U+00FF, so a bad label fails closed downstream today
+/// regardless of this check.
+///
+/// Returns the failing character class in `Err` (never the raw character —
+/// most of what this rejects is unprintable) so a call site can say exactly
+/// what was wrong.
+pub fn validate_group_label_chars(label: &str) -> Result<(), &'static str> {
+    if label.trim().is_empty() {
+        return Err("empty or whitespace-only");
+    }
+    for c in label.chars() {
+        if c == '\n' || c == '\r' {
+            return Err("contains a newline");
+        }
+        if c.is_control() {
+            return Err("contains a control character");
+        }
+        if (c as u32) > 0xFF {
+            return Err("contains a codepoint above U+00FF");
+        }
+    }
+    Ok(())
+}
+
 /// How to set an account's priority: an explicit integer, or a relative
 /// `--first` / `--last` that recomputes against the existing fleet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +230,252 @@ pub fn set_priority(
     })?;
     println!("Set priority of '{name}' to {value}.");
     Ok(())
+}
+
+/// Printed after every group mutation that actually changed the file. There is
+/// no live route to push a `groups` edit into a running proxy — it reads
+/// `groups` once, at boot, exactly like `disabled` before the live-control
+/// routes existed for it — so a successful `tcr group add`/`rm` that silently
+/// looked live would be the same class of bug `set_enabled`'s doc-comment
+/// describes: two accounts measured on the live fleet with a config saying one
+/// thing and the serving process doing another.
+const GROUP_RESTART_NOTE: &str = "note: the running proxy will not see this until it restarts";
+
+/// Resolve `name` to exactly one configured account by EXACT match on
+/// `Account.name` (which IS the email — see [`resolve_account`]'s doc-comment).
+///
+/// Deliberately not [`resolve_account`]: `tcr group add`/`rm`'s contract with
+/// the TcrBar panel (its argument shape is pinned, not ours to change) has no
+/// `--org` disambiguator, and an unknown name must list every configured
+/// account rather than [`resolve_account`]'s "no account matches" — the panel
+/// shells out blind and needs the full roster in the error to act on it.
+fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usize> {
+    match accounts.iter().position(|a| a.name == name) {
+        Some(idx) => Ok(idx),
+        None => {
+            let configured: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+            bail!(
+                "no account named '{name}' in the config. Configured accounts: {}",
+                configured.join(", ")
+            );
+        }
+    }
+}
+
+/// `tcr group add <group> <account>` — label `account` with `group`.
+///
+/// Idempotent: adding a label an account already carries succeeds and says so,
+/// so the panel can call it without first checking state. The group label
+/// itself is validated with [`validate_group_label_chars`] — the same Phase 1
+/// validator `tcr run --group` uses — because `add` is the one path that can
+/// put a fresh, attacker- or typo-controlled string into the config; `rm` must
+/// NOT run this check (see [`remove_from_group`]'s doc-comment).
+pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::Result<()> {
+    if let Err(reason) = validate_group_label_chars(group) {
+        bail!("group {group:?}: invalid group label — {reason}");
+    }
+    // Deliberately NOT `load_for_edit` — that helper's warning ("a proxy is
+    // already listening — it may overwrite this edit when it flushes the
+    // config on exit") describes a hazard THIS write does not have.
+    // `Manager::persist_now` flushes via `config::save_tokens`, not a whole
+    // `config::save` of its boot-time snapshot (see persist_now's and
+    // save_tokens' doc-comments) — it re-reads the CURRENT on-disk document
+    // at shutdown and merges in only the token fields, so a group label this
+    // surgical write already put on disk survives that flush untouched. The
+    // warning would be false on every ordinary run, and TcrBar calls this
+    // command with the proxy always up, which is exactly the case that makes
+    // a false-but-constant warning turn into wallpaper.
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let idx = find_account_by_name(&config.accounts, account)?;
+    let target = &config.accounts[idx];
+    let outcome = config::save_group_membership(config_path, target, group, true)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupWrite::Updated => {
+            println!("Added '{account}' to group '{group}'.");
+            println!("{GROUP_RESTART_NOTE}");
+        }
+        config::GroupWrite::Unchanged => {
+            println!("'{account}' is already in group '{group}'; nothing changed.");
+        }
+        config::GroupWrite::NoEntry => bail!(
+            "'{account}' vanished from {} between load and write (concurrent edit?) — nothing changed",
+            config_path.display()
+        ),
+        config::GroupWrite::Ambiguous => bail!(
+            "more than one entry in {} carries '{account}''s identity — nothing changed",
+            config_path.display()
+        ),
+    }
+    Ok(())
+}
+
+/// `tcr group rm <group> <account>` / `tcr group rm <group> --all` — remove
+/// `account`'s (or every member's, with `--all`) `group` label.
+///
+/// `account == None` iff `all` — clap's `ArgGroup` on `GroupRmArgs` refuses
+/// "both" and "neither" at parse time before this ever runs, so the `expect`
+/// below documents that invariant rather than guessing around it.
+///
+/// Deliberately does NOT run [`validate_group_label_chars`] on `group`: unlike
+/// `add`, `rm` must be able to remove a label that somehow got into the config
+/// with a bad character (hand-edited, or written by an older/buggy version) —
+/// refusing to remove a bad label would make it permanent.
+pub fn remove_from_group(
+    config_path: &Path,
+    group: &str,
+    account: Option<&str>,
+    all: bool,
+) -> anyhow::Result<()> {
+    // Same reasoning as `add_to_group`: no `load_for_edit` warning here either
+    // — `save_group_membership`'s surgical write survives the proxy's
+    // shutdown flush (`persist_now` -> `save_tokens`) for the same reason.
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+
+    if all {
+        let mut removed_from: Vec<String> = Vec::new();
+        for acct in &config.accounts {
+            if !acct.in_group(group) {
+                continue;
+            }
+            let outcome = config::save_group_membership(config_path, acct, group, false)
+                .with_context(|| format!("save config at {}", config_path.display()))?;
+            match outcome {
+                config::GroupWrite::Updated => removed_from.push(acct.name.clone()),
+                config::GroupWrite::Unchanged => {}
+                config::GroupWrite::NoEntry => bail!(
+                    "'{}' vanished from {} mid-removal (concurrent edit?) — {} account(s) already updated: {}",
+                    acct.name,
+                    config_path.display(),
+                    removed_from.len(),
+                    removed_from.join(", ")
+                ),
+                config::GroupWrite::Ambiguous => bail!(
+                    "more than one entry in {} carries '{}''s identity — {} account(s) already updated: {}",
+                    config_path.display(),
+                    acct.name,
+                    removed_from.len(),
+                    removed_from.join(", ")
+                ),
+            }
+        }
+        if removed_from.is_empty() {
+            println!("Group '{group}' has no members; nothing changed.");
+        } else {
+            println!(
+                "Removed group '{group}' from {} account(s): {}.",
+                removed_from.len(),
+                removed_from.join(", ")
+            );
+            println!("{GROUP_RESTART_NOTE}");
+        }
+        return Ok(());
+    }
+
+    // clap's ArgGroup on `GroupRmArgs` guarantees exactly one of
+    // `account`/`--all` — see this function's doc-comment.
+    let account = account.expect("clap guarantees `account` is Some when `all` is false");
+    let idx = find_account_by_name(&config.accounts, account)?;
+    let target = &config.accounts[idx];
+    let outcome = config::save_group_membership(config_path, target, group, false)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupWrite::Updated => {
+            println!("Removed '{account}' from group '{group}'.");
+            println!("{GROUP_RESTART_NOTE}");
+        }
+        config::GroupWrite::Unchanged => {
+            println!("'{account}' was not in group '{group}'; nothing changed.");
+        }
+        config::GroupWrite::NoEntry => bail!(
+            "'{account}' vanished from {} between load and write (concurrent edit?) — nothing changed",
+            config_path.display()
+        ),
+        config::GroupWrite::Ambiguous => bail!(
+            "more than one entry in {} carries '{account}''s identity — nothing changed",
+            config_path.display()
+        ),
+    }
+    Ok(())
+}
+
+/// `tcr group ls [--json]` — list every group and its members, plus the
+/// ungrouped count.
+///
+/// Read-only: plain [`config::load`], no clobber-warning (we never save).
+/// Text output is greppable, one line per group; an account in several groups
+/// appears under each — same on both paths.
+pub fn list_groups(config_path: &Path, json: bool) -> anyhow::Result<()> {
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    if json {
+        println!("{}", render_groups_json(&config)?);
+    } else {
+        print!("{}", render_groups_text(&config));
+    }
+    Ok(())
+}
+
+/// Group name -> the (in-order) names of every account carrying that label,
+/// plus the count of accounts carrying NO label at all. An account in several
+/// groups appears once per group it is in — this is the shared aggregation
+/// both [`render_groups_text`] and [`render_groups_json`] render from, so the
+/// two outputs can never disagree about which account is in which group.
+fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&str>>, usize) {
+    let mut groups: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    let mut ungrouped = 0usize;
+    for account in &config.accounts {
+        match account.groups.as_deref() {
+            Some(labels) if !labels.is_empty() => {
+                for label in labels {
+                    groups
+                        .entry(label.as_str())
+                        .or_default()
+                        .push(account.name.as_str());
+                }
+            }
+            _ => ungrouped += 1,
+        }
+    }
+    (groups, ungrouped)
+}
+
+/// `tcr group ls` text: one greppable line per group, then `ungrouped`.
+fn render_groups_text(config: &Config) -> String {
+    use std::fmt::Write as _;
+    let (groups, ungrouped) = group_membership(config);
+    let width = groups.keys().map(|g| g.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (group, members) in &groups {
+        let _ = writeln!(
+            out,
+            "group {group:width$} accounts={} members={}",
+            members.len(),
+            members.join(","),
+        );
+    }
+    let _ = writeln!(out, "ungrouped accounts={ungrouped}");
+    out
+}
+
+/// `tcr group ls --json`: the structured equivalent of [`render_groups_text`]
+/// for the TcrBar panel.
+fn render_groups_json(config: &Config) -> anyhow::Result<String> {
+    let (groups, ungrouped) = group_membership(config);
+    let rows: Vec<serde_json::Value> = groups
+        .iter()
+        .map(|(group, members)| {
+            serde_json::json!({
+                "group": group,
+                "accounts": members.len(),
+                "members": members,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({ "groups": rows, "ungrouped": ungrouped });
+    Ok(serde_json::to_string_pretty(&out)?)
 }
 
 /// Enable or disable the account matching `query`, **in the running proxy first**.
@@ -1804,6 +2084,237 @@ mod tests {
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
         fs::remove_file(&path).ok();
+    }
+
+    // --- group ---------------------------------------------------------
+
+    /// Three accounts: alice in two groups, bob in one (shared with alice),
+    /// carol in none — enough to cover multi-group membership, a shared
+    /// group, and an ungrouped account in one fixture. Carries `routes` (an
+    /// unmodelled top-level key) and per-account `models` (an unmodelled
+    /// per-account key) so a mutation's flatten round-trip can be checked
+    /// without a second fixture.
+    const GROUPED_ACCOUNTS: &str = r#"{
+      "proxy": { "port": 3456 },
+      "quotaProbeSeconds": 120,
+      "routes": [{ "name": "r1", "match": "*fable*" }],
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "orgName": "Org A",
+          "orgUuid": "uuid-a", "accessToken": "at-a", "refreshToken": "rt-a",
+          "expiresAt": 1893456000000, "priority": 0,
+          "groups": ["codereview", "dev"], "models": ["opus"] },
+        { "name": "bob@example.com", "type": "oauth", "orgName": "Org B",
+          "orgUuid": "uuid-b", "accessToken": "at-b", "refreshToken": "rt-b",
+          "expiresAt": 1893456000000, "priority": 1,
+          "groups": ["codereview"] },
+        { "name": "carol@example.com", "type": "oauth", "orgName": "Org C",
+          "orgUuid": "uuid-c", "accessToken": "at-c", "refreshToken": "rt-c",
+          "expiresAt": 1893456000000, "priority": 2 }
+      ]
+    }"#;
+
+    #[test]
+    fn group_add_labels_named_account_and_leaves_siblings_byte_identical() {
+        let path = write_config("group-add", TWO_ACCOUNTS);
+        add_to_group(&path, "codereview", "alice@example.com").unwrap();
+        let config = load(&path);
+        assert_eq!(
+            config.accounts[0].groups,
+            Some(vec!["codereview".to_string()])
+        );
+        // bob is untouched — same identity fields, still no `groups` key.
+        assert_eq!(config.accounts[1].name, "bob@example.com");
+        assert_eq!(config.accounts[1].groups, None);
+        let raw = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            value["accounts"][1].get("groups").is_none(),
+            "bob's raw JSON entry must not gain a groups key: {value}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_add_twice_is_idempotent() {
+        let path = write_config("group-add-twice", TWO_ACCOUNTS);
+        add_to_group(&path, "codereview", "alice@example.com").unwrap();
+        add_to_group(&path, "codereview", "alice@example.com").unwrap();
+        let config = load(&path);
+        assert_eq!(
+            config.accounts[0].groups,
+            Some(vec!["codereview".to_string()]),
+            "adding the same label twice must not duplicate it"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_rm_removes_only_named_label_leaving_others_intact() {
+        let path = write_config("group-rm-one", GROUPED_ACCOUNTS);
+        remove_from_group(&path, "codereview", Some("alice@example.com"), false).unwrap();
+        let config = load(&path);
+        assert_eq!(config.accounts[0].groups, Some(vec!["dev".to_string()]));
+        // bob still carries codereview — only alice's membership changed.
+        assert_eq!(
+            config.accounts[1].groups,
+            Some(vec!["codereview".to_string()])
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_rm_all_clears_label_from_every_member_and_nothing_else() {
+        let path = write_config("group-rm-all", GROUPED_ACCOUNTS);
+        remove_from_group(&path, "codereview", None, true).unwrap();
+        let config = load(&path);
+        // alice keeps `dev`, loses `codereview`.
+        assert_eq!(config.accounts[0].groups, Some(vec!["dev".to_string()]));
+        // bob had only `codereview` — the key drops entirely (not `[]`).
+        assert_eq!(config.accounts[1].groups, None);
+        // carol was never in it and stays untouched.
+        assert_eq!(config.accounts[2].groups, None);
+        // No other field moved — priorities and identities intact.
+        assert_eq!(config.accounts[0].priority, Some(0));
+        assert_eq!(config.accounts[1].priority, Some(1));
+        assert_eq!(config.accounts[2].priority, Some(2));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_rm_all_on_a_group_with_no_members_is_a_success_no_op() {
+        let path = write_config("group-rm-all-empty", GROUPED_ACCOUNTS);
+        let before = fs::read_to_string(&path).unwrap();
+        remove_from_group(&path, "nonexistent-group", None, true).unwrap();
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "an --all on an empty group must write nothing"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_add_unknown_account_errors_and_names_the_configured_accounts() {
+        let path = write_config("group-add-unknown", GROUPED_ACCOUNTS);
+        let err = add_to_group(&path, "codereview", "nobody@example.com").unwrap_err();
+        let message = err.to_string();
+        for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
+            assert!(
+                message.contains(name),
+                "unknown-account error must name every configured account, missing {name}: {message}"
+            );
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_rm_unknown_account_errors_and_names_the_configured_accounts() {
+        let path = write_config("group-rm-unknown", GROUPED_ACCOUNTS);
+        let err =
+            remove_from_group(&path, "codereview", Some("nobody@example.com"), false).unwrap_err();
+        let message = err.to_string();
+        for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
+            assert!(message.contains(name), "missing {name}: {message}");
+        }
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_add_rejects_bad_label_but_rm_still_accepts_it() {
+        // A control character somehow already in the config (hand-edited, or
+        // written by an older/buggy version) — `rm` must be able to strip it.
+        let with_bad_label = r#"{
+          "proxy": { "port": 3456 },
+          "accounts": [
+            { "name": "alice@example.com", "type": "oauth",
+              "accessToken": "at-a", "priority": 0,
+              "groups": ["good", "bad\u0000label"] }
+          ]
+        }"#;
+        let bad_label = "bad\u{0}label";
+
+        let path = write_config("group-add-bad-label", with_bad_label);
+        let err = add_to_group(&path, bad_label, "alice@example.com").unwrap_err();
+        assert!(
+            err.to_string().contains("control character"),
+            "add must name the character class at fault: {err}"
+        );
+        // Nothing was written by the rejected `add`.
+        let config = load(&path);
+        assert_eq!(
+            config.accounts[0].groups,
+            Some(vec!["good".to_string(), bad_label.to_string()])
+        );
+
+        // `rm` does NOT run the validator — it must still remove the bad label.
+        remove_from_group(&path, bad_label, Some("alice@example.com"), false).unwrap();
+        let config = load(&path);
+        assert_eq!(config.accounts[0].groups, Some(vec!["good".to_string()]));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_mutation_preserves_unmodelled_extra_keys() {
+        let path = write_config("group-extra", GROUPED_ACCOUNTS);
+        add_to_group(&path, "burst", "carol@example.com").unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        // Top-level unmodelled key.
+        assert!(
+            value["routes"].is_array(),
+            "top-level `routes` must survive: {value}"
+        );
+        assert_eq!(value["quotaProbeSeconds"], serde_json::json!(120));
+        // Per-account unmodelled key on an entry NOT even touched by this edit.
+        assert_eq!(value["accounts"][0]["models"], serde_json::json!(["opus"]));
+        fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn group_ls_json_lists_an_account_in_two_groups_under_both() {
+        let config = config::load(&write_config("group-ls-json", GROUPED_ACCOUNTS)).unwrap();
+        let rendered = render_groups_json(&config).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let groups = value["groups"].as_array().unwrap();
+        let codereview = groups
+            .iter()
+            .find(|g| g["group"] == "codereview")
+            .expect("codereview group must be present");
+        let members: Vec<&str> = codereview["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
+        assert!(
+            members.contains(&"alice@example.com"),
+            "alice is in codereview AND dev — she must appear under codereview too: {members:?}"
+        );
+        assert!(members.contains(&"bob@example.com"));
+        let dev = groups
+            .iter()
+            .find(|g| g["group"] == "dev")
+            .expect("dev group must be present");
+        let dev_members: Vec<&str> = dev["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m.as_str().unwrap())
+            .collect();
+        assert!(
+            dev_members.contains(&"alice@example.com"),
+            "alice must ALSO appear under dev: {dev_members:?}"
+        );
+        assert_eq!(value["ungrouped"], serde_json::json!(1)); // carol only
+    }
+
+    #[test]
+    fn group_ls_text_reports_ungrouped_count() {
+        let config = config::load(&write_config("group-ls-text", GROUPED_ACCOUNTS)).unwrap();
+        let rendered = render_groups_text(&config);
+        assert!(rendered.contains("ungrouped accounts=1"), "{rendered}");
+        assert!(rendered.contains("group codereview"), "{rendered}");
+        assert!(rendered.contains("group dev"), "{rendered}");
     }
 
     // --- enable / disable --------------------------------------------------
