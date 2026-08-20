@@ -247,6 +247,7 @@ pub fn probe(
         priority: None,
         switch_threshold: None,
         disabled: None,
+        groups: None,
         extra: serde_json::Map::new(),
     }
 }

@@ -113,6 +113,7 @@ fn account(name: &str, priority: i64) -> Account {
         priority: Some(priority),
         switch_threshold: None,
         disabled: None,
+        groups: None,
         extra: serde_json::Map::new(),
     }
 }

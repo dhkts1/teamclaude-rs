@@ -104,6 +104,7 @@ fn account(i: usize) -> Account {
         priority: Some(i as i64),
         switch_threshold: None,
         disabled: None,
+        groups: None,
         extra: serde_json::Map::new(),
     }
 }

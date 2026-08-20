@@ -119,9 +119,26 @@ pub struct Account {
     pub switch_threshold: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled: Option<bool>,
+    /// Labels used to prefer-route a session (`tcr run --group <name>`) to this
+    /// account. Absent or empty means the account belongs to no group. Backward
+    /// compatible in both directions: `Account` has no `deny_unknown_fields` and
+    /// a flattened `extra` map, so a config already carrying `groups` round-trips
+    /// today even before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups: Option<Vec<String>>,
     /// Any per-account keys we do not model (e.g. `models`, `upstream`, `sx`).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Account {
+    /// Whether this account belongs to `group`. An account with no `groups` key
+    /// belongs to none — it is reachable only by ungrouped routing.
+    pub fn in_group(&self, group: &str) -> bool {
+        self.groups
+            .as_deref()
+            .is_some_and(|groups| groups.iter().any(|g| g == group))
+    }
 }
 
 /// Per-account request pacing (opt-in; default OFF).
@@ -1455,6 +1472,47 @@ mod tests {
             serde_json::json!(["claude-fable-5"])
         );
 
+        fs::remove_file(&tmp).ok();
+    }
+
+    /// An account config carrying `groups` survives a load→save round-trip
+    /// unchanged, and — via [`SAMPLE`], whose one account has no `groups` key —
+    /// an account without the key still loads (defaulting to `None`/no groups).
+    #[test]
+    fn groups_round_trip_and_are_optional() {
+        // No `groups` key at all: loads fine, defaults to no groups.
+        let config: Config = serde_json::from_str(SAMPLE).unwrap();
+        assert_eq!(config.accounts[0].groups, None);
+        assert!(!config.accounts[0].in_group("codereview"));
+
+        // A `groups` key present: round-trips byte-for-byte through save→reload.
+        let with_groups = r#"{
+          "accounts": [
+            {
+              "name": "acct-grouped",
+              "type": "oauth",
+              "accessToken": "at-grouped",
+              "priority": 0,
+              "groups": ["codereview", "burst"]
+            }
+          ]
+        }"#;
+        let config: Config = serde_json::from_str(with_groups).unwrap();
+        assert_eq!(
+            config.accounts[0].groups,
+            Some(vec!["codereview".to_string(), "burst".to_string()])
+        );
+        assert!(config.accounts[0].in_group("codereview"));
+        assert!(
+            !config.accounts[0].in_group("CodeReview"),
+            "matching is case-sensitive"
+        );
+        assert!(!config.accounts[0].in_group("nope"));
+
+        let tmp = std::env::temp_dir().join(format!("tcr-cfg-groups-{}.json", std::process::id()));
+        save(&tmp, &config).unwrap();
+        let reloaded: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(reloaded.accounts[0].groups, config.accounts[0].groups);
         fs::remove_file(&tmp).ok();
     }
 
@@ -2808,6 +2866,7 @@ mod tests {
             priority: Some(2),
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         }
     }

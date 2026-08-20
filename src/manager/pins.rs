@@ -144,6 +144,7 @@ mod tests {
             priority: Some(0),
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         }
     }

@@ -2006,6 +2006,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -2095,6 +2096,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         let applied = post_add_account(&config, &account)
@@ -2145,6 +2147,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         let err = post_add_account(&config, &account)

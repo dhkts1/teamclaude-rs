@@ -746,6 +746,7 @@ pub fn upsert_account(
                 priority: Some(next_priority),
                 switch_threshold: None,
                 disabled: None,
+                groups: None,
                 extra: serde_json::Map::new(),
             });
             Ok(())
@@ -924,6 +925,7 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
         priority: None,
         switch_threshold: None,
         disabled: None,
+        groups: None,
         extra: serde_json::Map::new(),
     };
     match crate::cli::post_add_account(config, &probe).await {
@@ -1299,6 +1301,7 @@ fn persist_via_file(
         priority: None,
         switch_threshold: None,
         disabled: None,
+        groups: None,
         extra: serde_json::Map::new(),
     };
     match config::save_account(config_path, &account) {
@@ -1444,6 +1447,7 @@ async fn finish_login(
                 priority: None,
                 switch_threshold: None,
                 disabled: None,
+                groups: None,
                 extra: serde_json::Map::new(),
             };
             match crate::cli::post_add_account(config, &account).await {
@@ -3070,6 +3074,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         let rotate_config = load_or_default(&path).unwrap();
@@ -3271,6 +3276,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -3368,6 +3374,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -3550,6 +3557,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
