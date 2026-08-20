@@ -764,6 +764,44 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         guard fraction != nil else { return .unmeasured }
         return .state(effectiveQuotaState(for: window))
     }
+
+    /// The row-level "change this account's groups" menu — derived purely
+    /// from ``groups``, so a test can assert its shape without touching
+    /// SwiftUI (bridge: `docs/plans/stacked-cards-bridge.md`, "put rendered
+    /// values and state rules on the model, not in the view"). One
+    /// ``AccountGroupMenuAction/remove(group:)`` per membership,
+    /// ``AccountGroupMenuAction/removeAll`` only once there is more than one
+    /// membership to collapse — a single membership already has its own
+    /// removal action, and a second control that does the exact same thing
+    /// is noise, not a convenience — and ``AccountGroupMenuAction/addToGroup``
+    /// always last. `[.addToGroup]` alone for an account in no group at all:
+    /// the missing affordance this round exists to add, so an ungrouped
+    /// account gets exactly the one action that applies to it.
+    public var groupMenuActions: [AccountGroupMenuAction] {
+        let sortedGroups = (groups ?? []).sorted()
+        var actions: [AccountGroupMenuAction] = sortedGroups.map { .remove(group: $0) }
+        if sortedGroups.count > 1 {
+            actions.append(.removeAll)
+        }
+        actions.append(.addToGroup)
+        return actions
+    }
+}
+
+/// One entry in ``Account/groupMenuActions``, the row-level context menu
+/// that changes which groups an account belongs to — right-click on the
+/// account itself, the affordance the bridge specifically asked for because
+/// membership used to be reachable only from a section-header menu.
+public enum AccountGroupMenuAction: Equatable, Hashable, Sendable {
+    /// `tcr group rm <group> <account>` for exactly this one membership.
+    case remove(group: String)
+    /// One `tcr group rm <group> <account>` per current membership — there
+    /// is no server-side "remove this account from every group" call, so
+    /// the view issues the same single-membership command this case's
+    /// sibling does, once per group.
+    case removeAll
+    /// Opens the "add to an existing group" submenu.
+    case addToGroup
 }
 
 /// The two things a quota bar's fill/outline can honestly show: no reading
@@ -1355,6 +1393,34 @@ public struct GroupSection: Equatable, Sendable, Identifiable {
     /// the "is this section special" check and the "which groups exactly"
     /// detail stay two separate questions.
     public var isReserved: Bool { !reservedGroups.isEmpty }
+
+    /// `"2 accounts"` / `"1 account"` — the collapsed deck card's account
+    /// count, singular/plural. `total`, not `free`: the card's job is to say
+    /// how big the deck behind it is, the same count ``header`` already
+    /// answers with `free/total` right beside it.
+    public var accountCountLabel: String { "\(total) account\(total == 1 ? "" : "s")" }
+
+    /// The worst (highest) 5-hour utilization among this section's members —
+    /// the window that gates the SET next. Same rule as
+    /// ``GroupDetail/max5hUtilization``, kept separate rather than shared
+    /// because the two types have no common member-holding protocol and
+    /// duplicating one `.compactMap(\.fiveHour).max()` is cheaper than
+    /// inventing one for a single call site each.
+    public var max5hUtilization: Double? {
+        members.compactMap(\.fiveHour).max()
+    }
+
+    /// `"2 accounts · 5h 33% max"` — the collapsed deck card's one line of
+    /// context beneath the header, matching the mock this round was built
+    /// from. The worst-window half is OMITTED, not replaced with a
+    /// placeholder, when no member has ever reported a 5h fraction — the
+    /// same honesty rule ``GroupDetail/statLine`` and ``QuotaFormat`` already
+    /// follow. The count half is never omitted: a section always has at
+    /// least one member.
+    public var summaryLine: String {
+        let worst = max5hUtilization.map { "5h \(QuotaFormat.percent($0)) max" }
+        return [accountCountLabel, worst].compactMap { $0 }.joined(separator: " · ")
+    }
 }
 
 /// ``GroupTally`` elaborated with the accounts that make it up, for the Groups

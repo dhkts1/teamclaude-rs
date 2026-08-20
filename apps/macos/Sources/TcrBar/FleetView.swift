@@ -279,61 +279,35 @@ struct FleetView: View {
         }
     }
 
-    /// The sectioned accounts list: one ``AccountGroupSectionHeader`` per
-    /// distinct group SET (``Fleet/groupSections``), each followed by its
-    /// members in the panel's normal display order — an account in two
-    /// groups appears once, under the combined header, never twice.
+    /// One ``GroupDeckCard`` per ``Fleet/groupSections`` entry — the
+    /// sectioned list collapsed to one card per group SET instead of a
+    /// header followed by every member's full row (see `GroupDeckCard.swift`
+    /// for the interaction and the `RowHeightsKey` sizing hazard it was
+    /// built around).
     ///
-    /// Rows are today's ``AccountRow``, unchanged, with group chips
-    /// suppressed: the section header already says what the chips said, so
-    /// keeping both would be the same fact rendered twice.
-    /// One row of the sectioned list, plus the header (if any) that sits
-    /// directly above it — precomputed as plain data, not decided inside the
-    /// `ForEach` closure, so the "have we drawn this section's header yet"
-    /// bookkeeping is a pure function of `fleet` rather than a mutation a
-    /// SwiftUI body re-evaluates on every render.
-    private struct SectionedRow: Identifiable {
-        let account: Account
-        let header: GroupSection?
-        var id: String { account.id }
-    }
-
-    /// Walks the panel's normal display order once, attaching each section's
-    /// header to the first row (in that order) that belongs to it — so
-    /// sections read top-to-bottom in ``Fleet/groupSections``' own order
-    /// without a second, independent sort of the rows themselves.
-    private func sectionedRows(_ fleet: Fleet) -> [SectionedRow] {
-        let sectionByAccountName: [String: GroupSection] = fleet.groupSections.reduce(into: [:]) {
-            result, section in
-            for member in section.members { result[member.name] = section }
-        }
-        var seenSections: Set<String> = []
-        return fleet.rowsInDisplayOrder(pinning: control.current).map { account in
-            guard let section = sectionByAccountName[account.name], !seenSections.contains(section.id)
-            else {
-                return SectionedRow(account: account, header: nil)
-            }
-            seenSections.insert(section.id)
-            return SectionedRow(account: account, header: section)
-        }
-    }
-
+    /// This drops the old `sectionedRows(fleet)` walk's mid-list `Hairline`
+    /// after a pinned control-account row: that separator marked "index 0 of
+    /// one flat list is the control account", and a set of cards has no
+    /// single flat index zero to attach it to — the control account can sit
+    /// in any card, open or collapsed, same as any other member. No bridge
+    /// requirement asked this survive; only "keep the fragmentation
+    /// fallback" and "keep the header tally line" did, and both do — the
+    /// fallback still renders through `rowStack`, unchanged, and each card's
+    /// header still carries `section.label`.
     private func sectionedRowStack(_ fleet: Fleet) -> some View {
-        let rows = sectionedRows(fleet)
-        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            ForEach(rows) { row in
-                if let header = row.header {
-                    AccountGroupSectionHeader(
-                        section: header,
-                        allAccounts: fleet.accounts,
-                        groupController: groupController,
-                        confirmRemoveGroup: $confirmRemoveGroup
-                    )
-                }
-                accountRow(row.account, fleet: fleet, showGroupChips: false)
-                if row.account.name == control.current, rows.first?.id == row.id {
-                    Hairline()
-                }
+        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            ForEach(fleet.groupSections) { section in
+                GroupDeckCard(
+                    section: section,
+                    allAccounts: fleet.accounts,
+                    countersAreStructural: fleet.source.countersAreStructural,
+                    accounts: accounts,
+                    control: control,
+                    groupController: groupController,
+                    onChanged: { await poller.pollOnce() },
+                    onRelogin: { reloginAccount($0) },
+                    confirmRemoveGroup: $confirmRemoveGroup
+                )
             }
             NewGroupControl(allAccounts: fleet.accounts, groupController: groupController)
                 .padding(.top, Tok.tightSpacing)
@@ -348,7 +322,9 @@ struct FleetView: View {
             control: control,
             onChanged: { await poller.pollOnce() },
             onRelogin: { reloginAccount(account.name) },
-            showGroupChips: showGroupChips
+            showGroupChips: showGroupChips,
+            groupController: groupController,
+            allAccounts: fleet.accounts
         )
         .background(
             GeometryReader { proxy in
@@ -761,7 +737,15 @@ struct FleetView: View {
 /// keyed by `Account.id`. A dictionary rather than one summed scalar because
 /// rows are not uniform height — `visibleRowsHeight(for:)` needs the first N
 /// individually, in display order, not just their total.
-private struct RowHeightsKey: PreferenceKey {
+/// Not `private`: ``GroupDeckCard`` (`GroupDeckCard.swift`) registers a
+/// member row's height into the same key from outside this file, so an
+/// open card's rows count toward `visibleRowsHeight(for:)` exactly like an
+/// ungrouped account's row does. `PreferenceKey` values bubble up through
+/// any number of intervening views regardless of which type attaches them,
+/// so `fleetRows`'s single `onPreferenceChange(RowHeightsKey.self)` still
+/// catches every row, sectioned or not, without either file needing to
+/// know about the other's view tree.
+struct RowHeightsKey: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
         value.merge(nextValue()) { _, new in new }
@@ -811,6 +795,15 @@ struct AccountRow: View {
     /// (``Fleet/groupSectionsFragmented``), where the chips are the only
     /// place group membership is still shown.
     var showGroupChips: Bool = true
+    /// Mutating THIS row's own group membership from its context menu — the
+    /// affordance the bridge specifically asked for: before this round,
+    /// membership could only be changed from a section-header menu, and the
+    /// instinct is to act on the account itself. See ``groupMenuItems``.
+    @ObservedObject var groupController: GroupController
+    /// The whole fleet, so ``addToGroupMenu`` can offer every group this
+    /// account is not already in, not just the ones visible in whatever
+    /// section this row happens to be drawn under.
+    let allAccounts: [Account]
 
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
@@ -1180,6 +1173,65 @@ struct AccountRow: View {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(account.name, forType: .string)
+        }
+        Divider()
+        groupMenuItems
+    }
+
+    /// One entry per ``Account/groupMenuActions``, wired to
+    /// ``GroupController`` exactly the way ``GroupActionsMenu`` already
+    /// wires its own — same `remove(account:from:)`/`add(account:to:)`
+    /// calls, just keyed off this row's account instead of a section's
+    /// group. Kept as a top-level `@ViewBuilder` (not folded into
+    /// `contextMenuItems`'s body) so ``Account/groupMenuActions``'s own
+    /// doc-comment, not this one, is the single place the menu's SHAPE is
+    /// explained.
+    @ViewBuilder
+    private var groupMenuItems: some View {
+        ForEach(account.groupMenuActions, id: \.self) { action in
+            switch action {
+            case .remove(let group):
+                Button("Remove from \(group)") {
+                    Task { await groupController.remove(account: account.name, from: group) }
+                }
+            case .removeAll:
+                Button("Remove from all groups") {
+                    Task {
+                        for group in (account.groups ?? []) {
+                            await groupController.remove(account: account.name, from: group)
+                        }
+                    }
+                }
+            case .addToGroup:
+                addToGroupMenu
+            }
+        }
+    }
+
+    /// Every group this account is not already a member of, fleet-wide —
+    /// the population ``groupMenuItems``'s "Add to group…" submenu offers.
+    /// Disabled rather than hidden when empty (no group exists yet anywhere
+    /// in the fleet): a missing submenu reads as "this row cannot be added
+    /// to a group", which is not the true reason.
+    private var candidateGroupsToAdd: [String] {
+        let existing = Set(account.groups ?? [])
+        let everyGroup = Set(allAccounts.flatMap { $0.groups ?? [] })
+        return everyGroup.subtracting(existing).sorted()
+    }
+
+    @ViewBuilder
+    private var addToGroupMenu: some View {
+        if candidateGroupsToAdd.isEmpty {
+            Button("Add to group…") {}
+                .disabled(true)
+        } else {
+            Menu("Add to group…") {
+                ForEach(candidateGroupsToAdd, id: \.self) { group in
+                    Button(group) {
+                        Task { await groupController.add(account: account.name, to: group) }
+                    }
+                }
+            }
         }
     }
 
