@@ -220,6 +220,7 @@ impl Fleet {
             control_reserve: 0.05,
             http1_only: false,
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),
+            group_settings: HashMap::new(),
             extra: serde_json::Map::new(),
         };
         let manager = Manager::new(

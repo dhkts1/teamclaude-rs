@@ -95,6 +95,14 @@ pub enum GateReason {
     Rejected,
     /// Operator-disabled — held out until re-enabled, never self-frees.
     Disabled,
+    /// This account belongs to a group marked `reserved` (`tcr group reserve`)
+    /// and the request that would have selected it did not ask for one of
+    /// that account's groups. Unlike the other gates this one is a fact about
+    /// the REQUEST's group ask, not purely about the account — see
+    /// [`crate::manager::Manager::account_gate`]'s `group` parameter. Never
+    /// self-frees on its own (only `tcr group unreserve` clears it), so it
+    /// carries no clear-instant, same as [`Self::Disabled`].
+    Reserved,
 }
 
 /// A single account's live-computed view.
@@ -175,6 +183,10 @@ pub struct AccountSnapshot {
     /// Group labels for this account, mirroring `AccountRuntime::groups` —
     /// empty (never `None`) when the config carried no `groups` key.
     pub groups: Vec<String>,
+    /// The subset of [`Self::groups`] currently marked `reserved`
+    /// (`tcr group reserve`), sorted. Always an array, `[]` when none — a
+    /// config fact, never `null`. See [`GateReason::Reserved`].
+    pub reserved_groups: Vec<String>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

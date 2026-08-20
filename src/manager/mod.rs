@@ -840,6 +840,12 @@ pub struct Manager {
     upstream: String,
     proxy_api_key: Option<String>,
     global_threshold: f64,
+    /// The set of group labels marked `reserved` (`tcr group reserve`),
+    /// snapshotted from the config at construction — same restart-to-take-effect
+    /// contract as [`config::Account::groups`] itself (`tcr group add`/`rm`
+    /// print the same note). See [`Manager::eligible`]'s `reserved_group` doc
+    /// for the rule this drives.
+    reserved_groups: HashSet<String>,
     /// Per-account request pacing knobs, snapshotted from the config at
     /// construction. Default (all `None`) → inert → selection is byte-identical to
     /// the no-pacing build. See [`config::PacingConfig`].
@@ -1052,6 +1058,7 @@ impl Manager {
         let upstream = config.upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
+        let reserved_groups = config.reserved_group_names();
         let pacing = config.pacing.clone();
         let throttle = config.throttle.clone();
 
@@ -1099,6 +1106,7 @@ impl Manager {
             upstream,
             proxy_api_key,
             global_threshold,
+            reserved_groups,
             pacing,
             throttle,
             locked_idx,
@@ -1215,7 +1223,18 @@ impl Manager {
             .iter()
             .filter_map(|account| {
                 let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-                let (_, free_at) = Self::account_gate(account, threshold, now, now_ms, is_fable);
+                // `group: None` — same "unrequested traffic" view `Self::snapshot`
+                // reports; a promise this hint makes must hold for the traffic
+                // that would actually hit the synthetic 429 it is sizing.
+                let (_, free_at) = Self::account_gate(
+                    account,
+                    threshold,
+                    now,
+                    now_ms,
+                    is_fable,
+                    None,
+                    &self.reserved_groups,
+                );
                 free_at.map(odt_to_ms)
             })
             .filter(|&at| at > now_ms)
@@ -2385,6 +2404,7 @@ mod tests {
             control_reserve: 0.05,
             http1_only: false,
             accounts,
+            group_settings: HashMap::new(),
             extra: serde_json::Map::new(),
         }
     }
@@ -2892,6 +2912,177 @@ mod tests {
             ),
             Some(1),
             "group exhausted: must fall back to the whole pool, not return None"
+        );
+    }
+
+    // ---- reserved groups (a reservation is not a preference) ------------------
+
+    /// Like [`config_with`] but with the named groups marked `reserved` in
+    /// `groupSettings` — mirrors [`config_with_lock`]/[`config_with_control`].
+    fn config_with_reserved(accounts: Vec<Account>, reserved: &[&str]) -> Config {
+        let mut config = config_with(accounts);
+        for group in reserved {
+            config.group_settings.insert(
+                (*group).to_string(),
+                crate::config::GroupSettings {
+                    reserved: true,
+                    extra: serde_json::Map::new(),
+                },
+            );
+        }
+        config
+    }
+
+    /// Semantics test #1 (both directions): unrequested traffic cannot select
+    /// an account in a reserved group, even when its priority would otherwise
+    /// win — and the SAME account is reachable by unrequested traffic again
+    /// once its group is not reserved.
+    #[test]
+    fn reserved_group_blocks_unrequested_traffic_both_directions() {
+        let reserved_acct = account_in_groups("reserved-acct", 0, &["codereview"]);
+        let plain = account("plain", 5); // worse priority — must lose ordinarily
+        let manager = build_manager(
+            config_with_reserved(vec![reserved_acct, plain], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1),
+            "reserved account excluded from unrequested traffic despite better priority"
+        );
+
+        // Direction 2: same accounts, group NOT reserved — priority wins again.
+        let unreserved = build_manager(
+            config_with(vec![
+                account_in_groups("reserved-acct", 0, &["codereview"]),
+                account("plain", 5),
+            ]),
+            lock_refresher(),
+        );
+        assert_eq!(
+            unreserved.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(0),
+            "same account, group unreserved: unrequested traffic can select it again"
+        );
+    }
+
+    /// Semantics test #2: `--group codereview` can still select a reserved
+    /// `codereview` account — reservation narrows UNREQUESTED traffic, never
+    /// the group's own members.
+    #[test]
+    fn reserved_group_still_selectable_by_its_own_group_ask() {
+        let reserved_acct = account_in_groups("reserved-acct", 0, &["codereview"]);
+        let plain = account("plain", 5);
+        let manager = build_manager(
+            config_with_reserved(vec![reserved_acct, plain], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            Some(0),
+            "--group codereview still selects its own reserved account"
+        );
+    }
+
+    /// Semantics test #3: an account in reserved `codereview` + plain `dev` is
+    /// reachable by BOTH `--group` values and NOT by unrequested traffic.
+    #[test]
+    fn reserved_plus_plain_group_reachable_by_either_ask_not_unrequested() {
+        let multi = account_in_groups("multi", 0, &["codereview", "dev"]);
+        let plain = account("plain", 5);
+        let manager = build_manager(
+            config_with_reserved(vec![multi, plain], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            Some(0),
+            "reachable via its reserved group"
+        );
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("dev"),
+            ),
+            Some(0),
+            "reachable via its plain group too"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1),
+            "unrequested traffic still excluded — one reserved group is enough"
+        );
+    }
+
+    /// Semantics test #4 — THE test that proves the feature is real: a
+    /// session already pinned to an account whose group becomes reserved
+    /// (the on-disk-pin-predates-the-reservation case the bridge names) is
+    /// re-pinned away on its next UNREQUESTED request, not left serving the
+    /// reserved account forever. Seeds the pin directly into `manager.affinity`
+    /// — the shape a pin restored from disk at boot takes, exactly the
+    /// scenario the bridge's "reachable by a proxy restart or by a pin that
+    /// predates the reservation" sentence describes.
+    #[test]
+    fn pin_reclaim_when_the_pinned_accounts_group_is_reserved() {
+        let acct = account_in_groups("acct", 0, &["codereview"]);
+        let other = account("other", 5);
+        let manager = build_manager(
+            config_with_reserved(vec![acct, other], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let key = 4242u64;
+        {
+            let mut affinity = manager.affinity.lock().expect("affinity lock poisoned");
+            affinity.insert(key, (0, now_ms));
+        }
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("the plain account is still eligible");
+        assert_eq!(
+            served, 1,
+            "a reserved account must not keep serving an unrequested pinned session"
+        );
+
+        // The pin itself must have MOVED — "reservation is not a preference":
+        // an ordinary per-request divert would leave the OLD index pinned and
+        // only serve elsewhere for this one request; that is NOT enough here.
+        let pinned_now = manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            pinned_now,
+            Some(1),
+            "the pin itself must move off the reserved account, not merely divert one request"
         );
     }
 
@@ -3683,6 +3874,8 @@ mod tests {
                 now_ms,
                 false,
                 None,
+                None,
+                &HashSet::new(),
             ),
             "served 0ms ago (< 1000ms) → skipped"
         );
@@ -3698,6 +3891,8 @@ mod tests {
                 later_ms,
                 false,
                 None,
+                None,
+                &HashSet::new(),
             ),
             "after the spacing window → eligible again"
         );
@@ -3834,6 +4029,8 @@ mod tests {
                 now_ms,
                 false,
                 None,
+                None,
+                &HashSet::new(),
             ),
             "cap=0 → account stays eligible regardless of in_flight (no dark pool)"
         );
@@ -6468,7 +6665,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let a = gate_runtime();
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::Ok, None)
         );
     }
@@ -6482,7 +6679,15 @@ mod tests {
         disabled.disabled = true;
         disabled.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
         assert_eq!(
-            Manager::account_gate(&disabled, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(
+                &disabled,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new()
+            ),
             (GateReason::Disabled, None)
         );
 
@@ -6490,7 +6695,15 @@ mod tests {
         errored.status = AccountStatus::Error;
         errored.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
         assert_eq!(
-            Manager::account_gate(&errored, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(
+                &errored,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new()
+            ),
             (GateReason::Login, None)
         );
     }
@@ -6507,7 +6720,7 @@ mod tests {
         a.quota.five_hour = Some(window(0.99, Some(soon)));
         a.quota.seven_day = Some(window(0.99, Some(later)));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::SevenDay, Some(later))
         );
     }
@@ -6522,7 +6735,7 @@ mod tests {
         a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
         a.quota.seven_day = Some(window(0.99, None));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::SevenDay, None)
         );
     }
@@ -6536,12 +6749,12 @@ mod tests {
         let mut a = gate_runtime();
         a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::Ok, None),
             "the non-Fable view ignores the model-scoped weekly"
         );
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), true),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), true, None, &HashSet::new()),
             (GateReason::FableWeekly, Some(reset)),
             "a Fable evaluation gates on it"
         );
@@ -6559,7 +6772,7 @@ mod tests {
         a.quota.tokens_remaining = Some(50); // 95% spent, over the 0.90 threshold
         a.quota.standard_reset = Some(reset);
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::Standard, Some(reset))
         );
     }
@@ -6582,7 +6795,7 @@ mod tests {
 
         // The Standard gate (later reset) wins max_by_key over the +8s Hold.
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            Manager::account_gate(&a, 0.90, now, now_ms, false, None, &HashSet::new()),
             (GateReason::Standard, Some(reset)),
             "the standard reset outlasts the short hold"
         );
@@ -6602,7 +6815,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let a = gate_runtime(); // all standard fields None by default
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::Ok, None),
             "OAuth accounts never gate on the standard dimension"
         );
@@ -6619,7 +6832,7 @@ mod tests {
         a.quota.tokens_remaining = Some(10); // 99% spent, over threshold
         a.quota.standard_reset = Some(now - Duration::seconds(1)); // already refreshed
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false),
+            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
             (GateReason::Ok, None),
             "an expired standard window no longer gates"
         );
@@ -6636,11 +6849,11 @@ mod tests {
         // `account_gate` had no arm for it, so the TUI showed a rejected account as
         // healthy and in rotation.
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            Manager::account_gate(&a, 0.90, now, now_ms, false, None, &HashSet::new()),
             (GateReason::Rejected, None)
         );
         assert!(
-            !Manager::account_hard_ok(&a, now_ms),
+            !Manager::account_hard_ok(&a, now_ms, None, &HashSet::new()),
             "and it stays hard-gated, exactly as before"
         );
 
@@ -6649,7 +6862,7 @@ mod tests {
         // to come back at its 5h reset.
         a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, now_ms, false),
+            Manager::account_gate(&a, 0.90, now, now_ms, false, None, &HashSet::new()),
             (GateReason::Rejected, None),
             "a rejected account must not advertise a window reset as its recovery"
         );
@@ -6671,7 +6884,7 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let reset = now + Duration::seconds(5_000);
 
-        const ALL: [GateReason; 9] = [
+        const ALL: [GateReason; 10] = [
             GateReason::Ok,
             GateReason::Hold,
             GateReason::FiveHour,
@@ -6681,33 +6894,47 @@ mod tests {
             GateReason::Login,
             GateReason::Disabled,
             GateReason::Rejected,
+            GateReason::Reserved,
         ];
 
         for reason in ALL {
             // Only a Fable-scoped evaluation can ever surface the model-scoped gate.
             let is_fable = reason == GateReason::FableWeekly;
 
-            // Per case: a label, a runtime that actually exhibits `reason`, and
-            // whether that block is ACCOUNT-level (`account_hard_ok == false`) or
-            // request-scoped (`account_hard_ok` stays true, the pin survives).
-            let cases: Vec<(&str, AccountRuntime, bool)> = match reason {
-                GateReason::Ok => vec![("healthy", gate_runtime(), true)],
+            // Per case: a label, a runtime that actually exhibits `reason`, whether
+            // that block is ACCOUNT-level (`account_hard_ok == false`) or
+            // request-scoped (`account_hard_ok` stays true, the pin survives), and
+            // the reserved-group set the request evaluates against (empty for
+            // every reason but `Reserved` itself, which is the one whose gate
+            // depends on more than the runtime alone).
+            let cases: Vec<(&str, AccountRuntime, bool, HashSet<String>)> = match reason {
+                GateReason::Ok => vec![("healthy", gate_runtime(), true, HashSet::new())],
 
                 // Terminal: a fact about the credential, for every model class.
                 GateReason::Disabled => {
                     let mut a = gate_runtime();
                     a.disabled = true;
-                    vec![("operator-disabled", a, false)]
+                    vec![("operator-disabled", a, false, HashSet::new())]
                 }
                 GateReason::Login => {
                     let mut a = gate_runtime();
                     a.status = AccountStatus::Error;
-                    vec![("dead credential", a, false)]
+                    vec![("dead credential", a, false, HashSet::new())]
                 }
                 GateReason::Rejected => {
                     let mut a = gate_runtime();
                     a.quota.status = Some("rejected".to_string());
-                    vec![("upstream rejected", a, false)]
+                    vec![("upstream rejected", a, false, HashSet::new())]
+                }
+                // Reservation is not a preference: unrequested traffic (`group:
+                // None`, matching every other case in this loop) against an
+                // account in a reserved group is ACCOUNT-level-blocked, exactly
+                // like the terminal gates above — see `Self::reserved_blocks`.
+                GateReason::Reserved => {
+                    let mut a = gate_runtime();
+                    a.groups = vec!["codereview".to_string()];
+                    let reserved: HashSet<String> = ["codereview".to_string()].into();
+                    vec![("reserved group, unrequested traffic", a, false, reserved)]
                 }
 
                 // The one reason that splits on DURATION: past the cache TTL a hold
@@ -6718,8 +6945,8 @@ mod tests {
                     let mut short = gate_runtime();
                     short.rate_limited_until_ms = Some(now_ms + 30_000);
                     vec![
-                        ("hold outliving the cache", long, false),
-                        ("hold clearing while warm", short, true),
+                        ("hold outliving the cache", long, false, HashSet::new()),
+                        ("hold clearing while warm", short, true, HashSet::new()),
                     ]
                 }
 
@@ -6728,32 +6955,33 @@ mod tests {
                 GateReason::FiveHour => {
                     let mut a = gate_runtime();
                     a.quota.five_hour = Some(window(0.99, Some(reset)));
-                    vec![("5h over threshold", a, true)]
+                    vec![("5h over threshold", a, true, HashSet::new())]
                 }
                 GateReason::SevenDay => {
                     let mut a = gate_runtime();
                     a.quota.seven_day = Some(window(0.99, Some(reset)));
-                    vec![("7d over threshold", a, true)]
+                    vec![("7d over threshold", a, true, HashSet::new())]
                 }
                 GateReason::FableWeekly => {
                     let mut a = gate_runtime();
                     a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
-                    vec![("7d_oi over threshold", a, true)]
+                    vec![("7d_oi over threshold", a, true, HashSet::new())]
                 }
                 GateReason::Standard => {
                     let mut a = gate_runtime();
                     a.quota.tokens_limit = Some(1_000);
                     a.quota.tokens_remaining = Some(10); // 99% spent
                     a.quota.standard_reset = Some(reset);
-                    vec![("standard limit spent", a, true)]
+                    vec![("standard limit spent", a, true, HashSet::new())]
                 }
             };
 
-            for (label, runtime, account_level) in cases {
-                let (gate, _) = Manager::account_gate(&runtime, 0.90, now, now_ms, is_fable);
+            for (label, runtime, account_level, reserved) in cases {
+                let (gate, _) =
+                    Manager::account_gate(&runtime, 0.90, now, now_ms, is_fable, None, &reserved);
                 assert_eq!(gate, reason, "fixture `{label}` must exhibit {reason:?}");
 
-                let hard_ok = Manager::account_hard_ok(&runtime, now_ms);
+                let hard_ok = Manager::account_hard_ok(&runtime, now_ms, None, &reserved);
                 assert_eq!(
                     hard_ok, account_level,
                     "`{label}`: account_hard_ok disagrees with {reason:?}'s classification"

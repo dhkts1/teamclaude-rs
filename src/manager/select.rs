@@ -335,10 +335,9 @@ impl Manager {
                     // THIS request, so a Fable-exhausted pin that a Fable request
                     // already tried still keeps its pin for the session's Opus turns.
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
-                    if accounts
-                        .get(idx)
-                        .is_some_and(|a| Self::account_hard_ok(a, now_ms))
-                    {
+                    if accounts.get(idx).is_some_and(|a| {
+                        Self::account_hard_ok(a, now_ms, group, &self.reserved_groups)
+                    }) {
                         keep_pin = Some(idx);
                         divert_reason = Some("pin-tried");
                         divert_until_ms = accounts
@@ -378,7 +377,9 @@ impl Manager {
                                 now,
                                 now_ms,
                                 is_fable,
-                                None, // no group preference — honouring an existing pin/connection/sticky destination
+                                None,  // no group PREFERENCE — honouring an existing pin
+                                group, // but reservation is not a preference — real ask
+                                &self.reserved_groups,
                             )
                         });
                         if !x_usable {
@@ -430,9 +431,9 @@ impl Manager {
                             //    behaviour `select_revalidation`'s PIN-HONOR path
                             //    already had, hoisted to where it is reachable; both
                             //    log the identical line so they grep together.
-                            let account_alive = accounts
-                                .get(idx)
-                                .is_some_and(|a| Self::account_hard_ok(a, now_ms));
+                            let account_alive = accounts.get(idx).is_some_and(|a| {
+                                Self::account_hard_ok(a, now_ms, group, &self.reserved_groups)
+                            });
                             let model_blocked = accounts.get(idx).is_some_and(|a| {
                                 Self::model_blocked(a, self.global_threshold, now, is_fable)
                             });
@@ -519,7 +520,9 @@ impl Manager {
                                         now,
                                         now_ms,
                                         is_fable,
-                                        None, // no group preference — honouring an existing pin/connection/sticky destination
+                                        None,  // no group PREFERENCE — honouring an existing pin
+                                        group, // but reservation is not a preference — real ask
+                                        &self.reserved_groups,
                                     ) {
                                         continue;
                                     }
@@ -643,7 +646,9 @@ impl Manager {
                                             now,
                                             now_ms,
                                             is_fable,
-                                            None, // no group preference — honouring an existing pin/connection/sticky destination
+                                            None, // no group PREFERENCE — honouring an existing connection
+                                            group, // but reservation is not a preference — real ask
+                                            &self.reserved_groups,
                                         )
                                     })
                                 };
@@ -737,7 +742,9 @@ impl Manager {
                             now,
                             now_ms,
                             is_fable,
-                            None, // no group preference — honouring an existing pin/connection/sticky destination
+                            None,  // no group PREFERENCE — honouring a sticky destination
+                            group, // but reservation is not a preference — real ask
+                            &self.reserved_groups,
                         )
                     });
                     usable.then_some(sticky)
@@ -1000,8 +1007,23 @@ impl Manager {
 
         // HARD-gate predicate shared by both paths: the blocks that even a
         // revalidation serve must honor (soft utilization/pacing deliberately absent).
+        //
+        // `group: None` — this path (unlike `select_with_group`) carries no
+        // `--group` context at all, so it cannot tell a grouped session's real
+        // ask from an ungrouped one. Passing `None` is the conservative choice
+        // for a HARD reservation gate: it can only ever narrow who this path
+        // revalidates onto a reserved account, never widen it, so a reserved
+        // account is never leaked to traffic this path cannot identify.
         let hard_ok = |account: &AccountRuntime| -> bool {
-            Self::hard_ok(account, self.global_threshold, now, now_ms, is_fable)
+            Self::hard_ok(
+                account,
+                self.global_threshold,
+                now,
+                now_ms,
+                is_fable,
+                None,
+                &self.reserved_groups,
+            )
         };
 
         // Mirrors `select()`'s `keep_pin`: set to the OLD pin index when the pin
@@ -1064,7 +1086,7 @@ impl Manager {
                 // (see its affinity fast-path); the two now agree.
                 if accounts
                     .get(idx)
-                    .is_some_and(|a| Self::account_hard_ok(a, now_ms))
+                    .is_some_and(|a| Self::account_hard_ok(a, now_ms, None, &self.reserved_groups))
                 {
                     keep_pin = Some(idx);
                     pin_until_ms = accounts
@@ -1340,14 +1362,55 @@ impl Manager {
     /// possibly-stale arithmetic.
     ///
     /// Pure and lock-free; the caller holds whichever accounts lock it needs.
-    pub(super) fn account_hard_ok(account: &AccountRuntime, now_ms: i64) -> bool {
+    ///
+    /// `group` is the SESSION's real requested group (`tcr run --group`, or
+    /// `None`) — never the PREFER-narrowing override a pin-honoring call site
+    /// passes to [`Self::eligible`]. A reservation is not a preference: this is
+    /// the predicate that decides whether a warm pin survives, so it must see
+    /// what the session actually asked for, not the bypass value the four
+    /// pin/connection/sticky call sites in [`Manager::select_with_group`] pass
+    /// to `eligible` to avoid re-litigating group PREFERENCE against an
+    /// established pin. See [`Self::reserved_blocks`].
+    pub(super) fn account_hard_ok(
+        account: &AccountRuntime,
+        now_ms: i64,
+        group: Option<&str>,
+        reserved: &HashSet<String>,
+    ) -> bool {
         if Self::account_terminal_gate(account).is_some() {
             return false;
         }
         if Self::hold_outlives_cache(account, now_ms) {
             return false;
         }
+        if Self::reserved_blocks(account, group, reserved) {
+            return false;
+        }
         true
+    }
+
+    /// Whether a RESERVATION (not a preference — see the bridge's "Semantics"
+    /// section) holds `account` out for a request that asked for `group`.
+    ///
+    /// `A eligible iff g ∈ groups(A)` when the session asked for a specific `g`
+    /// — reservation never adds a SECOND requirement on top of that match, so
+    /// `Some(_)` always returns `false` here (the ordinary group-preference
+    /// check already governs, wherever the caller applies it). Only an
+    /// unrequested ask (`None`) — which includes the soft-fallback pass, which
+    /// deliberately treats itself as unrequested for this purpose exactly as it
+    /// does for group preference — is ever blocked, and then only if `account`
+    /// carries ANY reserved group: an account in reserved `codereview` and
+    /// plain `dev` stays reachable by `--group dev`, and is blocked for traffic
+    /// that asked for nothing.
+    pub(super) fn reserved_blocks(
+        account: &AccountRuntime,
+        group: Option<&str>,
+        reserved: &HashSet<String>,
+    ) -> bool {
+        if group.is_some() {
+            return false;
+        }
+        account.groups.iter().any(|g| reserved.contains(g))
     }
 
     /// Whether this account cannot serve **this request's model class** while still
@@ -1403,8 +1466,10 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        group: Option<&str>,
+        reserved: &HashSet<String>,
     ) -> bool {
-        Self::account_hard_ok(account, now_ms)
+        Self::account_hard_ok(account, now_ms, group, reserved)
             && !Self::hold_clears_while_warm(account, now_ms)
             && !Self::model_blocked(account, global_threshold, now, is_fable)
     }
@@ -1449,6 +1514,15 @@ impl Manager {
         true
     }
 
+    /// `reserved_group` is the SESSION's real requested group, used ONLY for
+    /// the reservation gate below — see [`Self::reserved_blocks`] and
+    /// [`Self::account_hard_ok`]'s doc-comment for why this is a separate
+    /// value from `group` (the PREFER-narrowing argument): the four
+    /// pin/connection/sticky call sites in [`Manager::select_with_group`] pass
+    /// `group: None` to bypass PREFER re-narrowing against an established pin,
+    /// but must still pass the session's ACTUAL ask here, because a
+    /// reservation is not a preference. Every other caller passes the same
+    /// value for both.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn eligible(
         account: &AccountRuntime,
@@ -1459,6 +1533,8 @@ impl Manager {
         now_ms: i64,
         is_fable: bool,
         group: Option<&str>,
+        reserved_group: Option<&str>,
+        reserved: &HashSet<String>,
     ) -> bool {
         if account.disabled || account.status == AccountStatus::Error {
             return false;
@@ -1481,6 +1557,13 @@ impl Manager {
         // is only that it is no longer grounds to MOVE AN EXISTING PIN — that
         // decision reads [`Self::account_hard_ok`], which excludes this gate.
         if Self::model_blocked(account, global_threshold, now, is_fable) {
+            return false;
+        }
+        // Reservation (not a preference — see this fn's `reserved_group` doc
+        // above and [`Self::reserved_blocks`]): a hard block, independent of
+        // the PREFER narrowing below, so it applies even at the four call
+        // sites that pass `group: None` to skip that narrowing.
+        if Self::reserved_blocks(account, reserved_group, reserved) {
             return false;
         }
         // `--group` PREFER routing (Phase 1: no `--only`, so this never hard-blocks
@@ -1554,12 +1637,20 @@ impl Manager {
     /// reset (a window over threshold whose reset is unknown) is the
     /// longest-possible constraint, so it sorts as "latest": it becomes the reason
     /// and `free_at` is `None` (we cannot promise a time). No active gate → `Ok`.
+    /// `group` is the SESSION's real requested group — same argument
+    /// [`Self::account_hard_ok`] takes, for the same reason: this display-side
+    /// mirror must agree with the routing predicate on which accounts a
+    /// RESERVED gate actually blocks. Every current caller ([`Manager::snapshot`],
+    /// [`Manager::retry_after_hint`]) reports the fleet as unrequested traffic
+    /// sees it, so both pass `None`.
     pub(super) fn account_gate(
         account: &AccountRuntime,
         threshold: f64,
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        group: Option<&str>,
+        reserved: &HashSet<String>,
     ) -> (GateReason, Option<OffsetDateTime>) {
         // Terminal states that never self-free — reported with no clear-instant.
         // Shared with `account_hard_ok` so the two can no longer disagree about
@@ -1572,6 +1663,14 @@ impl Manager {
         // but no known reset). Collected in eligibility order; soft pacing is
         // intentionally excluded (see the doc comment).
         let mut gates: Vec<(GateReason, Option<OffsetDateTime>)> = Vec::new();
+        // Reservation never self-frees on its own (only an operator's `tcr
+        // group unreserve` clears it) — `None` clear-instant, mirroring the
+        // terminal gates above; kept as an ordinary `gates` entry rather than
+        // an early return because it is a fact about THIS request's group ask,
+        // not about the credential — see `Self::reserved_blocks`.
+        if Self::reserved_blocks(account, group, reserved) {
+            gates.push((GateReason::Reserved, None));
+        }
         if let Some(until) = account.rate_limited_until_ms {
             if now_ms < until {
                 gates.push((GateReason::Hold, ms_to_odt(until)));
@@ -1686,6 +1785,8 @@ impl Manager {
                 now_ms,
                 is_fable,
                 group,
+                group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
+                &self.reserved_groups,
             ) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
                 // ineligibility (disabled/error/quota) so the log names only the former.
@@ -1700,6 +1801,8 @@ impl Manager {
                         now_ms,
                         is_fable,
                         group,
+                        group,
+                        &self.reserved_groups,
                     )
                 {
                     tracing::info!(
@@ -1757,6 +1860,8 @@ impl Manager {
                 now_ms,
                 is_fable,
                 group,
+                group,
+                &self.reserved_groups,
             ) {
                 continue;
             }
@@ -2050,6 +2155,7 @@ mod revalidation_sticky_tests {
             control_reserve: 0.05,
             http1_only: false,
             accounts,
+            group_settings: HashMap::new(),
             extra: serde_json::Map::new(),
         }
     }
@@ -2189,6 +2295,7 @@ mod sticky_divert_replay_tests {
             control_reserve: 0.05,
             http1_only: false,
             accounts,
+            group_settings: HashMap::new(),
             extra: serde_json::Map::new(),
         }
     }
@@ -2293,5 +2400,130 @@ mod sticky_divert_replay_tests {
              destination must be free to change, and with an untouched \
              third account in the fleet the LRU pick actually does change it"
         );
+    }
+}
+
+/// Reserved-group semantics test #5 (`docs/plans/reserved-groups-bridge.md`):
+/// `eligible` and `account_gate` must AGREE on the RESERVED gate over many
+/// account/reserved-set/ask combinations — a property test over the two
+/// predicates, not two example tests that can drift apart the way
+/// `gate_and_hard_ok_agree_on_every_variant` (`manager/mod.rs`) already
+/// guards the OTHER eight `GateReason` variants. Pure-predicate, so it needs
+/// no `Manager`/config plumbing — just [`AccountRuntime`] and the same
+/// `reserved_blocks` these two predicates both call.
+#[cfg(test)]
+mod reserved_gate_agreement_tests {
+    use super::*;
+    use crate::config::{Account, PacingConfig};
+
+    fn account_runtime(groups: &[&str]) -> AccountRuntime {
+        AccountRuntime::from_config(
+            &Account {
+                name: "probe".to_string(),
+                account_type: "oauth".to_string(),
+                account_uuid: None,
+                org_uuid: None,
+                org_name: None,
+                access_token: "at-probe".to_string(),
+                refresh_token: None,
+                expires_at: Some(crate::now_ms() + 3_600_000),
+                priority: Some(0),
+                switch_threshold: None,
+                disabled: None,
+                groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                extra: serde_json::Map::new(),
+            },
+            false,
+        )
+    }
+
+    /// Unrequested traffic (`group: None`, both `eligible`'s narrowing AND
+    /// reserved-check args): `eligible` and `account_gate` must agree with
+    /// `reserved_blocks` for every combination of an account's groups against
+    /// every reserved set — the account is otherwise perfectly healthy, so
+    /// RESERVED is the only thing that can hold it out.
+    #[test]
+    fn agree_on_unrequested_traffic_across_group_and_reserved_combinations() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let pacing = PacingConfig::default();
+
+        let group_combos: [&[&str]; 4] = [&[], &["codereview"], &["dev"], &["codereview", "dev"]];
+        let reserved_combos: [&[&str]; 4] = [
+            &[],
+            &["codereview"],
+            &["dev"],
+            &["codereview", "dev", "burst"],
+        ];
+
+        for groups in group_combos {
+            let account = account_runtime(groups);
+            for reserved_list in reserved_combos {
+                let reserved: HashSet<String> =
+                    reserved_list.iter().map(|s| s.to_string()).collect();
+                let blocked = Manager::reserved_blocks(&account, None, &reserved);
+
+                let elig = Manager::eligible(
+                    &account, 0.90, &pacing, false, now, now_ms, false, None, None, &reserved,
+                );
+                assert_eq!(
+                    elig, !blocked,
+                    "groups={groups:?} reserved={reserved_list:?}: eligible \
+                     disagrees with reserved_blocks on an otherwise-healthy account"
+                );
+
+                let (gate, _) =
+                    Manager::account_gate(&account, 0.90, now, now_ms, false, None, &reserved);
+                assert_eq!(
+                    gate == GateReason::Reserved,
+                    blocked,
+                    "groups={groups:?} reserved={reserved_list:?}: account_gate \
+                     disagrees with reserved_blocks"
+                );
+
+                let hard_ok = Manager::account_hard_ok(&account, now_ms, None, &reserved);
+                assert_eq!(
+                    hard_ok, !blocked,
+                    "groups={groups:?} reserved={reserved_list:?}: account_hard_ok \
+                     disagrees with reserved_blocks — a reserved pin would survive \
+                     the hard-gate re-test"
+                );
+            }
+        }
+    }
+
+    /// An explicit ask for one of the account's own groups always clears the
+    /// reserved gate in `eligible`, regardless of what else is reserved — the
+    /// spec's "session asked for group g -> eligible iff g in groups(A))"
+    /// branch, which never adds a second requirement on top of the match.
+    #[test]
+    fn an_explicit_matching_ask_is_never_reserved_blocked() {
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let pacing = PacingConfig::default();
+        let account = account_runtime(&["codereview", "dev"]);
+        let reserved: HashSet<String> = ["codereview".to_string(), "dev".to_string()].into();
+
+        for ask in ["codereview", "dev"] {
+            assert!(
+                Manager::eligible(
+                    &account,
+                    0.90,
+                    &pacing,
+                    false,
+                    now,
+                    now_ms,
+                    false,
+                    Some(ask),
+                    Some(ask),
+                    &reserved,
+                ),
+                "ask={ask}: an explicit ask for the account's own (reserved) group \
+                 must clear the reserved gate"
+            );
+            let (gate, _) =
+                Manager::account_gate(&account, 0.90, now, now_ms, false, Some(ask), &reserved);
+            assert_ne!(gate, GateReason::Reserved, "ask={ask}: account_gate agrees");
+        }
     }
 }

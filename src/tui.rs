@@ -1024,6 +1024,14 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         GateReason::Disabled => ("OFF".to_string(), dim),
+        // Cleared only by `tcr group unreserve`, never a timer — same red-bold
+        // treatment as LOGIN/REJECTED, not the dim OFF of an operator-disabled
+        // account (the credential itself is fine; the pool is deliberately
+        // holding it back).
+        GateReason::Reserved => (
+            "RESERVED".to_string(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
     }
 }
 
@@ -1452,6 +1460,7 @@ mod tests {
             stream_error_count: 0,
             last_stream_error: None,
             groups: Vec::new(),
+            reserved_groups: Vec::new(),
         }
     }
 
