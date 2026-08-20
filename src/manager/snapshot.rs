@@ -135,7 +135,25 @@ impl Manager {
                 // (non-Fable) view: `is_fable = false`, so the model-scoped weekly
                 // never gates a general fleet row (an account spent only on its
                 // Fable bucket still serves every other model, so it reads `Ok`).
-                let (gate, free_at) = Self::account_gate(a, threshold, now, now_ms, false);
+                // `group: None` — the fleet view answers "what would UNREQUESTED
+                // traffic see right now", the same question `retry_after_hint`
+                // asks (see `Self::account_gate`'s doc-comment).
+                let (gate, free_at) = Self::account_gate(
+                    a,
+                    threshold,
+                    now,
+                    now_ms,
+                    false,
+                    None,
+                    &self.reserved_groups,
+                );
+                let mut reserved_groups: Vec<String> = a
+                    .groups
+                    .iter()
+                    .filter(|g| self.reserved_groups.contains(*g))
+                    .cloned()
+                    .collect();
+                reserved_groups.sort();
                 AccountSnapshot {
                     name: a.name.clone(),
                     priority: a.priority,
@@ -185,6 +203,7 @@ impl Manager {
                     ),
                     last_stream_error: a.last_stream_error.clone(),
                     groups: a.groups.clone(),
+                    reserved_groups,
                 }
             })
             .collect();

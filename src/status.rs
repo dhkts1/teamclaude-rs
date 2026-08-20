@@ -209,6 +209,12 @@ pub struct AccountStatus {
     /// falling back to a fabricated offline snapshot.
     #[serde(default)]
     pub groups: Vec<String>,
+    /// The reserved subset of [`Self::groups`], mirroring
+    /// [`AccountSnapshot::reserved_groups`]. `#[serde(default)]` for the same
+    /// forward-compat reason as `groups` — an older server predates
+    /// reservation entirely.
+    #[serde(default)]
+    pub reserved_groups: Vec<String>,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -264,6 +270,7 @@ impl StatusPayload {
                 stream_error_count: a.stream_error_count,
                 last_stream_error: a.last_stream_error.clone(),
                 groups: a.groups.clone(),
+                reserved_groups: a.reserved_groups.clone(),
             })
             .collect();
         Self {
@@ -317,6 +324,7 @@ impl StatusPayload {
                     stream_error_count: a.stream_error_count,
                     last_stream_error: a.last_stream_error,
                     groups: a.groups,
+                    reserved_groups: a.reserved_groups,
                 }
             })
             .collect();
@@ -364,6 +372,7 @@ mod tests {
                 stream_error_count: 0,
                 last_stream_error: None,
                 groups: vec!["codereview".to_string()],
+                reserved_groups: vec!["codereview".to_string()],
             }],
             current: Some(0),
             recent: Vec::new(),
@@ -407,6 +416,39 @@ mod tests {
         assert_eq!(after.quota_state, before.quota_state);
         assert_eq!(after.gate, before.gate);
         assert_eq!(after.groups, before.groups, "groups rides the wire intact");
+        assert_eq!(
+            after.reserved_groups, before.reserved_groups,
+            "reservedGroups rides the wire intact"
+        );
+    }
+
+    /// A payload from an older server that predates `reservedGroups` still
+    /// deserializes, with the field defaulting to empty — same forward-compat
+    /// contract as `groups` and `stream_error_count`.
+    #[test]
+    fn payload_without_reserved_groups_field_still_deserializes() {
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+        ))
+        .expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        for account in value["accounts"].as_array_mut().expect("accounts array") {
+            account
+                .as_object_mut()
+                .expect("account object")
+                .remove("reservedGroups");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let back: StatusPayload =
+            serde_json::from_str(&stripped).expect("deserialize without reservedGroups field");
+        assert_eq!(
+            back.accounts[0].reserved_groups,
+            Vec::<String>::new(),
+            "missing reservedGroups field on the wire defaults to empty, not a decode error"
+        );
     }
 
     /// A payload from an older server that predates `groups` still deserializes,

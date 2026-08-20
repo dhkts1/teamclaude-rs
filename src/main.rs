@@ -166,8 +166,9 @@ struct GroupArgs {
     action: GroupAction,
 }
 
-/// `tcr group ls|add|rm` — the argument shape here is a CONTRACT with the
-/// TcrBar panel, which shells out to it (`TcrTool.run`); do not change it.
+/// `tcr group ls|add|rm|reserve|unreserve` — the argument shape here is a
+/// CONTRACT with the TcrBar panel, which shells out to it (`TcrTool.run`); do
+/// not change it.
 #[derive(Subcommand)]
 enum GroupAction {
     /// List groups and their members.
@@ -176,6 +177,11 @@ enum GroupAction {
     Add(GroupAddArgs),
     /// Remove one account from one group, or `--all` to delete the group.
     Rm(GroupRmArgs),
+    /// Reserve a group: from the next restart, an account carrying it is
+    /// off-limits to traffic that did not ask for one of its groups.
+    Reserve(GroupReserveArgs),
+    /// Clear a group's reserved flag.
+    Unreserve(GroupUnreserveArgs),
 }
 
 #[derive(clap::Args)]
@@ -217,6 +223,24 @@ struct GroupRmArgs {
     /// label.
     #[arg(long)]
     all: bool,
+}
+
+#[derive(clap::Args)]
+struct GroupReserveArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to reserve.
+    group: String,
+}
+
+#[derive(clap::Args)]
+struct GroupUnreserveArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to unreserve.
+    group: String,
 }
 
 #[derive(clap::Args)]
@@ -407,6 +431,14 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         GroupAction::Rm(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
             cli::remove_from_group(&config_path, &a.group, a.account.as_deref(), a.all)
+        }
+        GroupAction::Reserve(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::reserve_group(&config_path, &a.group)
+        }
+        GroupAction::Unreserve(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::unreserve_group(&config_path, &a.group)
         }
     }
 }

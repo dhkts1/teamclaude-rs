@@ -5,6 +5,7 @@
 //! `quotaProbeSeconds`, `warmupSeconds`, …). Every struct carries a flattened
 //! `extra` map so an unknown key survives a load→save round-trip untouched.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -139,6 +140,25 @@ impl Account {
             .as_deref()
             .is_some_and(|groups| groups.iter().any(|g| g == group))
     }
+}
+
+/// Properties of one group label (`groupSettings.<name>` in the file) — a home
+/// for facts about the GROUP itself, distinct from `Account::groups`, which only
+/// records membership. Absent for a group name that no account carries a
+/// `groupSettings` entry for; `#[serde(default)]` so an older config (or a group
+/// with no properties set) round-trips untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupSettings {
+    /// When `true`, an account carrying this group is off-limits to traffic
+    /// that did not ask for one of its groups — see
+    /// [`crate::manager::select::eligible`]'s doc-comment for the exact rule.
+    /// Absent/`false` (default) keeps today's prefer-only behaviour.
+    #[serde(default)]
+    pub reserved: bool,
+    /// Any `groupSettings.<name>.*` keys we do not model.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// Per-account request pacing (opt-in; default OFF).
@@ -299,9 +319,57 @@ pub struct Config {
     pub http1_only: bool,
     #[serde(default)]
     pub accounts: Vec<Account>,
+    /// Properties of GROUPS themselves (`"groupSettings": {"codereview":
+    /// {"reserved": true}}`), keyed by the same label `Account::groups` carries.
+    /// Absent → no group is reserved (default). Membership stays per-account;
+    /// this map holds only properties, so a key here naming a group with no
+    /// members is harmless — it reserves nothing — and is deliberately NOT
+    /// validated against current membership.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub group_settings: HashMap<String, GroupSettings>,
     /// Any top-level keys we do not model, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl Config {
+    /// The set of group labels currently marked `reserved`. Cheap to call —
+    /// intended for one-shot use (CLI verbs, [`crate::manager::Manager`]
+    /// construction caching its own copy), not a per-request hot path.
+    pub fn reserved_group_names(&self) -> HashSet<String> {
+        self.group_settings
+            .iter()
+            .filter(|(_, s)| s.reserved)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether `group` is currently marked `reserved`. `false` for a group
+    /// name with no `groupSettings` entry at all — same "absent means not
+    /// reserved" default the field's own doc-comment promises.
+    pub fn is_group_reserved(&self, group: &str) -> bool {
+        self.group_settings.get(group).is_some_and(|s| s.reserved)
+    }
+
+    /// How many ENABLED accounts would remain reachable by traffic that asks
+    /// for nothing, if exactly the group names in `reserved` were reserved —
+    /// the safety-rail figure `tcr group reserve` prints and refuses on. Takes
+    /// the candidate set explicitly (rather than reading
+    /// [`Self::reserved_group_names`] itself) so a caller can ask "what WOULD
+    /// this leave" before writing the change.
+    pub fn unreserved_enabled_count(&self, reserved: &HashSet<String>) -> usize {
+        self.accounts
+            .iter()
+            .filter(|a| !a.disabled.unwrap_or(false))
+            .filter(|a| {
+                a.groups
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .all(|g| !reserved.contains(g))
+            })
+            .count()
+    }
 }
 
 /// The default config path: `$HOME/.config/teamclaude.json`.
@@ -1242,6 +1310,98 @@ fn merge_group_membership(
         );
     }
     GroupWrite::Updated
+}
+
+/// What a targeted [`save_group_reserved`] did to the on-disk document. Same
+/// two-arm shape as [`GroupWrite`]'s success cases — this write can never fail
+/// on an identity mismatch (it targets a GROUP NAME, not an `accounts` entry),
+/// so it has no `NoEntry`/`Ambiguous` counterpart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupReserveWrite {
+    /// `groupSettings.<group>.reserved` was set (or its whole entry removed)
+    /// and the file rewritten.
+    Updated,
+    /// The group already carried (or already lacked) `reserved`, so nothing
+    /// was written and the file is byte-identical.
+    Unchanged,
+}
+
+/// Persist ONLY `groupSettings.<group>.reserved` into the file at `path`,
+/// leaving every other key — every account, every other group's settings —
+/// exactly as the user left it. Same read-modify-write shape as
+/// [`save_group_membership`] and for the same reason: `Config` is a boot-time
+/// snapshot, and a whole-file [`save`] would revert any out-of-band edit.
+///
+/// Setting `reserved` to `false` drops the `reserved` key rather than writing
+/// `false`, and drops the group's whole `groupSettings` entry once it is
+/// empty — mirroring the drops-the-key contract [`merge_group_membership`]
+/// uses for an account's last label, so a group that has ever been reserved
+/// and then unreserved carries no permanent litter.
+pub fn save_group_reserved(
+    path: &Path,
+    group: &str,
+    reserved: bool,
+) -> Result<GroupReserveWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_group_reserved(&mut doc, group, reserved);
+    if outcome == GroupReserveWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+fn merge_group_reserved(
+    doc: &mut Map<String, Value>,
+    group: &str,
+    reserved: bool,
+) -> GroupReserveWrite {
+    let already = doc
+        .get("groupSettings")
+        .and_then(Value::as_object)
+        .and_then(|settings| settings.get(group))
+        .and_then(Value::as_object)
+        .and_then(|entry| entry.get("reserved"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if already == reserved {
+        return GroupReserveWrite::Unchanged;
+    }
+
+    let settings = doc
+        .entry("groupSettings".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    // A hand-edited `groupSettings` that is not an object is corrupt input we
+    // must not silently coerce — replace it with a fresh object rather than
+    // panicking, since `already` above already proved it carried no usable
+    // `reserved` value for this group either way.
+    if !settings.is_object() {
+        *settings = Value::Object(Map::new());
+    }
+    let settings_obj = settings.as_object_mut().expect("just ensured object");
+
+    if reserved {
+        let entry = settings_obj
+            .entry(group.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        entry
+            .as_object_mut()
+            .expect("just ensured object")
+            .insert("reserved".to_string(), Value::Bool(true));
+    } else if let Some(entry) = settings_obj.get_mut(group) {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("reserved");
+            if obj.is_empty() {
+                settings_obj.remove(group);
+            }
+        }
+    }
+    if settings_obj.is_empty() {
+        doc.remove("groupSettings");
+    }
+    GroupReserveWrite::Updated
 }
 
 /// Set or remove the top-level `controlAccount` key in `doc`. Reports whether

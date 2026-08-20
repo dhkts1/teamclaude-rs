@@ -3622,6 +3622,7 @@ mod tests {
                 groups: None,
                 extra: serde_json::Map::new(),
             }],
+            group_settings: std::collections::HashMap::new(),
             extra: serde_json::Map::new(),
         }
     }

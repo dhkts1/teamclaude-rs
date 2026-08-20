@@ -401,6 +401,80 @@ pub fn remove_from_group(
     Ok(())
 }
 
+/// `tcr group reserve <group>` — mark `group` reserved: from the next
+/// restart, an account carrying it is off-limits to traffic that did not ask
+/// for one of its groups (`docs/plans/reserved-groups-bridge.md`'s
+/// "Semantics" section has the exact rule).
+///
+/// The safety rail runs BEFORE any write: reserving shrinks the general pool,
+/// so this refuses outright — leaving the config byte-identical — if the
+/// change would leave zero unreserved ENABLED accounts, and warns (but
+/// proceeds) below three. Idempotent: reserving an already-reserved group
+/// succeeds and says so.
+pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    if let Err(reason) = validate_group_label_chars(group) {
+        bail!("group {group:?}: invalid group label — {reason}");
+    }
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+
+    let mut reserved_after = config.reserved_group_names();
+    reserved_after.insert(group.to_string());
+    let remaining = config.unreserved_enabled_count(&reserved_after);
+    if remaining == 0 {
+        let currently_reserved: Vec<String> = config
+            .reserved_group_names()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let advice = if currently_reserved.is_empty() {
+            "every enabled account belongs to this group".to_string()
+        } else {
+            format!("unreserve one of: {} first", currently_reserved.join(", "))
+        };
+        bail!(
+            "reserving '{group}' would leave 0 unreserved enabled accounts — the fleet could serve no unrequested traffic. {advice}. Nothing changed."
+        );
+    }
+
+    let outcome = config::save_group_reserved(config_path, group, true)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupReserveWrite::Updated => {
+            println!("group '{group}' reserved. {remaining} unreserved enabled account(s) remain.");
+            if remaining < 3 {
+                eprintln!(
+                    "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
+                );
+            }
+            println!("{GROUP_RESTART_NOTE}");
+        }
+        config::GroupReserveWrite::Unchanged => {
+            println!("group '{group}' is already reserved; nothing changed. {remaining} unreserved enabled account(s) remain.");
+        }
+    }
+    Ok(())
+}
+
+/// `tcr group unreserve <group>` — clear `group`'s `reserved` flag. Never
+/// refused: unreserving only ever GROWS the unreserved pool, so the safety
+/// rail `reserve` runs has nothing to check here.
+pub fn unreserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    let outcome = config::save_group_reserved(config_path, group, false)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupReserveWrite::Updated => {
+            println!("group '{group}' unreserved.");
+            println!("{GROUP_RESTART_NOTE}");
+        }
+        config::GroupReserveWrite::Unchanged => {
+            println!("group '{group}' was not reserved; nothing changed.");
+        }
+    }
+    Ok(())
+}
+
 /// `tcr group ls [--json]` — list every group and its members, plus the
 /// ungrouped count.
 ///
@@ -451,9 +525,14 @@ fn render_groups_text(config: &Config) -> String {
     for (group, members) in &groups {
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={}",
+            "group {group:width$} accounts={} members={} reserved={}",
             members.len(),
             members.join(","),
+            if config.is_group_reserved(group) {
+                "yes"
+            } else {
+                "no"
+            },
         );
     }
     let _ = writeln!(out, "ungrouped accounts={ungrouped}");
@@ -471,6 +550,7 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
                 "group": group,
                 "accounts": members.len(),
                 "members": members,
+                "reserved": config.is_group_reserved(group),
             })
         })
         .collect();
@@ -1339,8 +1419,16 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         } else {
             format!(" groups={}", a.groups.join(","))
         };
+        // Reserved subset of `groups=`, greppable via `reserved_groups=codereview`.
+        // Omitted entirely when none of this account's groups is reserved — same
+        // "nothing to say" idiom as `groups=` above.
+        let reserved_groups = if a.reserved_groups.is_empty() {
+            String::new()
+        } else {
+            format!(" reserved_groups={}", a.reserved_groups.join(","))
+        };
         out.push_str(&format!(
-            "account {} priority={} {} {}{}{} state={} status={}{} probe={}{}{}{}{}\n",
+            "account {} priority={} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}\n",
             a.name,
             a.priority,
             five_hour,
@@ -1355,6 +1443,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             last_stream_error,
             if a.disabled { " disabled" } else { "" },
             groups,
+            reserved_groups,
         ));
     }
     out
@@ -1619,6 +1708,12 @@ fn render_accounts_json(
                 // above. Never `null`: "this account has no groups" is known,
                 // not unmeasured.
                 "groups": a.groups,
+                // The subset of `groups` currently RESERVED (`tcr group
+                // reserve`), sorted. Same never-`null` contract as `groups`
+                // above — this is the field the sibling macOS panel decodes to
+                // mark a section reserved; name and shape are a fixed contract,
+                // do not change them.
+                "reservedGroups": a.reserved_groups,
             })
         })
         .collect();
@@ -2267,6 +2362,110 @@ mod tests {
         assert_eq!(value["quotaProbeSeconds"], serde_json::json!(120));
         // Per-account unmodelled key on an entry NOT even touched by this edit.
         assert_eq!(value["accounts"][0]["models"], serde_json::json!(["opus"]));
+        fs::remove_file(&path).ok();
+    }
+
+    // --- group reserve / unreserve (the safety rail) -----------------------
+
+    /// Every account belongs to `codereview` and none are disabled — reserving
+    /// it would leave 0 unreserved enabled accounts, so this fixture is the
+    /// one the safety rail's hard refusal must fire on.
+    const ALL_IN_ONE_GROUP: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "priority": 0, "groups": ["codereview"] },
+        { "name": "bob@example.com", "type": "oauth", "accessToken": "at-b",
+          "priority": 1, "groups": ["codereview"] }
+      ]
+    }"#;
+
+    /// Bridge test #6: `reserve` refuses when it would leave zero unreserved
+    /// enabled accounts, and the config is BYTE-IDENTICAL after the refusal —
+    /// the safety rail runs its count-before-write, not a write-then-rollback.
+    #[test]
+    fn reserve_refuses_when_it_would_leave_zero_unreserved_enabled_accounts() {
+        let path = write_config("reserve-zero", ALL_IN_ONE_GROUP);
+        let before = fs::read_to_string(&path).unwrap();
+        let result = reserve_group(&path, "codereview");
+        assert!(
+            result.is_err(),
+            "reserving the fleet's only group must be refused"
+        );
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a refused reservation must not touch the file at all"
+        );
+        let config = load(&path);
+        assert!(
+            !config.is_group_reserved("codereview"),
+            "config in memory must also show the group as still unreserved"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A disabled account does not count toward the pool either direction —
+    /// reserving a group that leaves only a DISABLED account unreserved is
+    /// refused exactly like leaving none at all, and a group with a healthy
+    /// unreserved sibling succeeds and reports the right remaining count.
+    #[test]
+    fn reserve_counts_only_enabled_accounts_in_the_remaining_pool() {
+        let path = write_config(
+            "reserve-disabled-sibling",
+            r#"{
+              "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 0, "groups": ["codereview"] },
+                { "name": "bob@example.com", "type": "oauth", "accessToken": "at-b",
+                  "priority": 1, "disabled": true }
+              ]
+            }"#,
+        );
+        let result = reserve_group(&path, "codereview");
+        assert!(
+            result.is_err(),
+            "the only OTHER account is disabled — reserving must still refuse"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The success path: a group with headroom reserves cleanly, persists,
+    /// and survives a restart-style reload; unreserve clears it again. Idempotent
+    /// both ways.
+    #[test]
+    fn reserve_then_unreserve_round_trips_and_is_idempotent() {
+        let path = write_config("reserve-roundtrip", GROUPED_ACCOUNTS);
+        reserve_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(config.is_group_reserved("codereview"));
+        assert!(
+            !config.is_group_reserved("dev"),
+            "only the named group changes"
+        );
+
+        // Idempotent: reserving an already-reserved group succeeds.
+        reserve_group(&path, "codereview").unwrap();
+        assert!(load(&path).is_group_reserved("codereview"));
+
+        unreserve_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(!config.is_group_reserved("codereview"));
+
+        // Idempotent the other way too.
+        unreserve_group(&path, "codereview").unwrap();
+        assert!(!load(&path).is_group_reserved("codereview"));
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr group reserve` rejects the same bad-character labels `tcr group
+    /// add` already does — reuses [`validate_group_label_chars`], no second
+    /// validator.
+    #[test]
+    fn reserve_rejects_bad_label() {
+        let path = write_config("reserve-bad-label", TWO_ACCOUNTS);
+        let result = reserve_group(&path, "bad\nlabel");
+        assert!(result.is_err(), "a newline in the label must be rejected");
         fs::remove_file(&path).ok();
     }
 
@@ -3960,6 +4159,7 @@ mod tests {
                 None
             },
             groups: groups.iter().map(|g| g.to_string()).collect(),
+            reserved_groups: Vec::new(),
         }
     }
 
@@ -4314,5 +4514,116 @@ mod tests {
             !dave_line.contains("groups="),
             "unlabelled account omits the token entirely: {dave_line}"
         );
+    }
+
+    /// `reservedGroups` on the JSON wire: always an array, `[]` — never
+    /// `null` — when nothing is reserved, mirroring `groups`'s own contract.
+    /// Bridge test #7.
+    fn reserved_groups_snapshot() -> (StatsSnapshot, Vec<f64>) {
+        let base = AccountSnapshot {
+            name: String::new(),
+            priority: 0,
+            status: "active".to_string(),
+            disabled: false,
+            five_hour: None,
+            five_hour_reset: None,
+            seven_day: None,
+            seven_day_reset: None,
+            seven_day_oi: None,
+            requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            last_used: None,
+            rate_limited_until: None,
+            probe_status: crate::probe::ProbeStatus::Never,
+            last_probe: None,
+            probe_error: None,
+            quota_state: QuotaState::Normal,
+            gate: crate::stats::GateReason::Ok,
+            free_at: None,
+            stream_error_count: 0,
+            last_stream_error: None,
+            groups: Vec::new(),
+            reserved_groups: Vec::new(),
+        };
+        let accounts = vec![
+            AccountSnapshot {
+                name: "alice@example.com".to_string(),
+                gate: crate::stats::GateReason::Reserved,
+                groups: vec!["dev".to_string(), "codereview".to_string()],
+                reserved_groups: vec!["codereview".to_string()],
+                ..base.clone()
+            },
+            AccountSnapshot {
+                name: "dave@example.com".to_string(),
+                ..base
+            },
+        ];
+        (
+            StatsSnapshot {
+                accounts,
+                current: None,
+                recent: Vec::new(),
+                sessions: Vec::new(),
+            },
+            vec![0.90, 0.90],
+        )
+    }
+
+    #[test]
+    fn reserved_groups_render_as_array_never_null() {
+        let (snapshot, thresholds) = reserved_groups_snapshot();
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let alice = rows
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        assert_eq!(
+            alice["reservedGroups"],
+            serde_json::json!(["codereview"]),
+            "reserved subset of alice's groups: {alice}"
+        );
+        assert_eq!(alice["gate"], serde_json::json!("reserved"));
+        let dave = rows
+            .iter()
+            .find(|r| r["name"] == "dave@example.com")
+            .expect("dave row");
+        assert_eq!(
+            dave["reservedGroups"],
+            serde_json::json!([]),
+            "nothing reserved renders [], never null: {dave}"
+        );
+    }
+
+    /// `reservedGroups` round-trips through the `status.rs` wire (the
+    /// full server->client payload, not just this file's JSON renderer) —
+    /// bridge test #7's other half.
+    #[test]
+    fn reserved_groups_round_trip_through_status_payload() {
+        let (snapshot, thresholds) = reserved_groups_snapshot();
+        let payload =
+            crate::status::StatusPayload::from_snapshot(&snapshot, &thresholds, false, None);
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            wire.contains("\"reservedGroups\":[\"codereview\"]"),
+            "reservedGroups is camelCase on the wire: {wire}"
+        );
+        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let (rebuilt, _) = back.into_snapshot();
+        assert_eq!(
+            rebuilt.accounts[0].reserved_groups,
+            vec!["codereview".to_string()]
+        );
+        assert_eq!(rebuilt.accounts[1].reserved_groups, Vec::<String>::new());
     }
 }
