@@ -287,19 +287,6 @@ public enum Tok {
         .timingCurve(0.22, 1, 0.36, 1, duration: duration)
     }
 
-    /// The stacked group-deck card's hover/click motion (bridge:
-    /// `docs/plans/stacked-cards-bridge.md`) — deliberately a SEPARATE
-    /// animation from ``standardAnimation``, not a reuse. `standardAnimation`
-    /// is an ease curve tuned for a bar filling toward a value it is going
-    /// to reach and hold; a deck card's hover states are pointer-driven with
-    /// no momentum behind them; per the bridge, that means critically damped
-    /// and NEVER overshooting (`dampingFraction: 1`), where `standardAnimation`
-    /// itself has no overshoot control at all because a fill bar never needed
-    /// one. `response` sits inside the bridge's stated 0.3-0.4s window.
-    public static var deckAnimation: Animation {
-        .spring(response: 0.34, dampingFraction: 1.0, blendDuration: 0)
-    }
-
     // MARK: - Mapping
 
     public static func color(for state: QuotaState) -> Color {
@@ -393,6 +380,81 @@ public struct StatusPill: View {
                     )
             )
             .fixedSize()
+    }
+}
+
+/// One group tag on an account row (``Account/groupTags``) — the whole
+/// group-membership UI now that the dedicated Groups tab, deck cards and
+/// section headers are gone (bridge: `docs/plans/group-tags-bridge.md`).
+///
+/// Tinted by the SERVER-resolved colour (``GroupTag/background``), never a
+/// colour this app derives itself, so every client agrees on what a group
+/// looks like. A missing or malformed colour (`nil`) falls back to
+/// ``Tok/inkFaint`` — the same neutral hue ``StatusPill`` and this chip's own
+/// prior, uncoloured version both already used — rather than guessing.
+///
+/// A reserved group is marked with a small lock glyph, not a colour or shape
+/// change: colour is already spoken for by group identity here, so a second
+/// meaning riding the same channel (filled vs. outlined, a different hue)
+/// would ask the reader to disentangle two facts from one visual cue. The
+/// glyph is a second, independent channel.
+public struct GroupChip: View {
+    private let tag: GroupTag
+
+    public init(tag: GroupTag) {
+        self.tag = tag
+    }
+
+    /// `nil` background (no wire colour) draws the neutral wash a plain
+    /// `StatusPill` already uses; a real colour is drawn solid, since a
+    /// translucent wash over an operator-chosen hue would mis-render the
+    /// luminance ``foreground`` was computed against.
+    private var background: Color {
+        guard let rgb = tag.background else { return Tok.wash(Tok.inkFaint) }
+        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+    }
+
+    private var border: Color {
+        guard let rgb = tag.background else { return Tok.line(Tok.inkFaint) }
+        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue).opacity(0.6)
+    }
+
+    /// Chosen from the background's relative luminance
+    /// (``GroupTagColor/isLight(_:)``), not hardcoded — these chips sit on a
+    /// dark panel and the colour is operator-chosen, so a light pick (a pale
+    /// yellow) needs dark text and a very dark pick needs light text, or
+    /// either renders unreadable. `nil` background (the neutral fallback)
+    /// uses ``Tok/ink``, the panel's own primary-text token, since that wash
+    /// is already tuned against the dark panel the same way every other
+    /// `StatusPill` is.
+    private var foreground: Color {
+        guard let rgb = tag.background else { return Tok.ink }
+        return GroupTagColor.isLight(rgb) ? .black : .white
+    }
+
+    public var body: some View {
+        HStack(spacing: 2) {
+            if tag.isReserved {
+                Image(systemName: "lock.fill")
+                    .font(.system(size: Tok.detailFontSize - 2, weight: .bold))
+            }
+            Text(tag.name.uppercased())
+                .font(Tok.pillFont)
+                .tracking(Tok.pillTracking)
+        }
+        .foregroundStyle(foreground)
+        .padding(.horizontal, Tok.pillPaddingH)
+        .padding(.vertical, Tok.pillPaddingV)
+        .background(
+            RoundedRectangle(cornerRadius: Tok.pillRadius)
+                .fill(background)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Tok.pillRadius)
+                        .strokeBorder(border, lineWidth: Tok.hairlineWidth)
+                )
+        )
+        .fixedSize()
+        .help(tag.isReserved ? "\(tag.name) (reserved — held out of the general pool)" : tag.name)
     }
 }
 
