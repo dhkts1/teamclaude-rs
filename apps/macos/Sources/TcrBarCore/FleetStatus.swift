@@ -1144,42 +1144,7 @@ public struct Fleet: Equatable, Sendable {
     /// in several groups counts in each — mirroring ``breakdown``'s bucket
     /// idiom rather than inventing a second one.
     public var groupBreakdown: [GroupTally] {
-        // No account anywhere carries a label: a fleet that does not use
-        // groups renders nothing at all, not an all-`ungrouped` line.
-        guard accounts.contains(where: { !($0.groups ?? []).isEmpty }) else { return [] }
-
-        var totals: [String: Int] = [:]
-        var frees: [String: Int] = [:]
-        var ungroupedTotal = 0
-        var ungroupedFree = 0
-        for account in accounts {
-            let groups = account.groups ?? []
-            // `free` classifies with the same `FleetTally.Kind(account:)` this
-            // struct already uses for the top-line breakdown — a `.near`
-            // account still serves, so it counts as free exactly as it does
-            // there; only `.disabled` accounts are excluded from `free`
-            // (`total` counts them).
-            let isFree =
-                !account.disabled
-                && [.ok, .near].contains(FleetTally.Kind(account: account))
-            if groups.isEmpty {
-                ungroupedTotal += 1
-                if isFree { ungroupedFree += 1 }
-                continue
-            }
-            for group in groups {
-                totals[group, default: 0] += 1
-                if isFree { frees[group, default: 0] += 1 }
-            }
-        }
-
-        var result = totals.keys.sorted().map { name in
-            GroupTally(name: name, free: frees[name, default: 0], total: totals[name]!)
-        }
-        if ungroupedTotal > 0 {
-            result.append(GroupTally(name: "ungrouped", free: ungroupedFree, total: ungroupedTotal))
-        }
-        return result
+        groupDetails.map(\.tally)
     }
 
     /// `"codereview 0/3 · dev 4/5 · ungrouped 5/6"` — the same content as
@@ -1187,6 +1152,117 @@ public struct Fleet: Equatable, Sendable {
     /// ``breakdownLabel``'s idiom.
     public var groupBreakdownLabel: String {
         groupBreakdown.map(\.label).joined(separator: " · ")
+    }
+
+    /// ``groupBreakdown``, elaborated with the member list each group's row
+    /// needs to expand — the Groups view's source of truth. Same population,
+    /// same free/total counting, same alphabetical-then-`ungrouped` ordering;
+    /// ``groupBreakdown`` is now defined in terms of this rather than
+    /// duplicating the grouping pass.
+    public var groupDetails: [GroupDetail] {
+        // No account anywhere carries a label: a fleet that does not use
+        // groups renders nothing at all, not an all-`ungrouped` line.
+        guard accounts.contains(where: { !($0.groups ?? []).isEmpty }) else { return [] }
+
+        // `free` classifies with the same `FleetTally.Kind(account:)` this
+        // struct already uses for the top-line breakdown — a `.near`
+        // account still serves, so it counts as free exactly as it does
+        // there; only `.disabled` accounts are excluded from `free`
+        // (`total` counts them).
+        func isFree(_ account: Account) -> Bool {
+            !account.disabled && [.ok, .near].contains(FleetTally.Kind(account: account))
+        }
+
+        var members: [String: [Account]] = [:]
+        var ungroupedMembers: [Account] = []
+        for account in accounts {
+            let groups = account.groups ?? []
+            if groups.isEmpty {
+                ungroupedMembers.append(account)
+                continue
+            }
+            for group in groups {
+                members[group, default: []].append(account)
+            }
+        }
+
+        var result = members.keys.sorted().map { name -> GroupDetail in
+            let group = members[name]!
+            return GroupDetail(
+                name: name,
+                free: group.filter(isFree).count,
+                total: group.count,
+                members: group
+            )
+        }
+        if !ungroupedMembers.isEmpty {
+            result.append(
+                GroupDetail(
+                    name: "ungrouped",
+                    free: ungroupedMembers.filter(isFree).count,
+                    total: ungroupedMembers.count,
+                    members: ungroupedMembers
+                )
+            )
+        }
+        return result
+    }
+}
+
+/// ``GroupTally`` elaborated with the accounts that make it up, for the Groups
+/// view's expanded row. Membership is a SET like ``GroupTally``'s: an account
+/// in several groups appears in each detail's ``members``, unmodified.
+public struct GroupDetail: Equatable, Sendable, Identifiable {
+    public let name: String
+    /// Same counting as ``GroupTally/free``.
+    public let free: Int
+    /// Same counting as ``GroupTally/total`` — includes disabled members.
+    public let total: Int
+    /// Every account carrying this label (or, for `"ungrouped"`, every account
+    /// carrying none) — the same population ``total`` counts, disabled
+    /// included, so the view can list a parked member rather than hide it.
+    public let members: [Account]
+
+    public init(name: String, free: Int, total: Int, members: [Account]) {
+        self.name = name
+        self.free = free
+        self.total = total
+        self.members = members
+    }
+
+    public var id: String { name }
+
+    /// The plain ``GroupTally`` this detail elaborates.
+    public var tally: GroupTally { GroupTally(name: name, free: free, total: total) }
+
+    /// `"dev 4/5"` — same as ``GroupTally/label``.
+    public var label: String { tally.label }
+
+    /// The worst (highest) 5-hour utilization among members that have one —
+    /// the window that gates the group next. `nil` when no member has ever
+    /// reported a 5h fraction.
+    public var max5hUtilization: Double? {
+        members.compactMap(\.fiveHour).max()
+    }
+
+    /// The soonest reset among members currently held. `nil` when nothing in
+    /// the group is held.
+    public var soonestReset: HeldWindow? {
+        members.compactMap(\.soonestHold).min(by: { $0.minutesUntilReset < $1.minutesUntilReset })
+    }
+
+    /// `"5h 12% max · resets in 2h 14m"`. Either half is omitted — never
+    /// replaced with a placeholder — when its member data has nothing to say,
+    /// the same honesty rule ``QuotaFormat`` encodes for a single account;
+    /// `nil` when neither half has anything. Routes the reset half through
+    /// ``HeldWindow/duration(minutes:)``, this codebase's one duration
+    /// formatter, rather than growing a second one.
+    public var statLine: String? {
+        let utilization = max5hUtilization.map { "5h \(QuotaFormat.percent($0)) max" }
+        let reset = soonestReset.map { "resets in \(HeldWindow.duration(minutes: $0.minutesUntilReset))" }
+        let parts = [utilization, reset].compactMap { $0 }
+        guard !parts.isEmpty else { return nil }
+        return parts.joined(separator: " · ")
     }
 }
 
