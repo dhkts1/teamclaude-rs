@@ -48,6 +48,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         org_name: Some("Demo Org".to_string()),
         priority,
         disabled: false,
+        groups: Vec::new(),
         switch_threshold: None,
         access_token: "demo-access-token".to_string(),
         refresh_token: Some("demo-refresh-token".to_string()),

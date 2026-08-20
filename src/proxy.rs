@@ -49,6 +49,13 @@ use crate::stats::{RequestLogEntry, SessionKind};
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
 /// non-stream *response* body is bounded by the same cap (see [`read_capped_body`]).
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Header `tcr run --group <name>` sets via `ANTHROPIC_CUSTOM_HEADERS` (see
+/// `src/main.rs`'s `compose_group_header`), which Claude Code forwards
+/// verbatim as a real outbound header on every `/v1/messages` request. `pub`
+/// so `main.rs` — a separate (binary) crate — shares this one definition
+/// rather than duplicating the header name as a second literal that could
+/// drift out of sync with what this file reads.
+pub const GROUP_HEADER_NAME: &str = "x-tcr-group";
 /// Depth of the SSE tee side-channel. A fast upstream feeding a slow parser task
 /// can retain at most this many chunks; beyond it, `try_send` drops chunks for
 /// the parser (usage counting becomes best-effort) rather than letting the buffer
@@ -1724,6 +1731,7 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         priority: parsed.priority,
         switch_threshold: parsed.switch_threshold,
         disabled: None,
+        groups: None,
         extra: serde_json::Map::new(),
     };
     // Captured before the move below: on an ambiguous match this is the ONLY
@@ -1931,6 +1939,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         .as_deref()
         .is_some_and(crate::model::is_fable_model);
 
+    // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
+    // constant across the rotation loop — same shape as `request_model` above.
+    // An empty header value is treated as absent rather than an empty-string
+    // group, matching `compose_group_header`'s own "no inherited value" case.
+    let request_group = req_headers
+        .get(GROUP_HEADER_NAME)
+        .and_then(|v| v.to_str().ok())
+        .filter(|g| !g.is_empty())
+        .map(str::to_string);
+
     // The session key pins this connection to one account (opt-in). The extension
     // is present iff session affinity is enabled, so `session_key` is `None` (LRU
     // rotation) by default. When on, key on the most STABLE client identity —
@@ -2068,13 +2086,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         let now = OffsetDateTime::now_utc();
         let idx = match next_idx.take() {
             Some(i) => i,
-            None => match manager.select(
+            None => match manager.select_with_group(
                 &tried,
                 now,
                 request_model.as_deref(),
                 session_key,
                 &path,
                 conn_key,
+                request_group.as_deref(),
             ) {
                 Some(idx) => idx,
                 None => {
@@ -2543,13 +2562,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 let mut with_this_one = tried.clone();
                 with_this_one.insert(idx);
                 let failover_now = OffsetDateTime::now_utc();
-                if let Some(other) = manager.select(
+                if let Some(other) = manager.select_with_group(
                     &with_this_one,
                     failover_now,
                     request_model.as_deref(),
                     session_key,
                     &path,
                     conn_key,
+                    request_group.as_deref(),
                 ) {
                     debug_assert_ne!(
                         other, idx,
@@ -3599,6 +3619,7 @@ mod tests {
                 priority: Some(0),
                 switch_threshold: None,
                 disabled: None,
+                groups: None,
                 extra: serde_json::Map::new(),
             }],
             extra: serde_json::Map::new(),
@@ -4837,6 +4858,7 @@ mod tests {
             priority: Some(priority),
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         Config {
@@ -6621,6 +6643,7 @@ mod tests {
             priority: None,
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         };
         let resp = client

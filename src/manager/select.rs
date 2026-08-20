@@ -226,6 +226,12 @@ impl Manager {
     /// ([`Self::conn_affinity`]); everything else prefers the control account
     /// via [`Self::control_eligible`] (which deliberately bypasses `disabled`).
     /// Inert whenever [`Self::control`] is `None`.
+    ///
+    /// Thin wrapper over [`Self::select_with_group`] with no group preference —
+    /// kept as the stable signature the test suite (and every caller that has no
+    /// `--group` to express) already calls by the hundred, so a per-request
+    /// preference this narrow does not force every one of them to grow a new
+    /// trailing `None`.
     pub fn select(
         &self,
         tried: &HashSet<usize>,
@@ -234,6 +240,29 @@ impl Manager {
         affinity: Option<u64>,
         path: &str,
         conn_key: Option<u64>,
+    ) -> Option<usize> {
+        self.select_with_group(tried, now, model, affinity, path, conn_key, None)
+    }
+
+    /// [`Self::select`], with an optional PREFER-semantics group (`tcr run
+    /// --group <name>`, Phase 1 — see `docs/plans/account-groups-bridge-phase1.md`).
+    /// `group` narrows only the pacing-respecting first pass of the normal pick
+    /// (mirroring how that pass already narrows on `respect_pacing`); the soft
+    /// fallback pass always passes `None`, so a group with no current capacity
+    /// degrades to the whole pool rather than a 429. Every OTHER eligibility check
+    /// in this function — honouring an existing pin, a connection's noise
+    /// affinity, a sticky divert destination — passes `None` unconditionally: an
+    /// already-warm session is never re-keyed by a per-request preference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn select_with_group(
+        &self,
+        tried: &HashSet<usize>,
+        now: OffsetDateTime,
+        model: Option<&str>,
+        affinity: Option<u64>,
+        path: &str,
+        conn_key: Option<u64>,
+        group: Option<&str>,
     ) -> Option<usize> {
         // Hard account lock: pin ALL traffic to the configured account, bypassing
         // rotation/affinity/migration. `tried` still ends the rotation loop — once the
@@ -349,6 +378,7 @@ impl Manager {
                                 now,
                                 now_ms,
                                 is_fable,
+                                None, // no group preference — honouring an existing pin/connection/sticky destination
                             )
                         });
                         if !x_usable {
@@ -489,6 +519,7 @@ impl Manager {
                                         now,
                                         now_ms,
                                         is_fable,
+                                        None, // no group preference — honouring an existing pin/connection/sticky destination
                                     ) {
                                         continue;
                                     }
@@ -612,6 +643,7 @@ impl Manager {
                                             now,
                                             now_ms,
                                             is_fable,
+                                            None, // no group preference — honouring an existing pin/connection/sticky destination
                                         )
                                     })
                                 };
@@ -705,6 +737,7 @@ impl Manager {
                             now,
                             now_ms,
                             is_fable,
+                            None, // no group preference — honouring an existing pin/connection/sticky destination
                         )
                     });
                     usable.then_some(sticky)
@@ -752,26 +785,44 @@ impl Manager {
             let pool_tried: &HashSet<usize> = &pool_tried;
 
             // First pass: honour pacing (skip accounts at the concurrency cap or
-            // inside the min-spacing window). With pacing OFF this is byte-identical
+            // inside the min-spacing window) AND, when `--group` was requested,
+            // prefer that group. With pacing OFF and no group this is byte-identical
             // to the pre-pacing pick.
-            let mut best = self.pick_eligible(&accounts, pool_tried, now, now_ms, is_fable, true);
+            let mut best =
+                self.pick_eligible(&accounts, pool_tried, now, now_ms, is_fable, true, group);
 
-            // Soft fallback (CRITICAL — pacing must never DROP a servable request):
-            // if pacing gated EVERY account out but at least one is servable ignoring
-            // pacing, serve the least-loaded (lowest in_flight, then the normal LRU
-            // key). With pacing OFF the first pass and this pass use identical
-            // eligibility, so a None first pass ⟹ None here too — default-OFF stays
-            // byte-identical (no spurious fallback, no log).
+            // Soft fallback (CRITICAL — pacing must never DROP a servable request,
+            // and a group with no current capacity must never either): if the first
+            // pass found nothing, retry ignoring BOTH pacing and the group, serving
+            // the least-loaded (lowest in_flight, then the normal LRU key) account in
+            // the WHOLE pool. With pacing OFF and no group, the first pass and this
+            // pass use identical eligibility, so a None first pass ⟹ None here too —
+            // default-OFF stays byte-identical (no spurious fallback, no log).
             if best.is_none() {
                 if let Some(idx) =
-                    self.pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable)
+                    self.pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable, None)
                 {
                     if let Some(account) = accounts.get(idx) {
-                        tracing::info!(
-                            account = %account.name,
-                            in_flight = account.in_flight,
-                            "pacing: all accounts paced, serving least-loaded"
-                        );
+                        // This fallback fires whenever the first (group- and
+                        // pacing-respecting) pass came up empty — which can be pacing
+                        // alone, the group alone, or both together. Name whichever
+                        // constraints were actually IN PLAY on the first pass rather
+                        // than always blaming pacing: an operator debugging why
+                        // `--group` did not land where expected must not read a log
+                        // line about pacing when pacing was never the reason.
+                        match group {
+                            Some(g) => tracing::info!(
+                                account = %account.name,
+                                in_flight = account.in_flight,
+                                group = g,
+                                "group: requested group had no eligible account under pacing — falling back to the whole pool (group and pacing both ignored), serving least-loaded"
+                            ),
+                            None => tracing::info!(
+                                account = %account.name,
+                                in_flight = account.in_flight,
+                                "pacing: all accounts paced, serving least-loaded"
+                            ),
+                        }
                     }
                     best = Some(idx);
                 }
@@ -1398,6 +1449,7 @@ impl Manager {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn eligible(
         account: &AccountRuntime,
         global_threshold: f64,
@@ -1406,6 +1458,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        group: Option<&str>,
     ) -> bool {
         if account.disabled || account.status == AccountStatus::Error {
             return false;
@@ -1429,6 +1482,19 @@ impl Manager {
         // decision reads [`Self::account_hard_ok`], which excludes this gate.
         if Self::model_blocked(account, global_threshold, now, is_fable) {
             return false;
+        }
+        // `--group` PREFER routing (Phase 1: no `--only`, so this never hard-blocks
+        // an account on its own — it only narrows the CALLER's chosen pass, since
+        // the fallback pass always calls this with `group: None`). A HARD-looking
+        // early return by design, positioned after the model-block gate and before
+        // the SOFT pacing gate below, matching this account's true selectivity: it
+        // filters exactly like a hard gate WITHIN one pass. `account_gate` /
+        // `account_hard_ok` are untouched — Phase 1 never reports a group as the
+        // reason an account is hard-blocked.
+        if let Some(g) = group {
+            if !account.groups.iter().any(|acct_group| acct_group == g) {
+                return false;
+            }
         }
         // SOFT pacing gate, evaluated LAST so it only ever narrows an already-healthy
         // account. When `respect_pacing` is false (the fallback pass) or pacing is
@@ -1594,6 +1660,7 @@ impl Manager {
         !account.quota.is_near(reserved, now)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pick_eligible(
         &self,
         accounts: &[AccountRuntime],
@@ -1602,6 +1669,7 @@ impl Manager {
         now_ms: i64,
         is_fable: bool,
         respect_pacing: bool,
+        group: Option<&str>,
     ) -> Option<usize> {
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, u64, i128)> = None;
@@ -1617,6 +1685,7 @@ impl Manager {
                 now,
                 now_ms,
                 is_fable,
+                group,
             ) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
                 // ineligibility (disabled/error/quota) so the log names only the former.
@@ -1630,6 +1699,7 @@ impl Manager {
                         now,
                         now_ms,
                         is_fable,
+                        group,
                     )
                 {
                     tracing::info!(
@@ -1670,6 +1740,7 @@ impl Manager {
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
+        group: Option<&str>,
     ) -> Option<usize> {
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, u64, i128)> = None;
@@ -1685,6 +1756,7 @@ impl Manager {
                 now,
                 now_ms,
                 is_fable,
+                group,
             ) {
                 continue;
             }
@@ -1961,6 +2033,7 @@ mod revalidation_sticky_tests {
             priority: Some(0),
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -2099,6 +2172,7 @@ mod sticky_divert_replay_tests {
             priority: Some(0),
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
         }
     }

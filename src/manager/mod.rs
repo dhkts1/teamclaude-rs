@@ -220,6 +220,10 @@ pub struct AccountRuntime {
     pub org_name: Option<String>,
     pub priority: i64,
     pub disabled: bool,
+    /// Mirrors [`config::Account::groups`], normalized to an owned `Vec` (empty
+    /// when the config carried no `groups` key) so [`Manager::eligible`] can test
+    /// membership without an `Option` at every call site.
+    pub groups: Vec<String>,
     pub switch_threshold: Option<f64>,
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -535,6 +539,7 @@ impl AccountRuntime {
             org_name: account.org_name.clone(),
             priority: account.priority.unwrap_or(0),
             disabled: account.disabled.unwrap_or(false),
+            groups: account.groups.clone().unwrap_or_default(),
             switch_threshold: account.switch_threshold,
             access_token: account.access_token.clone(),
             refresh_token: account.refresh_token.clone(),
@@ -2006,6 +2011,11 @@ impl Manager {
                             priority: Some(row.priority),
                             switch_threshold: row.switch_threshold,
                             disabled: row.disabled.then_some(true),
+                            // Same "carry the row's REAL routing state" rule as
+                            // priority/switch_threshold/disabled above: group labels
+                            // are configured routing state, not identity, so a
+                            // credential re-add/refresh must not silently clear them.
+                            groups: (!row.groups.is_empty()).then(|| row.groups.clone()),
                             extra: serde_json::Map::new(),
                         };
                         Resolution::Updated {
@@ -2349,7 +2359,17 @@ mod tests {
             priority: Some(priority),
             switch_threshold: None,
             disabled: None,
+            groups: None,
             extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Like [`account`], carrying group labels — for the `--group` prefer-routing
+    /// tests.
+    fn account_in_groups(name: &str, priority: i64, groups: &[&str]) -> Account {
+        Account {
+            groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+            ..account(name, priority)
         }
     }
 
@@ -2808,6 +2828,71 @@ mod tests {
             account.probe_status = ProbeStatus::Ok;
             account.quota_known = true;
         }
+    }
+
+    // ---- `--group` prefer-routing (Phase 1: PREFER, never `--only`) -----------
+
+    /// The whole feature: with exactly one account carrying the requested group,
+    /// an unpinned select with that group MUST land on it — even though the
+    /// OTHER account would win the ordinary (no-preference) LRU/priority pick.
+    /// Then, group-out the grouped account (via `disabled`, the simplest hard
+    /// gate) and confirm the SAME select call FALLS BACK to the ungrouped
+    /// account rather than returning `None` — the prefer-semantics that make
+    /// Phase 1 different from the restricting `--only` of Phase 2.
+    #[test]
+    fn group_preference_prefers_then_falls_back_to_the_pool() {
+        let grouped = account_in_groups("grouped", 5, &["codereview"]);
+        let plain = account("plain", 0); // lower priority number sorts FIRST ordinarily
+        let manager = build_manager(config_with(vec![grouped, plain]), lock_refresher());
+        let now = OffsetDateTime::now_utc();
+
+        // Sanity control: with NO group requested, priority ordering picks the
+        // UNGROUPED account (index 1) — proves the group assertion below is
+        // actually exercising the preference, not just priority order.
+        assert_eq!(
+            manager.select_with_group(&HashSet::new(), now, None, None, "/v1/messages", None, None),
+            Some(1),
+            "no group requested: ordinary priority order picks the ungrouped account"
+        );
+
+        // The whole feature: `--group codereview` prefers index 0 despite its
+        // worse priority.
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            Some(0),
+            "a group with capacity must be preferred over a better-priority ungrouped account"
+        );
+
+        // Gate the grouped account out entirely (disabled = hard-ineligible).
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].disabled = true;
+        }
+
+        // The prefer-semantics that distinguish Phase 1 from Phase 2's `--only`:
+        // the group has no capacity, so the SAME request falls back to the whole
+        // pool rather than failing.
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            Some(1),
+            "group exhausted: must fall back to the whole pool, not return None"
+        );
     }
 
     // ---- hard account lock (`lockAccount`; no failover) -----------------------
@@ -3596,7 +3681,8 @@ mod tests {
                 true,
                 now,
                 now_ms,
-                false
+                false,
+                None,
             ),
             "served 0ms ago (< 1000ms) → skipped"
         );
@@ -3610,7 +3696,8 @@ mod tests {
                 true,
                 later,
                 later_ms,
-                false
+                false,
+                None,
             ),
             "after the spacing window → eligible again"
         );
@@ -3745,7 +3832,8 @@ mod tests {
                 true,
                 now,
                 now_ms,
-                false
+                false,
+                None,
             ),
             "cap=0 → account stays eligible regardless of in_flight (no dark pool)"
         );
