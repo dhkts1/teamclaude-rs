@@ -96,6 +96,15 @@ impl Manager {
         self.config.lock().expect("config lock poisoned").http1_only
     }
 
+    /// Every group on the fleet mapped to its resolved color, as snapshotted
+    /// at construction — see [`Self::reserved_groups`]'s field doc for why
+    /// this is cached rather than re-derived from `self.config` per call: a
+    /// `tcr group color` write needs a restart before this running process's
+    /// wire reflects it, matching every other group-settings knob.
+    pub fn group_colors(&self) -> BTreeMap<String, String> {
+        self.group_colors.clone()
+    }
+
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
     /// at `now` so the display can never show a past-reset window as still full.
     pub fn snapshot(&self, now: OffsetDateTime) -> StatsSnapshot {

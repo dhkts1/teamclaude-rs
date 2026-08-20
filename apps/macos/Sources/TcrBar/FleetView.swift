@@ -23,8 +23,9 @@ struct FleetView: View {
     /// would.
     @ObservedObject var awake: AwakeController
     @ObservedObject var updater: Updater
-    /// Mutating group membership from the section headers below. See
-    /// ``GroupController``.
+    /// Mutating group membership from each row's right-click menu — the
+    /// only way to change it from this panel now that the section-header
+    /// menus are gone. See ``GroupController``.
     @ObservedObject var groupController: GroupController
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
@@ -46,13 +47,6 @@ struct FleetView: View {
     /// Surfaced in place rather than swallowed: a button that silently does
     /// nothing is worse than one that says why.
     @State private var loginError: String?
-
-    /// Which group a "Remove Group…" confirmation is pending for, set by a
-    /// ``GroupActionsMenu`` in a section header. Owned here, not by the
-    /// header itself, so the confirmation dialog is a single instance on the
-    /// panel rather than one per section — the same reason `rowHeights` is
-    /// tracked once here instead of per row.
-    @State private var confirmRemoveGroup: String?
 
     /// Measured height of each account row, keyed by account id (`Account.id`
     /// is the account name).
@@ -84,31 +78,6 @@ struct FleetView: View {
         .padding(Tok.gutter)
         .frame(width: Tok.panelWidth)
         .background(Tok.panel)
-        // A group is implicit — it exists only once an account carries the
-        // label — so removing every member IS removing the group; there is
-        // no separate "delete an empty group" concept to confirm. This
-        // dialog exists for the destructive, hard-to-undo shape: clearing
-        // every member's label in one call. One instance for the whole
-        // panel, triggered by any section's ``GroupActionsMenu``.
-        .confirmationDialog(
-            "Remove the “\(confirmRemoveGroup ?? "")” group?",
-            isPresented: Binding(
-                get: { confirmRemoveGroup != nil },
-                set: { if !$0 { confirmRemoveGroup = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("Remove Group", role: .destructive) {
-                guard let name = confirmRemoveGroup else { return }
-                confirmRemoveGroup = nil
-                Task { await groupController.removeAll(group: name) }
-            }
-            Button("Cancel", role: .cancel) { confirmRemoveGroup = nil }
-        } message: {
-            Text(
-                "This removes the label from every member account. The proxy keeps "
-                    + "routing the old way until it restarts.")
-        }
     }
 
     // MARK: Header
@@ -159,22 +128,6 @@ struct FleetView: View {
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(fleet.breakdownLabel)
-            if !fleet.groupBreakdown.isEmpty {
-                HStack(spacing: Tok.tightSpacing) {
-                    ForEach(Array(fleet.groupBreakdown.enumerated()), id: \.offset) { index, tally in
-                        if index > 0 {
-                            Text("·").font(Tok.secondaryFont).foregroundStyle(.tertiary)
-                        }
-                        Text(tally.label)
-                            .font(Tok.secondaryDigitFont)
-                            .foregroundStyle(
-                                Tok.color(for: tally.free == 0 ? FleetTally.Kind.spent : .ok)
-                            )
-                    }
-                }
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel(fleet.groupBreakdownLabel)
-            }
         }
         .padding(.top, Tok.tightSpacing)
     }
@@ -232,15 +185,6 @@ struct FleetView: View {
             if fleet.source.countersAreStructural {
                 offlineNotice(fleet.source)
             }
-            // One list, always. `fleet.groupSections` decides only how it is
-            // labelled: sectioned when there is something to section without
-            // fragmenting, otherwise the same flat list this panel has
-            // always drawn — never a second view or mode to get stuck in.
-            if let notice = fleet.groupSectionsFragmentedNotice {
-                Text(notice)
-                    .font(Tok.detailFont)
-                    .foregroundStyle(.tertiary)
-            }
             if snapshotMode {
                 accountList(fleet)
             } else {
@@ -253,20 +197,15 @@ struct FleetView: View {
         }
     }
 
-    @ViewBuilder
+    /// A flat list of accounts — the only shape this panel draws now. Group
+    /// membership shows as a tag on the row (``AccountRow``'s pills line),
+    /// not as a section, card or separate view; see the bridge for why three
+    /// earlier attempts at the latter were all rejected.
     private func accountList(_ fleet: Fleet) -> some View {
-        if fleet.groupSections.isEmpty {
-            rowStack(fleet, showGroupChips: fleet.groupSectionsFragmented)
-        } else {
-            sectionedRowStack(fleet)
-        }
-    }
-
-    private func rowStack(_ fleet: Fleet, showGroupChips: Bool) -> some View {
         let rows = fleet.rowsInDisplayOrder(pinning: control.current)
         return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, account in
-                accountRow(account, fleet: fleet, showGroupChips: showGroupChips)
+                accountRow(account, fleet: fleet)
                 // A thin separator between the pinned control row and the
                 // rotation pool below it — the same `Hairline` this panel
                 // already uses to mark a scope boundary (see `appActions`).
@@ -279,42 +218,7 @@ struct FleetView: View {
         }
     }
 
-    /// One ``GroupDeckCard`` per ``Fleet/groupSections`` entry — the
-    /// sectioned list collapsed to one card per group SET instead of a
-    /// header followed by every member's full row (see `GroupDeckCard.swift`
-    /// for the interaction and the `RowHeightsKey` sizing hazard it was
-    /// built around).
-    ///
-    /// This drops the old `sectionedRows(fleet)` walk's mid-list `Hairline`
-    /// after a pinned control-account row: that separator marked "index 0 of
-    /// one flat list is the control account", and a set of cards has no
-    /// single flat index zero to attach it to — the control account can sit
-    /// in any card, open or collapsed, same as any other member. No bridge
-    /// requirement asked this survive; only "keep the fragmentation
-    /// fallback" and "keep the header tally line" did, and both do — the
-    /// fallback still renders through `rowStack`, unchanged, and each card's
-    /// header still carries `section.label`.
-    private func sectionedRowStack(_ fleet: Fleet) -> some View {
-        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            ForEach(fleet.groupSections) { section in
-                GroupDeckCard(
-                    section: section,
-                    allAccounts: fleet.accounts,
-                    countersAreStructural: fleet.source.countersAreStructural,
-                    accounts: accounts,
-                    control: control,
-                    groupController: groupController,
-                    onChanged: { await poller.pollOnce() },
-                    onRelogin: { reloginAccount($0) },
-                    confirmRemoveGroup: $confirmRemoveGroup
-                )
-            }
-            NewGroupControl(allAccounts: fleet.accounts, groupController: groupController)
-                .padding(.top, Tok.tightSpacing)
-        }
-    }
-
-    private func accountRow(_ account: Account, fleet: Fleet, showGroupChips: Bool) -> some View {
+    private func accountRow(_ account: Account, fleet: Fleet) -> some View {
         AccountRow(
             account: account,
             countersAreStructural: fleet.source.countersAreStructural,
@@ -322,7 +226,6 @@ struct FleetView: View {
             control: control,
             onChanged: { await poller.pollOnce() },
             onRelogin: { reloginAccount(account.name) },
-            showGroupChips: showGroupChips,
             groupController: groupController,
             allAccounts: fleet.accounts
         )
@@ -737,14 +640,6 @@ struct FleetView: View {
 /// keyed by `Account.id`. A dictionary rather than one summed scalar because
 /// rows are not uniform height — `visibleRowsHeight(for:)` needs the first N
 /// individually, in display order, not just their total.
-/// Not `private`: ``GroupDeckCard`` (`GroupDeckCard.swift`) registers a
-/// member row's height into the same key from outside this file, so an
-/// open card's rows count toward `visibleRowsHeight(for:)` exactly like an
-/// ungrouped account's row does. `PreferenceKey` values bubble up through
-/// any number of intervening views regardless of which type attaches them,
-/// so `fleetRows`'s single `onPreferenceChange(RowHeightsKey.self)` still
-/// catches every row, sectioned or not, without either file needing to
-/// know about the other's view tree.
 struct RowHeightsKey: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
@@ -787,14 +682,6 @@ struct AccountRow: View {
     /// Hands `tcr login` to a Terminal window for THIS account. Only drawn on a
     /// `.needsRelogin` row.
     let onRelogin: () -> Void
-    /// Draw this row's group chips. `false` when the row sits under a
-    /// ``AccountGroupSectionHeader`` — the header already says what the
-    /// chips said, so keeping both would be the same fact twice. `true` in
-    /// the flat list, whether that is because no account carries a label or
-    /// because sectioning fell back on fragmentation
-    /// (``Fleet/groupSectionsFragmented``), where the chips are the only
-    /// place group membership is still shown.
-    var showGroupChips: Bool = true
     /// Mutating THIS row's own group membership from its context menu — the
     /// affordance the bridge specifically asked for: before this round,
     /// membership could only be changed from a section-header menu, and the
@@ -1178,13 +1065,12 @@ struct AccountRow: View {
         groupMenuItems
     }
 
-    /// One entry per ``Account/groupMenuActions``, wired to
-    /// ``GroupController`` exactly the way ``GroupActionsMenu`` already
-    /// wires its own — same `remove(account:from:)`/`add(account:to:)`
-    /// calls, just keyed off this row's account instead of a section's
-    /// group. Kept as a top-level `@ViewBuilder` (not folded into
-    /// `contextMenuItems`'s body) so ``Account/groupMenuActions``'s own
-    /// doc-comment, not this one, is the single place the menu's SHAPE is
+    /// One entry per ``Account/groupMenuActions``, wired directly to
+    /// ``GroupController``'s `remove(account:from:)`/`add(account:to:)` — the
+    /// only way to change group membership from this panel now that the
+    /// section-header menus are gone. Kept as a top-level `@ViewBuilder` (not
+    /// folded into `contextMenuItems`'s body) so ``Account/groupMenuActions``'s
+    /// own doc-comment, not this one, is the single place the menu's SHAPE is
     /// explained.
     @ViewBuilder
     private var groupMenuItems: some View {
@@ -1365,21 +1251,20 @@ struct AccountRow: View {
                     StatusPill("unmeasured", tint: quotaTint)
                         .help("Never probed — this account's quota is unknown, not zero.")
                 }
-                // Group chips. At most two, with the rest collapsed to a `+N`
-                // chip — the panel is `Tok.panelWidth` (380pt) wide and an
-                // account can be in many groups. The existing `StatusPill`
-                // component, not a new one: these are the same shape of fact
-                // (a small labelled tag on the row) as the status pill beside
-                // them. Suppressed under a section header — see
-                // `showGroupChips`'s own doc-comment for why.
-                if showGroupChips {
-                    ForEach(Array((account.groups ?? []).prefix(2)), id: \.self) { group in
-                        StatusPill(group, tint: Tok.inkFaint)
-                    }
-                    if (account.groups ?? []).count > 2 {
-                        StatusPill("+\((account.groups ?? []).count - 2)", tint: Tok.inkFaint)
-                            .help((account.groups ?? []).joined(separator: ", "))
-                    }
+                // The entire group UI now that the dedicated group views are
+                // gone (bridge: `docs/plans/group-tags-bridge.md`) — one
+                // small colored tag per membership, right on the pills line
+                // beside CONTROL/ROTATING/quota so it reads as one more fact
+                // about the account. At most two, with the rest collapsed to
+                // a `+N` chip: the panel is `Tok.panelWidth` (380pt) wide and
+                // an account can be in many groups. An ungrouped account
+                // draws nothing here — no chip, no reserved space.
+                ForEach(Array(account.groupTags.prefix(2))) { tag in
+                    GroupChip(tag: tag)
+                }
+                if account.groupTags.count > 2 {
+                    StatusPill("+\(account.groupTags.count - 2)", tint: Tok.inkFaint)
+                        .help(account.groupTags.map(\.name).joined(separator: ", "))
                 }
             }
             // Two stacked bars, 5-hour on top and 7-day directly under it —

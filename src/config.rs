@@ -5,7 +5,7 @@
 //! `quotaProbeSeconds`, `warmupSeconds`, …). Every struct carries a flattened
 //! `extra` map so an unknown key survives a load→save round-trip untouched.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -156,9 +156,112 @@ pub struct GroupSettings {
     /// Absent/`false` (default) keeps today's prefer-only behaviour.
     #[serde(default)]
     pub reserved: bool,
+    /// A configured `#RRGGBB` (or `#RGB`, normalized on write) color for this
+    /// group's panel tag. Absent → no color was ever set, and
+    /// [`Config::group_color`] derives one deterministically from the group
+    /// name instead — see that function's doc-comment for the band. Never
+    /// read directly by a consumer that wants "the" color for a group; go
+    /// through [`Config::group_color`] / [`Config::group_colors`] so derived
+    /// and configured colors resolve through one seam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// Any `groupSettings.<name>.*` keys we do not model.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// Whether a group's resolved color came from an operator's explicit
+/// `tcr group color` write or was invented by [`derive_group_color`] because
+/// none was set. Purely informational — both are equally valid "the" color
+/// for a group — but an operator asking `tcr group ls` needs to be able to
+/// tell which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorSource {
+    Derived,
+    Set,
+}
+
+impl ColorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Derived => "derived",
+            Self::Set => "set",
+        }
+    }
+}
+
+/// Invent a stable color for `group` when no `tcr group color` was ever run
+/// for it. Same name always yields the same color (a deterministic hash of
+/// the bytes, not randomness or insertion order), and different names spread
+/// around the hue wheel so adjacent groups are visually distinguishable.
+///
+/// The saturation/lightness band (62% / 58%) is fixed rather than derived,
+/// because only hue is meant to vary: the panel this feeds is DARK
+/// (`docs/plans/group-colors-bridge.md`), so a color chip needs enough
+/// lightness to read against a near-black background (below ~40% starts
+/// disappearing into it) without climbing so high it washes out to pastel
+/// and loses hue distinctiveness (above ~70% several hues start reading as
+/// "off-white"); saturation sits mid-high so the chip reads as a color, not
+/// a shade of grey, while staying short of neon. 62/58 is the middle of
+/// both safe ranges, not a magic number — a reasonable UI author picking a
+/// dark-mode accent by eye lands in the same neighborhood.
+pub fn derive_group_color(group: &str) -> String {
+    // FNV-1a: no dependency, good-enough avalanche for hashing short ASCII
+    // labels into a hue — this is a display color, not a security boundary,
+    // so cryptographic strength buys nothing here.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in group.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let hue = (hash % 360) as f64;
+    hsl_to_hex(hue, 0.62, 0.58)
+}
+
+/// `H` in degrees [0, 360), `S`/`L` in [0.0, 1.0] — standard HSL-to-RGB,
+/// returned as a lowercase `#rrggbb`.
+fn hsl_to_hex(h: f64, s: f64, l: f64) -> String {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - (h_prime.rem_euclid(2.0) - 1.0).abs());
+    let (r1, g1, b1) = match h_prime as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to_byte = |v: f64| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    format!("#{:02x}{:02x}{:02x}", to_byte(r1), to_byte(g1), to_byte(b1))
+}
+
+/// Strictly validate a user-supplied hex color and normalize it to lowercase
+/// `#rrggbb`. Accepts `#RGB` and `#RRGGBB`, case-insensitive; rejects
+/// anything else (missing `#`, wrong digit count, non-hex characters)
+/// rather than trying to guess what garbage input meant.
+pub fn validate_hex_color(input: &str) -> Result<String, &'static str> {
+    let digits = input
+        .strip_prefix('#')
+        .ok_or("must start with '#' — accepted forms: #RGB, #RRGGBB")?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("must contain only hex digits after '#' — accepted forms: #RGB, #RRGGBB");
+    }
+    match digits.len() {
+        3 => {
+            let mut out = String::with_capacity(7);
+            out.push('#');
+            for c in digits.chars() {
+                let lower = c.to_ascii_lowercase();
+                out.push(lower);
+                out.push(lower);
+            }
+            Ok(out)
+        }
+        6 => Ok(format!("#{}", digits.to_ascii_lowercase())),
+        _ => Err("must be #RGB or #RRGGBB — accepted forms: #RGB, #RRGGBB"),
+    }
 }
 
 /// Per-account request pacing (opt-in; default OFF).
@@ -349,6 +452,53 @@ impl Config {
     /// reserved" default the field's own doc-comment promises.
     pub fn is_group_reserved(&self, group: &str) -> bool {
         self.group_settings.get(group).is_some_and(|s| s.reserved)
+    }
+
+    /// Every group label that currently has at least one member — the same
+    /// "a group exists only while some account carries the label" definition
+    /// [`crate::cli::remove_from_group`]'s `--all` arm already uses. A
+    /// `groupSettings` entry for a name no account carries (color configured
+    /// ahead of membership, or the last member since removed) is deliberately
+    /// NOT included: [`Self::group_colors`] answers "what should the panel
+    /// tag right now", not "what has ever been configured".
+    pub fn all_group_names(&self) -> BTreeSet<String> {
+        self.accounts
+            .iter()
+            .filter_map(|a| a.groups.as_ref())
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// The resolved color for `group` plus whether it was configured or
+    /// derived. Every group gets a color from this whether or not one was
+    /// ever set — see [`derive_group_color`]'s doc-comment for the
+    /// hue/saturation/lightness band and why it must be picked HERE, once,
+    /// rather than left for each client to invent independently.
+    pub fn group_color(&self, group: &str) -> (String, ColorSource) {
+        match self
+            .group_settings
+            .get(group)
+            .and_then(|s| s.color.as_deref())
+        {
+            Some(hex) => (hex.to_string(), ColorSource::Set),
+            None => (derive_group_color(group), ColorSource::Derived),
+        }
+    }
+
+    /// Every group that exists on the fleet ([`Self::all_group_names`])
+    /// mapped to its resolved color ([`Self::group_color`]) — the exact
+    /// shape `groupColors` puts on the wire. A `BTreeMap` so the wire order
+    /// (and any snapshot/test comparing it) is deterministic run to run,
+    /// independent of `HashMap` iteration order.
+    pub fn group_colors(&self) -> BTreeMap<String, String> {
+        self.all_group_names()
+            .into_iter()
+            .map(|g| {
+                let (hex, _) = self.group_color(&g);
+                (g, hex)
+            })
+            .collect()
     }
 
     /// How many ENABLED accounts would remain reachable by traffic that asks
@@ -1404,6 +1554,101 @@ fn merge_group_reserved(
     GroupReserveWrite::Updated
 }
 
+/// What a targeted [`save_group_color`] did to the on-disk document. Same
+/// shape as [`GroupReserveWrite`] and for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupColorWrite {
+    /// `groupSettings.<group>.color` was set (or its whole entry removed)
+    /// and the file rewritten.
+    Updated,
+    /// The group already carried (or already lacked) that exact color, so
+    /// nothing was written and the file is byte-identical.
+    Unchanged,
+}
+
+/// Persist ONLY `groupSettings.<group>.color` into the file at `path`,
+/// leaving every other key — every account, every other group's settings —
+/// exactly as the user left it. Same read-modify-write shape as
+/// [`save_group_reserved`] and for the same reason.
+///
+/// `color = None` (`tcr group color --clear`) drops the `color` key rather
+/// than writing anything, and drops the group's whole `groupSettings` entry
+/// once it is empty — same drops-the-key contract [`merge_group_reserved`]
+/// uses, so a group that has ever had a color set and then cleared carries
+/// no permanent litter and reverts to [`Config::group_color`]'s derived
+/// value on the very next read.
+///
+/// `color`, when `Some`, is trusted as already validated/normalized — call
+/// through [`validate_hex_color`] first; this function does not re-check it.
+pub fn save_group_color(
+    path: &Path,
+    group: &str,
+    color: Option<&str>,
+) -> Result<GroupColorWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_group_color(&mut doc, group, color);
+    if outcome == GroupColorWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+fn merge_group_color(
+    doc: &mut Map<String, Value>,
+    group: &str,
+    color: Option<&str>,
+) -> GroupColorWrite {
+    let already = doc
+        .get("groupSettings")
+        .and_then(Value::as_object)
+        .and_then(|settings| settings.get(group))
+        .and_then(Value::as_object)
+        .and_then(|entry| entry.get("color"))
+        .and_then(Value::as_str);
+    if already == color {
+        return GroupColorWrite::Unchanged;
+    }
+
+    let settings = doc
+        .entry("groupSettings".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    // Same corrupt-hand-edit guard as `merge_group_reserved`: `already` above
+    // already proved this was not a usable object for this group either way.
+    if !settings.is_object() {
+        *settings = Value::Object(Map::new());
+    }
+    let settings_obj = settings.as_object_mut().expect("just ensured object");
+
+    match color {
+        Some(hex) => {
+            let entry = settings_obj
+                .entry(group.to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !entry.is_object() {
+                *entry = Value::Object(Map::new());
+            }
+            entry
+                .as_object_mut()
+                .expect("just ensured object")
+                .insert("color".to_string(), Value::String(hex.to_string()));
+        }
+        None => {
+            if let Some(entry) = settings_obj.get_mut(group) {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.remove("color");
+                    if obj.is_empty() {
+                        settings_obj.remove(group);
+                    }
+                }
+            }
+        }
+    }
+    if settings_obj.is_empty() {
+        doc.remove("groupSettings");
+    }
+    GroupColorWrite::Updated
+}
+
 /// Set or remove the top-level `controlAccount` key in `doc`. Reports whether
 /// the document actually changed, so the caller can skip a pointless rewrite
 /// of a credential file.
@@ -1793,6 +2038,101 @@ mod tests {
         assert_eq!(reloaded.accounts[0].groups, config.accounts[0].groups);
         fs::remove_file(&tmp).ok();
     }
+
+    // --- group color ---------------------------------------------------------
+
+    #[test]
+    fn validate_hex_color_accepts_both_forms_case_insensitively_and_normalizes() {
+        assert_eq!(validate_hex_color("#32d74b"), Ok("#32d74b".to_string()));
+        assert_eq!(validate_hex_color("#32D74B"), Ok("#32d74b".to_string()));
+        assert_eq!(validate_hex_color("#ABC"), Ok("#aabbcc".to_string()));
+        assert_eq!(validate_hex_color("#abc"), Ok("#aabbcc".to_string()));
+    }
+
+    #[test]
+    fn validate_hex_color_rejects_garbage() {
+        for bad in [
+            "32d74b",  // missing '#'
+            "#32d74",  // 5 digits: neither #RGB nor #RRGGBB
+            "#zzzzzz", // non-hex characters
+            "#12345g", // trailing non-hex character
+            "",        // empty
+            "#",       // '#' alone
+        ] {
+            assert!(validate_hex_color(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn save_group_color_round_trips_and_clear_drops_the_key() {
+        let tmp = std::env::temp_dir().join(format!("tcr-cfg-color-{}.json", std::process::id()));
+        fs::write(&tmp, GROUPED_ACCOUNTS_JSON).unwrap();
+
+        let outcome = save_group_color(&tmp, "codereview", Some("#32d74b")).unwrap();
+        assert_eq!(outcome, GroupColorWrite::Updated);
+        let config: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(
+            config.group_color("codereview"),
+            ("#32d74b".to_string(), ColorSource::Set)
+        );
+
+        // Setting the SAME value again is a no-op write.
+        let outcome = save_group_color(&tmp, "codereview", Some("#32d74b")).unwrap();
+        assert_eq!(outcome, GroupColorWrite::Unchanged);
+
+        // Clearing drops the `color` key (and the whole `groupSettings.<group>`
+        // entry, since color was the only thing in it) — the derived value
+        // returns.
+        let outcome = save_group_color(&tmp, "codereview", None).unwrap();
+        assert_eq!(outcome, GroupColorWrite::Updated);
+        let config: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(
+            config.group_color("codereview"),
+            (derive_group_color("codereview"), ColorSource::Derived)
+        );
+        let raw = fs::read_to_string(&tmp).unwrap();
+        assert!(
+            !raw.contains("groupSettings"),
+            "the last property on the group's settings entry is gone, so the \
+             whole map is dropped rather than left as `{{}}`: {raw}"
+        );
+
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn all_group_names_is_the_union_of_every_accounts_groups() {
+        let config: Config = serde_json::from_str(GROUPED_ACCOUNTS_JSON).unwrap();
+        let names: Vec<String> = config.all_group_names().into_iter().collect();
+        assert_eq!(names, vec!["codereview".to_string(), "dev".to_string()]);
+    }
+
+    #[test]
+    fn group_colors_covers_every_fleet_group_including_unconfigured_ones() {
+        let tmp = std::env::temp_dir().join(format!("tcr-cfg-colors-{}.json", std::process::id()));
+        fs::write(&tmp, GROUPED_ACCOUNTS_JSON).unwrap();
+        save_group_color(&tmp, "dev", Some("#0a84ff")).unwrap();
+        let config: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+
+        let colors = config.group_colors();
+        assert_eq!(colors.len(), 2, "both codereview and dev are present");
+        assert_eq!(colors["dev"], "#0a84ff");
+        assert_eq!(colors["codereview"], derive_group_color("codereview"));
+
+        fs::remove_file(&tmp).ok();
+    }
+
+    /// Two accounts, `alice` in `codereview` and `dev`, `bob` in `codereview`
+    /// only — enough to exercise a shared group and a group with only one
+    /// member without a third fixture.
+    const GROUPED_ACCOUNTS_JSON: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+          "priority": 0, "groups": ["codereview", "dev"] },
+        { "name": "bob@example.com", "type": "oauth", "accessToken": "at-b",
+          "priority": 1, "groups": ["codereview"] }
+      ]
+    }"#;
 
     #[test]
     fn save_writes_owner_only_permissions() {
