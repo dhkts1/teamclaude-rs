@@ -148,6 +148,39 @@ final class RealWorldDecodeTests: XCTestCase {
         }
     }
 
+    /// `realWorldFixture` predates `groupColors` too — same absent-key
+    /// forward-compat contract as `groups` above, and the field
+    /// ``Account/groupTags`` reads to resolve a tag's background.
+    func testMissingGroupColorsFieldDecodesToNilNotAThrow() throws {
+        let fleet = try fleet()
+        XCTAssertTrue(
+            fleet.unreadable.isEmpty,
+            "an older tcr without the groupColors field must still decode every row"
+        )
+        for account in fleet.accounts {
+            XCTAssertNil(account.groupColors)
+        }
+    }
+
+    /// A `groupColors` object DOES decode when the wire carries it — the
+    /// live shape the sibling `groupColors`-emitting change adds, verified
+    /// against a copy of a real row rather than a hand-shaped fixture.
+    func testGroupColorsFieldDecodesWhenPresent() throws {
+        let json = realWorldFixture.replacingOccurrences(
+            of: "\"name\": \"alice@example.com\",",
+            with: """
+                "name": "alice@example.com",
+                "groups": ["codereview", "dev"],
+                "groupColors": {"codereview": "#32d74b", "dev": "#0a84ff"},
+                """
+        )
+        let fleet = try Fleet.decode(Data(json.utf8))
+        XCTAssertTrue(fleet.unreadable.isEmpty, "\(fleet.unreadable)")
+        let alice = try XCTUnwrap(fleet.accounts.first { $0.name == "alice@example.com" })
+        XCTAssertEqual(alice.groupColors, ["codereview": "#32d74b", "dev": "#0a84ff"])
+        XCTAssertEqual(alice.groupTags.map(\.name), ["codereview", "dev"])
+    }
+
     /// One null field must not cost the other rows. Before per-row decoding, the
     /// array decoded atomically and a single null erased all thirteen accounts.
     func testTheNeverProbedRowKeepsItsNullsAndCostsNoOtherRow() throws {
