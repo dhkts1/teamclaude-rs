@@ -1,6 +1,7 @@
 import Combine
 import Sparkle
 import SwiftUI
+import TcrBarCore
 
 /// Self-update, owned by the app the same way `poller` / `server` / `loginItem` /
 /// `accounts` are: one instance created in `TcrBarApp` and handed down. Not a
@@ -19,22 +20,32 @@ import SwiftUI
 /// it would make that number go backwards, and an updater comparing versions
 /// would conclude there is nothing to install.
 @MainActor
-final class Updater: ObservableObject {
+final class Updater: NSObject, ObservableObject {
     /// Mirrors Sparkle's own gate. It is false while a check is already in
     /// flight, so the button is disabled rather than silently no-op — the same
     /// rule the rest of this panel follows.
     @Published private(set) var canCheckForUpdates = false
+    /// The outcome of the last completed check, published from Sparkle's own
+    /// delegate callbacks below — never inferred by comparing version strings.
+    /// Starts `.unknown`: see ``UpdateState`` for why that is the honest
+    /// starting value rather than `.upToDate`.
+    @Published private(set) var updateState: UpdateState = .unknown
 
-    private let controller: SPUStandardUpdaterController
+    /// Implicitly-unwrapped and set after `super.init()`: `self` cannot be
+    /// handed to Sparkle as `updaterDelegate` until this instance is fully
+    /// initialized, and `SPUStandardUpdaterController` takes its delegate only
+    /// at construction — there is no settable property to wire it afterward.
+    private var controller: SPUStandardUpdaterController!
     private var observation: AnyCancellable?
 
     /// `startingUpdater: false` exists for the render harness. Starting the
     /// updater schedules background checks and can put UI on screen; a process
     /// invoked with `--render-states` must do neither.
     init(startingUpdater: Bool = true) {
+        super.init()
         controller = SPUStandardUpdaterController(
             startingUpdater: startingUpdater,
-            updaterDelegate: nil,
+            updaterDelegate: self,
             userDriverDelegate: nil
         )
         observation = controller.updater.publisher(for: \.canCheckForUpdates)
@@ -49,5 +60,30 @@ final class Updater: ObservableObject {
     /// check deliberately stays silent about.
     func checkForUpdates() {
         controller.updater.checkForUpdates()
+    }
+}
+
+/// Real Sparkle callbacks, not a stubbed indicator. Each method here does
+/// nothing but extract a plain value out of what Sparkle handed it and set
+/// ``Updater/updateState`` — the mapping itself lives on ``UpdateState`` in
+/// `TcrBarCore` and is unit-tested there; these three methods are not,
+/// because `TcrBarCore`'s test target deliberately excludes Sparkle
+/// (`Package.swift`), so `SUAppcastItem`/`SPUUpdater` are not constructible
+/// from a test. `nonisolated` plus a hop to the main actor because Sparkle
+/// does not promise which thread calls a delegate method, matching the
+/// existing `canCheckForUpdates` publisher above.
+extension Updater: SPUUpdaterDelegate {
+    nonisolated func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        let version = item.displayVersionString
+        Task { @MainActor in self.updateState = .available(version: version) }
+    }
+
+    nonisolated func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
+        Task { @MainActor in self.updateState = .upToDate }
+    }
+
+    nonisolated func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        let message = error.localizedDescription
+        Task { @MainActor in self.updateState = .failed(message) }
     }
 }

@@ -105,6 +105,31 @@ struct FleetView: View {
                     .font(Tok.detailDigitFont)
                     .foregroundStyle(.tertiary)
             }
+            updateStateLine
+        }
+    }
+
+    /// Renders only for ``UpdateState/available(version:)`` and
+    /// ``UpdateState/failed(_:)`` — see ``UpdateState/headerMessage``, which
+    /// is what actually decides that; this view just draws whatever it
+    /// returns. `.unknown` and `.upToDate` add no row: a permanent
+    /// "you're up to date" line has no place in a 380pt panel.
+    ///
+    /// `.available` is a button so clicking it runs the same
+    /// `checkForUpdates()` the footer's own button does — Sparkle drives the
+    /// rest of the install flow from there, never this view.
+    @ViewBuilder
+    private var updateStateLine: some View {
+        if let message = updater.updateState.headerMessage {
+            let isFailure: Bool = {
+                if case .failed = updater.updateState { return true }
+                return false
+            }()
+            Button(message) { updater.checkForUpdates() }
+                .buttonStyle(.plain)
+                .font(Tok.secondaryFont)
+                .foregroundStyle(isFailure ? Tok.spent : Tok.accent)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1078,10 +1103,13 @@ struct AccountRow: View {
                 Button("Remove from \(group)") {
                     Task { await groupController.remove(account: account.name, from: group) }
                 }
-                Button("Copy tcr group Command") {
-                    copyToPasteboard(
-                        GroupCommand.commandLine(
-                            arguments: GroupCommand.removeArguments(group: group, account: account.name)))
+                let copyRemove = GroupCommand.CopyCommandMenuEntry(
+                    arguments: GroupCommand.removeArguments(group: group, account: account.name))
+                Button(copyRemove.title) {
+                    copyToPasteboard(copyRemove.copiedText)
+                }
+                Button("Delete group “\(group)” for everyone…") {
+                    confirmDeleteGroup(group)
                 }
             case .removeAll:
                 Button("Remove from all groups") {
@@ -1120,6 +1148,11 @@ struct AccountRow: View {
                 ForEach(candidateGroupsToAdd, id: \.self) { group in
                     Button(group) {
                         Task { await groupController.add(account: account.name, to: group) }
+                    }
+                    let copyAdd = GroupCommand.CopyCommandMenuEntry(
+                        arguments: GroupCommand.addArguments(group: group, account: account.name))
+                    Button(copyAdd.title) {
+                        copyToPasteboard(copyAdd.copiedText)
                     }
                 }
             }
@@ -1167,6 +1200,33 @@ struct AccountRow: View {
             failureAlert.addButton(withTitle: "OK")
             failureAlert.runModal()
         }
+    }
+
+    /// Confirms before ``GroupController/removeAll(group:)`` — same
+    /// destructive-`NSAlert` shape as ``confirmTakeover()`` (critical style,
+    /// destructive button unlabeled-as-default, Cancel as the actual
+    /// default). This is the one group action that reaches past this row:
+    /// it removes `group` from every account on the fleet, not just
+    /// ``account``, so the alert text says that explicitly rather than
+    /// reading like an ordinary "remove from this group."
+    private func confirmDeleteGroup(_ group: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Delete group “\(group)” for every account?"
+        alert.informativeText = """
+            This removes “\(group)” from every account on the fleet, not just \
+            \(account.name) — every row currently tagged with it loses the tag.
+            """
+        let delete = alert.addButton(withTitle: "Delete Group")
+        delete.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        // Cancel is the default: Return and Escape both back out.
+        alert.window.defaultButtonCell = nil
+        alert.buttons.last?.keyEquivalent = "\r"
+        delete.keyEquivalent = ""
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { await groupController.removeAll(group: group) }
     }
 
     /// Shared by "Copy Account Name" and the per-group command copy — one
