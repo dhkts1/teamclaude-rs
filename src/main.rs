@@ -177,8 +177,9 @@ enum GroupAction {
     Add(GroupAddArgs),
     /// Remove one account from one group, or `--all` to delete the group.
     Rm(GroupRmArgs),
-    /// Reserve a group: from the next restart, an account carrying it is
-    /// off-limits to traffic that did not ask for one of its groups.
+    /// Reserve a group: an account carrying it becomes off-limits to traffic
+    /// that did not ask for one of its groups. A running proxy picks this up
+    /// live (no restart) on its next natural cadence check.
     Reserve(GroupReserveArgs),
     /// Clear a group's reserved flag.
     Unreserve(GroupUnreserveArgs),

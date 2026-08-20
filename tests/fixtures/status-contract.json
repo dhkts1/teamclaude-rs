@@ -10,7 +10,7 @@
     "freeAtMs": null,
     "gate": "ok",
     "groupColors": {
-      "codereview": "#5163d6",
+      "codereview": "#63cbfe",
       "dev": "#0a84ff"
     },
     "groups": [
@@ -54,7 +54,7 @@
     "freeAtMs": null,
     "gate": "ok",
     "groupColors": {
-      "codereview": "#5163d6",
+      "codereview": "#63cbfe",
       "dev": "#0a84ff"
     },
     "groups": [],
@@ -106,7 +106,7 @@
     "freeAtMs": 1767312000000,
     "gate": "ok",
     "groupColors": {
-      "codereview": "#5163d6",
+      "codereview": "#63cbfe",
       "dev": "#0a84ff"
     },
     "groups": [],
@@ -158,7 +158,7 @@
     "freeAtMs": null,
     "gate": "ok",
     "groupColors": {
-      "codereview": "#5163d6",
+      "codereview": "#63cbfe",
       "dev": "#0a84ff"
     },
     "groups": [],

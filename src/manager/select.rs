@@ -264,6 +264,11 @@ impl Manager {
         conn_key: Option<u64>,
         group: Option<&str>,
     ) -> Option<usize> {
+        // Live-reload group membership/settings before anything below reads them —
+        // see `Self::reload_groups_if_changed`'s doc. Cheap no-op when the config
+        // file's mtime has not moved since the last check.
+        self.reload_groups_if_changed();
+
         // Hard account lock: pin ALL traffic to the configured account, bypassing
         // rotation/affinity/migration. `tried` still ends the rotation loop — once the
         // locked account has failed this request, return None (no failover to the pool).
@@ -271,6 +276,10 @@ impl Manager {
             return if tried.contains(&li) { None } else { Some(li) };
         }
 
+        // A single point-in-time snapshot for the whole call — see
+        // `Self::reserved_groups`'s doc for why this clones rather than holding
+        // the lock across the accounts/affinity locks taken below.
+        let reserved_groups = self.reserved_groups();
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
@@ -335,9 +344,10 @@ impl Manager {
                     // THIS request, so a Fable-exhausted pin that a Fable request
                     // already tried still keeps its pin for the session's Opus turns.
                     let accounts = self.accounts.read().expect("accounts lock poisoned");
-                    if accounts.get(idx).is_some_and(|a| {
-                        Self::account_hard_ok(a, now_ms, group, &self.reserved_groups)
-                    }) {
+                    if accounts
+                        .get(idx)
+                        .is_some_and(|a| Self::account_hard_ok(a, now_ms, group, &reserved_groups))
+                    {
                         keep_pin = Some(idx);
                         divert_reason = Some("pin-tried");
                         divert_until_ms = accounts
@@ -379,7 +389,7 @@ impl Manager {
                                 is_fable,
                                 None,  // no group PREFERENCE — honouring an existing pin
                                 group, // but reservation is not a preference — real ask
-                                &self.reserved_groups,
+                                &reserved_groups,
                             )
                         });
                         if !x_usable {
@@ -432,7 +442,7 @@ impl Manager {
                             //    already had, hoisted to where it is reachable; both
                             //    log the identical line so they grep together.
                             let account_alive = accounts.get(idx).is_some_and(|a| {
-                                Self::account_hard_ok(a, now_ms, group, &self.reserved_groups)
+                                Self::account_hard_ok(a, now_ms, group, &reserved_groups)
                             });
                             let model_blocked = accounts.get(idx).is_some_and(|a| {
                                 Self::model_blocked(a, self.global_threshold, now, is_fable)
@@ -522,7 +532,7 @@ impl Manager {
                                         is_fable,
                                         None,  // no group PREFERENCE — honouring an existing pin
                                         group, // but reservation is not a preference — real ask
-                                        &self.reserved_groups,
+                                        &reserved_groups,
                                     ) {
                                         continue;
                                     }
@@ -648,7 +658,7 @@ impl Manager {
                                             is_fable,
                                             None, // no group PREFERENCE — honouring an existing connection
                                             group, // but reservation is not a preference — real ask
-                                            &self.reserved_groups,
+                                            &reserved_groups,
                                         )
                                     })
                                 };
@@ -744,7 +754,7 @@ impl Manager {
                             is_fable,
                             None,  // no group PREFERENCE — honouring a sticky destination
                             group, // but reservation is not a preference — real ask
-                            &self.reserved_groups,
+                            &reserved_groups,
                         )
                     });
                     usable.then_some(sticky)
@@ -996,12 +1006,18 @@ impl Manager {
         model: Option<&str>,
         affinity: Option<u64>,
     ) -> Option<usize> {
+        // Live-reload group membership/settings — same call `select_with_group`
+        // makes, so a session revalidated through THIS path also sees a just-
+        // reserved group and re-keys (bridge's pin-reclaim-via-reload case).
+        self.reload_groups_if_changed();
+
         // Anti-storm spacing on the FALLBACK path only: the upstream 429→hold and the
         // global egress throttle are the real backstops; this just stops a
         // synchronized burst from slamming one over-threshold account when the fleet
         // saturates. The pin-honor path is never throttled here.
         const REVALIDATION_MIN_SPACING_MS: i64 = 2000;
 
+        let reserved_groups = self.reserved_groups();
         let now_ms = odt_to_ms(now);
         let is_fable = model.is_some_and(crate::model::is_fable_model);
 
@@ -1022,7 +1038,7 @@ impl Manager {
                 now_ms,
                 is_fable,
                 None,
-                &self.reserved_groups,
+                &reserved_groups,
             )
         };
 
@@ -1086,7 +1102,7 @@ impl Manager {
                 // (see its affinity fast-path); the two now agree.
                 if accounts
                     .get(idx)
-                    .is_some_and(|a| Self::account_hard_ok(a, now_ms, None, &self.reserved_groups))
+                    .is_some_and(|a| Self::account_hard_ok(a, now_ms, None, &reserved_groups))
                 {
                     keep_pin = Some(idx);
                     pin_until_ms = accounts
@@ -1770,6 +1786,7 @@ impl Manager {
         respect_pacing: bool,
         group: Option<&str>,
     ) -> Option<usize> {
+        let reserved_groups = self.reserved_groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -1786,7 +1803,7 @@ impl Manager {
                 is_fable,
                 group,
                 group, // this pass's own real ask — see `eligible`'s `reserved_group` doc
-                &self.reserved_groups,
+                &reserved_groups,
             ) {
                 // Distinguish a pacing skip (healthy but capped/spaced) from a real
                 // ineligibility (disabled/error/quota) so the log names only the former.
@@ -1802,7 +1819,7 @@ impl Manager {
                         is_fable,
                         group,
                         group,
-                        &self.reserved_groups,
+                        &reserved_groups,
                     )
                 {
                     tracing::info!(
@@ -1845,6 +1862,7 @@ impl Manager {
         is_fable: bool,
         group: Option<&str>,
     ) -> Option<usize> {
+        let reserved_groups = self.reserved_groups();
         let mut best: Option<usize> = None;
         let mut best_key: Option<(u32, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
@@ -1861,7 +1879,7 @@ impl Manager {
                 is_fable,
                 group,
                 group,
-                &self.reserved_groups,
+                &reserved_groups,
             ) {
                 continue;
             }

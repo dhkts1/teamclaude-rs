@@ -840,18 +840,30 @@ pub struct Manager {
     upstream: String,
     proxy_api_key: Option<String>,
     global_threshold: f64,
-    /// The set of group labels marked `reserved` (`tcr group reserve`),
-    /// snapshotted from the config at construction — same restart-to-take-effect
-    /// contract as [`config::Account::groups`] itself (`tcr group add`/`rm`
-    /// print the same note). See [`Manager::eligible`]'s `reserved_group` doc
-    /// for the rule this drives.
-    reserved_groups: HashSet<String>,
+    /// The set of group labels marked `reserved` (`tcr group reserve`).
+    /// Seeded from the config at construction and **hot-reloaded** from the
+    /// config file's `groupSettings` thereafter — see
+    /// [`Self::reload_groups_if_changed`] for when and how. `RwLock` (not a
+    /// plain field) precisely because it is no longer construction-only: a
+    /// reader takes a short read lock and clones ([`Self::reserved_groups`]),
+    /// never held across the accounts/affinity locks. See
+    /// [`Manager::eligible`]'s `reserved_group` doc for the rule this drives.
+    reserved_groups: RwLock<HashSet<String>>,
     /// Every group on the fleet mapped to its resolved color
-    /// (`config::Config::group_colors`), snapshotted from the config at
-    /// construction — same restart-to-take-effect contract as
-    /// [`Self::reserved_groups`] above. `BTreeMap` for deterministic wire
-    /// order, matching [`config::Config::group_colors`]'s own return type.
-    group_colors: BTreeMap<String, String>,
+    /// (`config::Config::group_colors`). Seeded at construction and
+    /// hot-reloaded alongside [`Self::reserved_groups`] — same
+    /// [`Self::reload_groups_if_changed`] cadence, same `RwLock` reasoning.
+    /// `BTreeMap` for deterministic wire order, matching
+    /// [`config::Config::group_colors`]'s own return type.
+    group_colors: RwLock<BTreeMap<String, String>>,
+    /// The config file's mtime as of the last successful (or unmodified-since)
+    /// [`Self::reload_groups_if_changed`] check. `None` before the first check.
+    /// Guarded by `config_write` at every access — see that lock's doc and
+    /// `reload_groups_if_changed`'s for why: this and the file read it gates
+    /// must move together, or two racing reload calls could both see a stale
+    /// `None`/old value and redundantly re-parse (harmless) or, worse, one
+    /// could advance it past a write the other hasn't applied yet.
+    groups_reload_mtime: Mutex<Option<std::time::SystemTime>>,
     /// Per-account request pacing knobs, snapshotted from the config at
     /// construction. Default (all `None`) → inert → selection is byte-identical to
     /// the no-pacing build. See [`config::PacingConfig`].
@@ -1031,6 +1043,16 @@ fn cooldown_elapsed(deadline_ms: Option<i64>, now_ms: i64) -> bool {
     deadline_ms.is_some_and(|until| now_ms >= until)
 }
 
+/// A sorted `Vec` of `set`'s members, for a deterministic (and readable)
+/// before/after in [`Manager::apply_group_reload`]'s change log — `HashSet`'s
+/// own iteration order is unspecified and would make the same reload log
+/// differently run to run.
+fn sorted_groups(set: &HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = set.iter().cloned().collect();
+    v.sort();
+    v
+}
+
 impl Manager {
     /// Build a manager over `config`, using `refresher` for token refresh,
     /// `prober` for background usage reads, and persisting refreshes to
@@ -1117,8 +1139,9 @@ impl Manager {
             upstream,
             proxy_api_key,
             global_threshold,
-            reserved_groups,
-            group_colors,
+            reserved_groups: RwLock::new(reserved_groups),
+            group_colors: RwLock::new(group_colors),
+            groups_reload_mtime: Mutex::new(None),
             pacing,
             throttle,
             locked_idx,
@@ -1230,6 +1253,7 @@ impl Manager {
     /// traffic ignores it.
     pub fn retry_after_hint(&self, now: OffsetDateTime, is_fable: bool) -> i64 {
         let now_ms = odt_to_ms(now);
+        let reserved_groups = self.reserved_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let soonest = accounts
             .iter()
@@ -1245,7 +1269,7 @@ impl Manager {
                     now_ms,
                     is_fable,
                     None,
-                    &self.reserved_groups,
+                    &reserved_groups,
                 );
                 free_at.map(odt_to_ms)
             })
@@ -1382,6 +1406,175 @@ impl Manager {
         // it whole would stamp stale settings over the user's live file.
         if let Err(err) = config::save_tokens(path, &snapshot) {
             tracing::error!(error = %err, "failed to persist refreshed token to config");
+        }
+    }
+
+    /// A cloned snapshot of the currently-reserved group names. Clones rather
+    /// than returning a guard so a caller never holds this lock across a
+    /// second lock acquisition (`accounts`, `affinity`) — the set is a
+    /// handful of short strings, so the clone costs nothing worth avoiding.
+    /// See the field's own doc for the hot-reload contract this serves.
+    fn reserved_groups(&self) -> HashSet<String> {
+        self.reserved_groups
+            .read()
+            .expect("reserved_groups lock poisoned")
+            .clone()
+    }
+
+    /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
+    /// `color`) from `self.config_path` when the file's mtime has moved since
+    /// the last check — the fix for group edits appearing to do nothing
+    /// (`docs/plans/live-reload-bridge.md`, problem 1). Called from a natural
+    /// cadence point ([`Self::select_with_group`], [`Self::select_revalidation`],
+    /// [`Self::snapshot`]) rather than a dedicated watcher thread — one more
+    /// background task is one more thing to keep alive, and every one of
+    /// those call sites already runs on every request or every TUI tick.
+    ///
+    /// Touches ONLY the fields named above. Every other field of `self.config`
+    /// — accounts, credentials, tokens, every unmodelled top-level key — is
+    /// left exactly as booted: the in-memory snapshot stays authoritative for
+    /// those, or this would fight [`Self::persist_now`] / [`Self::persist_tokens`]
+    /// / [`Self::persist_disabled`]'s read-modify-write of the SAME file.
+    ///
+    /// Takes `config_write` (INV1, see that field's doc) across the mtime
+    /// check AND the file read/parse — the same discipline every writer of
+    /// this file already uses, so a reload can never straddle a concurrent
+    /// persist's write. [`config::write_atomic`]'s temp-file-then-rename
+    /// already rules out a torn read on its own; this keeps reload from being
+    /// the one reader that does not bother.
+    ///
+    /// A file that cannot be stat'd, read, or parsed **keeps every current
+    /// in-memory value** and logs a warning — never blanks the fleet's groups
+    /// — and, unlike a successful reload, does NOT advance the remembered
+    /// mtime, so a transient or malformed edit self-heals on the very next
+    /// natural-cadence check rather than waiting for the file to change
+    /// again.
+    pub(super) fn reload_groups_if_changed(&self) {
+        let Some(path) = &self.config_path else {
+            return;
+        };
+        let _writing = self
+            .config_write
+            .lock()
+            .expect("config write lock poisoned");
+        let mtime = match std::fs::metadata(path).and_then(|m| m.modified()) {
+            Ok(m) => m,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "group reload: could not stat config file, keeping current groups"
+                );
+                return;
+            }
+        };
+        {
+            let last = self
+                .groups_reload_mtime
+                .lock()
+                .expect("groups reload mtime lock poisoned");
+            if *last == Some(mtime) {
+                return;
+            }
+        }
+        match config::load(path) {
+            Ok(fresh) => {
+                self.apply_group_reload(&fresh);
+                *self
+                    .groups_reload_mtime
+                    .lock()
+                    .expect("groups reload mtime lock poisoned") = Some(mtime);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "group reload: config is unreadable/malformed, keeping current groups"
+                );
+            }
+        }
+    }
+
+    /// Apply `fresh`'s group membership/settings onto the running server and
+    /// log exactly what changed — the line an operator greps for after
+    /// editing groups to ask "did it pick up my edit". Silent when nothing
+    /// actually differs (the common case: most cadence ticks see an unchanged
+    /// file, or a mtime bump from an unrelated write). Called only from
+    /// [`Self::reload_groups_if_changed`], under `config_write`.
+    ///
+    /// Reserved-group membership is applied BEFORE per-account `groups`, so
+    /// that by the time this returns and the caller re-tests a pinned
+    /// session's hard gate, a session on an account whose group just became
+    /// reserved is judged against the fresh reservation — the existing
+    /// pin-reclaim-on-reservation test (`pin_reclaim_when_the_pinned_accounts_group_is_reserved`)
+    /// extends to the reload path for free, because [`Self::select_with_group`]
+    /// re-tests [`Self::account_hard_ok`] against a fresh [`Self::reserved_groups`]
+    /// snapshot on every call — reservation was never cached PAST one call, only
+    /// ACROSS them until this reload existed.
+    ///
+    /// Matches each running [`AccountRuntime`] to `fresh.accounts` by
+    /// [`crate::identity::same_identity`] — the SAME identity rule
+    /// [`Self::persist_tokens`] uses — rather than by name, so a config
+    /// mid-way through a login churn (a display name changed, an org backfilled)
+    /// still reloads the right row instead of silently dropping its groups.
+    fn apply_group_reload(&self, fresh: &Config) {
+        let new_reserved = fresh.reserved_group_names();
+        let new_colors = fresh.group_colors();
+        let mut changed: Vec<String> = Vec::new();
+
+        {
+            let mut reserved = self
+                .reserved_groups
+                .write()
+                .expect("reserved_groups lock poisoned");
+            if *reserved != new_reserved {
+                changed.push(format!(
+                    "reserved groups: {:?} -> {:?}",
+                    sorted_groups(&reserved),
+                    sorted_groups(&new_reserved)
+                ));
+                *reserved = new_reserved;
+            }
+        }
+        {
+            let mut colors = self
+                .group_colors
+                .write()
+                .expect("group_colors lock poisoned");
+            if *colors != new_colors {
+                changed.push(format!("group colors: {:?} -> {:?}", *colors, new_colors));
+                *colors = new_colors;
+            }
+        }
+        {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            for account in accounts.iter_mut() {
+                let probe = crate::identity::probe(
+                    &account.name,
+                    account.account_uuid.clone(),
+                    account.org_uuid.clone(),
+                    account.org_name.clone(),
+                );
+                let Some(matched) = fresh
+                    .accounts
+                    .iter()
+                    .find(|a| crate::identity::same_identity(&probe, a))
+                else {
+                    continue;
+                };
+                let new_groups = matched.groups.clone().unwrap_or_default();
+                if new_groups != account.groups {
+                    changed.push(format!(
+                        "{}: groups {:?} -> {:?}",
+                        account.name, account.groups, new_groups
+                    ));
+                    account.groups = new_groups;
+                }
+            }
+        }
+
+        if !changed.is_empty() {
+            tracing::info!(changes = ?changed, "config reload: picked up a group edit");
         }
     }
 
@@ -3097,6 +3290,190 @@ mod tests {
             Some(1),
             "the pin itself must move off the reserved account, not merely divert one request"
         );
+    }
+
+    // ---- live group reload (problem 1: group edits appear to do nothing) ------
+
+    /// A `Config` with one account per `(name, priority, groups)` tuple —
+    /// `groups = &[]` means no `groups` key, matching [`account`]/
+    /// [`account_in_groups`]'s own split. Shared setup for every reload test
+    /// below: called once to build the manager's BOOT config, and called
+    /// again (saved straight to `path`, never through the manager) to
+    /// simulate an out-of-band edit — a hand edit, or a sibling `tcr group`
+    /// invocation — while the manager keeps running.
+    fn reload_config(accounts: &[(&str, i64, &[&str])]) -> Config {
+        let built: Vec<Account> = accounts
+            .iter()
+            .map(|&(name, priority, groups)| {
+                if groups.is_empty() {
+                    account(name, priority)
+                } else {
+                    account_in_groups(name, priority, groups)
+                }
+            })
+            .collect();
+        config_with(built)
+    }
+
+    /// THE test for problem 1: editing a temp config's group membership and
+    /// touching its mtime makes a SUBSEQUENT snapshot report the new groups —
+    /// without rebuilding the `Manager`. If only one test in this section
+    /// survives, this is it.
+    #[test]
+    fn snapshot_picks_up_a_group_edit_without_rebuilding_the_manager() {
+        let path = tmp_config_path("reload-feature");
+        let boot = reload_config(&[("acct", 0, &["dev"])]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        let before = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(before.accounts[0].groups, vec!["dev".to_string()]);
+
+        // A fast filesystem can produce two writes with the SAME mtime at
+        // whole-second resolution; sleep past that so the edit is actually
+        // observable via mtime, the same concern any mtime-triggered reload
+        // design has.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let edited = reload_config(&[("acct", 0, &["ops", "burst"])]);
+        config::save(&path, &edited).expect("write edited reload config");
+
+        let after = manager.snapshot(OffsetDateTime::now_utc());
+        let mut groups = after.accounts[0].groups.clone();
+        groups.sort();
+        assert_eq!(
+            groups,
+            vec!["burst".to_string(), "ops".to_string()],
+            "a snapshot after the file changed must report the NEW groups, without \
+             rebuilding the Manager"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A reload does NOT disturb accounts, credentials or tokens — only
+    /// `groups`/`groupSettings` move. Rewrites the file with the SAME account
+    /// identity (name match), a DIFFERENT access token, AND a group change in
+    /// one write, then asserts the in-memory access token is untouched while
+    /// the group DID move — proving the scope, not just the happy path.
+    #[test]
+    fn reload_never_touches_accounts_credentials_or_tokens() {
+        let path = tmp_config_path("reload-scope");
+        let boot = reload_config(&[("acct", 0, &["dev"])]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        let original_token = {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            accounts[0].access_token.clone()
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut tampered = reload_config(&[("acct", 0, &["ops"])]);
+        tampered.accounts[0].access_token = "at-DIFFERENT-token-must-not-apply".to_string();
+        config::save(&path, &tampered).expect("write tampered reload config");
+
+        manager.reload_groups_if_changed();
+
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert_eq!(
+            accounts[0].access_token, original_token,
+            "reload must never touch the access token — only group fields"
+        );
+        assert_eq!(
+            accounts[0].groups,
+            vec!["ops".to_string()],
+            "the group change in the SAME file write must still apply"
+        );
+        drop(accounts);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A malformed config at reload time keeps the previous in-memory groups
+    /// (never blanks the fleet) and does not advance the remembered mtime, so
+    /// a subsequent FIX self-heals without the file needing to change again
+    /// after that.
+    #[test]
+    fn reload_keeps_current_groups_on_a_malformed_config() {
+        let path = tmp_config_path("reload-malformed");
+        let boot = reload_config(&[("acct", 0, &["dev"])]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, b"{ this is not valid json").expect("write malformed config");
+        manager.reload_groups_if_changed();
+
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert_eq!(
+            accounts[0].groups,
+            vec!["dev".to_string()],
+            "a malformed config at reload time must keep the previous groups, not blank them"
+        );
+        drop(accounts);
+
+        // Self-heal: fixing the file (mtime necessarily advances again, since
+        // this write follows the malformed one) makes the NEXT reload apply.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let fixed = reload_config(&[("acct", 0, &["fixed"])]);
+        config::save(&path, &fixed).expect("write fixed reload config");
+        manager.reload_groups_if_changed();
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert_eq!(accounts[0].groups, vec!["fixed".to_string()]);
+        drop(accounts);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A session pinned to an account that becomes reserved VIA RELOAD (not
+    /// construction-time, unlike
+    /// [`pin_reclaim_when_the_pinned_accounts_group_is_reserved`]) is
+    /// re-keyed on its next unrequested `select`.
+    #[test]
+    fn reload_re_keys_a_pin_when_its_group_becomes_reserved() {
+        let path = tmp_config_path("reload-pin-reclaim");
+        let boot = reload_config(&[("acct", 0, &["codereview"]), ("other", 5, &[])]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let key = 9191u64;
+        {
+            let mut affinity = manager.affinity.lock().expect("affinity lock poisoned");
+            affinity.insert(key, (0, now_ms));
+        }
+
+        // Reserve 'codereview' via a fresh file write — no construction-time
+        // reservation at all, unlike the sibling test above.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let reserved_config = config_with_reserved(
+            vec![
+                account_in_groups("acct", 0, &["codereview"]),
+                account("other", 5),
+            ],
+            &["codereview"],
+        );
+        config::save(&path, &reserved_config).expect("write reserved reload config");
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("the plain account is still eligible");
+        assert_eq!(
+            served, 1,
+            "a group reserved via RELOAD must not keep serving an unrequested pinned session"
+        );
+        let pinned_now = manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            pinned_now,
+            Some(1),
+            "the pin must move off the newly-reserved account, not merely divert one request"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     // ---- hard account lock (`lockAccount`; no failover) -----------------------
