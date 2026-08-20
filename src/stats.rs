@@ -172,6 +172,9 @@ pub struct AccountSnapshot {
     /// as `stream_error_count`, and surfaced by the same two renderers
     /// (`lastStreamError` in JSON, the `last_stream_error=` token in text).
     pub last_stream_error: Option<String>,
+    /// Group labels for this account, mirroring `AccountRuntime::groups` —
+    /// empty (never `None`) when the config carried no `groups` key.
+    pub groups: Vec<String>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

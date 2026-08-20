@@ -9,6 +9,10 @@
     "fiveHourState": "ok",
     "freeAtMs": null,
     "gate": "ok",
+    "groups": [
+      "codereview",
+      "dev"
+    ],
     "held": [],
     "http1Only": false,
     "inputTokens": 8000000,
@@ -44,6 +48,7 @@
     "fiveHourState": "near",
     "freeAtMs": null,
     "gate": "ok",
+    "groups": [],
     "held": [
       {
         "minutesUntilReset": 0,
@@ -90,6 +95,7 @@
     "fiveHourState": "spent",
     "freeAtMs": 1767312000000,
     "gate": "ok",
+    "groups": [],
     "held": [
       {
         "minutesUntilReset": 0,
@@ -136,6 +142,7 @@
     "fiveHourState": null,
     "freeAtMs": null,
     "gate": "ok",
+    "groups": [],
     "held": [],
     "http1Only": false,
     "inputTokens": 0,

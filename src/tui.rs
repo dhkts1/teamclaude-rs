@@ -1451,6 +1451,7 @@ mod tests {
             free_at,
             stream_error_count: 0,
             last_stream_error: None,
+            groups: Vec::new(),
         }
     }
 

@@ -528,6 +528,17 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let serverSha: String?
     public let serverDirty: Bool?
 
+    /// Group labels (`src/stats.rs`'s `AccountSnapshot::groups`, carried onto
+    /// the wire as `"groups"`, always an array — `[]` for an unlabelled
+    /// account, never `null`). Optional here, deliberately, unlike the wire's
+    /// own `[]`-never-`null` rule: synthesized `Decodable` would *throw* on
+    /// this whole row against an older `tcr` that predates the field and
+    /// omits the key outright, the same failure mode decision \#3 above
+    /// exists to prevent. `nil` means "this server did not report groups";
+    /// `[]` means "reported, and there are none" — both render as ungrouped,
+    /// but the type keeps the distinction rather than collapsing it.
+    public let groups: [String]?
+
     /// Explicit memberwise init, needed only because adding `fiveHourState`/
     /// `sevenDayState` after the struct already had test fixtures constructing
     /// it directly would otherwise force every one of them to grow two new
@@ -561,7 +572,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         streamErrorCount: Int?,
         source: StatusSource,
         serverSha: String?,
-        serverDirty: Bool?
+        serverDirty: Bool?,
+        groups: [String]? = nil
     ) {
         self.name = name
         self.priority = priority
@@ -589,6 +601,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.source = source
         self.serverSha = serverSha
         self.serverDirty = serverDirty
+        self.groups = groups
     }
 
     public var id: String { name }
@@ -1125,4 +1138,75 @@ public struct Fleet: Equatable, Sendable {
     public var breakdownLabel: String {
         breakdown.map(\.label).joined(separator: " · ")
     }
+
+    /// Per-group capacity: `[("codereview", free: 0, total: 3), ("dev", 4, 5),
+    /// ("ungrouped", 5, 6)]`. Membership is a SET, not a partition — an account
+    /// in several groups counts in each — mirroring ``breakdown``'s bucket
+    /// idiom rather than inventing a second one.
+    public var groupBreakdown: [GroupTally] {
+        // No account anywhere carries a label: a fleet that does not use
+        // groups renders nothing at all, not an all-`ungrouped` line.
+        guard accounts.contains(where: { !($0.groups ?? []).isEmpty }) else { return [] }
+
+        var totals: [String: Int] = [:]
+        var frees: [String: Int] = [:]
+        var ungroupedTotal = 0
+        var ungroupedFree = 0
+        for account in accounts {
+            let groups = account.groups ?? []
+            // `free` classifies with the same `FleetTally.Kind(account:)` this
+            // struct already uses for the top-line breakdown — a `.near`
+            // account still serves, so it counts as free exactly as it does
+            // there; only `.disabled` accounts are excluded from `free`
+            // (`total` counts them).
+            let isFree =
+                !account.disabled
+                && [.ok, .near].contains(FleetTally.Kind(account: account))
+            if groups.isEmpty {
+                ungroupedTotal += 1
+                if isFree { ungroupedFree += 1 }
+                continue
+            }
+            for group in groups {
+                totals[group, default: 0] += 1
+                if isFree { frees[group, default: 0] += 1 }
+            }
+        }
+
+        var result = totals.keys.sorted().map { name in
+            GroupTally(name: name, free: frees[name, default: 0], total: totals[name]!)
+        }
+        if ungroupedTotal > 0 {
+            result.append(GroupTally(name: "ungrouped", free: ungroupedFree, total: ungroupedTotal))
+        }
+        return result
+    }
+
+    /// `"codereview 0/3 · dev 4/5 · ungrouped 5/6"` — the same content as
+    /// ``groupBreakdown``, flattened for tests and for accessibility, matching
+    /// ``breakdownLabel``'s idiom.
+    public var groupBreakdownLabel: String {
+        groupBreakdown.map(\.label).joined(separator: " · ")
+    }
+}
+
+/// One bucket of the per-group capacity line. Unlike ``FleetTally``, whose
+/// buckets partition every account exactly once, a `GroupTally`'s accounts can
+/// (and do) overlap across buckets — group membership is a set.
+public struct GroupTally: Equatable, Sendable {
+    public let name: String
+    /// Accounts in this group that are enabled and not spent (`.ok` or
+    /// `.near` per `FleetTally.Kind`).
+    public let free: Int
+    /// Accounts carrying this label, INCLUDING disabled ones.
+    public let total: Int
+
+    public init(name: String, free: Int, total: Int) {
+        self.name = name
+        self.free = free
+        self.total = total
+    }
+
+    /// `"dev 4/5"`.
+    public var label: String { "\(name) \(free)/\(total)" }
 }

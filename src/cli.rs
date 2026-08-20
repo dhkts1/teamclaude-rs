@@ -1051,8 +1051,16 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             Some(f) if f > now => format!(" free_in={}s", (f - now).whole_seconds().max(1)),
             _ => String::new(),
         };
+        // Group labels, greppable via `groups=codereview,dev`. Omitted entirely
+        // when the account carries none, matching the `fable=`/`last_stream_error=`
+        // idiom for "nothing to say" rather than printing `groups=`.
+        let groups = if a.groups.is_empty() {
+            String::new()
+        } else {
+            format!(" groups={}", a.groups.join(","))
+        };
         out.push_str(&format!(
-            "account {} priority={} {} {}{}{} state={} status={}{} probe={}{}{}{}\n",
+            "account {} priority={} {} {}{}{} state={} status={}{} probe={}{}{}{}{}\n",
             a.name,
             a.priority,
             five_hour,
@@ -1066,6 +1074,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             stream_errors,
             last_stream_error,
             if a.disabled { " disabled" } else { "" },
+            groups,
         ));
     }
     out
@@ -1325,6 +1334,11 @@ fn render_accounts_json(
                 "rateLimitedUntilMs": a
                     .rate_limited_until
                     .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
+                // Group labels (config fact, not a serving counter) — always an
+                // array, `[]` when unlabelled, real on BOTH paths like `control`
+                // above. Never `null`: "this account has no groups" is known,
+                // not unmeasured.
+                "groups": a.groups,
             })
         })
         .collect();
@@ -3403,6 +3417,7 @@ mod tests {
         probe_status: crate::probe::ProbeStatus,
         probe_error: Option<&str>,
         quota_state: QuotaState,
+        groups: &[&str],
     ) -> AccountSnapshot {
         AccountSnapshot {
             name: name.to_string(),
@@ -3433,6 +3448,7 @@ mod tests {
             } else {
                 None
             },
+            groups: groups.iter().map(|g| g.to_string()).collect(),
         }
     }
 
@@ -3473,6 +3489,10 @@ mod tests {
                 crate::probe::ProbeStatus::Ok,
                 None,
                 QuotaState::Normal,
+                // Non-empty and multi-membership — the only row the Swift decode
+                // test has real group data to read, and the one the greppable
+                // `groups=codereview,dev` text-line assertion targets.
+                &["codereview", "dev"],
             ),
             // `near`: at threshold, so `held` carries a window — the only row
             // that exercises the nested object.
@@ -3489,6 +3509,7 @@ mod tests {
                 crate::probe::ProbeStatus::RateLimited,
                 None,
                 QuotaState::NearLimit,
+                &[],
             ),
             // `spent`: fully consumed, and carrying a probe error string.
             contract_account(
@@ -3504,10 +3525,12 @@ mod tests {
                 crate::probe::ProbeStatus::Error,
                 Some("probe failed: connection reset"),
                 QuotaState::Exhausted,
+                &[],
             ),
             // Never probed AND disabled: the four quota fractions and
             // `cacheHitRatio` are all null. This row is the one that shipped a
-            // decode crash — `valueNotFound … Path: [2].quota`.
+            // decode crash — `valueNotFound … Path: [2].quota`. Also the
+            // unlabelled row: `groups` must render `[]`, never `null`.
             contract_account(
                 "dave@example.com",
                 3,
@@ -3521,6 +3544,7 @@ mod tests {
                 crate::probe::ProbeStatus::Never,
                 None,
                 QuotaState::Normal,
+                &[],
             ),
         ];
         let mut accounts = accounts;
@@ -3688,6 +3712,20 @@ mod tests {
             rows.iter().any(|r| r["rateLimitedUntilMs"].is_i64()),
             "some row pins rateLimitedUntilMs as a number: {committed}"
         );
+        assert!(
+            rows.iter().any(|r| !r["groups"]
+                .as_array()
+                .expect("groups is an array")
+                .is_empty()),
+            "some row carries non-empty groups: {committed}"
+        );
+        assert!(
+            rows.iter().any(|r| r["groups"]
+                .as_array()
+                .expect("groups is an array")
+                .is_empty()),
+            "some row carries no groups, rendered as [] not null: {committed}"
+        );
 
         // Public repo: the fixture carries no real account data. A positive
         // control on the same probe — the fake domain really is present — so an
@@ -3703,5 +3741,67 @@ mod tests {
                 "every fixture account is obviously fake: {name}"
             );
         }
+    }
+
+    /// `groups` on the JSON path: an array for a labelled account (including
+    /// multi-membership), and `[]` — never `null` — for an unlabelled one. This
+    /// is config, not a serving counter, so it does not get the
+    /// null-on-offline treatment other fields get.
+    #[test]
+    fn groups_render_as_array_never_null() {
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let alice = rows
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        assert_eq!(
+            alice["groups"],
+            serde_json::json!(["codereview", "dev"]),
+            "labelled account carries its groups: {alice}"
+        );
+        let dave = rows
+            .iter()
+            .find(|r| r["name"] == "dave@example.com")
+            .expect("dave row");
+        assert_eq!(
+            dave["groups"],
+            serde_json::json!([]),
+            "unlabelled account renders [], never null: {dave}"
+        );
+    }
+
+    /// `groups=` on the text path: a greppable `groups=codereview,dev` token for
+    /// a labelled account, and the token omitted entirely (not `groups=`) for an
+    /// unlabelled one — the same "nothing to say" idiom as `fable=` and
+    /// `last_stream_error=`.
+    #[test]
+    fn groups_text_line_greppable_and_omitted_when_empty() {
+        let (snapshot, _thresholds) = status_contract_snapshot();
+        let text = render_accounts(&snapshot, StatusSource::Live);
+        let alice_line = text
+            .lines()
+            .find(|l| l.contains("alice@example.com"))
+            .expect("alice line");
+        assert!(
+            alice_line.contains("groups=codereview,dev"),
+            "labelled account's groups are greppable: {alice_line}"
+        );
+        let dave_line = text
+            .lines()
+            .find(|l| l.contains("dave@example.com"))
+            .expect("dave line");
+        assert!(
+            !dave_line.contains("groups="),
+            "unlabelled account omits the token entirely: {dave_line}"
+        );
     }
 }

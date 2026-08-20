@@ -134,6 +134,20 @@ final class RealWorldDecodeTests: XCTestCase {
         }
     }
 
+    /// `realWorldFixture` predates `groups` — it has neither key, the shape an
+    /// older `tcr` this newer TcrBar talks to would still emit. Decoding a row
+    /// without `groups` must yield `nil`, not throw and blank the row.
+    func testMissingGroupsFieldDecodesToNilNotAThrow() throws {
+        let fleet = try fleet()
+        XCTAssertTrue(
+            fleet.unreadable.isEmpty,
+            "an older tcr without the groups field must still decode every row"
+        )
+        for account in fleet.accounts {
+            XCTAssertNil(account.groups)
+        }
+    }
+
     /// One null field must not cost the other rows. Before per-row decoding, the
     /// array decoded atomically and a single null erased all thirteen accounts.
     func testTheNeverProbedRowKeepsItsNullsAndCostsNoOtherRow() throws {
@@ -316,6 +330,7 @@ final class RealWorldDecodeTests: XCTestCase {
         // A row WITH the new per-window reset fields populates them.
         XCTAssertEqual(ok.fiveHourResetAtMs, 1_767_225_600_000)
         XCTAssertEqual(ok.sevenDayResetAtMs, 1_767_312_000_000)
+        XCTAssertEqual(ok.groups, ["codereview", "dev"])
 
         // `near`: the only shape carrying the nested `held` objects.
         let near = try XCTUnwrap(byName["bob@example.com"])
@@ -349,6 +364,7 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertNil(never.probeError)
         XCTAssertEqual(never.quotaState, .ok, "the raw field says ok — it is a Rust default")
         XCTAssertFalse(never.hasQuotaEvidence, "but nothing has ever probed it")
+        XCTAssertEqual(never.groups, [], "reported and empty, not nil — the server did answer")
 
         // The fleet aggregates the panel headline reads.
         XCTAssertEqual(fleet.readyCount, 1)

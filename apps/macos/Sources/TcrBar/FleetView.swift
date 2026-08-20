@@ -124,6 +124,22 @@ struct FleetView: View {
             }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(fleet.breakdownLabel)
+            if !fleet.groupBreakdown.isEmpty {
+                HStack(spacing: Tok.tightSpacing) {
+                    ForEach(Array(fleet.groupBreakdown.enumerated()), id: \.offset) { index, tally in
+                        if index > 0 {
+                            Text("·").font(Tok.secondaryFont).foregroundStyle(.tertiary)
+                        }
+                        Text(tally.label)
+                            .font(Tok.secondaryDigitFont)
+                            .foregroundStyle(
+                                Tok.color(for: tally.free == 0 ? FleetTally.Kind.spent : .ok)
+                            )
+                    }
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(fleet.groupBreakdownLabel)
+            }
         }
         .padding(.top, Tok.tightSpacing)
     }
@@ -1169,6 +1185,19 @@ struct AccountRow: View {
                 } else {
                     StatusPill("unmeasured", tint: quotaTint)
                         .help("Never probed — this account's quota is unknown, not zero.")
+                }
+                // Group chips. At most two, with the rest collapsed to a `+N`
+                // chip — the panel is `Tok.panelWidth` (380pt) wide and an
+                // account can be in many groups. The existing `StatusPill`
+                // component, not a new one: these are the same shape of fact
+                // (a small labelled tag on the row) as the status pill beside
+                // them.
+                ForEach(Array((account.groups ?? []).prefix(2)), id: \.self) { group in
+                    StatusPill(group, tint: Tok.inkFaint)
+                }
+                if (account.groups ?? []).count > 2 {
+                    StatusPill("+\((account.groups ?? []).count - 2)", tint: Tok.inkFaint)
+                        .help((account.groups ?? []).joined(separator: ", "))
                 }
             }
             // Two stacked bars, 5-hour on top and 7-day directly under it —
