@@ -9,6 +9,10 @@
     "fiveHourState": "ok",
     "freeAtMs": null,
     "gate": "ok",
+    "groupColors": {
+      "codereview": "#5163d6",
+      "dev": "#0a84ff"
+    },
     "groups": [
       "codereview",
       "dev"
@@ -49,6 +53,10 @@
     "fiveHourState": "near",
     "freeAtMs": null,
     "gate": "ok",
+    "groupColors": {
+      "codereview": "#5163d6",
+      "dev": "#0a84ff"
+    },
     "groups": [],
     "held": [
       {
@@ -97,6 +105,10 @@
     "fiveHourState": "spent",
     "freeAtMs": 1767312000000,
     "gate": "ok",
+    "groupColors": {
+      "codereview": "#5163d6",
+      "dev": "#0a84ff"
+    },
     "groups": [],
     "held": [
       {
@@ -145,6 +157,10 @@
     "fiveHourState": null,
     "freeAtMs": null,
     "gate": "ok",
+    "groupColors": {
+      "codereview": "#5163d6",
+      "dev": "#0a84ff"
+    },
     "groups": [],
     "held": [],
     "http1Only": false,

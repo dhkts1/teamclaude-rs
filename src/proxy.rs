@@ -1139,6 +1139,7 @@ async fn status_handler(
         &manager.thresholds(),
         manager.http1_only(),
         manager.control_name(),
+        manager.group_colors(),
     );
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a

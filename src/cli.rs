@@ -475,6 +475,68 @@ pub fn unreserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tcr group color <group> <hex>` / `tcr group color <group> --clear` — set
+/// or clear `group`'s configured color. `hex = None` means `--clear`.
+///
+/// Unlike `reserve`/`unreserve`, this refuses a group with no current
+/// member — matching what [`add_to_group`] does for an unknown ACCOUNT
+/// (`find_account_by_name`'s error), applied here to the group name instead:
+/// a color for a label nothing carries could never appear on any account
+/// row, so setting one would silently do nothing and look like success.
+pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> anyhow::Result<()> {
+    // Validate the hex BEFORE touching the config, same ordering `reserve_group`
+    // uses for its safety rail: a rejected write must leave the file untouched.
+    let normalized = hex
+        .map(|h| {
+            config::validate_hex_color(h)
+                .map_err(|reason| anyhow::anyhow!("color {h:?}: invalid hex color — {reason}"))
+        })
+        .transpose()?;
+
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let existing = config.all_group_names();
+    if !existing.contains(group) {
+        if existing.is_empty() {
+            bail!("group {group:?}: no account in the config carries any group label — nothing to color");
+        }
+        bail!(
+            "group {group:?}: not a configured group. Configured groups: {}",
+            existing.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
+
+    let outcome = config::save_group_color(config_path, group, normalized.as_deref())
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    // Re-load is unnecessary for the message: `normalized`/`--clear` already
+    // tells us what the resolved value will be on the next read, and printing
+    // it from the just-loaded `config` for the clear case keeps this from
+    // silently drifting if `group_color`'s derivation ever changes.
+    let (resolved, source) = match &normalized {
+        Some(hex) => (hex.clone(), config::ColorSource::Set),
+        None => {
+            let (hex, _) = config.group_color(group);
+            (hex, config::ColorSource::Derived)
+        }
+    };
+    match outcome {
+        config::GroupColorWrite::Updated => {
+            println!(
+                "group '{group}' color set to {resolved} ({}).",
+                source.as_str()
+            );
+            println!("{GROUP_RESTART_NOTE}");
+        }
+        config::GroupColorWrite::Unchanged => {
+            println!(
+                "group '{group}' color is already {resolved} ({}); nothing changed.",
+                source.as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `tcr group ls [--json]` — list every group and its members, plus the
 /// ungrouped count.
 ///
@@ -523,9 +585,10 @@ fn render_groups_text(config: &Config) -> String {
     let width = groups.keys().map(|g| g.len()).max().unwrap_or(0);
     let mut out = String::new();
     for (group, members) in &groups {
+        let (color, source) = config.group_color(group);
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={} reserved={}",
+            "group {group:width$} accounts={} members={} reserved={} color={color} color_source={}",
             members.len(),
             members.join(","),
             if config.is_group_reserved(group) {
@@ -533,6 +596,7 @@ fn render_groups_text(config: &Config) -> String {
             } else {
                 "no"
             },
+            source.as_str(),
         );
     }
     let _ = writeln!(out, "ungrouped accounts={ungrouped}");
@@ -546,11 +610,14 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
     let rows: Vec<serde_json::Value> = groups
         .iter()
         .map(|(group, members)| {
+            let (color, source) = config.group_color(group);
             serde_json::json!({
                 "group": group,
                 "accounts": members.len(),
                 "members": members,
                 "reserved": config.is_group_reserved(group),
+                "color": color,
+                "colorSource": source.as_str(),
             })
         })
         .collect();
@@ -1493,6 +1560,7 @@ fn render_accounts_json(
     server: Option<&BuildInfo>,
     http1_only: bool,
     control: Option<&str>,
+    group_colors: &std::collections::BTreeMap<String, String>,
 ) -> String {
     let now = OffsetDateTime::now_utc();
     let rows: Vec<serde_json::Value> = snapshot
@@ -1714,6 +1782,15 @@ fn render_accounts_json(
                 // mark a section reserved; name and shape are a fixed contract,
                 // do not change them.
                 "reservedGroups": a.reserved_groups,
+                // Every group on the FLEET (not just this row's own groups)
+                // mapped to its resolved color — server-wide like `http1Only`
+                // above, repeated per row so the panel can tint any account's
+                // tag without a second lookup. Always an object, `{}` when
+                // there are no groups, never `null`: see
+                // `Config::group_colors`'s doc-comment. Name and shape are a
+                // fixed contract with the sibling macOS panel — do not change
+                // them.
+                "groupColors": group_colors,
             })
         })
         .collect();
@@ -1926,61 +2003,63 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
 
-    let (source, server_build, snapshot, thresholds, http1_only, control) = match fetch_live_status(
-        &config,
-    )
-    .await
-    {
-        Ok(payload) => {
-            let build = payload.build.clone();
-            let http1_only = payload.http1_only;
-            let control = payload.control.clone();
-            let (snapshot, thresholds) = payload.into_snapshot();
-            (
-                StatusSource::Live,
-                Some(build),
-                snapshot,
-                thresholds,
-                http1_only,
-                control,
-            )
-        }
-        Err(reason) => {
-            // Both "it answered something unusable" and "it answered nothing"
-            // warn; only the ordinary no-server case stays quiet.
-            if !matches!(reason, LiveStatusError::NoServer) {
-                let why = reason.why();
-                eprintln!(
+    let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
+        match fetch_live_status(&config).await {
+            Ok(payload) => {
+                let build = payload.build.clone();
+                let http1_only = payload.http1_only;
+                let control = payload.control.clone();
+                let group_colors = payload.group_colors.clone();
+                let (snapshot, thresholds) = payload.into_snapshot();
+                (
+                    StatusSource::Live,
+                    Some(build),
+                    snapshot,
+                    thresholds,
+                    http1_only,
+                    control,
+                    group_colors,
+                )
+            }
+            Err(reason) => {
+                // Both "it answered something unusable" and "it answered nothing"
+                // warn; only the ordinary no-server case stays quiet.
+                if !matches!(reason, LiveStatusError::NoServer) {
+                    let why = reason.why();
+                    eprintln!(
                         "[tcr] warning: could not read live status from the proxy on :{} ({why}) — falling back to an offline snapshot, whose serving counters are all zero.",
                         config.proxy.port
                     );
+                }
+                let thresholds = resolve_thresholds(&config);
+                // `config` is consumed by `snapshot_offline` below, so read
+                // `http1_only`/`control_account`/`group_colors` off it first —
+                // this is the config FILE's value, not a running server's
+                // (there is none in this branch), which is the honest answer
+                // for an offline snapshot. `control` is a config fact either
+                // way, so this is the same reading a live server would derive
+                // at boot.
+                let http1_only = config.http1_only;
+                let control = config.control_account.clone();
+                let group_colors = config.group_colors();
+                let snapshot = snapshot_offline(
+                    config,
+                    Arc::new(NoRefresh),
+                    Arc::new(LiveUsageProber::new()),
+                    true,
+                )
+                .await;
+                (
+                    StatusSource::Offline,
+                    None,
+                    snapshot,
+                    thresholds,
+                    http1_only,
+                    control,
+                    group_colors,
+                )
             }
-            let thresholds = resolve_thresholds(&config);
-            // `config` is consumed by `snapshot_offline` below, so read
-            // `http1_only`/`control_account` off it first — this is the
-            // config FILE's value, not a running server's (there is none
-            // in this branch), which is the honest answer for an offline
-            // snapshot. `control` is a config fact either way, so this is
-            // the same reading a live server would derive at boot.
-            let http1_only = config.http1_only;
-            let control = config.control_account.clone();
-            let snapshot = snapshot_offline(
-                config,
-                Arc::new(NoRefresh),
-                Arc::new(LiveUsageProber::new()),
-                true,
-            )
-            .await;
-            (
-                StatusSource::Offline,
-                None,
-                snapshot,
-                thresholds,
-                http1_only,
-                control,
-            )
-        }
-    };
+        };
 
     // Build skew goes to STDERR in both modes: `--json` output is a bare array
     // that scripts pipe into jq, and a diagnostic on stdout would corrupt it.
@@ -1998,7 +2077,8 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 source,
                 server_build.as_ref(),
                 http1_only,
-                control.as_deref()
+                control.as_deref(),
+                &group_colors,
             )
         );
     } else {
@@ -2007,9 +2087,22 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         // `http1Only` rides here rather than per-account: it is a server-wide
         // fact, like `source` itself, not a per-account gating detail — see
         // `Manager::http1_only`'s doc-comment for why this must NOT be
-        // re-derived from the config file when `source=live`.
+        // re-derived from the config file when `source=live`. `groupColors`
+        // rides the same way, one `name:hex` token per group.
+        let group_colors_field = if group_colors.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " groupColors={}",
+                group_colors
+                    .iter()
+                    .map(|(g, hex)| format!("{g}:{hex}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
         println!(
-            "status source={}{}{} http1Only={}",
+            "status source={}{}{} http1Only={}{}",
             source.as_str(),
             match source {
                 StatusSource::Live => String::new(),
@@ -2018,6 +2111,7 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
             },
             build_fields(server_build.as_ref()),
             http1_only,
+            group_colors_field,
         );
         print!("{}", render_accounts(&snapshot, source));
     }
@@ -2466,6 +2560,141 @@ mod tests {
         let path = write_config("reserve-bad-label", TWO_ACCOUNTS);
         let result = reserve_group(&path, "bad\nlabel");
         assert!(result.is_err(), "a newline in the label must be rejected");
+        fs::remove_file(&path).ok();
+    }
+
+    // --- group color --------------------------------------------------------
+
+    /// A configured color round-trips through config and onto both `ls`
+    /// renderers, tagged `color_source=set`/`colorSource: "set"`.
+    #[test]
+    fn group_color_set_round_trips_through_config_and_ls() {
+        let path = write_config("color-set", GROUPED_ACCOUNTS);
+        set_group_color(&path, "codereview", Some("#32D74B")).unwrap();
+        let config = load(&path);
+        assert_eq!(
+            config.group_color("codereview"),
+            ("#32d74b".to_string(), config::ColorSource::Set),
+            "hex normalizes to lowercase on write"
+        );
+        let text = render_groups_text(&config);
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("group codereview"))
+            .expect("codereview line");
+        assert!(
+            line.contains("color=#32d74b") && line.contains("color_source=set"),
+            "text ls carries the set color: {line}"
+        );
+        let json_value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
+        let row = json_value["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["group"] == "codereview")
+            .expect("codereview row");
+        assert_eq!(row["color"], serde_json::json!("#32d74b"));
+        assert_eq!(row["colorSource"], serde_json::json!("set"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// An unconfigured group gets a derived color that is stable across
+    /// independent reads and differs from another name's — the bridge's
+    /// "stable across runs, differs by name" requirement, checked directly
+    /// against the config layer rather than the CLI (no write happens here).
+    #[test]
+    fn unconfigured_group_color_is_derived_stable_and_distinguishes_names() {
+        let path = write_config("color-derived", GROUPED_ACCOUNTS);
+        let config = load(&path);
+        let (first, source) = config.group_color("codereview");
+        assert_eq!(source, config::ColorSource::Derived);
+        let (second, _) = config.group_color("codereview");
+        assert_eq!(first, second, "same name, same process, same color");
+        // Independent load — a fresh process reading the same file — must
+        // derive the identical color: stability cannot depend on anything
+        // but the group name.
+        let reloaded = load(&path);
+        let (third, _) = reloaded.group_color("codereview");
+        assert_eq!(first, third, "stable across independent loads");
+
+        let (dev_color, _) = config.group_color("dev");
+        assert_ne!(
+            first, dev_color,
+            "two different group names must not collide onto the same color"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// `--clear` reverts a configured color to the derived default — the
+    /// SAME derived value `unconfigured_group_color_is_derived_...` above
+    /// pins, not a different fallback.
+    #[test]
+    fn group_color_clear_reverts_to_derived() {
+        let path = write_config("color-clear", GROUPED_ACCOUNTS);
+        let (derived_before, _) = load(&path).group_color("codereview");
+
+        set_group_color(&path, "codereview", Some("#123456")).unwrap();
+        assert_eq!(
+            load(&path).group_color("codereview"),
+            ("#123456".to_string(), config::ColorSource::Set)
+        );
+
+        set_group_color(&path, "codereview", None).unwrap();
+        let (after_clear, source) = load(&path).group_color("codereview");
+        assert_eq!(source, config::ColorSource::Derived);
+        assert_eq!(
+            after_clear, derived_before,
+            "clearing must land on exactly the value that was always derived, \
+             not some other fallback"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Strictly invalid hex is rejected, and — like `reserve`'s safety
+    /// rail — the config is byte-identical after the refusal: a rejected
+    /// write must never touch the file.
+    #[test]
+    fn group_color_rejects_invalid_hex_and_leaves_file_untouched() {
+        let path = write_config("color-bad-hex", GROUPED_ACCOUNTS);
+        let before = fs::read_to_string(&path).unwrap();
+        for bad in ["32d74b", "#32d74", "#zzzzzz", "#12345g", ""] {
+            let result = set_group_color(&path, "codereview", Some(bad));
+            assert!(result.is_err(), "{bad:?} must be rejected");
+        }
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(before, after, "a rejected hex must not touch the file");
+        fs::remove_file(&path).ok();
+    }
+
+    /// `#RGB` shorthand expands to the doubled `#RRGGBB` form.
+    #[test]
+    fn group_color_accepts_short_hex_form() {
+        let path = write_config("color-short-hex", GROUPED_ACCOUNTS);
+        set_group_color(&path, "codereview", Some("#abc")).unwrap();
+        assert_eq!(
+            load(&path).group_color("codereview"),
+            ("#aabbcc".to_string(), config::ColorSource::Set)
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Setting a color on a group no account carries is an error listing the
+    /// configured groups — matching `add_to_group`'s unknown-account message
+    /// shape (via `find_account_by_name`).
+    #[test]
+    fn group_color_on_unknown_group_lists_configured_groups() {
+        let path = write_config("color-unknown-group", GROUPED_ACCOUNTS);
+        let before = fs::read_to_string(&path).unwrap();
+        let err = set_group_color(&path, "typo-group", Some("#32d74b"))
+            .expect_err("an unconfigured group name must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("codereview") && msg.contains("dev"), "{msg}");
+        let after = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "a refused group name must not touch the file"
+        );
         fs::remove_file(&path).ok();
     }
 
@@ -3045,6 +3274,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(rows.len(), 2, "one row per account");
@@ -3091,8 +3321,15 @@ mod tests {
         counted.accounts[0].requests = CACHE_SIGNAL_FLOOR_REQUESTS;
         counted.accounts[0].input_tokens = 1_000;
         counted.accounts[0].cache_read_tokens = 750;
-        let live =
-            render_accounts_json(&counted, &thresholds, StatusSource::Live, None, false, None);
+        let live = render_accounts_json(
+            &counted,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["cacheHitRatio"], serde_json::json!(0.75));
         assert_eq!(rows[0]["source"], "live");
@@ -3152,8 +3389,15 @@ mod tests {
         sparse.accounts[0].input_tokens = 42_000;
         sparse.accounts[0].cache_read_tokens = 100;
 
-        let live =
-            render_accounts_json(&sparse, &thresholds, StatusSource::Live, None, false, None);
+        let live = render_accounts_json(
+            &sparse,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert!(
             rows[0]["cacheHitRatio"].is_null(),
@@ -3191,6 +3435,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(
@@ -3225,6 +3470,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&offline).expect("valid json");
         for row in &rows {
@@ -3251,6 +3497,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(0));
@@ -3259,8 +3506,15 @@ mod tests {
         let mut errored = snapshot.clone();
         errored.accounts[0].stream_error_count = 3;
         errored.accounts[0].last_stream_error = Some("overloaded_error".to_string());
-        let live =
-            render_accounts_json(&errored, &thresholds, StatusSource::Live, None, false, None);
+        let live = render_accounts_json(
+            &errored,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&live).expect("valid json");
         assert_eq!(rows[0]["streamErrorCount"], serde_json::json!(3));
         assert_eq!(
@@ -3338,6 +3592,7 @@ mod tests {
             Some(&build),
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         assert_eq!(
@@ -3388,6 +3643,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         for row in &rows {
@@ -3717,7 +3973,15 @@ mod tests {
             assert!(secs > 0, "a promised instant is in the future: {line}");
         }
         // JSON mirrors it for machine consumers, in ms like every other instant.
-        let json = render_accounts_json(&gated, &thresholds, StatusSource::Live, None, false, None);
+        let json = render_accounts_json(
+            &gated,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
         assert!(
             json.contains("\"freeAtMs\""),
             "json carries freeAtMs: {json}"
@@ -3832,6 +4096,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         assert!(json.contains("\"held\""), "json carries held array: {json}");
         assert!(
@@ -3899,6 +4164,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&json).expect("json is a bare array");
@@ -3942,6 +4208,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&json).expect("json is a bare array");
@@ -3977,6 +4244,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> =
             serde_json::from_str(&json).expect("json is a bare array");
@@ -4287,6 +4555,22 @@ mod tests {
             dirty: Some(false),
             built_at: "2026-01-01T00:00:00Z".to_string(),
         };
+        // Real content, not an empty map: `groupColors` must be exercised by
+        // the fixture the same way `groups`/`reservedGroups` already are, or a
+        // future renderer bug that stops emitting real colors would pass this
+        // pin silently. Matches alice's `["codereview", "dev"]` membership
+        // above so a reader can see the shape it feeds without cross-checking
+        // another test.
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            (
+                "codereview".to_string(),
+                crate::config::derive_group_color("codereview"),
+            ),
+            ("dev".to_string(), "#0a84ff".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
         // Trailing newline so the file is a well-formed text file; the renderer
         // itself emits none.
         format!(
@@ -4297,7 +4581,8 @@ mod tests {
                 StatusSource::Live,
                 Some(&build),
                 false,
-                None
+                None,
+                &group_colors,
             )
         )
     }
@@ -4437,6 +4722,25 @@ mod tests {
                 .is_empty()),
             "some row carries no groups, rendered as [] not null: {committed}"
         );
+        // `groupColors` is server-wide (like `http1Only`), so it is identical
+        // on every row — checking row 0 checks all of them. Real entries, not
+        // an empty object: the fixture must exercise both a configured color
+        // ("dev") and a derived one ("codereview").
+        let group_colors = rows[0]["groupColors"]
+            .as_object()
+            .expect("groupColors is an object");
+        assert_eq!(
+            group_colors.get("dev"),
+            Some(&serde_json::json!("#0a84ff")),
+            "configured color round-trips onto the wire: {committed}"
+        );
+        assert!(
+            group_colors
+                .get("codereview")
+                .and_then(|v| v.as_str())
+                .is_some_and(|hex| hex.starts_with('#') && hex.len() == 7),
+            "derived color is still a real hex value on the wire: {committed}"
+        );
 
         // Public repo: the fixture carries no real account data. A positive
         // control on the same probe — the fake domain really is present — so an
@@ -4468,6 +4772,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         let alice = rows
@@ -4488,6 +4793,77 @@ mod tests {
             serde_json::json!([]),
             "unlabelled account renders [], never null: {dave}"
         );
+    }
+
+    /// `groupColors` is FLEET-wide, repeated on every row exactly like
+    /// `http1Only` — not filtered down to the groups the row itself belongs
+    /// to. Dave's row carries no groups but must still see `codereview`'s
+    /// color, and a group nobody on this fleet is even labelled with (`ops`)
+    /// still appears: the map is whatever the caller passes, not derived
+    /// per-row from `groups`.
+    #[test]
+    fn group_colors_is_fleet_wide_not_filtered_to_the_rows_own_groups() {
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let group_colors: std::collections::BTreeMap<String, String> = [
+            ("codereview".to_string(), "#5163d6".to_string()),
+            ("dev".to_string(), "#0a84ff".to_string()),
+            ("ops".to_string(), "#ff9500".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &group_colors,
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let dave = rows
+            .iter()
+            .find(|r| r["name"] == "dave@example.com")
+            .expect("dave row");
+        assert_eq!(
+            dave["groups"],
+            serde_json::json!([]),
+            "dave carries no groups of his own"
+        );
+        assert_eq!(
+            dave["groupColors"],
+            serde_json::json!({
+                "codereview": "#5163d6",
+                "dev": "#0a84ff",
+                "ops": "#ff9500",
+            }),
+            "dave's row still carries the full fleet map, including groups \
+             he does not belong to: {dave}"
+        );
+    }
+
+    /// `groupColors` on a fleet with no groups at all: `{}`, never `null` —
+    /// same never-`null` contract `groups`/`reservedGroups` already carry.
+    #[test]
+    fn group_colors_is_empty_object_never_null_when_no_groups() {
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &std::collections::BTreeMap::new(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        for row in &rows {
+            assert_eq!(
+                row["groupColors"],
+                serde_json::json!({}),
+                "empty fleet groups render as {{}}, never null: {row}"
+            );
+        }
     }
 
     /// `groups=` on the text path: a greppable `groups=codereview,dev` token for
@@ -4582,6 +4958,7 @@ mod tests {
             None,
             false,
             None,
+            &Default::default(),
         );
         let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
         let alice = rows
@@ -4611,8 +4988,13 @@ mod tests {
     #[test]
     fn reserved_groups_round_trip_through_status_payload() {
         let (snapshot, thresholds) = reserved_groups_snapshot();
-        let payload =
-            crate::status::StatusPayload::from_snapshot(&snapshot, &thresholds, false, None);
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &snapshot,
+            &thresholds,
+            false,
+            None,
+            Default::default(),
+        );
         let wire = serde_json::to_string(&payload).expect("serialize");
         assert!(
             wire.contains("\"reservedGroups\":[\"codereview\"]"),

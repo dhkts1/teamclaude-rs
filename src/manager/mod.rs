@@ -21,7 +21,7 @@
 //! Usage/request counters increment on the **actual serving index** passed by the
 //! proxy, never a mutated "current" pointer — that is bug #3 designed out.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -846,6 +846,12 @@ pub struct Manager {
     /// print the same note). See [`Manager::eligible`]'s `reserved_group` doc
     /// for the rule this drives.
     reserved_groups: HashSet<String>,
+    /// Every group on the fleet mapped to its resolved color
+    /// (`config::Config::group_colors`), snapshotted from the config at
+    /// construction — same restart-to-take-effect contract as
+    /// [`Self::reserved_groups`] above. `BTreeMap` for deterministic wire
+    /// order, matching [`config::Config::group_colors`]'s own return type.
+    group_colors: BTreeMap<String, String>,
     /// Per-account request pacing knobs, snapshotted from the config at
     /// construction. Default (all `None`) → inert → selection is byte-identical to
     /// the no-pacing build. See [`config::PacingConfig`].
@@ -1059,6 +1065,11 @@ impl Manager {
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let reserved_groups = config.reserved_group_names();
+        // Snapshotted at construction, same restart-to-take-effect contract as
+        // `reserved_groups` above and `config::Account::groups` itself — a
+        // `tcr group color` write needs a restart before the running server's
+        // wire reflects it.
+        let group_colors = config.group_colors();
         let pacing = config.pacing.clone();
         let throttle = config.throttle.clone();
 
@@ -1107,6 +1118,7 @@ impl Manager {
             proxy_api_key,
             global_threshold,
             reserved_groups,
+            group_colors,
             pacing,
             throttle,
             locked_idx,
@@ -2926,6 +2938,7 @@ mod tests {
                 (*group).to_string(),
                 crate::config::GroupSettings {
                     reserved: true,
+                    color: None,
                     extra: serde_json::Map::new(),
                 },
             );

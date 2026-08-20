@@ -134,6 +134,21 @@ pub struct StatusPayload {
     /// [`STATUS_KIND`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<String>,
+    /// Every group on the fleet mapped to its resolved color
+    /// (`crate::config::Config::group_colors`), server-wide like `http1_only`
+    /// and for the same reason: it is resolved from the config the SERVING
+    /// process booted with (`Manager::group_colors`), and a client must not
+    /// re-derive it from a config file that may have moved on since boot.
+    ///
+    /// `#[serde(default)]` for the same forward-compat reason as `http1_only`
+    /// — an OLD server's payload has no such key, and absent must read as an
+    /// empty map (a NEW client talking to an old server reports no group
+    /// colors, which is the truth: that server never resolved any) rather
+    /// than fail the parse and drop to the offline snapshot. Per this
+    /// struct's `build` doc-comment on when a bump is and is not warranted,
+    /// this must NOT bump [`STATUS_KIND`] — same reasoning as `control`.
+    #[serde(default)]
+    pub group_colors: std::collections::BTreeMap<String, String>,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -238,6 +253,7 @@ impl StatusPayload {
         thresholds: &[f64],
         http1_only: bool,
         control: Option<String>,
+        group_colors: std::collections::BTreeMap<String, String>,
     ) -> Self {
         let accounts = snapshot
             .accounts
@@ -281,6 +297,7 @@ impl StatusPayload {
             build: BuildInfo::current(),
             http1_only,
             control,
+            group_colors,
         }
     }
 
@@ -392,6 +409,7 @@ mod tests {
             &[0.85],
             false,
             None,
+            Default::default(),
         ))
         .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
@@ -432,6 +450,7 @@ mod tests {
             &[0.85],
             false,
             None,
+            Default::default(),
         ))
         .expect("serialize");
         let mut value: serde_json::Value = serde_json::from_str(&wire).expect("parse");
@@ -461,6 +480,7 @@ mod tests {
             &[0.85],
             false,
             None,
+            Default::default(),
         ))
         .expect("serialize");
         // Simulate an older server: strip every `"groups":[...]` occurrence from
@@ -491,6 +511,7 @@ mod tests {
             &[0.85],
             false,
             None,
+            Default::default(),
         ))
         .expect("serialize");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
@@ -601,14 +622,20 @@ mod tests {
             &[0.85],
             false,
             Some("alice@example.com".to_string()),
+            Default::default(),
         );
         let wire = serde_json::to_string(&with_control).expect("serialize");
         assert!(wire.contains("\"control\":\"alice@example.com\""), "{wire}");
         let back: StatusPayload = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back.control, Some("alice@example.com".to_string()));
 
-        let without_control =
-            StatusPayload::from_snapshot(&snapshot_with_counters(), &[0.85], false, None);
+        let without_control = StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        );
         let wire = serde_json::to_string(&without_control).expect("serialize");
         assert!(
             !wire.contains("\"control\""),
@@ -626,6 +653,7 @@ mod tests {
             &[0.9],
             false,
             None,
+            Default::default(),
         ))
         .expect("serialize");
         assert!(

@@ -166,7 +166,7 @@ struct GroupArgs {
     action: GroupAction,
 }
 
-/// `tcr group ls|add|rm|reserve|unreserve` — the argument shape here is a
+/// `tcr group ls|add|rm|reserve|unreserve|color` — the argument shape here is a
 /// CONTRACT with the TcrBar panel, which shells out to it (`TcrTool.run`); do
 /// not change it.
 #[derive(Subcommand)]
@@ -182,6 +182,8 @@ enum GroupAction {
     Reserve(GroupReserveArgs),
     /// Clear a group's reserved flag.
     Unreserve(GroupUnreserveArgs),
+    /// Set (or `--clear`) a group's color — the tag the panel draws for it.
+    Color(GroupColorArgs),
 }
 
 #[derive(clap::Args)]
@@ -241,6 +243,24 @@ struct GroupUnreserveArgs {
     config: Option<PathBuf>,
     /// The group label to unreserve.
     group: String,
+}
+
+#[derive(clap::Args)]
+struct GroupColorArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to color.
+    group: String,
+    /// The color, as `#RGB` or `#RRGGBB` (case-insensitive). Required unless
+    /// `--clear` is given; conflicts with `--clear` so the parser refuses
+    /// "both" and "neither" the same way `GroupRmArgs`'s `account`/`--all`
+    /// does.
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    hex: Option<String>,
+    /// Revert to the color derived from the group name instead of setting one.
+    #[arg(long)]
+    clear: bool,
 }
 
 #[derive(clap::Args)]
@@ -416,7 +436,7 @@ async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
     cli::set_control(&config_path, Some(&query), args.org.as_deref()).await
 }
 
-/// `tcr group ls|add|rm` — manage account group membership. Argument shape is
+/// `tcr group ls|add|rm|reserve|unreserve|color` — manage account group membership. Argument shape is
 /// the TcrBar panel contract — see [`GroupAction`]'s doc-comment.
 fn run_group(args: GroupArgs) -> anyhow::Result<()> {
     match args.action {
@@ -439,6 +459,12 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         GroupAction::Unreserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
             cli::unreserve_group(&config_path, &a.group)
+        }
+        GroupAction::Color(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            // clap's `conflicts_with`/`required_unless_present` on
+            // `GroupColorArgs` guarantee exactly one of `hex`/`--clear`.
+            cli::set_group_color(&config_path, &a.group, a.hex.as_deref())
         }
     }
 }
