@@ -157,9 +157,11 @@ struct GroupSectionView: View {
     @Binding var confirmRemoveGroup: String?
 
     private var isExpanded: Bool {
-        // Collapsed by default, except a starved group (`free == 0`) starts
-        // expanded — that is the one an operator opened the panel for.
-        expandedOverrides[detail.name] ?? (detail.free == 0)
+        // Collapsed by default, except a starved group starts expanded —
+        // that is the one an operator opened the panel for. The default
+        // itself lives on the model (`GroupDetail.startsExpanded`) so a test
+        // can assert it directly; this only adds the per-open override.
+        expandedOverrides[detail.name] ?? detail.startsExpanded
     }
 
     /// `ungrouped` is synthetic — nobody "removes" it, and there is nothing

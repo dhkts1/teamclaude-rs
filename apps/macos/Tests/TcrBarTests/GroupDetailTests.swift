@@ -144,7 +144,7 @@ final class GroupDetailTests: XCTestCase {
         XCTAssertEqual(fleet.groupDetails.map(\.tally), fleet.groupBreakdown)
     }
 
-    // MARK: - default expansion (bridge Unit 5) — `free` itself, which the view keys off
+    // MARK: - default expansion (bridge Unit 5)
 
     func testFreeIsZeroWhenEveryEnabledMemberIsSpent() {
         let fleet = Fleet(accounts: [
@@ -158,6 +158,47 @@ final class GroupDetailTests: XCTestCase {
             groupAccount("a@example.com", quotaState: .ok, groups: ["codereview"])
         ])
         XCTAssertNotEqual(fleet.groupDetails.first?.free, 0)
+    }
+
+    /// A starved group (`free == 0`) starts expanded — the model property the
+    /// view's disclosure row reads directly, per this file's house rule that
+    /// a rendered/behavioural fact is a property of the model, not a
+    /// view-private computation.
+    func testStarvedGroupStartsExpanded() {
+        let fleet = Fleet(accounts: [
+            groupAccount("a@example.com", quotaState: .spent, groups: ["codereview"])
+        ])
+        XCTAssertEqual(fleet.groupDetails.first?.startsExpanded, true)
+    }
+
+    func testNonStarvedGroupStartsCollapsed() {
+        let fleet = Fleet(accounts: [
+            groupAccount("a@example.com", quotaState: .ok, groups: ["codereview"])
+        ])
+        XCTAssertEqual(fleet.groupDetails.first?.startsExpanded, false)
+    }
+
+    // MARK: - ungrouped ordering and absence (bridge Unit 4, continued)
+
+    /// `ungrouped` is not just sorted alphabetically among real groups — it
+    /// is forced to the end regardless of its own name, which would sort
+    /// before every group in this fixture if it were treated as an ordinary
+    /// key.
+    func testUngroupedSortsLastEvenWhenItWouldSortFirstAlphabetically() {
+        let fleet = Fleet(accounts: [
+            groupAccount("a@example.com", groups: ["zzz-last-alphabetically"]),
+            groupAccount("b@example.com", groups: nil),
+        ])
+        XCTAssertEqual(fleet.groupDetails.map(\.name), ["zzz-last-alphabetically", "ungrouped"])
+    }
+
+    /// No account anywhere carries a label: the whole list is absent, not an
+    /// all-`ungrouped` list of one.
+    func testGroupDetailsAbsentWhenNothingIsLabelled() {
+        let fleet = Fleet(accounts: [
+            groupAccount("a@example.com", groups: nil)
+        ])
+        XCTAssertEqual(fleet.groupDetails, [])
     }
 }
 

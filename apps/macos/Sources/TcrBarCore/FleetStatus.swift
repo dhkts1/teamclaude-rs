@@ -1238,6 +1238,15 @@ public struct GroupDetail: Equatable, Sendable, Identifiable {
     /// `"dev 4/5"` — same as ``GroupTally/label``.
     public var label: String { tally.label }
 
+    /// Whether the Groups view's disclosure row for this group starts
+    /// expanded. A property of the model, not a view-private computation, so
+    /// a test can assert it directly — the house rule this file already
+    /// follows for ``statLine``. A starved group (`free == 0`) is the one an
+    /// operator opened the panel for, so it starts open; every other group
+    /// starts collapsed. The view still lets an explicit click override this
+    /// per group — this is only the DEFAULT.
+    public var startsExpanded: Bool { free == 0 }
+
     /// The worst (highest) 5-hour utilization among members that have one —
     /// the window that gates the group next. `nil` when no member has ever
     /// reported a 5h fraction.
