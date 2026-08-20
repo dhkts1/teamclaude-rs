@@ -23,6 +23,11 @@ struct FleetView: View {
     /// would.
     @ObservedObject var awake: AwakeController
     @ObservedObject var updater: Updater
+    /// Mutating group membership from the Groups view. See ``GroupController``.
+    @ObservedObject var groupController: GroupController
+    /// Which of Accounts/Groups is showing, persisted. See
+    /// ``FleetViewModePreference``.
+    @ObservedObject var viewMode: FleetViewModePreference
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -197,7 +202,23 @@ struct FleetView: View {
             if fleet.source.countersAreStructural {
                 offlineNotice(fleet.source)
             }
-            if snapshotMode {
+            // Hidden entirely, not merely disabled, when no account anywhere
+            // carries a label — nothing changes for an operator not using
+            // groups. `effectiveMode(for:)` enforces the same rule on the
+            // content below even if a stale preference says otherwise.
+            if !fleet.groupDetails.isEmpty {
+                FleetViewModeToggle(mode: $viewMode.mode)
+            }
+            if effectiveMode(for: fleet) == .groups {
+                if snapshotMode {
+                    GroupsListView(fleet: fleet, groupController: groupController)
+                } else {
+                    ScrollView {
+                        GroupsListView(fleet: fleet, groupController: groupController)
+                    }
+                    .frame(height: Tok.panelMaxHeight)
+                }
+            } else if snapshotMode {
                 rowStack(fleet)
             } else {
                 ScrollView {
@@ -207,6 +228,14 @@ struct FleetView: View {
                 .onPreferenceChange(RowHeightsKey.self) { rowHeights = $0 }
             }
         }
+    }
+
+    /// `viewMode.mode`, forced to `.accounts` when the fleet has no group to
+    /// show — the toggle itself is hidden in that case (see
+    /// ``fleetRows(_:)``), but a stale `Groups` preference from a fleet that
+    /// used to have labels must not draw an empty grouped list.
+    private func effectiveMode(for fleet: Fleet) -> FleetViewModePreference.Mode {
+        fleet.groupDetails.isEmpty ? .accounts : viewMode.mode
     }
 
     private func rowStack(_ fleet: Fleet) -> some View {
