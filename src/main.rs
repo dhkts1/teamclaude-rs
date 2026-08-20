@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
-use teamclaude_rs::cli::{self, PriorityArg};
+use teamclaude_rs::cli::{self, validate_group_label_chars, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::proxy::GROUP_HEADER_NAME;
 use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, server, singleton, tui, update};
@@ -57,6 +57,8 @@ enum Command {
     Disable(DisableArgs),
     /// Set, clear, or show the identity-bound control account.
     Control(ControlArgs),
+    /// Manage account group membership (`ls` / `add` / `rm`).
+    Group(GroupArgs),
     /// Probe every account's live quota and print the fleet status.
     Status(StatusArgs),
     /// Self-update: `git pull --ff-only` + `cargo build --release` in the checkout.
@@ -156,6 +158,65 @@ struct ControlArgs {
     /// Print the current control account and change nothing.
     #[arg(long)]
     show: bool,
+}
+
+#[derive(clap::Args)]
+struct GroupArgs {
+    #[command(subcommand)]
+    action: GroupAction,
+}
+
+/// `tcr group ls|add|rm` — the argument shape here is a CONTRACT with the
+/// TcrBar panel, which shells out to it (`TcrTool.run`); do not change it.
+#[derive(Subcommand)]
+enum GroupAction {
+    /// List groups and their members.
+    Ls(GroupLsArgs),
+    /// Add one account to one group.
+    Add(GroupAddArgs),
+    /// Remove one account from one group, or `--all` to delete the group.
+    Rm(GroupRmArgs),
+}
+
+#[derive(clap::Args)]
+struct GroupLsArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Emit a machine-readable JSON equivalent instead of greppable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct GroupAddArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to add.
+    group: String,
+    /// Account name (its bare email — `Account.name` IS the email). Exact,
+    /// case-sensitive.
+    account: String,
+}
+
+#[derive(clap::Args)]
+struct GroupRmArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to remove.
+    group: String,
+    /// Account name to drop from the group. Required unless `--all` is given;
+    /// conflicts with `--all` so the parser — not a runtime panic — refuses
+    /// "both" and "neither".
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    account: Option<String>,
+    /// Remove the group from every member instead of one account — deletes
+    /// the group, since groups exist only while some account carries the
+    /// label.
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(clap::Args)]
@@ -265,6 +326,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
         Some(Command::Control(args)) => run_control(args).await,
+        Some(Command::Group(args)) => run_group(args),
         Some(Command::Status(args)) => run_status(args).await,
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
@@ -328,6 +390,25 @@ async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
         anyhow::bail!("provide an account query, or --clear / --show");
     };
     cli::set_control(&config_path, Some(&query), args.org.as_deref()).await
+}
+
+/// `tcr group ls|add|rm` — manage account group membership. Argument shape is
+/// the TcrBar panel contract — see [`GroupAction`]'s doc-comment.
+fn run_group(args: GroupArgs) -> anyhow::Result<()> {
+    match args.action {
+        GroupAction::Ls(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::list_groups(&config_path, a.json)
+        }
+        GroupAction::Add(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::add_to_group(&config_path, &a.group, &a.account)
+        }
+        GroupAction::Rm(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::remove_from_group(&config_path, &a.group, a.account.as_deref(), a.all)
+        }
+    }
 }
 
 /// `tcr status [--json]` — probe every account's live quota and print it.
@@ -463,39 +544,9 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
 const MIN_CLAUDE_VERSION_FOR_GROUP: (u64, u64, u64) = (2, 1, 227);
 const MIN_CLAUDE_VERSION_FOR_GROUP_STR: &str = "2.1.227";
 
-/// Reject a group label whose CONTENT could corrupt `compose_group_header`'s
-/// output — a literal newline (legal in JSON via `\n`), any other control
-/// character, or a codepoint above U+00FF — and reject empty/whitespace-only.
-///
-/// Defense in depth, NOT a fix for a live vulnerability: Claude Code's own
-/// header-value parser already hard-errors (naming the offending pair by
-/// position) on a header value containing a line break, NUL, or a codepoint
-/// above U+00FF, so a bad label fails closed downstream today regardless of
-/// this check. This exists so our OWN header composition never depends on a
-/// downstream process's validation to protect its own output — `format!` has
-/// no opinion about what goes into a header value, and `compose_group_header`
-/// must not be the thing that first notices.
-///
-/// Returns the failing character class in `Err` (never the raw character —
-/// most of what this rejects is unprintable) so both call sites in
-/// [`validate_group`] can say exactly what was wrong.
-fn validate_group_label_chars(label: &str) -> Result<(), &'static str> {
-    if label.trim().is_empty() {
-        return Err("empty or whitespace-only");
-    }
-    for c in label.chars() {
-        if c == '\n' || c == '\r' {
-            return Err("contains a newline");
-        }
-        if c.is_control() {
-            return Err("contains a control character");
-        }
-        if (c as u32) > 0xFF {
-            return Err("contains a codepoint above U+00FF");
-        }
-    }
-    Ok(())
-}
+// `validate_group_label_chars` moved to `teamclaude_rs::cli` (imported below) so
+// `tcr group add`'s surgical write can reuse the same Phase 1 validator instead
+// of a second one drifting out of sync with this one.
 
 /// `--group`'s validation half (step a): the requested name must be a label
 /// SOME configured account actually carries, and every label involved —

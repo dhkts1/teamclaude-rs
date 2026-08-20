@@ -1126,6 +1126,124 @@ pub fn save_control_account(path: &Path, name: Option<&str>) -> Result<ControlWr
     Ok(outcome)
 }
 
+/// What a targeted [`save_group_membership`] did to the on-disk document. Same
+/// shape as [`DisabledWrite`], for the same reason — the caller must be able to
+/// say, in one line, whether a group edit will actually survive a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupWrite {
+    /// The label was added to (or removed from) the matching entry's `groups`
+    /// array and the file rewritten.
+    Updated,
+    /// The entry already carried (or already lacked) this label, so nothing
+    /// was written and the file is byte-identical.
+    Unchanged,
+    /// Nothing on disk carries that identity — deleted or renamed since the
+    /// caller loaded the config, or no usable `accounts` array. Nothing was
+    /// written.
+    NoEntry,
+    /// More than one entry carries that identity and nothing stored breaks the
+    /// tie. Nothing was written — same refusal [`save_disabled`] makes, for
+    /// the same reason: guessing which entry to edit risks labelling the
+    /// wrong account.
+    Ambiguous,
+}
+
+impl std::fmt::Display for GroupWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Updated => "updated",
+            Self::Unchanged => "unchanged",
+            Self::NoEntry => "no matching entry on disk",
+            Self::Ambiguous => "more than one entry on disk carries this identity",
+        })
+    }
+}
+
+/// Persist ONLY one `groups` label of the one account matching `target`'s
+/// identity into the file at `path` — add it when `member`, remove it
+/// otherwise — leaving every other key, and every other account, exactly as
+/// the user left it.
+///
+/// Same read-modify-write shape as [`save_disabled`] and for the same reason:
+/// `Config` is a boot-time snapshot, and rewriting the whole file ([`save`])
+/// would revert every out-of-band edit and drop unmodelled forward-compat
+/// keys. The edit runs on the file's raw JSON document via [`read_document`] +
+/// [`write_atomic`], never on a `Config` round-trip.
+///
+/// Removing an account's LAST label drops the `groups` key entirely rather
+/// than leaving `[]` on disk. `Account::in_group` treats an absent key and an
+/// empty array identically, so either choice is behaviourally safe — this
+/// picks "absent" so an account that has ever had a label removed does not
+/// carry a permanent empty-array litter, matching the `disabled == false`
+/// drops-the-key contract [`save_disabled`] uses. `groups_round_trip...` and
+/// this module's own tests pin the choice.
+pub fn save_group_membership(
+    path: &Path,
+    target: &Account,
+    group: &str,
+    member: bool,
+) -> Result<GroupWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_group_membership(&mut doc, target, group, member);
+    if outcome == GroupWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+/// Add or remove `group` on the one entry in `doc` matching `target`. Reports
+/// whether the document actually changed, so the caller can skip a pointless
+/// rewrite of a credential file.
+fn merge_group_membership(
+    doc: &mut Map<String, Value>,
+    target: &Account,
+    group: &str,
+    member: bool,
+) -> GroupWrite {
+    let entry = match find_account_entry(doc, target) {
+        Ok(entry) => entry,
+        Err(refusal) => {
+            return match refusal {
+                DisabledWrite::NoEntry => GroupWrite::NoEntry,
+                DisabledWrite::Ambiguous => GroupWrite::Ambiguous,
+                // `find_account_entry` only ever returns these two on `Err` —
+                // `Updated`/`Unchanged` are `DisabledWrite`'s success arms and
+                // never reach a caller through this path.
+                DisabledWrite::Updated | DisabledWrite::Unchanged => {
+                    unreachable!("find_account_entry only returns NoEntry/Ambiguous on Err")
+                }
+            };
+        }
+    };
+    let mut groups: Vec<String> = entry
+        .get("groups")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let already = groups.iter().any(|g| g == group);
+    if member == already {
+        return GroupWrite::Unchanged;
+    }
+    if member {
+        groups.push(group.to_string());
+    } else {
+        groups.retain(|g| g != group);
+    }
+    if groups.is_empty() {
+        entry.remove("groups");
+    } else {
+        entry.insert(
+            "groups".to_string(),
+            Value::Array(groups.into_iter().map(Value::String).collect()),
+        );
+    }
+    GroupWrite::Updated
+}
+
 /// Set or remove the top-level `controlAccount` key in `doc`. Reports whether
 /// the document actually changed, so the caller can skip a pointless rewrite
 /// of a credential file.
