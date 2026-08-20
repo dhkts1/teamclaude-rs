@@ -232,14 +232,20 @@ pub fn set_priority(
     Ok(())
 }
 
-/// Printed after every group mutation that actually changed the file. There is
-/// no live route to push a `groups` edit into a running proxy — it reads
-/// `groups` once, at boot, exactly like `disabled` before the live-control
-/// routes existed for it — so a successful `tcr group add`/`rm` that silently
-/// looked live would be the same class of bug `set_enabled`'s doc-comment
-/// describes: two accounts measured on the live fleet with a config saying one
-/// thing and the serving process doing another.
-const GROUP_RESTART_NOTE: &str = "note: the running proxy will not see this until it restarts";
+/// Printed after every group mutation that actually changed the file.
+///
+/// Used to say "will not see this until it restarts" — true before
+/// `Manager::reload_groups_if_changed` existed (`groups`/`groupSettings` were
+/// read once, at boot, exactly like `disabled` before the live-control routes
+/// existed for it). It is FALSE now: a running proxy hot-reloads group
+/// membership, reservation and color from this same file's mtime on its next
+/// natural cadence tick (a served request or a status/TUI read) — no restart.
+/// Left in place rather than deleted because the CLI and the running proxy
+/// are still two separate processes with no synchronous handshake, so
+/// "already applied" is still not quite true either — this says what IS true
+/// without over-promising instant propagation.
+const GROUP_LIVE_RELOAD_NOTE: &str =
+    "note: the running proxy picks this up automatically (next request or status check) — no restart needed";
 
 /// Resolve `name` to exactly one configured account by EXACT match on
 /// `Account.name` (which IS the email — see [`resolve_account`]'s doc-comment).
@@ -294,7 +300,7 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     match outcome {
         config::GroupWrite::Updated => {
             println!("Added '{account}' to group '{group}'.");
-            println!("{GROUP_RESTART_NOTE}");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupWrite::Unchanged => {
             println!("'{account}' is already in group '{group}'; nothing changed.");
@@ -369,7 +375,7 @@ pub fn remove_from_group(
                 removed_from.len(),
                 removed_from.join(", ")
             );
-            println!("{GROUP_RESTART_NOTE}");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         return Ok(());
     }
@@ -384,7 +390,7 @@ pub fn remove_from_group(
     match outcome {
         config::GroupWrite::Updated => {
             println!("Removed '{account}' from group '{group}'.");
-            println!("{GROUP_RESTART_NOTE}");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupWrite::Unchanged => {
             println!("'{account}' was not in group '{group}'; nothing changed.");
@@ -448,7 +454,7 @@ pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
                     "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."
                 );
             }
-            println!("{GROUP_RESTART_NOTE}");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupReserveWrite::Unchanged => {
             println!("group '{group}' is already reserved; nothing changed. {remaining} unreserved enabled account(s) remain.");
@@ -466,7 +472,7 @@ pub fn unreserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     match outcome {
         config::GroupReserveWrite::Updated => {
             println!("group '{group}' unreserved.");
-            println!("{GROUP_RESTART_NOTE}");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupReserveWrite::Unchanged => {
             println!("group '{group}' was not reserved; nothing changed.");
@@ -483,6 +489,12 @@ pub fn unreserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
 /// (`find_account_by_name`'s error), applied here to the group name instead:
 /// a color for a label nothing carries could never appear on any account
 /// row, so setting one would silently do nothing and look like success.
+///
+/// An explicit hex with no readable foreground in either text polarity
+/// (`APCA |Lc| < 60` for both black and white text —
+/// [`config::best_readable_apca`]) **warns, never refuses**: it is the
+/// operator's chip to pick badly if they want to. `--clear` never warns — a
+/// derived color always clears the floor by construction.
 pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> anyhow::Result<()> {
     // Validate the hex BEFORE touching the config, same ordering `reserve_group`
     // uses for its safety rail: a rejected write must leave the file untouched.
@@ -525,7 +537,7 @@ pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> an
                 "group '{group}' color set to {resolved} ({}).",
                 source.as_str()
             );
-            println!("{GROUP_RESTART_NOTE}");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
         }
         config::GroupColorWrite::Unchanged => {
             println!(
@@ -534,7 +546,36 @@ pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> an
             );
         }
     }
+    // Warn (never refuse — it is the operator's call) when neither text
+    // polarity clears the APCA readability floor. Only for an EXPLICIT
+    // `--clear`d/set color: a `Derived` color always clears the floor by
+    // construction (`derive_group_color`'s own worst-case-≥60 test), so
+    // checking it here would be dead code, never firing.
+    if source == config::ColorSource::Set {
+        if let Some(warning) = low_contrast_color_warning(&resolved, group) {
+            eprintln!("{warning}");
+        }
+    }
     Ok(())
+}
+
+/// The low-contrast warning [`set_group_color`] prints for an explicit hex
+/// with no readable foreground in either text polarity — `None` when
+/// `resolved` clears the APCA floor. Factored out as a pure function (input
+/// -> `Option<String>`, no I/O) so the warning's TRIGGER condition and
+/// CONTENT are both unit-testable without capturing stderr.
+fn low_contrast_color_warning(resolved: &str, group: &str) -> Option<String> {
+    let apca = config::best_readable_apca(resolved);
+    if apca >= 60.0 {
+        return None;
+    }
+    let alternative = config::derive_group_color(group);
+    Some(format!(
+        "warning: '{resolved}' has no readable foreground for group '{group}' \
+         (best achievable APCA |Lc| {apca:.1}, need >= 60 in either polarity). \
+         Set anyway, per your choice. A derived alternative that clears the \
+         floor: {alternative}."
+    ))
 }
 
 /// `tcr group ls [--json]` — list every group and its members, plus the
@@ -2596,6 +2637,68 @@ mod tests {
             .expect("codereview row");
         assert_eq!(row["color"], serde_json::json!("#32d74b"));
         assert_eq!(row["colorSource"], serde_json::json!("set"));
+        fs::remove_file(&path).ok();
+    }
+
+    /// THE test for problem 3's trigger condition: a known low-contrast pick
+    /// (`#d69451`, `config::best_readable_apca` measures ~54.1, below the 60
+    /// floor) produces a warning naming the measured value and a derived
+    /// alternative that itself clears the floor — driving
+    /// `low_contrast_color_warning`'s actual branch, not just checking it
+    /// compiles.
+    #[test]
+    fn low_contrast_color_warning_fires_and_names_a_good_alternative() {
+        let low_contrast = "#d69451";
+        assert!(
+            config::best_readable_apca(low_contrast) < 60.0,
+            "test fixture assumption broken: {low_contrast} must score below the APCA floor"
+        );
+        let warning = low_contrast_color_warning(low_contrast, "codereview").expect("must warn");
+        assert!(warning.contains(low_contrast), "names the color: {warning}");
+        assert!(warning.contains("codereview"), "names the group: {warning}");
+        let alternative = config::derive_group_color("codereview");
+        assert!(
+            warning.contains(&alternative),
+            "names a derived alternative ({alternative}): {warning}"
+        );
+        assert!(
+            config::best_readable_apca(&alternative) >= 60.0,
+            "the alternative named in the warning must itself be readable"
+        );
+    }
+
+    /// Control for the test above: a color that DOES clear the APCA floor
+    /// gets no warning at all — the low-contrast test is exercising the
+    /// warning branch specifically, not a function that always returns `Some`.
+    #[test]
+    fn low_contrast_color_warning_is_silent_for_a_readable_pick() {
+        let readable = "#32d74b";
+        assert!(
+            config::best_readable_apca(readable) >= 60.0,
+            "test fixture assumption broken: {readable} must clear the APCA floor"
+        );
+        assert_eq!(low_contrast_color_warning(readable, "codereview"), None);
+    }
+
+    /// `set_group_color` itself must still SUCCEED (never refuse) and
+    /// actually persist a low-contrast pick to disk — the warning is
+    /// advisory, not a gate. Exercises the real CLI entry point end to end,
+    /// distinct from the two pure-function tests above.
+    #[test]
+    fn set_group_color_accepts_a_low_contrast_pick_instead_of_refusing() {
+        let low_contrast = "#d69451";
+        let path = write_config("color-low-contrast", GROUPED_ACCOUNTS);
+        let result = set_group_color(&path, "codereview", Some(low_contrast));
+        assert!(
+            result.is_ok(),
+            "a low-contrast color must warn, not be refused: {result:?}"
+        );
+        let config = load(&path);
+        assert_eq!(
+            config.group_color("codereview"),
+            (low_contrast.to_string(), config::ColorSource::Set),
+            "the low-contrast color must actually be set, not silently dropped"
+        );
         fs::remove_file(&path).ok();
     }
 

@@ -96,18 +96,26 @@ impl Manager {
         self.config.lock().expect("config lock poisoned").http1_only
     }
 
-    /// Every group on the fleet mapped to its resolved color, as snapshotted
-    /// at construction — see [`Self::reserved_groups`]'s field doc for why
-    /// this is cached rather than re-derived from `self.config` per call: a
-    /// `tcr group color` write needs a restart before this running process's
-    /// wire reflects it, matching every other group-settings knob.
+    /// Every group on the fleet mapped to its resolved color — hot-reloaded
+    /// from `groupSettings` on the same cadence [`Self::snapshot`] and
+    /// selection reload (see [`Self::reload_groups_if_changed`]'s doc); a
+    /// `tcr group color` write is picked up on this process's next natural
+    /// check, no restart required.
     pub fn group_colors(&self) -> BTreeMap<String, String> {
-        self.group_colors.clone()
+        self.group_colors
+            .read()
+            .expect("group_colors lock poisoned")
+            .clone()
     }
 
     /// Compute the live snapshot the TUI renders. Every quota figure is evaluated
     /// at `now` so the display can never show a past-reset window as still full.
     pub fn snapshot(&self, now: OffsetDateTime) -> StatsSnapshot {
+        // Live-reload group membership/settings before this snapshot reads them
+        // — see `Self::reload_groups_if_changed`'s doc. Cheap no-op when the
+        // config file's mtime has not moved.
+        self.reload_groups_if_changed();
+        let reserved = self.reserved_groups();
         let now_ms = odt_to_ms(now);
         // (1) UNDER THE AFFINITY LOCK ONLY: copy every session's PIN out into a
         // local, then DROP the lock before the accounts lock below is taken — the
@@ -147,19 +155,12 @@ impl Manager {
                 // `group: None` — the fleet view answers "what would UNREQUESTED
                 // traffic see right now", the same question `retry_after_hint`
                 // asks (see `Self::account_gate`'s doc-comment).
-                let (gate, free_at) = Self::account_gate(
-                    a,
-                    threshold,
-                    now,
-                    now_ms,
-                    false,
-                    None,
-                    &self.reserved_groups,
-                );
+                let (gate, free_at) =
+                    Self::account_gate(a, threshold, now, now_ms, false, None, &reserved);
                 let mut reserved_groups: Vec<String> = a
                     .groups
                     .iter()
-                    .filter(|g| self.reserved_groups.contains(*g))
+                    .filter(|g| reserved.contains(*g))
                     .cloned()
                     .collect();
                 reserved_groups.sort();

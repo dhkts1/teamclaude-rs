@@ -61,6 +61,109 @@ final class GroupCommandTests: XCTestCase {
         let failure = GroupCommand.Failure(exitCode: 1, message: "")
         XCTAssertEqual(failure.summary, "group command failed (exit 1): no output")
     }
+
+    // MARK: - copy-command text derives from the same argv the action runs
+
+    /// The copied text and the argv the "Remove from <group>" button actually
+    /// runs must agree — asserted by deriving one from the other, not by
+    /// comparing two hand-typed strings, so a change to `removeArguments`
+    /// can never leave the copy button lying about what it does.
+    func testCopyCommandTextAgreesWithTheRemoveArgumentsItIsBuiltFrom() {
+        let arguments = GroupCommand.removeArguments(group: group, account: account)
+        XCTAssertEqual(
+            GroupCommand.commandLine(arguments: arguments),
+            "tcr " + arguments.joined(separator: " ")
+        )
+    }
+
+    func testCopyCommandTextMatchesTheDocumentedExample() {
+        let arguments = GroupCommand.removeArguments(group: "dev", account: "henry2@example.com")
+        XCTAssertEqual(
+            GroupCommand.commandLine(arguments: arguments),
+            "tcr group rm dev henry2@example.com"
+        )
+    }
+
+    func testShellQuoteLeavesAnEmailBare() {
+        XCTAssertEqual(GroupCommand.shellQuote("henry2@example.com"), "henry2@example.com")
+    }
+
+    /// An account or group name is not guaranteed to be shell-safe — this is
+    /// the one place that must not assume it is.
+    func testShellQuoteQuotesANameContainingASpace() {
+        XCTAssertEqual(GroupCommand.shellQuote("dev team"), "'dev team'")
+    }
+
+    func testShellQuoteEscapesAnEmbeddedSingleQuote() {
+        XCTAssertEqual(GroupCommand.shellQuote("o'brien"), "'o'\\''brien'")
+    }
+
+    func testCommandLineQuotesAGroupNameThatNeedsIt() {
+        let arguments = GroupCommand.removeArguments(group: "dev team", account: account)
+        XCTAssertEqual(
+            GroupCommand.commandLine(arguments: arguments),
+            "tcr group rm 'dev team' henry7@example.com"
+        )
+    }
+}
+
+/// Whether a typed name can be used to create a brand new group (bridge
+/// Unit 1: create-a-group).
+final class NewGroupNameTests: XCTestCase {
+
+    func testEmptyNameIsRejected() {
+        XCTAssertEqual(
+            NewGroupName.evaluate("", existingGroups: []),
+            .rejected(.empty)
+        )
+    }
+
+    func testControlCharacterIsRejected() {
+        XCTAssertEqual(
+            NewGroupName.evaluate("dev\u{0007}team", existingGroups: []),
+            .rejected(.controlCharacter)
+        )
+    }
+
+    func testNameAboveLatin1IsRejected() {
+        XCTAssertEqual(
+            NewGroupName.evaluate("dev😀", existingGroups: []),
+            .rejected(.aboveLatin1)
+        )
+    }
+
+    /// The gap this feature exists to close: without this check, typing an
+    /// existing group's name would silently perform a plain add into it
+    /// instead of the "create a new group" the operator asked for.
+    func testDuplicateOfAnExistingGroupIsRejected() {
+        XCTAssertEqual(
+            NewGroupName.evaluate("dev", existingGroups: ["dev", "codereview"]),
+            .duplicate
+        )
+    }
+
+    func testNovelValidNameIsAccepted() {
+        XCTAssertEqual(
+            NewGroupName.evaluate("staging", existingGroups: ["dev"]),
+            .valid("staging")
+        )
+    }
+
+    func testAcceptedNameIsTrimmed() {
+        XCTAssertEqual(
+            NewGroupName.evaluate("  staging  ", existingGroups: []),
+            .valid("staging")
+        )
+    }
+
+    func testRejectionMessageIsNilForAValidName() {
+        XCTAssertNil(NewGroupName.evaluate("staging", existingGroups: []).rejectionMessage)
+    }
+
+    func testRejectionMessageNamesTheDuplicateReason() {
+        let outcome = NewGroupName.evaluate("dev", existingGroups: ["dev"])
+        XCTAssertEqual(outcome.rejectionMessage, "A group named that already exists.")
+    }
 }
 
 /// Client-side group-name validation, mirroring the CLI's own rule (bridge
