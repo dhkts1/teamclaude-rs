@@ -105,6 +105,44 @@ final class GroupCommandTests: XCTestCase {
             "tcr group rm 'dev team' henry7@example.com"
         )
     }
+
+    // MARK: - CopyCommandMenuEntry (bridge Unit 1: unambiguous copy)
+
+    /// The whole point of ``GroupCommand/CopyCommandMenuEntry``: the title a
+    /// user reads and the text that lands on the clipboard both come out of
+    /// the same `commandLine(arguments:)` call, so they can never drift.
+    /// Asserted by deriving the expectation from that function too, not by
+    /// comparing two hand-typed literals.
+    func testCopyEntryTitleAndCopiedTextAreBothDerivedFromCommandLine() {
+        let arguments = GroupCommand.removeArguments(group: group, account: account)
+        let entry = GroupCommand.CopyCommandMenuEntry(arguments: arguments)
+        let expected = GroupCommand.commandLine(arguments: arguments)
+        XCTAssertEqual(entry.copiedText, expected)
+        XCTAssertEqual(entry.title, "Copy \u{201C}\(expected)\u{201D}")
+    }
+
+    /// Same relationship, but for the add form offered on a group the
+    /// account is not yet in — remove-only was half the affordance the
+    /// bridge asked to close.
+    func testCopyEntryForTheAddFormAlsoDerivesFromCommandLine() {
+        let arguments = GroupCommand.addArguments(group: "dev", account: "henry2@example.com")
+        let entry = GroupCommand.CopyCommandMenuEntry(arguments: arguments)
+        XCTAssertEqual(entry.copiedText, "tcr group add dev henry2@example.com")
+        XCTAssertEqual(entry.title, "Copy \u{201C}tcr group add dev henry2@example.com\u{201D}")
+    }
+
+    /// A remove-form entry and an add-form entry for the exact same
+    /// group/account never collide — this is the failure mode that made
+    /// "Copy tcr group Command" ambiguous in the first place (bridge: two
+    /// identically-labelled items with no way to tell which one is which).
+    func testRemoveAndAddCopyEntriesForTheSameGroupAndAccountDiffer() {
+        let removeEntry = GroupCommand.CopyCommandMenuEntry(
+            arguments: GroupCommand.removeArguments(group: group, account: account))
+        let addEntry = GroupCommand.CopyCommandMenuEntry(
+            arguments: GroupCommand.addArguments(group: group, account: account))
+        XCTAssertNotEqual(removeEntry.title, addEntry.title)
+        XCTAssertNotEqual(removeEntry.copiedText, addEntry.copiedText)
+    }
 }
 
 /// Whether a typed name can be used to create a brand new group (bridge

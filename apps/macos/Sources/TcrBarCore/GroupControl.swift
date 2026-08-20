@@ -56,6 +56,26 @@ public enum GroupCommand {
         (["tcr"] + arguments).map(shellQuote).joined(separator: " ")
     }
 
+    /// A menu item's title and the text it copies to the pasteboard, both
+    /// derived from the same argv via ``commandLine(arguments:)`` — so the
+    /// title can never say one thing and the clipboard hold another. Used
+    /// for both the remove form (`Copy "tcr group rm dev alice@example.com"`)
+    /// and the add form offered for a group the account is not yet in.
+    public struct CopyCommandMenuEntry: Equatable, Sendable {
+        /// What the menu item reads. Never truncated here — only the
+        /// rendered menu is free to clip it visually; the underlying string
+        /// stays complete so `copiedText` can be derived from it unambiguously.
+        public let title: String
+        /// What lands on the pasteboard when the item is chosen.
+        public let copiedText: String
+
+        public init(arguments: [String]) {
+            let line = commandLine(arguments: arguments)
+            self.title = "Copy “\(line)”"
+            self.copiedText = line
+        }
+    }
+
     /// Why a group command did not happen. Carries `tcr`'s own words verbatim,
     /// same posture as ``AccountCommand/Failure``.
     public struct Failure: Error, Equatable, Sendable {
