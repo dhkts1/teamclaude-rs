@@ -287,6 +287,19 @@ public enum Tok {
         .timingCurve(0.22, 1, 0.36, 1, duration: duration)
     }
 
+    /// The stacked group-deck card's hover/click motion (bridge:
+    /// `docs/plans/stacked-cards-bridge.md`) — deliberately a SEPARATE
+    /// animation from ``standardAnimation``, not a reuse. `standardAnimation`
+    /// is an ease curve tuned for a bar filling toward a value it is going
+    /// to reach and hold; a deck card's hover states are pointer-driven with
+    /// no momentum behind them; per the bridge, that means critically damped
+    /// and NEVER overshooting (`dampingFraction: 1`), where `standardAnimation`
+    /// itself has no overshoot control at all because a fill bar never needed
+    /// one. `response` sits inside the bridge's stated 0.3-0.4s window.
+    public static var deckAnimation: Animation {
+        .spring(response: 0.34, dampingFraction: 1.0, blendDuration: 0)
+    }
+
     // MARK: - Mapping
 
     public static func color(for state: QuotaState) -> Color {
