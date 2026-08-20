@@ -158,7 +158,6 @@ enum RenderStates {
                 // window on screen, neither of which belongs in a render run.
                 updater: Updater(startingUpdater: false),
                 groupController: GroupController(),
-                viewMode: FleetViewModePreference(),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true
             )

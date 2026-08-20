@@ -23,11 +23,9 @@ struct FleetView: View {
     /// would.
     @ObservedObject var awake: AwakeController
     @ObservedObject var updater: Updater
-    /// Mutating group membership from the Groups view. See ``GroupController``.
+    /// Mutating group membership from the section headers below. See
+    /// ``GroupController``.
     @ObservedObject var groupController: GroupController
-    /// Which of Accounts/Groups is showing, persisted. See
-    /// ``FleetViewModePreference``.
-    @ObservedObject var viewMode: FleetViewModePreference
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -48,6 +46,13 @@ struct FleetView: View {
     /// Surfaced in place rather than swallowed: a button that silently does
     /// nothing is worse than one that says why.
     @State private var loginError: String?
+
+    /// Which group a "Remove Group…" confirmation is pending for, set by a
+    /// ``GroupActionsMenu`` in a section header. Owned here, not by the
+    /// header itself, so the confirmation dialog is a single instance on the
+    /// panel rather than one per section — the same reason `rowHeights` is
+    /// tracked once here instead of per row.
+    @State private var confirmRemoveGroup: String?
 
     /// Measured height of each account row, keyed by account id (`Account.id`
     /// is the account name).
@@ -79,6 +84,31 @@ struct FleetView: View {
         .padding(Tok.gutter)
         .frame(width: Tok.panelWidth)
         .background(Tok.panel)
+        // A group is implicit — it exists only once an account carries the
+        // label — so removing every member IS removing the group; there is
+        // no separate "delete an empty group" concept to confirm. This
+        // dialog exists for the destructive, hard-to-undo shape: clearing
+        // every member's label in one call. One instance for the whole
+        // panel, triggered by any section's ``GroupActionsMenu``.
+        .confirmationDialog(
+            "Remove the “\(confirmRemoveGroup ?? "")” group?",
+            isPresented: Binding(
+                get: { confirmRemoveGroup != nil },
+                set: { if !$0 { confirmRemoveGroup = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove Group", role: .destructive) {
+                guard let name = confirmRemoveGroup else { return }
+                confirmRemoveGroup = nil
+                Task { await groupController.removeAll(group: name) }
+            }
+            Button("Cancel", role: .cancel) { confirmRemoveGroup = nil }
+        } message: {
+            Text(
+                "This removes the label from every member account. The proxy keeps "
+                    + "routing the old way until it restarts.")
+        }
     }
 
     // MARK: Header
@@ -202,27 +232,20 @@ struct FleetView: View {
             if fleet.source.countersAreStructural {
                 offlineNotice(fleet.source)
             }
-            // Hidden entirely, not merely disabled, when no account anywhere
-            // carries a label — nothing changes for an operator not using
-            // groups. `effectiveMode(for:)` enforces the same rule on the
-            // content below even if a stale preference says otherwise.
-            if !fleet.groupDetails.isEmpty {
-                FleetViewModeToggle(mode: $viewMode.mode)
+            // One list, always. `fleet.groupSections` decides only how it is
+            // labelled: sectioned when there is something to section without
+            // fragmenting, otherwise the same flat list this panel has
+            // always drawn — never a second view or mode to get stuck in.
+            if let notice = fleet.groupSectionsFragmentedNotice {
+                Text(notice)
+                    .font(Tok.detailFont)
+                    .foregroundStyle(.tertiary)
             }
-            if effectiveMode(for: fleet) == .groups {
-                if snapshotMode {
-                    GroupsListView(fleet: fleet, groupController: groupController)
-                } else {
-                    ScrollView {
-                        GroupsListView(fleet: fleet, groupController: groupController)
-                    }
-                    .frame(height: Tok.panelMaxHeight)
-                }
-            } else if snapshotMode {
-                rowStack(fleet)
+            if snapshotMode {
+                accountList(fleet)
             } else {
                 ScrollView {
-                    rowStack(fleet)
+                    accountList(fleet)
                 }
                 .frame(height: visibleRowsHeight(for: fleet))
                 .onPreferenceChange(RowHeightsKey.self) { rowHeights = $0 }
@@ -230,32 +253,20 @@ struct FleetView: View {
         }
     }
 
-    /// `viewMode.mode`, forced to `.accounts` when the fleet has no group to
-    /// show — the toggle itself is hidden in that case (see
-    /// ``fleetRows(_:)``), but a stale `Groups` preference from a fleet that
-    /// used to have labels must not draw an empty grouped list.
-    private func effectiveMode(for fleet: Fleet) -> FleetViewModePreference.Mode {
-        fleet.groupDetails.isEmpty ? .accounts : viewMode.mode
+    @ViewBuilder
+    private func accountList(_ fleet: Fleet) -> some View {
+        if fleet.groupSections.isEmpty {
+            rowStack(fleet, showGroupChips: fleet.groupSectionsFragmented)
+        } else {
+            sectionedRowStack(fleet)
+        }
     }
 
-    private func rowStack(_ fleet: Fleet) -> some View {
+    private func rowStack(_ fleet: Fleet, showGroupChips: Bool) -> some View {
         let rows = fleet.rowsInDisplayOrder(pinning: control.current)
         return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, account in
-                AccountRow(
-                    account: account,
-                    countersAreStructural: fleet.source.countersAreStructural,
-                    accounts: accounts,
-                    control: control,
-                    onChanged: { await poller.pollOnce() },
-                    onRelogin: { reloginAccount(account.name) }
-                )
-                .background(
-                    GeometryReader { proxy in
-                        Color.clear.preference(
-                            key: RowHeightsKey.self, value: [account.id: proxy.size.height])
-                    }
-                )
+                accountRow(account, fleet: fleet, showGroupChips: showGroupChips)
                 // A thin separator between the pinned control row and the
                 // rotation pool below it — the same `Hairline` this panel
                 // already uses to mark a scope boundary (see `appActions`).
@@ -266,6 +277,85 @@ struct FleetView: View {
                 }
             }
         }
+    }
+
+    /// The sectioned accounts list: one ``AccountGroupSectionHeader`` per
+    /// distinct group SET (``Fleet/groupSections``), each followed by its
+    /// members in the panel's normal display order — an account in two
+    /// groups appears once, under the combined header, never twice.
+    ///
+    /// Rows are today's ``AccountRow``, unchanged, with group chips
+    /// suppressed: the section header already says what the chips said, so
+    /// keeping both would be the same fact rendered twice.
+    /// One row of the sectioned list, plus the header (if any) that sits
+    /// directly above it — precomputed as plain data, not decided inside the
+    /// `ForEach` closure, so the "have we drawn this section's header yet"
+    /// bookkeeping is a pure function of `fleet` rather than a mutation a
+    /// SwiftUI body re-evaluates on every render.
+    private struct SectionedRow: Identifiable {
+        let account: Account
+        let header: GroupSection?
+        var id: String { account.id }
+    }
+
+    /// Walks the panel's normal display order once, attaching each section's
+    /// header to the first row (in that order) that belongs to it — so
+    /// sections read top-to-bottom in ``Fleet/groupSections``' own order
+    /// without a second, independent sort of the rows themselves.
+    private func sectionedRows(_ fleet: Fleet) -> [SectionedRow] {
+        let sectionByAccountName: [String: GroupSection] = fleet.groupSections.reduce(into: [:]) {
+            result, section in
+            for member in section.members { result[member.name] = section }
+        }
+        var seenSections: Set<String> = []
+        return fleet.rowsInDisplayOrder(pinning: control.current).map { account in
+            guard let section = sectionByAccountName[account.name], !seenSections.contains(section.id)
+            else {
+                return SectionedRow(account: account, header: nil)
+            }
+            seenSections.insert(section.id)
+            return SectionedRow(account: account, header: section)
+        }
+    }
+
+    private func sectionedRowStack(_ fleet: Fleet) -> some View {
+        let rows = sectionedRows(fleet)
+        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            ForEach(rows) { row in
+                if let header = row.header {
+                    AccountGroupSectionHeader(
+                        section: header,
+                        allAccounts: fleet.accounts,
+                        groupController: groupController,
+                        confirmRemoveGroup: $confirmRemoveGroup
+                    )
+                }
+                accountRow(row.account, fleet: fleet, showGroupChips: false)
+                if row.account.name == control.current, rows.first?.id == row.id {
+                    Hairline()
+                }
+            }
+            NewGroupControl(allAccounts: fleet.accounts, groupController: groupController)
+                .padding(.top, Tok.tightSpacing)
+        }
+    }
+
+    private func accountRow(_ account: Account, fleet: Fleet, showGroupChips: Bool) -> some View {
+        AccountRow(
+            account: account,
+            countersAreStructural: fleet.source.countersAreStructural,
+            accounts: accounts,
+            control: control,
+            onChanged: { await poller.pollOnce() },
+            onRelogin: { reloginAccount(account.name) },
+            showGroupChips: showGroupChips
+        )
+        .background(
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: RowHeightsKey.self, value: [account.id: proxy.size.height])
+            }
+        )
     }
 
     /// Height of the scroll viewport: room for the first `Tok.visibleAccountRows`
@@ -713,6 +803,14 @@ struct AccountRow: View {
     /// Hands `tcr login` to a Terminal window for THIS account. Only drawn on a
     /// `.needsRelogin` row.
     let onRelogin: () -> Void
+    /// Draw this row's group chips. `false` when the row sits under a
+    /// ``AccountGroupSectionHeader`` — the header already says what the
+    /// chips said, so keeping both would be the same fact twice. `true` in
+    /// the flat list, whether that is because no account carries a label or
+    /// because sectioning fell back on fragmentation
+    /// (``Fleet/groupSectionsFragmented``), where the chips are the only
+    /// place group membership is still shown.
+    var showGroupChips: Bool = true
 
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
@@ -1220,13 +1318,16 @@ struct AccountRow: View {
                 // account can be in many groups. The existing `StatusPill`
                 // component, not a new one: these are the same shape of fact
                 // (a small labelled tag on the row) as the status pill beside
-                // them.
-                ForEach(Array((account.groups ?? []).prefix(2)), id: \.self) { group in
-                    StatusPill(group, tint: Tok.inkFaint)
-                }
-                if (account.groups ?? []).count > 2 {
-                    StatusPill("+\((account.groups ?? []).count - 2)", tint: Tok.inkFaint)
-                        .help((account.groups ?? []).joined(separator: ", "))
+                // them. Suppressed under a section header — see
+                // `showGroupChips`'s own doc-comment for why.
+                if showGroupChips {
+                    ForEach(Array((account.groups ?? []).prefix(2)), id: \.self) { group in
+                        StatusPill(group, tint: Tok.inkFaint)
+                    }
+                    if (account.groups ?? []).count > 2 {
+                        StatusPill("+\((account.groups ?? []).count - 2)", tint: Tok.inkFaint)
+                            .help((account.groups ?? []).joined(separator: ", "))
+                    }
                 }
             }
             // Two stacked bars, 5-hour on top and 7-day directly under it —
