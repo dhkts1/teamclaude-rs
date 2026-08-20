@@ -803,11 +803,26 @@ impl Manager {
                     self.pick_least_loaded(&accounts, pool_tried, now, now_ms, is_fable, None)
                 {
                     if let Some(account) = accounts.get(idx) {
-                        tracing::info!(
-                            account = %account.name,
-                            in_flight = account.in_flight,
-                            "pacing: all accounts paced, serving least-loaded"
-                        );
+                        // This fallback fires whenever the first (group- and
+                        // pacing-respecting) pass came up empty — which can be pacing
+                        // alone, the group alone, or both together. Name whichever
+                        // constraints were actually IN PLAY on the first pass rather
+                        // than always blaming pacing: an operator debugging why
+                        // `--group` did not land where expected must not read a log
+                        // line about pacing when pacing was never the reason.
+                        match group {
+                            Some(g) => tracing::info!(
+                                account = %account.name,
+                                in_flight = account.in_flight,
+                                group = g,
+                                "group: requested group had no eligible account under pacing — falling back to the whole pool (group and pacing both ignored), serving least-loaded"
+                            ),
+                            None => tracing::info!(
+                                account = %account.name,
+                                in_flight = account.in_flight,
+                                "pacing: all accounts paced, serving least-loaded"
+                            ),
+                        }
                     }
                     best = Some(idx);
                 }

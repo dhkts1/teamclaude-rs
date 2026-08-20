@@ -207,10 +207,12 @@ struct RunArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Route this session to accounts labelled with this group. PREFER
-    /// semantics only (Phase 1): serves from the group when it has capacity,
-    /// falls back to the whole pool otherwise. The restricting form
-    /// (routing ONLY within the group, never falling back) is Phase 2.
+    /// Prefer accounts labelled with this group when picking an account for a
+    /// NEW request — falls back to the whole pool when the group has no
+    /// capacity, and once a session settles onto an account (a "pin"), that
+    /// pin is honoured group-blind for the rest of the session (correct for
+    /// this PREFER semantics; the restricting form that also constrains an
+    /// existing pin is Phase 2).
     #[arg(long)]
     group: Option<String>,
     /// Args passed verbatim to `claude` (e.g. `tcr run -- -p "hi"`).
@@ -461,12 +463,53 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
 const MIN_CLAUDE_VERSION_FOR_GROUP: (u64, u64, u64) = (2, 1, 227);
 const MIN_CLAUDE_VERSION_FOR_GROUP_STR: &str = "2.1.227";
 
+/// Reject a group label whose CONTENT could corrupt `compose_group_header`'s
+/// output — a literal newline (legal in JSON via `\n`), any other control
+/// character, or a codepoint above U+00FF — and reject empty/whitespace-only.
+///
+/// Defense in depth, NOT a fix for a live vulnerability: Claude Code's own
+/// header-value parser already hard-errors (naming the offending pair by
+/// position) on a header value containing a line break, NUL, or a codepoint
+/// above U+00FF, so a bad label fails closed downstream today regardless of
+/// this check. This exists so our OWN header composition never depends on a
+/// downstream process's validation to protect its own output — `format!` has
+/// no opinion about what goes into a header value, and `compose_group_header`
+/// must not be the thing that first notices.
+///
+/// Returns the failing character class in `Err` (never the raw character —
+/// most of what this rejects is unprintable) so both call sites in
+/// [`validate_group`] can say exactly what was wrong.
+fn validate_group_label_chars(label: &str) -> Result<(), &'static str> {
+    if label.trim().is_empty() {
+        return Err("empty or whitespace-only");
+    }
+    for c in label.chars() {
+        if c == '\n' || c == '\r' {
+            return Err("contains a newline");
+        }
+        if c.is_control() {
+            return Err("contains a control character");
+        }
+        if (c as u32) > 0xFF {
+            return Err("contains a codepoint above U+00FF");
+        }
+    }
+    Ok(())
+}
+
 /// `--group`'s validation half (step a): the requested name must be a label
-/// SOME configured account actually carries. A typo must never resolve to an
-/// empty set — with Phase 1's prefer-only semantics that would silently route
-/// every session across the whole pool with no error at all, which is the
-/// quiet-wrong-answer this refusal exists to prevent.
+/// SOME configured account actually carries, and every label involved —
+/// the requested one AND every configured one, since either could end up in
+/// `compose_group_header`'s output — must pass [`validate_group_label_chars`].
+/// A typo must never resolve to an empty set — with Phase 1's prefer-only
+/// semantics that would silently route every session across the whole pool
+/// with no error at all, which is the quiet-wrong-answer this refusal exists
+/// to prevent.
 fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
+    if let Err(reason) = validate_group_label_chars(group) {
+        anyhow::bail!("--group {group:?}: invalid group label — {reason}");
+    }
+
     let mut configured: Vec<&str> = config
         .accounts
         .iter()
@@ -474,6 +517,11 @@ fn validate_group(config: &Config, group: &str) -> anyhow::Result<()> {
         .flatten()
         .map(String::as_str)
         .collect();
+    for label in &configured {
+        if let Err(reason) = validate_group_label_chars(label) {
+            anyhow::bail!("config carries an invalid group label {label:?}: {reason}");
+        }
+    }
     configured.sort_unstable();
     configured.dedup();
 
@@ -1930,6 +1978,23 @@ mod tests {
         );
     }
 
+    /// The comparison must be NUMERIC per-component, not lexicographic on the
+    /// version string. `"2.1.9"` sorts AFTER `"2.1.227"` as a plain string
+    /// (`'9' > '2'`), which would wrongly classify it `Ok` against the
+    /// 2.1.227 minimum; numerically `9 < 227`, so it must be `TooOld`. Every
+    /// other version-gate test here (`2.1.226`/`1.9.999` vs `2.1.227`) would
+    /// pass under EITHER comparison and so does not guard this property —
+    /// this is the one case where the two implementations disagree.
+    #[test]
+    fn claude_version_compares_patch_numerically_not_lexicographically() {
+        assert_eq!(
+            classify_claude_version_output("2.1.9 (Claude Code)"),
+            ClaudeVersionCheck::TooOld("2.1.9".to_string()),
+            "2.1.9 must be TooOld against a 2.1.227 minimum — a lexicographic \
+             compare would wrongly say Ok because '9' > '2' as characters"
+        );
+    }
+
     #[test]
     fn claude_version_at_or_above_minimum_is_ok() {
         assert_eq!(
@@ -2011,6 +2076,82 @@ mod tests {
         assert!(
             validate_group(&config, "codereview").is_err(),
             "a typo must never silently resolve to the empty set — that routes everywhere"
+        );
+    }
+
+    // ---- `--group` label character validation (`validate_group_label_chars`) --
+
+    #[test]
+    fn group_label_chars_accepts_an_ordinary_ascii_label() {
+        assert_eq!(validate_group_label_chars("codereview"), Ok(()));
+        assert_eq!(validate_group_label_chars("code-review_2"), Ok(()));
+    }
+
+    #[test]
+    fn group_label_chars_rejects_empty_and_whitespace_only() {
+        assert_eq!(
+            validate_group_label_chars(""),
+            Err("empty or whitespace-only")
+        );
+        assert_eq!(
+            validate_group_label_chars("   "),
+            Err("empty or whitespace-only")
+        );
+    }
+
+    #[test]
+    fn group_label_chars_rejects_a_newline() {
+        assert_eq!(
+            validate_group_label_chars("code\nreview"),
+            Err("contains a newline")
+        );
+        assert_eq!(
+            validate_group_label_chars("code\rreview"),
+            Err("contains a newline")
+        );
+    }
+
+    #[test]
+    fn group_label_chars_rejects_other_control_characters() {
+        assert_eq!(
+            validate_group_label_chars("code\0review"),
+            Err("contains a control character")
+        );
+        assert_eq!(
+            validate_group_label_chars("code\treview"),
+            Err("contains a control character")
+        );
+    }
+
+    #[test]
+    fn group_label_chars_rejects_codepoints_above_u00ff() {
+        assert_eq!(
+            validate_group_label_chars("codereview\u{1F600}"), // an emoji
+            Err("contains a codepoint above U+00FF")
+        );
+    }
+
+    #[test]
+    fn validate_group_rejects_a_group_argument_with_an_embedded_newline() {
+        let mut config = default_config();
+        config.accounts = vec![account_with_groups("alice", Some(&["codereview"]))];
+        let err = validate_group(&config, "code\nreview")
+            .expect_err("a newline in the --group argument must be refused");
+        assert!(
+            err.to_string().contains("newline"),
+            "the error must name the character class at fault: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_group_rejects_a_config_declared_label_with_a_control_character() {
+        let mut config = default_config();
+        config.accounts = vec![account_with_groups("alice", Some(&["code\0review"]))];
+        let err = validate_group(&config, "codereview")
+            .expect_err("a control character in a CONFIG-declared label must also be refused");
+        assert!(
+            err.to_string().contains("control character"),
+            "the error must name the character class at fault: {err}"
         );
     }
 }
