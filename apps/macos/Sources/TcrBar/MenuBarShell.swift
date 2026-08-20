@@ -41,8 +41,6 @@ final class MenuBarShell {
     /// that reset every time the panel opened would lose the "restart the
     /// proxy to apply" note the moment the operator closed it.
     let groupController: GroupController
-    /// Which of Accounts/Groups the panel shows, persisted across opens.
-    let viewMode: FleetViewModePreference
     /// Owned here for the same reason as the rest, plus one of its own: the
     /// delegate's `tcrbar://check-for-updates` handler reaches through the shell
     /// to find it, so an updater that only existed while the panel was open would
@@ -68,8 +66,7 @@ final class MenuBarShell {
         awake: AwakeController? = nil,
         preference: LaunchPreference? = nil,
         updater: Updater? = nil,
-        groupController: GroupController? = nil,
-        viewMode: FleetViewModePreference? = nil
+        groupController: GroupController? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -80,7 +77,6 @@ final class MenuBarShell {
         self.preference = preference ?? LaunchPreference()
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
-        self.viewMode = viewMode ?? FleetViewModePreference()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -117,7 +113,7 @@ final class MenuBarShell {
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
                 accounts: self.accounts, control: self.control, awake: self.awake,
                 preference: self.preference, updater: self.updater,
-                groupController: self.groupController, viewMode: self.viewMode))
+                groupController: self.groupController))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -330,7 +326,6 @@ struct FleetPanel: View {
     @ObservedObject var preference: LaunchPreference
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
-    @ObservedObject var viewMode: FleetViewModePreference
 
     var body: some View {
         FleetView(
@@ -342,7 +337,6 @@ struct FleetPanel: View {
             awake: awake,
             updater: updater,
             groupController: groupController,
-            viewMode: viewMode,
             startServerAtLaunch: $preference.startServerAtLaunch
         )
     }

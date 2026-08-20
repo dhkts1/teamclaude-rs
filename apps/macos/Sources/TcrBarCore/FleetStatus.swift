@@ -539,6 +539,17 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// but the type keeps the distinction rather than collapsing it.
     public let groups: [String]?
 
+    /// Which of this account's own `groups` are held out of the general
+    /// pool (`src/stats.rs`'s reserved-group flag, carried onto the wire as
+    /// `"reservedGroups"`, repeated per row exactly the way `"groups"`
+    /// itself already is — not a group-scoped lookup). Optional for the same
+    /// forward-compat reason `groups` is: synthesized `Decodable` would
+    /// throw against a server built before this field existed, and that
+    /// server's rows must keep decoding. `nil` and `[]` both mean "nothing
+    /// reserved" — this build has no server old enough to send `groups` but
+    /// not this, but the two fields are decoded identically on principle.
+    public let reservedGroups: [String]?
+
     /// Explicit memberwise init, needed only because adding `fiveHourState`/
     /// `sevenDayState` after the struct already had test fixtures constructing
     /// it directly would otherwise force every one of them to grow two new
@@ -573,7 +584,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         source: StatusSource,
         serverSha: String?,
         serverDirty: Bool?,
-        groups: [String]? = nil
+        groups: [String]? = nil,
+        reservedGroups: [String]? = nil
     ) {
         self.name = name
         self.priority = priority
@@ -602,6 +614,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.serverSha = serverSha
         self.serverDirty = serverDirty
         self.groups = groups
+        self.reservedGroups = reservedGroups
     }
 
     public var id: String { name }
@@ -1164,14 +1177,7 @@ public struct Fleet: Equatable, Sendable {
         // groups renders nothing at all, not an all-`ungrouped` line.
         guard accounts.contains(where: { !($0.groups ?? []).isEmpty }) else { return [] }
 
-        // `free` classifies with the same `FleetTally.Kind(account:)` this
-        // struct already uses for the top-line breakdown — a `.near`
-        // account still serves, so it counts as free exactly as it does
-        // there; only `.disabled` accounts are excluded from `free`
-        // (`total` counts them).
-        func isFree(_ account: Account) -> Bool {
-            !account.disabled && [.ok, .near].contains(FleetTally.Kind(account: account))
-        }
+        let isFree = Fleet.isFreeMember
 
         var members: [String: [Account]] = [:]
         var ungroupedMembers: [Account] = []
@@ -1207,6 +1213,148 @@ public struct Fleet: Equatable, Sendable {
         }
         return result
     }
+
+    /// `free` classification shared by ``groupDetails`` and ``groupSections``:
+    /// the same `FleetTally.Kind(account:)` this struct already uses for the
+    /// top-line breakdown — a `.near` account still serves, so it counts as
+    /// free exactly as it does there; only `.disabled` accounts are excluded
+    /// from `free` (`total` counts them). One function so the two tallies
+    /// cannot drift onto two different notions of "free".
+    fileprivate static func isFreeMember(_ account: Account) -> Bool {
+        !account.disabled && [.ok, .near].contains(FleetTally.Kind(account: account))
+    }
+
+    /// Every account keyed by its own GROUP SET — the sorted list of labels
+    /// it carries, `[]` for an account with none. An account in two groups
+    /// lands in exactly one bucket (`["codereview", "dev"]`), never two, which
+    /// is the whole point of sectioning by set instead of by individual group
+    /// (see this file's header comment on the redesign this replaced).
+    ///
+    /// `[String]` is `Hashable` because `String` is, so it works as a
+    /// dictionary key directly — no second encoding of the same set needed.
+    private var accountsByGroupSet: [[String]: [Account]] {
+        var buckets: [[String]: [Account]] = [:]
+        for account in accounts {
+            buckets[(account.groups ?? []).sorted(), default: []].append(account)
+        }
+        return buckets
+    }
+
+    /// Above this many distinct group-sets, ``groupSections`` gives up and
+    /// returns `[]` so the view falls back to a flat, chip-labelled list
+    /// (``groupSectionsFragmented``). Group-sets are combinatorial — a
+    /// handful of overlapping groups can put every account in its own
+    /// distinct set — and past this point per-set headers stop summarizing
+    /// the fleet and start fragmenting it into one row-header per account,
+    /// which is worse than no sectioning at all.
+    public static let groupSetFragmentationThreshold = 8
+
+    /// The accounts list, sectioned by group SET: one section per distinct
+    /// combination of labels an account carries, `"ungrouped"` last. This is
+    /// the model behind the single accounts list — there is no second,
+    /// per-group list (that was the rejected `GroupsView` toggle; see this
+    /// file's header comment).
+    ///
+    /// `[]` in two distinct cases the view must tell apart:
+    ///  - no account anywhere carries a label — nothing to section, render
+    ///    today's flat list with no headers, same as ``groupDetails``.
+    ///  - more than ``groupSetFragmentationThreshold`` distinct sets — see
+    ///    ``groupSectionsFragmented``, which is what the view checks to
+    ///    decide whether to say why the list did not section.
+    public var groupSections: [GroupSection] {
+        // No account anywhere carries a label: nothing to section, same
+        // guard ``groupDetails`` uses for the same case.
+        guard accounts.contains(where: { !($0.groups ?? []).isEmpty }) else { return [] }
+        guard !groupSectionsFragmented else { return [] }
+        let isFree = Fleet.isFreeMember
+        let sections = accountsByGroupSet.map { groups, members in
+            GroupSection(
+                groups: groups,
+                free: members.filter(isFree).count,
+                total: members.count,
+                members: members
+            )
+        }
+        // `ungrouped` (empty `groups`) always sorts last, everything else by
+        // its rendered header — the same rule ``groupDetails`` applies to its
+        // own synthetic `"ungrouped"` entry.
+        return sections.sorted { lhs, rhs in
+            if lhs.groups.isEmpty { return false }
+            if rhs.groups.isEmpty { return true }
+            return lhs.header < rhs.header
+        }
+    }
+
+    /// True once there are more distinct group-sets than
+    /// ``groupSetFragmentationThreshold`` — the trigger for the flat,
+    /// chip-labelled fallback and its "too many group combinations to
+    /// section" notice. `false` for a fleet with no groups at all: that case
+    /// is "nothing to section", not "too much to section".
+    public var groupSectionsFragmented: Bool {
+        guard accounts.contains(where: { !($0.groups ?? []).isEmpty }) else { return false }
+        return accountsByGroupSet.count > Fleet.groupSetFragmentationThreshold
+    }
+
+    /// One short line explaining a fragmentation fallback, or `nil` when
+    /// sectioning is showing normally (or there is nothing to section at
+    /// all). The view shows this instead of silently rendering 30 headers.
+    public var groupSectionsFragmentedNotice: String? {
+        groupSectionsFragmented ? "too many group combinations to section" : nil
+    }
+}
+
+/// One group-SET section of the accounts list: every account sharing the
+/// exact same combination of group labels, keyed by that combination rather
+/// than by a single group — see ``Fleet/groupSections``, which builds these
+/// and is the reason this exists instead of reusing ``GroupDetail``.
+/// ``GroupDetail`` still exists for the per-group tally line
+/// (``Fleet/groupBreakdown``), a genuinely different question: a group's
+/// total is a SUM across these sections, which is exactly what a
+/// set-keyed section cannot answer on its own.
+public struct GroupSection: Equatable, Sendable, Identifiable {
+    /// Sorted alphabetically. `[]` for the synthetic "ungrouped" section —
+    /// every account carrying no label at all.
+    public let groups: [String]
+    /// Enabled and not spent, same rule ``GroupDetail/free`` uses.
+    public let free: Int
+    /// Every member, including disabled ones.
+    public let total: Int
+    /// Every account whose own group set is exactly ``groups``.
+    public let members: [Account]
+
+    public init(groups: [String], free: Int, total: Int, members: [Account]) {
+        self.groups = groups
+        self.free = free
+        self.total = total
+        self.members = members
+    }
+
+    public var id: String { header }
+
+    /// `"codereview + dev"`, or `"ungrouped"` when ``groups`` is empty.
+    public var header: String {
+        groups.isEmpty ? "ungrouped" : groups.joined(separator: " + ")
+    }
+
+    /// `"codereview + dev 1/1"`.
+    public var label: String { "\(header) \(free)/\(total)" }
+
+    /// Which of this section's own ``groups`` the wire has marked reserved.
+    /// Read off the members' own `reservedGroups` — the same
+    /// per-row-repeated idiom `groups` itself already uses — rather than a
+    /// group-scoped lookup this model has no other source for. Degrades to
+    /// `[]` on a server that never sends the field, since every member's
+    /// `reservedGroups` is then `nil` too.
+    public var reservedGroups: [String] {
+        let reserved = Set(members.flatMap { $0.reservedGroups ?? [] })
+        return groups.filter { reserved.contains($0) }
+    }
+
+    /// True once at least one of this section's own groups is reserved — the
+    /// header's lock glyph reads this, not ``reservedGroups`` directly, so
+    /// the "is this section special" check and the "which groups exactly"
+    /// detail stay two separate questions.
+    public var isReserved: Bool { !reservedGroups.isEmpty }
 }
 
 /// ``GroupTally`` elaborated with the accounts that make it up, for the Groups
