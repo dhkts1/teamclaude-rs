@@ -2494,6 +2494,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcr-status-wire"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "teamclaude-rs"
 version = "0.2.23"
 dependencies = [
@@ -2517,6 +2525,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tcr-status-wire",
  "tempfile",
  "thiserror 2.0.20",
  "time",
