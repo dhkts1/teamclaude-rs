@@ -48,6 +48,13 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 - **The build probably does not land in `target/`.** `CARGO_TARGET_DIR` redirects it and every agent
   session here sets it. Resolve the real path from `cargo metadata` rather than writing it down —
   command and rationale in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Finding the binary you just built".
+- **`tcr status` reports the RUNNING process's view, not what is on disk.** Group membership and
+  `groupSettings` (reserved, color) hot-reload when the config file's mtime changes
+  (`Manager::reload_groups_if_changed`); **every other config field is a boot-time snapshot** and needs a
+  restart. So an edit that "did nothing" may have applied perfectly and simply not be visible yet — check
+  the config with `tcr group ls` before concluding the write failed. A whole evening was lost to right-clicks
+  in TcrBar that wrote correctly and showed nothing, because the panel renders `tcr status --json` and the
+  server had never re-read the file.
 - The running process can be several commits behind the source. `tcr status --json` reports the running
   build's SHA — check it before concluding a fix is live. "The fix is in `main`" and "the fix is in the
   process serving traffic" are routinely different facts. (Kept in full here rather than as a link,
@@ -90,8 +97,18 @@ commit gates; put the scope in the body. Allowed types and examples:
 - When you restore a file after such an experiment, verify the *file* (`git status`, re-read the line) —
   not just a re-run. `mv` preserves mtime, so a restored file can leave a stale build in place and the
   suite will re-run the broken binary.
+- **A green CI run is not a control for a red local run.** `cargo` compiles every file in `tests/`,
+  including untracked ones, so a stale scratch file in your checkout fails the whole suite while CI —
+  which checks out a clean tree — stays green. Before blaming a merge, run `git status` on the failing
+  path: if it is `??`, it is not the branch's fault and it is not yours to delete without asking.
 - An empty search result is a claim about your probe, not about the world. Run a positive control — grep
   for something you know is there — before concluding something is absent.
+- **Check the surface a user actually reads, not the layer you changed.** Three separate changes have
+  shipped here with passing tests and been broken anyway: config writes the panel never displayed, app
+  bundles that silently lost `SUPublicEDKey` and so could never check for updates, and an update check that
+  rendered "no update found" as a failure. Every one passed its suite; every one was caught by a human
+  looking at the running app. The tests were real — they guarded the hop the author thought to doubt, and
+  the break was in the next hop along. Open the thing and look.
 - Cite `file:line` for claims about how the code behaves. This codebase documents *why* things are the
   way they are in module doc-comments; several of them name the specific bug they exist to prevent.
   Read the doc-comment before "fixing" what it describes.

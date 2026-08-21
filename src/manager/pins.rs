@@ -37,6 +37,25 @@ impl Manager {
         self.affinity_dirty.swap(false, Ordering::Relaxed)
     }
 
+    /// Record whether `key`'s most recent request asked Anthropic's cache for
+    /// the extended `"ttl":"1h"` window (see [`crate::cache_ttl`]). Called from
+    /// the request path once per request, independent of `select()` — nothing
+    /// on the selection/routing path needs this bit, only the persistence
+    /// bridge below. A request that does NOT ask for the extended window clears
+    /// any prior record for that key: this always reflects the LATEST request,
+    /// same as `touched_at_ms` does for the pin itself.
+    pub fn note_affinity_ttl(&self, key: u64, extended: bool) {
+        let mut ext = self
+            .affinity_extended
+            .lock()
+            .expect("affinity_extended lock poisoned");
+        if extended {
+            ext.insert(key);
+        } else {
+            ext.remove(&key);
+        }
+    }
+
     /// The pin map as persistable records — each live pin's index replaced by the
     /// identity of the account at that index.
     ///
@@ -52,8 +71,28 @@ impl Manager {
                 .collect()
         };
         if pins.is_empty() {
+            // Nothing live — prune the extended-TTL side map too rather than
+            // let it accumulate keys no snapshot will ever consult again.
+            self.affinity_extended
+                .lock()
+                .expect("affinity_extended lock poisoned")
+                .clear();
             return Vec::new();
         }
+        let live_keys: std::collections::HashSet<u64> =
+            pins.iter().map(|&(key, _, _)| key).collect();
+        let extended: std::collections::HashSet<u64> = {
+            let mut ext = self
+                .affinity_extended
+                .lock()
+                .expect("affinity_extended lock poisoned");
+            // A key can only fall out of `affinity` via the same LRU eviction
+            // `select()` already applies; once gone there, its extended-TTL
+            // record is dead weight — drop it here so this side map is bounded
+            // by exactly the same set `affinity` is.
+            ext.retain(|key| live_keys.contains(key));
+            ext.clone()
+        };
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         pins.into_iter()
             .filter_map(|(key, index, touched_at_ms)| {
@@ -65,6 +104,7 @@ impl Manager {
                     org_uuid: account.org_uuid.clone(),
                     org_name: account.org_name.clone(),
                     touched_at_ms,
+                    extended_ttl: extended.contains(&key),
                 })
             })
             .collect()
@@ -109,6 +149,18 @@ impl Manager {
             let mut map = self.affinity.lock().expect("affinity lock poisoned");
             for (&key, &value) in &report.pins {
                 map.entry(key).or_insert(value);
+            }
+        }
+        {
+            // Re-seed the extended-TTL record too, so a second restart before
+            // this session's next request still sees the wider window rather
+            // than silently falling back to the default on the very next flush.
+            let mut ext = self
+                .affinity_extended
+                .lock()
+                .expect("affinity_extended lock poisoned");
+            for &key in &report.extended {
+                ext.insert(key);
             }
         }
         report

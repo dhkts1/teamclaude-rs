@@ -70,6 +70,15 @@ use crate::identity::{self, Resolved};
 /// property (1) above, not a slightly stale preference.
 pub const PIN_TTL_MS: i64 = 15 * 60 * 1000;
 
+/// Restore window for a pin whose client explicitly asked Anthropic's cache for
+/// the extended `"ttl":"1h"` window (see [`StoredPin::extended_ttl`]), measured
+/// 2026-08-21 against 52,951 real `request usage` records: gaps of 15-60 minutes
+/// hit the cache 73-88% of the time and the hit rate does not fall off a cliff
+/// until past 60 minutes (12%). 55 minutes is that 60-minute warm window minus
+/// room for the restart itself, mirroring how [`PIN_TTL_MS`]'s 15 minutes is
+/// derived from the 5-minute default window plus the same margin.
+pub const EXTENDED_PIN_TTL_MS: i64 = 55 * 60 * 1000;
+
 /// Maximum pins written to disk, mirroring the in-memory `AFFINITY_CAP`. On
 /// overflow the freshest are kept, matching the in-memory LRU-by-last-touch
 /// eviction, so a restore can never produce a map larger than the process would
@@ -102,8 +111,19 @@ pub struct StoredPin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub org_name: Option<String>,
     /// Epoch ms of the last request served on this pin. Compared against
-    /// [`PIN_TTL_MS`] at load.
+    /// [`PIN_TTL_MS`] (or [`EXTENDED_PIN_TTL_MS`] below) at load.
     pub touched_at_ms: i64,
+    /// Whether the client's own request carried Anthropic's extended
+    /// `"cache_control": {"ttl": "1h"}` — see [`crate::cache_ttl`]. When `true`,
+    /// [`load`] compares this pin's age against [`EXTENDED_PIN_TTL_MS`] instead
+    /// of the caller's `ttl_ms`. A plain `bool` rather than a raw millisecond
+    /// value: the only two windows Anthropic's cache actually offers are the
+    /// 5-minute default and the 1-hour extended tier, so there is nothing an
+    /// arbitrary number would express that this doesn't, and a bad file can only
+    /// ever produce `false` (`#[serde(default)]`) — never a longer window than
+    /// the caller intended.
+    #[serde(default)]
+    pub extended_ttl: bool,
 }
 
 impl StoredPin {
@@ -136,6 +156,10 @@ pub struct LoadReport {
     /// Restored pins, in the in-memory map's own shape: key → (account index,
     /// last-touch ms).
     pub pins: HashMap<u64, (usize, i64)>,
+    /// The subset of `pins` whose [`StoredPin::extended_ttl`] was `true` — so
+    /// the caller can re-seed its own extended-TTL bookkeeping across a restart
+    /// rather than losing it until that session's next request.
+    pub extended: std::collections::HashSet<u64>,
     /// Dropped because their last touch was older than the TTL.
     pub expired: usize,
     /// Dropped because no live account carries that identity (removed, renamed).
@@ -237,13 +261,25 @@ pub fn load(path: &Path, accounts: &[Account], now_ms: i64, ttl_ms: i64) -> Load
 
     let mut report = LoadReport::default();
     for pin in file.pins {
-        if now_ms.saturating_sub(pin.touched_at_ms) > ttl_ms {
+        // Per-pin TTL: a client that asked for the extended 1h cache window gets
+        // the wider restore window; everything else (including a malformed or
+        // unrecognised recording) falls back to the caller's `ttl_ms` — never
+        // wider than what was actually requested.
+        let effective_ttl_ms = if pin.extended_ttl {
+            EXTENDED_PIN_TTL_MS
+        } else {
+            ttl_ms
+        };
+        if now_ms.saturating_sub(pin.touched_at_ms) > effective_ttl_ms {
             report.expired += 1;
             continue;
         }
         match identity::resolve(accounts.iter().enumerate(), &pin.probe()) {
             Resolved::One(index) => {
                 report.pins.insert(pin.key, (index, pin.touched_at_ms));
+                if pin.extended_ttl {
+                    report.extended.insert(pin.key);
+                }
             }
             Resolved::None => report.unresolved += 1,
             Resolved::Many => report.ambiguous += 1,
@@ -269,6 +305,17 @@ mod tests {
     }
 
     fn pin(key: u64, name: &str, uuid: Option<&str>, org: Option<&str>, touched: i64) -> StoredPin {
+        pin_with_ttl(key, name, uuid, org, touched, false)
+    }
+
+    fn pin_with_ttl(
+        key: u64,
+        name: &str,
+        uuid: Option<&str>,
+        org: Option<&str>,
+        touched: i64,
+        extended_ttl: bool,
+    ) -> StoredPin {
         StoredPin {
             key,
             name: name.to_string(),
@@ -276,6 +323,7 @@ mod tests {
             org_uuid: org.map(str::to_string),
             org_name: None,
             touched_at_ms: touched,
+            extended_ttl,
         }
     }
 
@@ -434,6 +482,74 @@ mod tests {
         assert_eq!(report.expired, 1);
         assert!(report.pins.contains_key(&11), "a minute old is warm");
         assert!(!report.pins.contains_key(&22), "past the TTL is cold");
+    }
+
+    /// The adaptive-TTL gate: a pin the client asked to cache for 1h gets the
+    /// extended (~55min) restore window instead of the 15-minute default, a pin
+    /// with no recorded TTL is still held to the default, and NEITHER survives
+    /// past the extended ceiling. Malformed/absent TTL must never grant a
+    /// LONGER window than the default — only ever the same or shorter.
+    #[test]
+    fn extended_ttl_pin_restores_a_30_minute_gap_the_default_would_drop() {
+        let path = tmp("extended-ttl");
+        let now = 10 * PIN_TTL_MS;
+        let thirty_min_ago = now - 30 * 60 * 1000;
+        let ninety_min_ago = now - 90 * 60 * 1000;
+        save(
+            &path,
+            &[
+                // 30 minutes old, recorded 1h TTL: must restore.
+                pin_with_ttl(
+                    11,
+                    "a@example.com",
+                    Some("uuid-a"),
+                    Some("org-1"),
+                    thirty_min_ago,
+                    true,
+                ),
+                // Same age, no recorded TTL: must NOT restore under the 15-min
+                // default.
+                pin_with_ttl(
+                    22,
+                    "b@example.com",
+                    Some("uuid-b"),
+                    Some("org-1"),
+                    thirty_min_ago,
+                    false,
+                ),
+                // 90 minutes old with the extended TTL: past even the ~55-minute
+                // extended ceiling, so it must not restore either.
+                pin_with_ttl(
+                    33,
+                    "c@example.com",
+                    Some("uuid-c"),
+                    Some("org-1"),
+                    ninety_min_ago,
+                    true,
+                ),
+            ],
+            now,
+        )
+        .expect("save");
+
+        let accounts = [
+            acct("a@example.com", Some("uuid-a"), Some("org-1")),
+            acct("b@example.com", Some("uuid-b"), Some("org-1")),
+            acct("c@example.com", Some("uuid-c"), Some("org-1")),
+        ];
+        let report = load(&path, &accounts, now, PIN_TTL_MS);
+        assert!(
+            report.pins.contains_key(&11),
+            "a 1h-TTL pin 30 minutes old must restore"
+        );
+        assert!(
+            !report.pins.contains_key(&22),
+            "no recorded TTL falls back to the 15-minute default and must not restore"
+        );
+        assert!(
+            !report.pins.contains_key(&33),
+            "90 minutes exceeds even the extended ceiling"
+        );
     }
 
     /// Every read failure degrades to "no pins" plus a stated reason. None of
