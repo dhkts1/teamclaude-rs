@@ -910,6 +910,19 @@ pub struct Manager {
     /// held while the accounts lock is taken (read the pin, drop this lock, then do
     /// eligibility) so the two can never deadlock.
     affinity: Mutex<HashMap<u64, (usize, i64)>>,
+    /// Session keys whose MOST RECENT request carried Anthropic's extended
+    /// `"cache_control": {"ttl": "1h"}` (see [`crate::cache_ttl`]), so
+    /// [`crate::manager::pins::affinity_pin_snapshot`] knows which persisted
+    /// pins get [`crate::affinity::EXTENDED_PIN_TTL_MS`] instead of the
+    /// default at the next restart. Deliberately a side map rather than a third
+    /// tuple field on `affinity` itself: nothing on the selection path
+    /// (`select.rs`) needs to read it, only the snapshot/restore bridge does, so
+    /// widening the hot map's value type for every read site there would be
+    /// blast radius this doesn't need. Written directly from the request path
+    /// (`crate::proxy`, alongside where `session_key` is computed) rather than
+    /// through `select()`, guarded and pruned the same way `affinity` is —
+    /// never held while the accounts lock is taken.
+    affinity_extended: Mutex<HashSet<u64>>,
     /// Set whenever `affinity` is mutated, cleared by the flusher task that
     /// writes the map to disk (see [`Manager::mark_affinity_dirty`] and
     /// [`crate::affinity`]). A relaxed atomic rather than a channel because the
@@ -1151,6 +1164,7 @@ impl Manager {
             current: Mutex::new(None),
             select_seq: AtomicU64::new(1),
             affinity: Mutex::new(HashMap::new()),
+            affinity_extended: Mutex::new(HashSet::new()),
             affinity_dirty: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             session_seq: AtomicU64::new(1),
