@@ -222,6 +222,17 @@ fi
 # It is read from the environment rather than written down because the private
 # half signs releases: only the release pipeline should have to know it, and this
 # repository is public.
+# The PUBLIC half is published in docs/RELEASING.md ("Publishing it is the
+# point") and ships in every Info.plist, so defaulting to it is not a leak — it
+# is the same value any installed copy already carries. Only the PRIVATE half is
+# a secret, and that lives in the keychain and never appears here.
+#
+# It used to be env-only, and the omission was silent: six locally-built bundles
+# shipped without SUPublicEDKey, and Sparkle then failed the update CHECK
+# outright on every one of them. The warning below claimed such a build "can
+# check the feed", which was measured false. An env override still wins, for a
+# build that must carry a different key.
+: "${TCRBAR_SPARKLE_PUBLIC_KEY:=1WZWEwzSEijRarey7qE0a+n4AO/+7e4Fj/nW8Y8ZKMM=}"
 sparkle_public_key_entry=""
 if [ -n "${TCRBAR_SPARKLE_PUBLIC_KEY:-}" ]; then
   sparkle_public_key_entry="	<key>SUPublicEDKey</key>
@@ -230,8 +241,8 @@ else
   {
     echo
     echo "WARNING: TCRBAR_SPARKLE_PUBLIC_KEY is not set, so SUPublicEDKey is OMITTED."
-    echo "WARNING: this build can check the feed but cannot verify a downloaded"
-    echo "WARNING: update, so Sparkle will refuse to install one. That is deliberate:"
+    echo "WARNING: Sparkle fails the update CHECK outright without it - measured,"
+    echo "WARNING: not merely refusing to install. That is deliberate:"
     echo "WARNING: a placeholder key would fail the same way while looking configured."
     echo "WARNING: Fix: export TCRBAR_SPARKLE_PUBLIC_KEY=<the EdDSA public key> and rebuild."
     echo
