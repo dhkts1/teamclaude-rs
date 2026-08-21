@@ -1611,41 +1611,39 @@ fn render_accounts_json(
         .map(|(i, a)| {
             let quota = gating_quota(a);
             let threshold = thresholds.get(i).copied().unwrap_or(1.0);
-            let held: Vec<serde_json::Value> = held_windows(a, threshold)
+            let held: Vec<tcr_status_wire::HeldWindowRow> = held_windows(a, threshold)
                 .into_iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "window": h.label,
-                        "resetAtMs": (h.reset.unix_timestamp_nanos() / 1_000_000) as i64,
-                        "minutesUntilReset": (h.reset - now).whole_minutes().max(0),
-                    })
+                .map(|h| tcr_status_wire::HeldWindowRow {
+                    window: h.label.to_string(),
+                    reset_at_ms: (h.reset.unix_timestamp_nanos() / 1_000_000) as i64,
+                    minutes_until_reset: (h.reset - now).whole_minutes().max(0),
                 })
                 .collect();
-            serde_json::json!({
-                "source": source.as_str(),
+            let row = tcr_status_wire::AccountStatusRow {
+                source: source.as_str().to_string(),
                 // Which build produced these numbers. A script watching this
                 // output can diff it against `git rev-parse --short HEAD` and
                 // know, without an `lsof`, whether the server predates the fix
                 // it is verifying.
-                "serverSha": server.map(|b| b.sha.as_str()),
-                "serverDirty": server.and_then(|b| b.dirty),
+                server_sha: server.map(|b| b.sha.clone()),
+                server_dirty: server.and_then(|b| b.dirty),
                 // Server-wide, repeated per row like `serverSha` above — whether
                 // this server's upstream clients are forced onto HTTP/1.1. See
                 // `Config::http1_only` and `Manager::http1_only`.
-                "http1Only": http1_only,
-                "name": a.name,
-                "priority": a.priority,
-                "status": a.status,
-                "disabled": a.disabled,
+                http1_only,
+                name: a.name.clone(),
+                priority: a.priority,
+                status: a.status.clone(),
+                disabled: a.disabled,
                 // Whether THIS row is the identity-bound control account
                 // (`Config::control_account` / `Manager::control_name`). Reported
                 // on the offline path too, deliberately — it is a config fact,
                 // not a serving counter, so it does NOT get the
                 // null-when-offline treatment `streamErrorCount` gets below;
                 // see `StatusPayload::control`'s doc-comment for why.
-                "control": control == Some(a.name.as_str()),
-                "quota": quota,
-                "quotaState": quota_state_token(a.quota_state),
+                control: control == Some(a.name.as_str()),
+                quota,
+                quota_state: quota_state_token(a.quota_state).to_string(),
                 // The server's own terminal-gate verdict
                 // (`Manager::account_terminal_gate`/`account_gate`), including the
                 // one TcrBar could not otherwise see: `rejected` (Anthropic's own
@@ -1658,10 +1656,10 @@ fn render_accounts_json(
                 // "disabled") via `GateReason`'s own `Serialize`. New field, so an
                 // older reader on either end is unaffected: a client built before
                 // this shipped simply never looks at it.
-                "gate": a.gate,
-                "fiveHour": a.five_hour,
-                "sevenDay": a.seven_day,
-                "sevenDayOi": a.seven_day_oi,
+                gate: gate_reason_token(a.gate),
+                five_hour: a.five_hour,
+                seven_day: a.seven_day,
+                seven_day_oi: a.seven_day_oi,
                 // Per-window state, additive alongside the existing combined
                 // `quotaState` above (which stays the most-spent-of-both gating
                 // verdict and is UNCHANGED by this field's addition — nothing
@@ -1672,11 +1670,19 @@ fn render_accounts_json(
                 // the two per-window quota bars independently instead of both
                 // by the shared gating state, so a 7d-red account with an empty
                 // 5h window doesn't paint its 5h bar red.
-                "fiveHourState": a.five_hour.map(|u| {
-                    quota_state_token(crate::stats::QuotaState::from_utilization(Some(u), threshold))
+                five_hour_state: a.five_hour.map(|u| {
+                    quota_state_token(crate::stats::QuotaState::from_utilization(
+                        Some(u),
+                        threshold,
+                    ))
+                    .to_string()
                 }),
-                "sevenDayState": a.seven_day.map(|u| {
-                    quota_state_token(crate::stats::QuotaState::from_utilization(Some(u), threshold))
+                seven_day_state: a.seven_day.map(|u| {
+                    quota_state_token(crate::stats::QuotaState::from_utilization(
+                        Some(u),
+                        threshold,
+                    ))
+                    .to_string()
                 }),
                 // A window's reset is a property of the window, not of whether
                 // it is currently pinning the account — UNCONDITIONAL, no
@@ -1691,9 +1697,13 @@ fn render_accounts_json(
                 // `held[]`) — a server-computed relative figure goes stale
                 // between polls, so the client derives the countdown from the
                 // timestamp against its own clock instead.
-                "fiveHourResetAtMs": a.five_hour_reset.map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
-                "sevenDayResetAtMs": a.seven_day_reset.map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
-                // `null` — NEVER `0` — on the OFFLINE path, same idiom as
+                five_hour_reset_at_ms: a
+                    .five_hour_reset
+                    .map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
+                seven_day_reset_at_ms: a
+                    .seven_day_reset
+                    .map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
+                // `None` — NEVER `0` — on the OFFLINE path, same idiom as
                 // `streamErrorCount`/`cacheHitRatio` below and for the same
                 // reason: these four are pure serving counters that live in
                 // the SERVING process, so a fresh offline `Manager` reads
@@ -1708,21 +1718,21 @@ fn render_accounts_json(
                 // they come from a live probe the offline path genuinely runs
                 // itself, not from the serving Manager's counters, so they are
                 // real numbers on both paths.
-                "requests": match source {
-                    StatusSource::Offline => serde_json::Value::Null,
-                    StatusSource::Live => serde_json::json!(a.requests),
+                requests: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => Some(a.requests),
                 },
-                "inputTokens": match source {
-                    StatusSource::Offline => serde_json::Value::Null,
-                    StatusSource::Live => serde_json::json!(a.input_tokens),
+                input_tokens: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => Some(a.input_tokens),
                 },
-                "outputTokens": match source {
-                    StatusSource::Offline => serde_json::Value::Null,
-                    StatusSource::Live => serde_json::json!(a.output_tokens),
+                output_tokens: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => Some(a.output_tokens),
                 },
-                "cacheReadTokens": match source {
-                    StatusSource::Offline => serde_json::Value::Null,
-                    StatusSource::Live => serde_json::json!(a.cache_read_tokens),
+                cache_read_tokens: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => Some(a.cache_read_tokens),
                 },
                 // Prompt-cache hit ratio (0.0-1.0): cache_read / input_total, and
                 // `null` — NEVER a literal 0.0 — when there is no reliable signal:
@@ -1743,10 +1753,7 @@ fn render_accounts_json(
                 // low ratio reads exactly like "the cache is broken" to anyone
                 // watching this field. `null` says "not measured"; `source` says
                 // which process would have measured it, when it could have.
-                "cacheHitRatio": match cache_hit_ratio(a, source) {
-                    None => serde_json::Value::Null,
-                    Some(ratio) => serde_json::json!(ratio),
-                },
+                cache_hit_ratio: cache_hit_ratio(a, source),
                 // When the background quota probe last ran for this account
                 // (`AccountSnapshot::last_probe`), Unix milliseconds like every
                 // other timestamp on this wire. Already crosses the
@@ -1762,11 +1769,11 @@ fn render_accounts_json(
                 // Real on BOTH paths, like `fiveHour`/`quota` above: the
                 // offline path runs its own live probe, so this is not a
                 // serving counter and gets no null-on-offline guard.
-                "lastProbeMs": a
+                last_probe_ms: a
                     .last_probe
                     .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
-                "probeStatus": a.probe_status.as_str(),
-                "probeError": a.probe_error,
+                probe_status: a.probe_status.as_str().to_string(),
+                probe_error: a.probe_error.clone(),
                 // Decayed count of stream failures — an in-band SSE `error` event,
                 // or a stream that hit EOF without `message_stop` (recorded as
                 // `"truncated"`). `null`, NEVER 0, on the offline
@@ -1775,17 +1782,17 @@ fn render_accounts_json(
                 // publishes an all-clear nobody measured. Same "not measured"
                 // idiom as `cacheHitRatio`; `source` says which process would
                 // have measured it.
-                "streamErrorCount": match source {
-                    StatusSource::Offline => serde_json::Value::Null,
-                    StatusSource::Live => serde_json::json!(a.stream_error_count),
+                stream_error_count: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => Some(a.stream_error_count as u64),
                 },
                 // The latest error's `error.type` (e.g. "overloaded_error"), or
                 // null when none has been observed / nothing measured.
-                "lastStreamError": match source {
+                last_stream_error: match source {
                     StatusSource::Offline => None,
                     StatusSource::Live => a.last_stream_error.clone(),
                 },
-                "held": held,
+                held,
                 // WHEN THE ACCOUNT COMES BACK — the question `status` cannot
                 // answer. `status: "throttled"` is a state; this is the instant.
                 //
@@ -1801,28 +1808,30 @@ fn render_accounts_json(
                 // only a human clears those) and for a gate whose reset upstream
                 // never reported. Absent means "no time can be promised", never
                 // "returns now".
-                "freeAtMs": a.free_at.map(|f| (f.unix_timestamp_nanos() / 1_000_000) as i64),
-                "secondsUntilFree": a
+                free_at_ms: a
+                    .free_at
+                    .map(|f| (f.unix_timestamp_nanos() / 1_000_000) as i64),
+                seconds_until_free: a
                     .free_at
                     .filter(|f| *f > now)
                     .map(|f| (f - now).whole_seconds()),
                 // The 429 hold specifically, so an operator can tell a short
                 // transient park from a week-scale quota cap without inferring it
                 // from `gate`.
-                "rateLimitedUntilMs": a
+                rate_limited_until_ms: a
                     .rate_limited_until
                     .map(|t| (t.unix_timestamp_nanos() / 1_000_000) as i64),
                 // Group labels (config fact, not a serving counter) — always an
                 // array, `[]` when unlabelled, real on BOTH paths like `control`
                 // above. Never `null`: "this account has no groups" is known,
                 // not unmeasured.
-                "groups": a.groups,
+                groups: a.groups.clone(),
                 // The subset of `groups` currently RESERVED (`tcr group
                 // reserve`), sorted. Same never-`null` contract as `groups`
                 // above — this is the field the sibling macOS panel decodes to
                 // mark a section reserved; name and shape are a fixed contract,
                 // do not change them.
-                "reservedGroups": a.reserved_groups,
+                reserved_groups: a.reserved_groups.clone(),
                 // Every group on the FLEET (not just this row's own groups)
                 // mapped to its resolved color — server-wide like `http1Only`
                 // above, repeated per row so the panel can tint any account's
@@ -1831,11 +1840,32 @@ fn render_accounts_json(
                 // `Config::group_colors`'s doc-comment. Name and shape are a
                 // fixed contract with the sibling macOS panel — do not change
                 // them.
-                "groupColors": group_colors,
-            })
+                group_colors: group_colors.clone(),
+            };
+            // Round-trip through `Value` rather than serializing the struct
+            // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
+            // out alphabetically ordered — matching this wire's output before
+            // this struct existed (the committed fixture's key order) — while
+            // `AccountStatusRow`'s own field order stays whatever reads best in
+            // this source file.
+            serde_json::to_value(row).unwrap_or(serde_json::Value::Null)
         })
         .collect();
     serde_json::to_string_pretty(&rows).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// The wire's kebab-case `gate` token for a [`crate::stats::GateReason`] —
+/// `GateReason` itself is `#[serde(rename_all = "kebab-case")]`, so this reuses
+/// that `Serialize` impl rather than hand-duplicating the mapping. Infallible:
+/// an enum-to-string serialization has no failure mode, so the `expect` names
+/// that invariant rather than guessing at a fallback token that could silently
+/// paper over a future variant nobody wired up.
+fn gate_reason_token(gate: crate::stats::GateReason) -> String {
+    serde_json::to_value(gate)
+        .expect("GateReason serializes infallibly")
+        .as_str()
+        .expect("GateReason serializes to a JSON string")
+        .to_string()
 }
 
 /// `tcr accounts [--probe]` — list configured accounts (offline). With

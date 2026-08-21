@@ -1,6 +1,15 @@
+# Explicit workspace, added alongside `crates/tcr-status-wire` (the shared
+# `tcr status --json` wire type). Keep `apps/macos/**` OUT of `members` forever
+# — `.github/workflows/ci.yml` runs `cargo test --all` / `cargo clippy
+# --all-targets --locked` on ubuntu, and `--all` means `--workspace`: anything
+# listed here compiles on Linux.
+[workspace]
+members = [".", "crates/tcr-status-wire"]
+resolver = "2"
+
 [package]
 name = "teamclaude-rs"
-version = "0.2.22"
+version = "0.2.23"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 # Noncommercial license, so this crate must never reach crates.io, whose terms
@@ -22,6 +31,9 @@ name = "tcr"
 path = "src/main.rs"
 
 [dependencies]
+# The shared `tcr status --json` wire type (`AccountStatusRow`), consumed by
+# `render_accounts_json` in `src/cli.rs`.
+tcr-status-wire = { path = "crates/tcr-status-wire" }
 # async runtime + HTTP
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "signal"] }
 axum = { version = "0.8", features = ["http2"] }
