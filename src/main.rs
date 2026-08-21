@@ -366,7 +366,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Run(args)) => run_claude(args),
         Some(Command::Login(args)) => run_login(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
-        Some(Command::Remove(args)) => run_remove(args),
+        Some(Command::Remove(args)) => run_remove(args).await,
         Some(Command::Priority(args)) => run_priority(args),
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
@@ -386,10 +386,11 @@ async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
     cli::list_accounts(&config_path, args.probe).await
 }
 
-/// `tcr remove <query> [--org]` — delete an account from the config.
-fn run_remove(args: RemoveArgs) -> anyhow::Result<()> {
+/// `tcr remove <query> [--org]` — delete an account from the config, applying
+/// a live disable through the RUNNING proxy first where there is one.
+async fn run_remove(args: RemoveArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::remove_account(&config_path, &args.query, args.org.as_deref())
+    cli::remove_account(&config_path, &args.query, args.org.as_deref()).await
 }
 
 /// `tcr priority <query> [N|--first|--last] [--org]` — set rotation priority.

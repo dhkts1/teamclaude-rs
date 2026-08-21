@@ -177,11 +177,89 @@ fn edit_account<T>(
     Ok(out)
 }
 
-/// Remove the account matching `query` from the config and save.
+/// Remove the account matching `query` from the config and save — live-first,
+/// same discipline as [`set_enabled`].
 ///
 /// Resolution happens BEFORE any mutation, so a non-matching query returns an
-/// error with the file left byte-identical (no partial write).
-pub fn remove_account(config_path: &Path, query: &str, org: Option<&str>) -> anyhow::Result<()> {
+/// error with the file left byte-identical (no partial write). Order is now
+/// resolve -> live-disable -> delete-from-config: deleting first and disabling
+/// second would leave a window (or, on a failed live call, a permanent state)
+/// where the config says the account does not exist while the running proxy
+/// keeps rotating it — the exact lie this change exists to eliminate, except
+/// now the record is gone too and unrecoverable.
+///
+/// `Unauthorized` and `Rejected` bail with the config untouched, for the same
+/// reasons as `set_enabled` — see its doc-comment — sharpened: a removal
+/// applied on top of a live disagreement cannot be undone by re-adding, since
+/// the account's credentials are gone from the file being edited.
+pub async fn remove_account(
+    config_path: &Path,
+    query: &str,
+    org: Option<&str>,
+) -> anyhow::Result<()> {
+    if let Ok(config) = config::load(config_path) {
+        match post_set_disabled(&config, query, org, true).await {
+            Ok(_) => {
+                let removed = edit_account(config_path, query, org, |config, idx| {
+                    config.accounts.remove(idx).name
+                })?;
+                println!("Removed account '{removed}'.");
+                return Ok(());
+            }
+            // Nothing is listening: no live rotation to disagree with the file.
+            Err(LiveControlError::NoServer) => {}
+            // A server is there and refused our key. Deleting the record now
+            // would leave the running proxy still rotating an account that no
+            // longer exists on disk — worse than the disable case, because
+            // there is no record left to reconcile against on restart.
+            Err(LiveControlError::Unauthorized) => {
+                bail!(
+                    "the proxy on :{} rejected the api-key in {} — the config was NOT changed, because deleting it would leave the running proxy still rotating this account. Fix `proxy.apiKey` and retry.",
+                    config.proxy.port,
+                    config_path.display()
+                );
+            }
+            // The route resolved our query to nothing, or to more than one
+            // account. The file's own resolution could land on a different
+            // row than the server matched — a removal applied to the wrong
+            // account is unrecoverable, so this bails rather than falling back.
+            Err(LiveControlError::Rejected(message)) => {
+                bail!(
+                    "the proxy running on :{} refused this: {message} Nothing was changed.",
+                    config.proxy.port
+                );
+            }
+            // An older tcr with no account-control route. The file half is all
+            // we can do; say loudly that the proxy keeps using the account
+            // until it restarts.
+            Err(LiveControlError::NoRoute) => {
+                let removed = edit_account(config_path, query, org, |config, idx| {
+                    config.accounts.remove(idx).name
+                })?;
+                eprintln!(
+                    "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP routing to '{removed}' until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
+                    config.proxy.port,
+                    crate::proxy::DISABLED_PATH,
+                );
+                println!("Removed account '{removed}'.");
+                return Ok(());
+            }
+            // It answered something we cannot use, or did not answer at all.
+            Err(other) => {
+                let removed = edit_account(config_path, query, org, |config, idx| {
+                    config.accounts.remove(idx).name
+                })?;
+                eprintln!(
+                    "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP routing to '{removed}' until it restarts.",
+                    config.proxy.port,
+                    other.why(),
+                );
+                println!("Removed account '{removed}'.");
+                return Ok(());
+            }
+        }
+    }
+
     let removed = edit_account(config_path, query, org, |config, idx| {
         config.accounts.remove(idx).name
     })?;
@@ -2270,21 +2348,31 @@ mod tests {
     }
 
     // --- remove ------------------------------------------------------------
+    //
+    // Every one of these uses `config_on_a_dead_port`, never `TWO_ACCOUNTS`'
+    // literal 3456 directly — `remove_account` now dials the configured proxy
+    // port for real, and 3456 is where the live fleet proxy actually listens
+    // on this machine. Landing on the real port would mean this test suite
+    // silently disabling a real account.
 
-    #[test]
-    fn remove_deletes_named_account_leaving_siblings() {
-        let path = write_config("remove", TWO_ACCOUNTS);
-        remove_account(&path, "alice@example.com", None).unwrap();
+    #[tokio::test]
+    async fn remove_deletes_named_account_leaving_siblings() {
+        let path = config_on_a_dead_port("remove").await;
+        remove_account(&path, "alice@example.com", None)
+            .await
+            .unwrap();
         let config = load(&path);
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].name, "bob@example.com");
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn remove_preserves_unmodelled_extra_fields() {
-        let path = write_config("remove-extra", TWO_ACCOUNTS);
-        remove_account(&path, "alice@example.com", None).unwrap();
+    #[tokio::test]
+    async fn remove_preserves_unmodelled_extra_fields() {
+        let path = config_on_a_dead_port("remove-extra").await;
+        remove_account(&path, "alice@example.com", None)
+            .await
+            .unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // The #1 silent-loss risk: unmodelled top-level keys survive the edit.
@@ -2293,14 +2381,130 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    #[test]
-    fn remove_nonexistent_errors_and_leaves_file_byte_identical() {
-        let path = write_config("remove-miss", TWO_ACCOUNTS);
+    #[tokio::test]
+    async fn remove_nonexistent_errors_and_leaves_file_byte_identical() {
+        let path = config_on_a_dead_port("remove-miss").await;
         let before = fs::read_to_string(&path).unwrap();
-        let result = remove_account(&path, "nobody@example.com", None);
+        let result = remove_account(&path, "nobody@example.com", None).await;
         assert!(result.is_err());
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after, "a failed resolve must not write the config");
+        fs::remove_file(&path).ok();
+    }
+
+    /// THE BITING TEST for remove, end to end through the PRODUCTION path: a
+    /// real hybrid listener, a real socket, the real router. Pre-change
+    /// `remove_account` only ever touched the file, so the running manager's
+    /// rotation kept serving the deleted account's identity until restart —
+    /// the same defect `set_enabled_parks_the_account_in_the_running_proxy`
+    /// exists to catch, one level more destructive here because the record is
+    /// also gone.
+    #[tokio::test]
+    async fn remove_parks_the_account_in_the_running_proxy_before_deleting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("live-remove").await;
+        let mut config = load(&path);
+        config.proxy.port = port;
+
+        let manager = Manager::with_live_refresher(config.clone(), Some(path.clone()));
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move { crate::mitm::serve(listener, served, None).await });
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        remove_account(&path, "alice@example.com", None)
+            .await
+            .unwrap();
+
+        // 1. THE RUNNING ROTATION: parked immediately, not just at next boot.
+        let live = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(live.accounts[0].name, "alice@example.com");
+        assert!(
+            live.accounts[0].disabled,
+            "the account is parked IN THE SERVING PROCESS before deletion"
+        );
+
+        // 2. …and the file no longer carries the record at all.
+        let config = load(&path);
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "bob@example.com");
+        fs::remove_file(&path).ok();
+    }
+
+    /// The proxy rejected our api-key: the one arm that must NOT write. If
+    /// this arm wrote instead, the config would say the account is gone while
+    /// the running proxy — the one we couldn't even authenticate to, let
+    /// alone confirm parked the account — keeps rotating it, permanently.
+    #[tokio::test]
+    async fn remove_refuses_on_unauthorized_without_writing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_config: Config = serde_json::from_str(&format!(
+            r#"{{ "proxy": {{ "port": {port}, "apiKey": "correct-key" }}, "accounts": [] }}"#
+        ))
+        .unwrap();
+        let manager = Manager::with_live_refresher(server_config, None);
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let path = config_on_a_dead_port("remove-unauth").await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        doc["proxy"]["apiKey"] = serde_json::json!("wrong-key");
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let err = remove_account(&path, "alice@example.com", None)
+            .await
+            .expect_err("a rejected api-key must refuse the removal");
+        assert!(
+            err.to_string().contains("NOT changed"),
+            "the refusal must say nothing changed: {err}"
+        );
+        assert_eq!(
+            before,
+            fs::read_to_string(&path).unwrap(),
+            "an Unauthorized removal must leave the config byte-identical"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// An ambiguous query is refused by the SERVER and the CLI does not fall
+    /// back to the file's own resolution — a removal applied to the wrong row
+    /// is unrecoverable, unlike a mis-applied disable.
+    #[tokio::test]
+    async fn remove_refuses_an_ambiguous_query_without_writing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let path = config_on_a_dead_port("remove-ambiguous").await;
+        let raw = fs::read_to_string(&path).unwrap();
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        doc["proxy"]["port"] = serde_json::json!(port);
+        doc["accounts"][1]["name"] = serde_json::json!("alice@example.com");
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let config = load(&path);
+        let manager = Manager::with_live_refresher(config, Some(path.clone()));
+        tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
+
+        let err = remove_account(&path, "alice@example.com", None)
+            .await
+            .expect_err("an ambiguous query must not be applied");
+        let text = err.to_string();
+        assert!(
+            text.contains("ambiguous") && text.contains("--org"),
+            "the refusal names the candidates and the fix: {text}"
+        );
+        assert_eq!(
+            before,
+            fs::read_to_string(&path).unwrap(),
+            "a refused removal leaves the config byte-identical"
+        );
         fs::remove_file(&path).ok();
     }
 

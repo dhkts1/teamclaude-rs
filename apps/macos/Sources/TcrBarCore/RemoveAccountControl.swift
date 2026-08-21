@@ -13,12 +13,15 @@ import Foundation
 ///     matched entry outright — there is no `tcr un-remove`. Getting the
 ///     account back means `tcr login` from scratch, which is why the panel
 ///     confirms before calling this at all.
-///  3. **This does not take effect in a running proxy.** The account list is
-///     a boot-time snapshot (`CLAUDE.md`'s config-reload rule): `tcr remove`
-///     changes the file and exits 0, but the row stays on screen, unchanged,
-///     until the proxy restarts. ``RemoveAccountController`` tracks that a
-///     removal landed so the panel can say so, and never claims the row is
-///     actually gone.
+///  3. **The account stops serving immediately, but the row does not leave
+///     the panel until restart.** `remove_account` now disables the account
+///     in the running proxy before deleting it from the config, so rotation
+///     stops right away — no restart needed for that half. The fleet row
+///     list is still a boot-time snapshot (`CLAUDE.md`'s config-reload rule)
+///     though, so the row itself keeps rendering, unchanged, until the proxy
+///     restarts. ``RemoveAccountController`` tracks that a removal landed so
+///     the panel can say exactly that, and never claims the row will
+///     disappear — it will not.
 ///  4. **Exit 0 with anything on stderr is not a clean success.** Same
 ///     three-arm ``Outcome`` as ``AccountCommand``/``GroupCommand``.
 public enum RemoveAccountCommand {
@@ -87,9 +90,9 @@ public enum RemoveAccountCommand {
 
 /// Panel-facing state for account deletion: which calls are in flight, which
 /// have an unsuperseded failure, and which accounts have been successfully
-/// deleted this session — the last of which drives the "restart the proxy to
-/// apply" notice, since the row itself has no way to reflect a boot-time
-/// config change on its own.
+/// deleted this session — the last of which drives the "stopped, stays
+/// listed until restart" notice, since the row itself has no way to reflect
+/// a boot-time config change on its own.
 ///
 /// Keyed by account name, same as ``AccountController``. Never cleared: like
 /// ``GroupController/appliedPendingRestart``, there is no live config reload
