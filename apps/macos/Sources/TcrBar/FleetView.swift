@@ -991,7 +991,7 @@ struct AccountRow: View {
         // gets no other signal that the delete landed but the row did not
         // change, since nothing here re-derives the fleet from the config.
         if removeController.needsRestart(account.name) {
-            parts.append("removed from config, restart the proxy to apply")
+            parts.append("removed from config and stopped, stays listed as disabled until the proxy restarts")
         }
         return parts.joined(separator: ", ")
     }
@@ -1259,8 +1259,8 @@ struct AccountRow: View {
     /// actual default). Names the account, states the consequence in plain
     /// language (this is not reversible from the UI — the saved OAuth tokens
     /// are gone and getting the account back needs a fresh `tcr login`), and
-    /// mentions the restart requirement up front rather than letting the
-    /// operator discover it by wondering why the row is still there.
+    /// states up front that the row stays listed as disabled until the proxy
+    /// restarts, even though the account itself stops serving right away.
     private func confirmDeleteAccount() {
         let alert = NSAlert()
         alert.alertStyle = .critical
@@ -1270,8 +1270,8 @@ struct AccountRow: View {
             It is not reversible from here — getting it back means running `tcr login` \
             again from scratch.
 
-            The change does not take effect until the proxy restarts, so this row \
-            stays visible until then.
+            The account stops serving immediately, but this row stays listed here as \
+            disabled until the proxy restarts.
             """
         let delete = alert.addButton(withTitle: "Delete Account")
         delete.hasDestructiveAction = true
@@ -1592,14 +1592,17 @@ struct AccountRow: View {
 
     /// Drawn after a successful ``RemoveAccountController/remove(account:org:)``
     /// and never cleared while the panel stays open — the whole reason it
-    /// exists. Deleting an account is a boot-time config change (see
-    /// ``RemoveAccountControl``'s doc-comment): the call lands and the file is
-    /// correct, but this row keeps rendering exactly as it did before, because
-    /// nothing here re-derives the fleet from a config the running proxy has
-    /// not re-read. A silent success here is the exact bug this codebase
+    /// exists. `remove_account` now disables the account in the running proxy
+    /// before deleting it from the config, so the account itself stops
+    /// serving immediately — but this row keeps rendering exactly as it did
+    /// before, because nothing here re-derives the fleet from a config the
+    /// running proxy has not re-read, and the row's membership in the fleet
+    /// list is itself a boot-time snapshot (see ``RemoveAccountControl``'s
+    /// doc-comment). A silent success here is the exact bug this codebase
     /// already lost an evening to for the enable/disable toggle — so this
-    /// line is what makes the true state (deleted, pending a restart) visible
-    /// instead of leaving the operator to wonder why the row never left.
+    /// line says what is actually true: stopped now, listed as disabled until
+    /// the next restart. It must not claim the row will disappear, because it
+    /// will not.
     ///
     /// `Tok.near`, matching `verdictLine`'s `.notHonoured`/`.spokeUp` tint:
     /// nothing failed — the delete landed — so this must not wear the error
@@ -1608,7 +1611,7 @@ struct AccountRow: View {
     private var removalNoticeLine: some View {
         if removeController.needsRestart(account.name) {
             Label(
-                "Removed from config. Restart the proxy to apply.",
+                "Removed from config and stopped. Stays listed as disabled until the proxy restarts.",
                 systemImage: "arrow.triangle.2.circlepath"
             )
             .font(Tok.detailFont)

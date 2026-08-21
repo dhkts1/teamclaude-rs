@@ -70,8 +70,8 @@ final class RemoveAccountCommandTests: XCTestCase {
 }
 
 /// The mutation controller: in-flight tracking, failure surfacing, and the
-/// "restart the proxy to apply" note that never clears itself — same shape
-/// as `GroupControllerTests`.
+/// "stopped, stays listed until restart" note that never clears itself —
+/// same shape as `GroupControllerTests`.
 @MainActor
 final class RemoveAccountControllerTests: XCTestCase {
 
