@@ -1990,6 +1990,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         None => (None, SessionKind::Fallback),
     };
 
+    // Record whether THIS request asked Anthropic's cache for the extended 1h
+    // window, same body bytes as `request_model` above and no second full
+    // parse of the document (see `crate::cache_ttl`). Only meaningful with a
+    // session key: it drives nothing on the routing path, only what TTL this
+    // session's persisted pin gets at the next restart.
+    if let Some(key) = session_key {
+        manager.note_affinity_ttl(key, crate::cache_ttl::requests_extended_ttl(&body_bytes));
+    }
+
     // 3. Selection + rotation loop.
     let account_count = manager.account_count();
     let mut tried: HashSet<usize> = HashSet::new();
