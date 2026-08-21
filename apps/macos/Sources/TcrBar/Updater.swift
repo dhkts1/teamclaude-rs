@@ -82,8 +82,29 @@ extension Updater: SPUUpdaterDelegate {
         Task { @MainActor in self.updateState = .upToDate }
     }
 
+    /// Sparkle aborts a check it completed successfully but found nothing for,
+    /// reporting `SUError.noUpdateError` — and it does so AFTER
+    /// ``updaterDidNotFindUpdate(_:error:)`` has already set `.upToDate`, so a
+    /// naive mapping here overwrites the good state with a failure carrying
+    /// Sparkle's own cheerful text. That shipped, and rendered in red as
+    /// "Update check failed: You're up to date!".
+    ///
+    /// "No update" is an outcome, not an error. Only a genuine abort is a
+    /// failure.
     nonisolated func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        if Self.isNoUpdateError(error) {
+            Task { @MainActor in self.updateState = .upToDate }
+            return
+        }
         let message = error.localizedDescription
         Task { @MainActor in self.updateState = .failed(message) }
+    }
+
+    /// Whether an abort is Sparkle's benign "there was nothing to install".
+    /// Matched on the error domain and code rather than its message, which is
+    /// user-facing and localised.
+    nonisolated static func isNoUpdateError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        return ns.domain == SUSparkleErrorDomain && ns.code == Int(SUError.noUpdateError.rawValue)
     }
 }
