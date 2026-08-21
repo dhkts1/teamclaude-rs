@@ -41,6 +41,11 @@ final class MenuBarShell {
     /// that reset every time the panel opened would lose the "restart the
     /// proxy to apply" note the moment the operator closed it.
     let groupController: GroupController
+    /// Account deletion for the gear menu's "Delete Account…" action, owned
+    /// here for the same reason as `groupController`: the "restart the proxy
+    /// to apply" notice must survive the panel closing and reopening, not
+    /// reset the moment the operator dismisses it.
+    let removeController: RemoveAccountController
     /// Owned here for the same reason as the rest, plus one of its own: the
     /// delegate's `tcrbar://check-for-updates` handler reaches through the shell
     /// to find it, so an updater that only existed while the panel was open would
@@ -66,7 +71,8 @@ final class MenuBarShell {
         awake: AwakeController? = nil,
         preference: LaunchPreference? = nil,
         updater: Updater? = nil,
-        groupController: GroupController? = nil
+        groupController: GroupController? = nil,
+        removeController: RemoveAccountController? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -77,6 +83,7 @@ final class MenuBarShell {
         self.preference = preference ?? LaunchPreference()
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
+        self.removeController = removeController ?? RemoveAccountController()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -113,7 +120,7 @@ final class MenuBarShell {
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
                 accounts: self.accounts, control: self.control, awake: self.awake,
                 preference: self.preference, updater: self.updater,
-                groupController: self.groupController))
+                groupController: self.groupController, removeController: self.removeController))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -326,6 +333,7 @@ struct FleetPanel: View {
     @ObservedObject var preference: LaunchPreference
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
+    @ObservedObject var removeController: RemoveAccountController
 
     var body: some View {
         FleetView(
@@ -337,6 +345,7 @@ struct FleetPanel: View {
             awake: awake,
             updater: updater,
             groupController: groupController,
+            removeController: removeController,
             startServerAtLaunch: $preference.startServerAtLaunch
         )
     }
