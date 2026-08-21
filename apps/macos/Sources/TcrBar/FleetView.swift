@@ -27,6 +27,9 @@ struct FleetView: View {
     /// only way to change it from this panel now that the section-header
     /// menus are gone. See ``GroupController``.
     @ObservedObject var groupController: GroupController
+    /// Deleting an account from each row's gear menu. See
+    /// ``RemoveAccountController``.
+    @ObservedObject var removeController: RemoveAccountController
     /// Owned by the app so it survives the panel closing; bound here so the
     /// checkbox and the launch path can never disagree about its value.
     @Binding var startServerAtLaunch: Bool
@@ -252,6 +255,7 @@ struct FleetView: View {
             onChanged: { await poller.pollOnce() },
             onRelogin: { reloginAccount(account.name) },
             groupController: groupController,
+            removeController: removeController,
             allAccounts: fleet.accounts
         )
         .background(
@@ -712,6 +716,8 @@ struct AccountRow: View {
     /// membership could only be changed from a section-header menu, and the
     /// instinct is to act on the account itself. See ``groupMenuItems``.
     @ObservedObject var groupController: GroupController
+    /// Deleting this row's account. See ``RemoveAccountController``.
+    @ObservedObject var removeController: RemoveAccountController
     /// The whole fleet, so ``addToGroupMenu`` can offer every group this
     /// account is not already in, not just the ones visible in whatever
     /// section this row happens to be drawn under.
@@ -972,11 +978,20 @@ struct AccountRow: View {
         if let failure = accounts.failure(for: account.name) {
             parts.append("last action failed: \(failure.summary)")
         }
+        if let failure = removeController.failure(for: account.name) {
+            parts.append("last action failed: \(failure.summary)")
+        }
         // Spoken for the same reason the pill is: a confirmation only a sighted
         // user gets is half built, and the `✓` in `rowLabel` is punctuation to a
         // screen reader.
         if let verdict = accounts.verdict(for: account.name, reportedDisabled: account.disabled) {
             parts.append(verdict.spokenLabel)
+        }
+        // Same reason `removalNoticeLine` is drawn at all: a VoiceOver user
+        // gets no other signal that the delete landed but the row did not
+        // change, since nothing here re-derives the fleet from the config.
+        if removeController.needsRestart(account.name) {
+            parts.append("removed from config, restart the proxy to apply")
         }
         return parts.joined(separator: ", ")
     }
@@ -1086,6 +1101,15 @@ struct AccountRow: View {
         }
         Divider()
         groupMenuItems
+        Divider()
+        // Last, and alone below its own rule — same placement logic as
+        // `dangerZone`'s "Take over port…": the most expensive, least
+        // reversible action on the row does not get to sit beside routine
+        // ones a misclick could land on instead.
+        Button("Delete Account…") {
+            confirmDeleteAccount()
+        }
+        .disabled(removeController.isPending(account.name))
     }
 
     /// One entry per ``Account/groupMenuActions``, wired directly to
@@ -1227,6 +1251,38 @@ struct AccountRow: View {
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         Task { await groupController.removeAll(group: group) }
+    }
+
+    /// Confirms before ``RemoveAccountController/remove(account:org:)`` — same
+    /// destructive-`NSAlert` shape as ``confirmTakeover()``/``confirmDeleteGroup(_:)``
+    /// (critical style, destructive button unlabeled-as-default, Cancel as the
+    /// actual default). Names the account, states the consequence in plain
+    /// language (this is not reversible from the UI — the saved OAuth tokens
+    /// are gone and getting the account back needs a fresh `tcr login`), and
+    /// mentions the restart requirement up front rather than letting the
+    /// operator discover it by wondering why the row is still there.
+    private func confirmDeleteAccount() {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        alert.messageText = "Delete account “\(account.name)”?"
+        alert.informativeText = """
+            This removes “\(account.name)” and its saved credentials from the config. \
+            It is not reversible from here — getting it back means running `tcr login` \
+            again from scratch.
+
+            The change does not take effect until the proxy restarts, so this row \
+            stays visible until then.
+            """
+        let delete = alert.addButton(withTitle: "Delete Account")
+        delete.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        // Cancel is the default: Return and Escape both back out.
+        alert.window.defaultButtonCell = nil
+        alert.buttons.last?.keyEquivalent = "\r"
+        delete.keyEquivalent = ""
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task { await removeController.remove(account: account.name) }
     }
 
     /// Shared by "Copy Account Name" and the per-group command copy — one
@@ -1523,7 +1579,41 @@ struct AccountRow: View {
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            if let failure = removeController.failure(for: account.name) {
+                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                    .font(Tok.detailFont)
+                    .foregroundStyle(Tok.spent)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             verdictLine
+            removalNoticeLine
+        }
+    }
+
+    /// Drawn after a successful ``RemoveAccountController/remove(account:org:)``
+    /// and never cleared while the panel stays open — the whole reason it
+    /// exists. Deleting an account is a boot-time config change (see
+    /// ``RemoveAccountControl``'s doc-comment): the call lands and the file is
+    /// correct, but this row keeps rendering exactly as it did before, because
+    /// nothing here re-derives the fleet from a config the running proxy has
+    /// not re-read. A silent success here is the exact bug this codebase
+    /// already lost an evening to for the enable/disable toggle — so this
+    /// line is what makes the true state (deleted, pending a restart) visible
+    /// instead of leaving the operator to wonder why the row never left.
+    ///
+    /// `Tok.near`, matching `verdictLine`'s `.notHonoured`/`.spokeUp` tint:
+    /// nothing failed — the delete landed — so this must not wear the error
+    /// colour the line above reserves for a `tcr` failure.
+    @ViewBuilder
+    private var removalNoticeLine: some View {
+        if removeController.needsRestart(account.name) {
+            Label(
+                "Removed from config. Restart the proxy to apply.",
+                systemImage: "arrow.triangle.2.circlepath"
+            )
+            .font(Tok.detailFont)
+            .foregroundStyle(Tok.near)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 
