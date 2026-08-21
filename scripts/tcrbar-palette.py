@@ -257,10 +257,56 @@ def check_set(label, surfaces, ink, status, failures, min_ratio=4.5):
 SWIFT_NUMERIC = re.compile(
     r"^\s*public static let (\w+): CGFloat = ([0-9.]+)\s*$", re.MULTILINE)
 
+# Mirrors SWIFT_NUMERIC's strictness exactly, for the Rust shape a future
+# token module would actually use: `pub const NAME: f64 = 12.0;` -- anchored
+# to its own line, same numeric literal, semicolon in place of nothing (Rust
+# statements need one; Swift's `let` does not). A future Rust source is not
+# required to look like this, but if it does not, that is a declaration-shape
+# change and this parser is meant to refuse exactly like SWIFT_NUMERIC does.
+RUST_NUMERIC = re.compile(
+    r"^\s*pub const (\w+): f64 = ([0-9.]+);\s*$", re.MULTILINE)
+
 
 def kebab(name):
     """`inkDim` -> `ink-dim`. CSS custom properties are conventionally kebab."""
     return re.sub(r"(?<!^)(?=[A-Z])", "-", name).lower()
+
+
+def screaming_snake(name):
+    """`inkDim` -> `INK_DIM`. Rust const convention."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).upper()
+
+
+def camel_from_screaming_snake(name):
+    """`RADIUS_SMALL` -> `radiusSmall`, the inverse of screaming_snake().
+
+    Every downstream consumer of a geometry dict (kebab() for CSS/JSON,
+    screaming_snake() for Rust) expects Swift's camelCase key shape, because
+    that is what SWIFT_NUMERIC produces. rust_geometry() normalises into that
+    same shape here so the two parsers are interchangeable past this point --
+    without it, kebab()/screaming_snake() would insert a separator before
+    every already-uppercase letter in a name that came from Rust and mangle
+    it (`RADIUS_SMALL` -> `r-a-d-i-u-s...`).
+    """
+    first, *rest = name.lower().split("_")
+    return first + "".join(word.capitalize() for word in rest)
+
+
+def _parsed_geometry(source, pattern, declaration_shape):
+    """Shared body of swift_geometry/rust_geometry: read, match, fail loud.
+
+    Both callers pass their own compiled pattern and a description of the
+    shape it expects, so the SystemExit message still names the parser that
+    came up empty rather than a generic one.
+    """
+    text = pathlib.Path(source).read_text(encoding="utf-8")
+    found = {name: value for name, value in pattern.findall(text)}
+    if not found:
+        raise SystemExit(
+            f"{source}: no `{declaration_shape}` declarations matched. The "
+            "declaration shape changed and this parser did not; refusing to "
+            "emit a stylesheet with no geometry.")
+    return found
 
 
 def swift_geometry(tokens_swift):
@@ -275,14 +321,30 @@ def swift_geometry(tokens_swift):
     a stylesheet missing half its spacing scale is worse than one that stops:
     the caller gets a file that looks complete and is not.
     """
-    text = pathlib.Path(tokens_swift).read_text(encoding="utf-8")
-    found = {name: value for name, value in SWIFT_NUMERIC.findall(text)}
-    if not found:
-        raise SystemExit(
-            f"{tokens_swift}: no `public static let <name>: CGFloat = <n>` "
-            "declarations matched. The declaration shape changed and this "
-            "parser did not; refusing to emit a stylesheet with no geometry.")
-    return found
+    return _parsed_geometry(
+        tokens_swift, SWIFT_NUMERIC,
+        "public static let <name>: CGFloat = <n>")
+
+
+def rust_geometry(tokens_rust):
+    """Read the same geometry scale out of an equivalent Rust source.
+
+    Exists so the day `Tokens.swift` moves to Rust, this generator does not
+    hard-fail a required CI check: point it at the new file with
+    `--tokens-rust` and it reads the same 21-odd constants out of
+    `pub const NAME: f64 = N;` declarations instead. Same refusal as
+    swift_geometry on zero matches -- a parser that silently returns `{}` is
+    the exact defect this file exists to refuse.
+
+    Keys are normalised from `NAME` (SCREAMING_SNAKE, Rust's convention) back
+    to `name` (camelCase, Swift's) so emit_css/emit_json/emit_rust -- all
+    written against the camelCase shape SWIFT_NUMERIC produces -- see the
+    same shape regardless of which parser ran.
+    """
+    found = _parsed_geometry(
+        tokens_rust, RUST_NUMERIC, "pub const <NAME>: f64 = <n>;")
+    return {camel_from_screaming_snake(name): value
+            for name, value in found.items()}
 
 
 def css_block(surfaces, ink, status, indent="    "):
@@ -377,6 +439,31 @@ def emit_json(path, geometry):
     return payload
 
 
+def emit_rust(path, geometry):
+    """The geometry constants alone, shaped for a future Rust token module.
+
+    Colour is not emitted here on purpose: colour is authored in this script
+    directly, not read out of a Swift or Rust source, so there is nothing to
+    mirror for it the way there is for geometry. This is the half of the
+    generated output whose *source* is about to become source-agnostic;
+    writing it out as Rust is what makes that move copy-free later instead of
+    hand-transcribed now.
+    """
+    lines = [
+        "// GENERATED by scripts/tcrbar-palette.py -- do not edit by hand.",
+        "//",
+        "// Geometry constants, read from whichever --tokens-swift /",
+        "// --tokens-rust source was authoritative when this was generated.",
+        "// Regenerate:  python3 scripts/tcrbar-palette.py --emit-rust <path>",
+        "",
+    ]
+    for name, v in sorted(geometry.items()):
+        lines.append(f"pub const {screaming_snake(name)}: f64 = {float(v)};")
+    out = "\n".join(lines) + "\n"
+    pathlib.Path(path).write_text(out, encoding="utf-8")
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Author, gate and emit the TcrBar palette.")
@@ -384,12 +471,33 @@ def main():
                         help="write CSS custom properties to PATH")
     parser.add_argument("--emit-json", metavar="PATH",
                         help="write the same tokens as JSON to PATH")
-    parser.add_argument(
-        "--tokens-swift",
-        default=str(pathlib.Path(__file__).resolve().parent.parent
-                    / "apps/macos/Sources/TcrBar/Tokens.swift"),
-        help="where the geometry scale is authored (default: the app's)")
+    parser.add_argument("--emit-rust", metavar="PATH",
+                        help="write the geometry constants as Rust consts "
+                             "to PATH")
+    default_tokens_swift = str(
+        pathlib.Path(__file__).resolve().parent.parent
+        / "apps/macos/Sources/TcrBar/Tokens.swift")
+    geometry_source = parser.add_mutually_exclusive_group()
+    geometry_source.add_argument(
+        "--tokens-swift", metavar="PATH", default=None,
+        help="where the geometry scale is authored, as Swift "
+             f"(default: {default_tokens_swift})")
+    geometry_source.add_argument(
+        "--tokens-rust", metavar="PATH", default=None,
+        help="where the geometry scale is authored, as Rust -- mutually "
+             "exclusive with --tokens-swift, never guessed from a file "
+             "extension")
     args = parser.parse_args()
+
+    # Explicit source selection, not extension-sniffing: whichever flag was
+    # actually passed picks the parser. With neither passed, Swift stays the
+    # default so today's invocation with no new flags is unchanged.
+    if args.tokens_rust is not None:
+        read_geometry = lambda: rust_geometry(args.tokens_rust)
+    else:
+        read_geometry = lambda: swift_geometry(
+            args.tokens_swift if args.tokens_swift is not None
+            else default_tokens_swift)
 
     panel = SURFACES["panel"]
     failures = []
@@ -493,22 +601,28 @@ def main():
         # under the generator's authority, into surfaces that never run the
         # check. Refusing is also the recoverable direction: a missing file is
         # obvious, a quietly wrong one is not.
-        if args.emit_css or args.emit_json:
+        if args.emit_css or args.emit_json or args.emit_rust:
             print("\nNOT emitting: the palette did not pass its own gate.")
         return 1
 
     print("All tokens pass: AA on both surfaces, in gamut, mutually distinct.")
 
-    if args.emit_css or args.emit_json:
-        geometry = swift_geometry(args.tokens_swift)
-        print(f"\ngeometry: {len(geometry)} values read from "
-              f"{pathlib.Path(args.tokens_swift).name}")
+    if args.emit_css or args.emit_json or args.emit_rust:
+        geometry = read_geometry()
+        source_name = pathlib.Path(
+            args.tokens_rust if args.tokens_rust is not None
+            else (args.tokens_swift if args.tokens_swift is not None
+                  else default_tokens_swift)).name
+        print(f"\ngeometry: {len(geometry)} values read from {source_name}")
         if args.emit_css:
             n = emit_css(args.emit_css, geometry)
             print(f"  css:  {n} custom properties -> {args.emit_css}")
         if args.emit_json:
             emit_json(args.emit_json, geometry)
             print(f"  json: -> {args.emit_json}")
+        if args.emit_rust:
+            emit_rust(args.emit_rust, geometry)
+            print(f"  rust: -> {args.emit_rust}")
 
     return 0
 
