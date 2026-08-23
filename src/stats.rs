@@ -187,6 +187,11 @@ pub struct AccountSnapshot {
     /// (`tcr group reserve`), sorted. Always an array, `[]` when none — a
     /// config fact, never `null`. See [`GateReason::Reserved`].
     pub reserved_groups: Vec<String>,
+    /// The subset of [`Self::groups`] that have opted in to letting an explicit
+    /// `--group` ask select the control account (`tcr group allow-control`),
+    /// sorted. Always an array, `[]` when none — a config fact, never `null`,
+    /// same contract as [`Self::reserved_groups`] beside it.
+    pub control_allowed_groups: Vec<String>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

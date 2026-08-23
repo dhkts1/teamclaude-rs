@@ -550,6 +550,16 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// not this, but the two fields are decoded identically on principle.
     public let reservedGroups: [String]?
 
+    /// Which of this account's own `groups` have opted in to letting an
+    /// explicit `--group` ask select the control account
+    /// (`groupSettings.<g>.allowControlAccount`, carried on the wire as
+    /// `"controlAllowedGroups"`). Repeated per row exactly the way `groups`
+    /// and `reservedGroups` already are, and optional for the same
+    /// forward-compat reason: a server built before the opt-in existed sends
+    /// no such key, and its rows must keep decoding rather than throwing the
+    /// panel back to a fabricated offline snapshot.
+    public let controlAllowedGroups: [String]?
+
     /// Every fleet group mapped to its resolved colour (`"#32d74b"`), carried
     /// onto the wire as `"groupColors"`, repeated per row exactly like
     /// `groups` and `reservedGroups` are — not a group-scoped lookup this
@@ -600,6 +610,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         serverDirty: Bool?,
         groups: [String]? = nil,
         reservedGroups: [String]? = nil,
+        controlAllowedGroups: [String]? = nil,
         groupColors: [String: String]? = nil
     ) {
         self.name = name
@@ -630,6 +641,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.serverDirty = serverDirty
         self.groups = groups
         self.reservedGroups = reservedGroups
+        self.controlAllowedGroups = controlAllowedGroups
         self.groupColors = groupColors
     }
 

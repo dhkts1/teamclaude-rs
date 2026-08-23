@@ -1136,6 +1136,15 @@ struct AccountRow: View {
                 {
                     Button("⚠︎ “\(group)” routes nothing — control account only") {}
                         .disabled(true)
+                } else if GroupRouting.allowsControlAccount(group: group, accounts: allAccounts) {
+                    // The opted-in state gets its OWN line rather than just the
+                    // absence of the warning above. Silence would be cheaper and
+                    // is the wrong call here: "opted in" and "I forgot to opt in"
+                    // would look identical, and an unroutable group that looked
+                    // fine is the exact failure this whole menu section exists
+                    // to end.
+                    Button("“\(group)” may use the control account") {}
+                        .disabled(true)
                 }
                 // The USE command, above the two removals. This slot used to copy
                 // `tcr group rm <group> <account>` — the twin of the button

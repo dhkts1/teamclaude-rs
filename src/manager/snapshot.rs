@@ -116,6 +116,7 @@ impl Manager {
         // config file's mtime has not moved.
         self.reload_groups_if_changed();
         let reserved = self.reserved_groups();
+        let control_allowed = self.control_allowed_groups();
         let now_ms = odt_to_ms(now);
         // (1) UNDER THE AFFINITY LOCK ONLY: copy every session's PIN out into a
         // local, then DROP the lock before the accounts lock below is taken — the
@@ -164,6 +165,13 @@ impl Manager {
                     .cloned()
                     .collect();
                 reserved_groups.sort();
+                let mut control_allowed_groups: Vec<String> = a
+                    .groups
+                    .iter()
+                    .filter(|g| control_allowed.contains(*g))
+                    .cloned()
+                    .collect();
+                control_allowed_groups.sort();
                 AccountSnapshot {
                     name: a.name.clone(),
                     priority: a.priority,
@@ -214,6 +222,7 @@ impl Manager {
                     last_stream_error: a.last_stream_error.clone(),
                     groups: a.groups.clone(),
                     reserved_groups,
+                    control_allowed_groups,
                 }
             })
             .collect();

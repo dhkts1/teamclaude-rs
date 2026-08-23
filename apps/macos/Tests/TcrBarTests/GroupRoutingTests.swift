@@ -59,6 +59,40 @@ final class GroupRoutingTests: XCTestCase {
             GroupRouting.routes(group: "research", accounts: accounts, controlName: nil))
     }
 
+    /// The opt-in makes a control-only group routable — the panel must not keep
+    /// warning about a group the proxy will now happily serve.
+    func testAnOptedInControlOnlyGroupRoutes() {
+        let accounts = [
+            routingAccount("gil@example.com", groups: ["research"], controlAllowed: ["research"])
+        ]
+        XCTAssertTrue(
+            GroupRouting.routes(
+                group: "research", accounts: accounts, controlName: "gil@example.com"))
+        XCTAssertTrue(GroupRouting.allowsControlAccount(group: "research", accounts: accounts))
+    }
+
+    /// Opting in one group must not quietly opt in a different one.
+    func testTheOptInIsPerGroup() {
+        let accounts = [
+            routingAccount("gil@example.com", groups: ["research", "secret"], controlAllowed: ["research"])
+        ]
+        XCTAssertFalse(GroupRouting.allowsControlAccount(group: "secret", accounts: accounts))
+        XCTAssertFalse(
+            GroupRouting.routes(group: "secret", accounts: accounts, controlName: "gil@example.com"))
+    }
+
+    /// A server too old to send `controlAllowedGroups` reports nil, which must
+    /// read as "not opted in" — the pre-feature behaviour, and the safe way to
+    /// be wrong: warn about a group that works rather than stay silent about one
+    /// that does not.
+    func testAMissingFieldReadsAsNotOptedIn() {
+        let accounts = [routingAccount("gil@example.com", groups: ["research"], controlAllowed: nil)]
+        XCTAssertFalse(GroupRouting.allowsControlAccount(group: "research", accounts: accounts))
+        XCTAssertFalse(
+            GroupRouting.routes(
+                group: "research", accounts: accounts, controlName: "gil@example.com"))
+    }
+
     /// A label nobody carries routes nothing — there is no member to serve it.
     func testALabelNoAccountCarriesDoesNotRoute() {
         let accounts = [routingAccount("a@example.com", groups: ["dev"])]
@@ -68,7 +102,9 @@ final class GroupRoutingTests: XCTestCase {
 }
 
 /// Hand-built accounts with the fields this file's assertions touch.
-private func routingAccount(_ name: String, groups: [String]?) -> Account {
+private func routingAccount(
+    _ name: String, groups: [String]?, controlAllowed: [String]? = nil
+) -> Account {
     Account(
         name: name,
         priority: 1,
@@ -92,6 +128,7 @@ private func routingAccount(_ name: String, groups: [String]?) -> Account {
         source: .live,
         serverSha: "abc1234",
         serverDirty: false,
-        groups: groups
+        groups: groups,
+        controlAllowedGroups: controlAllowed
     )
 }
