@@ -35,6 +35,64 @@ pub(super) enum RequestClass {
     ControlPreferred,
 }
 
+/// Why the group-respecting first pass of [`Manager::select_with_group`] came up
+/// empty, so the soft fallback had to drop the group and serve from the whole
+/// pool.
+///
+/// Exists because the log line at that fallback used to hardcode "under pacing"
+/// for every group miss. Pacing ships OFF ([`crate::config::default_pacing`]), so
+/// on a default install that sentence named the one constraint that was NOT in
+/// play and hid the one that was. Measured on the live fleet 2026-08-23: a group
+/// whose only member was the control account fell back on 3 of 3 probes (a
+/// two-account group landed in-group 3 of 3), and every one of the nine log lines
+/// produced while diagnosing it blamed pacing, which was unconfigured.
+///
+/// [`Self::OnlyControl`] is the arm that matters: it is not a transient miss. No
+/// retry, no quota recovering and no restart fixes it, because the exclusion is
+/// unconditional for [`RequestClass::Inference`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GroupMiss {
+    /// No configured account carries this label at all — a typo, or a label
+    /// removed from every account while a client still asks for it.
+    Unknown,
+    /// Every member is the control account, which an inference request never
+    /// selects. This group can NEVER serve inference.
+    OnlyControl,
+    /// Members exist and are selectable in principle, but every one is held out
+    /// right now by a hard gate: disabled, errored, rate-limited, over its
+    /// switch threshold, model-blocked, or reserved away from this caller.
+    AllGated,
+    /// At least one member would serve but for the SOFT pacing gate — the only
+    /// arm the old message was ever right about.
+    Paced,
+}
+
+impl GroupMiss {
+    /// One greppable token for the `reason=` log field, so an operator can count
+    /// group misses by cause without parsing prose.
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "no-such-group",
+            Self::OnlyControl => "control-account-only",
+            Self::AllGated => "all-members-unavailable",
+            Self::Paced => "all-members-paced",
+        }
+    }
+
+    /// The sentence a human reads in the log. Says what to DO about it in the
+    /// one case that has a remedy the operator must apply by hand.
+    pub(super) fn explain(self) -> &'static str {
+        match self {
+            Self::Unknown => "no configured account carries the requested group",
+            Self::OnlyControl => {
+                "the requested group's only member is the control account, which inference never selects — no request will ever route to this group until another account joins it or the control account is cleared"
+            }
+            Self::AllGated => "every account in the requested group is currently unavailable",
+            Self::Paced => "every account in the requested group is paced out",
+        }
+    }
+}
+
 /// Classify an unpinned request's path into the three-way split. Exact match
 /// for the two inference paths (mirrors `stable_session_key`'s
 /// `/v1/messages/count_tokens must NOT prefix-match /v1/messages` guard);
@@ -786,19 +844,25 @@ impl Manager {
             // Modeled as an extra `tried` member rather than a new parameter
             // threaded through `pick_eligible`/`pick_least_loaded`, so both
             // passes (and the pacing/least-loaded fallback) honour it for free.
-            let pool_tried: std::borrow::Cow<'_, HashSet<usize>> =
-                if request_class == RequestClass::Inference {
-                    match self.control() {
-                        Some(control_idx) if !tried.contains(&control_idx) => {
-                            let mut t = tried.clone();
-                            t.insert(control_idx);
-                            std::borrow::Cow::Owned(t)
-                        }
-                        _ => std::borrow::Cow::Borrowed(tried),
-                    }
-                } else {
-                    std::borrow::Cow::Borrowed(tried)
-                };
+            //
+            // Hoisted into its own binding (it used to be inlined in the `match`
+            // below) because the group-miss classifier on the fallback path needs
+            // the SAME answer: an account held out only by this exclusion is the
+            // one case where a `--group` ask can never be satisfied by any retry,
+            // and naming it requires knowing which index was excluded and why.
+            let control_excluded: Option<usize> = if request_class == RequestClass::Inference {
+                self.control()
+            } else {
+                None
+            };
+            let pool_tried: std::borrow::Cow<'_, HashSet<usize>> = match control_excluded {
+                Some(control_idx) if !tried.contains(&control_idx) => {
+                    let mut t = tried.clone();
+                    t.insert(control_idx);
+                    std::borrow::Cow::Owned(t)
+                }
+                _ => std::borrow::Cow::Borrowed(tried),
+            };
             let pool_tried: &HashSet<usize> = &pool_tried;
 
             // First pass: honour pacing (skip accounts at the concurrency cap or
@@ -828,12 +892,28 @@ impl Manager {
                         // `--group` did not land where expected must not read a log
                         // line about pacing when pacing was never the reason.
                         match group {
-                            Some(g) => tracing::info!(
-                                account = %account.name,
-                                in_flight = account.in_flight,
-                                group = g,
-                                "group: requested group had no eligible account under pacing — falling back to the whole pool (group and pacing both ignored), serving least-loaded"
-                            ),
+                            Some(g) => {
+                                let miss = Self::classify_group_miss(
+                                    &accounts,
+                                    tried,
+                                    control_excluded,
+                                    self.global_threshold,
+                                    &self.pacing,
+                                    now,
+                                    now_ms,
+                                    is_fable,
+                                    g,
+                                    &reserved_groups,
+                                );
+                                tracing::info!(
+                                    account = %account.name,
+                                    in_flight = account.in_flight,
+                                    group = g,
+                                    reason = miss.as_str(),
+                                    "group: falling back to the whole pool (group ignored), serving least-loaded — {}",
+                                    miss.explain(),
+                                );
+                            }
                             None => tracing::info!(
                                 account = %account.name,
                                 in_flight = account.in_flight,
@@ -1528,6 +1608,79 @@ impl Manager {
             }
         }
         true
+    }
+
+    /// Why the group-respecting pass found nothing — see [`GroupMiss`].
+    ///
+    /// Called ONLY from the soft fallback, which runs after that pass already
+    /// returned `None`, so this scan costs nothing on a request that routes
+    /// normally. Pure: takes the accounts slice the caller already holds a guard
+    /// on, and reads no lock of its own.
+    ///
+    /// `control_excluded` is the index [`Self::select_with_group`] forced into
+    /// its pool-`tried` set for THIS request — `Some` only for an inference
+    /// request with a control account configured. Passed in rather than
+    /// re-derived from `self.control()` so the answer here can never disagree
+    /// with the exclusion that actually ran: the classifier's whole job is to
+    /// name that exclusion when it is the reason.
+    ///
+    /// `tried` is the caller's ORIGINAL set, deliberately not the
+    /// control-injected `pool_tried` — a member that is only in the set because
+    /// of the injection must be attributed to [`GroupMiss::OnlyControl`], not
+    /// silently counted as "already tried".
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn classify_group_miss(
+        accounts: &[AccountRuntime],
+        tried: &HashSet<usize>,
+        control_excluded: Option<usize>,
+        global_threshold: f64,
+        pacing: &PacingConfig,
+        now: OffsetDateTime,
+        now_ms: i64,
+        is_fable: bool,
+        group: &str,
+        reserved: &HashSet<String>,
+    ) -> GroupMiss {
+        let members: Vec<usize> = accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, account)| account.groups.iter().any(|label| label == group))
+            .map(|(idx, _)| idx)
+            .collect();
+        if members.is_empty() {
+            return GroupMiss::Unknown;
+        }
+        if members.iter().all(|idx| Some(*idx) == control_excluded) {
+            return GroupMiss::OnlyControl;
+        }
+        // Would any member serve with the soft pacing gate lifted? If yes, pacing
+        // really was the reason and the old message was right by accident. If no,
+        // the members are hard-gated, and saying "paced" would be the same lie in
+        // the other direction — which is exactly the defect this classifier exists
+        // to end, so it must not be reintroduced here.
+        let servable_unpaced = members.iter().any(|idx| {
+            Some(*idx) != control_excluded
+                && !tried.contains(idx)
+                && accounts.get(*idx).is_some_and(|account| {
+                    Self::eligible(
+                        account,
+                        global_threshold,
+                        pacing,
+                        false,
+                        now,
+                        now_ms,
+                        is_fable,
+                        Some(group),
+                        Some(group),
+                        reserved,
+                    )
+                })
+        });
+        if servable_unpaced {
+            GroupMiss::Paced
+        } else {
+            GroupMiss::AllGated
+        }
     }
 
     /// `reserved_group` is the SESSION's real requested group, used ONLY for
@@ -2543,5 +2696,139 @@ mod reserved_gate_agreement_tests {
                 Manager::account_gate(&account, 0.90, now, now_ms, false, Some(ask), &reserved);
             assert_ne!(gate, GateReason::Reserved, "ask={ask}: account_gate agrees");
         }
+    }
+}
+
+/// Group-miss classification (`Manager::classify_group_miss`): the log line at
+/// the soft fallback must name the constraint that was actually in play.
+///
+/// The arm that earns the module is [`GroupMiss::OnlyControl`]. Before this
+/// existed, a group whose only member was the control account fell back on every
+/// single request and the log said "under pacing" — on a fleet where pacing was
+/// unconfigured. These tests pin each cause to its own answer so the message can
+/// never again describe a constraint that was switched off.
+#[cfg(test)]
+mod group_miss_tests {
+    use super::*;
+    use crate::config::{Account, PacingConfig};
+
+    fn account(name: &str, groups: &[&str], disabled: bool) -> AccountRuntime {
+        AccountRuntime::from_config(
+            &Account {
+                name: name.to_string(),
+                account_type: "oauth".to_string(),
+                account_uuid: None,
+                org_uuid: None,
+                org_name: None,
+                access_token: format!("at-{name}"),
+                refresh_token: None,
+                expires_at: Some(crate::now_ms() + 3_600_000),
+                priority: Some(0),
+                switch_threshold: None,
+                disabled: disabled.then_some(true),
+                groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                extra: serde_json::Map::new(),
+            },
+            false,
+        )
+    }
+
+    fn classify(
+        accounts: &[AccountRuntime],
+        control_excluded: Option<usize>,
+        pacing: &PacingConfig,
+        group: &str,
+    ) -> GroupMiss {
+        let now = OffsetDateTime::now_utc();
+        Manager::classify_group_miss(
+            accounts,
+            &HashSet::new(),
+            control_excluded,
+            0.95,
+            pacing,
+            now,
+            odt_to_ms(now),
+            false,
+            group,
+            &HashSet::new(),
+        )
+    }
+
+    /// The live defect, in one assertion: `research` holds exactly one account
+    /// and that account is the control one, which inference never picks. The
+    /// group is not busy and not paced — it is permanently unroutable, and the
+    /// reason must say so.
+    #[test]
+    fn a_group_holding_only_the_control_account_is_named_control_account_only() {
+        let accounts = [
+            account("gil@example.com", &["research"], false),
+            account("worker@example.com", &[], false),
+        ];
+        let miss = classify(&accounts, Some(0), &PacingConfig::default(), "research");
+        assert_eq!(miss, GroupMiss::OnlyControl, "{miss:?}");
+        assert_eq!(miss.as_str(), "control-account-only");
+        assert!(
+            miss.explain().contains("control account"),
+            "the sentence an operator reads must name the control account: {}",
+            miss.explain()
+        );
+    }
+
+    /// Same fleet, same group — but the request is NOT inference, so nothing
+    /// excluded the control account and the group is perfectly routable. Guards
+    /// against reporting `OnlyControl` from group shape alone.
+    #[test]
+    fn the_same_group_is_not_control_blocked_when_nothing_was_excluded() {
+        let accounts = [
+            account("gil@example.com", &["research"], false),
+            account("worker@example.com", &[], false),
+        ];
+        assert_ne!(
+            classify(&accounts, None, &PacingConfig::default(), "research"),
+            GroupMiss::OnlyControl
+        );
+    }
+
+    /// A label no account carries is its own cause — a typo or a label removed
+    /// from every account, not a busy group.
+    #[test]
+    fn a_label_no_account_carries_is_unknown() {
+        let accounts = [account("worker@example.com", &["dev"], false)];
+        assert_eq!(
+            classify(&accounts, None, &PacingConfig::default(), "resarch"),
+            GroupMiss::Unknown
+        );
+    }
+
+    /// A second, non-control member exists, so the group is not control-blocked
+    /// — but it is disabled, which is a hard gate and not pacing.
+    #[test]
+    fn a_hard_gated_member_is_unavailable_not_paced() {
+        let accounts = [
+            account("gil@example.com", &["research"], false),
+            account("worker@example.com", &["research"], true),
+        ];
+        assert_eq!(
+            classify(&accounts, Some(0), &PacingConfig::default(), "research"),
+            GroupMiss::AllGated
+        );
+    }
+
+    /// The one case the old hardcoded message was right about: pacing is
+    /// configured, the member is healthy, and it is inside its min-spacing
+    /// window. Pacing keeps its name — the fix is not to stop saying "paced",
+    /// it is to stop saying it when pacing is off.
+    #[test]
+    fn a_healthy_member_inside_the_spacing_window_is_paced() {
+        let pacing = PacingConfig {
+            max_in_flight_per_account: None,
+            min_spacing_ms: Some(60_000),
+        };
+        let mut accounts = [account("worker@example.com", &["research"], false)];
+        accounts[0].last_served_ms = crate::now_ms();
+        assert_eq!(
+            classify(&accounts, None, &pacing, "research"),
+            GroupMiss::Paced
+        );
     }
 }
