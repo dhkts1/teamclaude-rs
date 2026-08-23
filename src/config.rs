@@ -702,10 +702,84 @@ pub fn default_path() -> PathBuf {
     home.join(".config").join("teamclaude.json")
 }
 
+/// Whether an on-disk `accounts[]` entry can yield a usable credential, and if
+/// not, the account's `name` and why — for the warning [`load`] emits when it
+/// drops the entry. An `apikey` account needs `apiKey`; every other type
+/// (including the implicit `oauth` default) needs a non-empty `accessToken`.
+/// An `importFrom`-shaped entry (a bare pointer at another file, resolved by
+/// upstream at startup — not implemented here, see `config-bridge-coder.md`)
+/// has no inline token either, so it falls out through the same check.
+fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
+    let name = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unnamed>")
+        .to_string();
+    let has_nonempty = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    };
+    let is_apikey = entry.get("type").and_then(Value::as_str) == Some("apikey");
+    if is_apikey {
+        if has_nonempty("apiKey") {
+            None
+        } else {
+            Some((name, "apiKey"))
+        }
+    } else if has_nonempty("accessToken") {
+        None
+    } else {
+        Some((name, "accessToken"))
+    }
+}
+
 /// Load and parse the config at `path`.
+///
+/// Deserializes leniently at the account boundary: an `accounts[]` entry that
+/// cannot yield a usable credential ([`unusable_account`]) is dropped, with a
+/// warning naming it, rather than failing the WHOLE file the way a plain
+/// `serde_json::from_str` over `Config` would — `Account::access_token` is a
+/// required `String` with no `serde(default)` (deliberately: an empty-string
+/// token must never reach rotation and send `Bearer ` upstream), so one such
+/// entry used to take every other account in the file down with it. Upstream
+/// (`resolve-accounts.js`) skips an unusable account the same way rather than
+/// crashing the fleet. Every `Account` that survives into memory still has a
+/// real, non-empty credential — the 142 call sites reading `access_token` as a
+/// plain `String` are entitled to assume that.
+///
+/// If every account entry is unusable, that is still an error (an empty fleet
+/// booting silently is its own bug) — reported through the same
+/// [`ConfigError::Parse`] shape a malformed file already uses, not a new
+/// variant.
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let data = fs::read_to_string(path)?;
-    let config = serde_json::from_str(&data)?;
+    let mut doc: Value = serde_json::from_str(&data)?;
+
+    if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
+        let had_accounts = !accounts.is_empty();
+        let mut skipped = Vec::new();
+        accounts.retain(|entry| match unusable_account(entry) {
+            None => true,
+            Some((name, reason)) => {
+                tracing::warn!(account = %name, missing = reason, "No token for \"{name}\", skipping");
+                skipped.push(name);
+                false
+            }
+        });
+        if had_accounts && accounts.is_empty() {
+            return Err(ConfigError::Parse(
+                <serde_json::Error as serde::de::Error>::custom(format!(
+                    "no usable accounts remain after skipping {} without a credential: {}",
+                    skipped.len(),
+                    skipped.join(", ")
+                )),
+            ));
+        }
+    }
+
+    let config = serde_json::from_value(doc)?;
     Ok(config)
 }
 
@@ -2207,6 +2281,85 @@ mod tests {
         let reloaded: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
         assert_eq!(reloaded.accounts[0].groups, config.accounts[0].groups);
         fs::remove_file(&tmp).ok();
+    }
+
+    // --- load: skip unusable accounts, keep the rest -------------------------
+
+    /// One account with no `accessToken` (an `importFrom`-shaped entry, e.g.:
+    /// upstream reads the credential from another file at startup — not
+    /// implemented here) does not take the other, usable accounts down with
+    /// it, and the skipped account is named in a warning rather than silently
+    /// vanishing.
+    #[test]
+    fn load_skips_one_unusable_account_and_keeps_the_rest() {
+        let path = tmp_path("load-skip-one");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-good", "accessToken": "at-good" },
+                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "acct-good");
+        assert_eq!(config.accounts[0].access_token, "at-good");
+        fs::remove_file(&path).ok();
+    }
+
+    /// An `apikey` account with no `apiKey` is unusable by the same rule an
+    /// `oauth` account with no `accessToken` is — skipped, not fatal.
+    #[test]
+    fn load_skips_apikey_account_missing_api_key() {
+        let path = tmp_path("load-skip-apikey");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-good", "accessToken": "at-good" },
+                 { "name": "acct-apikey", "type": "apikey" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "acct-good");
+        fs::remove_file(&path).ok();
+    }
+
+    /// Every account unusable is still a load error — an empty fleet must
+    /// never boot silently — reported through the same `ConfigError::Parse`
+    /// shape a malformed file already uses.
+    #[test]
+    fn load_errors_when_every_account_is_unusable() {
+        let path = tmp_path("load-all-unusable");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected a Parse-shaped error, got {err:?}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// An empty `accounts` list is not "all unusable" — it is unchanged,
+    /// pre-existing, valid behaviour (no accounts configured at all).
+    #[test]
+    fn load_tolerates_empty_accounts_list() {
+        let path = tmp_path("load-empty-accounts");
+        fs::write(&path, r#"{ "accounts": [] }"#).unwrap();
+        let config = load(&path).unwrap();
+        assert!(config.accounts.is_empty());
+        fs::remove_file(&path).ok();
     }
 
     // --- group color ---------------------------------------------------------
