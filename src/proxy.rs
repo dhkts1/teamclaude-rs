@@ -3603,6 +3603,7 @@ mod tests {
 
     fn dummy_config(api_key: Option<&str>, upstream: &str) -> Config {
         Config {
+            quarantined_accounts: Vec::new(),
             proxy: ProxyConfig {
                 port: 0,
                 api_key: api_key.map(str::to_string),

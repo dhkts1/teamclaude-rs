@@ -603,6 +603,16 @@ pub struct Config {
     /// Any top-level keys we do not model, preserved verbatim on save.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+    /// Names of `accounts[]` entries [`load`] dropped because they carried no
+    /// usable credential ([`unusable_account`]) — see `load`'s doc-comment.
+    /// Populated ONLY by `load`; `#[serde(skip)]` so it is never read from or
+    /// written to the file — a `save()`/`save_tokens()` round-trip of a
+    /// `Config` carrying quarantined names must not fabricate an `accounts[]`
+    /// entry for them, and must not accept one from a hand-edited file either.
+    /// Empty for a `Config` built any other way (a test's
+    /// `serde_json::from_str`, `Config::default()`-shaped construction).
+    #[serde(skip)]
+    pub quarantined_accounts: Vec<String>,
 }
 
 impl Config {
@@ -753,18 +763,24 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 /// booting silently is its own bug) — reported through the same
 /// [`ConfigError::Parse`] shape a malformed file already uses, not a new
 /// variant.
+///
+/// The names of every quarantined account land in
+/// [`Config::quarantined_accounts`] — not just the log line — so a caller
+/// that cannot tolerate a quietly-shrunk fleet (the CLI's edit verbs; see
+/// `cli::load_for_edit`) can refuse instead of writing a `save()` that would
+/// permanently drop the entry's raw JSON (its `importFrom` pointer included).
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let data = fs::read_to_string(path)?;
     let mut doc: Value = serde_json::from_str(&data)?;
+    let mut quarantined = Vec::new();
 
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
         let had_accounts = !accounts.is_empty();
-        let mut skipped = Vec::new();
         accounts.retain(|entry| match unusable_account(entry) {
             None => true,
             Some((name, reason)) => {
                 tracing::warn!(account = %name, missing = reason, "No token for \"{name}\", skipping");
-                skipped.push(name);
+                quarantined.push(name);
                 false
             }
         });
@@ -772,14 +788,15 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
             return Err(ConfigError::Parse(
                 <serde_json::Error as serde::de::Error>::custom(format!(
                     "no usable accounts remain after skipping {} without a credential: {}",
-                    skipped.len(),
-                    skipped.join(", ")
+                    quarantined.len(),
+                    quarantined.join(", ")
                 )),
             ));
         }
     }
 
-    let config = serde_json::from_value(doc)?;
+    let mut config: Config = serde_json::from_value(doc)?;
+    config.quarantined_accounts = quarantined;
     Ok(config)
 }
 
@@ -2360,6 +2377,62 @@ mod tests {
         let config = load(&path).unwrap();
         assert!(config.accounts.is_empty());
         fs::remove_file(&path).ok();
+    }
+
+    /// `load` names every account it drops in
+    /// [`Config::quarantined_accounts`], not only in the log line — the CLI's
+    /// `load_for_edit` refuses on this rather than risk a `save()` that would
+    /// permanently erase the entry.
+    #[test]
+    fn load_reports_quarantined_account_names() {
+        let path = tmp_path("load-quarantine-names");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-good", "accessToken": "at-good" },
+                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
+        fs::remove_file(&path).ok();
+    }
+
+    /// `quarantined_accounts` is `#[serde(skip)]`: a `Config` carrying names in
+    /// it must not write them anywhere on `save()`, and a hand-edited file
+    /// carrying a same-named key must not be read into it either — the field
+    /// exists purely for the in-process caller, never the file.
+    #[test]
+    fn quarantined_accounts_do_not_serialize() {
+        let path = tmp_path("load-quarantine-serialize");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-good", "accessToken": "at-good" },
+                 { "name": "acct-import", "importFrom": "/some/other/file.json" }
+               ] }"#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert_eq!(config.quarantined_accounts, vec!["acct-import".to_string()]);
+
+        let out = tmp_path("load-quarantine-serialize-out");
+        save(&out, &config).unwrap();
+        let value = read_json(&out);
+        assert!(
+            value.get("quarantinedAccounts").is_none()
+                && value.get("quarantined_accounts").is_none(),
+            "quarantined_accounts leaked into the saved file: {value}"
+        );
+        // Round-tripping the SAVED file back through `load` must not resurrect
+        // a `quarantinedAccounts` key from the file into the field either.
+        let reloaded = load(&out).unwrap();
+        assert!(reloaded.quarantined_accounts.is_empty());
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&out).ok();
     }
 
     // --- group color ---------------------------------------------------------
