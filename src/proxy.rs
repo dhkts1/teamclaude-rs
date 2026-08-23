@@ -2031,6 +2031,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // case it actually describes — nothing ever reached an upstream at all.
     let mut transport_failures = 0usize;
     let mut upstream_responses = 0usize;
+    // Accounts upstream refused with a 403 on OUR pooled credential, in the order
+    // seen. Every entry here is also an `upstream_responses` and a `tried` — a 403
+    // is a real answer, not a transport gap, and there is nothing to retry on the
+    // same account (unlike 401, a fresh token does not change WHICH account this
+    // is). Kept as `(idx, name)` rather than folded into a bare counter because the
+    // fast-fail response below must name the refused account(s), not just count
+    // them.
+    let mut refused_403: Vec<(usize, Option<String>)> = Vec::new();
     // Bound the total attempts so per-account 401/429 retries can never loop.
     let max_attempts = max_attempts_for(account_count);
     // The account the NEXT iteration must use, bypassing select(). Two producers:
@@ -2119,6 +2127,21 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             return offline_unavailable(offline_failures);
                         }
                         return bad_gateway(transport_failures);
+                    }
+                    // Every upstream answer this request got was a 403 refusing OUR
+                    // credential — refusals are the WHOLE story, not one dead
+                    // account among others still worth a 429/quota wait. Fast-fail
+                    // here, before the soft-wait and revalidation-serve below: those
+                    // exist to ride out a transient PARK, and a 403'd credential is
+                    // not coming back on a timer. Gated on `upstream_responses`
+                    // (mirroring `every_attempt_transport_failed` above), not on
+                    // `account_count`, so this fires equally for a pinned request
+                    // that only ever tried its one pin. Mixed outcomes — some
+                    // accounts refused, others merely exhausted — fall through
+                    // unchanged to the existing exhaustion handling, which can still
+                    // recover on the accounts that were not refused.
+                    if !refused_403.is_empty() && refused_403.len() == upstream_responses {
+                        return credential_refused_response(&refused_403);
                     }
                     // A cold shared-limiter burst parks the whole fleet for ~15-20s.
                     // Rather than telling the client "all exhausted" for a transient
@@ -2435,6 +2458,31 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // A genuinely dead credential is still caught at the source: its refresh
             // 400s and the AuthRejected arm sets `Error` there. Here we just rotate —
             // this request fails over and the account stays eligible for the next one.
+            tried.insert(idx);
+            continue;
+        }
+
+        // 403 → upstream refuses the credential WE injected. The client never saw
+        // it and can do nothing about it, so this must never reach them as-is:
+        // Claude Code reads a 403 as "your own session is dead" and drops the
+        // user's login over an account problem that is not theirs. Rotate away, as
+        // the 401 branch above does — this account may simply be disabled or
+        // region-blocked while its siblings are fine.
+        //
+        // Deliberately does NOT set the terminal `Error` account status, for the
+        // same reason the 401 branch above does not: `Error` is permanent, skipped
+        // by the prober and by selection, and the only thing that clears it is a
+        // successful refresh, which can never run on a row nobody selects again.
+        // A 403 here is evidence about THIS request's account access, not proof the
+        // refresh token itself is dead — that is still caught at the source, where
+        // a rejected refresh sets `Error` directly.
+        if status == StatusCode::FORBIDDEN {
+            tracing::warn!(
+                account = account_name.as_deref().unwrap_or("?"),
+                account_index = idx,
+                "upstream 403 Forbidden — credential refused, rotating to another account"
+            );
+            refused_403.push((idx, account_name.clone()));
             tried.insert(idx);
             continue;
         }
@@ -3593,6 +3641,38 @@ fn offline_unavailable(dns_failures: usize) -> Response {
              offline. No account was rotated. Retry in {OFFLINE_RETRY_AFTER_SECS}s."
         ),
         Some(OFFLINE_RETRY_AFTER_SECS),
+    )
+}
+
+/// 502 when every upstream answer this request got was a 403 refusing OUR pooled
+/// credential — see the 403 branch above and its gate,
+/// `refused_403.len() == upstream_responses`, in the `None`-from-`select` arm.
+///
+/// Not a 429: waiting will not help, so a `retry-after` would be a lie. Not the
+/// bare 403 forwarded — the client never saw the credential upstream refused and
+/// re-authenticating THEIR session cannot fix an account problem that is entirely
+/// ours. `proxy_error`, naming the refused account(s), so whoever reads the log
+/// knows which credential(s) need attention (most likely re-login) rather than
+/// guessing from a blank 502.
+fn credential_refused_response(refused: &[(usize, Option<String>)]) -> Response {
+    let account_list: Vec<String> = refused
+        .iter()
+        .map(|(idx, name)| format!("{} (index {idx})", name.as_deref().unwrap_or("<unnamed>")))
+        .collect();
+    tracing::warn!(
+        refused_accounts = account_list.join(", "),
+        "returning 502 to client — every account tried was refused with a 403; \
+         re-login is likely required"
+    );
+    error_response(
+        StatusCode::BAD_GATEWAY,
+        "proxy_error",
+        &format!(
+            "Account credential(s) refused by upstream: {}. Re-login to the account \
+             (`tcr login` or the TcrBar UI) — retrying will not help.",
+            account_list.join(", ")
+        ),
+        None,
     )
 }
 
@@ -8840,6 +8920,14 @@ mod tests {
         "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
     }
 
+    /// A bare `403 Forbidden` — upstream refusing the pooled credential itself,
+    /// distinct from `local_endpoint_gate`'s own 403 (never sent upstream) and from
+    /// a `RelayMode::ClientCredential` 403 (a different code path entirely; see
+    /// `CLIENT_CREDENTIAL_PREFIXES`).
+    fn raw_403() -> String {
+        "HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+    }
+
     /// A `529 Overloaded` shaped like Anthropic's — the status the retry ladder
     /// exists for. Carries NO `retry-after` (the live captures do not), so the
     /// backoff comes from the ladder alone and the test's timing is deterministic.
@@ -9704,6 +9792,98 @@ mod tests {
             a.requests, 1,
             "and it comes HOME to the pinned account — the divert really was for one \
              request only"
+        );
+    }
+
+    /// A 403 refusing OUR pooled credential on account `a` must fail over to `b`,
+    /// never reach the client verbatim: Claude Code reads a bare 403 as its OWN
+    /// session being dead and drops the user's login over an account problem that
+    /// is entirely ours.
+    #[tokio::test]
+    async fn forbidden_403_fails_over_to_another_account() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_403()), Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        assert_eq!(
+            post_one(manager.clone()).await,
+            200,
+            "the 403 must never reach the client — it names a credential the client \
+             never saw and cannot act on"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "exactly one rotation: refused on `a`, served by `b`"
+        );
+        assert_eq!(
+            manager.account_status(0),
+            Some(AccountStatus::Active),
+            "a 403 is evidence about THIS request's access, not proof the refresh \
+             token is dead — the account must stay eligible for the next request, \
+             the same rule the 401 branch already follows"
+        );
+    }
+
+    /// When 403s cover the WHOLE eligible fleet, the client must get a 502
+    /// `proxy_error` naming the refused account(s) — never the bare upstream 403
+    /// (unusable: names a credential the client cannot act on) and never a
+    /// synthesized 429 (a lie: waiting will not fix a refused credential).
+    #[tokio::test]
+    async fn forbidden_403_fast_fails_when_the_whole_fleet_is_refused() {
+        // One script entry, reused for every connection: 403, anywhere.
+        let (up_addr, attempts) = spawn_counted_upstream(vec![Some(raw_403())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let (status, body) = post_one_with_body(manager.clone()).await;
+        assert_eq!(
+            status, 502,
+            "both accounts refused — refusals are the WHOLE story, so this must \
+             fast-fail rather than fall through to the generic exhaustion 429"
+        );
+        assert!(
+            body.contains("proxy_error"),
+            "must use the proxy_error envelope, not forward the 403: {body}"
+        );
+        assert!(
+            body.contains("a (index 0)") && body.contains("b (index 1)"),
+            "must name the refused accounts so the reader knows which credential(s) \
+             need attention: {body}"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "every account in the fleet was tried exactly once, then the fast-fail \
+             fired — no retry loop on a refusal"
+        );
+    }
+
+    /// A MIX of a 403 refusal and an ordinary quota rejection must NOT fast-fail:
+    /// the refusal does not account for the whole story, and the account that was
+    /// merely rate-limited can still recover on its own hold timer. This is the
+    /// upstream follow-up fix's whole point — a naive short-circuit at the top of
+    /// the no-account branch turns one dead credential into a hard error for every
+    /// recoverable exhaustion too.
+    #[tokio::test]
+    async fn forbidden_403_mixed_with_quota_exhaustion_falls_through_to_existing_handling() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_403()),               // `a` — refused
+            Some(raw_429_rejected(3_600)), // `b` — durable quota rejection
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        let status = post_one(manager.clone()).await;
+        assert_eq!(
+            status, 429,
+            "one refusal among a mixed fleet must fall through to the EXISTING \
+             exhaustion handling (a 429), not the 403 fast-fail's 502 — the \
+             quota-rejected account might still recover on its own hold"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both accounts were tried once each before the fleet-exhausted 429"
         );
     }
 
