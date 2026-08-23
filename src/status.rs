@@ -230,6 +230,12 @@ pub struct AccountStatus {
     /// reservation entirely.
     #[serde(default)]
     pub reserved_groups: Vec<String>,
+    /// The opted-in subset of [`Self::groups`] — see
+    /// [`AccountSnapshot::control_allowed_groups`]. `#[serde(default)]` for the
+    /// same forward-compat reason as the two fields above: a server that
+    /// predates the opt-in omits it entirely.
+    #[serde(default)]
+    pub control_allowed_groups: Vec<String>,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -287,6 +293,7 @@ impl StatusPayload {
                 last_stream_error: a.last_stream_error.clone(),
                 groups: a.groups.clone(),
                 reserved_groups: a.reserved_groups.clone(),
+                control_allowed_groups: a.control_allowed_groups.clone(),
             })
             .collect();
         Self {
@@ -342,6 +349,7 @@ impl StatusPayload {
                     last_stream_error: a.last_stream_error,
                     groups: a.groups,
                     reserved_groups: a.reserved_groups,
+                    control_allowed_groups: a.control_allowed_groups,
                 }
             })
             .collect();
@@ -390,6 +398,7 @@ mod tests {
                 last_stream_error: None,
                 groups: vec!["codereview".to_string()],
                 reserved_groups: vec!["codereview".to_string()],
+                control_allowed_groups: vec!["codereview".to_string()],
             }],
             current: Some(0),
             recent: Vec::new(),

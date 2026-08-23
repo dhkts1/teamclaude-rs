@@ -91,6 +91,13 @@ pub struct AccountStatusRow {
     pub rate_limited_until_ms: Option<i64>,
     pub groups: Vec<String>,
     pub reserved_groups: Vec<String>,
+    /// The subset of [`Self::groups`] that have opted in to letting an explicit
+    /// `--group` ask select the control account (`groupSettings.<g>.allowControlAccount`).
+    /// Rides beside `reserved_groups` and for the same reason: the panel decides
+    /// whether a group can route at all, and it cannot answer that from
+    /// membership alone once the opt-in exists.
+    #[serde(default)]
+    pub control_allowed_groups: Vec<String>,
     /// Every group on the fleet mapped to its resolved color, repeated per row.
     pub group_colors: BTreeMap<String, String>,
 }

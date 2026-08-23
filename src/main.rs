@@ -166,7 +166,7 @@ struct GroupArgs {
     action: GroupAction,
 }
 
-/// `tcr group ls|add|rm|reserve|unreserve|color` — the argument shape here is a
+/// `tcr group ls|add|rm|reserve|unreserve|allow-control|disallow-control|color` — the argument shape here is a
 /// CONTRACT with the TcrBar panel, which shells out to it (`TcrTool.run`); do
 /// not change it.
 #[derive(Subcommand)]
@@ -183,6 +183,12 @@ enum GroupAction {
     Reserve(GroupReserveArgs),
     /// Clear a group's reserved flag.
     Unreserve(GroupUnreserveArgs),
+    /// Opt a group in to selecting the control account on an explicit
+    /// `--group` ask — otherwise inference never selects it. A running proxy
+    /// picks this up live (no restart) on its next natural cadence check.
+    AllowControl(GroupAllowControlArgs),
+    /// Clear a group's `allowControlAccount` flag.
+    DisallowControl(GroupDisallowControlArgs),
     /// Set (or `--clear`) a group's color — the tag the panel draws for it.
     Color(GroupColorArgs),
 }
@@ -243,6 +249,24 @@ struct GroupUnreserveArgs {
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to unreserve.
+    group: String,
+}
+
+#[derive(clap::Args)]
+struct GroupAllowControlArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to opt in.
+    group: String,
+}
+
+#[derive(clap::Args)]
+struct GroupDisallowControlArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to opt out.
     group: String,
 }
 
@@ -438,7 +462,7 @@ async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
     cli::set_control(&config_path, Some(&query), args.org.as_deref()).await
 }
 
-/// `tcr group ls|add|rm|reserve|unreserve|color` — manage account group membership. Argument shape is
+/// `tcr group ls|add|rm|reserve|unreserve|allow-control|disallow-control|color` — manage account group membership. Argument shape is
 /// the TcrBar panel contract — see [`GroupAction`]'s doc-comment.
 fn run_group(args: GroupArgs) -> anyhow::Result<()> {
     match args.action {
@@ -461,6 +485,14 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         GroupAction::Unreserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
             cli::unreserve_group(&config_path, &a.group)
+        }
+        GroupAction::AllowControl(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::allow_control_group(&config_path, &a.group)
+        }
+        GroupAction::DisallowControl(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::disallow_control_group(&config_path, &a.group)
         }
         GroupAction::Color(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);

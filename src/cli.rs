@@ -594,6 +594,59 @@ pub fn unreserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tcr group allow-control <group>` — opt `group` in to selecting the
+/// control account (`groupSettings.<group>.allowControlAccount = true`): from
+/// the next restart, an explicit `--group group` ask for inference may select
+/// the control account (`select.rs`'s `control_excluded` carve-out), which
+/// inference never does otherwise. Idempotent: opting in an already-opted-in
+/// group succeeds and says so.
+///
+/// Same validation as [`reserve_group`] — `group` is a fresh label an
+/// operator typed, so [`validate_group_label_chars`] runs before any write.
+/// No safety rail like `reserve_group`'s unreserved-pool-floor check: opting
+/// in only ever GROWS what a group can serve, never shrinks the general pool.
+pub fn allow_control_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    if let Err(reason) = validate_group_label_chars(group) {
+        bail!("group {group:?}: invalid group label — {reason}");
+    }
+    let outcome = config::save_group_allow_control(config_path, group, true)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupControlWrite::Updated => {
+            println!("group '{group}' may now select the control account.");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
+        }
+        config::GroupControlWrite::Unchanged => {
+            println!("group '{group}' already may select the control account; nothing changed.");
+        }
+    }
+    Ok(())
+}
+
+/// `tcr group disallow-control <group>` — clear `group`'s
+/// `allowControlAccount` flag. Never refused: disallowing only ever SHRINKS
+/// what a group can serve, so this has nothing to check, mirroring
+/// [`unreserve_group`]. Deliberately does NOT run
+/// [`validate_group_label_chars`] — same reasoning as `unreserve_group`: it
+/// must be able to clear a label that somehow got into the config with a bad
+/// character, and refusing would make it permanent.
+pub fn disallow_control_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    let outcome = config::save_group_allow_control(config_path, group, false)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupControlWrite::Updated => {
+            println!("group '{group}' may no longer select the control account.");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
+        }
+        config::GroupControlWrite::Unchanged => {
+            println!(
+                "group '{group}' was not allowed to select the control account; nothing changed."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `tcr group color <group> <hex>` / `tcr group color <group> --clear` — set
 /// or clear `group`'s configured color. `hex = None` means `--clear`.
 ///
@@ -738,8 +791,11 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
 /// **This mirrors a runtime rule and must not drift from it.** The authority is
 /// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
 /// (`src/manager/select.rs`): an inference pick excludes the control account
-/// unconditionally, so a group with no other member can never be selected. This
-/// is the config-side view of that same fact — the only one `tcr group ls` can
+/// unconditionally, so a group with no other member can never be selected —
+/// UNLESS the group has opted in with `allowControlAccount`
+/// (`Config::group_allows_control`), which lifts the exclusion for that group's
+/// own `--group` asks (`select.rs`'s `control_excluded` carve-out). This is the
+/// config-side view of that same fact — the only one `tcr group ls` can
 /// compute, since it reads the file and not the running proxy. If the exclusion
 /// rule changes there, this changes with it.
 ///
@@ -752,9 +808,11 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
 /// the other. Two spellings of one fact is how they drift.
 const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
 
-fn group_routes(config: &Config, members: &[&str]) -> bool {
+fn group_routes(config: &Config, group: &str, members: &[&str]) -> bool {
     match config.control_account.as_deref() {
-        Some(control) => members.iter().any(|member| *member != control),
+        Some(control) => {
+            members.iter().any(|member| *member != control) || config.group_allows_control(group)
+        }
         None => !members.is_empty(),
     }
 }
@@ -767,13 +825,18 @@ fn render_groups_text(config: &Config) -> String {
     let mut out = String::new();
     for (group, members) in &groups {
         let (color, source) = config.group_color(group);
-        let routes = group_routes(config, members);
+        let routes = group_routes(config, group, members);
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={} reserved={} routes={}{} color={color} color_source={}",
+            "group {group:width$} accounts={} members={} reserved={} allows_control={} routes={}{} color={color} color_source={}",
             members.len(),
             members.join(","),
             if config.is_group_reserved(group) {
+                "yes"
+            } else {
+                "no"
+            },
+            if config.group_allows_control(group) {
                 "yes"
             } else {
                 "no"
@@ -799,12 +862,13 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
         .iter()
         .map(|(group, members)| {
             let (color, source) = config.group_color(group);
-            let routes = group_routes(config, members);
+            let routes = group_routes(config, group, members);
             serde_json::json!({
                 "group": group,
                 "accounts": members.len(),
                 "members": members,
                 "reserved": config.is_group_reserved(group),
+                "allowsControl": config.group_allows_control(group),
                 "routes": routes,
                 "routeBlock": if routes {
                     serde_json::Value::Null
@@ -1986,6 +2050,7 @@ fn render_accounts_json(
                 // mark a section reserved; name and shape are a fixed contract,
                 // do not change them.
                 reserved_groups: a.reserved_groups.clone(),
+                control_allowed_groups: Vec::new(),
                 // Every group on the FLEET (not just this row's own groups)
                 // mapped to its resolved color — server-wide like `http1Only`
                 // above, repeated per row so the panel can tint any account's
@@ -2911,6 +2976,89 @@ mod tests {
         let path = write_config("reserve-bad-label", TWO_ACCOUNTS);
         let result = reserve_group(&path, "bad\nlabel");
         assert!(result.is_err(), "a newline in the label must be rejected");
+        fs::remove_file(&path).ok();
+    }
+
+    // --- allow-control / disallow-control -----------------------------------
+
+    /// Mirrors [`reserve_then_unreserve_round_trips_and_is_idempotent`]: opting
+    /// in persists, is scoped to the named group, survives a reload, and both
+    /// directions are idempotent.
+    #[test]
+    fn allow_then_disallow_control_round_trips_and_is_idempotent() {
+        let path = write_config("allow-control-roundtrip", GROUPED_ACCOUNTS);
+        allow_control_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(config.group_allows_control("codereview"));
+        assert!(
+            !config.group_allows_control("dev"),
+            "only the named group changes"
+        );
+
+        // Idempotent: opting in an already-opted-in group succeeds.
+        allow_control_group(&path, "codereview").unwrap();
+        assert!(load(&path).group_allows_control("codereview"));
+
+        disallow_control_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(!config.group_allows_control("codereview"));
+
+        // Idempotent the other way too.
+        disallow_control_group(&path, "codereview").unwrap();
+        assert!(!load(&path).group_allows_control("codereview"));
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr group allow-control` rejects the same bad-character labels `tcr
+    /// group reserve`/`add` already do — reuses [`validate_group_label_chars`].
+    #[test]
+    fn allow_control_rejects_bad_label() {
+        let path = write_config("allow-control-bad-label", TWO_ACCOUNTS);
+        let result = allow_control_group(&path, "bad\nlabel");
+        assert!(result.is_err(), "a newline in the label must be rejected");
+        fs::remove_file(&path).ok();
+    }
+
+    /// `ls` must show a control-only group as routable once it has opted in —
+    /// the whole point of the flag, on the surface an operator actually reads.
+    #[test]
+    fn ls_marks_an_opted_in_control_only_group_as_routing() {
+        let path = write_config("routes-control-allowed", CONTROL_ONLY_GROUP);
+        allow_control_group(&path, "research").unwrap();
+        let config = load(&path);
+        let research = group_line(&render_groups_text(&config), "research");
+        assert!(
+            research.contains("allows_control=yes")
+                && research.contains("routes=yes")
+                && !research.contains("route_block="),
+            "an opted-in control-only group must report routable: {research}"
+        );
+        let dev = group_line(&render_groups_text(&config), "dev");
+        assert!(
+            dev.contains("allows_control=no"),
+            "an ordinary group must not be flagged as opted in: {dev}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Same fact on the JSON surface.
+    #[test]
+    fn ls_json_carries_allows_control() {
+        let path = write_config("routes-control-allowed-json", CONTROL_ONLY_GROUP);
+        allow_control_group(&path, "research").unwrap();
+        let config = load(&path);
+        let value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
+        let row = value["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .find(|r| r["group"] == "research")
+            .expect("research row");
+        assert_eq!(row["allowsControl"], serde_json::json!(true));
+        assert_eq!(row["routes"], serde_json::json!(true));
+        assert_eq!(row["routeBlock"], serde_json::Value::Null);
         fs::remove_file(&path).ok();
     }
 
@@ -4956,6 +5104,7 @@ mod tests {
             },
             groups: groups.iter().map(|g| g.to_string()).collect(),
             reserved_groups: Vec::new(),
+            control_allowed_groups: Vec::new(),
         }
     }
 
@@ -5451,6 +5600,7 @@ mod tests {
             last_stream_error: None,
             groups: Vec::new(),
             reserved_groups: Vec::new(),
+            control_allowed_groups: Vec::new(),
         };
         let accounts = vec![
             AccountSnapshot {
@@ -5458,6 +5608,7 @@ mod tests {
                 gate: crate::stats::GateReason::Reserved,
                 groups: vec!["dev".to_string(), "codereview".to_string()],
                 reserved_groups: vec!["codereview".to_string()],
+                control_allowed_groups: Vec::new(),
                 ..base.clone()
             },
             AccountSnapshot {

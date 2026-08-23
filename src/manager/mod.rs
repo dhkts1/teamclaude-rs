@@ -849,6 +849,13 @@ pub struct Manager {
     /// never held across the accounts/affinity locks. See
     /// [`Manager::eligible`]'s `reserved_group` doc for the rule this drives.
     reserved_groups: RwLock<HashSet<String>>,
+    /// The set of group labels opted in to `allowControlAccount` (`tcr group
+    /// allow-control`). Seeded from the config at construction and
+    /// **hot-reloaded** thereafter, same cadence and same `RwLock` reasoning
+    /// as [`Self::reserved_groups`] — see
+    /// [`Self::reload_groups_if_changed`]. See `select.rs`'s
+    /// `control_excluded` handling for the rule this drives.
+    control_allowed_groups: RwLock<HashSet<String>>,
     /// Every group on the fleet mapped to its resolved color
     /// (`config::Config::group_colors`). Seeded at construction and
     /// hot-reloaded alongside [`Self::reserved_groups`] — same
@@ -1100,6 +1107,7 @@ impl Manager {
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let reserved_groups = config.reserved_group_names();
+        let control_allowed_groups = config.control_allowed_group_names();
         // Snapshotted at construction, same restart-to-take-effect contract as
         // `reserved_groups` above and `config::Account::groups` itself — a
         // `tcr group color` write needs a restart before the running server's
@@ -1153,6 +1161,7 @@ impl Manager {
             proxy_api_key,
             global_threshold,
             reserved_groups: RwLock::new(reserved_groups),
+            control_allowed_groups: RwLock::new(control_allowed_groups),
             group_colors: RwLock::new(group_colors),
             groups_reload_mtime: Mutex::new(None),
             pacing,
@@ -1435,8 +1444,17 @@ impl Manager {
             .clone()
     }
 
+    /// A cloned snapshot of the currently control-account-allowed group
+    /// names. Same clone-not-guard reasoning as [`Self::reserved_groups`].
+    fn control_allowed_groups(&self) -> HashSet<String> {
+        self.control_allowed_groups
+            .read()
+            .expect("control_allowed_groups lock poisoned")
+            .clone()
+    }
+
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
-    /// `color`) from `self.config_path` when the file's mtime has moved since
+    /// `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
     /// the last check — the fix for group edits appearing to do nothing
     /// (`docs/plans/live-reload-bridge.md`, problem 1). Called from a natural
     /// cadence point ([`Self::select_with_group`], [`Self::select_revalidation`],
@@ -1533,6 +1551,7 @@ impl Manager {
     /// still reloads the right row instead of silently dropping its groups.
     fn apply_group_reload(&self, fresh: &Config) {
         let new_reserved = fresh.reserved_group_names();
+        let new_control_allowed = fresh.control_allowed_group_names();
         let new_colors = fresh.group_colors();
         let mut changed: Vec<String> = Vec::new();
 
@@ -1548,6 +1567,20 @@ impl Manager {
                     sorted_groups(&new_reserved)
                 ));
                 *reserved = new_reserved;
+            }
+        }
+        {
+            let mut control_allowed = self
+                .control_allowed_groups
+                .write()
+                .expect("control_allowed_groups lock poisoned");
+            if *control_allowed != new_control_allowed {
+                changed.push(format!(
+                    "control-allowed groups: {:?} -> {:?}",
+                    sorted_groups(&control_allowed),
+                    sorted_groups(&new_control_allowed)
+                ));
+                *control_allowed = new_control_allowed;
             }
         }
         {
@@ -3145,6 +3178,7 @@ mod tests {
                 (*group).to_string(),
                 crate::config::GroupSettings {
                     reserved: true,
+                    allow_control_account: false,
                     color: None,
                     extra: serde_json::Map::new(),
                 },
@@ -3255,6 +3289,104 @@ mod tests {
             manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
             Some(1),
             "unrequested traffic still excluded — one reserved group is enough"
+        );
+    }
+
+    // ---- control-account opt-in groups (`allowControlAccount`) ----------------
+
+    /// Like [`config_with_reserved`] but sets `allowControlAccount` instead —
+    /// combined with [`config_with_control`]'s `control_account` set so the
+    /// fixture is actually control-only, not just labelled.
+    fn config_with_control_allowed(
+        accounts: Vec<Account>,
+        control: &str,
+        groups: &[&str],
+    ) -> Config {
+        let mut config = config_with_control(accounts, control);
+        for group in groups {
+            config.group_settings.insert(
+                (*group).to_string(),
+                crate::config::GroupSettings {
+                    reserved: false,
+                    allow_control_account: true,
+                    color: None,
+                    extra: serde_json::Map::new(),
+                },
+            );
+        }
+        config
+    }
+
+    /// The whole feature, both directions: a group whose only member is the
+    /// control account cannot serve `--group research` inference by default —
+    /// but the SAME fixture, with `allowControlAccount` set on `research`,
+    /// serves it.
+    #[test]
+    fn control_only_group_serves_inference_only_once_opted_in() {
+        let control = account_in_groups("control-acct", 0, &["research"]);
+        let other = account("other", 5);
+
+        let blocked = build_manager(
+            config_with_control(vec![control.clone(), other.clone()], "control-acct"),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            blocked.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("research"),
+            ),
+            Some(1),
+            "not opted in: falls back to the whole pool, never the control account"
+        );
+
+        let mut opted_in_config = config_with_control(vec![control, other], "control-acct");
+        opted_in_config.group_settings.insert(
+            "research".to_string(),
+            crate::config::GroupSettings {
+                reserved: false,
+                allow_control_account: true,
+                color: None,
+                extra: serde_json::Map::new(),
+            },
+        );
+        let opted_in = build_manager(opted_in_config, lock_refresher());
+        assert_eq!(
+            opted_in.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("research"),
+            ),
+            Some(0),
+            "opted in: the group's own `--group` ask may now select the control account"
+        );
+    }
+
+    /// The opt-in is scoped to the GROUP, not to the control account globally:
+    /// an unrequested (no `--group`) inference request must still never select
+    /// the control account, even when its only group has opted in.
+    #[test]
+    fn control_opt_in_does_not_affect_unrequested_traffic() {
+        let control = account_in_groups("control-acct", 0, &["research"]);
+        let other = account("other", 5);
+        let manager = build_manager(
+            config_with_control_allowed(vec![control, other], "control-acct", &["research"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1),
+            "unrequested traffic must still never select the control account"
         );
     }
 
@@ -3485,6 +3617,75 @@ mod tests {
             pinned_now,
             Some(1),
             "the pin must move off the newly-reserved account, not merely divert one request"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Same live-reload cadence as [`reload_re_keys_a_pin_when_its_group_becomes_reserved`],
+    /// applied to `allowControlAccount`: a control-only group cannot serve its
+    /// own `--group` ask at boot, and a config write that opts it in — with NO
+    /// restart — makes the very same request land on the control account on
+    /// its next call.
+    #[test]
+    fn reload_picks_up_a_group_opting_in_to_the_control_account() {
+        let path = tmp_config_path("reload-control-allowed");
+        let boot = config_with_control(
+            vec![
+                account_in_groups("control-acct", 0, &["research"]),
+                account("other", 5),
+            ],
+            "control-acct",
+        );
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("research"),
+            ),
+            Some(1),
+            "not opted in at boot: falls back to the whole pool"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut opted_in = config_with_control(
+            vec![
+                account_in_groups("control-acct", 0, &["research"]),
+                account("other", 5),
+            ],
+            "control-acct",
+        );
+        opted_in.group_settings.insert(
+            "research".to_string(),
+            crate::config::GroupSettings {
+                reserved: false,
+                allow_control_account: true,
+                color: None,
+                extra: serde_json::Map::new(),
+            },
+        );
+        config::save(&path, &opted_in).expect("write opted-in reload config");
+
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("research"),
+            ),
+            Some(0),
+            "a live opt-in write must be picked up with no restart"
         );
 
         std::fs::remove_file(&path).ok();
