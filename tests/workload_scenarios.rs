@@ -208,6 +208,7 @@ impl Fleet {
     fn new(accounts: &[(&str, i64)], pacing: PacingConfig) -> Self {
         let account_names = accounts.iter().map(|(n, _)| (*n).to_string()).collect();
         let config = Config {
+            quarantined_accounts: Vec::new(),
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: SWITCH_THRESHOLD,
