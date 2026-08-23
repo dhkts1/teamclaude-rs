@@ -156,6 +156,14 @@ pub struct GroupSettings {
     /// Absent/`false` (default) keeps today's prefer-only behaviour.
     #[serde(default)]
     pub reserved: bool,
+    /// When `true`, an explicit `--group` ask for this group is allowed to
+    /// select the control account — see
+    /// [`crate::manager::select::select_with_group`]'s `control_excluded`
+    /// handling for the exact carve-out. Absent/`false` (default) keeps
+    /// today's behaviour: inference never selects the control account, so a
+    /// group whose only member is the control account can never route.
+    #[serde(default)]
+    pub allow_control_account: bool,
     /// A configured `#RRGGBB` (or `#RGB`, normalized on write) color for this
     /// group's panel tag. Absent → no color was ever set, and
     /// [`Config::group_color`] derives one deterministically from the group
@@ -632,6 +640,25 @@ impl Config {
     /// reserved" default the field's own doc-comment promises.
     pub fn is_group_reserved(&self, group: &str) -> bool {
         self.group_settings.get(group).is_some_and(|s| s.reserved)
+    }
+
+    /// The set of group labels currently opted in to `allowControlAccount`.
+    /// Same cheap, one-shot-use posture as [`Self::reserved_group_names`].
+    pub fn control_allowed_group_names(&self) -> HashSet<String> {
+        self.group_settings
+            .iter()
+            .filter(|(_, s)| s.allow_control_account)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether `group` currently opts in to selecting the control account.
+    /// `false` for a group name with no `groupSettings` entry at all — same
+    /// "absent means false" default the field's own doc-comment promises.
+    pub fn group_allows_control(&self, group: &str) -> bool {
+        self.group_settings
+            .get(group)
+            .is_some_and(|s| s.allow_control_account)
     }
 
     /// Every group label that currently has at least one member — the same
@@ -1815,6 +1842,93 @@ fn merge_group_reserved(
     GroupReserveWrite::Updated
 }
 
+/// What a targeted [`save_group_allow_control`] did to the on-disk document.
+/// Same shape as [`GroupReserveWrite`] and for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupControlWrite {
+    /// `groupSettings.<group>.allowControlAccount` was set (or its whole
+    /// entry removed) and the file rewritten.
+    Updated,
+    /// The group already carried (or already lacked) `allowControlAccount`,
+    /// so nothing was written and the file is byte-identical.
+    Unchanged,
+}
+
+/// Persist ONLY `groupSettings.<group>.allowControlAccount` into the file at
+/// `path`, leaving every other key — every account, every other group's
+/// settings — exactly as the user left it. Same read-modify-write shape as
+/// [`save_group_reserved`] and for the same reason.
+///
+/// Setting `allow` to `false` drops the `allowControlAccount` key rather than
+/// writing `false`, and drops the group's whole `groupSettings` entry once it
+/// is empty — same drops-the-key contract [`merge_group_reserved`] uses, so a
+/// group that has ever opted in and then opted out carries no permanent
+/// litter.
+pub fn save_group_allow_control(
+    path: &Path,
+    group: &str,
+    allow: bool,
+) -> Result<GroupControlWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_group_allow_control(&mut doc, group, allow);
+    if outcome == GroupControlWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+fn merge_group_allow_control(
+    doc: &mut Map<String, Value>,
+    group: &str,
+    allow: bool,
+) -> GroupControlWrite {
+    let already = doc
+        .get("groupSettings")
+        .and_then(Value::as_object)
+        .and_then(|settings| settings.get(group))
+        .and_then(Value::as_object)
+        .and_then(|entry| entry.get("allowControlAccount"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if already == allow {
+        return GroupControlWrite::Unchanged;
+    }
+
+    let settings = doc
+        .entry("groupSettings".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    // Same corrupt-hand-edit guard as `merge_group_reserved`: `already` above
+    // already proved this was not a usable object for this group either way.
+    if !settings.is_object() {
+        *settings = Value::Object(Map::new());
+    }
+    let settings_obj = settings.as_object_mut().expect("just ensured object");
+
+    if allow {
+        let entry = settings_obj
+            .entry(group.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        entry
+            .as_object_mut()
+            .expect("just ensured object")
+            .insert("allowControlAccount".to_string(), Value::Bool(true));
+    } else if let Some(entry) = settings_obj.get_mut(group) {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("allowControlAccount");
+            if obj.is_empty() {
+                settings_obj.remove(group);
+            }
+        }
+    }
+    if settings_obj.is_empty() {
+        doc.remove("groupSettings");
+    }
+    GroupControlWrite::Updated
+}
+
 /// What a targeted [`save_group_color`] did to the on-disk document. Same
 /// shape as [`GroupReserveWrite`] and for the same reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2673,6 +2787,41 @@ mod tests {
             config.group_color("codereview"),
             (derive_group_color("codereview"), ColorSource::Derived)
         );
+        let raw = fs::read_to_string(&tmp).unwrap();
+        assert!(
+            !raw.contains("groupSettings"),
+            "the last property on the group's settings entry is gone, so the \
+             whole map is dropped rather than left as `{{}}`: {raw}"
+        );
+
+        fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn save_group_allow_control_round_trips_and_false_drops_the_key() {
+        let tmp =
+            std::env::temp_dir().join(format!("tcr-cfg-allow-control-{}.json", std::process::id()));
+        fs::write(&tmp, GROUPED_ACCOUNTS_JSON).unwrap();
+
+        let outcome = save_group_allow_control(&tmp, "codereview", true).unwrap();
+        assert_eq!(outcome, GroupControlWrite::Updated);
+        let config: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert!(config.group_allows_control("codereview"));
+        assert!(
+            !config.group_allows_control("dev"),
+            "only the named group changes"
+        );
+
+        // Setting the SAME value again is a no-op write.
+        let outcome = save_group_allow_control(&tmp, "codereview", true).unwrap();
+        assert_eq!(outcome, GroupControlWrite::Unchanged);
+
+        // Setting `false` drops the `allowControlAccount` key (and the whole
+        // `groupSettings.<group>` entry, since it was the only thing in it).
+        let outcome = save_group_allow_control(&tmp, "codereview", false).unwrap();
+        assert_eq!(outcome, GroupControlWrite::Updated);
+        let config: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert!(!config.group_allows_control("codereview"));
         let raw = fs::read_to_string(&tmp).unwrap();
         assert!(
             !raw.contains("groupSettings"),

@@ -24,7 +24,22 @@ public enum GroupRouting {
         let members = accounts.filter { ($0.groups ?? []).contains(group) }
         guard !members.isEmpty else { return false }
         guard let controlName else { return true }
+        if allowsControlAccount(group: group, accounts: accounts) { return true }
         return members.contains { $0.name != controlName }
+    }
+
+    /// Whether `group` has opted in to letting an explicit `--group` ask select
+    /// the control account (`tcr group allow-control <group>`).
+    ///
+    /// Read from the rows themselves, not passed in: the opt-in rides the wire
+    /// per account as `controlAllowedGroups`, the same shape `groups` and
+    /// `reservedGroups` already use, so any row carrying the label also carries
+    /// whether that label opted in. A server too old to send the field reports
+    /// `nil`, which reads as "not opted in" — the pre-feature behaviour, and the
+    /// safe direction to be wrong in: the panel warns about a group that works
+    /// rather than staying silent about one that does not.
+    public static func allowsControlAccount(group: String, accounts: [Account]) -> Bool {
+        accounts.contains { ($0.controlAllowedGroups ?? []).contains(group) }
     }
 }
 

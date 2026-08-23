@@ -85,7 +85,7 @@ impl GroupMiss {
         match self {
             Self::Unknown => "no configured account carries the requested group",
             Self::OnlyControl => {
-                "the requested group's only member is the control account, which inference never selects — no request will ever route to this group until another account joins it or the control account is cleared"
+                "the requested group's only member is the control account, which inference never selects — no request will ever route to this group until another account joins it, the control account is cleared, or the group opts in with `tcr group allow-control <g>`"
             }
             Self::AllGated => "every account in the requested group is currently unavailable",
             Self::Paced => "every account in the requested group is paced out",
@@ -338,6 +338,9 @@ impl Manager {
         // `Self::reserved_groups`'s doc for why this clones rather than holding
         // the lock across the accounts/affinity locks taken below.
         let reserved_groups = self.reserved_groups();
+        // Same point-in-time-snapshot reasoning as `reserved_groups` above — see
+        // `Self::control_allowed_groups`'s doc.
+        let control_allowed_groups = self.control_allowed_groups();
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
@@ -850,8 +853,26 @@ impl Manager {
             // the SAME answer: an account held out only by this exclusion is the
             // one case where a `--group` ask can never be satisfied by any retry,
             // and naming it requires knowing which index was excluded and why.
+            //
+            // Opt-in carve-out: an explicit `--group g` ask is allowed to select
+            // the control account when the control account itself carries `g`
+            // AND `g` has opted in via `groupSettings.g.allowControlAccount`
+            // (`tcr group allow-control g`). Both conditions are checked here
+            // rather than deferred to `eligible`, so this stays the single place
+            // that decides whether the control account is even a CANDIDATE for
+            // inference — `pool_pick_respects_control_reserve`'s reserve-floor
+            // guard already applies unconditionally once the account becomes
+            // selectable, so this carve-out stays safe without further changes.
             let control_excluded: Option<usize> = if request_class == RequestClass::Inference {
-                self.control()
+                self.control().filter(|&idx| {
+                    let opted_in = group.is_some_and(|g| {
+                        control_allowed_groups.contains(g)
+                            && accounts
+                                .get(idx)
+                                .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
+                    });
+                    !opted_in
+                })
             } else {
                 None
             };
