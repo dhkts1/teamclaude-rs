@@ -1350,6 +1350,7 @@ mod tests {
     /// router to observe which HTTP version `serve_connection` negotiated.
     fn dummy_manager() -> Arc<Manager> {
         let config = crate::config::Config {
+            quarantined_accounts: Vec::new(),
             proxy: crate::config::ProxyConfig {
                 port: 0,
                 api_key: None,
