@@ -1,6 +1,33 @@
 import Combine
 import Foundation
 
+/// Whether a group can actually serve traffic, as opposed to merely existing
+/// with a member and a colour.
+///
+/// **Mirrors a proxy rule and must not drift from it.** The authority is
+/// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
+/// (`src/manager/select.rs`): an inference pick excludes the control account
+/// unconditionally, so a group with no other member can never be selected, and
+/// every request asking for it is served from the whole pool instead. The `tcr`
+/// CLI computes the same fact for `tcr group ls`'s `routes=` field; this is the
+/// panel's copy, computed from data the panel already has (`Account.groups` plus
+/// the name `ControlAccountController` resolves) rather than a new wire field.
+///
+/// Deliberately NOT a health check: a member that is merely disabled or
+/// rate-limited right now still counts as routable, because that is transient and
+/// this is about the group's permanent shape.
+public enum GroupRouting {
+    /// `false` when the group has no members at all, or when every member is the
+    /// control account. `controlName == nil` means no control account is set (or
+    /// the panel could not resolve one), in which case membership alone decides.
+    public static func routes(group: String, accounts: [Account], controlName: String?) -> Bool {
+        let members = accounts.filter { ($0.groups ?? []).contains(group) }
+        guard !members.isEmpty else { return false }
+        guard let controlName else { return true }
+        return members.contains { $0.name != controlName }
+    }
+}
+
 /// Mutating group membership: adding an account to a group, removing one
 /// from a group, or removing a whole group. Same two rules as
 /// ``AccountCommand``/``ControlAccountCommand``, and for the same reasons:
@@ -31,6 +58,20 @@ public enum GroupCommand {
     /// `tcr group rm <group> --all` — removes the whole group.
     public static func removeAllArguments(group: String) -> [String] {
         ["group", "rm", group, "--all"]
+    }
+
+    /// `tcr run --group <group>` — start a Claude Code session that PREFERS this
+    /// group. The only argv here that is not a mutation, and the only one a
+    /// person actually wants off a group row: every other entry in this menu
+    /// administers the label, and none of them used it.
+    ///
+    /// **Copy-only. Never pass this to ``perform(arguments:)``.** That helper
+    /// runs argv to completion and reads its exit code; `tcr run` launches an
+    /// interactive Claude Code session, so running it from a menubar app would
+    /// hang the app on a process with no terminal. It exists to be rendered by
+    /// ``CopyCommandMenuEntry`` and put on the pasteboard, nothing else.
+    public static func runArguments(group: String) -> [String] {
+        ["run", "--group", group]
     }
 
     /// Shell-quotes a single argument for a copy-pasteable command line.

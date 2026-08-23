@@ -84,6 +84,32 @@ final class GroupCommandTests: XCTestCase {
         )
     }
 
+    /// The group row's copy entry is the command that USES the group, not one
+    /// that administers it. Pinned as an exact string because this text is what
+    /// lands on a person's pasteboard and gets pasted into a shell — if it
+    /// drifts from `tcr run`'s real flag, the paste fails at their prompt, not
+    /// in a test.
+    func testCopyRunCommandIsTheUseCommandNotAMutation() {
+        let arguments = GroupCommand.runArguments(group: "research")
+        XCTAssertEqual(
+            GroupCommand.commandLine(arguments: arguments),
+            "tcr run --group research"
+        )
+        XCTAssertFalse(
+            arguments.contains("rm"),
+            "the group row's copy entry must never spell a removal"
+        )
+    }
+
+    /// Same quoting discipline as every other copied command — a group name
+    /// with a space must survive the round trip into a shell.
+    func testCopyRunCommandQuotesAGroupNameThatNeedsIt() {
+        XCTAssertEqual(
+            GroupCommand.commandLine(arguments: GroupCommand.runArguments(group: "dev team")),
+            "tcr run --group 'dev team'"
+        )
+    }
+
     func testShellQuoteLeavesAnEmailBare() {
         XCTAssertEqual(GroupCommand.shellQuote("henry2@example.com"), "henry2@example.com")
     }

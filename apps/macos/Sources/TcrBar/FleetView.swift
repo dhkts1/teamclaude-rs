@@ -1124,13 +1124,32 @@ struct AccountRow: View {
         ForEach(account.groupMenuActions, id: \.self) { action in
             switch action {
             case .remove(let group):
+                // First, and disabled because there is nothing to click — this
+                // states a fact about the group, it does not offer to change it.
+                // Without it the panel renders a group that serves nothing
+                // exactly like one that works: a member, a colour, a healthy
+                // row. That is how a group whose only member was the control
+                // account survived on the live fleet, silently falling back on
+                // every request.
+                if !GroupRouting.routes(
+                    group: group, accounts: allAccounts, controlName: control.current)
+                {
+                    Button("⚠︎ “\(group)” routes nothing — control account only") {}
+                        .disabled(true)
+                }
+                // The USE command, above the two removals. This slot used to copy
+                // `tcr group rm <group> <account>` — the twin of the button
+                // right below it — which made three consecutive entries all
+                // spell a deletion and offered no way at all to start a session
+                // on the group. Copying the command that administers a label was
+                // never what anyone wanted off a row that already carries it.
+                let copyRun = GroupCommand.CopyCommandMenuEntry(
+                    arguments: GroupCommand.runArguments(group: group))
+                Button(copyRun.title) {
+                    copyToPasteboard(copyRun.copiedText)
+                }
                 Button("Remove from \(group)") {
                     Task { await groupController.remove(account: account.name, from: group) }
-                }
-                let copyRemove = GroupCommand.CopyCommandMenuEntry(
-                    arguments: GroupCommand.removeArguments(group: group, account: account.name))
-                Button(copyRemove.title) {
-                    copyToPasteboard(copyRemove.copiedText)
                 }
                 Button("Delete group “\(group)” for everyone…") {
                     confirmDeleteGroup(group)
