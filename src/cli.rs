@@ -346,6 +346,23 @@ fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usiz
     }
 }
 
+/// The warning [`add_to_group`] prints when the account being labelled is the
+/// control account. Split out as a pure function so a test can assert the text
+/// without capturing stderr — the notice IS the fix here, so it needs a gate of
+/// its own rather than riding along untested inside an `eprintln!`.
+///
+/// `None` when there is nothing to say, which is every ordinary add.
+fn control_account_group_notice(config: &Config, account: &str, group: &str) -> Option<String> {
+    if config.control_account.as_deref() != Some(account) {
+        return None;
+    }
+    Some(format!(
+        "warning: '{account}' is the control account, which inference requests never select. \
+         A group whose only member is the control account routes nothing — add another account \
+         to '{group}', or clear the control account with `tcr control --clear`."
+    ))
+}
+
 /// `tcr group add <group> <account>` — label `account` with `group`.
 ///
 /// Idempotent: adding a label an account already carries succeeds and says so,
@@ -373,6 +390,24 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
         .with_context(|| format!("load config at {}", config_path.display()))?;
     let idx = find_account_by_name(&config.accounts, account)?;
     let target = &config.accounts[idx];
+    // The label itself is real and the write below is correct — but on the
+    // CONTROL account it buys nothing, because `Manager::select_with_group`
+    // excludes that account from every inference pick
+    // (`select.rs`'s `control_excluded`). A group whose only member is the
+    // control account therefore serves NOTHING: every request asking for it
+    // falls back to the whole pool, silently, forever. Measured on the live
+    // fleet 2026-08-23 — 0 of 3 probes landed in such a group, 3 of 3 landed in
+    // an ordinary two-account one.
+    //
+    // Warn rather than refuse: the label is legitimate (the panel colours it,
+    // `tcr status` reports it, and a second account joining the group makes it
+    // route), and refusing would break this command's idempotence contract with
+    // TcrBar. stderr is the channel TcrBar already surfaces verbatim — see
+    // `GroupCommand::classify`'s `spoke` arm, which exists for exactly this
+    // "exit 0 but you should read something" case.
+    if let Some(notice) = control_account_group_notice(&config, &target.name, group) {
+        eprintln!("{notice}");
+    }
     let outcome = config::save_group_membership(config_path, target, group, true)
         .with_context(|| format!("save config at {}", config_path.display()))?;
     match outcome {
@@ -697,6 +732,33 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
     (groups, ungrouped)
 }
 
+/// Whether a group can serve an inference request at all, as opposed to merely
+/// existing with members and a colour.
+///
+/// **This mirrors a runtime rule and must not drift from it.** The authority is
+/// `Manager::classify_group_miss`'s `GroupMiss::OnlyControl` arm
+/// (`src/manager/select.rs`): an inference pick excludes the control account
+/// unconditionally, so a group with no other member can never be selected. This
+/// is the config-side view of that same fact — the only one `tcr group ls` can
+/// compute, since it reads the file and not the running proxy. If the exclusion
+/// rule changes there, this changes with it.
+///
+/// Deliberately NOT a general health check: an account that is merely disabled or
+/// rate-limited right now still counts as routable here, because that is
+/// transient and this line is about the group's permanent shape.
+/// The one reason a group can exist and still route nothing, spelled ONCE.
+/// Both `ls` surfaces render this same token — a text `route_block=` field and a
+/// JSON `routeBlock` value — so a script keying on one cannot be surprised by
+/// the other. Two spellings of one fact is how they drift.
+const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
+
+fn group_routes(config: &Config, members: &[&str]) -> bool {
+    match config.control_account.as_deref() {
+        Some(control) => members.iter().any(|member| *member != control),
+        None => !members.is_empty(),
+    }
+}
+
 /// `tcr group ls` text: one greppable line per group, then `ungrouped`.
 fn render_groups_text(config: &Config) -> String {
     use std::fmt::Write as _;
@@ -705,15 +767,22 @@ fn render_groups_text(config: &Config) -> String {
     let mut out = String::new();
     for (group, members) in &groups {
         let (color, source) = config.group_color(group);
+        let routes = group_routes(config, members);
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={} reserved={} color={color} color_source={}",
+            "group {group:width$} accounts={} members={} reserved={} routes={}{} color={color} color_source={}",
             members.len(),
             members.join(","),
             if config.is_group_reserved(group) {
                 "yes"
             } else {
                 "no"
+            },
+            if routes { "yes" } else { "no" },
+            if routes {
+                String::new()
+            } else {
+                format!(" route_block={ROUTE_BLOCK_CONTROL_ONLY}")
             },
             source.as_str(),
         );
@@ -730,11 +799,18 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
         .iter()
         .map(|(group, members)| {
             let (color, source) = config.group_color(group);
+            let routes = group_routes(config, members);
             serde_json::json!({
                 "group": group,
                 "accounts": members.len(),
                 "members": members,
                 "reserved": config.is_group_reserved(group),
+                "routes": routes,
+                "routeBlock": if routes {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(ROUTE_BLOCK_CONTROL_ONLY.to_string())
+                },
                 "color": color,
                 "colorSource": source.as_str(),
             })
@@ -2835,6 +2911,121 @@ mod tests {
         let path = write_config("reserve-bad-label", TWO_ACCOUNTS);
         let result = reserve_group(&path, "bad\nlabel");
         assert!(result.is_err(), "a newline in the label must be rejected");
+        fs::remove_file(&path).ok();
+    }
+
+    // --- unroutable groups ---------------------------------------------------
+
+    /// A fleet where the control account is the ONLY member of a group. This is
+    /// the shape that shipped on the live fleet and served nothing: inference
+    /// never picks the control account, so `research` could not route, while
+    /// `tcr group ls` reported a healthy one-member group.
+    const CONTROL_ONLY_GROUP: &str = r#"{
+      "proxy": { "port": 3456 },
+      "controlAccount": "gil@example.com",
+      "accounts": [
+        { "name": "gil@example.com", "type": "oauth", "accessToken": "at-g",
+          "expiresAt": 1893456000000, "priority": 0, "groups": ["research"] },
+        { "name": "worker@example.com", "type": "oauth", "accessToken": "at-w",
+          "expiresAt": 1893456000000, "priority": 1, "groups": ["dev"] },
+        { "name": "worker2@example.com", "type": "oauth", "accessToken": "at-w2",
+          "expiresAt": 1893456000000, "priority": 2, "groups": ["dev"] }
+      ]
+    }"#;
+
+    fn group_line(text: &str, group: &str) -> String {
+        text.lines()
+            .find(|l| {
+                l.starts_with(&format!("group {group} "))
+                    || l.starts_with(&format!("group {group}"))
+            })
+            .unwrap_or_else(|| panic!("no line for group {group} in:\n{text}"))
+            .to_string()
+    }
+
+    /// `ls` must distinguish a group that cannot route from one that can — the
+    /// whole point of the field. `dev` (two ordinary accounts) routes; `research`
+    /// (control account only) does not, and says why.
+    #[test]
+    fn ls_marks_a_control_only_group_as_not_routing() {
+        let path = write_config("routes-control-only", CONTROL_ONLY_GROUP);
+        let config = load(&path);
+        let research = group_line(&render_groups_text(&config), "research");
+        assert!(
+            research.contains("routes=no") && research.contains("route_block=control-account-only"),
+            "a control-account-only group must say it routes nothing: {research}"
+        );
+        let dev = group_line(&render_groups_text(&config), "dev");
+        assert!(
+            dev.contains("routes=yes") && !dev.contains("route_block="),
+            "an ordinary group must not be flagged: {dev}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The remedy the warning tells an operator to apply must actually clear the
+    /// flag — otherwise the message sends them somewhere that does not help.
+    #[test]
+    fn a_second_member_makes_the_group_route_again() {
+        let path = write_config("routes-second-member", CONTROL_ONLY_GROUP);
+        add_to_group(&path, "research", "worker@example.com").unwrap();
+        let config = load(&path);
+        let research = group_line(&render_groups_text(&config), "research");
+        assert!(
+            research.contains("routes=yes") && !research.contains("route_block="),
+            "adding a non-control account must make the group routable: {research}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Same fact on the JSON surface, which the panel and scripts read.
+    #[test]
+    fn ls_json_carries_routes_and_route_block() {
+        let path = write_config("routes-json", CONTROL_ONLY_GROUP);
+        let config = load(&path);
+        let value: serde_json::Value =
+            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
+        let row = |name: &str| -> serde_json::Value {
+            value["groups"]
+                .as_array()
+                .expect("groups array")
+                .iter()
+                .find(|r| r["group"] == name)
+                .expect("group row")
+                .clone()
+        };
+        assert_eq!(row("research")["routes"], serde_json::json!(false));
+        assert_eq!(
+            row("research")["routeBlock"],
+            serde_json::json!(ROUTE_BLOCK_CONTROL_ONLY),
+            "the JSON reason must be the same token the text surface prints"
+        );
+        assert_eq!(row("dev")["routes"], serde_json::json!(true));
+        assert_eq!(row("dev")["routeBlock"], serde_json::Value::Null);
+        fs::remove_file(&path).ok();
+    }
+
+    /// The warning `group add` prints. It fires only for the control account,
+    /// and it names both remedies — otherwise it is just an alarm with no exit.
+    #[test]
+    fn labelling_the_control_account_warns_and_names_a_remedy() {
+        let path = write_config("routes-notice", CONTROL_ONLY_GROUP);
+        let config = load(&path);
+        let notice = control_account_group_notice(&config, "gil@example.com", "research")
+            .expect("labelling the control account must produce a notice");
+        assert!(notice.contains("control account"), "{notice}");
+        assert!(
+            notice.contains("research"),
+            "the notice names the group: {notice}"
+        );
+        assert!(
+            notice.contains("tcr control --clear"),
+            "the notice names a runnable remedy: {notice}"
+        );
+        assert!(
+            control_account_group_notice(&config, "worker@example.com", "dev").is_none(),
+            "an ordinary account must not be warned about"
+        );
         fs::remove_file(&path).ok();
     }
 

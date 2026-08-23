@@ -262,6 +262,39 @@ A name matching no account is not a startup failure: the proxy logs an error nam
 available accounts and runs **unlocked**. So a typo'd `lockAccount` looks exactly like an
 ordinary rotating proxy unless you read the log at boot.
 
+## `groups[]` and `controlAccount`: the combination that routes nothing
+
+`accounts[].groups` labels an account. A client asks for a label with `tcr run --group
+<label>`, which sets the `x-tcr-group` header on its requests, and selection then **prefers**
+accounts carrying that label.
+
+Prefers, not requires. If no account in the group can serve the request, the proxy does not
+queue and does not fail — it falls back to the whole pool and serves from any account,
+because dropping a servable request is worse than serving it from the wrong place. The
+fallback logs one line naming the group and the reason, at the moment it happens.
+
+The trap is `controlAccount`. That account is the identity plane's designated account, and
+inference requests **never** select it — not when it is enabled, not when it is idle, not
+ever. So a group whose only member is the control account can never serve inference. Every
+request asking for it falls back, on every request, permanently. Nothing about the group
+looks wrong: it has a member, a colour, and a healthy line in `tcr status`.
+
+`tcr group ls` names this directly:
+
+```
+group research accounts=1 members=gil@example.com reserved=no routes=no route_block=control-account-only ...
+group dev      accounts=2 members=a@example.com,b@example.com reserved=no routes=yes ...
+```
+
+`routes=no` means the group exists and serves nothing. Two ways out: add a second, ordinary
+account to the group, or move the control account elsewhere with `tcr control --clear`.
+`tcr group add` prints the same warning at the moment you create the situation.
+
+Reserving is the other half and solves a different problem. `tcr group reserve <label>` makes
+an account carrying that label off-limits to traffic that did *not* ask for one of its
+groups. That keeps other sessions off the account; it does **not** make `--group` strict, and
+a reserved group with no available member still falls back to the pool.
+
 ## `http1Only`: caps blast radius, costs multiplexing
 
 A connection-level fault on HTTP/2 (GOAWAY, a framing error) kills **every** multiplexed
