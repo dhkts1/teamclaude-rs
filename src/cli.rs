@@ -103,9 +103,32 @@ fn warn_if_server_running(config: &Config) {
 }
 
 /// Load the config for a management verb, warning if a server is live.
+///
+/// Refuses when [`Config::quarantined_accounts`] is non-empty. The server's
+/// `load` is deliberately lenient — it drops an `accounts[]` entry with no
+/// usable credential (e.g. an `importFrom`-shaped account) rather than take
+/// the whole fleet down. A CLI edit verb cannot share that leniency: its
+/// round-trip is `save_after_edit` → a bare `serde_json::to_string_pretty`
+/// of the typed `Config`, which has nowhere to put an entry that was never
+/// deserialized into it — so writing back after loading such a file would
+/// silently and permanently erase the quarantined entry's raw JSON (its
+/// `importFrom` pointer included) the first time any verb saved. Refusing
+/// here, before any edit happens, keeps that erasure from ever becoming
+/// reachable; the operator fixes or removes the entry by hand, then the CLI
+/// works on it same as always.
 fn load_for_edit(config_path: &Path) -> anyhow::Result<Config> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
+    if !config.quarantined_accounts.is_empty() {
+        bail!(
+            "config at {} has {} account(s) with no usable credential, so the CLI cannot safely \
+             load-edit-save it: {}. Fix or remove the entry in the file by hand (the server \
+             itself tolerates it and keeps running).",
+            config_path.display(),
+            config.quarantined_accounts.len(),
+            config.quarantined_accounts.join(", ")
+        );
+    }
     warn_if_server_running(&config);
     Ok(config)
 }
@@ -2486,6 +2509,57 @@ mod tests {
 
     fn load(path: &Path) -> Config {
         config::load(path).unwrap()
+    }
+
+    // --- load_for_edit refuses a config with a quarantined account ---------
+
+    const ONE_ACCOUNT_ONE_UNUSABLE: &str = r#"{
+      "accounts": [
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a" },
+        { "name": "carol@example.com", "type": "oauth", "importFrom": "/some/other/file.json" }
+      ]
+    }"#;
+
+    /// The server's own `config::load` stays lenient on this file — it drops
+    /// the unusable entry and keeps running. This is the control: proves the
+    /// fixture used by the refusal test below is exactly the kind of file the
+    /// fix was meant to keep the SERVER booting on.
+    #[test]
+    fn server_load_tolerates_a_quarantined_account() {
+        let path = write_config("server-load-quarantine", ONE_ACCOUNT_ONE_UNUSABLE);
+        let config = config::load(&path).expect("server load must not fail on this file");
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "alice@example.com");
+        assert_eq!(
+            config.quarantined_accounts,
+            vec!["carol@example.com".to_string()]
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The CLI's load-edit-save round-trip cannot represent a quarantined
+    /// entry (`save` has nowhere to put it), so it refuses up front rather
+    /// than silently losing the entry's raw JSON on the next save.
+    #[test]
+    fn load_for_edit_refuses_a_config_with_a_quarantined_account() {
+        let path = write_config("cli-load-quarantine", ONE_ACCOUNT_ONE_UNUSABLE);
+        let err = load_for_edit(&path).expect_err("must refuse rather than silently drop an entry");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("carol@example.com"),
+            "error should name the quarantined account: {message}"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A config with no quarantined accounts is unaffected: `load_for_edit`
+    /// still succeeds exactly as before this change.
+    #[test]
+    fn load_for_edit_succeeds_with_no_quarantined_accounts() {
+        let path = write_config("cli-load-no-quarantine", TWO_ACCOUNTS);
+        let config = load_for_edit(&path).expect("a clean config must still load for editing");
+        assert_eq!(config.accounts.len(), 2);
+        fs::remove_file(&path).ok();
     }
 
     // --- remove ------------------------------------------------------------

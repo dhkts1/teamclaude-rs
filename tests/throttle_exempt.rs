@@ -118,6 +118,7 @@ fn config(upstream: &str, throttle: ThrottleConfig, throttle_exempt_noise: bool)
         serde_json::Value::Bool(throttle_exempt_noise),
     );
     Config {
+        quarantined_accounts: Vec::new(),
         proxy: ProxyConfig {
             port: 0,
             api_key: None,
