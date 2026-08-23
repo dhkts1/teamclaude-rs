@@ -6,82 +6,134 @@
 //! last `system` block, a tool definition, a message content block — and every
 //! shape shares one property that matters here: the client only ever sets
 //! `"ttl"` at all to ask for the NON-default window (`"1h"`; the field is
-//! omitted entirely for the ordinary 5-minute default). So rather than modelling
-//! every place a `cache_control` object can appear, this is a bounded byte scan:
-//! find a `"cache_control"` key, then look for a `"ttl"` key anywhere in the
-//! window that follows (key ORDER inside the object is not assumed — `"ttl"`
-//! may come before or after `"type"`) and, only once `"ttl"` itself is found,
-//! require `:` with optional JSON whitespace (space/tab/CR/LF) on either side
-//! and the literal value `"1h"`. No second JSON parse of the body (nothing here
-//! allocates a `Value` tree), and a short window so a `ttl`-shaped string
-//! anywhere else in a large body (message content, a tool's own output) can
-//! never be mistaken for the field.
+//! omitted entirely for the ordinary 5-minute default).
+//!
+//! This used to be a bounded byte scan for `"cache_control"` followed by a
+//! nearby `"ttl"`. That is blind to JSON structure: it fires on an unrelated
+//! sibling key that merely sits close to a real `cache_control` object, and —
+//! worse — it fires on a JSON *string value* that happens to quote the shape,
+//! which is exactly what an agent session embeds in a request body the moment
+//! it reads or diffs this very file's own doc comments and test fixtures.
+//!
+//! So instead this is a typed [`serde_json`] peek, modelled on
+//! [`crate::model::parse_request_model`]: a minimal `#[derive(Deserialize)]`
+//! shape that only reads `cache_control` off the three structurally legal
+//! positions (a `system` block, a tool definition, a message content block)
+//! and checks *that object's own* `ttl` field. A `"ttl":"1h"` anywhere else —
+//! including inside a string, a mismatched key, or a sibling object — is not
+//! visible to this shape at all, so it can never be mistaken for the field.
+//! This still does not allocate a generic `serde_json::Value` tree: every
+//! field it does not care about is simply skipped by `serde` during the same
+//! single pass.
 
-/// How far past a `"cache_control"` key to look for its `ttl` value before
-/// giving up — comfortably past `{"type":"ephemeral","ttl":"1h"}` even
-/// pretty-printed with indentation, with margin for key reordering, without
-/// being wide enough to reach into unrelated JSON.
-const SCAN_WINDOW: usize = 128;
+use serde::Deserialize;
 
-const CACHE_CONTROL_KEY: &[u8] = br#""cache_control""#;
-const TTL_KEY: &[u8] = br#""ttl""#;
-const EXTENDED_TTL_LITERAL: &[u8] = br#""1h""#;
+/// The `cache_control` object itself: only its own `ttl` matters here.
+#[derive(Deserialize)]
+struct CacheControl {
+    #[serde(default)]
+    ttl: Option<String>,
+}
 
-/// `true` iff `body` contains at least one `cache_control` object whose `ttl`
-/// is the extended `"1h"` window. Anything else — absent, `"5m"`, malformed,
-/// truncated, not JSON at all — is `false`, which is today's 15-minute pin
-/// behaviour. This must never be a way to get a LONGER pin from a malformed
-/// body: the only path to `true` is a `"ttl"` key, JSON-whitespace-tolerant
-/// `:`, and the exact literal `"1h"` — nothing looser than that.
+/// `true` iff `cache_control` is present and its own `ttl` is the extended
+/// `"1h"` window. Absent, malformed-away, or any other value (e.g. `"5m"`) is
+/// `false` — the ordinary default-window behaviour.
+fn is_extended(cache_control: &Option<CacheControl>) -> bool {
+    matches!(
+        cache_control.as_ref().and_then(|c| c.ttl.as_deref()),
+        Some("1h")
+    )
+}
+
+/// A single content block — the shape shared by `system` array entries and a
+/// message's `content` array entries. Everything but `cache_control` is
+/// skipped.
+#[derive(Deserialize)]
+struct ContentBlock {
+    #[serde(default)]
+    cache_control: Option<CacheControl>,
+}
+
+/// `system` and a message's `content` are both legally either a plain string
+/// (no `cache_control` possible) or an array of content blocks (where it is).
+/// A string value — including one that happens to quote a `cache_control`
+/// object's JSON shape — never matches the `Blocks` arm.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TextOrBlocks {
+    // The string itself is never read — its only job is to consume the
+    // `Text` shape so it does not fall through to `Blocks` and expose
+    // whatever `cache_control`-shaped substring it might quote.
+    Text(#[allow(dead_code)] String),
+    Blocks(Vec<ContentBlock>),
+}
+
+impl TextOrBlocks {
+    fn any_extended(&self) -> bool {
+        match self {
+            TextOrBlocks::Text(_) => false,
+            TextOrBlocks::Blocks(blocks) => blocks.iter().any(|b| is_extended(&b.cache_control)),
+        }
+    }
+}
+
+/// One entry of `messages`. Everything but `content` is skipped.
+#[derive(Deserialize)]
+struct Message {
+    #[serde(default)]
+    content: Option<TextOrBlocks>,
+}
+
+/// One entry of `tools`. Everything but `cache_control` is skipped.
+#[derive(Deserialize)]
+struct ToolDef {
+    #[serde(default)]
+    cache_control: Option<CacheControl>,
+}
+
+/// The three top-level positions a `cache_control` object can legally appear
+/// under. Everything else in the request body is skipped.
+#[derive(Deserialize)]
+struct TtlPeek {
+    #[serde(default)]
+    system: Option<TextOrBlocks>,
+    #[serde(default)]
+    messages: Option<Vec<Message>>,
+    #[serde(default)]
+    tools: Option<Vec<ToolDef>>,
+}
+
+/// `true` iff `body` contains at least one structurally legal `cache_control`
+/// object — on a `system` block, a tool definition, or a message content
+/// block — whose own `ttl` is the extended `"1h"` window. Anything else —
+/// absent, `"5m"`, malformed, truncated, not JSON at all, or a `cache_control`
+/// shape that only appears inside a string — is `false`, which is today's
+/// 15-minute pin behaviour. This must never be a way to get a LONGER pin from
+/// a malformed or merely lookalike body: the only path to `true` is a real
+/// `cache_control` object, in one of the three legal positions, whose own
+/// `ttl` is exactly `"1h"`.
 pub fn requests_extended_ttl(body: &[u8]) -> bool {
-    let mut start = 0;
-    while let Some(rel) = find(&body[start..], CACHE_CONTROL_KEY) {
-        let key_end = start + rel + CACHE_CONTROL_KEY.len();
-        let window_end = (key_end + SCAN_WINDOW).min(body.len());
-        if ttl_1h_in_window(&body[key_end..window_end]) {
+    let Ok(peek) = serde_json::from_slice::<TtlPeek>(body) else {
+        return false;
+    };
+
+    if peek.system.is_some_and(|s| s.any_extended()) {
+        return true;
+    }
+    if let Some(messages) = peek.messages {
+        if messages
+            .iter()
+            .any(|m| m.content.as_ref().is_some_and(TextOrBlocks::any_extended))
+        {
             return true;
         }
-        start = key_end;
     }
-    false
-}
-
-/// Within `window` (already bounded to [`SCAN_WINDOW`] bytes past a
-/// `"cache_control"` key), find a `"ttl"` key and check whether ITS value —
-/// skipping whitespace, then `:`, then whitespace again, exactly as JSON
-/// permits between any token and the next — is the literal `"1h"`.
-fn ttl_1h_in_window(window: &[u8]) -> bool {
-    let mut start = 0;
-    while let Some(rel) = find(&window[start..], TTL_KEY) {
-        let after_key = start + rel + TTL_KEY.len();
-        let mut pos = skip_json_whitespace(window, after_key);
-        if window.get(pos) == Some(&b':') {
-            pos = skip_json_whitespace(window, pos + 1);
-            if window[pos..].starts_with(EXTENDED_TTL_LITERAL) {
-                return true;
-            }
+    if let Some(tools) = peek.tools {
+        if tools.iter().any(|t| is_extended(&t.cache_control)) {
+            return true;
         }
-        start = after_key;
     }
     false
-}
-
-/// Advance `pos` past any run of JSON whitespace (space, tab, CR, LF) —
-/// the same four characters the JSON grammar itself treats as insignificant
-/// between tokens, so this tolerates any client's pretty-printing without
-/// tolerating anything JSON wouldn't.
-fn skip_json_whitespace(body: &[u8], mut pos: usize) -> usize {
-    while matches!(body.get(pos), Some(b' ' | b'\t' | b'\r' | b'\n')) {
-        pos += 1;
-    }
-    pos
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -95,6 +147,18 @@ mod tests {
     }
 
     #[test]
+    fn detects_extended_ttl_on_a_tool_definition() {
+        let body = br#"{"tools":[{"name":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#;
+        assert!(requests_extended_ttl(body));
+    }
+
+    #[test]
+    fn detects_extended_ttl_on_a_message_content_block() {
+        let body = br#"{"messages":[{"role":"user","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}]}"#;
+        assert!(requests_extended_ttl(body));
+    }
+
+    #[test]
     fn default_cache_control_with_no_ttl_is_not_extended() {
         let body =
             br#"{"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}"#;
@@ -103,7 +167,7 @@ mod tests {
 
     #[test]
     fn explicit_5m_ttl_is_not_extended() {
-        let body = br#"{"cache_control":{"type":"ephemeral","ttl":"5m"}}"#;
+        let body = br#"{"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral","ttl":"5m"}}]}"#;
         assert!(!requests_extended_ttl(body));
     }
 
@@ -120,52 +184,57 @@ mod tests {
     }
 
     #[test]
-    fn a_ttl_1h_string_far_from_any_cache_control_key_does_not_count() {
-        // The literal appears in unrelated content, well past the scan window
-        // from any `cache_control` key — must not false-positive.
-        let filler = "x".repeat(SCAN_WINDOW + 10);
-        let body =
-            format!(r#"{{"cache_control":{{"type":"ephemeral"}},"note":"{filler}","ttl":"1h"}}"#);
-        assert!(!requests_extended_ttl(body.as_bytes()));
-    }
-
-    #[test]
-    fn extended_ttl_on_a_tool_definition_is_detected() {
-        let body = br#"{"tools":[{"name":"x","cache_control":{"type":"ephemeral","ttl":"1h"}}]}"#;
-        assert!(requests_extended_ttl(body));
-    }
-
-    #[test]
     fn spaced_json_ttl_1h_is_detected() {
-        let body = br#"{"cache_control": {"type": "ephemeral", "ttl": "1h"}}"#;
+        let body = br#"{"system": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}"#;
         assert!(requests_extended_ttl(body));
     }
 
     #[test]
     fn pretty_printed_ttl_1h_across_newlines_is_detected() {
-        let body =
-            b"{\n  \"cache_control\": {\n    \"type\": \"ephemeral\",\n    \"ttl\": \"1h\"\n  }\n}";
+        let body = b"{\n  \"system\": [{\n    \"type\": \"text\",\n    \"text\": \"x\",\n    \"cache_control\": {\n      \"type\": \"ephemeral\",\n      \"ttl\": \"1h\"\n    }\n  }]\n}";
         assert!(requests_extended_ttl(body));
     }
 
     #[test]
     fn reordered_and_spaced_keys_are_detected() {
-        let body = br#"{"cache_control": {"ttl": "1h", "type": "ephemeral"}}"#;
+        let body = br#"{"system": [{"cache_control": {"ttl": "1h", "type": "ephemeral"}, "type": "text", "text": "x"}]}"#;
         assert!(requests_extended_ttl(body));
     }
 
     #[test]
     fn spaced_5m_ttl_is_not_extended() {
-        let body = br#"{"cache_control": {"type": "ephemeral", "ttl": "5m"}}"#;
+        let body = br#"{"system": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "5m"}}]}"#;
         assert!(!requests_extended_ttl(body));
     }
 
+    /// Reproduced failure #1 from the bridge: a `cache_control` object with no
+    /// `ttl`, sitting next to an unrelated sibling object that happens to have
+    /// a `"ttl":"1h"` key of its own. Neither is a legal `cache_control`/`ttl`
+    /// pairing, so this must be `false`.
     #[test]
-    fn a_spaced_ttl_1h_in_message_content_far_from_cache_control_does_not_count() {
-        let filler = "x".repeat(SCAN_WINDOW + 10);
-        let body = format!(
-            r#"{{"cache_control": {{"type": "ephemeral"}}, "note": "{filler}", "ttl": "1h"}}"#
-        );
-        assert!(!requests_extended_ttl(body.as_bytes()));
+    fn unrelated_sibling_ttl_next_to_cache_control_does_not_count() {
+        let body = br#"{"cache_control":{"type":"ephemeral"},"config":{"ttl":"1h"}}"#;
+        assert!(!requests_extended_ttl(body));
+    }
+
+    /// Reproduced failure #2 from the bridge: a real `cache_control` (with no
+    /// `ttl`) inside a `system` block, plus an unrelated top-level `"tool"`
+    /// (singular — not the legal `"tools"` array) whose own object has a
+    /// `"ttl":"1h"`. Must be `false`.
+    #[test]
+    fn unrelated_singular_tool_ttl_does_not_count() {
+        let body = br#"{"system":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}],"tool":{"ttl":"1h"}}"#;
+        assert!(!requests_extended_ttl(body));
+    }
+
+    /// The self-trigger class: a message whose `content` is a plain STRING
+    /// that happens to quote the literal `cache_control`/`ttl` JSON shape —
+    /// e.g. an agent session pasting this very module's own test fixtures
+    /// into a request. A string can never be a `cache_control` object, so
+    /// this must be `false` regardless of what text it contains.
+    #[test]
+    fn ttl_1h_quoted_inside_a_message_string_does_not_count() {
+        let body = br#"{"messages":[{"role":"user","content":"see {\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}} for reference"}]}"#;
+        assert!(!requests_extended_ttl(body));
     }
 }
