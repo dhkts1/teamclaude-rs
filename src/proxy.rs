@@ -1940,17 +1940,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         .as_deref()
         .is_some_and(crate::model::is_fable_model);
 
-    // Whether THIS request asked Anthropic's cache for the extended 1h window.
-    // Read ONCE here, beside `request_model` and for the same reason: it is a
-    // property of the body, constant across the rotation loop, and it now has
-    // two consumers — the persisted pin's TTL below, and the usage ledger's
-    // fallback when a response reports a flat cache-creation count with no
-    // `ephemeral_1h_input_tokens` breakdown. It used to be parsed inside the
-    // session-key branch, which is why hoisting it costs nothing when affinity
-    // is on (the same single parse, now shared) and one body parse per request
-    // when affinity is off.
-    let request_extended_ttl = crate::cache_ttl::requests_extended_ttl(&body_bytes);
-
     // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
     // constant across the rotation loop — same shape as `request_model` above.
     // An empty header value is treated as absent rather than an empty-string
@@ -2002,12 +1991,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     };
 
     // Record whether THIS request asked Anthropic's cache for the extended 1h
-    // window, same body bytes as `request_model` above and no second full
-    // parse of the document (see `crate::cache_ttl`). Only meaningful with a
-    // session key: it drives nothing on the routing path, only what TTL this
-    // session's persisted pin gets at the next restart.
+    // window. Deliberately INSIDE the session-key branch: `requests_extended_ttl`
+    // deserializes the whole body and materializes every system/tools/messages
+    // content block, so hoisting it out charges that parse to every request
+    // that will never use the answer — `count_tokens`, anything unkeyed, and
+    // every request at all with `"sessionAffinity": false`. It drives nothing
+    // on the routing path, only what TTL this session's persisted pin gets at
+    // the next restart. The usage ledger's own fallback need is answered
+    // lazily, at the one point it can still matter — see `usage_record`.
     if let Some(key) = session_key {
-        manager.note_affinity_ttl(key, request_extended_ttl);
+        manager.note_affinity_ttl(key, crate::cache_ttl::requests_extended_ttl(&body_bytes));
     }
 
     // 3. Selection + rotation loop.
@@ -2737,6 +2730,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // task below outlives this iteration. A `String` clone per streamed
             // request, so the ledger can attribute tokens to a model at all.
             let request_model_for_usage = request_model.clone();
+            // `Bytes` is reference-counted, so this is a pointer bump, not a
+            // copy of the conversation. The spawned task needs the body only to
+            // answer the cache-TTL question, and only in the case where the
+            // response reported no 1h split of its own — see `usage_record`,
+            // which takes that answer as a closure so the parse never runs
+            // otherwise.
+            let body_for_ttl = body_bytes.clone();
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -2749,7 +2749,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         &parsed,
                         request_model_for_usage.clone(),
                         session_key,
-                        request_extended_ttl,
+                        || crate::cache_ttl::requests_extended_ttl(&body_for_ttl),
                     );
                     // One line per terminal request, never per SSE event — a
                     // per-event log here would be the same flood vector the
@@ -2948,12 +2948,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         if status.is_success() {
             let parsed = usage_from_json(&bytes);
             if parsed.input_total > 0 || parsed.output > 0 {
-                let record = usage_record(
-                    &parsed,
-                    request_model.clone(),
-                    session_key,
-                    request_extended_ttl,
-                );
+                let record = usage_record(&parsed, request_model.clone(), session_key, || {
+                    crate::cache_ttl::requests_extended_ttl(&body_bytes)
+                });
                 // One line per terminal (non-streamed) request — see the
                 // matching log line on the streaming arm above.
                 tracing::info!(
@@ -3411,7 +3408,15 @@ struct ParsedUsage {
     /// `cache_creation - cache_creation_1h`. Kept apart because the two bill
     /// differently (2x base input against 1.25x), so a single cache-creation
     /// number cannot be priced.
-    cache_creation_1h: u64,
+    ///
+    /// `None` means the response REPORTED NO SPLIT; `Some(0)` means it reported
+    /// one and it was zero. Those are different facts and collapsing them is a
+    /// pricing error, not a formality: a Claude Code session pins its system
+    /// prompt at 1h and its conversation at 5m, so a turn writing 200k tokens
+    /// of 5-minute cache and nothing at 1h answers `{ephemeral_5m: 200000,
+    /// ephemeral_1h: 0}` — and reading that 0 as "no data" hands the whole
+    /// write to the request's 1h flag and prices it at 2x instead of 1.25x.
+    cache_creation_1h: Option<u64>,
 }
 
 /// Extract the cache-read + cache-creation components of a `usage` object,
@@ -3424,20 +3429,22 @@ struct ParsedUsage {
 /// (`ephemeral_1h_input_tokens`), which the Messages API sends alongside the
 /// flat `cache_creation_input_tokens`. It is CLAMPED to the flat count on
 /// purpose: the flat number is the one the existing `cache_creation_tokens`
-/// counter has always carried, and splitting it must never change its total. A
-/// response that omitted the nested object leaves this 0 here; the caller then
-/// falls back to the REQUEST's own `cache_control` ttl
-/// ([`crate::cache_ttl::requests_extended_ttl`]), which is the only other
-/// evidence of which window was asked for.
-fn cache_breakdown(usage: &Value) -> (u64, u64, u64) {
+/// counter has always carried, and splitting it must never change its total.
+///
+/// `None` — and ONLY `None` — means the response did not report a split at all
+/// (no nested object, or no such field in it). A reported `0` comes back as
+/// `Some(0)`: it is a first-hand statement that nothing was written at 1h, and
+/// the caller must not treat it as missing data and fall back to the REQUEST's
+/// `cache_control` ttl ([`crate::cache_ttl::requests_extended_ttl`]), which is
+/// only evidence of what was ASKED for.
+fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let cache_creation = field("cache_creation_input_tokens");
     let cache_creation_1h = usage
         .get("cache_creation")
         .and_then(|c| c.get("ephemeral_1h_input_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or(0)
-        .min(cache_creation);
+        .map(|reported| reported.min(cache_creation));
     (
         field("cache_read_input_tokens"),
         cache_creation,
@@ -3456,41 +3463,47 @@ fn cache_breakdown(usage: &Value) -> (u64, u64, u64) {
 /// own `model` field can differ from what was asked for, and the ask is what the
 /// operator reasons about.
 ///
-/// **The 5m/1h split falls back to the request's `cache_control` ttl.** When the
-/// response carried `usage.cache_creation.ephemeral_1h_input_tokens` that figure
-/// wins outright — it is a first-hand report of what was written. Only when the
-/// response omitted it does `extended_ttl` decide, and then it decides ALL of
-/// the flat cache-creation count, because a body whose only `cache_control` ttl
-/// is `"1h"` wrote its cache under that window. Silence in both places means 5
-/// minutes, which is the API's own default.
+/// **The 5m/1h split falls back to the request's `cache_control` ttl, and only
+/// then.** When the response REPORTED
+/// `usage.cache_creation.ephemeral_1h_input_tokens` that figure wins outright,
+/// including when it reported zero — it is a first-hand report of what was
+/// written, and a reported zero is data. Only when the response omitted the
+/// field entirely (`None`) is `extended_ttl` consulted, and then it decides ALL
+/// of the flat cache-creation count, because a body whose only `cache_control`
+/// ttl is `"1h"` wrote its cache under that window. Silence in both places means
+/// 5 minutes, which is the API's own default.
+///
+/// `extended_ttl` is a CLOSURE because answering it means deserializing the
+/// whole request body (`crate::cache_ttl::requests_extended_ttl` materializes
+/// every system/tools/messages content block), and on the path that matters —
+/// a Messages response that reported its own split — the answer is never
+/// needed. Lazy, so a multi-megabyte conversation pays for that parse only when
+/// it is the only evidence left.
 fn usage_record(
     parsed: &ParsedUsage,
     model: Option<String>,
     session: Option<u64>,
-    extended_ttl: bool,
+    extended_ttl: impl FnOnce() -> bool,
 ) -> crate::usage::UsageRecord {
-    let cache_1h = if parsed.cache_creation_1h > 0 {
-        parsed.cache_creation_1h
-    } else if extended_ttl {
-        parsed.cache_creation
-    } else {
-        0
+    let cache_1h = match parsed.cache_creation_1h {
+        Some(reported) => reported,
+        None if extended_ttl() => parsed.cache_creation,
+        None => 0,
     };
-    crate::usage::UsageRecord {
-        ts_ms: crate::now_ms(),
+    crate::usage::UsageRecord::from_quota_input(
+        crate::now_ms(),
         model,
         session,
-        // BASE input: `input_total` is the quota counter and folds in both cache
-        // dimensions (see `sum_input_tokens`), which bill at different rates and
-        // so must not be counted at the base rate as well.
-        input: parsed
-            .input_total
-            .saturating_sub(parsed.cache_read + parsed.cache_creation),
-        cache_5m: parsed.cache_creation.saturating_sub(cache_1h),
+        // The QUOTA figure, verbatim: `input_total` is `sum_input_tokens`, the
+        // number the cumulative counter has always been fed. The base input
+        // priced at the input rate is derived from it inside the constructor,
+        // which is also where a caller whose components exceed it is handled.
+        parsed.input_total,
+        parsed.cache_creation.saturating_sub(cache_1h),
         cache_1h,
-        cache_read: parsed.cache_read,
-        output: parsed.output,
-    }
+        parsed.cache_read,
+        parsed.output,
+    )
 }
 
 /// Parse the token breakdown from a non-streamed JSON messages body.
@@ -4635,6 +4648,79 @@ mod tests {
             "cache-read retained on the JSON path"
         );
         assert_eq!(parsed.cache_creation, 3, "cache-creation retained");
+        assert_eq!(
+            parsed.cache_creation_1h, None,
+            "this response reported no 1h split at all — absent, not zero"
+        );
+    }
+
+    /// FINDING 2. A reported `ephemeral_1h_input_tokens: 0` is a first-hand
+    /// statement that nothing was written at the 1-hour TTL, and must never be
+    /// read as "no breakdown" and handed to the request's `cache_control` flag.
+    ///
+    /// This is the shape every Claude Code session here produces: the system
+    /// prompt is pinned at 1h, the conversation at 5m, so a turn that writes
+    /// 200k tokens of 5-minute cache and nothing at 1h answers exactly this
+    /// while `requests_extended_ttl` is true. Booking those 200k at 1h prices
+    /// them at 2x base input instead of 1.25x — on Opus 5, $10/MTok against
+    /// $6.25/MTok — and both `costUsd` and `cacheCreation1hTokens` read high
+    /// while looking measured.
+    #[test]
+    fn an_explicitly_zero_1h_split_is_not_mistaken_for_a_missing_one() {
+        let body = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
+            "cache_creation":{"ephemeral_5m_input_tokens":200000,"ephemeral_1h_input_tokens":0},
+            "cache_read_input_tokens":0,"output_tokens":11}}"#;
+        let parsed = usage_from_json(body);
+        assert_eq!(
+            parsed.cache_creation_1h,
+            Some(0),
+            "reported zero survives as a REPORTED zero"
+        );
+
+        let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || true);
+        assert_eq!(
+            record.cache_1h, 0,
+            "the response said nothing was written at 1h, and the request's ttl flag \
+             does not overrule a first-hand report"
+        );
+        assert_eq!(
+            record.cache_5m, 200_000,
+            "the whole write is a 5-minute write, priced at 1.25x rather than 2x"
+        );
+
+        // The genuinely absent case still falls back, which is the behaviour
+        // this must not break: no nested object, so the request's ttl decides.
+        let no_split = br#"{"usage":{"input_tokens":50,"cache_creation_input_tokens":200000,
+            "cache_read_input_tokens":0,"output_tokens":11}}"#;
+        let parsed = usage_from_json(no_split);
+        assert_eq!(parsed.cache_creation_1h, None, "control: nothing reported");
+        let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || true);
+        assert_eq!(
+            record.cache_1h, 200_000,
+            "with no report at all, the request's own 1h cache_control is the only evidence"
+        );
+    }
+
+    /// FINDING 10. `requests_extended_ttl` deserializes the entire request body
+    /// and materializes every system/tools/messages content block. On the path
+    /// that matters — a response that reported its own 1h split — its answer is
+    /// never used, so it must never be computed. The closure PANICS here: if
+    /// the evaluation is eager again, this test says so instead of the cost
+    /// showing up as per-request latency on a multi-megabyte conversation.
+    #[test]
+    fn the_request_body_is_not_reparsed_when_the_response_reported_its_split() {
+        let parsed = ParsedUsage {
+            input_total: 1_000,
+            output: 10,
+            cache_read: 0,
+            cache_creation: 900,
+            cache_creation_1h: Some(400),
+        };
+        let record = usage_record(&parsed, Some("claude-opus-5".to_string()), None, || {
+            panic!("the request body must not be parsed when the response reported its split")
+        });
+        assert_eq!(record.cache_1h, 400);
+        assert_eq!(record.cache_5m, 500);
     }
 
     #[test]

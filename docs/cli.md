@@ -338,6 +338,11 @@ tcr status --json | jq '.[] | {name, today: .usage.today.costUsd, hour: .usage.l
 Each totals object carries `requests`, `inputTokens` (BASE input — see below), `cacheCreationTokens`,
 `cacheCreation1hTokens`, `cacheReadTokens`, `outputTokens`, `costUsd` and `unpricedRequests`.
 
+`cacheCreationTokens` is ALL cache creation, both TTLs — the same quantity the row-level key of that
+name carries, so the two never mean different things in one row. `cacheCreation1hTokens` is the
+subset of it written under the extended 1-hour window (which bills at 2x base input rather than
+1.25x); the 5-minute part is the difference between the two.
+
 **`usage.today.inputTokens` is not the row's `inputTokens`.** The row-level one is the QUOTA counter
 and folds cache creation and cache reads into a single number, which is what quota is charged on. The
 usage object keeps the four dimensions apart because they bill at four different rates, so they have
@@ -351,6 +356,10 @@ that compares across accounts, models and days. When a model has no published ra
 `costUsd` is `null` and `unpricedRequests` counts the requests missing from the figure — a partial
 total says so rather than passing itself off as the whole. Add a rate with `pricing` in the config
 ([configuration.md](configuration.md#pricing-and-usageretentiondays)).
+
+`costUsd: null` means exactly that one thing: the bucket served requests and not one of them could be
+priced. A bucket that served NOTHING reports `costUsd: 0.0` — an idle account is a measured zero, in
+`today` and `lastHour` alike.
 
 **`usage: null` means not measured, never "spent nothing".** Two cases produce it: the row came from
 the offline path (no serving process, so there is nothing to aggregate), or the proxy that answered

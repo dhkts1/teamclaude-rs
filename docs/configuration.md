@@ -83,6 +83,11 @@ per day at roughly 2 MB per 17k requests. Files older than this are deleted once
 and yesterday's are ever read back (that is what makes a restart keep the day's totals); the rest are
 history for you to grep.
 
+`0` is the floor, and it keeps today AND yesterday: those two files are what the boot replay reads, and
+the pruner never deletes them whatever this is set to. It has to be both — on a UTC+3 machine the first
+three hours of the local day live in yesterday's UTC-named file, so deleting it would cost the second
+restart of the day those hours, silently and while still reporting them as measured.
+
 **"Today" is the local calendar day of the machine the server runs on**, resolved per record against
 that record's own instant, so a day boundary is correct across a daylight-saving change. Ledger FILE
 names are UTC dates and need not agree with it — the file name is a shard key, not a claim about your

@@ -703,6 +703,13 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             malformed = report.malformed,
             pruned = report.pruned,
             retention_days = retention,
+            // The two the writer thread owns: whether it is actually writing
+            // (false if it could not start, or has already failed), and how
+            // many lines its queue had no room for. Both are the answer to
+            // "will today's totals survive the next restart", which the count
+            // of replayed lines alone cannot give.
+            persisting = manager.usage_is_persisting(),
+            dropped_lines = manager.usage_dropped_lines(),
             "usage ledger attached"
         );
     }

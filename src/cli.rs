@@ -5231,7 +5231,10 @@ mod tests {
         tcr_status_wire::UsageTotals {
             requests,
             input_tokens: input,
-            cache_creation_tokens: cache_5m,
+            // BOTH TTLs, exactly as `Totals::to_wire` emits it — the same
+            // quantity the row-level `cacheCreationTokens` carries, with the
+            // 1-hour part broken out beside it.
+            cache_creation_tokens: cache_5m + cache_1h,
             cache_creation_1h_tokens: cache_1h,
             cache_read_tokens: cache_read,
             output_tokens: output,
@@ -5279,8 +5282,9 @@ mod tests {
     ///
     /// The token counts reconcile with the row-level counters
     /// [`contract_account`] sets: 102 requests, 400,000 base input, 1,600,000
-    /// cache creation (1,200,000 at 5 minutes plus 400,000 at an hour),
-    /// 6,000,000 cache reads and 31,860 output. `lastHour` is a subset of
+    /// cache creation (1,200,000 at 5 minutes plus 400,000 at an hour, and the
+    /// nested `cacheCreationTokens` carries that same 1,600,000 the row-level
+    /// key does), 6,000,000 cache reads and 31,860 output. `lastHour` is a subset of
     /// `window`, which is a subset of `today` — the containment any reader will
     /// assume, so the sample had better honour it.
     ///

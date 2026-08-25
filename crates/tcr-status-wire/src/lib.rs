@@ -37,6 +37,11 @@ use serde::{Deserialize, Serialize};
 /// and none of their models could be priced; `unpricedRequests` says how many
 /// of `requests` are missing from the figure, so a partial total is never
 /// mistaken for a complete one.
+///
+/// A bucket with NO requests reports `costUsd: 0.0`. Nothing served is a
+/// measured zero, and `null` is reserved for the one case above — an idle
+/// account used to report `today.costUsd: null` beside `lastHour.costUsd: 0`
+/// for the very same absence of traffic.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageTotals {
@@ -48,11 +53,14 @@ pub struct UsageTotals {
     /// have to stay apart to be priced.
     #[serde(default)]
     pub input_tokens: u64,
-    /// Cache-creation tokens written under the default 5-minute TTL.
+    /// ALL cache-creation tokens, both TTLs — the same quantity the row-level
+    /// [`AccountStatusRow::cache_creation_tokens`] carries, deliberately, so
+    /// one key never means two things in one row. The 5-minute part is this
+    /// minus [`Self::cache_creation_1h_tokens`].
     #[serde(default)]
     pub cache_creation_tokens: u64,
-    /// Cache-creation tokens written under the extended 1-hour TTL, which bills
-    /// at twice base input rather than 1.25x.
+    /// The SUBSET of [`Self::cache_creation_tokens`] written under the extended
+    /// 1-hour TTL, which bills at twice base input rather than 1.25x.
     #[serde(default)]
     pub cache_creation_1h_tokens: u64,
     #[serde(default)]

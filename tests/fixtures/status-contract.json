@@ -47,7 +47,7 @@
     "usage": {
       "lastHour": {
         "cacheCreation1hTokens": 47000,
-        "cacheCreationTokens": 141000,
+        "cacheCreationTokens": 188000,
         "cacheReadTokens": 705000,
         "costUsd": 1.6413,
         "inputTokens": 47000,
@@ -57,7 +57,7 @@
       },
       "today": {
         "cacheCreation1hTokens": 400000,
-        "cacheCreationTokens": 1200000,
+        "cacheCreationTokens": 1600000,
         "cacheReadTokens": 6000000,
         "costUsd": 14.1657,
         "inputTokens": 400000,
@@ -68,7 +68,7 @@
       "todayByModel": {
         "claude-opus-5": {
           "cacheCreation1hTokens": 280000,
-          "cacheCreationTokens": 840000,
+          "cacheCreationTokens": 1120000,
           "cacheReadTokens": 4200000,
           "costUsd": 12.0785,
           "inputTokens": 280000,
@@ -78,7 +78,7 @@
         },
         "claude-sonnet-5": {
           "cacheCreation1hTokens": 120000,
-          "cacheCreationTokens": 360000,
+          "cacheCreationTokens": 480000,
           "cacheReadTokens": 1800000,
           "costUsd": 2.0872,
           "inputTokens": 120000,
@@ -89,7 +89,7 @@
       },
       "window": {
         "cacheCreation1hTokens": 157000,
-        "cacheCreationTokens": 471000,
+        "cacheCreationTokens": 628000,
         "cacheReadTokens": 2355000,
         "costUsd": 5.6141,
         "inputTokens": 157000,
@@ -156,7 +156,7 @@
     "usage": {
       "lastHour": {
         "cacheCreation1hTokens": 47000,
-        "cacheCreationTokens": 141000,
+        "cacheCreationTokens": 188000,
         "cacheReadTokens": 705000,
         "costUsd": 1.3804,
         "inputTokens": 47000,
@@ -166,7 +166,7 @@
       },
       "today": {
         "cacheCreation1hTokens": 400000,
-        "cacheCreationTokens": 1200000,
+        "cacheCreationTokens": 1600000,
         "cacheReadTokens": 6000000,
         "costUsd": 12.0785,
         "inputTokens": 400000,
@@ -177,7 +177,7 @@
       "todayByModel": {
         "claude-opus-5": {
           "cacheCreation1hTokens": 280000,
-          "cacheCreationTokens": 840000,
+          "cacheCreationTokens": 1120000,
           "cacheReadTokens": 4200000,
           "costUsd": 12.0785,
           "inputTokens": 280000,
@@ -187,7 +187,7 @@
         },
         "claude-sonnet-4-5-20250929": {
           "cacheCreation1hTokens": 120000,
-          "cacheCreationTokens": 360000,
+          "cacheCreationTokens": 480000,
           "cacheReadTokens": 1800000,
           "costUsd": null,
           "inputTokens": 120000,
@@ -198,7 +198,7 @@
       },
       "window": {
         "cacheCreation1hTokens": 157000,
-        "cacheCreationTokens": 471000,
+        "cacheCreationTokens": 628000,
         "cacheReadTokens": 2355000,
         "costUsd": 4.8314,
         "inputTokens": 157000,
@@ -265,7 +265,7 @@
     "usage": {
       "lastHour": {
         "cacheCreation1hTokens": 47000,
-        "cacheCreationTokens": 141000,
+        "cacheCreationTokens": 188000,
         "cacheReadTokens": 705000,
         "costUsd": 1.6413,
         "inputTokens": 47000,
@@ -275,7 +275,7 @@
       },
       "today": {
         "cacheCreation1hTokens": 400000,
-        "cacheCreationTokens": 1200000,
+        "cacheCreationTokens": 1600000,
         "cacheReadTokens": 6000000,
         "costUsd": 14.1657,
         "inputTokens": 400000,
@@ -286,7 +286,7 @@
       "todayByModel": {
         "claude-opus-5": {
           "cacheCreation1hTokens": 280000,
-          "cacheCreationTokens": 840000,
+          "cacheCreationTokens": 1120000,
           "cacheReadTokens": 4200000,
           "costUsd": 12.0785,
           "inputTokens": 280000,
@@ -296,7 +296,7 @@
         },
         "claude-sonnet-5": {
           "cacheCreation1hTokens": 120000,
-          "cacheCreationTokens": 360000,
+          "cacheCreationTokens": 480000,
           "cacheReadTokens": 1800000,
           "costUsd": 2.0872,
           "inputTokens": 120000,
@@ -307,7 +307,7 @@
       },
       "window": {
         "cacheCreation1hTokens": 157000,
-        "cacheCreationTokens": 471000,
+        "cacheCreationTokens": 628000,
         "cacheReadTokens": 2355000,
         "costUsd": 5.6141,
         "inputTokens": 157000,

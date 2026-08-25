@@ -621,7 +621,8 @@ pub struct Config {
     /// `~/.cache/teamclaude/usage/`. Absent → 90. Checked once at boot; older
     /// files are deleted then. `0` keeps only today and yesterday (the two the
     /// boot replay reads), which is the floor — the ledger cannot keep less and
-    /// still survive a restart.
+    /// still survive a restart, so `crate::usage::prune` refuses to delete
+    /// either of those two days whatever this says.
     #[serde(default = "default_usage_retention_days")]
     pub usage_retention_days: u32,
     #[serde(default)]
