@@ -248,21 +248,17 @@ public enum Tok {
     public static let space5: CGFloat = 16
 
     public static let panelWidth: CGFloat = 380
+    /// The cap on the scrolling account list — what keeps Quit and the
+    /// checkboxes on screen under a long fleet.
+    ///
+    /// A row count (`visibleAccountRows = 4`) used to do this and was the wrong
+    /// unit: rows are not uniform height, so four of them is not a fixed number
+    /// of points. `FleetView.visibleRowsHeight(for:)` sums every measured row
+    /// and clamps here instead.
     public static let panelMaxHeight: CGFloat = 520
-    /// Number of account rows visible before the list scrolls. Fixed rather
-    /// than a preference: a long fleet otherwise renders far enough to push the
-    /// footer past the bottom of the screen, taking Quit and the checkboxes with
-    /// it. This is a ROW COUNT, not a per-row height multiplier — rows are not
-    /// uniform height (`AccountRow` grows for the needs-relogin state and
-    /// several conditional detail lines), so the panel sums actual measured
-    /// heights for the first N rows rather than multiplying this by a constant.
-    /// See `FleetView.visibleRowsHeight(for:)`.
-    public static let visibleAccountRows = 4
     public static let gutter = space4
     public static let rowSpacing = space3
     public static let tightSpacing = space2
-    /// Vertical breathing room around one account row.
-    public static let rowPaddingV = space1
     /// Gap between lines *inside* a row — tighter than the gap between rows, so
     /// a row still reads as one block.
     public static let rowLineSpacing = space1
@@ -272,6 +268,19 @@ public enum Tok {
     public static let radiusLarge: CGFloat = 12
     public static let barHeight: CGFloat = 6
     public static let barRadius: CGFloat = 3
+    /// Width of a quota bar. Fixed, so the percentage after it starts at the
+    /// same x on every card; a bar that took the leftover width could not.
+    ///
+    /// 72 is what fits. A row has about 300pt, and the 7-day line also carries
+    /// `100%` (31), `in 4d 12h` (50) and `102 req · cache 84%` (101). At 120 the
+    /// counters rendered as `102 req ·…`, at 80 they still did on the spent
+    /// rows. A truncated counter deletes a measurement; a shorter bar only
+    /// blunts a magnitude, and 72pt still resolves under a percent per pixel.
+    public static let barWidth: CGFloat = 72
+    /// Width of the `5h`/`7d` label. `5h` and `7d` are not the same width in a
+    /// proportional face, so without this the two bars in a card start a hair
+    /// apart.
+    public static let windowLabelWidth: CGFloat = 20
     public static let pillRadius = radiusSmall
     public static let pillPaddingH: CGFloat = 6
     public static let pillPaddingV: CGFloat = 2
