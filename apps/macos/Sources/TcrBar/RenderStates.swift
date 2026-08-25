@@ -249,8 +249,23 @@ enum RenderStates {
         fiveHour: String? = nil,
         fiveHourState: String? = nil,
         sevenDay: String? = nil,
-        sevenDayState: String? = nil
+        sevenDayState: String? = nil,
+        // Minutes from NOW until each window resets, written onto the wire as
+        // epoch milliseconds the way `tcr` sends them.
+        //
+        // Relative rather than a fixed timestamp because
+        // `QuotaFormat.resetCaption` returns nil for a reset that is not in the
+        // future: a hard-coded epoch draws a caption today and nothing a month
+        // from now, deleting the thing these scenes exist to show. The cost is
+        // that the caption's digits differ between renders.
+        fiveHourResetInMinutes: Int? = nil,
+        sevenDayResetInMinutes: Int? = nil
     ) -> String {
+        func resetAtMs(_ minutes: Int?) -> String {
+            guard let minutes else { return "null" }
+            let at = Date().addingTimeInterval(Double(minutes) * 60)
+            return "\(Int64(at.timeIntervalSince1970 * 1000))"
+        }
         let fh = fiveHour ?? quota
         let fhState = fiveHourState ?? state
         let sd = sevenDay ?? quota
@@ -271,6 +286,8 @@ enum RenderStates {
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
              "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
              "sevenDayOi":0.0,"held":\(held),
+             "fiveHourResetAtMs":\(resetAtMs(fiveHourResetInMinutes)),
+             "sevenDayResetAtMs":\(resetAtMs(sevenDayResetInMinutes)),
              "requests":102,"inputTokens":8781926,"outputTokens":31860,
              "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
              "probeError":null,"lastStreamError":null,"streamErrorCount":0,
@@ -281,8 +298,12 @@ enum RenderStates {
     private static let hold =
         #"[{"window":"7d","minutesUntilReset":6498,"resetAtMs":1786406400224}]"#
 
+    /// Two healthy accounts, and the row's two shapes side by side: alice has a
+    /// reset on both windows and carries a caption beside each percentage; bob
+    /// has none on the wire and must still read as a complete row. The caption
+    /// is drawn when there is one, never reserved as blank space.
     private static var healthyJSON: String {
-        "[\(account("alice@example.com", quota: "0.12", state: "ok")),"
+        "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320)),"
             + "\(account("bob@example.com", quota: "0.31", state: "ok"))]"
     }
 
@@ -341,9 +362,17 @@ enum RenderStates {
         var rows = (1...4).map {
             account("ok-\($0)@example.com", quota: "0.\($0)2", state: "ok")
         }
-        rows.append(account("near@example.com", quota: "0.94", state: "near", held: hold))
+        // The near and spent rows carry resets on both windows — what the real
+        // fleet looks like, and the only way this scene shows a caption in its
+        // window's own colour (`FleetView.captionTint`).
+        rows.append(
+            account(
+                "near@example.com", quota: "0.94", state: "near", held: hold,
+                fiveHourResetInMinutes: 47, sevenDayResetInMinutes: 6_498))
         rows += (1...6).map {
-            account("spent-\($0)@example.com", quota: "1.0", state: "spent", held: hold)
+            account(
+                "spent-\($0)@example.com", quota: "1.0", state: "spent", held: hold,
+                fiveHourResetInMinutes: 12 + $0 * 30, sevenDayResetInMinutes: 6_498)
         }
         rows.append(
             account(

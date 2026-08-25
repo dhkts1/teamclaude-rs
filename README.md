@@ -80,8 +80,9 @@ Every other key, its default and the file's permissions are in
 
 `apps/macos` is a native front end over the same `tcr status --json` the TUI reads. The
 menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet capacity at
-a glance. Each row carries quota bars, a reset countdown, probe health, and an
-Enable/Disable button that shells out to `tcr`, so you can steer the fleet from the panel.
+a glance. Each row is one line per quota window — bar, percentage and the countdown to that
+window's reset — plus probe health and a menu that shells out to `tcr`, so you can steer the
+fleet from the panel.
 It can also supervise the proxy, and self-updates through [Sparkle](https://sparkle-project.org).
 
 Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run

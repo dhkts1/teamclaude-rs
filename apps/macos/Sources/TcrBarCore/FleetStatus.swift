@@ -308,7 +308,14 @@ public enum QuotaFormat {
         return .measured(min(max(value, 0), 1))
     }
 
-    /// `"resets in 2h 14m"`, or nil when there is nothing to count down to.
+    /// `"in 2h 14m"`, or nil when there is nothing to count down to.
+    ///
+    /// It read `"resets in 2h 14m"` until the card became one line per window.
+    /// The caption now follows that window's own percentage (`5h 94% in 2h
+    /// 14m`), where the only thing a countdown can count down to is the reset.
+    /// The seven characters of `"resets "` are also 35 of the roughly 300pt
+    /// that line has, and with them the counters beside it truncated to
+    /// `102 req ·…` — a measured fact dropped for a word the context supplies.
     ///
     /// `nil` in → `nil` out — never a placeholder — the same house rule
     /// ``percent(_:)`` states above: an absent measurement never renders as
@@ -327,7 +334,7 @@ public enum QuotaFormat {
         guard seconds > 0 else { return nil }
         let minutes = Int((seconds / 60).rounded())
         guard minutes > 0 else { return nil }
-        return "resets in \(HeldWindow.duration(minutes: minutes))"
+        return "in \(HeldWindow.duration(minutes: minutes))"
     }
 }
 

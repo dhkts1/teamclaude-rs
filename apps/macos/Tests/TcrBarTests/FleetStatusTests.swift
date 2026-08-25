@@ -530,7 +530,7 @@ final class QuotaFormatTests: XCTestCase {
         let reset = now.addingTimeInterval(45 * 60)
         XCTAssertEqual(
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
-            "resets in 45m"
+            "in 45m"
         )
     }
 
@@ -539,7 +539,7 @@ final class QuotaFormatTests: XCTestCase {
         let reset = now.addingTimeInterval((2 * 60 + 14) * 60)
         XCTAssertEqual(
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
-            "resets in 2h 14m"
+            "in 2h 14m"
         )
     }
 
@@ -548,7 +548,7 @@ final class QuotaFormatTests: XCTestCase {
         let reset = now.addingTimeInterval((4 * 24 * 60 + 12 * 60) * 60)
         XCTAssertEqual(
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
-            "resets in 4d 12h"
+            "in 4d 12h"
         )
     }
 }
