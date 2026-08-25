@@ -238,21 +238,28 @@ pub struct AccountStatus {
     pub control_allowed_groups: Vec<String>,
     /// Proxy-computed usage and cost — see [`AccountSnapshot::usage`].
     ///
-    /// `#[serde(default, skip_serializing_if)]` for the reason
-    /// [`StatusPayload::build`]'s doc-comment sets out, and this field is the
-    /// textbook case for it rather than a bump of [`STATUS_KIND`]. Both skew
-    /// directions degrade HONESTLY:
+    /// Both skew directions degrade HONESTLY, which is exactly what
+    /// [`StatusPayload::build`]'s doc-comment reserves a [`STATUS_KIND`] bump
+    /// for NOT doing — so this must not bump it:
     ///
     /// * OLD client ← NEW server: serde skips the unknown key; every field the
     ///   old client reads is untouched.
-    /// * NEW client ← OLD server: the key is absent, `default` gives `None`, and
-    ///   the client renders "this server does not report usage" — which is the
-    ///   truth. Without the default it would be a hard deserialize error and
-    ///   `tcr status` would fall back to the all-zeros offline snapshot, the
-    ///   exact fabricated-healthy-fleet failure `stream_error_count`'s
-    ///   doc-comment records happening live on 2026-08-04.
+    /// * NEW client ← OLD server: the key is absent and reads as `None`, and
+    ///   the client renders "this server does not report usage" — the truth.
     ///
-    /// Neither direction is MISREAD, so this must NOT bump `STATUS_KIND`.
+    /// **The `Option` is what carries that second direction, not the
+    /// `#[serde(default)]`.** serde's `missing_field` hands the field a
+    /// `MissingFieldDeserializer` whose `deserialize_option` returns
+    /// `visit_none` (serde 1.0.228, `src/private/de.rs:45-50`), so an absent
+    /// `Option<T>` is `None` with or without the attribute. Verified by
+    /// mutation: removing `default` here leaves every test green.
+    ///
+    /// That is NOT true of a non-`Option` field, which is where the real hazard
+    /// lives — see [`Self::stream_error_count`], a bare `usize` whose `default`
+    /// genuinely is load-bearing and whose absence took down a whole fleet view
+    /// on 2026-08-04. `default` is kept here for consistency with the optional
+    /// fields beside it; `skip_serializing_if` is doing real work, keeping the
+    /// key off the wire entirely rather than emitting `"usage": null`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<tcr_status_wire::UsageRow>,
 }
@@ -600,11 +607,17 @@ mod tests {
     /// process keeps serving until someone restarts it.
     ///
     /// An account row with no `usage` key at all must deserialize, and read as
-    /// `None` — "this server does not report usage", which is true. Without the
-    /// `#[serde(default)]` this is a hard `missing field` error and `tcr status`
-    /// falls back to the offline snapshot's structural zeros, showing a
-    /// fabricated healthy fleet. That is not hypothetical: `stream_error_count`
-    /// shipped without a default and did exactly that on 2026-08-04.
+    /// `None` — "this server does not report usage", which is true. Anything
+    /// that makes the absence a hard deserialize error instead drops
+    /// `tcr status` to the offline snapshot's structural zeros and shows a
+    /// fabricated healthy fleet; `stream_error_count` did exactly that on
+    /// 2026-08-04.
+    ///
+    /// What this test actually catches is `usage` ceasing to be an `Option`
+    /// (verified by mutation — making it a required field turns this red).
+    /// Removing the field's `#[serde(default)]` does NOT, because serde already
+    /// reads an absent `Option` as `None`; the field's own doc-comment records
+    /// why, and which of its attributes is therefore load-bearing.
     #[test]
     fn a_payload_without_usage_reads_as_not_measured() {
         let old_server = r#"{"kind":"tcr.status.v1","accounts":[{"name":"alice@example.com","priority":0,"status":"active","disabled":false,"fiveHour":null,"fiveHourResetMs":null,"sevenDay":null,"sevenDayResetMs":null,"sevenDayOi":null,"requests":7,"inputTokens":1000,"outputTokens":200,"cacheReadTokens":750,"cacheCreationTokens":50,"lastUsedMs":null,"rateLimitedUntilMs":null,"probeStatus":"ok","lastProbeMs":null,"probeError":null,"quotaState":"normal","gate":"ok","freeAtMs":null,"threshold":0.85,"lastStreamError":null}]}"#;
