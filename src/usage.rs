@@ -413,9 +413,11 @@ fn date_string(date: Date) -> String {
 struct LedgerLine {
     /// Unix milliseconds.
     t: i64,
-    /// The serving account's `name`. Replay resolves it back to an index by
-    /// name rather than by position, so reordering or removing an account in
-    /// the config cannot silently reattribute yesterday's traffic.
+    /// The serving account's `name`. Replay resolves a line by identity and
+    /// never by POSITION, so reordering or removing an account in the config
+    /// cannot silently reattribute yesterday's traffic. The name is the weakest
+    /// of the three keys ([`resolve_account`]) and the only one an account with
+    /// no stored identity has.
     a: String,
     /// The serving account's `account_uuid` — the STABLE half of its identity,
     /// and the first thing [`resolve_account`] tries.
