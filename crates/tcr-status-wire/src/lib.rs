@@ -153,8 +153,17 @@ pub struct AccountStatusRow {
     pub seven_day_oi: Option<f64>,
     pub five_hour_state: Option<String>,
     pub seven_day_state: Option<String>,
+    /// Per-window state for the Fable weekly (`seven_day_oi`), mirroring
+    /// [`Self::seven_day_state`] and gating Fable requests only — see
+    /// `GateReason::FableWeekly`. `null` when that window has no reading yet,
+    /// same "not measured" idiom as the fields beside it.
+    pub seven_day_oi_state: Option<String>,
     pub five_hour_reset_at_ms: Option<i64>,
     pub seven_day_reset_at_ms: Option<i64>,
+    /// The Fable weekly window's reset, mirroring [`Self::seven_day_reset_at_ms`]:
+    /// unconditional on threshold, `null` when the window's reset has already
+    /// elapsed with nothing learned since or was never learned at all.
+    pub seven_day_oi_reset_at_ms: Option<i64>,
     /// `None` on the offline path — a structural "not measured", never `0`.
     pub requests: Option<u64>,
     pub input_tokens: Option<u64>,

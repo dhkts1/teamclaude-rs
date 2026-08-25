@@ -94,3 +94,66 @@ fn the_fixture_pins_usage_present_and_usage_absent() {
         "a day with SOME priced requests still reports what could be priced"
     );
 }
+
+/// `sevenDayOiState` and `sevenDayOiResetAtMs` — the Fable weekly pair — round
+/// trip through [`AccountStatusRow`] like their `sevenDay` twins, and a row
+/// missing them (an older server's shape) still decodes with both `None`.
+#[test]
+fn fable_weekly_pair_round_trips_and_decodes_absent() {
+    let committed =
+        std::fs::read_to_string(fixture_path()).expect("committed contract fixture is readable");
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(&committed).expect("fixture is a bare JSON array");
+
+    // The fixture must carry both a present (non-null) reading and an absent
+    // one, or this only ever proves one of the two directions.
+    let present = rows
+        .iter()
+        .find(|r| r["sevenDayOiState"].is_string())
+        .expect("fixture carries a row with a learned sevenDayOiState")
+        .clone();
+    assert!(
+        present["sevenDayOiResetAtMs"].is_i64(),
+        "the same row also carries a learned sevenDayOiResetAtMs: {present}"
+    );
+    let decoded = AccountStatusRow::from_value(present.clone()).expect("row decodes");
+    assert_eq!(
+        decoded.seven_day_oi_state,
+        present["sevenDayOiState"].as_str().map(str::to_string)
+    );
+    assert_eq!(
+        decoded.seven_day_oi_reset_at_ms,
+        present["sevenDayOiResetAtMs"].as_i64()
+    );
+    let reencoded = serde_json::to_value(&decoded).expect("row re-encodes");
+    assert_eq!(
+        reencoded["sevenDayOiState"], present["sevenDayOiState"],
+        "sevenDayOiState round-trips byte-for-byte"
+    );
+    assert_eq!(
+        reencoded["sevenDayOiResetAtMs"], present["sevenDayOiResetAtMs"],
+        "sevenDayOiResetAtMs round-trips byte-for-byte"
+    );
+
+    // A row shaped like an OLDER server's — both keys stripped entirely, not
+    // present-as-null — must still decode, reading both as `None`.
+    let mut older = present;
+    older
+        .as_object_mut()
+        .expect("row is an object")
+        .remove("sevenDayOiState");
+    older
+        .as_object_mut()
+        .expect("row is an object")
+        .remove("sevenDayOiResetAtMs");
+    let decoded = AccountStatusRow::from_value(older)
+        .expect("a row missing the Fable weekly pair still decodes");
+    assert_eq!(
+        decoded.seven_day_oi_state, None,
+        "missing sevenDayOiState decodes as None, not a decode error"
+    );
+    assert_eq!(
+        decoded.seven_day_oi_reset_at_ms, None,
+        "missing sevenDayOiResetAtMs decodes as None, not a decode error"
+    );
+}

@@ -173,6 +173,14 @@ pub struct AccountStatus {
     pub seven_day: Option<f64>,
     pub seven_day_reset_ms: Option<i64>,
     pub seven_day_oi: Option<f64>,
+    /// The Fable weekly window's reset, mirroring [`Self::seven_day_reset_ms`].
+    /// `#[serde(default, skip_serializing_if = "Option::is_none")]` for the same
+    /// forward/back-compat reason as `usage` below: an OLDER server's payload
+    /// has no such key (reads as `None`, the truth — "this server does not
+    /// report it"), and an OLDER client simply never looks at the extra key on
+    /// a NEWER server's payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_oi_reset_ms: Option<i64>,
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -301,6 +309,7 @@ impl StatusPayload {
                 seven_day: a.seven_day,
                 seven_day_reset_ms: a.seven_day_reset.map(to_ms),
                 seven_day_oi: a.seven_day_oi,
+                seven_day_oi_reset_ms: a.seven_day_oi_reset.map(to_ms),
                 requests: a.requests,
                 input_tokens: a.input_tokens,
                 output_tokens: a.output_tokens,
@@ -359,6 +368,7 @@ impl StatusPayload {
                     seven_day: a.seven_day,
                     seven_day_reset: a.seven_day_reset_ms.and_then(from_ms),
                     seven_day_oi: a.seven_day_oi,
+                    seven_day_oi_reset: a.seven_day_oi_reset_ms.and_then(from_ms),
                     requests: a.requests,
                     input_tokens: a.input_tokens,
                     output_tokens: a.output_tokens,
@@ -409,6 +419,7 @@ mod tests {
                 seven_day: None,
                 seven_day_reset: None,
                 seven_day_oi: Some(0.11),
+                seven_day_oi_reset: from_ms(crate::now_ms() + 3_600_000),
                 requests: 7,
                 input_tokens: 1_000,
                 output_tokens: 200,
@@ -462,6 +473,10 @@ mod tests {
         assert_eq!(after.five_hour, before.five_hour);
         assert_eq!(after.five_hour_reset, before.five_hour_reset);
         assert_eq!(after.seven_day_oi, before.seven_day_oi);
+        assert_eq!(
+            after.seven_day_oi_reset, before.seven_day_oi_reset,
+            "sevenDayOiResetAtMs rides the wire intact"
+        );
         assert_eq!(after.requests, before.requests);
         assert_eq!(after.input_tokens, before.input_tokens);
         assert_eq!(after.output_tokens, before.output_tokens);
@@ -538,6 +553,37 @@ mod tests {
             back.accounts[0].groups,
             Vec::<String>::new(),
             "missing groups field on the wire defaults to empty, not a decode error"
+        );
+    }
+
+    /// A payload from an older server that predates `sevenDayOiResetMs` still
+    /// deserializes, defaulting to `None` — same forward-compat contract as
+    /// `reservedGroups` and `groups`.
+    #[test]
+    fn payload_without_seven_day_oi_reset_field_still_deserializes() {
+        let mut snapshot = snapshot_with_counters();
+        snapshot.accounts[0].seven_day_oi_reset = from_ms(crate::now_ms() + 3_600_000);
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        for account in value["accounts"].as_array_mut().expect("accounts array") {
+            account
+                .as_object_mut()
+                .expect("account object")
+                .remove("sevenDayOiResetMs");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let back: StatusPayload =
+            serde_json::from_str(&stripped).expect("deserialize without sevenDayOiResetMs field");
+        assert_eq!(
+            back.accounts[0].seven_day_oi_reset_ms, None,
+            "missing sevenDayOiResetMs field on the wire defaults to None, not a decode error"
         );
     }
 
