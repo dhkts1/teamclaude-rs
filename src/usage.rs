@@ -1716,27 +1716,42 @@ mod tests {
             );
         }
 
-        // A request landing while the flush is in progress, on its own thread.
-        let recorded = Arc::new(AtomicBool::new(false));
+        // Requests keep landing for as long as the flush runs, on their own
+        // thread, counting as they go.
+        let served = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
         let worker = {
             let tracker = Arc::clone(&tracker);
-            let recorded = Arc::clone(&recorded);
+            let served = Arc::clone(&served);
+            let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                for _ in 0..64 {
+                while !stop.load(Ordering::SeqCst) {
                     tracker.record(
                         0,
                         &record(now, "claude-opus-5", 1),
                         "alice@example.com",
                         None,
                     );
+                    served.fetch_add(1, Ordering::SeqCst);
                 }
-                recorded.store(true, Ordering::SeqCst);
+            })
+        };
+
+        // Read MID-FLUSH, not after it: a request path blocked behind the
+        // flush's own lock still catches up the instant the flush returns, so a
+        // count taken afterwards cannot tell the two apart. This one is taken
+        // while the flush is provably still waiting.
+        let sampler = {
+            let served = Arc::clone(&served);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                served.load(Ordering::SeqCst)
             })
         };
 
         let started = std::time::Instant::now();
         assert!(
-            !tracker.flush_ledger_within(std::time::Duration::from_millis(200)),
+            !tracker.flush_ledger_within(std::time::Duration::from_millis(600)),
             "a flush that cannot be queued reports failure rather than joining the stall"
         );
         let waited = started.elapsed();
@@ -1745,11 +1760,13 @@ mod tests {
             "the flush must return inside its own bound, not the writer's: waited {waited:?}"
         );
 
+        let mid_flush = sampler.join().expect("the sampling thread finished");
+        stop.store(true, Ordering::SeqCst);
         worker.join().expect("the recording thread finished");
         assert!(
-            recorded.load(Ordering::SeqCst),
-            "record() completed while the flush was waiting — the request path never waits \
-             on the writer"
+            mid_flush > 0,
+            "requests were served WHILE the flush was waiting on the wedged writer — the \
+             request path never waits on the ledger"
         );
         drop(ack_rx);
         let _ = std::fs::remove_dir_all(&dir);
