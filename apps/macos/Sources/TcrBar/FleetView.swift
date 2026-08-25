@@ -394,7 +394,13 @@ struct FleetView: View {
             controlHairline: hasControlHairline(rows) ? Tok.hairlineWidth : nil,
             budget: PanelHeight.listBudget(
                 cap: Tok.panelMaxHeight,
-                headerOverflow: usageLineHeight - usageLineBaseline,
+                headerOverflow: PanelHeight.headerOverflow(
+                    lineHeight: usageLineHeight,
+                    oneLineHeight: usageLineBaseline,
+                    // The line's own render condition, read from the fleet
+                    // rather than from the last measurement: a measurement
+                    // taken while the line existed does not expire on its own.
+                    lineIsDrawn: fleet.usageSummaryLine != nil),
                 minimum: Tok.panelMinListHeight))
     }
 

@@ -55,6 +55,32 @@ public enum PanelHeight {
     /// reads as a broken panel, not as a full one. `Tok.panelMinListHeight`.
     public static let panelMinListHeight: CGFloat = 120
 
+    /// What the header's spend line takes BEYOND one rendered line — the figure
+    /// ``listBudget(cap:headerOverflow:minimum:)`` subtracts.
+    ///
+    /// `lineIsDrawn` is the parameter this exists for. Both measurements arrive
+    /// from SwiftUI preferences, and a preference is only emitted while the view
+    /// that emits it is on screen: when the spend line stops rendering — an
+    /// older proxy, or a read that went offline, both routine here — the last
+    /// measured pair is simply the last thing anyone said. Subtracting it goes
+    /// on charging the account list 14 to 28pt for a header that is no longer
+    /// there, for the rest of the session: dead space under the last row and a
+    /// scrollbar on a fleet that would have fit.
+    ///
+    /// The observers moved outside the branch that renders the line so the
+    /// state resets on its own, and this makes that reset unnecessary as well
+    /// as true: a header with no line has no overflow, whatever the last
+    /// measurement happened to be. A rule with two independent reasons to hold
+    /// is the one that survives a refactor of either.
+    public static func headerOverflow(
+        lineHeight: CGFloat,
+        oneLineHeight: CGFloat,
+        lineIsDrawn: Bool
+    ) -> CGFloat {
+        guard lineIsDrawn else { return 0 }
+        return lineHeight - oneLineHeight
+    }
+
     /// What the scrolling list may occupy: the cap, less whatever the header
     /// grew past one line.
     ///

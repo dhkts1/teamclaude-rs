@@ -45,7 +45,9 @@ final class PanelHeightTests: XCTestCase {
     private let hairline: CGFloat = 0.5
 
     private func budget(headerLineHeight: CGFloat, oneLine: CGFloat) -> CGFloat {
-        PanelHeight.listBudget(headerOverflow: headerLineHeight - oneLine)
+        PanelHeight.listBudget(
+            headerOverflow: PanelHeight.headerOverflow(
+                lineHeight: headerLineHeight, oneLineHeight: oneLine, lineIsDrawn: true))
     }
 
     func testAOneLineHeaderStillGetsTheWholeCap() {
@@ -100,6 +102,32 @@ final class PanelHeightTests: XCTestCase {
         XCTAssertEqual(
             PanelHeight.visibleRowsHeight(rowHeights: [], spacing: spacing, budget: 400), 400,
             "before SwiftUI reports a row height the panel must not collapse")
+    }
+
+    /// Round two, finding 2. A fleet WITH a wrapped spend line and then WITHOUT
+    /// one leaves the list at the full cap.
+    ///
+    /// Both measurements come from SwiftUI preferences, which are only emitted
+    /// while the emitting view is on screen, so when the line stops rendering
+    /// the last measured pair is just the last thing anyone said. That is not an
+    /// exotic state — it is what the panel shows the moment the proxy is
+    /// restarted onto a build predating `usage`, or the read goes offline. The
+    /// old arithmetic went on subtracting a two-line header that was no longer
+    /// there, clamping the account list one to two rows short for the rest of
+    /// the session.
+    func testAHeaderThatStopsDrawingItsSpendLineGivesTheBudgetBack() {
+        let wrapped = PanelHeight.headerOverflow(
+            lineHeight: 42, oneLineHeight: 14, lineIsDrawn: true)
+        XCTAssertEqual(wrapped, 28, "three rendered lines cost the list two")
+        XCTAssertEqual(PanelHeight.listBudget(headerOverflow: wrapped), PanelHeight.panelMaxHeight - 28)
+
+        // The same stale pair, with the line no longer rendered.
+        let gone = PanelHeight.headerOverflow(
+            lineHeight: 42, oneLineHeight: 14, lineIsDrawn: false)
+        XCTAssertEqual(gone, 0, "a header with no spend line has no overflow, whatever was measured")
+        XCTAssertEqual(
+            PanelHeight.listBudget(headerOverflow: gone), PanelHeight.panelMaxHeight,
+            "the list gets the whole cap back")
     }
 
     /// Round two, finding 3. `accountList` puts a `Hairline` after index 0 when
