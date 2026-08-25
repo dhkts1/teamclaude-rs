@@ -267,16 +267,18 @@ enum RenderStates {
         // whose 7d window is spent can have Fable headroom and the reverse, and
         // a fixture that tied them together could not show it.
         //
-        // `"0.0"` by default, which draws `fable 0%` — a measured zero, the
-        // most headroom there is. `"null"` is the NOT-MEASURED row (an older
-        // server, or a window never learned for this account) and must draw an
-        // EMPTY slot, never `n/a`; scene 14 carries one.
-        sevenDayOi: String = "0.0",
+        // NOT MEASURED by default — an older server, or a window never learned
+        // for this account, which is the majority of a real fleet: the window
+        // is only learned once a Fable request has been served on that account.
+        // It must draw an EMPTY slot, never `n/a` and never `0%`, so every
+        // scene that does not opt in is also the negative case. Scenes 01 and
+        // 14 opt in.
+        sevenDayOi: String = "null",
         // `"null"` is the shape a proxy predating `sevenDayOiState` sends: a
         // real fraction with no state word beside it, which draws the figure in
         // the neutral tint rather than borrowing the composite state. Scene 14
         // carries one of those too.
-        sevenDayOiState: String = "ok",
+        sevenDayOiState: String = "null",
         sevenDayOiResetInMinutes: Int? = nil,
         // The `usage` object, as raw JSON. Defaults to the measured shape, so
         // every existing scene shows the spend line the panel now draws.
@@ -435,12 +437,18 @@ enum RenderStates {
         #"[{"window":"7d","minutesUntilReset":6498,"resetAtMs":1786406400224}]"#
 
     /// Two healthy accounts, and the row's two shapes side by side: alice has a
-    /// reset on both windows and carries a caption beside each percentage; bob
+    /// reset on every window and carries a caption beside each percentage; bob
     /// has none on the wire and must still read as a complete row. The caption
     /// is drawn when there is one, never reserved as blank space.
+    ///
+    /// Both carry a Fable weekly reading, which is what the README's own shot is
+    /// cut from — the two shapes of that slot, a percentage with its countdown
+    /// and a percentage alone, in the panel a reader sees first. Neither is
+    /// `near` or `spent`: this is the healthy scene, and the two tinted shapes
+    /// are scene 14's job.
     private static var healthyJSON: String {
-        "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320)),"
-            + "\(account("bob@example.com", quota: "0.31", state: "ok"))]"
+        "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498)),"
+            + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok"))]"
     }
 
     /// The bug this scene exists to catch: a 7d-red account must not paint
