@@ -130,14 +130,23 @@ impl Manager {
                     account.output_tokens += record.output;
                     account.cache_read_tokens += record.cache_read;
                     account.cache_creation_tokens += record.cache_creation();
-                    (
-                        account.name.clone(),
+                    // The org key is read by the LEDGER LINE and by nothing
+                    // else, so it is allocated only when there is a ledger to
+                    // read it — an embedder or a test with no usage directory
+                    // pays nothing. Gated on `is_attached` rather than
+                    // `is_persisting`: a ledger whose writes are failing right
+                    // now is still queueing, and a line queued without its org
+                    // resolves onto the wrong account when it lands.
+                    let org = if self.usage.is_attached() {
                         crate::identity::org_key_of(
                             account.org_uuid.as_deref(),
                             account.org_name.as_deref(),
                         )
-                        .map(str::to_string),
-                    )
+                        .map(str::to_string)
+                    } else {
+                        None
+                    };
+                    (account.name.clone(), org)
                 }
                 // An index with no account is not this function's to complain
                 // about — the caller's rotation loop already resolved it, and a
@@ -210,6 +219,19 @@ impl Manager {
     /// holding `~/.cache` stalled long enough to back the writer up.
     pub fn usage_dropped_lines(&self) -> u64 {
         self.usage.dropped_lines()
+    }
+
+    /// Drain the usage ledger and stop its writer, inside `budget`, so the day
+    /// file holds every request this process served — see
+    /// [`crate::usage::UsageTracker::shutdown_ledger`]. Called once, from
+    /// `ServerHandle::shutdown_within`; a restart is the routine event here
+    /// (every TcrBar update forces one), so the lines still in the queue at that
+    /// moment are the ones a restart used to lose.
+    pub fn shutdown_usage_ledger(
+        &self,
+        budget: std::time::Duration,
+    ) -> crate::usage::LedgerShutdown {
+        self.usage.shutdown_ledger(budget)
     }
 
     /// Fold a background probe's usage into account `idx`'s quota windows and latch

@@ -34,6 +34,14 @@ use crate::{affinity, build_info, cli, mitm, singleton};
 /// pause and not a hang.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// The floor on what [`ServerHandle::shutdown_within`] gives the usage ledger to
+/// drain. The ledger flush runs LAST, so a shutdown that spent its whole grace
+/// on a wedged task would otherwise hand it zero and lose the queue by
+/// construction. Small enough to stay a pause: draining a few thousand queued
+/// lines onto a working disk is milliseconds, and a disk that cannot manage it
+/// in a quarter of a second is the stall this is bounded for.
+const MIN_LEDGER_SHUTDOWN: Duration = Duration::from_millis(250);
+
 /// Where the MITM listener's TLS material comes from.
 ///
 /// `tcr` always uses [`TlsSetup::Load`], which is what `run_server` did inline.
@@ -337,6 +345,10 @@ pub struct ShutdownReport {
     pub tasks_aborted: usize,
     /// What the final pin write did.
     pub affinity: AffinityFlush,
+    /// What the usage ledger's drain-and-join did: `Flushed` means every line
+    /// this process queued is on disk, `Abandoned` means the writer outlasted
+    /// the grace and its tail is gone.
+    pub ledger: crate::usage::LedgerShutdown,
 }
 
 /// A bound, running proxy — and the owner of every task [`serve`] spawned.
@@ -509,10 +521,36 @@ impl ServerHandle {
         // makes the pins survive a SIGKILL, which is the case that matters.
         let affinity = self.flush_affinity_finally();
 
+        // Then the usage ledger, LAST, because it is the one flush whose input
+        // is still arriving: an in-flight request that finishes during the joins
+        // above records its usage, and that line is in the writer's queue rather
+        // than on disk. Bounded by whatever is left of the caller's grace — a
+        // stalled volume must not turn a quit into a hang — with a floor, so a
+        // shutdown that has already spent its whole budget still gets one real
+        // attempt instead of a guaranteed loss.
+        let ledger_budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(MIN_LEDGER_SHUTDOWN);
+        let ledger = self.manager.shutdown_usage_ledger(ledger_budget);
+        match ledger {
+            crate::usage::LedgerShutdown::NotAttached => {}
+            crate::usage::LedgerShutdown::Flushed => tracing::info!(
+                dropped_lines = self.manager.usage_dropped_lines(),
+                "the usage ledger drained and closed; today's totals will replay at the next boot"
+            ),
+            crate::usage::LedgerShutdown::Abandoned => tracing::warn!(
+                budget_ms = ledger_budget.as_millis(),
+                dropped_lines = self.manager.usage_dropped_lines(),
+                "the usage ledger did not drain inside the shutdown budget; the last requests \
+                 it served are not on disk"
+            ),
+        }
+
         ShutdownReport {
             tasks_joined: self.tasks_joined,
             tasks_aborted: self.tasks_aborted,
             affinity,
+            ledger,
         }
     }
 

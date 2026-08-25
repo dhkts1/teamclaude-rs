@@ -83,6 +83,14 @@ per day at roughly 2 MB per 17k requests. Files older than this are deleted once
 and yesterday's are ever read back (that is what makes a restart keep the day's totals); the rest are
 history for you to grep.
 
+Lines are written by a dedicated thread, off the request path, so a stalled disk costs accounting and
+never latency. A clean shutdown drains that thread's queue and waits for it to close the file, so the
+requests served in the final moments before a restart are in the day it replays. Two things can still
+cost lines — a write that fails, and a queue that fills faster than the disk drains it — and both are
+said out loud at the moment they start, and again when they stop: the server logs the transition with a
+running dropped-line count, and reports `persisting=false` for as long as it lasts — rather than a short
+day presented afterwards as a measured one.
+
 `0` is the floor, and it keeps today AND yesterday: those two files are what the boot replay reads, and
 the pruner never deletes them whatever this is set to. It has to be both — on a UTC+3 machine the first
 three hours of the local day live in yesterday's UTC-named file, so deleting it would cost the second
