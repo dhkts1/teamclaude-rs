@@ -319,6 +319,23 @@ It asks the running proxy where there is one and falls back to an offline read w
 is not; the output labels which it got, so a fallback is never silently presented as a live
 measurement.
 
+### The weekly quota pair on `--json`
+
+Each row carries `sevenDay`/`sevenDayState`/`sevenDayResetAtMs` for the shared weekly bucket, and
+the same three keys again under an `Oi` suffix for the Fable weekly (`unified-7d_oi`) bucket. No
+per-row table exists for the row's other quota fields, so this documents only the pair this change
+adds:
+
+| key | shape | what it is |
+|---|---|---|
+| `sevenDayOi` | fraction or `null` | Fable weekly utilization (0.0–1.0), evaluated live. `null` when never learned |
+| `sevenDayOiState` | `"ok"` / `"near"` / `"spent"` or `null` | this window's own state against the account's threshold, `null` when `sevenDayOi` is |
+| `sevenDayOiResetAtMs` | Unix ms or `null` | when this window resets, `null` once it has already elapsed with nothing learned since, or if it was never learned |
+
+Unlike the shared `sevenDay` bucket, this window gates **Fable requests only** — a non-Fable
+request never checks it, and `held[]`/the general `quotaState` never reflect it either. It exists on
+the wire so a Fable-scoped caption and tint have something to read.
+
 ### The `usage` object on `--json`
 
 Every row carries `usage`: what that account spent, aggregated by the proxy as it served each
