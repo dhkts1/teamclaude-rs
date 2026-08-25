@@ -98,7 +98,12 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+# `local-offset` is what makes "today" a LOCAL calendar day in `usage.rs`.
+# time 0.3.55 resolves the offset with `localtime_r` for the instant asked about
+# (`src/sys/local_offset_at/unix.rs`), so it is DST-correct per record and — unlike
+# pre-0.3.37 — carries no multi-threaded-process refusal, which is why this needs
+# no change to how `main` builds the tokio runtime.
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "local-offset"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2.2.0"

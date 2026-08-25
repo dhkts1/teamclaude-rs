@@ -878,6 +878,18 @@ pub struct Manager {
     /// Global outbound throttle knobs, snapshotted from config at construction
     /// (default all-`None` → inert → byte-identical to the no-throttle build).
     throttle: ThrottleConfig,
+    /// Per-account usage buckets, pricing and the append-only ledger — the one
+    /// place a served request's tokens are aggregated for display. Present on
+    /// every `Manager`, but only the SERVING process attaches a ledger to it
+    /// (`Self::attach_usage_ledger`), so an offline manager's tracker is empty
+    /// and its rows read as "not measured" rather than as zero traffic.
+    ///
+    /// Lock order: this is a **leaf** lock. Nothing taken while it is held, and
+    /// it is always innermost — `Self::record_usage` takes the accounts lock,
+    /// drops it, and only then records here; `Self::snapshot` holds the accounts
+    /// READ lock across its `usage_row` calls, which is safe precisely because
+    /// no path ever runs the other way round.
+    usage: crate::usage::UsageTracker,
     /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
     /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
     /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
@@ -1147,8 +1159,14 @@ impl Manager {
             idx
         });
 
+        let usage = crate::usage::UsageTracker::new(
+            accounts.len(),
+            crate::pricing::PricingTable::new(config.pricing.clone().into_iter().collect()),
+        );
+
         let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
+            usage,
             refresher,
             prober,
             warmer,
@@ -2658,6 +2676,8 @@ mod tests {
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         }
     }
@@ -5756,6 +5776,30 @@ mod tests {
         // NEW: the cache components accumulate separately (a subset of the sum).
         assert_eq!(snap.accounts[0].cache_read_tokens, 1000);
         assert_eq!(snap.accounts[0].cache_creation_tokens, 100);
+    }
+
+    /// FINDING 7. `input_tokens` is the QUOTA counter, and `update_usage` is
+    /// `pub` on a library crate — so it must add the caller's number, verbatim,
+    /// whatever relationship that number has to the components passed beside
+    /// it. Decomposing with a saturating subtraction and re-summing the pieces
+    /// grew the counter by 800 for an `input_tokens` of 100, which is both the
+    /// quota consumption and the denominator of `cacheHitRatio`.
+    #[test]
+    fn update_usage_adds_the_callers_input_verbatim() {
+        let refresher = Arc::new(CountingRefresher {
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let manager = build_manager(config_with(vec![account("a", 0)]), refresher);
+        // An inconsistent caller: 100 of input against 800 of components.
+        manager.update_usage(0, 100, 5, 750, 50);
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snap.accounts[0].input_tokens, 100,
+            "the quota counter grows by exactly what the caller passed"
+        );
+        assert_eq!(snap.accounts[0].output_tokens, 5);
+        assert_eq!(snap.accounts[0].cache_read_tokens, 750);
+        assert_eq!(snap.accounts[0].cache_creation_tokens, 50);
     }
 
     /// Drive an account's model-scoped weekly (`7d_oi`, Fable) bucket over

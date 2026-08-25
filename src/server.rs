@@ -34,6 +34,14 @@ use crate::{affinity, build_info, cli, mitm, singleton};
 /// pause and not a hang.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+// The floor on what `ShutdownHandle::shutdown_within` gives the usage ledger to
+// drain. The ledger flush runs LAST, so a shutdown that spent its whole grace on
+// a wedged task would otherwise hand it zero and lose the queue by construction.
+// Defined in `usage`, which owns the shutdown it bounds and floors the writer
+// join at the same value: two copies of "how long is a real attempt" is how the
+// two steps come to disagree.
+use crate::usage::MIN_LEDGER_SHUTDOWN;
+
 /// Where the MITM listener's TLS material comes from.
 ///
 /// `tcr` always uses [`TlsSetup::Load`], which is what `run_server` did inline.
@@ -158,6 +166,17 @@ pub struct ServeOptions {
     /// never repairs it. The next boot then cold-starts every session's prompt
     /// cache. Point this somewhere disposable, or leave it `None`.
     pub affinity_path: Option<PathBuf>,
+    /// The usage-ledger DIRECTORY, or `None` to keep usage **in memory only** —
+    /// nothing is replayed at boot and nothing is written, so a restart starts
+    /// the day at zero.
+    ///
+    /// `None` is the default for the same reason as [`Self::affinity_path`]:
+    /// the binary's path ([`crate::usage::default_dir`]) is one shared
+    /// directory, and a second process that serves briefly would append its
+    /// traffic into the live proxy's day file and replay the live proxy's
+    /// traffic into its own totals. Point this somewhere disposable, or leave
+    /// it `None`.
+    pub usage_dir: Option<PathBuf>,
     /// Where the MITM TLS material comes from.
     pub tls: TlsSetup,
     /// What is hosting this proxy — a standalone `tcr` process
@@ -217,6 +236,7 @@ impl ServeOptions {
             port: None,
             incumbent: IncumbentPolicy::never_signal(),
             affinity_path: None,
+            usage_dir: None,
             tls: TlsSetup::Load,
             // Inert, like every other field here: with no owner dir, `host` is
             // recorded nowhere and this value cannot be read by anyone. A caller
@@ -325,6 +345,10 @@ pub struct ShutdownReport {
     pub tasks_aborted: usize,
     /// What the final pin write did.
     pub affinity: AffinityFlush,
+    /// What the usage ledger's drain-and-join did: `Flushed` means every line
+    /// this process queued is on disk, `Abandoned` means the writer outlasted
+    /// the grace and its tail is gone.
+    pub ledger: crate::usage::LedgerShutdown,
 }
 
 /// A bound, running proxy — and the owner of every task [`serve`] spawned.
@@ -497,10 +521,77 @@ impl ServerHandle {
         // makes the pins survive a SIGKILL, which is the case that matters.
         let affinity = self.flush_affinity_finally();
 
+        // Then the usage ledger, LAST, because it is the one flush whose input
+        // is still arriving: an in-flight request that finishes during the joins
+        // above records its usage, and that line is in the writer's queue rather
+        // than on disk. Bounded by whatever is left of the caller's grace — a
+        // stalled volume must not turn a quit into a hang — with a floor, so a
+        // shutdown that has already spent its whole budget still gets one real
+        // attempt instead of a guaranteed loss.
+        let ledger_budget = deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .max(MIN_LEDGER_SHUTDOWN);
+        let ledger = self.shutdown_ledger_within(ledger_budget).await;
+        match ledger {
+            crate::usage::LedgerShutdown::NotAttached => {}
+            crate::usage::LedgerShutdown::Flushed => tracing::info!(
+                dropped_lines = self.manager.usage_dropped_lines(),
+                "the usage ledger drained and closed; today's totals will replay at the next boot"
+            ),
+            crate::usage::LedgerShutdown::Abandoned => tracing::warn!(
+                budget_ms = ledger_budget.as_millis(),
+                dropped_lines = self.manager.usage_dropped_lines(),
+                "the usage ledger did not drain inside the shutdown budget; the last requests \
+                 it served are not on disk"
+            ),
+        }
+
         ShutdownReport {
             tasks_joined: self.tasks_joined,
             tasks_aborted: self.tasks_aborted,
             affinity,
+            ledger,
+        }
+    }
+
+    /// The ledger drain, on a BLOCKING thread and awaited with a timeout.
+    ///
+    /// `UsageTracker::shutdown_ledger` is synchronous through and through — a
+    /// retry loop around `try_send`, a `recv_timeout`, a writer-finish poll —
+    /// and it can occupy its whole budget. Called inline it would be a
+    /// multi-second stretch of an `async fn` with no await point in it, which
+    /// breaks both promises this function makes: a caller that wraps it in its
+    /// own `tokio::time::timeout` cannot interrupt it (cancellation only lands
+    /// at an await), and a Tokio worker is held off its other tasks for the
+    /// duration.
+    ///
+    /// So it runs on the blocking pool and this awaits it, bounded by the same
+    /// budget. Dropping the returned future — the caller's timeout firing —
+    /// stops the WAIT, not the drain: the blocking thread finishes the flush and
+    /// the join on its own, which is the right half to keep going, and the
+    /// process exits when it is done either way. A drain nobody is left to hear
+    /// about is reported as `Abandoned`, which is what a caller that stopped
+    /// waiting has to assume.
+    async fn shutdown_ledger_within(&self, budget: Duration) -> crate::usage::LedgerShutdown {
+        let manager = Arc::clone(&self.manager);
+        let drain = tokio::task::spawn_blocking(move || manager.shutdown_usage_ledger(budget));
+        // The drain's own worst case is the flush budget PLUS the writer join's
+        // floor, so bounding this at `budget` alone would cut off exactly the
+        // slow-but-alive writer the floor exists to let finish — and report a
+        // completed drain as abandoned.
+        let bound = budget + MIN_LEDGER_SHUTDOWN;
+        match tokio::time::timeout(bound, drain).await {
+            Ok(Ok(report)) => report,
+            // The blocking pool is gone, or the drain panicked: either way this
+            // process has no evidence the day file is complete.
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "the usage-ledger drain did not run to completion"
+                );
+                crate::usage::LedgerShutdown::Abandoned
+            }
+            Err(_) => crate::usage::LedgerShutdown::Abandoned,
         }
     }
 
@@ -607,6 +698,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         port: port_override,
         incumbent,
         affinity_path,
+        usage_dir,
         tls,
         host,
         owner_dir,
@@ -670,6 +762,36 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     }
 
     let manager = Manager::with_live_refresher(config, persist_path);
+
+    // Usage accounting is restored before the listener binds, for the same
+    // reason the affinity pins are: the first request after a bounce must not
+    // see a day that has reset to zero. Only when a directory was given — see
+    // `ServeOptions::usage_dir` on why that is not the default.
+    //
+    // Never fatal. A ledger that cannot be read or written costs the restart's
+    // history and nothing else, so `attach_usage_ledger` reports rather than
+    // errors and the proxy serves either way.
+    if let Some(usage_dir) = &usage_dir {
+        crate::usage::warn_if_local_offset_unavailable();
+        let retention = manager.usage_retention_days();
+        let report = manager.attach_usage_ledger(usage_dir.clone(), retention);
+        tracing::info!(
+            path = %usage_dir.display(),
+            replayed = report.replayed,
+            unresolved = report.unresolved,
+            malformed = report.malformed,
+            pruned = report.pruned,
+            retention_days = retention,
+            // The two the writer thread owns: whether it is actually writing
+            // (false if it could not start, or has already failed), and how
+            // many lines its queue had no room for. Both are the answer to
+            // "will today's totals survive the next restart", which the count
+            // of replayed lines alone cannot give.
+            persisting = manager.usage_is_persisting(),
+            dropped_lines = manager.usage_dropped_lines(),
+            "usage ledger attached"
+        );
+    }
 
     // One trigger for every task this function spawns. `watch` rather than a
     // one-shot so each loop can hold its own receiver and shutdown is
@@ -1204,6 +1326,65 @@ mod tests {
             "the tasks stop well inside the grace, so none should need aborting: {report:?}"
         );
         drop(keepalive);
+    }
+
+    /// FINDING 2 (round 3). `shutdown_within` promises a caller that bounds it
+    /// with its own deadline and drops the future keeps a usable handle. The
+    /// usage-ledger drain is synchronous through and through — a `try_send`
+    /// retry loop, a `recv_timeout`, a writer-finish poll — and it can occupy
+    /// the whole remaining grace. Called inline it is a multi-second stretch of
+    /// an `async fn` with no await point in it, and cancellation only lands at
+    /// an await: the caller's timeout, which exists to turn a wedged shutdown
+    /// into a bounded quit, is silently inert, and a Tokio worker is held off
+    /// its other tasks for the duration.
+    ///
+    /// The ledger writer here is wedged for the whole test, so the drain will
+    /// take its full budget; the assertion is that the CALLER's much shorter
+    /// timeout is the one that decides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_can_interrupt_a_wedged_usage_ledger_drain() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-server-ledger-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (shutdown, _rx) = watch::channel(false);
+        let manager = inert_manager();
+        manager.attach_usage_ledger(dir.clone(), 90);
+        let wedge = manager.wedge_usage_writer_for_test();
+
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(std::future::ready(())),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+
+        let started = std::time::Instant::now();
+        let interrupted = tokio::time::timeout(
+            Duration::from_millis(150),
+            handle.shutdown_within(Duration::from_secs(5)),
+        )
+        .await;
+        let waited = started.elapsed();
+
+        assert!(
+            interrupted.is_err(),
+            "the caller's 150ms timeout must be what ends this wait, not the ledger's \
+             5s budget"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "a blocking drain inside the async fn cannot be cancelled at all: waited \
+             {waited:?}"
+        );
+
+        // The drain is still running on the blocking pool, which is the point:
+        // freeing the writer lets it finish on its own.
+        drop(wedge);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A FAILED final pin write must be distinguishable from affinity being off.

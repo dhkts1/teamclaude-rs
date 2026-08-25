@@ -1380,6 +1380,8 @@ mod tests {
                 extra: serde_json::Map::new(),
             }],
             group_settings: std::collections::HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         };
         Manager::new(

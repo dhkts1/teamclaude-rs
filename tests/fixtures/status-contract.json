@@ -1,5 +1,6 @@
 [
   {
+    "cacheCreationTokens": 1600000,
     "cacheHitRatio": 0.75,
     "cacheReadTokens": 6000000,
     "control": false,
@@ -42,9 +43,65 @@
     "sevenDayState": "ok",
     "source": "live",
     "status": "active",
-    "streamErrorCount": 2
+    "streamErrorCount": 2,
+    "usage": {
+      "lastHour": {
+        "cacheCreation1hTokens": 47000,
+        "cacheCreationTokens": 188000,
+        "cacheReadTokens": 705000,
+        "costUsd": 1.6413,
+        "inputTokens": 47000,
+        "outputTokens": 3756,
+        "requests": 12,
+        "unpricedRequests": 0
+      },
+      "today": {
+        "cacheCreation1hTokens": 400000,
+        "cacheCreationTokens": 1600000,
+        "cacheReadTokens": 6000000,
+        "costUsd": 14.1657,
+        "inputTokens": 400000,
+        "outputTokens": 31860,
+        "requests": 102,
+        "unpricedRequests": 0
+      },
+      "todayByModel": {
+        "claude-opus-5": {
+          "cacheCreation1hTokens": 280000,
+          "cacheCreationTokens": 1120000,
+          "cacheReadTokens": 4200000,
+          "costUsd": 12.0785,
+          "inputTokens": 280000,
+          "outputTokens": 21140,
+          "requests": 70,
+          "unpricedRequests": 0
+        },
+        "claude-sonnet-5": {
+          "cacheCreation1hTokens": 120000,
+          "cacheCreationTokens": 480000,
+          "cacheReadTokens": 1800000,
+          "costUsd": 2.0872,
+          "inputTokens": 120000,
+          "outputTokens": 10720,
+          "requests": 32,
+          "unpricedRequests": 0
+        }
+      },
+      "window": {
+        "cacheCreation1hTokens": 157000,
+        "cacheCreationTokens": 628000,
+        "cacheReadTokens": 2355000,
+        "costUsd": 5.6141,
+        "inputTokens": 157000,
+        "outputTokens": 12476,
+        "requests": 40,
+        "since": 1767207600000,
+        "unpricedRequests": 0
+      }
+    }
   },
   {
+    "cacheCreationTokens": 1600000,
     "cacheHitRatio": 0.75,
     "cacheReadTokens": 6000000,
     "control": false,
@@ -95,9 +152,65 @@
     "sevenDayState": "near",
     "source": "live",
     "status": "active",
-    "streamErrorCount": 2
+    "streamErrorCount": 2,
+    "usage": {
+      "lastHour": {
+        "cacheCreation1hTokens": 47000,
+        "cacheCreationTokens": 188000,
+        "cacheReadTokens": 705000,
+        "costUsd": 1.3804,
+        "inputTokens": 47000,
+        "outputTokens": 3756,
+        "requests": 12,
+        "unpricedRequests": 4
+      },
+      "today": {
+        "cacheCreation1hTokens": 400000,
+        "cacheCreationTokens": 1600000,
+        "cacheReadTokens": 6000000,
+        "costUsd": 12.0785,
+        "inputTokens": 400000,
+        "outputTokens": 31860,
+        "requests": 102,
+        "unpricedRequests": 32
+      },
+      "todayByModel": {
+        "claude-opus-5": {
+          "cacheCreation1hTokens": 280000,
+          "cacheCreationTokens": 1120000,
+          "cacheReadTokens": 4200000,
+          "costUsd": 12.0785,
+          "inputTokens": 280000,
+          "outputTokens": 21140,
+          "requests": 70,
+          "unpricedRequests": 0
+        },
+        "claude-sonnet-4-5-20250929": {
+          "cacheCreation1hTokens": 120000,
+          "cacheCreationTokens": 480000,
+          "cacheReadTokens": 1800000,
+          "costUsd": null,
+          "inputTokens": 120000,
+          "outputTokens": 10720,
+          "requests": 32,
+          "unpricedRequests": 32
+        }
+      },
+      "window": {
+        "cacheCreation1hTokens": 157000,
+        "cacheCreationTokens": 628000,
+        "cacheReadTokens": 2355000,
+        "costUsd": 4.8314,
+        "inputTokens": 157000,
+        "outputTokens": 12476,
+        "requests": 40,
+        "since": 1767207600000,
+        "unpricedRequests": 12
+      }
+    }
   },
   {
+    "cacheCreationTokens": 1600000,
     "cacheHitRatio": 0.75,
     "cacheReadTokens": 6000000,
     "control": false,
@@ -148,9 +261,65 @@
     "sevenDayState": "spent",
     "source": "live",
     "status": "throttled",
-    "streamErrorCount": 2
+    "streamErrorCount": 2,
+    "usage": {
+      "lastHour": {
+        "cacheCreation1hTokens": 47000,
+        "cacheCreationTokens": 188000,
+        "cacheReadTokens": 705000,
+        "costUsd": 1.6413,
+        "inputTokens": 47000,
+        "outputTokens": 3756,
+        "requests": 12,
+        "unpricedRequests": 0
+      },
+      "today": {
+        "cacheCreation1hTokens": 400000,
+        "cacheCreationTokens": 1600000,
+        "cacheReadTokens": 6000000,
+        "costUsd": 14.1657,
+        "inputTokens": 400000,
+        "outputTokens": 31860,
+        "requests": 102,
+        "unpricedRequests": 0
+      },
+      "todayByModel": {
+        "claude-opus-5": {
+          "cacheCreation1hTokens": 280000,
+          "cacheCreationTokens": 1120000,
+          "cacheReadTokens": 4200000,
+          "costUsd": 12.0785,
+          "inputTokens": 280000,
+          "outputTokens": 21140,
+          "requests": 70,
+          "unpricedRequests": 0
+        },
+        "claude-sonnet-5": {
+          "cacheCreation1hTokens": 120000,
+          "cacheCreationTokens": 480000,
+          "cacheReadTokens": 1800000,
+          "costUsd": 2.0872,
+          "inputTokens": 120000,
+          "outputTokens": 10720,
+          "requests": 32,
+          "unpricedRequests": 0
+        }
+      },
+      "window": {
+        "cacheCreation1hTokens": 157000,
+        "cacheCreationTokens": 628000,
+        "cacheReadTokens": 2355000,
+        "costUsd": 5.6141,
+        "inputTokens": 157000,
+        "outputTokens": 12476,
+        "requests": 40,
+        "since": 1767207600000,
+        "unpricedRequests": 0
+      }
+    }
   },
   {
+    "cacheCreationTokens": 0,
     "cacheHitRatio": null,
     "cacheReadTokens": 0,
     "control": false,

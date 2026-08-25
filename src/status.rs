@@ -236,6 +236,32 @@ pub struct AccountStatus {
     /// predates the opt-in omits it entirely.
     #[serde(default)]
     pub control_allowed_groups: Vec<String>,
+    /// Proxy-computed usage and cost — see [`AccountSnapshot::usage`].
+    ///
+    /// Both skew directions degrade HONESTLY, which is exactly what
+    /// [`StatusPayload::build`]'s doc-comment reserves a [`STATUS_KIND`] bump
+    /// for NOT doing — so this must not bump it:
+    ///
+    /// * OLD client ← NEW server: serde skips the unknown key; every field the
+    ///   old client reads is untouched.
+    /// * NEW client ← OLD server: the key is absent and reads as `None`, and
+    ///   the client renders "this server does not report usage" — the truth.
+    ///
+    /// **The `Option` is what carries that second direction, not the
+    /// `#[serde(default)]`.** serde's `missing_field` hands the field a
+    /// `MissingFieldDeserializer` whose `deserialize_option` returns
+    /// `visit_none` (serde 1.0.228, `src/private/de.rs:45-50`), so an absent
+    /// `Option<T>` is `None` with or without the attribute. Verified by
+    /// mutation: removing `default` here leaves every test green.
+    ///
+    /// That is NOT true of a non-`Option` field, which is where the real hazard
+    /// lives — see [`Self::stream_error_count`], a bare `usize` whose `default`
+    /// genuinely is load-bearing and whose absence took down a whole fleet view
+    /// on 2026-08-04. `default` is kept here for consistency with the optional
+    /// fields beside it; `skip_serializing_if` is doing real work, keeping the
+    /// key off the wire entirely rather than emitting `"usage": null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<tcr_status_wire::UsageRow>,
 }
 
 /// Unix milliseconds for an instant, matching [`crate::now_ms`]'s unit.
@@ -294,6 +320,7 @@ impl StatusPayload {
                 groups: a.groups.clone(),
                 reserved_groups: a.reserved_groups.clone(),
                 control_allowed_groups: a.control_allowed_groups.clone(),
+                usage: a.usage.clone(),
             })
             .collect();
         Self {
@@ -350,6 +377,7 @@ impl StatusPayload {
                     groups: a.groups,
                     reserved_groups: a.reserved_groups,
                     control_allowed_groups: a.control_allowed_groups,
+                    usage: a.usage,
                 }
             })
             .collect();
@@ -399,6 +427,7 @@ mod tests {
                 groups: vec!["codereview".to_string()],
                 reserved_groups: vec!["codereview".to_string()],
                 control_allowed_groups: vec!["codereview".to_string()],
+                usage: None,
             }],
             current: Some(0),
             recent: Vec::new(),
@@ -571,6 +600,99 @@ mod tests {
             serde_json::from_str(future).expect("an unknown field is skipped, not fatal");
         assert_eq!(payload.kind, STATUS_KIND, "and the kind never had to move");
         assert_eq!(payload.build.sha, "cd146ce");
+    }
+
+    /// THE SKEW THAT ACTUALLY HAPPENS HERE: a NEW client reading an OLD
+    /// server's payload — the binary on disk is rebuilt on merge while the live
+    /// process keeps serving until someone restarts it.
+    ///
+    /// An account row with no `usage` key at all must deserialize, and read as
+    /// `None` — "this server does not report usage", which is true. Anything
+    /// that makes the absence a hard deserialize error instead drops
+    /// `tcr status` to the offline snapshot's structural zeros and shows a
+    /// fabricated healthy fleet; `stream_error_count` did exactly that on
+    /// 2026-08-04.
+    ///
+    /// What this test actually catches is `usage` ceasing to be an `Option`
+    /// (verified by mutation — making it a required field turns this red).
+    /// Removing the field's `#[serde(default)]` does NOT, because serde already
+    /// reads an absent `Option` as `None`; the field's own doc-comment records
+    /// why, and which of its attributes is therefore load-bearing.
+    #[test]
+    fn a_payload_without_usage_reads_as_not_measured() {
+        let old_server = r#"{"kind":"tcr.status.v1","accounts":[{"name":"alice@example.com","priority":0,"status":"active","disabled":false,"fiveHour":null,"fiveHourResetMs":null,"sevenDay":null,"sevenDayResetMs":null,"sevenDayOi":null,"requests":7,"inputTokens":1000,"outputTokens":200,"cacheReadTokens":750,"cacheCreationTokens":50,"lastUsedMs":null,"rateLimitedUntilMs":null,"probeStatus":"ok","lastProbeMs":null,"probeError":null,"quotaState":"normal","gate":"ok","freeAtMs":null,"threshold":0.85,"lastStreamError":null}]}"#;
+        let payload: StatusPayload = serde_json::from_str(old_server)
+            .expect("a payload with no usage key must still deserialize");
+        let account = payload
+            .accounts
+            .first()
+            .expect("the payload carries one account");
+        assert_eq!(
+            account.usage, None,
+            "absent usage is NOT MEASURED, never a fabricated zero"
+        );
+        // And every counter the old server DID report survives untouched.
+        assert_eq!(account.requests, 7);
+        assert_eq!(account.cache_creation_tokens, 50);
+
+        // The reconstructed snapshot carries the same absence through, so the
+        // renderer one layer out has the same fact to work with.
+        let (snapshot, _) = payload.into_snapshot();
+        assert_eq!(snapshot.accounts[0].usage, None);
+    }
+
+    /// The other direction: a usage object on the wire survives the round trip
+    /// with every dimension and the cost intact, so nothing is quietly dropped
+    /// between the server and the renderer.
+    #[test]
+    fn a_usage_row_round_trips_through_the_payload() {
+        let mut snapshot = snapshot_with_counters();
+        let totals = tcr_status_wire::UsageTotals {
+            requests: 3,
+            input_tokens: 1_000,
+            cache_creation_tokens: 2_000,
+            cache_creation_1h_tokens: 500,
+            cache_read_tokens: 9_000,
+            output_tokens: 400,
+            cost_usd: Some(0.0425),
+            unpriced_requests: 1,
+        };
+        snapshot.accounts[0].usage = Some(tcr_status_wire::UsageRow {
+            today: totals,
+            window: Some(tcr_status_wire::UsageWindow {
+                since: 1_767_207_600_000,
+                totals,
+            }),
+            last_hour: totals,
+            today_by_model: [("claude-opus-5".to_string(), totals)]
+                .into_iter()
+                .collect(),
+        });
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot,
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("payload serializes");
+        let (back, _) = serde_json::from_str::<StatusPayload>(&wire)
+            .expect("payload deserializes")
+            .into_snapshot();
+        assert_eq!(
+            back.accounts[0].usage, snapshot.accounts[0].usage,
+            "usage crosses the wire unchanged"
+        );
+        // `since` rides inside the window object via `flatten`; prove the flatten
+        // actually round-trips rather than trusting the derive.
+        assert_eq!(
+            back.accounts[0]
+                .usage
+                .as_ref()
+                .and_then(|u| u.window)
+                .map(|w| w.since),
+            Some(1_767_207_600_000)
+        );
     }
 
     /// The MIRROR of the test above, for the direction that actually broke: a

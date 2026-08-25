@@ -136,7 +136,8 @@ impl Manager {
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account_snaps = accounts
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(idx, a)| {
                 let five_hour = a.quota.five_hour.map(|w| w.effective(now));
                 let seven_day = a.quota.seven_day.map(|w| w.effective(now));
                 // Honest quota state vs this account's OWN threshold (same gating
@@ -223,6 +224,28 @@ impl Manager {
                     groups: a.groups.clone(),
                     reserved_groups,
                     control_allowed_groups,
+                    // Always populated here: this snapshot is built by a
+                    // process that has a usage tracker, so the numbers are
+                    // measured even when they are all zero (an account that has
+                    // genuinely served nothing today). The "not measured" null
+                    // is applied one layer out, by `render_accounts_json`,
+                    // which is the only place that knows the reading came from
+                    // a fresh OFFLINE manager rather than the serving one.
+                    //
+                    // The window's start is derived from the LIVE reset
+                    // (`live_reset`), not the raw stored one, so a window whose
+                    // reset has already elapsed does not name a start five
+                    // hours before an instant that has passed.
+                    usage: Some(
+                        self.usage_row(
+                            idx,
+                            now_ms,
+                            a.quota
+                                .five_hour
+                                .and_then(|w| w.live_reset(now))
+                                .map(odt_to_ms),
+                        ),
+                    ),
                 }
             })
             .collect();

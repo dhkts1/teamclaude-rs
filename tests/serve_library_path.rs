@@ -23,6 +23,7 @@ use teamclaude_rs::config::Config;
 use teamclaude_rs::proxy::STATUS_PATH;
 use teamclaude_rs::server::{serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup};
 use teamclaude_rs::singleton::{ProxyHost, ProxyOwner};
+use teamclaude_rs::usage::LedgerShutdown;
 
 /// The port `tcr` uses by default. Named here so the assertion below says what
 /// it is protecting rather than showing a bare number.
@@ -87,6 +88,10 @@ fn options(tag: &str) -> ServeOptions {
         // could reach `takeover_port` could SIGKILL the developer's live proxy.
         incumbent: IncumbentPolicy::never_signal(),
         affinity_path: Some(scratch_affinity_path(tag)),
+        // In-memory usage only. The binary's ledger directory is shared, and a
+        // test serving briefly must never append into the live proxy's day file
+        // — the same hazard `affinity_path` is scratch-scoped for.
+        usage_dir: None,
         // Loading the MITM material mints/reads a CA on disk. Base-URL mode is
         // all this file exercises, so do not touch it.
         tls: TlsSetup::Disabled,
@@ -384,6 +389,63 @@ async fn serving_writes_the_port_claim_after_binding_and_withdraws_it_on_shutdow
          listening must not still be advertising the port: {}",
         owner_path.display()
     );
+}
+
+/// The usage ledger is drained and its writer JOINED as part of shutdown.
+///
+/// The lines are written by a dedicated thread off the request path, so at any
+/// instant some of them are in its queue rather than on disk. Nothing used to
+/// drain that queue at exit: `flush_ledger` had no production caller and the
+/// writer's `JoinHandle` was dropped on the floor, so every restart — and a
+/// TcrBar update forces one — discarded the requests served in its final moments
+/// and the next boot reported a short day as a measured one.
+///
+/// This is the WIRING gate: that `shutdown_within` performs that drain at all,
+/// and reports what it did. What the drain guarantees about the file's contents
+/// is `usage.rs`'s `shutdown_drains_every_queued_line_to_disk`, which can wedge
+/// the writer and prove the lines were still queued.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutting_down_drains_the_usage_ledger_and_says_it_did() {
+    // A scratch ledger directory. NEVER the default one: the live proxy appends
+    // its own day file there, and a test must not touch it.
+    let usage_dir = scratch_affinity_path("ledger")
+        .parent()
+        .expect("the scratch path has a parent")
+        .join("usage");
+
+    let mut handle = serve(ServeOptions {
+        usage_dir: Some(usage_dir.clone()),
+        ..options("ledger")
+    })
+    .await
+    .expect("binding an ephemeral port cannot fail")
+    .expect_started();
+
+    assert_ne!(
+        handle.addr().port(),
+        LIVE_PROXY_PORT,
+        "a test must never bind the port a live proxy serves on"
+    );
+    assert!(
+        handle.manager().usage_is_persisting(),
+        "a ledger was attached and nothing has failed, so the proxy says it is persisting"
+    );
+
+    let report = tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
+        .await
+        .expect("shutdown did not finish");
+    assert_eq!(
+        report.ledger,
+        LedgerShutdown::Flushed,
+        "shutdown owes the next boot a drained, closed day file"
+    );
+    assert_eq!(report.tasks_aborted, 0, "clean shutdown");
+    assert!(
+        !handle.manager().usage_is_persisting(),
+        "and once the ledger is closed the proxy stops claiming today's totals will survive"
+    );
+
+    let _ = std::fs::remove_dir_all(&usage_dir);
 }
 
 /// The default incumbent policy — what `..Default::default()`, a struct literal

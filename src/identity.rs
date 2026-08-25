@@ -21,16 +21,30 @@ use crate::config::Account;
 /// Stable org discriminator for an account record: org UUID, else org name, else
 /// `None` (an empty string is treated as absent).
 pub fn org_key(a: &Account) -> Option<&str> {
-    a.org_uuid
-        .as_deref()
+    org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref())
+}
+
+/// [`org_key`] over the two fields directly, for callers holding a runtime row
+/// rather than a config record (`AccountRuntime`, which carries the same pair).
+/// One definition, because two copies of "which field wins" is exactly the drift
+/// this module exists to prevent.
+pub fn org_key_of<'a>(org_uuid: Option<&'a str>, org_name: Option<&'a str>) -> Option<&'a str> {
+    org_uuid
         .filter(|s| !s.is_empty())
-        .or_else(|| a.org_name.as_deref().filter(|s| !s.is_empty()))
+        .or_else(|| org_name.filter(|s| !s.is_empty()))
 }
 
 /// The account UUID of a record, when one is actually stored (an empty string is
 /// treated as absent, exactly as [`org_key`] treats an empty org).
 fn uuid_key(a: &Account) -> Option<&str> {
-    a.account_uuid.as_deref().filter(|s| !s.is_empty())
+    uuid_key_of(a.account_uuid.as_deref())
+}
+
+/// [`uuid_key`] over the field directly, for callers holding a runtime row
+/// rather than a config record — the same split, and for the same reason, as
+/// [`org_key`] and [`org_key_of`].
+pub fn uuid_key_of(account_uuid: Option<&str>) -> Option<&str> {
+    account_uuid.filter(|s| !s.is_empty())
 }
 
 /// Whether two account records refer to the same account+org.

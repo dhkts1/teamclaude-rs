@@ -39,6 +39,12 @@ fn default_switch_threshold() -> f64 {
 fn default_control_reserve() -> f64 {
     0.05
 }
+
+/// Default [`Config::usage_retention_days`]: a quarter of history, which is ~180 MB
+/// at the observed ~2 MB/day and answers "how did last month compare".
+fn default_usage_retention_days() -> u32 {
+    90
+}
 /// Default pacing when the `pacing` key is absent: OFF — no in-flight cap, no
 /// min-spacing, so an unconfigured proxy runs the no-pacing selection path.
 ///
@@ -598,6 +604,27 @@ pub struct Config {
     /// opt-in. Set `"http1Only": true` to enable.
     #[serde(default)]
     pub http1_only: bool,
+    /// Per-model price overrides for the usage ledger's cost figures, keyed by a
+    /// model id or any PREFIX of one (`"claude-opus-5"` covers every dated
+    /// variant). `input` and `output` are USD per million tokens and are
+    /// required; the three cache dimensions default to the same multipliers the
+    /// built-in table uses (read 0.1x input, 5-minute write 1.25x, 1-hour write
+    /// 2x). An override beats the built-in table outright — see
+    /// [`crate::pricing::PricingTable::lookup`].
+    ///
+    /// This is also how a model the built-in table has no published rate for
+    /// gets priced instead of counting as `unpricedRequests`. Absent → the
+    /// built-in table alone.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pricing: HashMap<String, crate::pricing::PricingOverride>,
+    /// How many days of usage-ledger day files to keep in
+    /// `~/.cache/teamclaude/usage/`. Absent → 90. Checked once at boot; older
+    /// files are deleted then. `0` keeps only today and yesterday (the two the
+    /// boot replay reads), which is the floor — the ledger cannot keep less and
+    /// still survive a restart, so `crate::usage::prune` refuses to delete
+    /// either of those two days whatever this says.
+    #[serde(default = "default_usage_retention_days")]
+    pub usage_retention_days: u32,
     #[serde(default)]
     pub accounts: Vec<Account>,
     /// Properties of GROUPS themselves (`"groupSettings": {"codereview":

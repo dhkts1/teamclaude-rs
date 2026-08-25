@@ -134,6 +134,8 @@ fn config(upstream: &str, throttle: ThrottleConfig, throttle_exempt_noise: bool)
         http1_only: false,
         accounts: (0..POOL).map(account).collect(),
         group_settings: std::collections::HashMap::new(),
+        pricing: Default::default(),
+        usage_retention_days: 90,
         extra,
     }
 }

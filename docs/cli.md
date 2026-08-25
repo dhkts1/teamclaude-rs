@@ -319,6 +319,57 @@ It asks the running proxy where there is one and falls back to an offline read w
 is not; the output labels which it got, so a fallback is never silently presented as a live
 measurement.
 
+### The `usage` object on `--json`
+
+Every row carries `usage`: what that account spent, aggregated by the proxy as it served each
+request rather than by re-reading transcripts afterwards.
+
+```
+tcr status --json | jq '.[] | {name, today: .usage.today.costUsd, hour: .usage.lastHour.costUsd}'
+```
+
+| key | shape | what it is |
+|---|---|---|
+| `usage.today` | totals | the **local calendar day** of the machine the server runs on |
+| `usage.window` | totals + `since` | this account's current 5-hour quota window, read from Anthropic's own reset header. `null` when that reset is unknown, because then the window's start cannot be named |
+| `usage.lastHour` | totals | the trailing 60 minutes — burn rate is `lastHour.costUsd` per hour, by definition |
+| `usage.todayByModel` | `{model: totals}` | `today`, split by model id |
+
+Each totals object carries `requests`, `inputTokens` (BASE input — see below), `cacheCreationTokens`,
+`cacheCreation1hTokens`, `cacheReadTokens`, `outputTokens`, `costUsd` and `unpricedRequests`.
+
+`cacheCreationTokens` is ALL cache creation, both TTLs — the same quantity the row-level key of that
+name carries, so the two never mean different things in one row. `cacheCreation1hTokens` is the
+subset of it written under the extended 1-hour window (which bills at 2x base input rather than
+1.25x); the 5-minute part is the difference between the two.
+
+**`usage.today.inputTokens` is not the row's `inputTokens`.** The row-level one is the QUOTA counter
+and folds cache creation and cache reads into a single number, which is what quota is charged on. The
+usage object keeps the four dimensions apart because they bill at four different rates, so they have
+to be separable to be priced at all. The new row-level `cacheCreationTokens` is the companion
+`cacheReadTokens` never had: with both, a reader can see how much input was served FROM cache and how
+much was spent WRITING it.
+
+**`costUsd` is API list price, not a bill.** These accounts are subscriptions; nothing here is
+charged. The figure answers "what would this traffic have cost on the API", which is the only unit
+that compares across accounts, models and days. When a model has no published rate in this build,
+`costUsd` is `null` and `unpricedRequests` counts the requests missing from the figure — a partial
+total says so rather than passing itself off as the whole. Add a rate with `pricing` in the config
+([configuration.md](configuration.md#pricing-and-usageretentiondays)).
+
+`costUsd: null` means exactly that one thing: the bucket served requests and not one of them could be
+priced. A bucket that served NOTHING reports `costUsd: 0.0` — an idle account is a measured zero, in
+`today` and `lastHour` alike.
+
+**`usage: null` means not measured, never "spent nothing".** Two cases produce it: the row came from
+the offline path (no serving process, so there is nothing to aggregate), or the proxy that answered
+was built before this field existed — which is the ordinary state here, since the binary on disk is
+rebuilt on merge while the live process keeps serving until someone restarts it. `source` on the same
+row says which.
+
+Totals survive a restart: each served request is appended to `~/.cache/teamclaude/usage/`, and boot
+replays the day back in. Fleet-wide totals are not a field — sum the rows.
+
 ---
 
 ## `tcr update`

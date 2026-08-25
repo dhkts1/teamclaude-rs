@@ -192,6 +192,16 @@ pub struct AccountSnapshot {
     /// sorted. Always an array, `[]` when none — a config fact, never `null`,
     /// same contract as [`Self::reserved_groups`] beside it.
     pub control_allowed_groups: Vec<String>,
+    /// Proxy-computed usage and cost for this account: today, the current 5-hour
+    /// window, the trailing hour, and today split by model.
+    ///
+    /// `None` means NOT MEASURED, never "served nothing". It is `None` on any
+    /// snapshot built outside the serving process — a fresh offline `Manager`
+    /// has no traffic to aggregate and no ledger attached — and on a row
+    /// reconstructed from a server whose build predates the field. The same
+    /// honest-null discipline `cacheHitRatio` follows: an unmeasured zero read
+    /// as a measurement is how a real prompt-cache catastrophe went unseen.
+    pub usage: Option<tcr_status_wire::UsageRow>,
 }
 
 /// Whether a live session was keyed on a stable client identity (x-api-key /

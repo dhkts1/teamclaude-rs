@@ -44,11 +44,63 @@ section below.
 | `throttle` | object | `{minSpacingMs: 350, burst: 4}` → **ON** | no | fleet-wide egress rate limiter, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
+| `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
+| `usageRetentionDays` | u32 | **`90`** | no | how many days of usage ledger files to keep |
 | `accounts` | array | `[]` | no | the rotatable accounts |
 
 `switchThreshold` is **0.95**, not 0.90. The default function is
 `default_switch_threshold()` and it returns `0.95`; the older README said 0.90, which was
 never the shipped value.
+
+## `pricing` and `usageRetentionDays`
+
+`tcr status --json` reports what each account's traffic **would have cost on Anthropic's API**. The
+accounts are subscriptions, so nothing here is a bill; it is the only unit that compares across
+accounts, models and days.
+
+Prices come from a table built into the binary (`src/pricing.rs`), matched by longest prefix so a
+dated id like `claude-haiku-4-5-20251001` resolves to its family. A model the table has no published
+rate for is reported as `costUsd: null` with `unpricedRequests` counting it — never as `$0.00`, which
+would be a spend nobody measured presented as one.
+
+`pricing` is how you add or change a rate. Keys are a model id or any prefix of one; `input` and
+`output` are USD per million tokens and both are required. The three cache dimensions default to the
+same multipliers the built-in table uses — cache read 0.1x input, a 5-minute cache write 1.25x, a
+1-hour cache write 2x — and can be set explicitly:
+
+```json
+"pricing": {
+  "claude-sonnet-4-5": { "input": 3, "output": 15 },
+  "claude-opus-5": { "input": 5, "output": 25, "cacheRead": 0.5 }
+}
+```
+
+An override beats the built-in table outright, even when its key is the shorter prefix: a price you
+wrote down is what this proxy should believe.
+
+`usageRetentionDays` bounds the ledger under `~/.cache/teamclaude/usage/`, one `<UTC-date>.jsonl` file
+per day at roughly 2 MB per 17k requests. Files older than this are deleted once, at boot. Only today's
+and yesterday's are ever read back (that is what makes a restart keep the day's totals); the rest are
+history for you to grep.
+
+Lines are written by a dedicated thread, off the request path, so a stalled disk costs accounting and
+never latency. A clean shutdown drains that thread's queue and waits for it to close the file, so the
+requests served in the final moments before a restart are in the day it replays. Two things can still
+cost lines — a write that fails, and a queue that fills faster than the disk drains it — and both are
+said out loud at the moment they start, and again when they stop: the server logs the transition with a
+running dropped-line count, and reports `persisting=false` for as long as it lasts — rather than a short
+day presented afterwards as a measured one.
+
+`0` is the floor, and it keeps today AND yesterday: those two files are what the boot replay reads, and
+the pruner never deletes them whatever this is set to. It has to be both — on a UTC+3 machine the first
+three hours of the local day live in yesterday's UTC-named file, so deleting it would cost the second
+restart of the day those hours, silently and while still reporting them as measured.
+
+**"Today" is the local calendar day of the machine the server runs on**, resolved per record against
+that record's own instant, so a day boundary is correct across a daylight-saving change. Ledger FILE
+names are UTC dates and need not agree with it — the file name is a shard key, not a claim about your
+calendar. If the machine's UTC offset cannot be read at all, day boundaries fall back to UTC and the
+server says so once in its boot log.
 
 ## `proxy.*`
 

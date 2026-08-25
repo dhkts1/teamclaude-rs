@@ -2349,6 +2349,8 @@ mod revalidation_sticky_tests {
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         }
     }
@@ -2490,6 +2492,8 @@ mod sticky_divert_replay_tests {
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         }
     }
