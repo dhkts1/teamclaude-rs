@@ -65,9 +65,10 @@ struct FleetView: View {
     /// controller is set to `sizingOptions = [.preferredContentSize]`
     /// (`MenuBarShell.swift`) for exactly this reason.
     ///
-    /// Per-row rather than one summed total because rows are not uniform
-    /// height — see `Tok.visibleAccountRows`. `visibleRowsHeight(for:)` sums
-    /// the first `Tok.visibleAccountRows` of these, in display order.
+    /// Per-row rather than one summed total because rows are not uniform height
+    /// — the needs-relogin state and several conditional detail lines all grow a
+    /// row. `visibleRowsHeight(for:)` sums all of these and clamps the total to
+    /// `Tok.panelMaxHeight`.
     @State private var rowHeights: [String: CGFloat] = [:]
 
     var body: some View {
@@ -96,27 +97,41 @@ struct FleetView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            Text(poller.state.summary)
-                .font(Tok.secondaryFont)
-                .foregroundStyle(poller.state.isHealthyRead ? .secondary : .primary)
-                .fixedSize(horizontal: false, vertical: true)
+            // Only when the read is NOT healthy. On a healthy read this said
+            // "13 accounts — live", which the tallies below say with more
+            // detail. Every other state — pending, tool missing, command
+            // failed, undecodable, stale — is carried nowhere else in the
+            // panel, so it still prints, and it is then the most important
+            // sentence on screen.
+            if !poller.state.isHealthyRead {
+                Text(poller.state.summary)
+                    .font(Tok.secondaryFont)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
                 capacitySummary(fleet)
             }
-            if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
-                Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
-                    .font(Tok.detailDigitFont)
-                    .foregroundStyle(.tertiary)
-            }
+            usageSummary
             updateStateLine
         }
+    }
+
+    /// Where the fleet's spend, burn rate, model mix and cache hit rate go, once
+    /// the proxy puts a `usage` object on the wire. Empty until then: a row of
+    /// zeros would answer a question the panel cannot answer yet. Named so the
+    /// next change has a place to fill rather than a header to re-derive.
+    @ViewBuilder
+    private var usageSummary: some View {
+        EmptyView()
     }
 
     /// Renders only for ``UpdateState/available(version:)`` and
     /// ``UpdateState/failed(_:)`` — see ``UpdateState/headerMessage``, which
     /// is what actually decides that; this view just draws whatever it
     /// returns. `.unknown` and `.upToDate` add no row: a permanent
-    /// "you're up to date" line has no place in a 380pt panel.
+    /// "you're up to date" line has no place in a 380pt panel. Same rule that
+    /// drops the poll summary on a healthy read and moved `server <sha>` to the
+    /// footer — a header line has to say something the next line does not.
     ///
     /// `.available` is a button so clicking it runs the same
     /// `checkForUpdates()` the footer's own button does — Sparkle drives the
@@ -138,26 +153,30 @@ struct FleetView: View {
 
     /// The one question the panel exists to answer: is there capacity right now,
     /// and if not, when does it come back. All counting lives on `Fleet`.
+    ///
+    /// The verdict and its tallies were two stacked lines and are now one that
+    /// wraps, which gives the header a line back. Concatenated `Text` rather
+    /// than an `HStack` because an `HStack` cannot wrap — it would overflow or
+    /// truncate — while concatenated runs flow onto a second line and keep
+    /// their own colours.
     private func capacitySummary(_ fleet: Fleet) -> some View {
-        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+        var line =
             Text(fleet.capacitySummary)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Tok.color(for: fleet.capacityState))
-                .fixedSize(horizontal: false, vertical: true)
-            HStack(spacing: Tok.tightSpacing) {
-                ForEach(Array(fleet.breakdown.enumerated()), id: \.offset) { index, tally in
-                    if index > 0 {
-                        Text("·").font(Tok.secondaryFont).foregroundStyle(.tertiary)
-                    }
-                    Text(tally.label)
-                        .font(Tok.secondaryDigitFont)
-                        .foregroundStyle(Tok.color(for: tally.kind))
-                }
-            }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(fleet.breakdownLabel)
+            .font(.subheadline.weight(.semibold))
+            .foregroundColor(Tok.color(for: fleet.capacityState))
+        for tally in fleet.breakdown {
+            line =
+                line
+                + Text(" · ").font(Tok.secondaryFont).foregroundColor(Tok.inkFaint)
+                + Text(tally.label)
+                .font(Tok.secondaryDigitFont)
+                .foregroundColor(Tok.color(for: tally.kind))
         }
-        .padding(.top, Tok.tightSpacing)
+        return
+            line
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityLabel("\(fleet.capacitySummary), \(fleet.breakdownLabel)")
+            .padding(.top, Tok.tightSpacing)
     }
 
     // MARK: Body
@@ -256,7 +275,8 @@ struct FleetView: View {
             onRelogin: { reloginAccount(account.name) },
             groupController: groupController,
             removeController: removeController,
-            allAccounts: fleet.accounts
+            allAccounts: fleet.accounts,
+            snapshotMode: snapshotMode
         )
         .background(
             GeometryReader { proxy in
@@ -266,18 +286,16 @@ struct FleetView: View {
         )
     }
 
-    /// Height of the scroll viewport: room for the first `Tok.visibleAccountRows`
-    /// rows (any accounts past that scroll into view), clamped so it never
-    /// collapses to nothing and never exceeds the historical panel-wide cap.
+    /// Height of the scroll viewport: every row, clamped to `Tok.panelMaxHeight`.
     ///
-    /// Sums per-row *measured* heights rather than `Tok.visibleAccountRows *`
-    /// some constant, because rows are not uniform height — see the doc on
-    /// `Tok.visibleAccountRows`.
+    /// It used to stop at the first four rows, which left the panel short of its
+    /// own cap while it had more to show — and a row count is the wrong unit
+    /// anyway, since rows are not uniform height. A two-account fleet now draws
+    /// in full and a thirteen-account one fills to 520pt and scrolls.
     ///
     /// Fallback: before SwiftUI has laid out and reported any row height (the
     /// first frame, prior to the first `onPreferenceChange`), `rowHeights` is
-    /// empty and this returns `Tok.panelMaxHeight` — the original
-    /// always-room-for-roughly-8-rows behaviour — so the panel never renders
+    /// empty and this returns `Tok.panelMaxHeight`, so the panel never renders
     /// at zero or one-row height while waiting for a real measurement.
     private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
         let orderedHeights = fleet.rowsInDisplayOrder(pinning: control.current).compactMap {
@@ -286,10 +304,9 @@ struct FleetView: View {
         guard !orderedHeights.isEmpty else {
             return Tok.panelMaxHeight
         }
-        let visibleCount = min(orderedHeights.count, Tok.visibleAccountRows)
         let summed =
-            orderedHeights.prefix(visibleCount).reduce(0, +)
-            + Tok.rowSpacing * CGFloat(max(visibleCount - 1, 0))
+            orderedHeights.reduce(0, +)
+            + Tok.rowSpacing * CGFloat(max(orderedHeights.count - 1, 0))
         return min(max(summed, Tok.rowSpacing), Tok.panelMaxHeight)
     }
 
@@ -321,10 +338,23 @@ struct FleetView: View {
 
     private var footer: some View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-            Text(server.state.summary)
-                .font(Tok.secondaryFont)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            // The running server's build, beside who supervises it — two facts
+            // about the same process, neither about capacity. It used to sit in
+            // the header, pushing the fleet's own numbers down for a string
+            // read about once a release.
+            HStack(spacing: Tok.tightSpacing) {
+                Text(server.state.summary)
+                    .font(Tok.secondaryFont)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: Tok.tightSpacing)
+                if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
+                    Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
+                        .font(Tok.detailDigitFont)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
             fleetActions
             // Scope boundary by PROXIMITY, not by a rule. A `Hairline` shipped
             // here first and was then rendered with `--render-states`: it put a
@@ -722,6 +752,13 @@ struct AccountRow: View {
     /// account is not already in, not just the ones visible in whatever
     /// section this row happens to be drawn under.
     let allAccounts: [Account]
+    /// Mirrors ``FleetView/snapshotMode``. `ImageRenderer` cannot draw a
+    /// `Menu` — it rasterises the yellow "unsupported control" placeholder
+    /// the README hero used to ship — so a snapshot draws
+    /// ``accountActionsMenuLabel`` on its own, with no `Menu` wrapping it.
+    /// Defaults to `false` so every other call site (the live panel) is
+    /// unchanged.
+    var snapshotMode: Bool = false
 
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
@@ -798,6 +835,26 @@ struct AccountRow: View {
         switch account.quotaBarTintSource(for: .sevenDay) {
         case .unmeasured: return Tok.unmeasured
         case .state(let state): return Tok.color(for: state)
+        }
+    }
+
+    /// What colour the reset caption wears.
+    ///
+    /// `Tok.inkFaint` while the window is fine — the percentage beside it is the
+    /// fact, and the countdown must not compete with it. On a `near` or `spent`
+    /// window it takes that window's colour, because there the countdown IS the
+    /// fact: it answers when capacity comes back, and it should be findable down
+    /// a column of thirteen rows.
+    ///
+    /// Demoted with the bar and the percentage on a stale reading.
+    private func captionTint(for window: Account.QuotaWindow) -> Color {
+        if hasStaleQuotaReading { return Tok.disabled }
+        guard case .state(let state) = account.quotaBarTintSource(for: window) else {
+            return Tok.inkFaint
+        }
+        switch state {
+        case .near, .spent: return Tok.color(for: state)
+        case .ok, .unknown: return Tok.inkFaint
         }
     }
 
@@ -1003,6 +1060,11 @@ struct AccountRow: View {
             // that curve from clipping the account name or the toggle button —
             // an outer radius with no matching inset draws a border that bites
             // into its own content at the corners.
+            //
+            // It is also the only inner padding now. `rowContent` carried a
+            // second one (`Tok.rowPaddingV`) from before this card had a border,
+            // when a row needed its own breathing room. Inside a bordered card
+            // with `Tok.rowSpacing` between cards it was 4pt of nothing.
             .padding(.horizontal, Tok.space3)
             .padding(.vertical, Tok.space2)
             .background(
@@ -1043,7 +1105,6 @@ struct AccountRow: View {
                     toggleButton
                 }
             }
-            .padding(.vertical, Tok.rowPaddingV)
         } else {
             HStack(alignment: .top, spacing: Tok.tightSpacing) {
                 information
@@ -1051,7 +1112,6 @@ struct AccountRow: View {
                     .accessibilityLabel(rowAccessibilityLabel)
                 accountActionsMenu
             }
-            .padding(.vertical, Tok.rowPaddingV)
         }
     }
 
@@ -1347,24 +1407,44 @@ struct AccountRow: View {
     /// and a bordered icon-only control reads as heavier chrome than a
     /// 13pt row wants. This is the one icon-only control in the panel, so
     /// there is no existing icon-menu style to match instead.
+    @ViewBuilder
     private var accountActionsMenu: some View {
-        Menu {
-            contextMenuItems
-        } label: {
-            Image(systemName: "gearshape")
-                .font(Tok.bodyFont)
-                .foregroundStyle(.secondary)
-                // The Menu's own `.accessibilityLabel` below names the
-                // control; without hiding the glyph too, VoiceOver reads
-                // both the image ("gearshape, image") and the label,
-                // announcing the same control twice.
-                .accessibilityHidden(true)
+        if snapshotMode {
+            // `ImageRenderer` cannot draw a `Menu` at all — it rasterises a
+            // yellow prohibition glyph in its place, which is what shipped
+            // in the README hero before this branch existed. A snapshot
+            // draws the label on its own, non-interactive, so the PNG shows
+            // the gearshape a user actually sees on the live panel.
+            accountActionsMenuLabel
+                .controlSize(.small)
+                .fixedSize()
+                .accessibilityLabel("Account actions for \(account.name)")
+                .help("Enable/disable, re-login, or copy the account name.")
+        } else {
+            Menu {
+                contextMenuItems
+            } label: {
+                accountActionsMenuLabel
+            }
+            .menuStyle(.borderlessButton)
+            .controlSize(.small)
+            .fixedSize()
+            .accessibilityLabel("Account actions for \(account.name)")
+            .help("Enable/disable, re-login, or copy the account name.")
         }
-        .menuStyle(.borderlessButton)
-        .controlSize(.small)
-        .fixedSize()
-        .accessibilityLabel("Account actions for \(account.name)")
-        .help("Enable/disable, re-login, or copy the account name.")
+    }
+
+    /// The gearshape glyph shared by the live `Menu` and its `snapshotMode`
+    /// stand-in, so the two can never draw two different icons.
+    private var accountActionsMenuLabel: some View {
+        Image(systemName: "gearshape")
+            .font(Tok.bodyFont)
+            .foregroundStyle(.secondary)
+            // The Menu's own `.accessibilityLabel` below names the
+            // control; without hiding the glyph too, VoiceOver reads
+            // both the image ("gearshape, image") and the label,
+            // announcing the same control twice.
+            .accessibilityHidden(true)
     }
 
     /// The one place `tcr enable`/`tcr disable` is actually run. Shared by
@@ -1468,7 +1548,7 @@ struct AccountRow: View {
                         .help(account.groupTags.map(\.name).joined(separator: ", "))
                 }
             }
-            // Two stacked bars, 5-hour on top and 7-day directly under it —
+            // Two window lines, 5-hour on top and 7-day directly under it —
             // Gil's explicit call (bridge, 2026-08-18) — each tinted by its OWN
             // window's state (`fiveHourTint`/`sevenDayTint`) rather than the
             // shared gating tint the single bar used to wear: a 7d-red account
@@ -1479,84 +1559,49 @@ struct AccountRow: View {
             // numbered here, a third "most-spent-of-both" percentage would be
             // the same fact restated rather than new information.
             //
-            // The label sits ABOVE its own bar, not below — a first attempt put
-            // "5h X%" underneath the 5h bar and "7d Y%" underneath the 7d bar,
-            // which reads as a column of bar / label / bar / label with no
-            // visual rule saying which label belongs to which neighbour. Above
-            // reads unambiguously: "5h X%" immediately precedes the bar it
-            // describes, with the PRIOR bar a full row away.
-            // `Tok.rowLineSpacing` (2pt, shared by every line in this column)
-            // put this label line visually inside the pills above it — the
-            // pills carry their own 2pt vertical padding on top of that gap,
-            // so the two collided. The fix is asymmetric, not a blanket
-            // increase to `rowLineSpacing`: only this label line, right below
-            // the pills, gets extra top padding, leaving the rest of the
-            // column untouched.
-            HStack(spacing: Tok.tightSpacing) {
-                Text("5h \(QuotaFormat.percent(account.fiveHour))")
-                    .font(Tok.secondaryDigitFont)
-                    // Demoted alongside the bar, not left `.secondary`: the eye
-                    // should group these digits as historical rather than live,
-                    // the same distinction `fiveHourTint` draws for the fill.
-                    // The number itself is unchanged — it is still true, just
-                    // no longer reachable.
-                    .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
-                // `Tok.inkFaint` ("tertiary text and hints" in this design
-                // system — see Tokens.swift), not `.secondary` — the
-                // percentage above is the primary fact on this line, and the
-                // countdown is context; it must not compete with the number.
-                // Demoted alongside `hasStaleQuotaReading` for the same
-                // reason the percentage is: one half of a line reading live
-                // and the other historical makes the row argue with itself.
-                if let caption = QuotaFormat.resetCaption(
-                    resetAtMs: account.fiveHourResetAtMs,
-                    now: Date()
-                ) {
-                    Text("· \(caption)")
-                        .font(Tok.secondaryFont)
-                        .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint)
-                        .lineLimit(1)
-                }
-                Spacer()
+            // Label, bar and percentage share ONE line per window, which took
+            // the card from 96pt to 59pt. The earlier choice here was label
+            // above its bar versus below it; above won because below read as
+            // bar / label / bar / label with nothing saying which label went
+            // with which. Beside cannot be misread at all — a label and its bar
+            // are on the same line. The reset caption comes with it, so the
+            // hourglass line that said the same thing lower down is gone.
+            //
+            // The extra top padding is asymmetric on purpose: at
+            // `Tok.rowLineSpacing` alone this first line collided with the
+            // pills, which carry their own vertical padding.
+            quotaLine(
+                window: "5h",
+                fraction: account.fiveHour,
+                tint: fiveHourTint,
+                barLabel: "5-hour quota",
+                resetAtMs: account.fiveHourResetAtMs,
+                captionTint: captionTint(for: .fiveHour)
+            ) {
+                // This 5h window's spend goes here once the proxy puts `usage`
+                // on the wire. Empty until then — a placeholder would claim a
+                // number the panel does not have.
+                EmptyView()
             }
-            .padding(.top, Tok.tightSpacing)
-            QuotaBar(fraction: account.fiveHour, tint: fiveHourTint, label: "5-hour quota")
-                // Sighted-hover half of the same fix `quotaTint`/`fiveHourTint`
-                // make for the fill colour: a muted bar alone can still read
-                // as "just a dim healthy bar" rather than "not live" without a
-                // word saying so on hover.
-                .help(
-                    hasStaleQuotaReading
-                        ? "The last reading taken before the credential was rejected. "
-                            + "This headroom is unreachable until you re-login."
-                        : ""
-                )
-            HStack(spacing: Tok.tightSpacing) {
-                Text("7d \(QuotaFormat.percent(account.sevenDay))")
-                    .font(Tok.secondaryDigitFont)
-                    // Same demotion as the 5h percentage — one bar reading
-                    // live and the other historical would be its own new
-                    // contradiction inside a single row.
-                    .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
-                // Same inline placement and `Tok.inkFaint` demotion as the 5h
-                // caption above — see that comment for why.
-                if let caption = QuotaFormat.resetCaption(
-                    resetAtMs: account.sevenDayResetAtMs,
-                    now: Date()
-                ) {
-                    Text("· \(caption)")
-                        .font(Tok.secondaryFont)
-                        .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint)
-                        .lineLimit(1)
-                }
-                Spacer()
+            .padding(.top, Tok.space1)
+            quotaLine(
+                window: "7d",
+                fraction: account.sevenDay,
+                tint: sevenDayTint,
+                barLabel: "7-day quota",
+                resetAtMs: account.sevenDayResetAtMs,
+                captionTint: captionTint(for: .sevenDay)
+            ) {
                 // `status` is the account's own field and it keeps saying
                 // "active" while `disabled` is true — verified against live
                 // output, not just a fixture. Printing it next to a PARKED pill
                 // puts "parked" and "active" in one line and makes the row argue
                 // with itself, so the pill speaks for a parked account and the
-                // raw status only shows when it can be true.
-                if !account.disabled {
+                // raw status only shows when it can be true. `active` is dropped
+                // too: the ROTATING pill already says it. The word now prints
+                // only when it adds something — `throttled`, `error`, whatever
+                // else `tcr` reports.
+                if !account.disabled && account.status != "active" {
                     Text(account.status)
                         .font(Tok.secondaryFont)
                         // `active` and `error` must not be pixel-identical: an
@@ -1566,23 +1611,12 @@ struct AccountRow: View {
                         .foregroundStyle(account.health == .needsRelogin ? Tok.spent : .secondary)
                         .lineLimit(1)
                 }
-            }
-            QuotaBar(fraction: account.sevenDay, tint: sevenDayTint, label: "7-day quota")
-                .help(
-                    hasStaleQuotaReading
-                        ? "The last reading taken before the credential was rejected. "
-                            + "This headroom is unreachable until you re-login."
-                        : ""
-                )
-            if let hold = account.soonestHold {
-                Label(hold.countdownLabel, systemImage: "hourglass")
-                    .font(Tok.secondaryFont)
-                    .foregroundStyle(Tok.near)
-            }
-            if !countersAreStructural {
-                Text("\(QuotaFormat.count(account.requests)) req · cache \(cacheLabel)")
-                    .font(Tok.detailDigitFont)
-                    .foregroundStyle(.tertiary)
+                if !countersAreStructural {
+                    Text("\(QuotaFormat.count(account.requests)) req · cache \(cacheLabel)")
+                        .font(Tok.detailDigitFont)
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
             if let error = account.lastStreamError, !error.isEmpty {
                 // A nil count here is not a quantity with an unknown value —
@@ -1615,6 +1649,61 @@ struct AccountRow: View {
             }
             verdictLine
             removalNoticeLine
+        }
+    }
+
+    /// One window of quota on one line — `5h ▓▓▓░░░ 12% in 2h 10m` — then
+    /// whatever the caller puts on the right.
+    ///
+    /// Label and bar are fixed-width, so every card's percentage lands in the
+    /// same column. That column is what makes thirteen rows scannable.
+    ///
+    /// `hasStaleQuotaReading` demotes label, bar, percentage and caption
+    /// together: a row must not read half live and half historical.
+    @ViewBuilder
+    private func quotaLine<Trailing: View>(
+        window: String,
+        fraction: Double?,
+        tint: Color,
+        barLabel: String,
+        resetAtMs: Int64?,
+        captionTint: Color,
+        @ViewBuilder trailing: () -> Trailing
+    ) -> some View {
+        HStack(spacing: Tok.tightSpacing) {
+            Text(window)
+                .font(Tok.secondaryDigitFont)
+                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint)
+                .frame(width: Tok.windowLabelWidth, alignment: .leading)
+            QuotaBar(fraction: fraction, tint: tint, label: barLabel)
+                // Sighted-hover half of the same fix `quotaTint`/`fiveHourTint`
+                // make for the fill colour: a muted bar alone can still read as
+                // "just a dim healthy bar" rather than "not live" without a word
+                // saying so on hover.
+                .help(
+                    hasStaleQuotaReading
+                        ? "The last reading taken before the credential was rejected. "
+                            + "This headroom is unreachable until you re-login."
+                        : ""
+                )
+            Text(QuotaFormat.percent(fraction))
+                .font(Tok.secondaryDigitFont)
+                // Demoted alongside the bar, not left `.secondary`: the eye
+                // should group these digits as historical rather than live, the
+                // same distinction `fiveHourTint` draws for the fill. The number
+                // itself is unchanged — it is still true, just no longer
+                // reachable.
+                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
+            // Drawn whenever the wire has a reset for this window, beside the
+            // number it belongs to. Colour: `captionTint(for:)`.
+            if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: Date()) {
+                Text(caption)
+                    .font(Tok.secondaryFont)
+                    .foregroundStyle(captionTint)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: Tok.tightSpacing)
+            trailing()
         }
     }
 
@@ -1786,6 +1875,9 @@ struct QuotaBar: View {
     /// row now draws. Named so VoiceOver reading two bars in a row hears two
     /// distinct labels rather than "Quota" twice.
     var label: String = "Quota"
+    /// Fixed, not whatever the line leaves over: a bar that filled the leftover
+    /// width would be a different length on every card. See `Tok.barWidth`.
+    var width: CGFloat = Tok.barWidth
 
     /// Honour the system Reduce Motion setting. SwiftUI does not suppress an
     /// explicit `.animation` for you.
@@ -1805,20 +1897,18 @@ struct QuotaBar: View {
     }
 
     var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: Tok.barRadius).fill(Tok.track)
-                if let fraction {
-                    RoundedRectangle(cornerRadius: Tok.barRadius)
-                        .fill(tint)
-                        .frame(width: geo.size.width * min(max(fraction, 0), 1))
-                } else {
-                    RoundedRectangle(cornerRadius: Tok.barRadius)
-                        .strokeBorder(tint, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
-                }
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: Tok.barRadius).fill(Tok.track)
+            if let fraction {
+                RoundedRectangle(cornerRadius: Tok.barRadius)
+                    .fill(tint)
+                    .frame(width: width * min(max(fraction, 0), 1))
+            } else {
+                RoundedRectangle(cornerRadius: Tok.barRadius)
+                    .strokeBorder(tint, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
             }
         }
-        .frame(height: Tok.barHeight)
+        .frame(width: width, height: Tok.barHeight)
         .animation(reduceMotion ? nil : Tok.standardAnimation, value: fraction)
         .accessibilityElement()
         .accessibilityLabel(label)

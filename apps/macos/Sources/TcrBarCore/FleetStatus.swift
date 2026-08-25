@@ -308,7 +308,14 @@ public enum QuotaFormat {
         return .measured(min(max(value, 0), 1))
     }
 
-    /// `"resets in 2h 14m"`, or nil when there is nothing to count down to.
+    /// `"in 2h 14m"`, or nil when there is nothing to count down to.
+    ///
+    /// It read `"resets in 2h 14m"` until the card became one line per window.
+    /// The caption now follows that window's own percentage (`5h 94% in 2h
+    /// 14m`), where the only thing a countdown can count down to is the reset.
+    /// The seven characters of `"resets "` are also 35 of the roughly 300pt
+    /// that line has, and with them the counters beside it truncated to
+    /// `102 req ·…` — a measured fact dropped for a word the context supplies.
     ///
     /// `nil` in → `nil` out — never a placeholder — the same house rule
     /// ``percent(_:)`` states above: an absent measurement never renders as
@@ -327,7 +334,7 @@ public enum QuotaFormat {
         guard seconds > 0 else { return nil }
         let minutes = Int((seconds / 60).rounded())
         guard minutes > 0 else { return nil }
-        return "resets in \(HeldWindow.duration(minutes: minutes))"
+        return "in \(HeldWindow.duration(minutes: minutes))"
     }
 }
 
@@ -1292,6 +1299,14 @@ public struct Fleet: Equatable, Sendable {
 
     /// Per-bucket counts in fixed severity order, with empty buckets omitted so
     /// a healthy fleet reads just `"12 ok"`.
+    ///
+    /// `.needsRelogin` and `.unmeasured` are excluded from the order: both are
+    /// already named by ``capacitySummary`` (`"1 need re-login"`,
+    /// `"1 unmeasured"`), and this tally used to name them a second time —
+    /// the header line read `"1 of 2 ready · 1 need re-login · 1 ok · 1 need
+    /// re-login"`. Every other bucket appears in `capacitySummary` only as a
+    /// number folded into `readyCount`, never spelled out on its own, so it
+    /// keeps its place here.
     public var breakdown: [FleetTally] {
         let disabledCount = accounts.count - enabledCount
         var counts: [FleetTally.Kind: Int] = [:]
@@ -1300,7 +1315,7 @@ public struct Fleet: Equatable, Sendable {
         }
         counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .needsRelogin, .unmeasured, .disabled,
+            .ok, .near, .spent, .unknown, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }

@@ -530,7 +530,7 @@ final class QuotaFormatTests: XCTestCase {
         let reset = now.addingTimeInterval(45 * 60)
         XCTAssertEqual(
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
-            "resets in 45m"
+            "in 45m"
         )
     }
 
@@ -539,7 +539,7 @@ final class QuotaFormatTests: XCTestCase {
         let reset = now.addingTimeInterval((2 * 60 + 14) * 60)
         XCTAssertEqual(
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
-            "resets in 2h 14m"
+            "in 2h 14m"
         )
     }
 
@@ -548,7 +548,7 @@ final class QuotaFormatTests: XCTestCase {
         let reset = now.addingTimeInterval((4 * 24 * 60 + 12 * 60) * 60)
         XCTAssertEqual(
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
-            "resets in 4d 12h"
+            "in 4d 12h"
         )
     }
 }
@@ -766,13 +766,21 @@ final class FleetNeedsReloginTests: XCTestCase {
         XCTAssertEqual(fleet.needsReloginCount, 1)
     }
 
+    /// `needsReloginCount` is the bucket now — `breakdown` omits it because
+    /// `capacitySummary` already names it, and repeating it produced the
+    /// duplicated header `"1 of 2 ready · 1 need re-login · 1 ok · 1 need
+    /// re-login"`.
     func testBrokenAccountGetsItsOwnBreakdownBucket() {
         let fleet = Fleet(accounts: [
             account("alice@example.com", state: .ok),
             brokenAccount("dave@example.com"),
             brokenAccount("erin@example.com"),
         ])
-        XCTAssertEqual(fleet.breakdownLabel, "1 ok · 2 need re-login")
+        XCTAssertEqual(fleet.needsReloginCount, 2)
+        XCTAssertEqual(
+            fleet.breakdownLabel, "1 ok",
+            "capacitySummary already names the broken accounts — breakdown must not repeat them"
+        )
     }
 
     func testCapacitySummaryNamesTheBrokenAccounts() {
@@ -781,6 +789,27 @@ final class FleetNeedsReloginTests: XCTestCase {
             brokenAccount("dave@example.com"),
         ])
         XCTAssertEqual(fleet.capacitySummary, "1 of 2 ready · 1 need re-login")
+    }
+
+    /// The exact duplication a live fleet with a broken account produced:
+    /// `capacitySummary` names the re-login bucket, and `breakdown` used to
+    /// name it again, so the header — `capacitySummary` plus every
+    /// `breakdown` tally, joined by `" · "` (`FleetView.capacitySummary(_:)`)
+    /// — read `"1 of 2 ready · 1 need re-login · 1 ok · 1 need re-login"`.
+    /// Watch this fail first: reverting `breakdown`'s `order` to include
+    /// `.needsRelogin` reproduces the repeat.
+    func testHeaderLineDoesNotRepeatTheNeedsReloginFact() {
+        let fleet = Fleet(accounts: [
+            account("alice@example.com", state: .ok),
+            brokenAccount("dave@example.com"),
+        ])
+        let headerLine = ([fleet.capacitySummary] + fleet.breakdown.map(\.label))
+            .joined(separator: " · ")
+        XCTAssertEqual(headerLine, "1 of 2 ready · 1 need re-login · 1 ok")
+        XCTAssertEqual(
+            headerLine.components(separatedBy: "need re-login").count - 1, 1,
+            "\"need re-login\" must appear exactly once in the rendered header line"
+        )
     }
 
     /// The case that used to say "No confirmed capacity · 5 unmeasured" for a
@@ -980,22 +1009,34 @@ final class FleetProbedThenBrokenTests: XCTestCase {
         )
     }
 
+    /// The bucket is `needsReloginCount`, not `breakdown`: `breakdown` omits
+    /// `.needsRelogin` because `capacitySummary` already names it (see
+    /// `FleetNeedsReloginTests.testHeaderLineDoesNotRepeatTheNeedsReloginFact`).
+    /// What this test still pins is "not `.ok`" — dave must not land in the
+    /// bucket that reads him as ready-and-serving.
     func testProbedThenBrokenAccountGetsTheNeedsReloginBreakdownBucketNotOk() {
         let fleet = Fleet(accounts: [
             account("alice@example.com", state: .ok),
             probedThenBrokenAccount("dave@example.com"),
         ])
-        XCTAssertEqual(fleet.breakdownLabel, "1 ok · 1 need re-login")
+        XCTAssertEqual(fleet.needsReloginCount, 1)
+        XCTAssertEqual(fleet.breakdownLabel, "1 ok", "dave must not inflate the ok bucket")
     }
 
     /// Same class, different quota state: a spent-then-broken account must
     /// also land in `needsRelogin`, not `spent` — the bucket answers "why is
     /// this not ready", and the answer is the credential, not the quota.
+    /// `breakdownLabel` is empty here because the fleet's only account is the
+    /// broken one, and `.needsRelogin` is excluded from `breakdown` —
+    /// `capacitySummary` (asserted below) is where it is named.
     func testSpentThenBrokenAccountAlsoBucketsAsNeedsReloginNotSpent() {
         let fleet = Fleet(accounts: [
             probedThenBrokenAccount("dave@example.com", quota: 1.0, quotaState: .spent)
         ])
-        XCTAssertEqual(fleet.breakdownLabel, "1 need re-login")
+        XCTAssertEqual(fleet.needsReloginCount, 1)
+        XCTAssertFalse(fleet.breakdownLabel.contains("spent"), "must not bucket as spent")
+        XCTAssertEqual(fleet.breakdownLabel, "")
+        XCTAssertEqual(fleet.capacitySummary, "No capacity · 1 need re-login")
     }
 }
 
