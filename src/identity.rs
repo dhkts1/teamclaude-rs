@@ -37,7 +37,14 @@ pub fn org_key_of<'a>(org_uuid: Option<&'a str>, org_name: Option<&'a str>) -> O
 /// The account UUID of a record, when one is actually stored (an empty string is
 /// treated as absent, exactly as [`org_key`] treats an empty org).
 fn uuid_key(a: &Account) -> Option<&str> {
-    a.account_uuid.as_deref().filter(|s| !s.is_empty())
+    uuid_key_of(a.account_uuid.as_deref())
+}
+
+/// [`uuid_key`] over the field directly, for callers holding a runtime row
+/// rather than a config record — the same split, and for the same reason, as
+/// [`org_key`] and [`org_key_of`].
+pub fn uuid_key_of(account_uuid: Option<&str>) -> Option<&str> {
+    account_uuid.filter(|s| !s.is_empty())
 }
 
 /// Whether two account records refer to the same account+org.

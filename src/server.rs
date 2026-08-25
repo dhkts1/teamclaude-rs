@@ -34,13 +34,13 @@ use crate::{affinity, build_info, cli, mitm, singleton};
 /// pause and not a hang.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// The floor on what [`ServerHandle::shutdown_within`] gives the usage ledger to
-/// drain. The ledger flush runs LAST, so a shutdown that spent its whole grace
-/// on a wedged task would otherwise hand it zero and lose the queue by
-/// construction. Small enough to stay a pause: draining a few thousand queued
-/// lines onto a working disk is milliseconds, and a disk that cannot manage it
-/// in a quarter of a second is the stall this is bounded for.
-const MIN_LEDGER_SHUTDOWN: Duration = Duration::from_millis(250);
+// The floor on what `ShutdownHandle::shutdown_within` gives the usage ledger to
+// drain. The ledger flush runs LAST, so a shutdown that spent its whole grace on
+// a wedged task would otherwise hand it zero and lose the queue by construction.
+// Defined in `usage`, which owns the shutdown it bounds and floors the writer
+// join at the same value: two copies of "how long is a real attempt" is how the
+// two steps come to disagree.
+use crate::usage::MIN_LEDGER_SHUTDOWN;
 
 /// Where the MITM listener's TLS material comes from.
 ///
@@ -531,7 +531,7 @@ impl ServerHandle {
         let ledger_budget = deadline
             .saturating_duration_since(tokio::time::Instant::now())
             .max(MIN_LEDGER_SHUTDOWN);
-        let ledger = self.manager.shutdown_usage_ledger(ledger_budget);
+        let ledger = self.shutdown_ledger_within(ledger_budget).await;
         match ledger {
             crate::usage::LedgerShutdown::NotAttached => {}
             crate::usage::LedgerShutdown::Flushed => tracing::info!(
@@ -551,6 +551,47 @@ impl ServerHandle {
             tasks_aborted: self.tasks_aborted,
             affinity,
             ledger,
+        }
+    }
+
+    /// The ledger drain, on a BLOCKING thread and awaited with a timeout.
+    ///
+    /// `UsageTracker::shutdown_ledger` is synchronous through and through — a
+    /// retry loop around `try_send`, a `recv_timeout`, a writer-finish poll —
+    /// and it can occupy its whole budget. Called inline it would be a
+    /// multi-second stretch of an `async fn` with no await point in it, which
+    /// breaks both promises this function makes: a caller that wraps it in its
+    /// own `tokio::time::timeout` cannot interrupt it (cancellation only lands
+    /// at an await), and a Tokio worker is held off its other tasks for the
+    /// duration.
+    ///
+    /// So it runs on the blocking pool and this awaits it, bounded by the same
+    /// budget. Dropping the returned future — the caller's timeout firing —
+    /// stops the WAIT, not the drain: the blocking thread finishes the flush and
+    /// the join on its own, which is the right half to keep going, and the
+    /// process exits when it is done either way. A drain nobody is left to hear
+    /// about is reported as `Abandoned`, which is what a caller that stopped
+    /// waiting has to assume.
+    async fn shutdown_ledger_within(&self, budget: Duration) -> crate::usage::LedgerShutdown {
+        let manager = Arc::clone(&self.manager);
+        let drain = tokio::task::spawn_blocking(move || manager.shutdown_usage_ledger(budget));
+        // The drain's own worst case is the flush budget PLUS the writer join's
+        // floor, so bounding this at `budget` alone would cut off exactly the
+        // slow-but-alive writer the floor exists to let finish — and report a
+        // completed drain as abandoned.
+        let bound = budget + MIN_LEDGER_SHUTDOWN;
+        match tokio::time::timeout(bound, drain).await {
+            Ok(Ok(report)) => report,
+            // The blocking pool is gone, or the drain panicked: either way this
+            // process has no evidence the day file is complete.
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    error = %err,
+                    "the usage-ledger drain did not run to completion"
+                );
+                crate::usage::LedgerShutdown::Abandoned
+            }
+            Err(_) => crate::usage::LedgerShutdown::Abandoned,
         }
     }
 
@@ -1285,6 +1326,65 @@ mod tests {
             "the tasks stop well inside the grace, so none should need aborting: {report:?}"
         );
         drop(keepalive);
+    }
+
+    /// FINDING 2 (round 3). `shutdown_within` promises a caller that bounds it
+    /// with its own deadline and drops the future keeps a usable handle. The
+    /// usage-ledger drain is synchronous through and through — a `try_send`
+    /// retry loop, a `recv_timeout`, a writer-finish poll — and it can occupy
+    /// the whole remaining grace. Called inline it is a multi-second stretch of
+    /// an `async fn` with no await point in it, and cancellation only lands at
+    /// an await: the caller's timeout, which exists to turn a wedged shutdown
+    /// into a bounded quit, is silently inert, and a Tokio worker is held off
+    /// its other tasks for the duration.
+    ///
+    /// The ledger writer here is wedged for the whole test, so the drain will
+    /// take its full budget; the assertion is that the CALLER's much shorter
+    /// timeout is the one that decides.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_caller_can_interrupt_a_wedged_usage_ledger_drain() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-server-ledger-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (shutdown, _rx) = watch::channel(false);
+        let manager = inert_manager();
+        manager.attach_usage_ledger(dir.clone(), 90);
+        let wedge = manager.wedge_usage_writer_for_test();
+
+        let mut handle = handle_full(
+            shutdown,
+            tokio::spawn(std::future::ready(())),
+            Vec::new(),
+            Arc::clone(&manager),
+            None,
+        );
+
+        let started = std::time::Instant::now();
+        let interrupted = tokio::time::timeout(
+            Duration::from_millis(150),
+            handle.shutdown_within(Duration::from_secs(5)),
+        )
+        .await;
+        let waited = started.elapsed();
+
+        assert!(
+            interrupted.is_err(),
+            "the caller's 150ms timeout must be what ends this wait, not the ledger's \
+             5s budget"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "a blocking drain inside the async fn cannot be cancelled at all: waited \
+             {waited:?}"
+        );
+
+        // The drain is still running on the blocking pool, which is the point:
+        // freeing the writer lets it finish on its own.
+        drop(wedge);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A FAILED final pin write must be distinguishable from affinity being off.

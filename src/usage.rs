@@ -67,17 +67,40 @@
 //! today's totals will survive a restart, and it must say so at 10:00 rather
 //! than at the next boot.
 //!
+//! # Who owns the health flags
+//!
+//! Two flags, and neither is written from both sides. `healthy` is the WRITER's,
+//! set from write results and from nowhere else. `dropping` is the queue's to
+//! RAISE — it is the only side that sees a line lost to a full queue — and the
+//! writer's to LOWER, once it has proof the pressure eased (a completed write
+//! with no new drop behind it). One warning when an episode starts, one line
+//! when it ends.
+//!
+//! The alternative — letting the queue clear `healthy` and the writer set it —
+//! is a flap, not a report: under sustained saturation every completed write
+//! frees exactly one slot, the next request refills it and the one after is
+//! dropped, so the pair flips on every write. That is a log line per served
+//! request and a `persisting` that alternates between two reads instead of
+//! reading false for as long as the incident lasts.
+//!
 //! # Shutdown
 //!
 //! The queue is the whole reason a shutdown has work to do: lines sitting in it
 //! are counted, priced and visible in `tcr status`, and until the writer takes
 //! them they are not on disk. [`UsageTracker::shutdown_ledger`] therefore
-//! flushes the queue and JOINS the writer, both inside the caller's budget, so
-//! the day file is complete and closed before the process exits —
-//! `ServerHandle::shutdown_within` calls it after the affinity pins.
-//! A writer that does not drain inside that budget is abandoned rather than
-//! waited on, and the result says which happened: a `tcr` that quits into a
-//! stalled volume must still quit.
+//! flushes the queue and JOINS the writer, so the day file is complete and
+//! closed before the process exits — `ServerHandle::shutdown_within` calls it
+//! after the affinity pins.
+//!
+//! The two steps get SEPARATE budgets. Sharing one deadline meant a flush that
+//! spent it — which is precisely what a stalled volume produces — handed the
+//! join zero milliseconds and abandoned a writer that had not been asked to stop
+//! yet: the channel closes only when the flush returns and the handle drops, so
+//! the join is the first moment the writer can finish at all. It now always gets
+//! at least [`MIN_LEDGER_SHUTDOWN`] of its own after that, and a writer that
+//! does not drain inside it is abandoned rather than waited on: a `tcr` that
+//! quits into a stalled volume must still quit. The result says which happened,
+//! and it never says `Abandoned` about a writer that finished.
 //!
 //! File names are UTC dates; "today" is a LOCAL day computed from the record
 //! timestamps inside the files. The two deliberately need not agree — the file
@@ -110,6 +133,22 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// traffic — enough to ride out a slow `write`, small enough that a writer stuck
 /// for good costs bounded memory.
 const LEDGER_QUEUE_DEPTH: usize = 4096;
+
+/// The floor on what the writer JOIN gets in [`UsageTracker::shutdown_ledger`],
+/// measured from the moment the channel closes.
+///
+/// The join cannot start earlier than that: the writer ends when the last sender
+/// drops, and the last sender is the handle the flush is still using. So a
+/// budget shared with the flush is a budget the join can be handed empty, which
+/// is the guaranteed loss this floor exists to remove. Small enough to stay a
+/// pause — draining a few thousand queued lines onto a working disk is
+/// milliseconds, and a disk that cannot manage it in a quarter of a second is
+/// the stall the bound exists for.
+///
+/// Lives here rather than in `server.rs` because it bounds a step of the
+/// shutdown this module owns; `ServerHandle::shutdown_within` uses the same
+/// constant as the floor on the whole ledger budget.
+pub const MIN_LEDGER_SHUTDOWN: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Latched the first time a caller's `quota_input` came in below its own cache
 /// components, so the warning is one line per boot rather than one per request.
@@ -378,13 +417,31 @@ struct LedgerLine {
     /// name rather than by position, so reordering or removing an account in
     /// the config cannot silently reattribute yesterday's traffic.
     a: String,
+    /// The serving account's `account_uuid` — the STABLE half of its identity,
+    /// and the first thing [`resolve_account`] tries.
+    ///
+    /// The name and the org key both move under a live account: a re-login
+    /// backfills a missing `org_uuid` (`Manager::add_or_update_account`), which
+    /// changes what [`crate::identity::org_key`] returns from the org NAME to
+    /// the org UUID from that moment on. Keyed on the org alone, the lines
+    /// written before that edit match nothing afterwards and a whole morning
+    /// replays as `unresolved` — a measured-looking zero, which is the one
+    /// failure this module exists to prevent. The account UUID does not move.
+    ///
+    /// Absent for an API-key account and for every line written before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    u: Option<String>,
     /// The serving account's org discriminator ([`crate::identity::org_key`]),
     /// because a NAME is not an identity here: the same email legitimately
     /// appears twice in one fleet, once per org (`identity.rs`), and replaying
     /// both onto whichever index came first doubles one account's day and
-    /// zeroes the other's. Absent when the account carries no org at all, which
-    /// is every config written before org identity existed — such a line still
-    /// resolves by name, but only while that name is unique.
+    /// zeroes the other's. It is also what tells two orgs of the same PERSON
+    /// apart, which is the one case `u` cannot decide alone.
+    ///
+    /// Absent when the account carries no org at all, which is every config
+    /// written before org identity existed — such a line still resolves by
+    /// name, but only while that name is unique.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     g: Option<String>,
     #[serde(default)]
@@ -409,31 +466,40 @@ enum LedgerMsg {
 /// The write half of the ledger, as seen from the request path. Holds no file
 /// and performs no I/O — it only queues.
 ///
-/// `Clone`, so a caller that needs to SEND can lift the sender out from under
-/// [`UsageTracker::ledger`]'s mutex and let go of it first: the request path
-/// takes that same mutex in [`UsageTracker::record`], and a send that waits
-/// while holding it is the fleet-wide stall this module exists to remove.
-#[derive(Debug, Clone)]
+/// Deliberately NOT `Clone`. [`UsageTracker::shutdown_ledger`]'s correctness
+/// rests on its `drop(handle)` being the last sender: that is what closes the
+/// channel, ends the writer, and makes the join it then waits on able to finish
+/// at all. A second live handle anywhere — a flush on another thread, a future
+/// health endpoint — silently turns that drop into a no-op and the shutdown
+/// spends its whole budget waiting for a writer nobody asked to stop. A caller
+/// that only needs to SEND clones the `SyncSender` instead ([`Self::flush_via`])
+/// and lets go of it before it waits, which keeps both properties: the ledger
+/// mutex is not held across a send, and no sender outlives the call.
+#[derive(Debug)]
 struct LedgerHandle {
     tx: SyncSender<LedgerMsg>,
     /// Lines the queue had no room for. Shared with the writer, which reports
     /// the running count on every health transition.
     dropped: Arc<AtomicU64>,
-    /// The same flag [`Ledger`] sets from write results and
-    /// [`UsageTracker::is_persisting`] reads. Cleared here too: a line the queue
-    /// had no room for is a line that will not survive a restart, exactly like
-    /// one whose write failed, and the writer never sees it to say so.
-    healthy: Arc<AtomicBool>,
+    /// Raised here and lowered only by the writer — see the module docs on flag
+    /// ownership. A line the queue had no room for is a line that will not
+    /// survive a restart, exactly like one whose write failed, and the writer
+    /// never sees it to say so.
+    dropping: Arc<AtomicBool>,
 }
 
 impl LedgerHandle {
     /// Queue one line, or count it as dropped. NEVER blocks: a writer stuck on
     /// a stalled volume must cost accounting, not latency.
     ///
-    /// A drop is a health TRANSITION, not just a counter bump. `Full` means the
-    /// writer is not keeping up and `Disconnected` means it is gone; in both,
-    /// this line is lost and so is every one behind it until the queue moves
-    /// again, so `is_persisting()` must stop saying today's totals will survive.
+    /// A drop RAISES `dropping`, which is this side's only flag write: `Full`
+    /// means the writer is not keeping up and `Disconnected` means it is gone;
+    /// in both, this line is lost and so is every one behind it until the queue
+    /// moves again, so `is_persisting()` must stop saying today's totals will
+    /// survive. The warning is on the flag's false→true edge, so an episode
+    /// costs one line however many requests it eats — and the flag stays raised
+    /// until the WRITER lowers it, which is what stops the report flapping once
+    /// per completed write under sustained saturation.
     fn queue(&self, line: LedgerLine) {
         let Err(err) = self.tx.try_send(LedgerMsg::Line(Box::new(line))) else {
             return;
@@ -443,7 +509,7 @@ impl LedgerHandle {
             std::sync::mpsc::TrySendError::Full(_) => "the writer's queue is full",
             std::sync::mpsc::TrySendError::Disconnected(_) => "the writer thread has ended",
         };
-        if self.healthy.swap(false, Ordering::Relaxed) {
+        if !self.dropping.swap(true, Ordering::Relaxed) {
             tracing::warn!(
                 reason,
                 dropped_lines = dropped,
@@ -459,11 +525,15 @@ impl LedgerHandle {
     /// stalled disk cannot hold anything else up. An unbounded `send` here would
     /// block forever on precisely the full queue a stall produces, which is the
     /// one case the bound exists for.
-    fn flush_within(&self, deadline: std::time::Instant) -> bool {
+    ///
+    /// Takes the sender BY VALUE and drops it before waiting on the ack, so a
+    /// flush overlapping a shutdown cannot be the sender that keeps the writer's
+    /// channel open — see [`LedgerHandle`]'s own docs.
+    fn flush_via(tx: SyncSender<LedgerMsg>, deadline: std::time::Instant) -> bool {
         let (ack_tx, ack_rx) = sync_channel::<()>(0);
         let mut msg = LedgerMsg::Flush(ack_tx);
         loop {
-            match self.tx.try_send(msg) {
+            match tx.try_send(msg) {
                 Ok(()) => break,
                 Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return false,
                 Err(std::sync::mpsc::TrySendError::Full(back)) => {
@@ -475,8 +545,15 @@ impl LedgerHandle {
                 }
             }
         }
+        drop(tx);
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         ack_rx.recv_timeout(left).is_ok()
+    }
+
+    /// [`Self::flush_via`] on a borrowed handle, for the one caller that still
+    /// holds the handle itself.
+    fn flush_within(&self, deadline: std::time::Instant) -> bool {
+        Self::flush_via(self.tx.clone(), deadline)
     }
 }
 
@@ -505,9 +582,19 @@ struct Ledger {
     /// Cleared while writes are failing and set again when one succeeds. Read
     /// by [`UsageTracker::is_persisting`], so an operator asking "will today's
     /// totals survive a restart" gets the truth rather than the answer that was
-    /// true at boot.
+    /// true at boot. This thread is its ONLY writer.
     healthy: Arc<AtomicBool>,
+    /// Raised by [`LedgerHandle::queue`] when a line is lost to a full queue,
+    /// and lowered HERE, by [`Self::note_drop_episode`], once a completed write
+    /// has proof the pressure eased.
+    dropping: Arc<AtomicBool>,
     dropped: Arc<AtomicU64>,
+    /// The drop count as of this thread's previous completed write. An episode
+    /// has ended when a write completes and this has not moved: every drop
+    /// means a full queue, a full queue means lines waiting, and lines waiting
+    /// mean another write — so a write with nothing new behind it is the
+    /// pressure being over, not a lull inside it.
+    drops_seen: u64,
 }
 
 impl Ledger {
@@ -519,7 +606,7 @@ impl Ledger {
             // log flood. A transition is the one event that is both bounded and
             // never absent.
             Err(err) => {
-                if self.healthy.swap(false, Ordering::Relaxed) {
+                if self.set_healthy(false) {
                     tracing::warn!(
                         dir = %self.dir.display(),
                         error = %err,
@@ -530,15 +617,54 @@ impl Ledger {
                 }
             }
             Ok(()) => {
-                if !self.healthy.swap(true, Ordering::Relaxed) {
+                if self.set_healthy(true) {
                     tracing::info!(
                         dir = %self.dir.display(),
                         dropped_lines = self.dropped.load(Ordering::Relaxed),
                         "the usage ledger is writing again; the lines it missed are gone"
                     );
                 }
+                self.note_drop_episode();
             }
         }
+    }
+
+    /// Move `healthy` to `to`, answering whether that was a TRANSITION. One
+    /// helper rather than a `swap` open-coded at each arm, so "which direction
+    /// is worth a line" is decided in one place and cannot drift between the
+    /// two.
+    fn set_healthy(&self, to: bool) -> bool {
+        self.healthy.swap(to, Ordering::Relaxed) != to
+    }
+
+    /// Close out a full-queue episode, if this write ended one.
+    ///
+    /// Called only after a SUCCESSFUL write, and only this thread ever lowers
+    /// the flag — the queue side would lower it on the very next completed
+    /// write and re-raise it on the request after that, which is a flap rather
+    /// than a report. The re-read after the clear closes the one race that is
+    /// left: a line dropped while this was deciding leaves the counter moved,
+    /// and the flag goes straight back up.
+    fn note_drop_episode(&mut self) {
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped != self.drops_seen {
+            // Still inside the episode: lines are being lost faster than this
+            // thread is clearing them. Say nothing and stay unhealthy.
+            self.drops_seen = dropped;
+            return;
+        }
+        if !self.dropping.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        if self.dropped.load(Ordering::Relaxed) != dropped {
+            self.dropping.store(true, Ordering::Relaxed);
+            return;
+        }
+        tracing::info!(
+            dir = %self.dir.display(),
+            dropped_lines = dropped,
+            "the usage ledger caught up; the lines it dropped while its queue was full are gone"
+        );
     }
 
     fn try_append(&mut self, line: &LedgerLine) -> std::io::Result<()> {
@@ -643,14 +769,22 @@ pub struct ReplayReport {
 }
 
 /// A live account as the ledger knows it: the display name it is recorded
-/// under, plus the org discriminator that makes that name an identity. Built
-/// from the rotation by `Manager::attach_usage_ledger`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// under, plus the identity fields that make that name resolvable. Built from
+/// the rotation by `Manager::attach_usage_ledger`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LedgerAccount {
     pub name: String,
+    /// `account_uuid`, when this account has one — the half of the identity
+    /// that does not move under a rename or an org backfill.
+    pub uuid: Option<String>,
     /// [`crate::identity::org_key`] for this account: org UUID, else org name,
     /// else `None`.
     pub org: Option<String>,
+    /// The org NAME, kept alongside the key because a line written before this
+    /// account's `org_uuid` was backfilled carries the name where a line
+    /// written after carries the uuid — and both name the same org. `None` when
+    /// the account has no org name, and equal to `org` when it has no org uuid.
+    pub org_name: Option<String>,
 }
 
 /// Per-account usage buckets, the pricing table, and the ledger.
@@ -670,10 +804,13 @@ pub struct UsageTracker {
     writer: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// Whether a ledger is attached at all, readable without taking the lock.
     attached: AtomicBool,
-    /// Whether the writer's last write SUCCEEDED. Owned here rather than by the
+    /// Whether the writer's last write SUCCEEDED. Held here rather than by the
     /// writer thread so `is_persisting` can read it without a lock, and so it
-    /// outlives a writer that ends.
+    /// outlives a writer that ends; the writer thread is still its only WRITER.
     healthy: Arc<AtomicBool>,
+    /// Whether lines are currently being lost to a full queue — see the module
+    /// docs on flag ownership.
+    dropping: Arc<AtomicBool>,
     /// Lines the queue had no room for, over the life of the process.
     dropped: Arc<AtomicU64>,
 }
@@ -689,6 +826,7 @@ impl UsageTracker {
             writer: Mutex::new(None),
             attached: AtomicBool::new(false),
             healthy: Arc::new(AtomicBool::new(true)),
+            dropping: Arc::new(AtomicBool::new(false)),
             dropped: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -702,7 +840,9 @@ impl UsageTracker {
     /// exactly the same way as one that was never there, because the answer to
     /// "will today's totals survive" is no in every one of them.
     pub fn is_persisting(&self) -> bool {
-        self.attached.load(Ordering::Relaxed) && self.healthy.load(Ordering::Relaxed)
+        self.attached.load(Ordering::Relaxed)
+            && self.healthy.load(Ordering::Relaxed)
+            && !self.dropping.load(Ordering::Relaxed)
     }
 
     /// Whether a ledger is attached at all — i.e. whether a caller's per-request
@@ -731,60 +871,111 @@ impl UsageTracker {
 
     /// [`Self::flush_ledger`] with the bound spelled out.
     ///
-    /// The sender is CLONED out from under the ledger mutex and the guard
-    /// dropped before anything is sent. Holding it across the send would put
-    /// every concurrent [`Self::record`] behind this call — and the case where
-    /// this call waits is the stalled writer, which is exactly the case where
-    /// the request path must not wait for anything.
+    /// The SENDER — not the handle — is cloned out from under the ledger mutex
+    /// and the guard dropped before anything is sent. Holding the guard across
+    /// the send would put every concurrent [`Self::record`] behind this call,
+    /// and the case where this call waits is the stalled writer, which is
+    /// exactly the case where the request path must not wait for anything.
+    /// Cloning the HANDLE instead would leave a second sender alive for the
+    /// length of the flush, which is what [`Self::shutdown_ledger`]'s drop must
+    /// be the last of.
     pub fn flush_ledger_within(&self, budget: std::time::Duration) -> bool {
-        let handle = self.ledger.lock().expect("ledger lock poisoned").clone();
+        let tx = self
+            .ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .as_ref()
+            .map(|handle| handle.tx.clone());
         let deadline = std::time::Instant::now() + budget;
-        handle.is_some_and(|handle| handle.flush_within(deadline))
+        tx.is_some_and(|tx| LedgerHandle::flush_via(tx, deadline))
     }
 
-    /// Flush the queue and JOIN the writer, both inside `budget`, so the day
-    /// file holds every line this process queued and is closed before it exits.
+    /// Flush the queue and JOIN the writer, so the day file holds every line
+    /// this process queued and is closed before it exits.
     ///
     /// Detaches the ledger first, so a request that lands mid-shutdown is
     /// counted in memory and neither queued nor waited on, and
     /// [`Self::is_persisting`] answers false from that instant.
     ///
-    /// A writer that has not drained when the budget runs out is ABANDONED, not
-    /// waited on: `tcr` quits into a stalled volume every bit as often as into a
-    /// healthy one, and a shutdown that hangs is worse than a ledger that loses
-    /// its tail — which the returned [`LedgerShutdown`] says out loud.
+    /// `budget` bounds the FLUSH. The join is bounded separately, by whatever is
+    /// left of `budget` but never by less than [`MIN_LEDGER_SHUTDOWN`], because
+    /// the join is the first moment the writer can end at all: the channel
+    /// closes when the handle below drops, which happens after the flush has
+    /// returned. Sharing one deadline handed the join zero milliseconds every
+    /// time the flush spent the budget — a stalled volume, the case all of this
+    /// is for — and abandoned a writer that had never been asked to stop.
+    ///
+    /// A writer that has not drained when the join budget runs out is ABANDONED,
+    /// not waited on: `tcr` quits into a stalled volume every bit as often as
+    /// into a healthy one, and a shutdown that hangs is worse than a ledger that
+    /// loses its tail — which the returned [`LedgerShutdown`] says out loud. It
+    /// never says it about a writer that finished: a writer ends only after it
+    /// has taken every message queued before the channel closed, which is the
+    /// same fact a flush acknowledgement reports and strictly more of it.
     pub fn shutdown_ledger(&self, budget: std::time::Duration) -> LedgerShutdown {
-        let deadline = std::time::Instant::now() + budget;
+        let flush_deadline = std::time::Instant::now() + budget;
         self.attached.store(false, Ordering::Relaxed);
         let Some(handle) = self.ledger.lock().expect("ledger lock poisoned").take() else {
             return LedgerShutdown::NotAttached;
         };
-        let flushed = handle.flush_within(deadline);
+        let flushed = handle.flush_within(flush_deadline);
         // The writer ends when the last sender goes, so this drop is what asks
         // it to stop — after the flush, never before.
         drop(handle);
-        let Some(writer) = self.writer.lock().expect("writer lock poisoned").take() else {
-            return if flushed {
-                LedgerShutdown::Flushed
-            } else {
-                LedgerShutdown::Abandoned
-            };
-        };
-        while !writer.is_finished() {
-            if std::time::Instant::now() >= deadline {
-                return LedgerShutdown::Abandoned;
+        let join_deadline = flush_deadline.max(std::time::Instant::now() + MIN_LEDGER_SHUTDOWN);
+        // One mapping, at one exit: a second copy of "which bool means which
+        // outcome" is how a shutdown report comes to disagree with itself
+        // depending on the path it took.
+        let drained = match self.writer.lock().expect("writer lock poisoned").take() {
+            // No writer thread to join (it never started, or a previous
+            // shutdown already took it), so the flush is all the evidence there
+            // is.
+            None => flushed,
+            Some(writer) => {
+                while !writer.is_finished() {
+                    if std::time::Instant::now() >= join_deadline {
+                        return LedgerShutdown::Abandoned;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                if writer.join().is_err() {
+                    tracing::warn!(
+                        "the usage-ledger writer thread panicked; its last lines are gone"
+                    );
+                    return LedgerShutdown::Abandoned;
+                }
+                true
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
-        if writer.join().is_err() {
-            tracing::warn!("the usage-ledger writer thread panicked; its last lines are gone");
-            return LedgerShutdown::Abandoned;
-        }
-        if flushed {
+        };
+        if drained {
             LedgerShutdown::Flushed
         } else {
             LedgerShutdown::Abandoned
         }
+    }
+
+    /// Wedge the writer thread: hand it a flush it cannot answer, and return the
+    /// receiver that holds it there. Dropping the receiver frees it — a
+    /// rendezvous `send` fails the moment its receiver goes.
+    ///
+    /// Test-only, and the one way to build the stalled-volume case without a
+    /// stalled volume. `pub(crate)` because the shutdown it stalls is
+    /// `ServerHandle::shutdown_within`'s, which lives in another module.
+    #[cfg(test)]
+    pub(crate) fn wedge_writer_for_test(&self) -> Receiver<()> {
+        let (ack_tx, ack_rx) = sync_channel::<()>(0);
+        self.ledger
+            .lock()
+            .expect("ledger lock poisoned")
+            .as_ref()
+            .expect("a ledger is attached")
+            .tx
+            .send(LedgerMsg::Flush(ack_tx))
+            .expect("the writer is alive");
+        // No wait is needed for the wedge to bite: the channel is FIFO, so
+        // everything queued after this marker stays queued until the writer gets
+        // past it, whether or not it has reached it yet.
+        ack_rx
     }
 
     /// Price one record and fold it into the ring and the day accumulator.
@@ -869,21 +1060,24 @@ impl UsageTracker {
     /// full queue drops it and counts the drop rather than making a client wait
     /// on a disk.
     ///
-    /// `account_org` is the serving account's org discriminator
-    /// ([`crate::identity::org_key`]) and is what makes the line resolvable
-    /// back to THIS account on replay when the fleet holds the same email in
-    /// two orgs.
+    /// `account_uuid` and `account_org` are the serving account's identity
+    /// ([`crate::identity`]), and they are what make the line resolvable back to
+    /// THIS account on replay: the uuid survives a rename and an org backfill,
+    /// and the org tells two orgs of the same person apart. A name alone does
+    /// neither.
     pub fn record(
         &self,
         idx: usize,
         record: &UsageRecord,
         account_name: &str,
+        account_uuid: Option<&str>,
         account_org: Option<&str>,
     ) {
         if self.attached.load(Ordering::Relaxed) {
             let line = LedgerLine {
                 t: record.ts_ms,
                 a: account_name.to_string(),
+                u: account_uuid.map(str::to_string),
                 g: account_org.map(str::to_string),
                 m: record.model.clone(),
                 s: record.session,
@@ -933,9 +1127,12 @@ impl UsageTracker {
             dir,
             open: None,
             healthy: Arc::clone(&self.healthy),
+            dropping: Arc::clone(&self.dropping),
             dropped: Arc::clone(&self.dropped),
+            drops_seen: self.dropped.load(Ordering::Relaxed),
         };
         self.healthy.store(true, Ordering::Relaxed);
+        self.dropping.store(false, Ordering::Relaxed);
         match std::thread::Builder::new()
             .name("tcr-usage-ledger".to_string())
             .spawn(move || ledger_writer(rx, ledger))
@@ -947,7 +1144,7 @@ impl UsageTracker {
                 *self.ledger.lock().expect("ledger lock poisoned") = Some(LedgerHandle {
                     tx,
                     dropped: Arc::clone(&self.dropped),
-                    healthy: Arc::clone(&self.healthy),
+                    dropping: Arc::clone(&self.dropping),
                 });
                 self.attached.store(true, Ordering::Relaxed);
             }
@@ -1051,34 +1248,80 @@ impl UsageTracker {
     }
 }
 
-/// Resolve one ledger line to a live account index.
+/// Resolve one ledger line to a live account index — the account that WROTE it,
+/// or nobody. Never a neighbour: every step below insists on a unique match, and
+/// an ambiguous or absent one is [`ReplayReport::unresolved`], counted and said
+/// out loud at boot.
 ///
-/// A line that CARRIES an org resolves by (name, org) or not at all — that pair
-/// is the account's identity (`identity.rs`), and the whole reason the line
-/// carries an org. Falling back to the name when the org matched nothing undoes
-/// the fix: with `alice@example.com` in org-a and org-b, removing the org-b
-/// account leaves its whole day matching org-a's name uniquely, and it replays
-/// onto org-a — inflating an account's `costUsd` with traffic it never served,
-/// under a boot log reporting a clean `unresolved=0`. Unresolved and counted is
-/// the honest answer; the org this line names is not in this fleet.
+/// Three keys, strongest first.
 ///
-/// A line with NO org — every line written before org identity existed —
-/// resolves by name alone, and ONLY when exactly one live account wears that
-/// name: with two, a name match is a coin flip, and a coin flip that lands wrong
-/// doubles one account's day and zeroes the other's.
+/// 1. **The account UUID** (`u`), when the line carries one. It is the only part
+///    of the identity that survives the routine edits: a re-login backfills a
+///    missing `org_uuid` (`Manager::add_or_update_account`), and from that
+///    moment [`crate::identity::org_key`] returns the uuid where it used to
+///    return the org NAME — so a line keyed on the org alone stops matching its
+///    own account half way through the day, and the morning replays as a zero
+///    that reads as measured. A uuid that matches NOTHING is unresolved even
+///    when the name is unique: a removed account's uuid stays gone, and the
+///    survivor wearing its name did not serve that traffic. A uuid is never the
+///    whole answer for a line that also carries an org, because one person in
+///    several orgs is several accounts (`identity.rs`): the org must agree too,
+///    or removing one of them would replay its day onto its sibling — the same
+///    misattribution the org key was added to prevent, one key up.
+/// 2. **(name, org)**, for a line with no uuid: an API-key account, or one
+///    written before this field existed.
+/// 3. **The name alone**, and only for a line carrying neither key, and only
+///    while exactly one live account wears that name. With two, a name match is
+///    a coin flip, and a coin flip that lands wrong doubles one account's day
+///    and zeroes the other's.
+///
+/// A line's org is matched against the account's org KEY *or* its org NAME,
+/// because those are the same org written two ways — the uuid after a backfill,
+/// the name before it — and a fleet where two different orgs answer to one of
+/// those strings is ambiguous rather than resolvable, which the uniqueness check
+/// already handles.
 fn resolve_account(accounts: &[LedgerAccount], line: &LedgerLine) -> Option<usize> {
-    if let Some(org) = line.g.as_deref() {
-        return accounts
+    if let Some(uuid) = line.u.as_deref() {
+        let same_person = accounts
             .iter()
-            .position(|a| a.name == line.a && a.org.as_deref() == Some(org));
+            .enumerate()
+            .filter(|(_, a)| a.uuid.as_deref() == Some(uuid));
+        return match line.g.as_deref() {
+            Some(org) => only(same_person.filter(|(_, a)| names_org(a, Some(org)))),
+            None => only(same_person),
+        };
     }
-    let mut by_name = accounts
-        .iter()
-        .enumerate()
-        .filter(|(_, a)| a.name == line.a)
-        .map(|(idx, _)| idx);
-    match (by_name.next(), by_name.next()) {
-        (Some(only), None) => Some(only),
+    if line.g.is_some() {
+        return only(
+            accounts
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.name == line.a && names_org(a, line.g.as_deref())),
+        );
+    }
+    only(
+        accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.name == line.a),
+    )
+}
+
+/// Whether `org` names THIS account's organization — as its key (uuid, else
+/// name) or as its name, which is the same org written the way it was written
+/// before the uuid was known.
+fn names_org(account: &LedgerAccount, org: Option<&str>) -> bool {
+    org.is_some_and(|org| {
+        account.org.as_deref() == Some(org) || account.org_name.as_deref() == Some(org)
+    })
+}
+
+/// The index of the ONE candidate, or `None` for none and for several. Every
+/// resolution step in this module ends this way, so "ambiguous is unresolved"
+/// is stated once rather than re-derived per key.
+fn only<'a, I: Iterator<Item = (usize, &'a LedgerAccount)>>(mut candidates: I) -> Option<usize> {
+    match (candidates.next(), candidates.next()) {
+        (Some((idx, _)), None) => Some(idx),
         _ => None,
     }
 }
@@ -1154,7 +1397,7 @@ mod tests {
     fn named(name: &str) -> LedgerAccount {
         LedgerAccount {
             name: name.to_string(),
-            org: None,
+            ..LedgerAccount::default()
         }
     }
 
@@ -1313,12 +1556,14 @@ mod tests {
                 ),
                 &names[0].name,
                 None,
+                None,
             );
         }
         writer.record(
             1,
             &record(now, "claude-haiku-4-5-20251001", 10),
             &names[1].name,
+            None,
             None,
         );
         // The write is off the request path now, so the file is complete only
@@ -1364,6 +1609,7 @@ mod tests {
             &record(now, "claude-opus-5", 5),
             "gone@example.com",
             None,
+            None,
         );
         assert!(writer.flush_ledger());
 
@@ -1387,10 +1633,12 @@ mod tests {
             LedgerAccount {
                 name: "alice@example.com".to_string(),
                 org: Some("org-a".to_string()),
+                ..LedgerAccount::default()
             },
             LedgerAccount {
                 name: "alice@example.com".to_string(),
                 org: Some("org-b".to_string()),
+                ..LedgerAccount::default()
             },
         ];
 
@@ -1400,6 +1648,7 @@ mod tests {
             0,
             &record(now, "claude-opus-5", 1_000),
             "alice@example.com",
+            None,
             Some("org-a"),
         );
         for _ in 0..3 {
@@ -1407,6 +1656,7 @@ mod tests {
                 1,
                 &record(now, "claude-opus-5", 7),
                 "alice@example.com",
+                None,
                 Some("org-b"),
             );
         }
@@ -1475,6 +1725,7 @@ mod tests {
             &record(now, "claude-opus-5", 5),
             "alice@example.com",
             None,
+            None,
         );
         assert!(tracker.flush_ledger(), "the writer is alive, just failing");
         assert!(
@@ -1533,6 +1784,7 @@ mod tests {
                         &record(now, "claude-opus-5", 1),
                         "alice@example.com",
                         None,
+                        None,
                     );
                 }
                 finished.store(true, Ordering::SeqCst);
@@ -1567,20 +1819,7 @@ mod tests {
     /// it — `SyncSender::send` on a rendezvous channel fails the moment its
     /// receiver goes.
     fn wedge(tracker: &UsageTracker) -> Receiver<()> {
-        let (ack_tx, ack_rx) = sync_channel::<()>(0);
-        tracker
-            .ledger
-            .lock()
-            .expect("ledger lock poisoned")
-            .as_ref()
-            .expect("a ledger is attached")
-            .tx
-            .send(LedgerMsg::Flush(ack_tx))
-            .expect("the writer is alive");
-        // No wait is needed for the wedge to bite: the channel is FIFO, so
-        // everything queued after this marker stays queued until the writer
-        // gets past it, whether or not it has reached it yet.
-        ack_rx
+        tracker.wedge_writer_for_test()
     }
 
     fn lines_in(dir: &Path, now: i64) -> usize {
@@ -1613,6 +1852,7 @@ mod tests {
                 0,
                 &record(now, "claude-opus-5", 5),
                 "alice@example.com",
+                None,
                 None,
             );
         }
@@ -1667,6 +1907,7 @@ mod tests {
                 &record(now, "claude-opus-5", 1),
                 "alice@example.com",
                 None,
+                None,
             );
         }
         assert!(
@@ -1684,6 +1925,7 @@ mod tests {
             0,
             &record(now, "claude-opus-5", 1),
             "alice@example.com",
+            None,
             None,
         );
         assert!(tracker.flush_ledger());
@@ -1713,6 +1955,7 @@ mod tests {
                 &record(now, "claude-opus-5", 1),
                 "alice@example.com",
                 None,
+                None,
             );
         }
 
@@ -1730,6 +1973,7 @@ mod tests {
                         0,
                         &record(now, "claude-opus-5", 1),
                         "alice@example.com",
+                        None,
                         None,
                     );
                     served.fetch_add(1, Ordering::SeqCst);
@@ -1785,10 +2029,12 @@ mod tests {
             LedgerAccount {
                 name: "alice@example.com".to_string(),
                 org: Some("org-a".to_string()),
+                ..LedgerAccount::default()
             },
             LedgerAccount {
                 name: "alice@example.com".to_string(),
                 org: Some("org-b".to_string()),
+                ..LedgerAccount::default()
             },
         ];
 
@@ -1798,6 +2044,7 @@ mod tests {
             0,
             &record(now, "claude-opus-5", 11),
             "alice@example.com",
+            None,
             Some("org-a"),
         );
         for _ in 0..3 {
@@ -1805,6 +2052,7 @@ mod tests {
                 1,
                 &record(now, "claude-opus-5", 22),
                 "alice@example.com",
+                None,
                 Some("org-b"),
             );
         }
@@ -1814,6 +2062,7 @@ mod tests {
         let survivor = vec![LedgerAccount {
             name: "alice@example.com".to_string(),
             org: Some("org-a".to_string()),
+            ..LedgerAccount::default()
         }];
         let replayed = tracker();
         let report = replayed.attach_ledger(dir.clone(), 90, &survivor, now);
@@ -1839,6 +2088,7 @@ mod tests {
             &record(now, "claude-opus-5", 7),
             "alice@example.com",
             None,
+            None,
         );
         assert!(old.flush_ledger());
         let replayed = tracker();
@@ -1851,6 +2101,399 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// An account with the full identity, written the way
+    /// `Manager::attach_usage_ledger` writes it.
+    fn identified(name: &str, uuid: &str, org_uuid: Option<&str>, org_name: &str) -> LedgerAccount {
+        LedgerAccount {
+            name: name.to_string(),
+            uuid: Some(uuid.to_string()),
+            // `org_key`: the uuid when there is one, else the name.
+            org: Some(org_uuid.unwrap_or(org_name).to_string()),
+            org_name: Some(org_name.to_string()),
+        }
+    }
+
+    /// Record one line under `account`'s own identity, as the manager does.
+    fn record_as(tracker: &UsageTracker, idx: usize, account: &LedgerAccount, input: u64) {
+        let now = crate::now_ms();
+        tracker.record(
+            idx,
+            &record(now, "claude-opus-5", input),
+            &account.name,
+            account.uuid.as_deref(),
+            account.org.as_deref(),
+        );
+    }
+
+    /// FINDING 1 (round 3). A re-login BACKFILLS a missing `org_uuid`
+    /// (`Manager::add_or_update_account`), so `org_key` stops returning the org
+    /// NAME and starts returning the uuid — half way through a day, on a routine
+    /// credential refresh nobody thinks of as an identity edit. Keyed on the org
+    /// alone, every line written before that moment matched nothing at the next
+    /// restart and the whole morning replayed as `unresolved`: five hours of
+    /// requests, tokens and `costUsd` gone from today's totals, presented as a
+    /// measured number.
+    #[test]
+    fn an_org_uuid_backfill_does_not_orphan_the_morning() {
+        let dir = scratch("org-backfill");
+        let now = crate::now_ms();
+
+        // 09:00. The config carries an org NAME and no org uuid, so every line
+        // this account writes carries `g: "Acme"`.
+        let before = identified("alice@example.com", "acct-1", None, "Acme");
+        // 14:00, after the refresh: the same account, one field richer.
+        let after = identified("alice@example.com", "acct-1", Some("org-uuid-1"), "Acme");
+
+        let writer = tracker();
+        writer.attach_ledger(dir.clone(), 90, std::slice::from_ref(&before), now);
+        for _ in 0..5 {
+            record_as(&writer, 0, &before, 3);
+        }
+        for _ in 0..2 {
+            record_as(&writer, 0, &after, 7);
+        }
+        assert!(writer.flush_ledger());
+
+        // The next restart — a TcrBar update forces one — reads the backfilled
+        // config.
+        let replayed = tracker();
+        let report = replayed.attach_ledger(dir.clone(), 90, std::slice::from_ref(&after), now);
+        assert_eq!(
+            (report.replayed, report.unresolved),
+            (7, 0),
+            "the morning is this account's own traffic, and an org backfill is not a reason \
+             to lose it"
+        );
+        assert_eq!(replayed.row(0, now, None).today.requests, 7);
+        assert_eq!(
+            replayed.row(0, now, None).today.input_tokens,
+            5 * 3 + 2 * 7,
+            "and the tokens came back with the requests"
+        );
+
+        // The same edit on an account that never had an `account_uuid` either —
+        // the fully-legacy shape, where the org NAME on the line is the only
+        // thing left to match, and it still names this account's org.
+        let dir2 = scratch("org-backfill-legacy");
+        let legacy_before = LedgerAccount {
+            name: "bob@example.com".to_string(),
+            org: Some("Initech".to_string()),
+            org_name: Some("Initech".to_string()),
+            ..LedgerAccount::default()
+        };
+        let legacy_after = LedgerAccount {
+            org: Some("org-uuid-2".to_string()),
+            ..legacy_before.clone()
+        };
+        let writer = tracker();
+        writer.attach_ledger(dir2.clone(), 90, std::slice::from_ref(&legacy_before), now);
+        for _ in 0..4 {
+            record_as(&writer, 0, &legacy_before, 1);
+        }
+        assert!(writer.flush_ledger());
+        let replayed = tracker();
+        let report = replayed.attach_ledger(dir2.clone(), 90, &[legacy_after], now);
+        assert_eq!(
+            (report.replayed, report.unresolved),
+            (4, 0),
+            "the uuid and the name are the same org written twice, before and after the \
+             backfill"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// FINDING 1 (round 3), the other half: what the account uuid must NOT buy.
+    /// A line resolves to the account that wrote it or to nobody — never to a
+    /// neighbour — so a uuid that names no live account is unresolved however
+    /// unique the name is, and one person's two orgs stay two accounts.
+    #[test]
+    fn a_uuid_resolves_to_its_own_account_or_to_nobody() {
+        let dir = scratch("uuid-identity");
+        let now = crate::now_ms();
+
+        // One person, two orgs: two real accounts sharing a name AND a uuid.
+        let corp = identified("alice@example.com", "acct-1", Some("org-a"), "Corp");
+        let personal = identified("alice@example.com", "acct-1", Some("org-b"), "Personal");
+        let fleet = vec![corp.clone(), personal.clone()];
+
+        let writer = tracker();
+        writer.attach_ledger(dir.clone(), 90, &fleet, now);
+        record_as(&writer, 0, &corp, 11);
+        for _ in 0..3 {
+            record_as(&writer, 1, &personal, 22);
+        }
+        assert!(writer.flush_ledger());
+
+        let replayed = tracker();
+        let report = replayed.attach_ledger(dir.clone(), 90, &fleet, now);
+        assert_eq!((report.replayed, report.unresolved), (4, 0));
+        assert_eq!(
+            replayed.row(0, now, None).today.requests,
+            1,
+            "a shared uuid is not a licence to hand one org's day to the other"
+        );
+        assert_eq!(replayed.row(1, now, None).today.requests, 3);
+
+        // The org-b account is removed. Its lines name a uuid that IS still in
+        // the fleet, on the sibling — and they are still not the sibling's.
+        let survivor = vec![corp.clone()];
+        let replayed = tracker();
+        let report = replayed.attach_ledger(dir.clone(), 90, &survivor, now);
+        assert_eq!(
+            (report.replayed, report.unresolved),
+            (1, 3),
+            "the org this line names is not in this fleet; unresolved and counted is the \
+             honest answer"
+        );
+        assert_eq!(replayed.row(0, now, None).today.requests, 1);
+
+        // A uuid that matches NOTHING is unresolved even against a uniquely
+        // named live account: a removed account's uuid stays gone.
+        let stranger = vec![identified(
+            "alice@example.com",
+            "acct-9",
+            Some("org-a"),
+            "Corp",
+        )];
+        let replayed = tracker();
+        let report = replayed.attach_ledger(dir.clone(), 90, &stranger, now);
+        assert_eq!(
+            (report.replayed, report.unresolved),
+            (0, 4),
+            "a unique name is not evidence about a uuid nobody in this fleet carries"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING 0 (round 3). The flush and the writer JOIN had one deadline
+    /// between them, so a flush that spent it — a stalled volume, the case the
+    /// whole bound exists for — handed the join zero milliseconds and abandoned
+    /// a writer that had not been asked to stop yet: the channel closes when the
+    /// handle drops, which is AFTER the flush returns, so the join is the first
+    /// moment the writer can finish at all.
+    ///
+    /// Here the flush's budget is 5ms against a wedged writer, so it is gone
+    /// before the join starts. The writer is freed a beat later and drains
+    /// every line.
+    #[test]
+    fn the_writer_join_gets_its_own_budget_after_the_flush_spent_everything() {
+        let dir = scratch("join-budget");
+        let now = crate::now_ms();
+        let tracker = tracker();
+        tracker.attach_ledger(dir.clone(), 90, &[named("alice@example.com")], now);
+
+        let ack_rx = wedge(&tracker);
+        for _ in 0..8 {
+            tracker.record(
+                0,
+                &record(now, "claude-opus-5", 5),
+                "alice@example.com",
+                None,
+                None,
+            );
+        }
+        assert_eq!(
+            lines_in(&dir, now),
+            0,
+            "control: with the writer wedged, not one line has reached the file yet"
+        );
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(ack_rx);
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = tracker.shutdown_ledger(std::time::Duration::from_millis(5));
+        let waited = started.elapsed();
+        assert_eq!(
+            outcome,
+            LedgerShutdown::Flushed,
+            "the writer drained inside the join's own budget; reporting `Abandoned` here \
+             tells an operator their last requests are lost when they are on disk"
+        );
+        assert_eq!(
+            lines_in(&dir, now),
+            8,
+            "every line queued before the shutdown is on disk"
+        );
+        assert!(
+            waited < MIN_LEDGER_SHUTDOWN * 4,
+            "and it is still bounded: waited {waited:?}"
+        );
+        releaser.join().expect("the releasing thread finished");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING 0 (round 3), the other side of the same budget: a writer that
+    /// really is wedged is still abandoned — but at the END of the join's
+    /// budget, not at 0ms. `tcr` quitting into a stalled volume must still quit.
+    #[test]
+    fn a_wedged_writer_is_abandoned_at_the_end_of_the_join_budget_not_at_zero() {
+        let dir = scratch("join-wedged");
+        let now = crate::now_ms();
+        let tracker = tracker();
+        tracker.attach_ledger(dir.clone(), 90, &[named("alice@example.com")], now);
+
+        let ack_rx = wedge(&tracker);
+        for _ in 0..4 {
+            tracker.record(
+                0,
+                &record(now, "claude-opus-5", 5),
+                "alice@example.com",
+                None,
+                None,
+            );
+        }
+
+        let started = std::time::Instant::now();
+        let outcome = tracker.shutdown_ledger(std::time::Duration::from_millis(5));
+        let waited = started.elapsed();
+        assert_eq!(outcome, LedgerShutdown::Abandoned);
+        assert!(
+            waited >= MIN_LEDGER_SHUTDOWN,
+            "the join must get a real attempt of its own, not the flush's leftovers: \
+             waited {waited:?}"
+        );
+        assert!(
+            waited < MIN_LEDGER_SHUTDOWN * 8,
+            "and a quit into a stalled volume is a pause, not a hang: waited {waited:?}"
+        );
+
+        drop(ack_rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDINGS 4 and 7 (round 3). `healthy` had two writers — the writer thread
+    /// setting it from write results, the queue clearing it on a drop — and
+    /// under sustained saturation they flip it against each other once per
+    /// completed write: every write frees one slot, the next request fills it,
+    /// the one after is dropped. `persisting` then alternates between two reads
+    /// instead of reading false for as long as the incident lasts, and the
+    /// transition log — bounded by design — becomes a line per served request.
+    ///
+    /// The writer is stepped one message at a time here, so the reading below is
+    /// taken at the exact point the two-writer shape disagrees with the truth:
+    /// one write has just completed, and the queue behind it is still full.
+    #[test]
+    fn a_saturated_queue_reports_not_persisting_for_the_whole_episode() {
+        let dir = scratch("flap");
+        let now = crate::now_ms();
+        let tracker = tracker();
+        tracker.attach_ledger(dir.clone(), 90, &[named("alice@example.com")], now);
+        assert!(tracker.is_persisting(), "control: nothing has failed yet");
+
+        let line = |tracker: &UsageTracker| {
+            tracker.record(
+                0,
+                &record(now, "claude-opus-5", 1),
+                "alice@example.com",
+                None,
+                None,
+            );
+        };
+
+        // [park] [one line] [step] [park] — rendezvous markers the writer cannot
+        // pass until this thread receives, so every observation is taken while
+        // it is stopped at a known point.
+        let park_first = wedge(&tracker);
+        line(&tracker);
+        let step = wedge(&tracker);
+        let park_again = wedge(&tracker);
+        for _ in 0..LEDGER_QUEUE_DEPTH + 16 {
+            line(&tracker);
+        }
+        let dropped = tracker.dropped_lines();
+        assert!(
+            dropped > 0,
+            "control: the queue filled and lines were dropped"
+        );
+        assert!(
+            !tracker.is_persisting(),
+            "a ledger dropping lines must not report that today's totals will survive"
+        );
+
+        // Let exactly one line through: the answer to `step` is the proof that
+        // write finished, and `park_again` stops the writer before the next one.
+        park_first
+            .recv()
+            .expect("the writer answers the first marker");
+        step.recv()
+            .expect("the writer wrote the line and reached the step");
+        assert_eq!(
+            tracker.dropped_lines(),
+            dropped,
+            "control: the reading below is taken between two drops, not after the episode"
+        );
+        assert!(
+            !tracker.is_persisting(),
+            "one completed write does not end an episode that is still eating lines — a \
+             `healthy` the queue clears and the writer sets reads TRUE right here"
+        );
+
+        // And it recovers, once the queue is genuinely drained.
+        drop(park_again);
+        assert!(tracker.flush_ledger(), "the writer drains once it is freed");
+        assert!(
+            tracker.is_persisting(),
+            "a ledger that caught up says so again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FINDING 5 (round 3). `shutdown_ledger`'s `drop(handle)` is the ONLY thing
+    /// that closes the writer's channel, and the join right after it waits for a
+    /// writer that ends when the channel closes. A second live sender anywhere —
+    /// a flush on another thread, a future health endpoint — turns that drop
+    /// into a no-op, and the shutdown spends its whole budget waiting for a
+    /// writer nobody asked to stop. `LedgerHandle` is therefore not `Clone`, and
+    /// a flush lets go of its cloned SENDER before it waits.
+    #[test]
+    fn a_flush_in_flight_does_not_keep_the_writers_channel_open() {
+        let dir = scratch("one-sender");
+        let now = crate::now_ms();
+        let tracker = Arc::new(tracker());
+        tracker.attach_ledger(dir.clone(), 90, &[named("alice@example.com")], now);
+
+        let ack_rx = wedge(&tracker);
+        for _ in 0..4 {
+            tracker.record(
+                0,
+                &record(now, "claude-opus-5", 5),
+                "alice@example.com",
+                None,
+                None,
+            );
+        }
+
+        // A flush that is still outstanding when the shutdown drops the handle.
+        let flusher = {
+            let tracker = Arc::clone(&tracker);
+            std::thread::spawn(move || {
+                tracker.flush_ledger_within(std::time::Duration::from_secs(3))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            drop(ack_rx);
+        });
+        assert_eq!(
+            tracker.shutdown_ledger(std::time::Duration::from_millis(5)),
+            LedgerShutdown::Flushed,
+            "the writer ended, so the channel it reads was closed — no other sender \
+             outlived the handle"
+        );
+        assert_eq!(lines_in(&dir, now), 4);
+        flusher.join().expect("the flushing thread finished");
+        releaser.join().expect("the releasing thread finished");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FINDING 3. The rotation grows at runtime (`tcr login`, TcrBar's

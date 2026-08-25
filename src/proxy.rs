@@ -1998,7 +1998,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // split of its own. Constructing the cell parses nothing; nothing at all is
     // parsed for a request neither consumer asks about (`count_tokens`,
     // anything unkeyed with no cache creation).
-    let extended_ttl = Arc::new(ExtendedTtlOnce::new(body_bytes.clone()));
+    // NOT an `Arc`: nothing may carry this cell past the end of the handler.
+    // The one consumer that outlives it — the spawned SSE task — takes the
+    // `bool` instead, and a plain cell is what makes that a compile error rather
+    // than a review note.
+    let extended_ttl = ExtendedTtlOnce::new(body_bytes.clone());
 
     // The pin's TTL drives nothing on the routing path, only what TTL this
     // session's persisted pin gets at the next restart. Deliberately still
@@ -2735,14 +2739,21 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // task below outlives this iteration. A `String` clone per streamed
             // request, so the ledger can attribute tokens to a model at all.
             let request_model_for_usage = request_model.clone();
-            // The CELL, not the body: the task needs the cache-TTL answer only
-            // when the response reports no 1h split of its own, and by the time
-            // it asks, the pin's TTL above has usually already answered it and
-            // dropped the conversation. Cloning `body_bytes` in here instead
-            // pinned every in-flight conversation in memory for the whole life
-            // of its stream — minutes, times every concurrent session — to carry
-            // one `bool`.
-            let extended_ttl_for_usage = Arc::clone(&extended_ttl);
+            // The ANSWER, not the cell and not the body. Resolving it here costs
+            // one structural deserialize per streamed request — the same one the
+            // pin's TTL above already pays whenever session affinity is on,
+            // which is the default — and it releases the conversation now, with
+            // the handler.
+            //
+            // Handing the task the cell instead only looks cheaper. It asks
+            // through `usage_record`, which asks only when the response reported
+            // no 1h split AND wrote cache — so an ordinary cache-read turn never
+            // asks at all, and with `"sessionAffinity": false` nothing else has
+            // asked either: the body then stays resident for the whole life of
+            // the stream, minutes, times every concurrent session. That is the
+            // retention this was supposed to remove, still there on the common
+            // path of one configuration.
+            let extended_ttl_for_usage = extended_ttl.get();
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -2755,7 +2766,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         &parsed,
                         request_model_for_usage.clone(),
                         session_key,
-                        || extended_ttl_for_usage.get(),
+                        || extended_ttl_for_usage,
                     );
                     // One line per terminal request, never per SSE event — a
                     // per-event log here would be the same flood vector the
@@ -3478,11 +3489,16 @@ fn cache_breakdown(usage: &Value) -> (u64, u64, Option<u64>) {
 /// system/tools/messages content block). Whichever asks first pays; the other
 /// reads the cell.
 ///
-/// The body is RELEASED the moment the answer exists. `Bytes` is refcounted, so
-/// holding a clone in the SSE task for the life of the stream keeps the whole
-/// conversation resident for minutes, times every concurrent session — for a
-/// value that is a `bool`. Once the answer is known the buffer is dropped here
-/// and the task carries a cell, not a body.
+/// The body is released when the answer is COMPUTED, and nothing may hold this
+/// cell past the end of the handler — which is why it is not shared and not
+/// `Arc`ed. `Bytes` is refcounted, so a cell carried into the spawned SSE task
+/// keeps the whole conversation resident for as long as the stream runs —
+/// minutes, times every concurrent session — whenever nobody asks it the
+/// question, and on the common path nobody does: `usage_record` asks only for a
+/// turn that wrote cache and got no 1h split back, and with
+/// `"sessionAffinity": false` the pin's TTL never asks either. So the streamed
+/// arm resolves the answer before it spawns and hands over the `bool`; the
+/// non-streamed arm asks lazily and dies with the handler.
 #[derive(Debug)]
 struct ExtendedTtlOnce {
     answer: std::sync::OnceLock<bool>,

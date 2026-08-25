@@ -122,7 +122,7 @@ impl Manager {
     /// across accounts reaches this once per upstream RESPONSE, and counting
     /// requests here is bug #4. That count happens in [`Manager::record_served`].
     pub fn record_usage(&self, idx: usize, record: crate::usage::UsageRecord) {
-        let (name, org) = {
+        let (name, (uuid, org)) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
                 Some(account) => {
@@ -130,23 +130,27 @@ impl Manager {
                     account.output_tokens += record.output;
                     account.cache_read_tokens += record.cache_read;
                     account.cache_creation_tokens += record.cache_creation();
-                    // The org key is read by the LEDGER LINE and by nothing
-                    // else, so it is allocated only when there is a ledger to
-                    // read it — an embedder or a test with no usage directory
-                    // pays nothing. Gated on `is_attached` rather than
+                    // The identity fields are read by the LEDGER LINE and by
+                    // nothing else, so they are allocated only when there is a
+                    // ledger to read them — an embedder or a test with no usage
+                    // directory pays nothing. Gated on `is_attached` rather than
                     // `is_persisting`: a ledger whose writes are failing right
-                    // now is still queueing, and a line queued without its org
-                    // resolves onto the wrong account when it lands.
-                    let org = if self.usage.is_attached() {
-                        crate::identity::org_key_of(
-                            account.org_uuid.as_deref(),
-                            account.org_name.as_deref(),
+                    // now is still queueing, and a line queued without its
+                    // identity resolves onto the wrong account when it lands.
+                    let identity = if self.usage.is_attached() {
+                        (
+                            crate::identity::uuid_key_of(account.account_uuid.as_deref())
+                                .map(str::to_string),
+                            crate::identity::org_key_of(
+                                account.org_uuid.as_deref(),
+                                account.org_name.as_deref(),
+                            )
+                            .map(str::to_string),
                         )
-                        .map(str::to_string)
                     } else {
-                        None
+                        (None, None)
                     };
-                    (account.name.clone(), org)
+                    (account.name.clone(), identity)
                 }
                 // An index with no account is not this function's to complain
                 // about — the caller's rotation loop already resolved it, and a
@@ -155,7 +159,8 @@ impl Manager {
                 None => return,
             }
         };
-        self.usage.record(idx, &record, &name, org.as_deref());
+        self.usage
+            .record(idx, &record, &name, uuid.as_deref(), org.as_deref());
     }
 
     /// Attach `dir` as the usage ledger: replay today's and yesterday's files
@@ -169,9 +174,10 @@ impl Manager {
         dir: std::path::PathBuf,
         retention_days: u32,
     ) -> crate::usage::ReplayReport {
-        // Name AND org: the ledger resolves a line by identity, because the same
-        // email in two orgs is two accounts (`identity.rs`) and a name alone
-        // cannot tell them apart.
+        // The whole identity, not the name: the same email in two orgs is two
+        // accounts (`identity.rs`) and a name alone cannot tell them apart,
+        // while the org key alone moves under a re-login's backfill and strands
+        // every line written before it.
         let accounts: Vec<crate::usage::LedgerAccount> = self
             .accounts
             .read()
@@ -179,8 +185,10 @@ impl Manager {
             .iter()
             .map(|a| crate::usage::LedgerAccount {
                 name: a.name.clone(),
+                uuid: crate::identity::uuid_key_of(a.account_uuid.as_deref()).map(str::to_string),
                 org: crate::identity::org_key_of(a.org_uuid.as_deref(), a.org_name.as_deref())
                     .map(str::to_string),
+                org_name: a.org_name.clone().filter(|s| !s.is_empty()),
             })
             .collect();
         self.usage
@@ -232,6 +240,15 @@ impl Manager {
         budget: std::time::Duration,
     ) -> crate::usage::LedgerShutdown {
         self.usage.shutdown_ledger(budget)
+    }
+
+    /// Test-only: stall the usage-ledger writer, so a shutdown through this
+    /// manager takes its whole budget — see
+    /// [`crate::usage::UsageTracker::wedge_writer_for_test`]. Dropping the
+    /// returned receiver frees the writer.
+    #[cfg(test)]
+    pub(crate) fn wedge_usage_writer_for_test(&self) -> std::sync::mpsc::Receiver<()> {
+        self.usage.wedge_writer_for_test()
     }
 
     /// Fold a background probe's usage into account `idx`'s quota windows and latch
