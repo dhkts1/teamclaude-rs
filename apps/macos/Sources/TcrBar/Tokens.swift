@@ -255,7 +255,20 @@ public enum Tok {
     /// unit: rows are not uniform height, so four of them is not a fixed number
     /// of points. `FleetView.visibleRowsHeight(for:)` sums every measured row
     /// and clamps here instead.
+    ///
+    /// It is the cap on the LIST, not on the panel, and 520 is what it stays: a
+    /// header that wraps does not shrink this number, it spends part of it.
+    /// The panel is `header + Hairline + list + Hairline + footer`, so a header
+    /// line growing from one rendered line to three used to add that height on
+    /// top of this cap and push Quit and the checkboxes off the bottom of the
+    /// popover. `PanelHeight.listBudget` subtracts the header's overflow from
+    /// this cap instead, which is what holds the panel's TOTAL height to what
+    /// it was before the spend line existed.
     public static let panelMaxHeight: CGFloat = 520
+    /// The floor under that budget: a header long enough to eat the whole cap
+    /// must still leave a list a reader can scroll. A zero-height scroll view
+    /// reads as a broken panel, not as a full one.
+    public static let panelMinListHeight: CGFloat = 120
     public static let gutter = space4
     public static let rowSpacing = space3
     public static let tightSpacing = space2

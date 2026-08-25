@@ -399,6 +399,31 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertFalse(never.hasQuotaEvidence, "but nothing has ever probed it")
         XCTAssertEqual(never.groups, [], "reported and empty, not nil — the server did answer")
 
+        // The `usage` object, cross-language: the Rust renderer writes these
+        // exact keys and this app reads them. `bob@example.com` is the row that
+        // carries an unpriceable model, so its per-model `costUsd` is null
+        // while its own day total is a PARTIAL sum with `unpricedRequests`
+        // saying so — the shape the panel's "N unpriced" clause exists for.
+        let usage = try XCTUnwrap(ok.usage)
+        XCTAssertEqual(usage.today.costUsd, 14.1657)
+        XCTAssertEqual(usage.today.requests, 102)
+        XCTAssertEqual(usage.today.inputTokens, 400_000, "BASE input, not the row's quota counter")
+        XCTAssertEqual(usage.today.cacheReadTokens, 6_000_000)
+        XCTAssertEqual(usage.today.unpricedRequests, 0)
+        XCTAssertEqual(try XCTUnwrap(usage.window).since, 1_767_207_600_000)
+        XCTAssertEqual(try XCTUnwrap(usage.window).costUsd, 5.6141)
+        XCTAssertEqual(usage.todayByModel.keys.sorted(), ["claude-opus-5", "claude-sonnet-5"])
+
+        let partial = try XCTUnwrap(near.usage)
+        XCTAssertEqual(partial.today.unpricedRequests, 32)
+        XCTAssertEqual(partial.today.costUsd, 12.0785, "a partial total is still reported")
+        XCTAssertNil(
+            partial.todayByModel["claude-sonnet-4-5-20250929"]?.costUsd,
+            "a model with no published rate is null, never 0.0")
+
+        XCTAssertNil(never.usage, "no usage object on this row — not measured, not zero")
+        XCTAssertNil(never.windowUsageLabel, "so the card's 5h slot stays empty")
+
         // The fleet aggregates the panel headline reads.
         XCTAssertEqual(fleet.readyCount, 1)
         XCTAssertEqual(fleet.enabledCount, 3)

@@ -520,9 +520,22 @@ enum ShellProbe {
              "disabled":false,"quota":0.\(index % 9 + 1),"quotaState":"ok",
              "fiveHour":0.1,"sevenDay":0.1,"sevenDayOi":0.0,"held":[],
              "requests":1,"inputTokens":1,"outputTokens":1,"cacheReadTokens":1,
-             "cacheHitRatio":0.5,"probeStatus":"ok","probeError":null,
+             "cacheCreationTokens":0,"cacheHitRatio":0.5,"probeStatus":"ok",
+             "probeError":null,
              "lastStreamError":null,"streamErrorCount":0,"source":"live",
-             "serverSha":"abc1234","serverDirty":false}
+             "serverSha":"abc1234","serverDirty":false,
+             "usage":{"today":{"requests":1,"inputTokens":1,"cacheCreationTokens":0,
+               "cacheCreation1hTokens":0,"cacheReadTokens":1,"outputTokens":1,
+               "costUsd":0.42,"unpricedRequests":0},
+              "window":{"requests":1,"inputTokens":1,"cacheCreationTokens":0,
+               "cacheCreation1hTokens":0,"cacheReadTokens":1,"outputTokens":1,
+               "costUsd":0.42,"unpricedRequests":0,"since":1767207600000},
+              "lastHour":{"requests":1,"inputTokens":1,"cacheCreationTokens":0,
+               "cacheCreation1hTokens":0,"cacheReadTokens":1,"outputTokens":1,
+               "costUsd":0.42,"unpricedRequests":0},
+              "todayByModel":{"claude-opus-5":{"requests":1,"inputTokens":1,
+                "cacheCreationTokens":0,"cacheCreation1hTokens":0,"cacheReadTokens":1,
+                "outputTokens":1,"costUsd":0.42,"unpricedRequests":0}}}}
             """
         }
         let json = "[\(rows.joined(separator: ","))]"

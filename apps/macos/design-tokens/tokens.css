@@ -37,6 +37,7 @@
     --tcr-detail-font-size: 10px;
     --tcr-hairline-width: 0.5px;
     --tcr-panel-max-height: 520px;
+    --tcr-panel-min-list-height: 120px;
     --tcr-panel-width: 380px;
     --tcr-pill-padding-h: 6px;
     --tcr-pill-padding-v: 2px;

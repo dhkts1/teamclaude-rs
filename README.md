@@ -83,6 +83,12 @@ menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet
 a glance. Each row is one line per quota window — bar, percentage and the countdown to that
 window's reset — plus probe health and a menu that shells out to `tcr`, so you can steer the
 fleet from the panel.
+The header line and each card also say what that traffic would have cost on the API — spend
+today, the last hour's burn rate, the model mix and the cache hit rate — attributed per account
+by the proxy as it serves, and replayed from disk after a restart. Nothing here is a bill:
+these accounts are subscriptions, and list price is simply the one unit that compares across
+accounts, models and days. An account the proxy never measured shows no figure at all rather
+than a zero.
 It can also supervise the proxy, and self-updates through [Sparkle](https://sparkle-project.org).
 
 Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run
