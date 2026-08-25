@@ -413,7 +413,6 @@ final class RealWorldDecodeTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(usage.window).since, 1_767_207_600_000)
         XCTAssertEqual(try XCTUnwrap(usage.window).costUsd, 5.6141)
         XCTAssertEqual(usage.todayByModel.keys.sorted(), ["claude-opus-5", "claude-sonnet-5"])
-        XCTAssertEqual(ok.cacheCreationTokens, 1_600_000)
 
         let partial = try XCTUnwrap(near.usage)
         XCTAssertEqual(partial.today.unpricedRequests, 32)

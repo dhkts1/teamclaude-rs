@@ -68,8 +68,24 @@ struct FleetView: View {
     /// Per-row rather than one summed total because rows are not uniform height
     /// — the needs-relogin state and several conditional detail lines all grow a
     /// row. `visibleRowsHeight(for:)` sums all of these and clamps the total to
-    /// `Tok.panelMaxHeight`.
+    /// what `PanelHeight.listBudget` leaves of `Tok.panelMaxHeight`.
     @State private var rowHeights: [String: CGFloat] = [:]
+
+    /// The spend line as drawn, and the height one line of it would be.
+    ///
+    /// That line wraps rather than truncates and has no bounded length, so a
+    /// busy fleet's summary is two or three lines — height the panel used to
+    /// add on top of its own cap, pushing Quit and the checkboxes off the
+    /// bottom. The difference between these two comes out of the LIST's budget
+    /// instead (`PanelHeight.listBudget`), so the panel's total height is what
+    /// it was before this line existed.
+    ///
+    /// Both are measured rather than computed: the font, the panel width and
+    /// the string itself decide where it wraps, and the baseline is a hidden
+    /// one-line `Text` in the same font drawn as an overlay, which takes part
+    /// in no layout of its own.
+    @State private var usageLineHeight: CGFloat = 0
+    @State private var usageLineBaseline: CGFloat = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
@@ -117,7 +133,7 @@ struct FleetView: View {
     }
 
     /// The fleet's spend, burn rate, model mix and cache hit rate, on one line:
-    /// `$12.40 today · $3.10/hr · opus-5 62% · sonnet-5 38% · cache 96%`.
+    /// `$12.4 today · $3.10/hr · opus-5 62% · sonnet-5 38% · cache 96%`.
     ///
     /// Draws nothing at all when no row carries a `usage` object —
     /// ``Fleet/usageSummaryLine`` returns `nil` there, which is the case
@@ -126,6 +142,11 @@ struct FleetView: View {
     /// honest output; every figure on this line is a measurement or it is
     /// absent. All of the arithmetic and the wording live on `Fleet`, where a
     /// test can assert on the finished string.
+    ///
+    /// Measured twice — as drawn, and as one line of the same font would be —
+    /// so the height it takes when it wraps comes out of the account list's
+    /// budget rather than out of the footer's place on screen. The baseline
+    /// `Text` is hidden and drawn as an overlay, so it occupies no layout.
     @ViewBuilder
     private var usageSummary: some View {
         if case .loaded(let fleet) = poller.state, let line = fleet.usageSummaryLine {
@@ -133,6 +154,26 @@ struct FleetView: View {
                 .font(Tok.secondaryDigitFont)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+                .background(
+                    GeometryReader { proxy in
+                        Color.clear.preference(
+                            key: UsageLineHeightKey.self, value: proxy.size.height)
+                    }
+                )
+                .overlay(alignment: .topLeading) {
+                    Text(verbatim: "0")
+                        .font(Tok.secondaryDigitFont)
+                        .lineLimit(1)
+                        .hidden()
+                        .background(
+                            GeometryReader { proxy in
+                                Color.clear.preference(
+                                    key: UsageLineBaselineKey.self, value: proxy.size.height)
+                            }
+                        )
+                }
+                .onPreferenceChange(UsageLineHeightKey.self) { usageLineHeight = $0 }
+                .onPreferenceChange(UsageLineBaselineKey.self) { usageLineBaseline = $0 }
         }
     }
 
@@ -297,28 +338,37 @@ struct FleetView: View {
         )
     }
 
-    /// Height of the scroll viewport: every row, clamped to `Tok.panelMaxHeight`.
+    /// Height of the scroll viewport: every row, clamped to what the header
+    /// left of `Tok.panelMaxHeight`.
     ///
     /// It used to stop at the first four rows, which left the panel short of its
     /// own cap while it had more to show — and a row count is the wrong unit
     /// anyway, since rows are not uniform height. A two-account fleet now draws
     /// in full and a thirteen-account one fills to 520pt and scrolls.
     ///
+    /// `Tok.panelMaxHeight` is the cap on the LIST, and the panel is
+    /// `header + Hairline + list + Hairline + footer`: a header that wraps to
+    /// three lines used to add its extra height on top of that cap and push
+    /// Quit off the bottom. The wrapped spend line's overflow is subtracted
+    /// here instead — the cap itself is unchanged at 520, and a one-line header
+    /// still gets the whole of it. The arithmetic is `PanelHeight`, where a
+    /// test can run it.
+    ///
     /// Fallback: before SwiftUI has laid out and reported any row height (the
     /// first frame, prior to the first `onPreferenceChange`), `rowHeights` is
-    /// empty and this returns `Tok.panelMaxHeight`, so the panel never renders
-    /// at zero or one-row height while waiting for a real measurement.
+    /// empty and this returns the budget itself, so the panel never renders at
+    /// zero or one-row height while waiting for a real measurement.
     private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
         let orderedHeights = fleet.rowsInDisplayOrder(pinning: control.current).compactMap {
             rowHeights[$0.id]
         }
-        guard !orderedHeights.isEmpty else {
-            return Tok.panelMaxHeight
-        }
-        let summed =
-            orderedHeights.reduce(0, +)
-            + Tok.rowSpacing * CGFloat(max(orderedHeights.count - 1, 0))
-        return min(max(summed, Tok.rowSpacing), Tok.panelMaxHeight)
+        return PanelHeight.visibleRowsHeight(
+            rowHeights: orderedHeights,
+            spacing: Tok.rowSpacing,
+            budget: PanelHeight.listBudget(
+                cap: Tok.panelMaxHeight,
+                headerOverflow: usageLineHeight - usageLineBaseline,
+                minimum: Tok.panelMinListHeight))
     }
 
     private func offlineNotice(_ source: StatusSource) -> some View {
@@ -714,6 +764,25 @@ struct RowHeightsKey: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
         value.merge(nextValue()) { _, new in new }
+    }
+}
+
+/// The spend line's drawn height, and the height of one line of it — the pair
+/// `PanelHeight.listBudget` turns into the header's overflow. Same
+/// preference-key pattern the rows use, for the same reason: the wrap point
+/// depends on the font, the panel width and the string, so it is measured, not
+/// computed.
+struct UsageLineHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+struct UsageLineBaselineKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -1602,7 +1671,7 @@ struct AccountRow: View {
                 resetAtMs: account.fiveHourResetAtMs,
                 captionTint: captionTint(for: .fiveHour)
             ) {
-                // This 5h window's spend and output tokens — `$4.20 · 48k`,
+                // This 5h window's spend and output tokens — `$4.20 · 48k out`,
                 // the account's own quota window when the server can name its
                 // start, otherwise its day (`Account.windowUsageLabel`).
                 // Absent, not zero, when the proxy did not measure this
@@ -1611,6 +1680,13 @@ struct AccountRow: View {
                 // nobody made. Demoted with `hasStaleQuotaReading` like the
                 // percentage beside it — a row must not read half live and
                 // half historical.
+                //
+                // Every form carries its unit and its span, because this slot
+                // sits in one HStack beside a percentage and a countdown: a
+                // bare `900` there read as 900 requests, 900 dollars or a
+                // second percentage. `$9.41 today` marks the day fallback,
+                // `$5.61+` marks a cost some of whose requests could not be
+                // priced, and tokens are `12k out`.
                 if let usageLabel = account.windowUsageLabel {
                     Text(usageLabel)
                         .font(Tok.detailDigitFont)
