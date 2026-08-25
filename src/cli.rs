@@ -1925,6 +1925,18 @@ fn render_accounts_json(
                     ))
                     .to_string()
                 }),
+                // The Fable weekly window's per-window state, same shape and
+                // threshold as `sevenDayState` beside it — mirrors the
+                // `is_fable`-gated comparison `account_gate` makes
+                // (`GateReason::FableWeekly`), just evaluated unconditionally
+                // here rather than only when a request is Fable-scoped.
+                seven_day_oi_state: a.seven_day_oi.map(|u| {
+                    quota_state_token(crate::stats::QuotaState::from_utilization(
+                        Some(u),
+                        threshold,
+                    ))
+                    .to_string()
+                }),
                 // A window's reset is a property of the window, not of whether
                 // it is currently pinning the account — UNCONDITIONAL, no
                 // threshold gate. `held[]` below stays exactly as it is; it
@@ -1943,6 +1955,11 @@ fn render_accounts_json(
                     .map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
                 seven_day_reset_at_ms: a
                     .seven_day_reset
+                    .map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
+                // The Fable weekly window's reset, same unconditional shape as
+                // `sevenDayResetAtMs` beside it.
+                seven_day_oi_reset_at_ms: a
+                    .seven_day_oi_reset
                     .map(|r| (r.unix_timestamp_nanos() / 1_000_000) as i64),
                 // `None` — NEVER `0` — on the OFFLINE path, same idiom as
                 // `streamErrorCount`/`cacheHitRatio` below and for the same
@@ -5163,6 +5180,7 @@ mod tests {
         seven_day: Option<f64>,
         seven_day_reset: Option<OffsetDateTime>,
         seven_day_oi: Option<f64>,
+        seven_day_oi_reset: Option<OffsetDateTime>,
         probe_status: crate::probe::ProbeStatus,
         probe_error: Option<&str>,
         quota_state: QuotaState,
@@ -5179,6 +5197,7 @@ mod tests {
             seven_day,
             seven_day_reset,
             seven_day_oi,
+            seven_day_oi_reset,
             requests: if five_hour.is_some() { 102 } else { 0 },
             input_tokens: if five_hour.is_some() { 8_000_000 } else { 0 },
             output_tokens: if five_hour.is_some() { 31_860 } else { 0 },
@@ -5366,6 +5385,7 @@ mod tests {
                 Some(0.01),
                 Some(seven_day_reset),
                 Some(0.0),
+                Some(seven_day_reset),
                 crate::probe::ProbeStatus::Ok,
                 None,
                 QuotaState::Normal,
@@ -5389,6 +5409,7 @@ mod tests {
                 Some(0.91),
                 Some(seven_day_reset),
                 Some(0.10),
+                Some(seven_day_reset),
                 crate::probe::ProbeStatus::RateLimited,
                 None,
                 QuotaState::NearLimit,
@@ -5411,6 +5432,7 @@ mod tests {
                 Some(1.0),
                 Some(seven_day_reset),
                 Some(0.5),
+                Some(seven_day_reset),
                 crate::probe::ProbeStatus::Error,
                 Some("probe failed: connection reset"),
                 QuotaState::Exhausted,
@@ -5426,6 +5448,7 @@ mod tests {
                 3,
                 "active",
                 true,
+                None,
                 None,
                 None,
                 None,
@@ -5810,6 +5833,61 @@ mod tests {
         );
     }
 
+    /// `sevenDayOiState` and `sevenDayOiResetAtMs` render from a snapshot that
+    /// carries the Fable weekly pair, and both keys are `null` — never absent,
+    /// never a fabricated `0`/`"ok"` — for an account whose window was never
+    /// learned. Mirrors `sevenDayState`/`sevenDayResetAtMs`'s own contract.
+    #[test]
+    fn fable_weekly_state_and_reset_render_and_null_when_unlearned() {
+        let (snapshot, thresholds) = reserved_groups_snapshot();
+        let mut snapshot = snapshot;
+        let learned_reset = fixture_instant(1_767_312_000_000);
+        // alice: learned, above threshold → "near". dave: never learned → null.
+        snapshot.accounts[0].seven_day_oi = Some(0.95);
+        snapshot.accounts[0].seven_day_oi_reset = Some(learned_reset);
+        snapshot.accounts[1].seven_day_oi = None;
+        snapshot.accounts[1].seven_day_oi_reset = None;
+
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let alice = rows
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        assert_eq!(
+            alice["sevenDayOiState"],
+            serde_json::json!("near"),
+            "learned, above-threshold window renders its state: {alice}"
+        );
+        assert_eq!(
+            alice["sevenDayOiResetAtMs"],
+            serde_json::json!(learned_reset.unix_timestamp_nanos() as i64 / 1_000_000),
+            "learned window's reset reaches the wire: {alice}"
+        );
+        let dave = rows
+            .iter()
+            .find(|r| r["name"] == "dave@example.com")
+            .expect("dave row");
+        assert_eq!(
+            dave["sevenDayOiState"],
+            serde_json::Value::Null,
+            "never-learned window's state is null, not absent: {dave}"
+        );
+        assert_eq!(
+            dave["sevenDayOiResetAtMs"],
+            serde_json::Value::Null,
+            "never-learned window's reset is null, not absent: {dave}"
+        );
+    }
+
     /// `reservedGroups` on the JSON wire: always an array, `[]` — never
     /// `null` — when nothing is reserved, mirroring `groups`'s own contract.
     /// Bridge test #7.
@@ -5824,6 +5902,7 @@ mod tests {
             seven_day: None,
             seven_day_reset: None,
             seven_day_oi: None,
+            seven_day_oi_reset: None,
             requests: 0,
             input_tokens: 0,
             output_tokens: 0,

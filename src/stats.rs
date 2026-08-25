@@ -120,6 +120,10 @@ pub struct AccountSnapshot {
     pub seven_day_reset: Option<OffsetDateTime>,
     /// Model-scoped weekly utilization (Fable), evaluated live.
     pub seven_day_oi: Option<f64>,
+    /// The Fable weekly window's reset instant, live like [`Self::seven_day_reset`]:
+    /// `None` once the window's reset has elapsed with nothing learned since, or
+    /// when it was never learned at all — never a past instant.
+    pub seven_day_oi_reset: Option<OffsetDateTime>,
     pub requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,

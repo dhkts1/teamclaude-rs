@@ -200,6 +200,7 @@ impl Manager {
                     seven_day,
                     seven_day_reset: a.quota.seven_day.and_then(|w| w.live_reset(now)),
                     seven_day_oi: a.quota.seven_day_oi.map(|w| w.effective(now)),
+                    seven_day_oi_reset: a.quota.seven_day_oi.and_then(|w| w.live_reset(now)),
                     requests: a.requests,
                     input_tokens: a.input_tokens,
                     output_tokens: a.output_tokens,

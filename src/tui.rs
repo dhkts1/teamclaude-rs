@@ -1444,6 +1444,7 @@ mod tests {
             seven_day: None,
             seven_day_reset: None,
             seven_day_oi: None,
+            seven_day_oi_reset: None,
             requests: 0,
             input_tokens: 0,
             output_tokens: 0,
