@@ -56,4 +56,9 @@ but persisting them removes the restart escape hatch: with every account held, a
 every selection path and the proxy makes no upstream attempt at all until the holds expire, turning
 "restart to clear it" into an outage with a non-obvious recovery. The measured benefit was a handful of
 429 round trips per restart. Not worth it. Quota is likewise deliberately not persisted — the probe
-re-derives it within seconds, and a stale window can outlive its truth.
+re-derives it within seconds, and a stale window can outlive its truth. The rule that decision
+established is about routing STATE: a hold, a quota reading, anything the proxy would act on later can
+outlive its truth, so it is re-derived rather than restored. The **usage ledger**
+(`~/.cache/teamclaude/usage/`, `src/usage.rs`) is not state — it is a RECORD of requests that have
+already happened, it cannot become false, and nothing routes on it. So it IS persisted, and today's
+totals survive a restart instead of resetting the day every time TcrBar updates.

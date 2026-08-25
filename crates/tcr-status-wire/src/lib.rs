@@ -28,6 +28,79 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// One bucket's token and cost totals. Every field is a plain sum over the
+/// requests in the bucket, so a client can add two of these together.
+///
+/// `costUsd` is the API **list-price equivalent** — what this traffic would
+/// have cost on the API — not a bill: the accounts behind this proxy are
+/// subscriptions. It is `null`, never `0.0`, when the bucket served requests
+/// and none of their models could be priced; `unpricedRequests` says how many
+/// of `requests` are missing from the figure, so a partial total is never
+/// mistaken for a complete one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageTotals {
+    #[serde(default)]
+    pub requests: u64,
+    /// Base (non-cached) input tokens. Deliberately NOT the row-level
+    /// `inputTokens`, which is the QUOTA counter and folds cache creation and
+    /// cache reads into one number — those are separate billing dimensions and
+    /// have to stay apart to be priced.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Cache-creation tokens written under the default 5-minute TTL.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Cache-creation tokens written under the extended 1-hour TTL, which bills
+    /// at twice base input rather than 1.25x.
+    #[serde(default)]
+    pub cache_creation_1h_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// `null` when nothing in this bucket could be priced — see the struct docs.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    #[serde(default)]
+    pub unpriced_requests: u64,
+}
+
+/// [`UsageTotals`] for a bounded window, plus the instant the window opened.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageWindow {
+    /// Unix milliseconds: the start of this account's current 5-hour window
+    /// (`fiveHourResetAtMs - 5h`), as read from Anthropic's own headers.
+    pub since: i64,
+    #[serde(flatten)]
+    pub totals: UsageTotals,
+}
+
+/// One account's usage, aggregated by the proxy at request time.
+///
+/// Absent (`null`) means "not measured": the row came from a server built
+/// before this existed, or from the offline path, which has no serving
+/// counters at all. It never means zero usage.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageRow {
+    /// The local calendar day of the machine the SERVER runs on.
+    #[serde(default)]
+    pub today: UsageTotals,
+    /// This account's current 5-hour window. `null` when the server has not
+    /// learned the window's reset, so its start cannot be named.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<UsageWindow>,
+    /// The trailing 60 minutes — burn rate is `lastHour.costUsd` per hour, by
+    /// definition.
+    #[serde(default)]
+    pub last_hour: UsageTotals,
+    /// `today`, split by model id.
+    #[serde(default)]
+    pub today_by_model: BTreeMap<String, UsageTotals>,
+}
+
 /// A gating window (`5h` or `7d`) currently holding an account out of rotation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,6 +173,19 @@ pub struct AccountStatusRow {
     pub control_allowed_groups: Vec<String>,
     /// Every group on the fleet mapped to its resolved color, repeated per row.
     pub group_colors: BTreeMap<String, String>,
+    /// Cache-creation input tokens (a subset of `inputTokens`, like
+    /// `cacheReadTokens` beside it). Tracked since cache accounting landed and
+    /// never emitted here until now, which left `cacheReadTokens` on the wire
+    /// with no companion to say how much of the input was spent WRITING the
+    /// cache. `None` on the offline path, same "not measured" idiom as the
+    /// other serving counters.
+    #[serde(default)]
+    pub cache_creation_tokens: Option<u64>,
+    /// Proxy-computed usage and cost for this account. `None` when the serving
+    /// build predates it or the row came from the offline path — see
+    /// [`UsageRow`]'s doc-comment: absent is "not measured", never zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageRow>,
 }
 
 impl AccountStatusRow {

@@ -87,6 +87,10 @@ fn options(tag: &str) -> ServeOptions {
         // could reach `takeover_port` could SIGKILL the developer's live proxy.
         incumbent: IncumbentPolicy::never_signal(),
         affinity_path: Some(scratch_affinity_path(tag)),
+        // In-memory usage only. The binary's ledger directory is shared, and a
+        // test serving briefly must never append into the live proxy's day file
+        // — the same hazard `affinity_path` is scratch-scoped for.
+        usage_dir: None,
         // Loading the MITM material mints/reads a CA on disk. Base-URL mode is
         // all this file exercises, so do not touch it.
         tls: TlsSetup::Disabled,

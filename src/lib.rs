@@ -26,6 +26,7 @@ pub mod manager;
 pub mod mitm;
 pub mod model;
 pub mod oauth;
+pub mod pricing;
 pub mod probe;
 pub mod proxy;
 pub mod quota;
@@ -36,6 +37,7 @@ pub mod stats;
 pub mod status;
 pub mod tui;
 pub mod update;
+pub mod usage;
 pub mod warmer;
 
 use time::OffsetDateTime;

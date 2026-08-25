@@ -158,6 +158,17 @@ pub struct ServeOptions {
     /// never repairs it. The next boot then cold-starts every session's prompt
     /// cache. Point this somewhere disposable, or leave it `None`.
     pub affinity_path: Option<PathBuf>,
+    /// The usage-ledger DIRECTORY, or `None` to keep usage **in memory only** —
+    /// nothing is replayed at boot and nothing is written, so a restart starts
+    /// the day at zero.
+    ///
+    /// `None` is the default for the same reason as [`Self::affinity_path`]:
+    /// the binary's path ([`crate::usage::default_dir`]) is one shared
+    /// directory, and a second process that serves briefly would append its
+    /// traffic into the live proxy's day file and replay the live proxy's
+    /// traffic into its own totals. Point this somewhere disposable, or leave
+    /// it `None`.
+    pub usage_dir: Option<PathBuf>,
     /// Where the MITM TLS material comes from.
     pub tls: TlsSetup,
     /// What is hosting this proxy — a standalone `tcr` process
@@ -217,6 +228,7 @@ impl ServeOptions {
             port: None,
             incumbent: IncumbentPolicy::never_signal(),
             affinity_path: None,
+            usage_dir: None,
             tls: TlsSetup::Load,
             // Inert, like every other field here: with no owner dir, `host` is
             // recorded nowhere and this value cannot be read by anyone. A caller
@@ -607,6 +619,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         port: port_override,
         incumbent,
         affinity_path,
+        usage_dir,
         tls,
         host,
         owner_dir,
@@ -670,6 +683,29 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     }
 
     let manager = Manager::with_live_refresher(config, persist_path);
+
+    // Usage accounting is restored before the listener binds, for the same
+    // reason the affinity pins are: the first request after a bounce must not
+    // see a day that has reset to zero. Only when a directory was given — see
+    // `ServeOptions::usage_dir` on why that is not the default.
+    //
+    // Never fatal. A ledger that cannot be read or written costs the restart's
+    // history and nothing else, so `attach_usage_ledger` reports rather than
+    // errors and the proxy serves either way.
+    if let Some(usage_dir) = &usage_dir {
+        crate::usage::warn_if_local_offset_unavailable();
+        let retention = manager.usage_retention_days();
+        let report = manager.attach_usage_ledger(usage_dir.clone(), retention);
+        tracing::info!(
+            path = %usage_dir.display(),
+            replayed = report.replayed,
+            unresolved = report.unresolved,
+            malformed = report.malformed,
+            pruned = report.pruned,
+            retention_days = retention,
+            "usage ledger attached"
+        );
+    }
 
     // One trigger for every task this function spawns. `watch` rather than a
     // one-shot so each loop can hold its own receiver and shutdown is

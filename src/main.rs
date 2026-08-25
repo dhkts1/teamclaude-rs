@@ -1030,6 +1030,9 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             server::IncumbentPolicy::replace_legacy_js_only()
         },
         affinity_path: Some(affinity::default_path()),
+        // The shared usage ledger, a binary-only side effect exactly like the
+        // pin cache above and for the same reason: one directory, one writer.
+        usage_dir: Some(teamclaude_rs::usage::default_dir()),
         tls: server::TlsSetup::Load,
         // This is a standalone `tcr` process, stated rather than sniffed from
         // `argv[0]`: the owner file is what makes a proxy identifiable when its

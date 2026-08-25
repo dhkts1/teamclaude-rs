@@ -77,13 +77,119 @@ impl Manager {
         cache_read: u64,
         cache_creation: u64,
     ) {
-        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-        if let Some(account) = accounts.get_mut(idx) {
-            account.input_tokens += input_tokens;
-            account.output_tokens += output_tokens;
-            account.cache_read_tokens += cache_read;
-            account.cache_creation_tokens += cache_creation;
-        }
+        self.record_usage(
+            idx,
+            crate::usage::UsageRecord {
+                ts_ms: crate::now_ms(),
+                model: None,
+                session: None,
+                // The caller of this shape only has the FLAT cache-creation
+                // count, so the whole of it is booked as a 5-minute write and
+                // the base input is what is left after the two cache
+                // components are taken out — exactly the arithmetic
+                // `sum_input_tokens` did to build `input_tokens` in the first
+                // place. `saturating_sub` because this is a public entry point:
+                // a caller that passes an `input_tokens` smaller than its own
+                // components is inconsistent, and the counters must not wrap.
+                input: input_tokens.saturating_sub(cache_read + cache_creation),
+                cache_5m: cache_creation,
+                cache_1h: 0,
+                cache_read,
+                output: output_tokens,
+            },
+        );
+    }
+
+    /// **The single entry point for a served request's usage.** Every token this
+    /// fleet spends passes through here exactly once, and nothing else may
+    /// increment the four cumulative counters.
+    ///
+    /// It does two separable things, in this order:
+    ///
+    /// 1. Adds to the cumulative per-account counters, whose meanings are
+    ///    UNCHANGED by this function existing — `input_tokens` is still the
+    ///    quota counter with cache creation and cache reads folded in
+    ///    ([`crate::usage::UsageRecord::input_total`] reproduces it exactly),
+    ///    and `cache_creation_tokens` is still both TTLs together. `status.rs`
+    ///    explains why an existing wire field may never quietly change meaning.
+    /// 2. Records the same request in the usage tracker, which is where the
+    ///    model, the 5m/1h cache split, the cost and the time buckets live.
+    ///
+    /// The accounts write lock is RELEASED before step 2 — the two locks are
+    /// never held together, the same discipline `update_quota` follows for the
+    /// warm-wake notify.
+    ///
+    /// Deliberately does NOT touch the request counter: a client request retried
+    /// across accounts reaches this once per upstream RESPONSE, and counting
+    /// requests here is bug #4. That count happens in [`Manager::record_served`].
+    pub fn record_usage(&self, idx: usize, record: crate::usage::UsageRecord) {
+        let name = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            match accounts.get_mut(idx) {
+                Some(account) => {
+                    account.input_tokens += record.input_total();
+                    account.output_tokens += record.output;
+                    account.cache_read_tokens += record.cache_read;
+                    account.cache_creation_tokens += record.cache_creation();
+                    account.name.clone()
+                }
+                // An index with no account is not this function's to complain
+                // about — the caller's rotation loop already resolved it, and a
+                // configuration reloaded underneath is not a reason to record
+                // the tokens against somebody else.
+                None => return,
+            }
+        };
+        self.usage.record(idx, &record, &name);
+    }
+
+    /// Attach `dir` as the usage ledger: replay today's and yesterday's files
+    /// back through the recording path so a restart does not lose the day, prune
+    /// day files past `retention_days`, then start appending.
+    ///
+    /// Only the SERVING process calls this. Returns what the replay found so the
+    /// caller can log whether the day was restored or genuinely started at zero.
+    pub fn attach_usage_ledger(
+        &self,
+        dir: std::path::PathBuf,
+        retention_days: u32,
+    ) -> crate::usage::ReplayReport {
+        let names: Vec<String> = self
+            .accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .iter()
+            .map(|a| a.name.clone())
+            .collect();
+        self.usage
+            .attach_ledger(dir, retention_days, &names, crate::now_ms())
+    }
+
+    /// This account's usage row as of `now_ms` — see
+    /// [`crate::usage::UsageTracker::row`].
+    pub(super) fn usage_row(
+        &self,
+        idx: usize,
+        now_ms: i64,
+        five_hour_reset_ms: Option<i64>,
+    ) -> tcr_status_wire::UsageRow {
+        self.usage.row(idx, now_ms, five_hour_reset_ms)
+    }
+
+    /// The configured usage-ledger retention, in days
+    /// ([`crate::config::Config::usage_retention_days`]). Read from the config
+    /// this manager booted with, like every other boot-time knob.
+    pub fn usage_retention_days(&self) -> u32 {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .usage_retention_days
+    }
+
+    /// Whether a usage ledger is attached — i.e. whether today's totals will
+    /// survive a restart. False on every offline/test manager.
+    pub fn usage_is_persisting(&self) -> bool {
+        self.usage.is_persisting()
     }
 
     /// Fold a background probe's usage into account `idx`'s quota windows and latch

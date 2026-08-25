@@ -1940,6 +1940,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         .as_deref()
         .is_some_and(crate::model::is_fable_model);
 
+    // Whether THIS request asked Anthropic's cache for the extended 1h window.
+    // Read ONCE here, beside `request_model` and for the same reason: it is a
+    // property of the body, constant across the rotation loop, and it now has
+    // two consumers — the persisted pin's TTL below, and the usage ledger's
+    // fallback when a response reports a flat cache-creation count with no
+    // `ephemeral_1h_input_tokens` breakdown. It used to be parsed inside the
+    // session-key branch, which is why hoisting it costs nothing when affinity
+    // is on (the same single parse, now shared) and one body parse per request
+    // when affinity is off.
+    let request_extended_ttl = crate::cache_ttl::requests_extended_ttl(&body_bytes);
+
     // `tcr run --group <name>` (Phase 1, PREFER semantics only). Read once,
     // constant across the rotation loop — same shape as `request_model` above.
     // An empty header value is treated as absent rather than an empty-string
@@ -1996,7 +2007,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // session key: it drives nothing on the routing path, only what TTL this
     // session's persisted pin gets at the next restart.
     if let Some(key) = session_key {
-        manager.note_affinity_ttl(key, crate::cache_ttl::requests_extended_ttl(&body_bytes));
+        manager.note_affinity_ttl(key, request_extended_ttl);
     }
 
     // 3. Selection + rotation loop.
@@ -2720,6 +2731,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // comment there. This clone is ONLY for the per-request usage log
             // line inside the spawned parser task.
             let account_name_for_log = account_name.clone();
+            // Cloned for the same reason and in the same place as
+            // `account_name_for_log` above: the model this request targeted is
+            // parsed once per request (`request_model`) and the spawned parser
+            // task below outlives this iteration. A `String` clone per streamed
+            // request, so the ledger can attribute tokens to a model at all.
+            let request_model_for_usage = request_model.clone();
             tokio::spawn(async move {
                 let byte_stream = futures::stream::unfold(rx, |mut rx| async move {
                     rx.recv()
@@ -2728,12 +2745,11 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 });
                 let (parsed, stream_error) = parse_sse_usage(byte_stream).await;
                 if parsed.input_total > 0 || parsed.output > 0 {
-                    manager_side.update_usage(
-                        idx,
-                        parsed.input_total,
-                        parsed.output,
-                        parsed.cache_read,
-                        parsed.cache_creation,
+                    let record = usage_record(
+                        &parsed,
+                        request_model_for_usage.clone(),
+                        session_key,
+                        request_extended_ttl,
                     );
                     // One line per terminal request, never per SSE event — a
                     // per-event log here would be the same flood vector the
@@ -2742,12 +2758,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     tracing::info!(
                         account = account_name_for_log.as_deref().unwrap_or("?"),
                         session = ?session_key,
+                        model = request_model_for_usage.as_deref().unwrap_or("?"),
                         cache_read_tokens = parsed.cache_read,
                         cache_creation_tokens = parsed.cache_creation,
+                        cache_creation_1h_tokens = record.cache_1h,
                         input_tokens = parsed.input_total,
                         output_tokens = parsed.output,
                         "request usage"
                     );
+                    manager_side.record_usage(idx, record);
                 }
                 // Sibling of the usage guard above, not nested in it: an error
                 // event with NO message_start leaves input_total == output == 0,
@@ -2929,24 +2948,26 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         if status.is_success() {
             let parsed = usage_from_json(&bytes);
             if parsed.input_total > 0 || parsed.output > 0 {
-                manager.update_usage(
-                    idx,
-                    parsed.input_total,
-                    parsed.output,
-                    parsed.cache_read,
-                    parsed.cache_creation,
+                let record = usage_record(
+                    &parsed,
+                    request_model.clone(),
+                    session_key,
+                    request_extended_ttl,
                 );
                 // One line per terminal (non-streamed) request — see the
                 // matching log line on the streaming arm above.
                 tracing::info!(
                     account = account_name.as_deref().unwrap_or("?"),
                     session = ?session_key,
+                    model = request_model.as_deref().unwrap_or("?"),
                     cache_read_tokens = parsed.cache_read,
                     cache_creation_tokens = parsed.cache_creation,
+                    cache_creation_1h_tokens = record.cache_1h,
                     input_tokens = parsed.input_total,
                     output_tokens = parsed.output,
                     "request usage"
                 );
+                manager.record_usage(idx, record);
             }
         }
         return build_response(
@@ -3385,17 +3406,91 @@ struct ParsedUsage {
     output: u64,
     cache_read: u64,
     cache_creation: u64,
+    /// The part of `cache_creation` written under the extended 1-hour TTL. A
+    /// SUBSET of `cache_creation`, never additional to it — the 5-minute part is
+    /// `cache_creation - cache_creation_1h`. Kept apart because the two bill
+    /// differently (2x base input against 1.25x), so a single cache-creation
+    /// number cannot be priced.
+    cache_creation_1h: u64,
 }
 
-/// Extract the cache-read + cache-creation components of a `usage` object.
-/// R2: both parse paths (JSON and SSE) call THIS, so the two cache fields are
+/// Extract the cache-read + cache-creation components of a `usage` object,
+/// plus how much of the cache creation was written under the extended 1-hour
+/// TTL.
+/// R2: both parse paths (JSON and SSE) call THIS, so the three cache fields are
 /// extracted identically and cache% can never depend on stream-mode.
-fn cache_breakdown(usage: &Value) -> (u64, u64) {
+///
+/// The 1-hour figure comes from the nested `usage.cache_creation` object
+/// (`ephemeral_1h_input_tokens`), which the Messages API sends alongside the
+/// flat `cache_creation_input_tokens`. It is CLAMPED to the flat count on
+/// purpose: the flat number is the one the existing `cache_creation_tokens`
+/// counter has always carried, and splitting it must never change its total. A
+/// response that omitted the nested object leaves this 0 here; the caller then
+/// falls back to the REQUEST's own `cache_control` ttl
+/// ([`crate::cache_ttl::requests_extended_ttl`]), which is the only other
+/// evidence of which window was asked for.
+fn cache_breakdown(usage: &Value) -> (u64, u64, u64) {
     let field = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let cache_creation = field("cache_creation_input_tokens");
+    let cache_creation_1h = usage
+        .get("cache_creation")
+        .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(cache_creation);
     (
         field("cache_read_input_tokens"),
-        field("cache_creation_input_tokens"),
+        cache_creation,
+        cache_creation_1h,
     )
+}
+
+/// Build the ledger record for one served request from its parsed response
+/// usage, the model the REQUEST named, and whether the request asked for the
+/// extended cache window.
+///
+/// Two things happen here that neither caller should duplicate.
+///
+/// **The model comes from the REQUEST, not the response.** It is parsed once per
+/// request (`parse_request_model`) and is the same on both arms; the response's
+/// own `model` field can differ from what was asked for, and the ask is what the
+/// operator reasons about.
+///
+/// **The 5m/1h split falls back to the request's `cache_control` ttl.** When the
+/// response carried `usage.cache_creation.ephemeral_1h_input_tokens` that figure
+/// wins outright — it is a first-hand report of what was written. Only when the
+/// response omitted it does `extended_ttl` decide, and then it decides ALL of
+/// the flat cache-creation count, because a body whose only `cache_control` ttl
+/// is `"1h"` wrote its cache under that window. Silence in both places means 5
+/// minutes, which is the API's own default.
+fn usage_record(
+    parsed: &ParsedUsage,
+    model: Option<String>,
+    session: Option<u64>,
+    extended_ttl: bool,
+) -> crate::usage::UsageRecord {
+    let cache_1h = if parsed.cache_creation_1h > 0 {
+        parsed.cache_creation_1h
+    } else if extended_ttl {
+        parsed.cache_creation
+    } else {
+        0
+    };
+    crate::usage::UsageRecord {
+        ts_ms: crate::now_ms(),
+        model,
+        session,
+        // BASE input: `input_total` is the quota counter and folds in both cache
+        // dimensions (see `sum_input_tokens`), which bill at different rates and
+        // so must not be counted at the base rate as well.
+        input: parsed
+            .input_total
+            .saturating_sub(parsed.cache_read + parsed.cache_creation),
+        cache_5m: parsed.cache_creation.saturating_sub(cache_1h),
+        cache_1h,
+        cache_read: parsed.cache_read,
+        output: parsed.output,
+    }
 }
 
 /// Parse the token breakdown from a non-streamed JSON messages body.
@@ -3410,12 +3505,13 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
         .get("output_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let (cache_read, cache_creation) = cache_breakdown(usage);
+    let (cache_read, cache_creation, cache_creation_1h) = cache_breakdown(usage);
     ParsedUsage {
         input_total: sum_input_tokens(usage),
         output,
         cache_read,
         cache_creation,
+        cache_creation_1h,
     }
 }
 
@@ -3491,7 +3587,11 @@ where
                 saw_message_start = true;
                 if let Some(usage) = value.get("message").and_then(|m| m.get("usage")) {
                     parsed.input_total = sum_input_tokens(usage);
-                    (parsed.cache_read, parsed.cache_creation) = cache_breakdown(usage);
+                    (
+                        parsed.cache_read,
+                        parsed.cache_creation,
+                        parsed.cache_creation_1h,
+                    ) = cache_breakdown(usage);
                     if let Some(out) = usage.get("output_tokens").and_then(Value::as_u64) {
                         parsed.output = out;
                     }
@@ -3714,6 +3814,8 @@ mod tests {
                 extra: serde_json::Map::new(),
             }],
             group_settings: std::collections::HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         }
     }

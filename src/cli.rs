@@ -2083,6 +2083,27 @@ fn render_accounts_json(
                 // fixed contract with the sibling macOS panel — do not change
                 // them.
                 group_colors: group_colors.clone(),
+                // Cache-creation tokens, the companion `cacheReadTokens` never
+                // had here: without it a reader can see how much input was
+                // served FROM cache but not how much was spent WRITING it, and
+                // the two together are what make a cache-hit ratio
+                // interpretable. Same null-on-offline guard as the four serving
+                // counters above — it is one of them, and has been tracked in
+                // `AccountSnapshot` all along.
+                cache_creation_tokens: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => Some(a.cache_creation_tokens),
+                },
+                // Proxy-computed usage and cost. `None` on the OFFLINE path for
+                // the same reason as the counters above, and one more besides:
+                // an offline manager has no ledger and has aggregated nothing,
+                // so every figure in this object would be a structural zero —
+                // a fabricated "$0.00 spent today" is precisely the false
+                // measurement this whole object exists to replace.
+                usage: match source {
+                    StatusSource::Offline => None,
+                    StatusSource::Live => a.usage.clone(),
+                },
             };
             // Round-trip through `Value` rather than serializing the struct
             // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
@@ -5146,6 +5167,7 @@ mod tests {
         probe_error: Option<&str>,
         quota_state: QuotaState,
         groups: &[&str],
+        usage: Option<tcr_status_wire::UsageRow>,
     ) -> AccountSnapshot {
         AccountSnapshot {
             name: name.to_string(),
@@ -5161,7 +5183,11 @@ mod tests {
             input_tokens: if five_hour.is_some() { 8_000_000 } else { 0 },
             output_tokens: if five_hour.is_some() { 31_860 } else { 0 },
             cache_read_tokens: if five_hour.is_some() { 6_000_000 } else { 0 },
-            cache_creation_tokens: 0,
+            // Chosen so the four input dimensions reconcile: `inputTokens` is
+            // the quota counter and equals base + cache creation + cache reads,
+            // so 8,000,000 = 400,000 + 1,600,000 + 6,000,000. A fixture whose
+            // numbers do not add up teaches every reader the wrong arithmetic.
+            cache_creation_tokens: if five_hour.is_some() { 1_600_000 } else { 0 },
             last_used: None,
             rate_limited_until: None,
             probe_status,
@@ -5179,6 +5205,126 @@ mod tests {
             groups: groups.iter().map(|g| g.to_string()).collect(),
             reserved_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
+            usage,
+        }
+    }
+
+    /// One model's slice of a fixture row's usage, priced by the SAME function
+    /// production prices with.
+    ///
+    /// A cost typed into a fixture is a claim about the pricing table that
+    /// nothing checks: change a rate and the fixture goes on asserting the old
+    /// dollar figure is what this proxy produces. Running the real
+    /// [`crate::pricing`] path means the committed bytes are what the code
+    /// actually computes, and a rate change shows up as a fixture diff — which
+    /// is most of the point of committing one.
+    fn contract_totals(
+        model: &str,
+        requests: u64,
+        input: u64,
+        cache_5m: u64,
+        cache_1h: u64,
+        cache_read: u64,
+        output: u64,
+    ) -> tcr_status_wire::UsageTotals {
+        let price = crate::pricing::PricingTable::default().lookup(model);
+        tcr_status_wire::UsageTotals {
+            requests,
+            input_tokens: input,
+            cache_creation_tokens: cache_5m,
+            cache_creation_1h_tokens: cache_1h,
+            cache_read_tokens: cache_read,
+            output_tokens: output,
+            cost_usd: price.map(|price| {
+                crate::pricing::cost_nanos(&price, input, cache_5m, cache_1h, cache_read, output)
+                    as f64
+                    / 1e9
+            }),
+            unpriced_requests: if price.is_some() { 0 } else { requests },
+        }
+    }
+
+    /// Add `other` into `totals`, the way the tracker's own buckets sum.
+    /// `costUsd` is `None` only when NOTHING in the sum could be priced.
+    fn contract_add(
+        totals: tcr_status_wire::UsageTotals,
+        other: tcr_status_wire::UsageTotals,
+    ) -> tcr_status_wire::UsageTotals {
+        let requests = totals.requests + other.requests;
+        let unpriced_requests = totals.unpriced_requests + other.unpriced_requests;
+        tcr_status_wire::UsageTotals {
+            requests,
+            input_tokens: totals.input_tokens + other.input_tokens,
+            cache_creation_tokens: totals.cache_creation_tokens + other.cache_creation_tokens,
+            cache_creation_1h_tokens: totals.cache_creation_1h_tokens
+                + other.cache_creation_1h_tokens,
+            cache_read_tokens: totals.cache_read_tokens + other.cache_read_tokens,
+            output_tokens: totals.output_tokens + other.output_tokens,
+            // Summed in NANODOLLARS, then converted once — exactly what the
+            // tracker does. Adding the two dollar figures as `f64` instead
+            // yields 14.165700000000001 for a total the production path renders
+            // as 14.1657, and a fixture that disagrees with production in its
+            // last bit is a fixture that will be "fixed" by someone rounding.
+            cost_usd: if requests > 0 && unpriced_requests >= requests {
+                None
+            } else {
+                let nanos = |usd: Option<f64>| (usd.unwrap_or(0.0) * 1e9).round() as u64;
+                Some((nanos(totals.cost_usd) + nanos(other.cost_usd)) as f64 / 1e9)
+            },
+            unpriced_requests,
+        }
+    }
+
+    /// A fixture row's `usage`, built from a mix of two models.
+    ///
+    /// The token counts reconcile with the row-level counters
+    /// [`contract_account`] sets: 102 requests, 400,000 base input, 1,600,000
+    /// cache creation (1,200,000 at 5 minutes plus 400,000 at an hour),
+    /// 6,000,000 cache reads and 31,860 output. `lastHour` is a subset of
+    /// `window`, which is a subset of `today` — the containment any reader will
+    /// assume, so the sample had better honour it.
+    ///
+    /// `second_model` is what makes the two priced rows differ from the third:
+    /// pass a model the table has no published rate for and `costUsd` becomes a
+    /// PARTIAL total with `unpricedRequests` saying how much is missing, which
+    /// is the case a client renderer is most likely to get wrong.
+    fn contract_usage(second_model: &str) -> tcr_status_wire::UsageRow {
+        let opus = |requests: u64| {
+            contract_totals(
+                "claude-opus-5",
+                requests,
+                4_000 * requests,
+                12_000 * requests,
+                4_000 * requests,
+                60_000 * requests,
+                302 * requests,
+            )
+        };
+        let other = |requests: u64| {
+            contract_totals(
+                second_model,
+                requests,
+                3_750 * requests,
+                11_250 * requests,
+                3_750 * requests,
+                56_250 * requests,
+                335 * requests,
+            )
+        };
+        tcr_status_wire::UsageRow {
+            today: contract_add(opus(70), other(32)),
+            window: Some(tcr_status_wire::UsageWindow {
+                // The 5-hour reset every fixture row carries, minus five hours.
+                since: 1_767_225_600_000 - crate::usage::FIVE_HOURS_MS,
+                totals: contract_add(opus(28), other(12)),
+            }),
+            last_hour: contract_add(opus(8), other(4)),
+            today_by_model: [
+                ("claude-opus-5".to_string(), opus(70)),
+                (second_model.to_string(), other(32)),
+            ]
+            .into_iter()
+            .collect(),
         }
     }
 
@@ -5223,6 +5369,9 @@ mod tests {
                 // test has real group data to read, and the one the greppable
                 // `groups=codereview,dev` text-line assertion targets.
                 &["codereview", "dev"],
+                // Every request priced: `costUsd` is a complete figure and
+                // `unpricedRequests` is 0.
+                Some(contract_usage("claude-sonnet-5")),
             ),
             // `near`: at threshold, so `held` carries a window — the only row
             // that exercises the nested object.
@@ -5240,6 +5389,12 @@ mod tests {
                 None,
                 QuotaState::NearLimit,
                 &[],
+                // A model the built-in table has no published rate for, so a
+                // THIRD of this row's requests are unpriced: `costUsd` is a
+                // partial total and `unpricedRequests` says so. The case a
+                // client renderer is most likely to get wrong — silently
+                // presenting a partial sum as the whole spend.
+                Some(contract_usage("claude-sonnet-4-5-20250929")),
             ),
             // `spent`: fully consumed, and carrying a probe error string.
             contract_account(
@@ -5256,6 +5411,7 @@ mod tests {
                 Some("probe failed: connection reset"),
                 QuotaState::Exhausted,
                 &[],
+                Some(contract_usage("claude-sonnet-5")),
             ),
             // Never probed AND disabled: the four quota fractions and
             // `cacheHitRatio` are all null. This row is the one that shipped a
@@ -5275,6 +5431,13 @@ mod tests {
                 None,
                 QuotaState::Normal,
                 &[],
+                // NO usage object at all — the shape a client gets from a
+                // server built before usage existed. The key is absent, not
+                // null-valued and not zero-filled, so both decoders are pinned
+                // against the skew that actually happens here: the binary on
+                // disk is rebuilt on merge while the live process keeps serving
+                // until someone restarts it.
+                None,
             ),
         ];
         let mut accounts = accounts;
@@ -5675,6 +5838,7 @@ mod tests {
             groups: Vec::new(),
             reserved_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
+            usage: None,
         };
         let accounts = vec![
             AccountSnapshot {
@@ -5683,6 +5847,7 @@ mod tests {
                 groups: vec!["dev".to_string(), "codereview".to_string()],
                 reserved_groups: vec!["codereview".to_string()],
                 control_allowed_groups: Vec::new(),
+                usage: None,
                 ..base.clone()
             },
             AccountSnapshot {

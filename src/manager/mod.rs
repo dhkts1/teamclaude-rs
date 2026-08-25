@@ -878,6 +878,18 @@ pub struct Manager {
     /// Global outbound throttle knobs, snapshotted from config at construction
     /// (default all-`None` → inert → byte-identical to the no-throttle build).
     throttle: ThrottleConfig,
+    /// Per-account usage buckets, pricing and the append-only ledger — the one
+    /// place a served request's tokens are aggregated for display. Present on
+    /// every `Manager`, but only the SERVING process attaches a ledger to it
+    /// (`Self::attach_usage_ledger`), so an offline manager's tracker is empty
+    /// and its rows read as "not measured" rather than as zero traffic.
+    ///
+    /// Lock order: this is a **leaf** lock. Nothing taken while it is held, and
+    /// it is always innermost — `Self::record_usage` takes the accounts lock,
+    /// drops it, and only then records here; `Self::snapshot` holds the accounts
+    /// READ lock across its `usage_row` calls, which is safe precisely because
+    /// no path ever runs the other way round.
+    usage: crate::usage::UsageTracker,
     /// Resolved hard-lock target (index of the account named by `config.lockAccount`),
     /// or `None` when unlocked / the name did not match. When `Some(i)`, [`Self::select`]
     /// returns `i` unconditionally (bypassing rotation/affinity/migration) — no failover.
@@ -1147,8 +1159,14 @@ impl Manager {
             idx
         });
 
+        let usage = crate::usage::UsageTracker::new(
+            accounts.len(),
+            crate::pricing::PricingTable::new(config.pricing.clone().into_iter().collect()),
+        );
+
         let manager = Arc::new(Self {
             accounts: RwLock::new(accounts),
+            usage,
             refresher,
             prober,
             warmer,
@@ -2658,6 +2676,8 @@ mod tests {
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         }
     }

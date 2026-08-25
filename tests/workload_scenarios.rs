@@ -222,6 +222,8 @@ impl Fleet {
             http1_only: false,
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),
             group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
             extra: serde_json::Map::new(),
         };
         let manager = Manager::new(

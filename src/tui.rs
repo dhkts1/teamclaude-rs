@@ -1462,6 +1462,7 @@ mod tests {
             groups: Vec::new(),
             reserved_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
+            usage: None,
         }
     }
 
