@@ -514,11 +514,18 @@ enum ShellProbe {
     /// two-account fleet would let assertion 5 pass on a panel that is short for
     /// an honest reason.
     private static func probeFleet() -> Fleet {
+        // Relative, not a fixed epoch: `QuotaFormat.resetCaption` refuses a
+        // reset that is not in the future, so a hardcoded timestamp would draw
+        // the Fable caption today and drop it silently a month from now —
+        // shortening the very line whose width this probe exists to check.
+        let fableReset = Int64(Date().addingTimeInterval(4.5 * 86_400).timeIntervalSince1970 * 1000)
         let rows = (1...13).map { index in
             """
             {"name":"probe-\(index)@example.com","priority":0,"status":"active",
              "disabled":false,"quota":0.\(index % 9 + 1),"quotaState":"ok",
-             "fiveHour":0.1,"sevenDay":0.1,"sevenDayOi":0.0,"held":[],
+             "fiveHour":0.1,"sevenDay":0.1,
+             "sevenDayOi":0.1,"sevenDayOiState":"ok","sevenDayOiResetAtMs":\(fableReset),
+             "held":[],
              "requests":1,"inputTokens":1,"outputTokens":1,"cacheReadTokens":1,
              "cacheCreationTokens":0,"cacheHitRatio":0.5,"probeStatus":"ok",
              "probeError":null,

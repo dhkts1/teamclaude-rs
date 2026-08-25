@@ -130,6 +130,24 @@ struct FleetView: View {
             usageSummary
             updateStateLine
         }
+        // OUTSIDE `usageSummary`'s own `if`, and outside the subtree that
+        // emits these two preferences — the same placement `RowHeightsKey`'s
+        // observer already has on the ScrollView, and for the same reason.
+        // Attached inside that branch, the emitter and its observers vanished
+        // together the moment the spend line stopped rendering, so neither
+        // closure fired and `usageLineHeight`/`usageLineBaseline` kept their
+        // last values on a header that was no longer on screen — 14 to 28pt
+        // still being subtracted from the account list's budget for the rest
+        // of the session. That is not an exotic state: it is what the panel
+        // shows the instant the proxy is restarted onto a build predating
+        // `usage`, or the read goes offline.
+        //
+        // Here they fire with each key's `defaultValue` (0) when the emitting
+        // subtree disappears, which is the reset — a header that draws no
+        // spend line has no overflow, and `listBudget` gives the list the
+        // whole cap back.
+        .onPreferenceChange(UsageLineHeightKey.self) { usageLineHeight = $0 }
+        .onPreferenceChange(UsageLineBaselineKey.self) { usageLineBaseline = $0 }
     }
 
     /// The fleet's spend, burn rate, model mix and cache hit rate, on one line:
@@ -147,6 +165,8 @@ struct FleetView: View {
     /// so the height it takes when it wraps comes out of the account list's
     /// budget rather than out of the footer's place on screen. The baseline
     /// `Text` is hidden and drawn as an overlay, so it occupies no layout.
+    /// This view only EMITS those two measurements; `header` observes them,
+    /// outside this `if`, so that they reset when the line stops rendering.
     @ViewBuilder
     private var usageSummary: some View {
         if case .loaded(let fleet) = poller.state, let line = fleet.usageSummaryLine {
@@ -172,8 +192,6 @@ struct FleetView: View {
                             }
                         )
                 }
-                .onPreferenceChange(UsageLineHeightKey.self) { usageLineHeight = $0 }
-                .onPreferenceChange(UsageLineBaselineKey.self) { usageLineBaseline = $0 }
         }
     }
 
@@ -310,7 +328,10 @@ struct FleetView: View {
                 // already uses to mark a scope boundary (see `appActions`).
                 // Only drawn when the control row is actually first: index 0
                 // is an ordinary pool row on every fleet without one set.
-                if index == 0, account.name == control.current {
+                // `hasControlHairline` is the same condition, and
+                // `visibleRowsHeight` sizes the viewport with it — they must
+                // stay one predicate or the list is short by 8.5pt again.
+                if index == 0, hasControlHairline(rows) {
                     Hairline()
                 }
             }
@@ -359,16 +380,34 @@ struct FleetView: View {
     /// empty and this returns the budget itself, so the panel never renders at
     /// zero or one-row height while waiting for a real measurement.
     private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
-        let orderedHeights = fleet.rowsInDisplayOrder(pinning: control.current).compactMap {
-            rowHeights[$0.id]
-        }
+        let rows = fleet.rowsInDisplayOrder(pinning: control.current)
+        let orderedHeights = rows.compactMap { rowHeights[$0.id] }
         return PanelHeight.visibleRowsHeight(
             rowHeights: orderedHeights,
             spacing: Tok.rowSpacing,
+            // The separator `accountList` draws under a PINNED control row.
+            // `rowHeights` is filled from `AccountRow`'s own GeometryReader and
+            // the hairline is not an `AccountRow`, so nothing in that array
+            // knows about it — and it costs the list its own thickness plus one
+            // more gap, 8.5pt the viewport was short of its content on every
+            // fleet with a control account set.
+            controlHairline: hasControlHairline(rows) ? Tok.hairlineWidth : nil,
             budget: PanelHeight.listBudget(
                 cap: Tok.panelMaxHeight,
-                headerOverflow: usageLineHeight - usageLineBaseline,
+                headerOverflow: PanelHeight.headerOverflow(
+                    lineHeight: usageLineHeight,
+                    oneLineHeight: usageLineBaseline,
+                    // The line's own render condition, read from the fleet
+                    // rather than from the last measurement: a measurement
+                    // taken while the line existed does not expire on its own.
+                    lineIsDrawn: fleet.usageSummaryLine != nil),
                 minimum: Tok.panelMinListHeight))
+    }
+
+    /// Whether `accountList` will insert its control-row separator — the same
+    /// condition, written once, so the drawing and the measuring cannot drift.
+    private func hasControlHairline(_ rows: [Account]) -> Bool {
+        rows.first?.name == control.current && control.current != nil
     }
 
     private func offlineNotice(_ source: StatusSource) -> some View {
@@ -960,6 +999,36 @@ struct AccountRow: View {
         hasStaleQuotaReading ? AnyShapeStyle(Tok.disabled) : AnyShapeStyle(.tertiary)
     }
 
+    /// The Fable weekly figure's tint, from that window's OWN state.
+    ///
+    /// It carries the colour because it has no bar to carry it — the 7d line's
+    /// own percentage can stay neutral beside a tinted bar, and this one cannot.
+    /// `near` and `spent` take the window's hue for the same reason
+    /// `captionTint(for:)` does: there the figure IS the news, and it should be
+    /// findable down a column of thirteen rows. `ok` stays neutral rather than
+    /// green, because that is twelve of those thirteen rows and colouring the
+    /// unremarkable case spends the panel's colour budget on it.
+    ///
+    /// An ABSENT `sevenDayOiState` is neutral too, and deliberately does not
+    /// fall back to the composite `quotaState` the way `effectiveQuotaState`
+    /// does for the other two windows: the composite is the most-spent of all
+    /// three, so borrowing it paints the Fable figure red because the 5-hour
+    /// window is spent. That is not a hypothetical — `sevenDayOi` has been on
+    /// the wire far longer than `sevenDayOiState`, so a live proxy sends the
+    /// fraction with no state beside it routinely. The percentage is still a
+    /// measurement and still prints; only the state colour is withheld.
+    ///
+    /// Demoted with the rest of the row on a stale reading, like every other
+    /// figure on it.
+    private var fableFigureStyle: AnyShapeStyle {
+        if hasStaleQuotaReading { return AnyShapeStyle(Tok.disabled) }
+        guard let state = account.sevenDayOiState else { return AnyShapeStyle(.tertiary) }
+        switch state {
+        case .near, .spent: return AnyShapeStyle(Tok.color(for: state))
+        case .ok, .unknown: return AnyShapeStyle(.tertiary)
+        }
+    }
+
     /// Whether this account is in the rotation, said in BOTH directions.
     ///
     /// This row used to render a pill only when `disabled` was true, so "in
@@ -1125,6 +1194,11 @@ struct AccountRow: View {
         // "zero dollars" over an absent measurement is the one thing this
         // whole feature must not do.
         if let usageLabel = account.windowUsageSpokenLabel { parts.append(usageLabel) }
+        // The spoken half of the 7d line's Fable slot. Silent when the server
+        // did not measure that window, exactly as the printed slot is — and
+        // spoken when it did, because a gate that decides whether Fable
+        // requests can land here is not a sighted-user-only fact.
+        if let fable = account.fableWeeklySpokenLabel(now: Date()) { parts.append(fable) }
         if let failure = accounts.failure(for: account.name) {
             parts.append("last action failed: \(failure.summary)")
         }
@@ -1722,13 +1796,31 @@ struct AccountRow: View {
                         .foregroundStyle(account.health == .needsRelogin ? Tok.spent : .secondary)
                         .lineLimit(1)
                 }
-                if !countersAreStructural {
-                    Text("\(QuotaFormat.count(account.requests)) req · cache \(cacheLabel)")
+                // The FABLE weekly window — a third quota window, with its own
+                // reset, that gates Fable requests only and is reflected in
+                // neither the `7d` bar beside it nor `held[]`/`quotaState`
+                // (`docs/cli.md`, "The weekly quota pair on `--json`"). Until
+                // this slot existed the panel drew no Fable figure at all
+                // while the router was already gating on one.
+                //
+                // Absent, never `n/a`, when the server did not measure it:
+                // `fableWeeklyLabel` is nil for an older server or a
+                // never-learned window and this slot stays empty, the same
+                // rule the 5h line's spend figures follow.
+                if let fable = account.fableWeeklyLabel {
+                    Text(fable)
                         .font(Tok.detailDigitFont)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(fableFigureStyle)
                         .lineLimit(1)
                 }
             }
+            // The serving counters this line used to print. A running total
+            // since the proxy started answers "has this account been used",
+            // which is read once; the Fable percentage above is a live gate on
+            // what the router will do next, and only one of the two fits in
+            // the slot. Absent — no tooltip at all — on a structurally zero
+            // offline read, the same rule the printed line followed.
+            .help(account.countersTooltip(countersAreStructural: countersAreStructural) ?? "")
             if let error = account.lastStreamError, !error.isEmpty {
                 // A nil count here is not a quantity with an unknown value —
                 // unlike `account.requests` above, this number is a MODIFIER
@@ -1952,17 +2044,6 @@ struct AccountRow: View {
                 ? "Run `tcr enable` for this account and re-read the fleet."
                 : "Run `tcr disable` to take this account out of rotation. Reversible."
         )
-    }
-
-    /// `null` cache ratio means "nothing to divide by" — say so rather than
-    /// printing a 0% that reads as a measurement.
-    private var cacheLabel: String {
-        guard let ratio = account.cacheHitRatio else { return "n/a" }
-        return percent(ratio)
-    }
-
-    private func percent(_ value: Double) -> String {
-        "\(Int((value * 100).rounded()))%"
     }
 
 }
