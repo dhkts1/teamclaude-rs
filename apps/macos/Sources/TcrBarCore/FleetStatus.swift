@@ -1299,6 +1299,14 @@ public struct Fleet: Equatable, Sendable {
 
     /// Per-bucket counts in fixed severity order, with empty buckets omitted so
     /// a healthy fleet reads just `"12 ok"`.
+    ///
+    /// `.needsRelogin` and `.unmeasured` are excluded from the order: both are
+    /// already named by ``capacitySummary`` (`"1 need re-login"`,
+    /// `"1 unmeasured"`), and this tally used to name them a second time —
+    /// the header line read `"1 of 2 ready · 1 need re-login · 1 ok · 1 need
+    /// re-login"`. Every other bucket appears in `capacitySummary` only as a
+    /// number folded into `readyCount`, never spelled out on its own, so it
+    /// keeps its place here.
     public var breakdown: [FleetTally] {
         let disabledCount = accounts.count - enabledCount
         var counts: [FleetTally.Kind: Int] = [:]
@@ -1307,7 +1315,7 @@ public struct Fleet: Equatable, Sendable {
         }
         counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .needsRelogin, .unmeasured, .disabled,
+            .ok, .near, .spent, .unknown, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }

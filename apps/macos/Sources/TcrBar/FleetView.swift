@@ -275,7 +275,8 @@ struct FleetView: View {
             onRelogin: { reloginAccount(account.name) },
             groupController: groupController,
             removeController: removeController,
-            allAccounts: fleet.accounts
+            allAccounts: fleet.accounts,
+            snapshotMode: snapshotMode
         )
         .background(
             GeometryReader { proxy in
@@ -751,6 +752,13 @@ struct AccountRow: View {
     /// account is not already in, not just the ones visible in whatever
     /// section this row happens to be drawn under.
     let allAccounts: [Account]
+    /// Mirrors ``FleetView/snapshotMode``. `ImageRenderer` cannot draw a
+    /// `Menu` — it rasterises the yellow "unsupported control" placeholder
+    /// the README hero used to ship — so a snapshot draws
+    /// ``accountActionsMenuLabel`` on its own, with no `Menu` wrapping it.
+    /// Defaults to `false` so every other call site (the live panel) is
+    /// unchanged.
+    var snapshotMode: Bool = false
 
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
@@ -1399,24 +1407,44 @@ struct AccountRow: View {
     /// and a bordered icon-only control reads as heavier chrome than a
     /// 13pt row wants. This is the one icon-only control in the panel, so
     /// there is no existing icon-menu style to match instead.
+    @ViewBuilder
     private var accountActionsMenu: some View {
-        Menu {
-            contextMenuItems
-        } label: {
-            Image(systemName: "gearshape")
-                .font(Tok.bodyFont)
-                .foregroundStyle(.secondary)
-                // The Menu's own `.accessibilityLabel` below names the
-                // control; without hiding the glyph too, VoiceOver reads
-                // both the image ("gearshape, image") and the label,
-                // announcing the same control twice.
-                .accessibilityHidden(true)
+        if snapshotMode {
+            // `ImageRenderer` cannot draw a `Menu` at all — it rasterises a
+            // yellow prohibition glyph in its place, which is what shipped
+            // in the README hero before this branch existed. A snapshot
+            // draws the label on its own, non-interactive, so the PNG shows
+            // the gearshape a user actually sees on the live panel.
+            accountActionsMenuLabel
+                .controlSize(.small)
+                .fixedSize()
+                .accessibilityLabel("Account actions for \(account.name)")
+                .help("Enable/disable, re-login, or copy the account name.")
+        } else {
+            Menu {
+                contextMenuItems
+            } label: {
+                accountActionsMenuLabel
+            }
+            .menuStyle(.borderlessButton)
+            .controlSize(.small)
+            .fixedSize()
+            .accessibilityLabel("Account actions for \(account.name)")
+            .help("Enable/disable, re-login, or copy the account name.")
         }
-        .menuStyle(.borderlessButton)
-        .controlSize(.small)
-        .fixedSize()
-        .accessibilityLabel("Account actions for \(account.name)")
-        .help("Enable/disable, re-login, or copy the account name.")
+    }
+
+    /// The gearshape glyph shared by the live `Menu` and its `snapshotMode`
+    /// stand-in, so the two can never draw two different icons.
+    private var accountActionsMenuLabel: some View {
+        Image(systemName: "gearshape")
+            .font(Tok.bodyFont)
+            .foregroundStyle(.secondary)
+            // The Menu's own `.accessibilityLabel` below names the
+            // control; without hiding the glyph too, VoiceOver reads
+            // both the image ("gearshape, image") and the label,
+            // announcing the same control twice.
+            .accessibilityHidden(true)
     }
 
     /// The one place `tcr enable`/`tcr disable` is actually run. Shared by
