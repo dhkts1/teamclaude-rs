@@ -262,6 +262,22 @@ enum RenderStates {
         // that the caption's digits differ between renders.
         fiveHourResetInMinutes: Int? = nil,
         sevenDayResetInMinutes: Int? = nil,
+        // The FABLE weekly window — a third window with its own reset, gating
+        // Fable requests only. Independent of the two above on purpose: a row
+        // whose 7d window is spent can have Fable headroom and the reverse, and
+        // a fixture that tied them together could not show it.
+        //
+        // `"0.0"` by default, which draws `fable 0%` — a measured zero, the
+        // most headroom there is. `"null"` is the NOT-MEASURED row (an older
+        // server, or a window never learned for this account) and must draw an
+        // EMPTY slot, never `n/a`; scene 14 carries one.
+        sevenDayOi: String = "0.0",
+        // `"null"` is the shape a proxy predating `sevenDayOiState` sends: a
+        // real fraction with no state word beside it, which draws the figure in
+        // the neutral tint rather than borrowing the composite state. Scene 14
+        // carries one of those too.
+        sevenDayOiState: String = "ok",
+        sevenDayOiResetInMinutes: Int? = nil,
         // The `usage` object, as raw JSON. Defaults to the measured shape, so
         // every existing scene shows the spend line the panel now draws.
         // `"null"` is the not-measured row — an older proxy, or an offline
@@ -293,9 +309,11 @@ enum RenderStates {
             {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
              "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
-             "sevenDayOi":0.0,"held":\(held),
+             "sevenDayOi":\(sevenDayOi),"sevenDayOiState":\(quote(sevenDayOiState)),
+             "held":\(held),
              "fiveHourResetAtMs":\(resetAtMs(fiveHourResetInMinutes)),
              "sevenDayResetAtMs":\(resetAtMs(sevenDayResetInMinutes)),
+             "sevenDayOiResetAtMs":\(resetAtMs(sevenDayOiResetInMinutes)),
              "requests":102,"inputTokens":8781926,"outputTokens":31860,
              "cacheReadTokens":7407414,"cacheCreationTokens":\(usage == "null" ? "null" : "1200000"),
              "cacheHitRatio":0.84,"probeStatus":"\(probe)",
@@ -538,17 +556,38 @@ enum RenderStates {
     /// The fully-priced card (`$5.61 · 12k out`, no marker) is scene 01's; a
     /// second priced model in this fleet would push the `?` past the two the
     /// header names, which is the one thing this scene exists to show.
+    /// The same four rows also carry all four branches of the FABLE weekly
+    /// slot on their 7d line, because that slot has the same shape of rule and
+    /// the same way of being got wrong:
+    ///
+    ///  - `partial@` — `near`: `fable 71% · in 4d 12h`, in that window's amber.
+    ///  - `unpriced@` — `spent`: `fable 100% · in 4d 12h`, in red. Its 7d
+    ///    window is `ok` in the same frame, which is the point: the two are
+    ///    independent windows and a reader must be able to see one spent while
+    ///    the other has headroom.
+    ///  - `no-window@` — a real fraction with NO state word, which is what a
+    ///    proxy predating `sevenDayOiState` sends and therefore what the live
+    ///    one sends today. Neutral tint, real percentage: nothing borrows the
+    ///    composite state to colour it.
+    ///  - `unmeasured@` — no fraction at all: an EMPTY slot, never `n/a`.
     private static var usageStatsJSON: String {
         let partial = account(
             "partial@example.com", quota: "0.42", state: "ok",
             fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320,
+            sevenDayOi: "0.71", sevenDayOiState: "near", sevenDayOiResetInMinutes: 6_498,
             usage: partiallyPricedUsage)
         let unpriced = account(
-            "unpriced@example.com", quota: "0.31", state: "ok", usage: unpricedUsage)
+            "unpriced@example.com", quota: "0.31", state: "ok",
+            sevenDayOi: "1.0", sevenDayOiState: "spent", sevenDayOiResetInMinutes: 6_498,
+            usage: unpricedUsage)
         let noWindow = account(
-            "no-window@example.com", quota: "0.18", state: "ok", usage: noWindowUsage)
+            "no-window@example.com", quota: "0.18", state: "ok",
+            sevenDayOi: "0.34", sevenDayOiState: "null",
+            usage: noWindowUsage)
         let unmeasured = account(
-            "unmeasured@example.com", quota: "0.07", state: "ok", usage: unmeasuredUsage)
+            "unmeasured@example.com", quota: "0.07", state: "ok",
+            sevenDayOi: "null", sevenDayOiState: "null",
+            usage: unmeasuredUsage)
         return "[\(partial),\(unpriced),\(noWindow),\(unmeasured)]"
     }
 

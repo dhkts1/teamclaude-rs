@@ -257,7 +257,8 @@ final class UsageStatsTests: XCTestCase {
         let line = try XCTUnwrap(fleet.usageSummaryLine)
         XCTAssertEqual(
             line,
-            "$14.0 today · $3.00/hr · opus-5 86% · sonnet-5 14% · +1 · cache 75% · 32 unpriced")
+            "$14.0 today · $3.00/hr · opus-5 86% · sonnet-5 14% · +1 · cache 75% "
+                + "· 32 unpriced today")
     }
 
     func testHeaderLineCollapsesTheThirdModel() throws {
@@ -460,6 +461,73 @@ final class UsageStatsTests: XCTestCase {
             "the merge happens on the label, before anything ranks or counts it")
     }
 
+    /// Round two, finding 5. One label, two ids, one of them priceable.
+    ///
+    /// `todayByModelLabel` canonicalizes before grouping, so `claude-opus-5`
+    /// and `claude-opus-5-20250929` merge — the ordinary state during a
+    /// rollout. If this build has a rate for one id and not the other,
+    /// `UsageTotals.adding` folds `(priced, nil)` into the priced value, and
+    /// the merged bucket lands in `todayModelShare`'s PRICED head with a
+    /// non-nil cost. The `?` the whole unpriced feature exists to show can
+    /// never fire for it, so the header printed `opus-5 62%` — a clean
+    /// percentage of a partial cost — and only the fleet-wide clause hinted
+    /// otherwise. `partial` carries it out, and the figure wears the same `+`
+    /// the card's own cost wears for the same reason.
+    func testAMergedLabelSaysItsPercentIsAFloor() throws {
+        let fleet = Fleet(accounts: [
+            row(
+                name: "alice@example.com",
+                usage: UsageRow(
+                    today: totals(cost: 20.0, input: 100, unpriced: 30, requests: 130),
+                    window: nil,
+                    lastHour: totals(cost: 1.0),
+                    todayByModel: [
+                        // One model, two ids. The dated one has no rate here.
+                        "claude-opus-5": totals(cost: 12.0, output: 1_000, requests: 70),
+                        "claude-opus-5-20250929": totals(
+                            cost: nil, output: 400, unpriced: 30, requests: 30),
+                        "claude-sonnet-5": totals(cost: 8.0, output: 600, requests: 30),
+                    ]))
+        ])
+        let merged = try XCTUnwrap(fleet.todayByModelLabel["opus-5"])
+        XCTAssertEqual(merged.costUsd, 12.0, "the priced half is all the cost there is")
+        XCTAssertEqual(
+            merged.unpricedRequests, 30,
+            "and the unpriceable half is still counted, which is what makes the figure a floor")
+
+        let share = fleet.todayModelShare
+        XCTAssertEqual(share.map(\.model), ["opus-5", "sonnet-5"])
+        XCTAssertTrue(share[0].partial, "30 of this label's requests are missing from its cost")
+        XCTAssertFalse(share[1].partial, "sonnet-5 was priced in full")
+        XCTAssertEqual(share[0].label, "opus-5 60%+")
+        XCTAssertEqual(share[1].label, "sonnet-5 40%")
+
+        let line = try XCTUnwrap(fleet.usageSummaryLine)
+        XCTAssertTrue(line.contains("opus-5 60%+ · sonnet-5 40%"), line)
+    }
+
+    /// The `+` marks a partial cost, never an absent one. A label with no price
+    /// at all keeps `?`, which already says everything a `+` would qualify.
+    func testAnEntirelyUnpricedLabelKeepsItsQuestionMarkAndNoPlus() throws {
+        let fleet = Fleet(accounts: [
+            row(
+                name: "alice@example.com",
+                usage: UsageRow(
+                    today: totals(cost: 12.0, input: 100, unpriced: 32, requests: 132),
+                    window: nil,
+                    lastHour: totals(cost: 1.0),
+                    todayByModel: [
+                        "claude-opus-5": totals(cost: 12.0, output: 21_140, requests: 100),
+                        "claude-sonnet-4-5-20250929": totals(
+                            cost: nil, output: 8_860, unpriced: 32, requests: 32),
+                    ]))
+        ])
+        let share = fleet.todayModelShare
+        XCTAssertEqual(share[1].label, "sonnet-4-5 ?")
+        XCTAssertFalse(share[1].partial)
+        XCTAssertEqual(share[0].label, "opus-5 100%", "this label was priced in full")
+    }
+
     // MARK: A measured zero is a reading
 
     /// Finding 4. Between the server's local midnight and the first request of
@@ -487,7 +555,11 @@ final class UsageStatsTests: XCTestCase {
 
     /// Finding 5. `n/a/hr` runs two tokens together and parses as a path, where
     /// every other `n/a` in this family stands alone as a word. The rate is
-    /// dropped instead; the `N unpriced` clause already says why it is missing.
+    /// dropped instead — and the HOUR says why, in its own clause. Round two's
+    /// finding 4 is the reason that clause is not today's: the two buckets
+    /// share no traffic across the server's local midnight, so today's count
+    /// cannot speak for the hour, and ``testAnUnpriceableHourSaysSoEvenWhenTheDayIsEmpty``
+    /// is the case that proves it.
     func testAnUnpriceableHourDropsTheRateRatherThanRunningItTogether() throws {
         let fleet = Fleet(accounts: [
             row(
@@ -501,8 +573,55 @@ final class UsageStatsTests: XCTestCase {
         let line = try XCTUnwrap(fleet.usageSummaryLine)
         XCTAssertFalse(line.contains("n/a/hr"), line)
         XCTAssertFalse(line.contains("/hr"), "an unpriceable hour has no rate to state: \(line)")
-        XCTAssertTrue(line.hasPrefix("$14.0 today · opus-5 100%"), line)
-        XCTAssertTrue(line.hasSuffix("102 unpriced"), line)
+        XCTAssertTrue(line.hasPrefix("$14.0 today · 12 unpriced this hour · opus-5 100%"), line)
+        XCTAssertTrue(line.hasSuffix("102 unpriced today"), line)
+    }
+
+    /// Round two, finding 4. The `/hr` segment is keyed on the HOUR's own
+    /// state, and when the hour cannot be priced the line says so about the
+    /// hour.
+    ///
+    /// The bug was that the doc justified dropping the rate with "the
+    /// `N unpriced` clause already says why" — a clause computed from `today`.
+    /// `lastHour` is the trailing 60 minutes and `today` is the server's local
+    /// calendar day, so at 00:30 they share no traffic at all: `today` is empty
+    /// (a measured `$0.00`, and zero unpriced requests) while the hour still
+    /// holds the previous evening's traffic on a model this build has no rate
+    /// for. The header then printed `$0.00 today · cache n/a` — the burn rate
+    /// the panel exists to show simply gone, with nothing saying it was
+    /// unknown rather than unrendered.
+    func testAnUnpriceableHourSaysSoEvenWhenTheDayIsEmpty() throws {
+        let fleet = Fleet(accounts: [
+            row(
+                name: "alice@example.com",
+                usage: UsageRow(
+                    // Midnight has rolled: today served nothing at all.
+                    today: totals(cost: nil, requests: 0),
+                    window: nil,
+                    lastHour: totals(cost: nil, unpriced: 12, requests: 12),
+                    todayByModel: [:]))
+        ])
+        XCTAssertEqual(
+            fleet.todayUnpricedRequests, 0,
+            "today's count cannot explain the hour — it is a different bucket")
+        XCTAssertEqual(fleet.lastHourUnpricedRequests, 12)
+        let line = try XCTUnwrap(fleet.usageSummaryLine)
+        XCTAssertEqual(line, "$0.00 today · 12 unpriced this hour · cache n/a")
+        XCTAssertFalse(
+            line.contains("/hr"),
+            "no rate is stated — but the hour is no longer silent: \(line)")
+    }
+
+    /// Round two, finding 4, the other direction: an hour that served nothing
+    /// is a measured `$0.00/hr`, and must not grow an unpriced clause.
+    func testAnIdleHourKeepsItsMeasuredZeroRate() throws {
+        let idle = totals(cost: nil, requests: 0)
+        let fleet = Fleet(accounts: [
+            row(
+                name: "alice@example.com",
+                usage: UsageRow(today: idle, window: nil, lastHour: idle, todayByModel: [:]))
+        ])
+        XCTAssertEqual(fleet.burnRateSegment, "$0.00/hr")
     }
 
     // MARK: Formatters — the band is chosen after rounding
@@ -528,6 +647,58 @@ final class UsageStatsTests: XCTestCase {
         XCTAssertEqual(QuotaFormat.usd(9.996), "$10.0")
         XCTAssertEqual(QuotaFormat.usd(99.94), "$99.9", "and below the rounding point it does not")
         XCTAssertEqual(QuotaFormat.usd(9.994), "$9.99")
+    }
+
+    /// Round two, finding 6. The band re-pass fixed the SUFFIX and left the
+    /// DECIMALS reading the raw unit, so `9_999` still printed `"10.0k"` —
+    /// five characters and three useful figures, the identical defect the
+    /// re-pass exists to remove, one field over. Both come from the rounded
+    /// figure now.
+    func testTokensPickTheirDecimalsAfterRoundingToo() {
+        XCTAssertEqual(QuotaFormat.tokens(9_999), "10k", "not 10.0k")
+        XCTAssertEqual(QuotaFormat.tokens(9_999_999), "10M")
+        XCTAssertEqual(QuotaFormat.tokens(9_999_999_999), "10G")
+        XCTAssertEqual(
+            QuotaFormat.tokens(9_950), "9.9k",
+            "and a value that does NOT round up to ten keeps its decimal")
+        XCTAssertEqual(QuotaFormat.tokens(9_949), "9.9k")
+        XCTAssertEqual(QuotaFormat.tokens(10_000), "10k")
+        XCTAssertEqual(
+            QuotaFormat.tokens(9_999).count, 3,
+            "the whole rule is four characters, and this is the value that broke it")
+    }
+
+    /// Round two, finding 7. The promotion loop stopped at `G`, so the exact
+    /// `"1000k"` overflow the re-pass removes everywhere else was still
+    /// reachable at the top of the ladder: `999_500_000_000` rendered
+    /// `"1000G"`, a unit below the figure it names.
+    func testTheTopBandRoundsLikeEveryOtherBand() {
+        XCTAssertEqual(QuotaFormat.tokens(999_500_000_000), "1.0T", "not 1000G")
+        XCTAssertEqual(QuotaFormat.tokens(5_000_000_000_000), "5.0T", "not 5000G")
+        XCTAssertEqual(QuotaFormat.tokens(999_499_999_999), "999G", "below the rounding point")
+        XCTAssertEqual(QuotaFormat.tokens(1_000_000_000_000), "1.0T")
+    }
+
+    /// Round two, finding 9. `usd` and `tokens` each carried their own
+    /// round-then-pick-the-band pass, which is exactly how they drifted: the
+    /// same defect was fixed in one and left in the other. One helper now, and
+    /// this asserts the rule holds identically on both sides of it — a figure
+    /// that rounds up across a boundary is printed at the band it rounded INTO,
+    /// never the one it started in.
+    func testBothFormattersShareTheSameRoundThenBandRule() {
+        // Money: the boundary is a decimal count.
+        XCTAssertEqual(QuotaFormat.usd(9.996), "$10.0")
+        // Tokens: the boundary is a decimal count AND a unit.
+        XCTAssertEqual(QuotaFormat.tokens(9_999), "10k")
+        XCTAssertEqual(QuotaFormat.tokens(999_950), "1.0M")
+        // And the helper itself, driven directly: one re-pass, not zero.
+        let decimals = QuotaFormat.bandAfterRounding(
+            9.996,
+            band: { $0 < 10 ? 2 : 1 },
+            printedMagnitude: { decimals, magnitude in
+                Double(String(format: "%.\(decimals)f", magnitude)) ?? magnitude
+            })
+        XCTAssertEqual(decimals, 1, "9.996 rounds to 10.00, which is the one-decimal band")
     }
 
     // MARK: A decoded field nobody renders

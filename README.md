@@ -82,7 +82,9 @@ Every other key, its default and the file's permissions are in
 menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet capacity at
 a glance. Each row is one line per quota window — bar, percentage and the countdown to that
 window's reset — plus probe health and a menu that shells out to `tcr`, so you can steer the
-fleet from the panel.
+fleet from the panel. Each row also carries the Fable weekly window, with its own percentage
+and its own countdown, for an account the proxy has learned one for; an account it has not
+shows nothing there rather than a zero.
 The header line and each card also say what that traffic would have cost on the API — spend
 today, the last hour's burn rate, the model mix and the cache hit rate — attributed per account
 by the proxy as it serves, and replayed from disk after a restart. Nothing here is a bill:

@@ -264,11 +264,20 @@ public enum Tok {
     /// popover. `PanelHeight.listBudget` subtracts the header's overflow from
     /// this cap instead, which is what holds the panel's TOTAL height to what
     /// it was before the spend line existed.
-    public static let panelMaxHeight: CGFloat = 520
+    ///
+    /// The number itself lives in `PanelHeight`, with the arithmetic that
+    /// reads it, because the test target links `TcrBarCore` and not this one:
+    /// stated here, the gate over that arithmetic could only assert against a
+    /// hand-copied duplicate and would stay green through any change to it.
+    /// It keeps its name over there, and `scripts/tcrbar-palette.py` reads
+    /// that file as well as this one, so `--tcr-panel-max-height` is the same
+    /// token it always was.
+    public static let panelMaxHeight = PanelHeight.panelMaxHeight
     /// The floor under that budget: a header long enough to eat the whole cap
     /// must still leave a list a reader can scroll. A zero-height scroll view
-    /// reads as a broken panel, not as a full one.
-    public static let panelMinListHeight: CGFloat = 120
+    /// reads as a broken panel, not as a full one. Authored in `PanelHeight`
+    /// for the reason above.
+    public static let panelMinListHeight = PanelHeight.panelMinListHeight
     public static let gutter = space4
     public static let rowSpacing = space3
     public static let tightSpacing = space2
@@ -285,10 +294,13 @@ public enum Tok {
     /// same x on every card; a bar that took the leftover width could not.
     ///
     /// 72 is what fits. A row has about 300pt, and the 7-day line also carries
-    /// `100%` (31), `in 4d 12h` (50) and `102 req · cache 84%` (101). At 120 the
-    /// counters rendered as `102 req ·…`, at 80 they still did on the spent
-    /// rows. A truncated counter deletes a measurement; a shorter bar only
-    /// blunts a magnitude, and 72pt still resolves under a percent per pixel.
+    /// `100%` (31), `in 4d 12h` (50) and the Fable weekly window,
+    /// `fable 71% · in 4d 12h` (about 105). At 120 the trailing slot rendered
+    /// truncated, at 80 it still did on the spent rows. A truncated figure
+    /// deletes a measurement; a shorter bar only blunts a magnitude, and 72pt
+    /// still resolves under a percent per pixel. The serving counters that used
+    /// to hold that slot (`102 req · cache 84%`, 101) are a tooltip now — see
+    /// `Account.countersTooltip(countersAreStructural:)`.
     public static let barWidth: CGFloat = 72
     /// Width of the `5h`/`7d` label. `5h` and `7d` are not the same width in a
     /// proportional face, so without this the two bars in a card start a hair

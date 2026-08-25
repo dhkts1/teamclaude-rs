@@ -309,21 +309,39 @@ def _parsed_geometry(source, pattern, declaration_shape):
     return found
 
 
-def swift_geometry(tokens_swift):
-    """Read the spacing, radius and type scale out of Tokens.swift.
+def swift_geometry(*sources):
+    """Read the spacing, radius and type scale out of the Swift token sources.
 
     Parsed rather than mirrored, so there is exactly one place each number is
     written down. Aliases (`gutter = space4`) are skipped on purpose: they are
     Swift-side naming for Swift call sites, not separate values, and emitting
     both would imply two knobs where there is one.
 
+    Several sources, not one, because a number's home is the file that USES it:
+    `panelMaxHeight` and `panelMinListHeight` are clamps `PanelHeight` applies,
+    and they moved there so the test target — which links `TcrBarCore` and not
+    the executable `Tok` lives in — could assert against the real values instead
+    of hand-copied duplicates. Reading both files is what keeps that move from
+    quietly deleting two published tokens. A name declared in two sources is an
+    error rather than a silent last-one-wins: that is the duplicate this whole
+    generator exists to rule out.
+
     Raises rather than returning a partial map. An emitter that silently ships
     a stylesheet missing half its spacing scale is worse than one that stops:
     the caller gets a file that looks complete and is not.
     """
-    return _parsed_geometry(
-        tokens_swift, SWIFT_NUMERIC,
-        "public static let <name>: CGFloat = <n>")
+    merged = {}
+    for source in sources:
+        found = _parsed_geometry(
+            source, SWIFT_NUMERIC,
+            "public static let <name>: CGFloat = <n>")
+        clashes = sorted(set(found) & set(merged))
+        if clashes:
+            raise SystemExit(
+                f"{source}: {', '.join(clashes)} already declared in another "
+                "token source. One number, one home — pick which file owns it.")
+        merged.update(found)
+    return merged
 
 
 def rust_geometry(tokens_rust):
@@ -474,14 +492,22 @@ def main():
     parser.add_argument("--emit-rust", metavar="PATH",
                         help="write the geometry constants as Rust consts "
                              "to PATH")
-    default_tokens_swift = str(
-        pathlib.Path(__file__).resolve().parent.parent
-        / "apps/macos/Sources/TcrBar/Tokens.swift")
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    # Two files, because a number lives with the code that applies it: the
+    # spacing/radius/type scale in Tokens.swift, and the account list's two
+    # clamps in PanelHeight, which is in the library the tests can link. Both
+    # are published tokens and always were; see swift_geometry().
+    default_tokens_swift = [
+        str(repo_root / "apps/macos/Sources/TcrBar/Tokens.swift"),
+        str(repo_root / "apps/macos/Sources/TcrBarCore/PanelHeight.swift"),
+    ]
     geometry_source = parser.add_mutually_exclusive_group()
     geometry_source.add_argument(
-        "--tokens-swift", metavar="PATH", default=None,
-        help="where the geometry scale is authored, as Swift "
-             f"(default: {default_tokens_swift})")
+        "--tokens-swift", metavar="PATH", action="append", default=None,
+        help="where the geometry scale is authored, as Swift. Repeatable; "
+             "each file is read and the results merged, and a name declared "
+             "twice is an error "
+             f"(default: {', '.join(default_tokens_swift)})")
     geometry_source.add_argument(
         "--tokens-rust", metavar="PATH", default=None,
         help="where the geometry scale is authored, as Rust -- mutually "
@@ -492,12 +518,13 @@ def main():
     # Explicit source selection, not extension-sniffing: whichever flag was
     # actually passed picks the parser. With neither passed, Swift stays the
     # default so today's invocation with no new flags is unchanged.
+    swift_sources = (
+        args.tokens_swift if args.tokens_swift is not None
+        else default_tokens_swift)
     if args.tokens_rust is not None:
         read_geometry = lambda: rust_geometry(args.tokens_rust)
     else:
-        read_geometry = lambda: swift_geometry(
-            args.tokens_swift if args.tokens_swift is not None
-            else default_tokens_swift)
+        read_geometry = lambda: swift_geometry(*swift_sources)
 
     panel = SURFACES["panel"]
     failures = []
@@ -609,10 +636,10 @@ def main():
 
     if args.emit_css or args.emit_json or args.emit_rust:
         geometry = read_geometry()
-        source_name = pathlib.Path(
-            args.tokens_rust if args.tokens_rust is not None
-            else (args.tokens_swift if args.tokens_swift is not None
-                  else default_tokens_swift)).name
+        source_name = (
+            pathlib.Path(args.tokens_rust).name
+            if args.tokens_rust is not None
+            else ", ".join(pathlib.Path(p).name for p in swift_sources))
         print(f"\ngeometry: {len(geometry)} values read from {source_name}")
         if args.emit_css:
             n = emit_css(args.emit_css, geometry)

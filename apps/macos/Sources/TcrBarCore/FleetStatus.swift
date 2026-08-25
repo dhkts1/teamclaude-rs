@@ -241,6 +241,11 @@ public enum QuotaFormat {
     /// same case, and what `cacheHitRatio` has always rendered here.
     public static let notMeasured = "n/a"
 
+    /// What a share nobody could compute prints as. Distinct from
+    /// ``notMeasured``: the model's TRAFFIC was measured — it is only its cost,
+    /// and therefore its share of a cost total, that this build cannot price.
+    public static let unknownShare = "?"
+
     /// `0.42` → `"42%"`; `nil` → `"n/a"`.
     ///
     /// A nil fraction must never come back as `"0%"`. Zero is a measurement
@@ -293,17 +298,47 @@ public enum QuotaFormat {
     /// The band is chosen from the ROUNDED figure, not the raw one. Picking it
     /// first printed `"$100.0"` for `99.96` and `"$10.00"` for `9.996`: three
     /// useful figures, one more than this rule promises, on exactly the values
-    /// that sit under a band's ceiling. One re-pass is enough — rounding can
-    /// lift a figure across one band, never two.
+    /// that sit under a band's ceiling. ``bandAfterRounding(_:band:printedMagnitude:)``
+    /// is that re-pass, shared with ``tokens(_:)``.
     public static func usd(_ value: Double?) -> String {
         guard let value else { return notMeasured }
-        let firstPass = usdDecimals(for: abs(value))
-        let rounded = Double(String(format: "%.\(firstPass)f", value)) ?? value
-        return "$" + String(format: "%.\(usdDecimals(for: abs(rounded)))f", value)
+        let decimals = bandAfterRounding(
+            abs(value),
+            band: usdDecimals(for:),
+            printedMagnitude: { decimals, magnitude in
+                Double(String(format: "%.\(decimals)f", magnitude)) ?? magnitude
+            })
+        return "$" + String(format: "%.\(decimals)f", value)
     }
 
     private static func usdDecimals(for magnitude: Double) -> Int {
         magnitude < 10 ? 2 : (magnitude < 100 ? 1 : 0)
+    }
+
+    /// The band a magnitude should PRINT at, chosen from the magnitude it has
+    /// after being rounded at the band its raw magnitude selects.
+    ///
+    /// Both formatters below need this and each used to carry its own pass,
+    /// which is how they drifted: ``usd(_:)`` re-picked its decimal count and
+    /// ``tokens(_:)`` re-picked only its unit, so `tokens(9_999)` printed
+    /// `"10.0k"` — three useful figures and five characters, the exact defect
+    /// the re-pass exists to remove — while `usd(9.996)` printed `"$10.0"`
+    /// correctly. One helper, one rule, one place to fix.
+    ///
+    /// `band` maps a magnitude to whatever the caller renders at: a decimal
+    /// count for money, a unit-and-decimals pair for token counts.
+    /// `printedMagnitude` maps a band back to the figure printing at that band
+    /// would actually yield, which is what the second pass reads.
+    ///
+    /// ONE re-pass, not a loop: rounding can lift a figure across one band, and
+    /// the figure it lifts to is exactly `1000` (or `10`, or `100`) of the next
+    /// unit, which is never itself rounded up again.
+    static func bandAfterRounding<Band>(
+        _ magnitude: Double,
+        band: (Double) -> Band,
+        printedMagnitude: (Band, Double) -> Double
+    ) -> Band {
+        band(printedMagnitude(band(magnitude), magnitude))
     }
 
     /// `812` → `"812"`; `48_000` → `"48k"`; `1_240_000` → `"1.2M"`;
@@ -316,27 +351,47 @@ public enum QuotaFormat {
     ///
     /// `nil` → `"n/a"`, never `"0"`: an absent count is not a count of zero.
     ///
-    /// The band is chosen from the ROUNDED figure, the same rule ``usd(_:)``
-    /// follows. Choosing it from the raw count printed `"1000k"` for `999_950`
-    /// and `"1000M"` for `999_500_000` — five characters on a line this
-    /// function exists to keep to four, and a unit one band below the figure it
-    /// names. A band is promoted while the count would round to `1000` of it.
+    /// BOTH the unit and the decimal count come from the ROUNDED figure, the
+    /// same rule ``usd(_:)`` follows through the same
+    /// ``bandAfterRounding(_:band:printedMagnitude:)`` pass. Taking either from
+    /// the raw count broke the rule in its own way: the unit printed `"1000k"`
+    /// for `999_950`, a unit one band below the figure it names, and the
+    /// decimals printed `"10.0k"` for `9_999`, five characters and three
+    /// useful figures on a line this function exists to keep to four and two.
+    ///
+    /// The ladder ends at `T`. A count that would round to `1000T` prints
+    /// verbatim, because there is no named unit above it — that needs about
+    /// 1e15 tokens in one bucket, and inventing a `P` for it would be a band
+    /// nobody can read rather than a fix.
     public static func tokens(_ value: Int?) -> String {
         guard let value else { return notMeasured }
-        let bands: [(divisor: Double, suffix: String)] = [
-            (1, ""), (1_000, "k"), (1_000_000, "M"), (1_000_000_000, "G"),
-        ]
-        func printed(_ unit: Double) -> String {
-            String(format: "%.\(abs(unit) < 10 ? 1 : 0)f", unit)
+        let band = bandAfterRounding(
+            abs(Double(value)),
+            band: tokenBand(for:),
+            printedMagnitude: { band, magnitude in
+                let unit = magnitude / tokenBands[band.unit].divisor
+                let printed = Double(String(format: "%.\(band.decimals)f", unit)) ?? unit
+                return printed * tokenBands[band.unit].divisor
+            })
+        guard band.unit > 0 else { return "\(value)" }
+        let unit = Double(value) / tokenBands[band.unit].divisor
+        return String(format: "%.\(band.decimals)f", unit) + tokenBands[band.unit].suffix
+    }
+
+    private static let tokenBands: [(divisor: Double, suffix: String)] = [
+        (1, ""), (1_000, "k"), (1_000_000, "M"), (1_000_000_000, "G"),
+        (1_000_000_000_000, "T"),
+    ]
+
+    /// The largest unit this magnitude reaches, and the decimals that unit
+    /// prints at — one below ten of the unit, none above, which is the
+    /// two-useful-figures rule ``usd(_:)`` states.
+    private static func tokenBand(for magnitude: Double) -> (unit: Int, decimals: Int) {
+        var unit = 0
+        while unit + 1 < tokenBands.count, magnitude >= tokenBands[unit + 1].divisor {
+            unit += 1
         }
-        var band = 0
-        while band + 1 < bands.count,
-            abs(Double(printed(Double(value) / bands[band].divisor)) ?? 0) >= 1_000
-        {
-            band += 1
-        }
-        guard band > 0 else { return "\(value)" }
-        return printed(Double(value) / bands[band].divisor) + bands[band].suffix
+        return (unit, magnitude / tokenBands[unit].divisor < 10 ? 1 : 0)
     }
 
     /// `"claude-sonnet-4-5-20250929"` → `"sonnet-4-5"`;
@@ -784,6 +839,21 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// `nil` here falls back to the shared `quotaState` tint for that bar.
     public let fiveHourState: QuotaState?
     public let sevenDayState: QuotaState?
+    /// The FABLE weekly window's own state (`src/cli.rs`'s `sevenDayOiState`),
+    /// the companion to ``sevenDayOi`` that ``sevenDayState`` is to
+    /// ``sevenDay``. Same threshold, same three words.
+    ///
+    /// `nil` both when the window has no reading and when the server predates
+    /// the field — and unlike the two above, that second case is the ORDINARY
+    /// one right now: ``sevenDayOi`` has been on the wire for far longer than
+    /// this state word, so a live proxy routinely sends a Fable fraction with
+    /// no state beside it. Nothing may fall back to the composite `quotaState`
+    /// here the way ``effectiveQuotaState(for:)`` does for the other two: the
+    /// composite is the most-spent of all three windows, so borrowing it would
+    /// paint a Fable figure red because the 5-hour window is spent — the same
+    /// overclaim ``quotaBarTintSource(for:)`` exists to prevent, one window
+    /// over. A `nil` here means the Fable figure wears no state colour at all.
+    public let sevenDayOiState: QuotaState?
     /// Each window's own reset instant, UNCONDITIONAL — carried whenever the
     /// window has a live reset, regardless of whether it is currently a
     /// binding hold (`held`, below, still gates on threshold and answers a
@@ -793,6 +863,13 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// reset to report (`src/cli.rs`'s `fiveHourResetAtMs`/`sevenDayResetAtMs`).
     public let fiveHourResetAtMs: Int64?
     public let sevenDayResetAtMs: Int64?
+    /// The Fable weekly window's reset instant (`src/cli.rs`'s
+    /// `sevenDayOiResetAtMs`), same unconditional shape as
+    /// ``sevenDayResetAtMs``. `nil` when that reset has already elapsed with
+    /// nothing learned since, when it was never learned, or when the server
+    /// predates the field — three honest absences the wire collapses into one,
+    /// and all three draw no caption.
+    public let sevenDayOiResetAtMs: Int64?
     public let held: [HeldWindow]
 
     /// Pure serving counters. `null` on the wire — and `nil` here, NEVER `0` —
@@ -901,8 +978,10 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         sevenDayOi: Double?,
         fiveHourState: QuotaState? = nil,
         sevenDayState: QuotaState? = nil,
+        sevenDayOiState: QuotaState? = nil,
         fiveHourResetAtMs: Int64? = nil,
         sevenDayResetAtMs: Int64? = nil,
+        sevenDayOiResetAtMs: Int64? = nil,
         held: [HeldWindow],
         requests: Int?,
         inputTokens: Int?,
@@ -933,8 +1012,10 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.sevenDayOi = sevenDayOi
         self.fiveHourState = fiveHourState
         self.sevenDayState = sevenDayState
+        self.sevenDayOiState = sevenDayOiState
         self.fiveHourResetAtMs = fiveHourResetAtMs
         self.sevenDayResetAtMs = sevenDayResetAtMs
+        self.sevenDayOiResetAtMs = sevenDayOiResetAtMs
         self.held = held
         self.requests = requests
         self.inputTokens = inputTokens
@@ -1159,6 +1240,85 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         let spoken = QuotaFormat.usd(cost)
         let priced = bucket.unpricedRequests > 0 ? "at least \(spoken)" : spoken
         return "\(span): \(priced), \(tokens)"
+    }
+
+    /// What the card's 7d line shows on its right: `"fable 71% · in 4d 12h"` —
+    /// this account's FABLE weekly window, the third quota window the row
+    /// otherwise never names.
+    ///
+    /// It is a separate window with a separate reset, gating Fable requests
+    /// only (`docs/cli.md`, "The weekly quota pair on `--json`"): a non-Fable
+    /// request never checks it, and `held[]`/`quotaState` never reflect it. So
+    /// it cannot be read off the `7d` bar beside it, and until this slot
+    /// existed the panel drew no Fable figure at all while the router was
+    /// gating on one.
+    ///
+    /// `nil` — an EMPTY slot, never `"n/a"` — when ``sevenDayOi`` is `nil`: an
+    /// older server, or an account this window has never been learned for. The
+    /// same rule ``windowUsageLabel`` follows, and for the same reason: a
+    /// figure nobody measured is absent, not zero and not a placeholder.
+    ///
+    /// The word `fable` carries the span the way `" today"` and `" out"` carry
+    /// theirs on the 5h line — a bare `71%` in this slot would be read as the
+    /// 7-day percentage beside it restated. The caption is ``sevenDayOiResetAtMs``
+    /// through ``QuotaFormat/resetCaption(resetAtMs:now:)``, the same formatter
+    /// and the same future-only rule the two window captions use; a window with
+    /// no live reset prints the percentage alone.
+    public var fableWeeklyLabel: String? { fableWeeklyLabel(now: Date()) }
+
+    /// ``fableWeeklyLabel`` against an explicit clock, so a test is deterministic.
+    public func fableWeeklyLabel(now: Date) -> String? {
+        guard let sevenDayOi else { return nil }
+        let figure = "fable \(QuotaFormat.percent(sevenDayOi))"
+        guard let caption = QuotaFormat.resetCaption(resetAtMs: sevenDayOiResetAtMs, now: now)
+        else { return figure }
+        return "\(figure) · \(caption)"
+    }
+
+    /// ``fableWeeklyLabel`` for VoiceOver, spoken as part of the row's combined
+    /// label for the same reason the spend figures are: a fact only a sighted
+    /// user gets is half built.
+    ///
+    /// Names the window in words rather than the printed `"fable"` shorthand,
+    /// and says `"used"` after the percentage — utilization and headroom are
+    /// the same number read two opposite ways, and a spoken bare percentage has
+    /// no bar beside it to disambiguate. The state word is spoken only when the
+    /// server sent one (see ``sevenDayOiState``); silence there is the honest
+    /// output, not an `"ok"` nobody measured.
+    public func fableWeeklySpokenLabel(now: Date) -> String? {
+        guard let sevenDayOi else { return nil }
+        var spoken = "Fable weekly window: \(QuotaFormat.percent(sevenDayOi)) used"
+        if let state = sevenDayOiState { spoken += ", \(state.token)" }
+        if let caption = QuotaFormat.resetCaption(resetAtMs: sevenDayOiResetAtMs, now: now) {
+            spoken += ", resets \(caption)"
+        }
+        return spoken
+    }
+
+    /// The row's serving counters, as a tooltip: `"102 requests served since
+    /// this proxy started · 84% of their input tokens came from cache"`.
+    ///
+    /// They used to be printed on the 7d line, where the Fable window now sits.
+    /// Moving them here is not a demotion of the numbers but of their PLACE: a
+    /// running total since process start answers "has this account been used",
+    /// which a reader consults once, while the Fable percentage is a live gate
+    /// that changes what the router will do next and belongs in the column.
+    ///
+    /// Both figures say their span, which the one-line form could not afford
+    /// to: `102 req` was a count with no window attached, and a reader who
+    /// assumed "today" was wrong by however long the proxy had been up
+    /// (`Manager.record_served`, `src/manager/snapshot.rs:23` — incremented per
+    /// served request and never reset in-process).
+    ///
+    /// `nil` when the counters are STRUCTURAL — an offline read, where they are
+    /// zero because nothing measured them — so the tooltip is absent rather
+    /// than reporting a zero as a measurement. ``requests`` is `"n/a"` and
+    /// ``cacheHitRatio`` `"n/a"` on their own nulls, the same idiom the printed
+    /// line used.
+    public func countersTooltip(countersAreStructural: Bool) -> String? {
+        guard !countersAreStructural else { return nil }
+        return "\(QuotaFormat.count(requests)) requests served since this proxy started · "
+            + "\(QuotaFormat.percent(cacheHitRatio)) of their input tokens came from cache"
     }
 
     /// The row-level "change this account's groups" menu — derived purely
@@ -1736,6 +1896,43 @@ public struct Fleet: Equatable, Sendable {
         return measuredUsage.reduce(0) { $0 + $1.today.unpricedRequests }
     }
 
+    /// The trailing hour's requests missing from ``lastHourCost``, the hour's
+    /// own counterpart to ``todayUnpricedRequests``. Same `nil`-when-nothing-
+    /// was-measured rule.
+    ///
+    /// It exists because `lastHour` is NOT a subset of `today`: the hour is the
+    /// trailing 60 minutes and the day is the server's local calendar day, so
+    /// across midnight the two share no traffic at all. Reading today's count
+    /// to explain the hour's missing rate was the defect — at 00:30 every row's
+    /// `today` is empty while the hour still holds the previous evening's
+    /// traffic.
+    public var lastHourUnpricedRequests: Int? {
+        guard hasUsage else { return nil }
+        return measuredUsage.reduce(0) { $0 + $1.lastHour.unpricedRequests }
+    }
+
+    /// The burn-rate segment of the header line: `"$3.10/hr"`, or
+    /// `"12 unpriced this hour"` when the hour served requests and not one of
+    /// them could be priced.
+    ///
+    /// The rate is dropped rather than printed as `"n/a/hr"`, which runs two
+    /// tokens together and parses as a path — but dropping it ALONE left the
+    /// header silent about why the burn rate had vanished, and the fleet-wide
+    /// `N unpriced` clause could not cover it: that clause counts `today`, a
+    /// bucket the hour is not part of across the server's local midnight.
+    /// Whatever this segment says, it says it about the HOUR.
+    ///
+    /// `nil` when no row was measured at all — the whole line is absent then.
+    /// Also `nil` for a shape this build has no words for: an hour with no
+    /// price and no unpriced requests, which `src/usage.rs:293` cannot produce
+    /// (a null cost means `unpriced_requests >= requests > 0`).
+    public var burnRateSegment: String? {
+        guard hasUsage else { return nil }
+        if let hourly = lastHourCost { return "\(QuotaFormat.usd(hourly))/hr" }
+        guard let unpriced = lastHourUnpricedRequests, unpriced > 0 else { return nil }
+        return "\(unpriced) unpriced this hour"
+    }
+
     /// Today's traffic per model, merged across accounts. Keys are raw model
     /// ids; ``QuotaFormat/modelLabel(_:)`` shortens them for display.
     public var todayByModel: [String: UsageTotals] {
@@ -1784,8 +1981,37 @@ public struct Fleet: Equatable, Sendable {
         return merged
     }
 
-    /// Each model's share of today, biggest first — `[("opus-5", 0.62), …]`,
-    /// with `nil` for a model whose traffic could not be priced.
+    /// One model's slice of the header line, as three separable facts: which
+    /// model, what share of the day it took, and whether that share is a floor.
+    ///
+    /// A tuple carried the first two until a label could be partly priceable
+    /// (see ``todayModelShare``), at which point `share == nil` had to mean two
+    /// different things. A named type keeps the three apart, and ``label`` is
+    /// the one place that decides how they read.
+    public struct ModelShare: Equatable, Sendable {
+        /// Canonical, already through ``QuotaFormat/modelLabel(_:)``.
+        public let model: String
+        /// `nil` when nothing under this label could be priced — never `0`.
+        public let share: Double?
+        /// Some of this label's requests could not be priced, so ``share`` is a
+        /// share of a PARTIAL cost.
+        public let partial: Bool
+
+        public init(model: String, share: Double?, partial: Bool) {
+            self.model = model
+            self.share = share
+            self.partial = partial
+        }
+
+        /// `"opus-5 62%"`, `"opus-5 62%+"` when the cost behind it is a floor,
+        /// `"sonnet-4-5 ?"` when nothing under it could be priced at all.
+        public var label: String {
+            guard let share else { return "\(model) \(QuotaFormat.unknownShare)" }
+            return "\(model) \(QuotaFormat.percent(share))\(partial ? "+" : "")"
+        }
+    }
+
+    /// Each model's share of today, biggest first.
     ///
     /// Share is by COST among the models that have one, because cost is what
     /// the line beside it reports and a share computed in a different unit than
@@ -1804,37 +2030,70 @@ public struct Fleet: Equatable, Sendable {
     /// this line; what is unknown about it is its cost, and `"?"` says exactly
     /// that. ``todayUnpricedRequests`` still says how much of the total is
     /// missing.
-    public var todayModelShare: [(model: String, share: Double?)] {
+    ///
+    /// A label can also be PARTLY priceable, which is the case a two-state
+    /// answer hid. ``todayByModelLabel`` canonicalizes ids before grouping, so
+    /// `claude-opus-5` and `claude-opus-5-20250929` merge — and if this build
+    /// has a rate for one id and not the other, ``UsageTotals/adding(_:)``
+    /// folds `(priced, nil)` into the priced value, giving the merged bucket a
+    /// non-nil cost that lands it in the priced head with its unpriceable
+    /// traffic invisible. `opus-5 100%` for a model whose traffic was only
+    /// partly priceable is the same overclaim the `"?"` exists to remove, just
+    /// relocated inside one label. ``ModelShare/partial`` carries it out, and
+    /// the label prints `opus-5 62%+` — the same `"+"` the card's own cost
+    /// wears for the same reason (``Account/windowUsageLabel``): a floor, not
+    /// a total.
+    public var todayModelShare: [ModelShare] {
         let byLabel = todayByModelLabel.filter { $0.value.requests > 0 }
         guard !byLabel.isEmpty else { return [] }
         // Biggest first; an exact tie breaks on the name so two polls carrying
         // identical data cannot reshuffle the line.
-        func rank(
-            _ entries: [(model: String, weight: Double, share: Double?)]
-        ) -> [(model: String, share: Double?)] {
+        func rank(_ entries: [(weight: Double, share: ModelShare)]) -> [ModelShare] {
             entries
-                .sorted { $0.weight == $1.weight ? $0.model < $1.model : $0.weight > $1.weight }
-                .map { (model: $0.model, share: $0.share) }
+                .sorted {
+                    $0.weight == $1.weight
+                        ? $0.share.model < $1.share.model : $0.weight > $1.weight
+                }
+                .map(\.share)
         }
         let priced = byLabel.filter { $0.value.costUsd != nil }
         let pricedTotal = priced.values.reduce(0.0) { $0 + ($1.costUsd ?? 0) }
         guard pricedTotal > 0 else {
             let total = byLabel.values.reduce(0) { $0 + $1.outputTokens }
             guard total > 0 else { return [] }
+            // Share by output TOKENS here, and every token was counted — so no
+            // label is a floor and none wears `"+"`, even though some of this
+            // traffic has no price. What is partial in this branch is the unit,
+            // which the doc-comment above owns, not any one label's figure.
             return rank(
                 byLabel.map {
                     let share = Double($0.value.outputTokens) / Double(total)
-                    return (model: $0.key, weight: share, share: Double?.some(share))
+                    return (
+                        weight: share,
+                        share: ModelShare(model: $0.key, share: share, partial: false)
+                    )
                 })
         }
         let head = rank(
             priced.map {
                 let share = ($0.value.costUsd ?? 0) / pricedTotal
-                return (model: $0.key, weight: share, share: Double?.some(share))
+                return (
+                    weight: share,
+                    share: ModelShare(
+                        model: $0.key, share: share,
+                        partial: $0.value.unpricedRequests > 0)
+                )
             })
         let tail = rank(
             byLabel.filter { $0.value.costUsd == nil }
-                .map { (model: $0.key, weight: Double($0.value.outputTokens), share: nil) })
+                .map {
+                    (
+                        weight: Double($0.value.outputTokens),
+                        // `"?"` already says the whole cost is unknown; a `"+"`
+                        // beside it would qualify a figure that is not there.
+                        share: ModelShare(model: $0.key, share: nil, partial: false)
+                    )
+                })
         return head + tail
     }
 
@@ -1850,29 +2109,33 @@ public struct Fleet: Equatable, Sendable {
     /// 380pt wide, and the third model's share is not what anyone opens it for.
     /// An unpriced model is named with `"?"` where its percentage would go and
     /// counts toward that `+N` like any other — see ``todayModelShare``.
-    /// `" · N unpriced"` is appended whenever requests are missing from the
-    /// cost, so a partial total says it is partial rather than passing itself
-    /// off as the whole.
+    /// `" · N unpriced today"` is appended whenever requests are missing from
+    /// the cost, so a partial total says it is partial rather than passing
+    /// itself off as the whole. It names its span because the line can now
+    /// carry the HOUR's unpriced count too (``burnRateSegment``), and two bare
+    /// `N unpriced` clauses over different buckets would be unreadable.
     ///
-    /// The `/hr` segment is DROPPED, not printed as `n/a`, when the hour could
-    /// not be priced: `"n/a/hr"` runs two tokens together and parses as a path,
-    /// where every other `n/a` in this family stands alone as a word. The
-    /// `N unpriced` clause already says why the rate is missing. An hour that
-    /// served nothing is `$0.00/hr` — a measurement, not an absence.
+    /// The rate is never printed as `"n/a/hr"`, which runs two tokens together
+    /// and parses as a path, where every other `n/a` in this family stands
+    /// alone as a word. An hour that could not be priced says so about the HOUR
+    /// — see ``burnRateSegment``, which owns that choice — because the
+    /// `N unpriced` clause below counts `today`, and the trailing hour is not
+    /// part of the day across the server's local midnight. An hour that served
+    /// nothing is `$0.00/hr`: a measurement, not an absence.
     public var usageSummaryLine: String? {
         guard hasUsage else { return nil }
         var parts = ["\(QuotaFormat.usd(todayCost)) today"]
-        if let hourly = lastHourCost {
-            parts.append("\(QuotaFormat.usd(hourly))/hr")
+        if let rate = burnRateSegment {
+            parts.append(rate)
         }
         let share = todayModelShare
         for entry in share.prefix(2) {
-            parts.append("\(entry.model) \(entry.share.map { QuotaFormat.percent($0) } ?? "?")")
+            parts.append(entry.label)
         }
         if share.count > 2 { parts.append("+\(share.count - 2)") }
         parts.append("cache \(QuotaFormat.percent(todayCacheHitRatio))")
         if let unpriced = todayUnpricedRequests, unpriced > 0 {
-            parts.append("\(unpriced) unpriced")
+            parts.append("\(unpriced) unpriced today")
         }
         return parts.joined(separator: " · ")
     }
