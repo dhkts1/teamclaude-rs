@@ -7,7 +7,7 @@ import Foundation
 // block); the Rust side owns that spelling, so this file is the one place that
 // has to track it.
 //
-// Four deliberate decisions:
+// Six deliberate decisions:
 //
 //  1. Unknown enum payloads decode to an `.unknown(String)` case that carries the
 //     raw text. A `quotaState` variant added on the Rust side must degrade to a
@@ -50,6 +50,14 @@ import Foundation
 //     companion boolean/string rather than reusing `null`), that decode
 //     lives here and should degrade the same way every other unrecognised
 //     shape in this file does — never a thrown row.
+//  6. The `usage` object (``UsageRow``) is optional at the row, and its
+//     `costUsd` is optional inside, and the two nulls mean different things:
+//     the row's null is "this account was not measured" — an older server, or
+//     an offline read — while `costUsd`'s is "this traffic could not be
+//     priced". `window` carries a third: "the server cannot name when this
+//     quota window started". None of the three is a zero, and none of them
+//     renders as one. Every counter INSIDE a bucket is non-optional, because
+//     the Rust side writes all of them together or writes no bucket at all.
 
 /// How close an account is to its own switch threshold.
 ///
@@ -267,6 +275,70 @@ public enum QuotaFormat {
         return "\(value)"
     }
 
+    /// `0.42` → `"$0.42"`; `12.4157` → `"$12.4"`; `120.4` → `"$120"`;
+    /// `nil` → `"n/a"`.
+    ///
+    /// Decimals shrink as the number grows, so a cost keeps two useful figures
+    /// at every size and never spends panel width on digits nobody reads: two
+    /// decimals under `$10`, one under `$100`, none above. A whole fleet's day
+    /// and one account's window go through the SAME formatter, so two costs in
+    /// the panel can always be compared without checking how each was rounded.
+    ///
+    /// `nil` is `"n/a"` for the reason every formatter in this enum gives:
+    /// `costUsd` is `null` on the wire when a bucket served requests and not
+    /// one of them could be priced (`src/usage.rs`'s `to_wire`), and `"$0.00"`
+    /// would report "this traffic was free" about traffic nobody could price.
+    /// A zero that IS measured still prints `"$0.00"` — that is a real reading.
+    public static func usd(_ value: Double?) -> String {
+        guard let value else { return notMeasured }
+        let magnitude = abs(value)
+        let decimals = magnitude < 10 ? 2 : (magnitude < 100 ? 1 : 0)
+        return "$" + String(format: "%.\(decimals)f", value)
+    }
+
+    /// `812` → `"812"`; `48_000` → `"48k"`; `1_240_000` → `"1.2M"`;
+    /// `nil` → `"n/a"`.
+    ///
+    /// Token counts run to eight digits and the card has room for four, so a
+    /// raw count truncates the line it sits on. One decimal below ten of a
+    /// unit (`1.2k`, `1.2M`), none above it (`48k`, `12M`): the same
+    /// two-useful-figures rule ``usd(_:)`` follows, for the same reason.
+    ///
+    /// `nil` → `"n/a"`, never `"0"`: an absent count is not a count of zero.
+    public static func tokens(_ value: Int?) -> String {
+        guard let value else { return notMeasured }
+        func scaled(_ divisor: Double, _ suffix: String) -> String {
+            let unit = Double(value) / divisor
+            let decimals = abs(unit) < 10 ? 1 : 0
+            return String(format: "%.\(decimals)f", unit) + suffix
+        }
+        let magnitude = abs(value)
+        if magnitude >= 1_000_000 { return scaled(1_000_000, "M") }
+        if magnitude >= 1_000 { return scaled(1_000, "k") }
+        return "\(value)"
+    }
+
+    /// `"claude-sonnet-4-5-20250929"` → `"sonnet-4-5"`;
+    /// `"claude-opus-5"` → `"opus-5"`; anything else, verbatim.
+    ///
+    /// Two removals and no third: the `claude-` prefix, which every model in
+    /// this fleet shares and which therefore distinguishes nothing, and a
+    /// trailing eight-digit release date, which is the same model. What is
+    /// left is the part a reader uses to tell one line from another. An id
+    /// this rule does not recognise is printed unchanged rather than guessed
+    /// at — a shortened name nobody can look up is worse than a long one.
+    public static func modelLabel(_ id: String) -> String {
+        var label = id
+        if label.hasPrefix("claude-") { label.removeFirst("claude-".count) }
+        if let dash = label.lastIndex(of: "-") {
+            let tail = label[label.index(after: dash)...]
+            if tail.count == 8 && tail.allSatisfy(\.isNumber) {
+                label = String(label[..<dash])
+            }
+        }
+        return label
+    }
+
     /// `(3, "overloaded_error")` → `"3× overloaded_error"`;
     /// `(nil, "overloaded_error")` → `"overloaded_error"`.
     ///
@@ -440,6 +512,162 @@ public struct HeldWindow: Decodable, Equatable, Sendable {
     }
 }
 
+/// One bucket of measured traffic — a day, a quota window, an hour, or one
+/// model's share of the day (`docs/cli.md`, "The `usage` object on `--json`").
+///
+/// The four token dimensions are kept apart rather than folded into one number
+/// because they bill at four different rates, so a single sum could not be
+/// priced at all. That is the opposite of the row-level `inputTokens`, which is
+/// the QUOTA counter and deliberately folds them together — see
+/// ``Account/inputTokens``.
+///
+/// Every counter here is non-optional, unlike the row-level ones: the Rust side
+/// writes all eight keys whenever it writes a bucket at all, so a missing key is
+/// a shape this build does not know how to read, and `Fleet.decode` marking that
+/// row unreadable is the honest outcome. `costUsd` is the ONE genuine null.
+public struct UsageTotals: Decodable, Equatable, Sendable {
+    public let requests: Int
+    /// BASE input only — cache creation and cache reads are the two fields
+    /// below, not folded in here.
+    public let inputTokens: Int
+    /// Tokens spent WRITING the 5-minute cache.
+    public let cacheCreationTokens: Int
+    /// Tokens spent writing the 1-hour cache. Priced differently from the
+    /// 5-minute one, which is why it is a field and not an addend.
+    public let cacheCreation1hTokens: Int
+    /// Tokens served FROM cache.
+    public let cacheReadTokens: Int
+    public let outputTokens: Int
+    /// API list price for this bucket, in dollars — what the traffic WOULD have
+    /// cost on the API, never a bill; these accounts are subscriptions.
+    ///
+    /// `null`, and `nil` here, when the bucket served requests and not one of
+    /// them could be priced (`src/usage.rs`'s `to_wire`). A bucket with some
+    /// priced and some unpriced requests reports the partial sum, and
+    /// ``unpricedRequests`` is how a reader knows it is partial. Never render
+    /// a `nil` as `$0.00` — see ``QuotaFormat/usd(_:)``.
+    public let costUsd: Double?
+    /// Requests whose model has no published rate in this build, and which are
+    /// therefore MISSING from ``costUsd``. Non-zero means the cost beside it is
+    /// a floor, not a total.
+    public let unpricedRequests: Int
+    /// When this bucket started, unix milliseconds. Present only on
+    /// `usage.window`, which is the only bucket whose start is a fact the
+    /// server knows (Anthropic's own reset header); `nil` on `today`,
+    /// `lastHour` and every per-model bucket, whose spans are defined by their
+    /// names.
+    public let since: Int64?
+
+    public init(
+        requests: Int,
+        inputTokens: Int,
+        cacheCreationTokens: Int,
+        cacheCreation1hTokens: Int,
+        cacheReadTokens: Int,
+        outputTokens: Int,
+        costUsd: Double?,
+        unpricedRequests: Int,
+        since: Int64? = nil
+    ) {
+        self.requests = requests
+        self.inputTokens = inputTokens
+        self.cacheCreationTokens = cacheCreationTokens
+        self.cacheCreation1hTokens = cacheCreation1hTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.outputTokens = outputTokens
+        self.costUsd = costUsd
+        self.unpricedRequests = unpricedRequests
+        self.since = since
+    }
+
+    /// Two buckets added, for summing rows into a fleet total.
+    ///
+    /// Cost follows the server's own rule (`src/usage.rs`'s `Totals::add` and
+    /// `to_wire`): a priced side plus an unpriced one is the PARTIAL sum, with
+    /// ``unpricedRequests`` carrying the caveat, and the result is `nil` only
+    /// when neither side had a price at all. Adding a `nil` as `0` would turn
+    /// "nobody could price this" into "this was free". ``since`` is dropped: a
+    /// sum of two buckets has no single start instant.
+    public func adding(_ other: UsageTotals) -> UsageTotals {
+        UsageTotals(
+            requests: requests + other.requests,
+            inputTokens: inputTokens + other.inputTokens,
+            cacheCreationTokens: cacheCreationTokens + other.cacheCreationTokens,
+            cacheCreation1hTokens: cacheCreation1hTokens + other.cacheCreation1hTokens,
+            cacheReadTokens: cacheReadTokens + other.cacheReadTokens,
+            outputTokens: outputTokens + other.outputTokens,
+            costUsd: UsageTotals.addCost(costUsd, other.costUsd),
+            unpricedRequests: unpricedRequests + other.unpricedRequests,
+            since: nil
+        )
+    }
+
+    /// `nil + nil == nil`; anything else is the sum of what was priced.
+    public static func addCost(_ lhs: Double?, _ rhs: Double?) -> Double? {
+        switch (lhs, rhs) {
+        case (nil, nil): return nil
+        case (let a?, let b?): return a + b
+        case (let a?, nil): return a
+        case (nil, let b?): return b
+        }
+    }
+
+    /// Cache reads over everything that could have been an input token —
+    /// base input, cache writes and cache reads. `nil` when that denominator is
+    /// zero, the same honest-null rule ``Account/cacheHitRatio`` follows: no
+    /// input means no ratio was measured, not a ratio of zero.
+    public var cacheHitRatio: Double? {
+        let denominator = inputTokens + cacheCreationTokens + cacheCreation1hTokens + cacheReadTokens
+        guard denominator > 0 else { return nil }
+        return Double(cacheReadTokens) / Double(denominator)
+    }
+}
+
+/// One account's measured spend — the `usage` object on its row.
+///
+/// `nil` on ``Account/usage`` means NOT MEASURED, never "spent nothing", and
+/// the two causes are both ordinary: the row came from the offline path, where
+/// there is no serving process to aggregate anything, or the proxy that
+/// answered was built before this field existed — which is the routine state
+/// here, since the binary on disk is rebuilt on merge while the live process
+/// keeps serving until someone restarts it. `source` on the same row says
+/// which. Synthesized `Decodable` calls `decodeIfPresent` for an `Optional`
+/// property, so the older server's missing key yields `nil` rather than
+/// throwing the whole row away — the same forward-compat contract `groups`
+/// and the per-window states already follow.
+public struct UsageRow: Decodable, Equatable, Sendable {
+    /// The local calendar day of the machine the SERVER runs on.
+    public let today: UsageTotals
+    /// This account's current 5-hour quota window, read from Anthropic's own
+    /// reset header. `nil` when that reset is unknown, because then the
+    /// window's start cannot be named — a different fact from "the window is
+    /// empty", and the card falls back to ``today`` rather than drawing a zero.
+    public let window: UsageTotals?
+    /// The trailing 60 minutes. Burn rate is `lastHour.costUsd` per hour, by
+    /// definition — no division, no assumed span.
+    public let lastHour: UsageTotals
+    /// ``today``, split by model id. Keys are raw ids (`claude-opus-5`);
+    /// ``QuotaFormat/modelLabel(_:)`` shortens them for display.
+    public let todayByModel: [String: UsageTotals]
+
+    public init(
+        today: UsageTotals,
+        window: UsageTotals?,
+        lastHour: UsageTotals,
+        todayByModel: [String: UsageTotals]
+    ) {
+        self.today = today
+        self.window = window
+        self.lastHour = lastHour
+        self.todayByModel = todayByModel
+    }
+
+    /// The bucket the card's 5h line shows: this account's own quota window
+    /// when the server could name its start, else the day. Never `nil` — a row
+    /// that carries `usage` at all has a `today`.
+    public var windowOrToday: UsageTotals { window ?? today }
+}
+
 /// One account row of `tcr status --json`.
 public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let name: String
@@ -515,8 +743,19 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let inputTokens: Int?
     public let outputTokens: Int?
     public let cacheReadTokens: Int?
+    /// Tokens this account spent WRITING the cache — the companion
+    /// ``cacheReadTokens`` never had. With both, a reader can see how much
+    /// input was served FROM cache and how much was spent putting it there.
+    /// Same offline-null idiom as the four counters above, plus the
+    /// forward-compat one: `nil` also when an older `tcr` omits the key.
+    public let cacheCreationTokens: Int?
     /// `null` when `inputTokens` is 0 — an absence, not a measured zero.
     public let cacheHitRatio: Double?
+
+    /// What this account SPENT, as the proxy measured it while serving. `nil`
+    /// means not measured — see ``UsageRow`` for the two ways that happens.
+    /// Never read as zero: the panel draws nothing at all for a `nil` here.
+    public let usage: UsageRow?
 
     public let probeStatus: ProbeState
     public let probeError: String?
@@ -618,7 +857,9 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         groups: [String]? = nil,
         reservedGroups: [String]? = nil,
         controlAllowedGroups: [String]? = nil,
-        groupColors: [String: String]? = nil
+        groupColors: [String: String]? = nil,
+        cacheCreationTokens: Int? = nil,
+        usage: UsageRow? = nil
     ) {
         self.name = name
         self.priority = priority
@@ -650,6 +891,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.reservedGroups = reservedGroups
         self.controlAllowedGroups = controlAllowedGroups
         self.groupColors = groupColors
+        self.cacheCreationTokens = cacheCreationTokens
+        self.usage = usage
     }
 
     public var id: String { name }
@@ -798,6 +1041,37 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         }()
         guard fraction != nil else { return .unmeasured }
         return .state(effectiveQuotaState(for: window))
+    }
+
+    /// What the card's 5h line shows on its right: `"$4.20 · 48k"` — this
+    /// account's spend and output tokens for its current quota window.
+    ///
+    /// `nil` when ``usage`` is `nil`, and the view then draws NOTHING there.
+    /// That is the whole rule this property exists to hold: an account the
+    /// proxy could not measure gets an empty slot, not a row of zeros, because
+    /// `$0.00 · 0` beside a live account is a claim nobody made.
+    ///
+    /// Falls back to ``UsageRow/today`` when `window` is `nil`, which is the
+    /// server saying it does not know when this window started — the figure is
+    /// still measured traffic, just over a span the server can name. Cost is
+    /// dropped, not zeroed, when nothing in the bucket could be priced: the
+    /// token count is a measurement and prints on its own.
+    public var windowUsageLabel: String? {
+        guard let bucket = usage?.windowOrToday else { return nil }
+        let tokens = QuotaFormat.tokens(bucket.outputTokens)
+        guard bucket.costUsd != nil else { return tokens }
+        return "\(QuotaFormat.usd(bucket.costUsd)) · \(tokens)"
+    }
+
+    /// ``windowUsageLabel`` for VoiceOver, where `"·"` is punctuation and
+    /// `"48k"` is not self-describing. Spoken as part of the row's combined
+    /// label, for the same reason the pills are: a fact only a sighted user
+    /// gets is half built.
+    public var windowUsageSpokenLabel: String? {
+        guard let bucket = usage?.windowOrToday else { return nil }
+        let tokens = "\(QuotaFormat.tokens(bucket.outputTokens)) output tokens"
+        guard let cost = bucket.costUsd else { return "this window: \(tokens), cost not priced" }
+        return "this window: \(QuotaFormat.usd(cost)), \(tokens)"
     }
 
     /// The row-level "change this account's groups" menu — derived purely
@@ -1327,6 +1601,134 @@ public struct Fleet: Equatable, Sendable {
     /// ``breakdown``, flattened for tests and for accessibility.
     public var breakdownLabel: String {
         breakdown.map(\.label).joined(separator: " · ")
+    }
+
+    // MARK: Usage summary
+    //
+    // What the fleet SPENT, summed from the rows that carry a measurement.
+    // Every aggregate below skips a row whose `usage` is nil rather than
+    // counting it as zero, and reports nil rather than 0 when no row could be
+    // measured at all — the same rule `cacheHitRatio` and the offline counters
+    // follow, and the reason the header draws no line against an older server
+    // instead of a row of zeros.
+
+    /// The rows the proxy actually measured. Sums below are over these only.
+    public var measuredUsage: [UsageRow] { accounts.compactMap(\.usage) }
+
+    /// True when at least one row carries a `usage` object. False against an
+    /// older `tcr`, and against a fully offline read — the case where the panel
+    /// must say nothing about spend rather than say zero.
+    public var hasUsage: Bool { !measuredUsage.isEmpty }
+
+    /// Today's cost across the fleet, in dollars. `nil` when no measured row
+    /// could be priced at all — see ``UsageTotals/costUsd``. A fleet where some
+    /// rows are priced and some are not reports the partial sum, and
+    /// ``todayUnpricedRequests`` is how a reader knows it is partial.
+    public var todayCost: Double? {
+        measuredUsage.reduce(nil) { UsageTotals.addCost($0, $1.today.costUsd) }
+    }
+
+    /// The trailing hour's cost across the fleet — the burn rate, per hour by
+    /// definition. Same nil rule as ``todayCost``.
+    public var lastHourCost: Double? {
+        measuredUsage.reduce(nil) { UsageTotals.addCost($0, $1.lastHour.costUsd) }
+    }
+
+    /// Today's requests that are MISSING from ``todayCost`` because their model
+    /// has no published rate in this build. `nil` — not `0` — when no row was
+    /// measured, so "nothing unpriced" and "nothing measured" stay different
+    /// answers.
+    public var todayUnpricedRequests: Int? {
+        guard hasUsage else { return nil }
+        return measuredUsage.reduce(0) { $0 + $1.today.unpricedRequests }
+    }
+
+    /// Today's traffic per model, merged across accounts. Keys are raw model
+    /// ids; ``QuotaFormat/modelLabel(_:)`` shortens them for display.
+    public var todayByModel: [String: UsageTotals] {
+        var merged: [String: UsageTotals] = [:]
+        for row in measuredUsage {
+            for (model, totals) in row.todayByModel {
+                merged[model] = merged[model].map { $0.adding(totals) } ?? totals
+            }
+        }
+        return merged
+    }
+
+    /// Today's cache hit rate across the fleet — reads over base input plus
+    /// cache writes plus reads. `nil` when that denominator is zero, exactly as
+    /// ``Account/cacheHitRatio`` is `null` on the wire when there was no input:
+    /// no traffic means no ratio was measured, not a ratio of zero.
+    public var todayCacheHitRatio: Double? {
+        let today = measuredUsage.map(\.today)
+        guard !today.isEmpty else { return nil }
+        let reads = today.reduce(0) { $0 + $1.cacheReadTokens }
+        let denominator = today.reduce(0) {
+            $0 + $1.inputTokens + $1.cacheCreationTokens + $1.cacheCreation1hTokens
+                + $1.cacheReadTokens
+        }
+        guard denominator > 0 else { return nil }
+        return Double(reads) / Double(denominator)
+    }
+
+    /// Each model's share of today, biggest first — `[("opus-5", 0.62), …]`.
+    ///
+    /// Share is by COST among the models that have one, because cost is what
+    /// the line beside it reports and a share computed in a different unit than
+    /// the total it sits next to invites exactly the arithmetic a reader
+    /// shouldn't have to do. When NOTHING today could be priced, share falls
+    /// back to output tokens: the mix is still a fact worth showing, and saying
+    /// so in tokens is honest where inventing a cost would not be. Models are
+    /// left out of the denominator, not counted as zero, when they are unpriced
+    /// in a fleet where something else was priced — ``todayUnpricedRequests``
+    /// is what says the picture is partial.
+    public var todayModelShare: [(model: String, share: Double)] {
+        let byModel = todayByModel
+        guard !byModel.isEmpty else { return [] }
+        func ranked(_ weight: (UsageTotals) -> Double) -> [(model: String, share: Double)] {
+            let weights = byModel.mapValues(weight).filter { $0.value > 0 }
+            let total = weights.values.reduce(0, +)
+            guard total > 0 else { return [] }
+            return
+                weights
+                .map { (model: QuotaFormat.modelLabel($0.key), share: $0.value / total) }
+                // Biggest share first; an exact tie breaks on the name so two
+                // polls carrying identical data cannot reshuffle the line.
+                .sorted { $0.share == $1.share ? $0.model < $1.model : $0.share > $1.share }
+        }
+        let byCost = ranked { $0.costUsd ?? 0 }
+        return byCost.isEmpty ? ranked { Double($0.outputTokens) } : byCost
+    }
+
+    /// `"$12.40 today · $3.10/hr · opus-5 62% · sonnet-5 38% · cache 96%"`, or
+    /// `nil` when no row carries a measurement.
+    ///
+    /// `nil` is the whole point of the property: against an older `tcr`, or an
+    /// offline read, there is nothing to say about spend and the header draws
+    /// no line at all. A line of zeros would answer a question this build
+    /// cannot answer.
+    ///
+    /// Two models are named and the rest collapse to `"+N"`: the panel is
+    /// 380pt wide, and the third model's share is not what anyone opens it for.
+    /// `" · N unpriced"` is appended whenever requests are missing from the
+    /// cost, so a partial total says it is partial rather than passing itself
+    /// off as the whole.
+    public var usageSummaryLine: String? {
+        guard hasUsage else { return nil }
+        var parts = [
+            "\(QuotaFormat.usd(todayCost)) today",
+            "\(QuotaFormat.usd(lastHourCost))/hr",
+        ]
+        let share = todayModelShare
+        for entry in share.prefix(2) {
+            parts.append("\(entry.model) \(QuotaFormat.percent(entry.share))")
+        }
+        if share.count > 2 { parts.append("+\(share.count - 2)") }
+        parts.append("cache \(QuotaFormat.percent(todayCacheHitRatio))")
+        if let unpriced = todayUnpricedRequests, unpriced > 0 {
+            parts.append("\(unpriced) unpriced")
+        }
+        return parts.joined(separator: " · ")
     }
 
 }

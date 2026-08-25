@@ -116,13 +116,24 @@ struct FleetView: View {
         }
     }
 
-    /// Where the fleet's spend, burn rate, model mix and cache hit rate go, once
-    /// the proxy puts a `usage` object on the wire. Empty until then: a row of
-    /// zeros would answer a question the panel cannot answer yet. Named so the
-    /// next change has a place to fill rather than a header to re-derive.
+    /// The fleet's spend, burn rate, model mix and cache hit rate, on one line:
+    /// `$12.40 today · $3.10/hr · opus-5 62% · sonnet-5 38% · cache 96%`.
+    ///
+    /// Draws nothing at all when no row carries a `usage` object —
+    /// ``Fleet/usageSummaryLine`` returns `nil` there, which is the case
+    /// against an older proxy and against an offline read. A line of zeros
+    /// would answer a question this build cannot answer, so silence is the
+    /// honest output; every figure on this line is a measurement or it is
+    /// absent. All of the arithmetic and the wording live on `Fleet`, where a
+    /// test can assert on the finished string.
     @ViewBuilder
     private var usageSummary: some View {
-        EmptyView()
+        if case .loaded(let fleet) = poller.state, let line = fleet.usageSummaryLine {
+            Text(line)
+                .font(Tok.secondaryDigitFont)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 
     /// Renders only for ``UpdateState/available(version:)`` and
@@ -872,6 +883,14 @@ struct AccountRow: View {
         account.health == .needsRelogin && account.hasQuotaEvidence
     }
 
+    /// The 5h line's spend figures, demoted with everything else on the row
+    /// when the reading is historical. `AnyShapeStyle` because the branches are
+    /// different types: `Color` has a `.secondary` but no `.tertiary`, so the
+    /// plain ternary the 7d counters use cannot be written here.
+    private var usageFigureStyle: AnyShapeStyle {
+        hasStaleQuotaReading ? AnyShapeStyle(Tok.disabled) : AnyShapeStyle(.tertiary)
+    }
+
     /// Whether this account is in the rotation, said in BOTH directions.
     ///
     /// This row used to render a pill only when `disabled` was true, so "in
@@ -1032,6 +1051,11 @@ struct AccountRow: View {
             parts.append("never probed, quota unknown")
         }
         if let hold = account.soonestHold { parts.append(hold.countdownLabel) }
+        // The spoken half of the 5h line's right-hand figures. Silent when the
+        // account was not measured, exactly as the printed slot is — speaking
+        // "zero dollars" over an absent measurement is the one thing this
+        // whole feature must not do.
+        if let usageLabel = account.windowUsageSpokenLabel { parts.append(usageLabel) }
         if let failure = accounts.failure(for: account.name) {
             parts.append("last action failed: \(failure.summary)")
         }
@@ -1578,10 +1602,21 @@ struct AccountRow: View {
                 resetAtMs: account.fiveHourResetAtMs,
                 captionTint: captionTint(for: .fiveHour)
             ) {
-                // This 5h window's spend goes here once the proxy puts `usage`
-                // on the wire. Empty until then — a placeholder would claim a
-                // number the panel does not have.
-                EmptyView()
+                // This 5h window's spend and output tokens — `$4.20 · 48k`,
+                // the account's own quota window when the server can name its
+                // start, otherwise its day (`Account.windowUsageLabel`).
+                // Absent, not zero, when the proxy did not measure this
+                // account: `windowUsageLabel` is nil there and this slot stays
+                // empty, because `$0.00 · 0` beside a live account is a claim
+                // nobody made. Demoted with `hasStaleQuotaReading` like the
+                // percentage beside it — a row must not read half live and
+                // half historical.
+                if let usageLabel = account.windowUsageLabel {
+                    Text(usageLabel)
+                        .font(Tok.detailDigitFont)
+                        .foregroundStyle(usageFigureStyle)
+                        .lineLimit(1)
+                }
             }
             .padding(.top, Tok.space1)
             quotaLine(

@@ -87,6 +87,8 @@ enum RenderStates {
             // checkmark) never rasterise regardless of state; see this file's
             // own header and `AccountRow.accountActionsMenu`'s doc-comment.
             ("13-control-account", .loaded(fleet(healthyJSON)), false, "alice@example.com"),
+            // Every spend branch at once — see `usageStatsJSON`.
+            ("14-usage-stats", .loaded(fleet(usageStatsJSON)), false, nil),
         ]
     }
 
@@ -259,7 +261,13 @@ enum RenderStates {
         // from now, deleting the thing these scenes exist to show. The cost is
         // that the caption's digits differ between renders.
         fiveHourResetInMinutes: Int? = nil,
-        sevenDayResetInMinutes: Int? = nil
+        sevenDayResetInMinutes: Int? = nil,
+        // The `usage` object, as raw JSON. Defaults to the measured shape, so
+        // every existing scene shows the spend line the panel now draws.
+        // `"null"` is the not-measured row — an older proxy, or an offline
+        // read — and it must render as an EMPTY slot, never as `$0.00`; see
+        // `unmeasuredUsage` and scene `14-usage-stats`.
+        usage: String = measuredUsage
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
@@ -289,11 +297,87 @@ enum RenderStates {
              "fiveHourResetAtMs":\(resetAtMs(fiveHourResetInMinutes)),
              "sevenDayResetAtMs":\(resetAtMs(sevenDayResetInMinutes)),
              "requests":102,"inputTokens":8781926,"outputTokens":31860,
-             "cacheReadTokens":7407414,"cacheHitRatio":0.84,"probeStatus":"\(probe)",
+             "cacheReadTokens":7407414,"cacheCreationTokens":\(usage == "null" ? "null" : "1200000"),
+             "cacheHitRatio":0.84,"probeStatus":"\(probe)",
              "probeError":null,"lastStreamError":null,"streamErrorCount":0,
-             "source":"\(source)","serverSha":"abc1234","serverDirty":false}
+             "source":"\(source)","serverSha":"abc1234","serverDirty":false,
+             "usage":\(usage)}
             """
     }
+
+    // MARK: Usage fixtures
+    //
+    // The numbers RECONCILE with the row-level counters above, because a
+    // fixture that does not is a fixture that teaches a reader a wrong
+    // relationship: the row's `inputTokens` is the QUOTA counter and folds all
+    // three input dimensions together, so base input (174512) + cache creation
+    // (1200000) + cache reads (7407414) == 8781926, and 7407414/8781926 is the
+    // 0.84 `cacheHitRatio` already on the row. The per-model buckets sum to
+    // `today` on every field, the same way the server's own do.
+
+    /// A fully measured, fully priced account: two models, a named quota
+    /// window, and nothing unpriced.
+    private static let measuredUsage = """
+        {"today":{"requests":102,"inputTokens":174512,"cacheCreationTokens":1200000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":7407414,"outputTokens":31860,
+          "costUsd":14.1657,"unpricedRequests":0},
+         "window":{"requests":40,"inputTokens":68000,"cacheCreationTokens":471000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":2900000,"outputTokens":12476,
+          "costUsd":5.6141,"unpricedRequests":0,"since":1767207600000},
+         "lastHour":{"requests":12,"inputTokens":20000,"cacheCreationTokens":141000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":705000,"outputTokens":3756,
+          "costUsd":1.6413,"unpricedRequests":0},
+         "todayByModel":{
+           "claude-opus-5":{"requests":70,"inputTokens":122158,"cacheCreationTokens":840000,
+            "cacheCreation1hTokens":0,"cacheReadTokens":5185190,"outputTokens":21140,
+            "costUsd":12.0785,"unpricedRequests":0},
+           "claude-sonnet-5":{"requests":32,"inputTokens":52354,"cacheCreationTokens":360000,
+            "cacheCreation1hTokens":0,"cacheReadTokens":2222224,"outputTokens":10720,
+            "costUsd":2.0872,"unpricedRequests":0}}}
+        """
+
+    /// Nothing this account served could be priced: `costUsd` is null in every
+    /// bucket and `unpricedRequests` says how many requests are missing from
+    /// the figure. The card must print the token count ALONE — no `$0.00` —
+    /// and the header must append `N unpriced`.
+    private static let unpricedUsage = """
+        {"today":{"requests":102,"inputTokens":174512,"cacheCreationTokens":1200000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":7407414,"outputTokens":31860,
+          "costUsd":null,"unpricedRequests":102},
+         "window":{"requests":40,"inputTokens":68000,"cacheCreationTokens":471000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":2900000,"outputTokens":12476,
+          "costUsd":null,"unpricedRequests":40,"since":1767207600000},
+         "lastHour":{"requests":12,"inputTokens":20000,"cacheCreationTokens":141000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":705000,"outputTokens":3756,
+          "costUsd":null,"unpricedRequests":12},
+         "todayByModel":{
+           "claude-sonnet-4-5-20250929":{"requests":102,"inputTokens":174512,
+            "cacheCreationTokens":1200000,"cacheCreation1hTokens":0,
+            "cacheReadTokens":7407414,"outputTokens":31860,"costUsd":null,
+            "unpricedRequests":102}}}
+        """
+
+    /// Measured and priced, but the server cannot name when this account's
+    /// 5-hour window started, so `window` is null and the card falls back to
+    /// the DAY's figures — which are still a measurement.
+    private static let noWindowUsage = """
+        {"today":{"requests":102,"inputTokens":174512,"cacheCreationTokens":1200000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":7407414,"outputTokens":31860,
+          "costUsd":9.4102,"unpricedRequests":0},
+         "window":null,
+         "lastHour":{"requests":12,"inputTokens":20000,"cacheCreationTokens":141000,
+          "cacheCreation1hTokens":0,"cacheReadTokens":705000,"outputTokens":3756,
+          "costUsd":1.1021,"unpricedRequests":0},
+         "todayByModel":{
+           "claude-opus-5":{"requests":102,"inputTokens":174512,
+            "cacheCreationTokens":1200000,"cacheCreation1hTokens":0,
+            "cacheReadTokens":7407414,"outputTokens":31860,"costUsd":9.4102,
+            "unpricedRequests":0}}}
+        """
+
+    /// Not measured: an offline read, or a proxy built before `usage` existed.
+    /// The 5h slot stays empty and the header line is not drawn at all.
+    private static let unmeasuredUsage = "null"
 
     private static let hold =
         #"[{"window":"7d","minutesUntilReset":6498,"resetAtMs":1786406400224}]"#
@@ -391,8 +475,37 @@ enum RenderStates {
             + "\(account("never@example.com", quota: "null", state: "ok", probe: "never"))]"
     }
 
+    /// `usage` is null here for the same reason the four serving counters are
+    /// on a real offline row: there is no serving process to have measured
+    /// anything. The spend line and the 5h figures must both be absent.
     private static var offlineJSON: String {
-        "[\(account("alice@example.com", quota: "0.12", state: "ok", source: "offline"))]"
+        "[\(account("alice@example.com", quota: "0.12", state: "ok", source: "offline", usage: unmeasuredUsage))]"
+    }
+
+    /// Every branch of the spend rendering in one panel, because each one is a
+    /// DIFFERENT null and the whole feature is the claim that they never look
+    /// alike:
+    ///
+    ///  - `priced@` — measured, priced, with its own quota window: `$5.61 · 12k`.
+    ///  - `unpriced@` — measured but unpriceable: the token count alone, and
+    ///    the header's `N unpriced` clause.
+    ///  - `no-window@` — priced, but the server cannot name the window's start,
+    ///    so the card shows the DAY.
+    ///  - `unmeasured@` — no `usage` at all: an empty slot, not a zero.
+    ///
+    /// The header line is the fleet's sum over the three measured rows, so it
+    /// also proves the unmeasured one contributes nothing rather than zero.
+    private static var usageStatsJSON: String {
+        let priced = account(
+            "priced@example.com", quota: "0.42", state: "ok",
+            fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320)
+        let unpriced = account(
+            "unpriced@example.com", quota: "0.31", state: "ok", usage: unpricedUsage)
+        let noWindow = account(
+            "no-window@example.com", quota: "0.18", state: "ok", usage: noWindowUsage)
+        let unmeasured = account(
+            "unmeasured@example.com", quota: "0.07", state: "ok", usage: unmeasuredUsage)
+        return "[\(priced),\(unpriced),\(noWindow),\(unmeasured)]"
     }
 
     /// The bug this whole scene set exists for: a dead-credential account
