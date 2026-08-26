@@ -40,6 +40,32 @@ fn default_control_reserve() -> f64 {
     0.05
 }
 
+/// Default [`Config::reset_urgency_tier_hours`]: 24h buckets.
+///
+/// Rotation ranks an eligible account by which 24-hour bucket its governing
+/// weekly reset falls into, ahead of the LRU tick — so a fleet spends the
+/// account whose unused weekly headroom expires soonest, before the one whose
+/// window has days left to run. Unused weekly quota is worth nothing after its
+/// reset, and on the live fleet (measured 2026-08-26, 13 accounts, all at
+/// priority 0) the resets were spread from 2.5h to 152.5h out, with the
+/// soonest-resetting account sitting on 44% unspent.
+///
+/// The bucket width is what keeps this from becoming the deterministic pin that
+/// [`crate::manager::Manager::select`] already rejected headroom-ordering for. A
+/// RAW reset instant is millisecond-precision and never ties, so ranking on it
+/// directly would retire the LRU tick entirely and park every unpinned request
+/// on one account until it gated. Bucketing restores the tie: at 24h the live
+/// fleet's four soonest accounts share one bucket and still fan out inside it.
+///
+/// Wider buckets weaken the urgency signal (at 48h, six of the thirteen collapse
+/// into one bucket); narrower ones concentrate load (at 6h the soonest account
+/// is alone in its bucket, which is the raw behaviour with extra steps). `0`
+/// disables the tier term outright and restores the pre-tier ordering — the
+/// config-only rollback, no rebuild.
+fn default_reset_urgency_tier_hours() -> u32 {
+    24
+}
+
 /// Default [`Config::usage_retention_days`]: a quarter of history, which is ~180 MB
 /// at the observed ~2 MB/day and answers "how did last month compare".
 fn default_usage_retention_days() -> u32 {
@@ -590,6 +616,18 @@ pub struct Config {
     /// [`crate::manager::select::effective_threshold`].
     #[serde(default = "default_control_reserve")]
     pub control_reserve: f64,
+    /// Width, in hours, of the reset-urgency bucket rotation ranks by within a
+    /// priority tier — see [`default_reset_urgency_tier_hours`] for why this is
+    /// a bucket and not the raw reset instant. Absent → 24. `0` disables the
+    /// term and restores the pre-tier `(priority, lastSelectedSeq, reset)`
+    /// ordering.
+    ///
+    /// **Boot-time snapshot, like every field here except `groups` and
+    /// `groupSettings`** — the manager resolves it once at construction, so an
+    /// edit needs a restart before the serving process rotates by it. `tcr
+    /// status` reports the running process's view, not the file's.
+    #[serde(default = "default_reset_urgency_tier_hours")]
+    pub reset_urgency_tier_hours: u32,
     /// Force the upstream-forwarding client onto HTTP/1.1 instead of the
     /// h2-and-fall-back-to-h1 negotiation reqwest does by default. Absent →
     /// `false` (h2). OFF by default deliberately: an intermittent

@@ -2,12 +2,19 @@
 //!
 //! Selection order:
 //!   1. lowest `priority` value wins (operator-controlled; default 0);
-//!   2. within a priority tier, the least-recently-*selected* account goes next,
-//!      so consecutive requests fan out across the fleet instead of hammering one
+//!   2. within a priority tier, the account in the soonest reset-urgency BUCKET
+//!      goes next — the governing weekly reset floored into
+//!      `resetUrgencyTierHours`-wide buckets (default 24h; `0` disables the
+//!      term). Unused weekly quota is worth nothing once its window resets, so
+//!      the fleet spends the account whose headroom expires soonest first. A
+//!      window with no known reset sorts ahead of every bucket ("probe it").
+//!   3. within a bucket, the least-recently-*selected* account goes next, so
+//!      consecutive requests fan out across the fleet instead of hammering one
 //!      account. (A single request barely moves a weekly bar, so ordering by
-//!      quota headroom would pin one account until its bar caught up.) A
-//!      never-selected account sorts first; soonest weekly reset is the
-//!      cold-start tiebreak.
+//!      quota headroom would pin one account until its bar caught up — and
+//!      ordering by the RAW reset instant would do the same, which is why step 2
+//!      buckets rather than compares directly.) A never-selected account sorts
+//!      first; the raw weekly reset is the cold-start tiebreak below that.
 //!
 //! Eligibility = not disabled, not in an active rate-limit hold, not in a hard
 //! `error` state, and under its threshold (per-account `switchThreshold` else the
@@ -997,6 +1004,16 @@ pub struct Manager {
     /// pick before this reserve is ever consulted. It exists for the day
     /// `controlAccount` names a POOLED (non-disabled) account.
     control_reserve: f64,
+    /// Width in MILLISECONDS of the reset-urgency bucket that rotation ranks by
+    /// within a priority tier, resolved once from
+    /// [`crate::config::Config::reset_urgency_tier_hours`] at construction
+    /// (boot-time snapshot — an edit needs a restart). `0` disables the term,
+    /// restoring the pre-tier `(priority, last_selected_seq, reset)` ordering.
+    ///
+    /// Held in ms rather than hours so [`select::Manager::reset_urgency_tier`]
+    /// divides in the same unit the resets arrive in, with no repeated
+    /// hour-conversion at the top of every selection loop.
+    reset_urgency_tier_ms: i64,
 }
 
 /// Resets the keep-warm in-flight flag on drop, so a sweep that unwinds early
@@ -1147,6 +1164,15 @@ impl Manager {
         // config file is not bound by either.
         let control_reserve = config.control_reserve.clamp(0.0, 0.5);
 
+        // Hours → ms once, at construction. `i64::from` then a checked multiply:
+        // a hand-edited `resetUrgencyTierHours` of, say, 100_000_000 would
+        // overflow the product and wrap to a negative width, which would invert
+        // the bucket ordering rather than fail loudly. Saturating at i64::MAX
+        // instead degrades to "one bucket for everyone" — the same shape as the
+        // `0` disable, which is the safe direction to fall.
+        let reset_urgency_tier_ms =
+            i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
+
         let control_idx = config.control_account.as_ref().and_then(|name| {
             let idx = accounts.iter().position(|a| a.name == *name);
             if idx.is_none() {
@@ -1199,6 +1225,7 @@ impl Manager {
             conn_affinity: Mutex::new(HashMap::new()),
             divert_ledger: Mutex::new(HashMap::new()),
             control_reserve,
+            reset_urgency_tier_ms,
         });
 
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
@@ -2673,6 +2700,7 @@ mod tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),

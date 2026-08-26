@@ -201,15 +201,21 @@ impl Manager {
     /// Pick the best eligible account not in `tried`, spreading load across the
     /// fleet, or `None` if all are exhausted/held/disabled.
     ///
-    /// Within a priority tier we pick the **least-recently-selected** account
-    /// (lowest `last_selected_seq`; a never-selected account sorts first) so
-    /// consecutive requests fan out instead of hammering one account. Ordering by
-    /// quota headroom was rejected deliberately: a single request barely moves a
-    /// weekly bar, so "most headroom first" would deterministically pin one
-    /// account until its bar caught up — the exact overload this fixes. The
-    /// winner is stamped with the next monotonic tick *before returning*, so even
-    /// a burst of concurrent selects rotates (each sees the previous stamp). The
-    /// soonest weekly reset is the final cold-start tiebreak (all-unseen startup).
+    /// Within a priority tier we pick from the soonest **reset-urgency bucket**
+    /// first ([`Self::reset_urgency_tier`] — the governing weekly reset floored
+    /// into `resetUrgencyTierHours`-wide buckets, default 24h), because unused
+    /// weekly quota is worth nothing once its window resets. Within a bucket we
+    /// pick the **least-recently-selected** account (lowest `last_selected_seq`;
+    /// a never-selected account sorts first) so consecutive requests fan out
+    /// instead of hammering one account. Ordering by quota headroom was rejected
+    /// deliberately: a single request barely moves a weekly bar, so "most
+    /// headroom first" would deterministically pin one account until its bar
+    /// caught up — the exact overload this fixes. Ranking on the RAW reset
+    /// instant would pin it the same way, which is why the urgency term buckets
+    /// instead of comparing directly. The winner is stamped with the next
+    /// monotonic tick *before returning*, so even a burst of concurrent selects
+    /// rotates within its bucket (each sees the previous stamp). The soonest
+    /// weekly reset is the final cold-start tiebreak (all-unseen startup).
     ///
     /// This mutates rotation state (the stamp), so it takes the write lock.
     ///
@@ -1921,8 +1927,10 @@ impl Manager {
     }
 
     /// The best pacing-respecting eligible account not in `tried`, by ascending
-    /// `(priority, last_selected_seq, soonest weekly reset)` — the pre-pacing LRU
-    /// order, now additionally skipping any account the soft pacing gate holds out.
+    /// `(priority, reset-urgency bucket, last_selected_seq, soonest weekly reset)`
+    /// — the pre-pacing LRU order, now bucketed by reset urgency
+    /// ([`Self::reset_urgency_tier`]) and additionally skipping any account the
+    /// soft pacing gate holds out.
     /// Read-only (no stamp); the caller stamps the winner. Emits one INFO line per
     /// account skipped *specifically because of pacing* (healthy but capped/spaced)
     /// so the knobs are tunable live.
@@ -1949,6 +1957,59 @@ impl Manager {
         !account.quota.is_near(reserved, now)
     }
 
+    /// The reset-urgency bucket `account` falls into — its governing weekly
+    /// reset, floored into [`Manager::reset_urgency_tier_ms`]-wide buckets
+    /// measured forward from `now`. **Ascending: a lower bucket is spent
+    /// first**, because unused weekly quota is worth nothing once its window
+    /// resets.
+    ///
+    /// Why a bucket and not the reset instant itself: a reset is a
+    /// millisecond-precision instant that essentially never ties, so ranking on
+    /// it directly would retire the `last_selected_seq` tiebreak entirely and
+    /// park every unpinned request on the single soonest-resetting account until
+    /// it gated. That is the same deterministic pin [`Manager::select`]'s
+    /// doc-comment rejects quota-headroom ordering for, and this pool pick
+    /// carries no `in_flight` term to dilute it (only
+    /// [`Manager::pick_least_loaded`] does), so a burst would land undiluted.
+    /// Bucketing re-creates the tie: at the default 24h, the live fleet's four
+    /// soonest-resetting accounts share one bucket and still fan out inside it.
+    ///
+    /// Two arms deliberately return a value that is NOT a bucket index:
+    ///  - **no known live reset → [`i64::MIN`]**, sorting the account ahead of
+    ///    every bucket. This preserves the pre-tier "unknown quota sorts first,
+    ///    probe it" contract byte-for-byte — the same reason the raw-`reset`
+    ///    term below maps `None` to [`i128::MIN`]. It covers both a genuinely
+    ///    unmeasured window and one whose reset has already elapsed;
+    ///    [`crate::quota::QuotaWindow::live_reset`] collapses those two into
+    ///    `None` and this does not try to tell them apart.
+    ///  - **feature disabled (`reset_urgency_tier_ms == 0`) → a constant `0`**,
+    ///    which ties for every account and hands the decision straight back to
+    ///    the LRU tick. That restores the pre-tier ordering exactly, including
+    ///    the unknown-reset-first behaviour, which survives on the raw-`reset`
+    ///    term the key still carries.
+    ///
+    /// Self-rotating by construction: spending an account does not move its
+    /// reset, but crossing that reset starts a fresh window ~7 days out, which
+    /// drops the account to the back of the bucket order. No account starves —
+    /// each one's window comes due in turn.
+    fn reset_urgency_tier(&self, account: &AccountRuntime, now: OffsetDateTime) -> i64 {
+        if self.reset_urgency_tier_ms == 0 {
+            return 0;
+        }
+        let Some(reset) = account.quota.governing_weekly_reset(now) else {
+            return i64::MIN;
+        };
+        // `live_reset` only ever hands back a FUTURE instant, so this difference
+        // is positive in practice; `max(0)` keeps a clock that stepped backwards
+        // between the two reads from producing a negative bucket that would
+        // outrank a genuinely urgent account. `try_from` saturates rather than
+        // wrapping for the same reason.
+        let remaining_ms = i64::try_from((reset - now).whole_milliseconds())
+            .unwrap_or(i64::MAX)
+            .max(0);
+        remaining_ms / self.reset_urgency_tier_ms
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pick_eligible(
         &self,
@@ -1962,7 +2023,7 @@ impl Manager {
     ) -> Option<usize> {
         let reserved_groups = self.reserved_groups();
         let mut best: Option<usize> = None;
-        let mut best_key: Option<(i64, u64, i128)> = None;
+        let mut best_key: Option<(i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
             if tried.contains(&idx) {
                 continue;
@@ -2012,7 +2073,12 @@ impl Manager {
                 .quota
                 .governing_weekly_reset(now)
                 .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
-            let key = (account.priority, account.last_selected_seq, reset);
+            let key = (
+                account.priority,
+                self.reset_urgency_tier(account, now),
+                account.last_selected_seq,
+                reset,
+            );
             if best_key.is_none_or(|b| key < b) {
                 best = Some(idx);
                 best_key = Some(key);
@@ -2022,8 +2088,13 @@ impl Manager {
     }
 
     /// The least-loaded servable account not in `tried`, IGNORING pacing (the soft
-    /// fallback pass). Sort key ascending: `(in_flight, priority, last_selected_seq,
-    /// weekly reset)` — least concurrent load first, then the normal LRU order. All
+    /// fallback pass). Sort key ascending: `(in_flight, priority, reset-urgency
+    /// bucket, last_selected_seq, weekly reset)` — least concurrent load first,
+    /// then the normal bucketed LRU order. `in_flight` stays ahead of the urgency
+    /// bucket deliberately: this pass exists to find the COOLEST account when the
+    /// fleet is all-paced, and letting reset urgency outrank live load would send
+    /// the overflow straight back onto the busy account the fallback is trying to
+    /// relieve. All
     /// non-pacing eligibility (disabled/error/rate-limit/quota) still applies, so a
     /// genuinely exhausted fleet still yields `None` (a real 429), while a merely
     /// all-paced fleet always yields the coolest account. Read-only.
@@ -2038,7 +2109,7 @@ impl Manager {
     ) -> Option<usize> {
         let reserved_groups = self.reserved_groups();
         let mut best: Option<usize> = None;
-        let mut best_key: Option<(u32, i64, u64, i128)> = None;
+        let mut best_key: Option<(u32, i64, i64, u64, i128)> = None;
         for (idx, account) in accounts.iter().enumerate() {
             if tried.contains(&idx) {
                 continue;
@@ -2067,6 +2138,7 @@ impl Manager {
             let key = (
                 account.in_flight,
                 account.priority,
+                self.reset_urgency_tier(account, now),
                 account.last_selected_seq,
                 reset,
             );
@@ -2346,6 +2418,7 @@ mod revalidation_sticky_tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),
@@ -2489,6 +2562,7 @@ mod sticky_divert_replay_tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
             group_settings: HashMap::new(),
@@ -2857,5 +2931,245 @@ mod group_miss_tests {
             classify(&accounts, None, &pacing, "research"),
             GroupMiss::Paced
         );
+    }
+}
+
+/// Tests for the reset-urgency bucket ([`Manager::reset_urgency_tier`]) — the
+/// second ranking key inside a priority tier.
+///
+/// The headline claim every test here circles: **an account whose weekly
+/// headroom expires sooner is spent ahead of one that was selected less
+/// recently**, because unused weekly quota is worth nothing after its reset.
+/// That is a deliberate inversion of the pre-tier LRU order, so the discriminating
+/// test below is built to FAIL on the pre-tier code — it stamps the urgent
+/// account as the most-recently-selected one, which is exactly the account plain
+/// LRU sorts last.
+#[cfg(test)]
+mod reset_urgency_tests {
+    use super::*;
+    use crate::config::{Account, ProxyConfig};
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::quota::QuotaWindow;
+    use crate::warmer::LiveWarmer;
+    use std::collections::HashSet;
+
+    fn account(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn config_with(accounts: Vec<Account>, tier_hours: u32) -> Config {
+        Config {
+            quarantined_accounts: Vec::new(),
+            proxy: ProxyConfig::default(),
+            upstream: "https://api.anthropic.com".to_string(),
+            switch_threshold: 0.90,
+            pacing: PacingConfig::default(),
+            throttle: ThrottleConfig::default(),
+            lock_account: None,
+            control_account: None,
+            control_reserve: 0.05,
+            reset_urgency_tier_hours: tier_hours,
+            http1_only: false,
+            accounts,
+            group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn build_manager(config: Config) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// Give account `idx` a weekly window resetting `hours` from `now` at a
+    /// utilization well under the fixture's 0.90 threshold, so the account is
+    /// ranked but never gated — this suite is about ORDER, and an account held
+    /// out by quota would prove nothing about it.
+    fn set_weekly(manager: &Manager, idx: usize, hours: i64, now: OffsetDateTime) {
+        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        accounts[idx].quota.seven_day = Some(QuotaWindow {
+            utilization: 0.10,
+            reset: Some(now + time::Duration::hours(hours)),
+        });
+    }
+
+    fn set_seq(manager: &Manager, idx: usize, seq: u64) {
+        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        accounts[idx].last_selected_seq = seq;
+    }
+
+    fn pick(manager: &Manager, now: OffsetDateTime) -> usize {
+        manager
+            .select(&HashSet::new(), now, None, None, "/v1/messages", None)
+            .expect("an account is eligible")
+    }
+
+    /// **The discriminating test.** Two accounts in one priority tier: `urgent`
+    /// resets in 2h (bucket 0 at the default 24h width), `roomy` in 100h
+    /// (bucket 4). `urgent` is stamped as the MOST recently selected account and
+    /// `roomy` as never-selected, so pre-tier LRU would pick `roomy` — this test
+    /// fails on the old ordering, which is the point of it.
+    ///
+    /// Mirrors the live fleet that motivated the change (measured 2026-08-26):
+    /// 13 accounts all at priority 0, resets spread 2.5h–152.5h, and the
+    /// soonest-resetting account sitting on 44% of a weekly bucket that was
+    /// worth nothing a few hours later.
+    #[test]
+    fn a_sooner_resetting_account_outranks_a_less_recently_selected_one() {
+        let manager = build_manager(config_with(vec![account("urgent"), account("roomy")], 24));
+        let now = OffsetDateTime::now_utc();
+
+        set_weekly(&manager, 0, 2, now);
+        set_weekly(&manager, 1, 100, now);
+        // Bias plain LRU as hard as possible TOWARD `roomy`: `urgent` looks
+        // most-recently-selected, `roomy` never-selected.
+        set_seq(&manager, 0, 999);
+        set_seq(&manager, 1, 0);
+
+        assert_eq!(
+            pick(&manager, now),
+            0,
+            "the account whose weekly window resets in 2h must be spent before \
+             the one with 100h left, even though it is the most recently \
+             selected of the two — its unused headroom is the only headroom \
+             about to expire"
+        );
+    }
+
+    /// The other half of the design: bucketing must NOT collapse into a
+    /// deterministic pin. Two accounts resetting 2h apart share bucket 0 at the
+    /// default 24h width, so LRU still decides between them and consecutive
+    /// picks alternate — the fan-out that ranking on the raw reset instant would
+    /// have destroyed.
+    #[test]
+    fn accounts_in_one_bucket_still_fan_out_by_lru() {
+        let manager = build_manager(config_with(vec![account("first"), account("second")], 24));
+        let now = OffsetDateTime::now_utc();
+
+        set_weekly(&manager, 0, 2, now);
+        set_weekly(&manager, 1, 4, now);
+
+        let picks: Vec<usize> = (0..4).map(|_| pick(&manager, now)).collect();
+        assert!(
+            picks.contains(&0) && picks.contains(&1),
+            "two accounts sharing one urgency bucket must both be served — \
+             got {picks:?}, which is the deterministic pin the bucket exists \
+             to prevent"
+        );
+    }
+
+    /// `resetUrgencyTierHours: 0` is the config-only rollback: the urgency term
+    /// ties for every account and the pre-tier LRU order returns. Same fixture
+    /// as the discriminating test, opposite expected winner.
+    #[test]
+    fn tier_hours_zero_restores_the_pre_tier_lru_order() {
+        let manager = build_manager(config_with(vec![account("urgent"), account("roomy")], 0));
+        let now = OffsetDateTime::now_utc();
+
+        set_weekly(&manager, 0, 2, now);
+        set_weekly(&manager, 1, 100, now);
+        set_seq(&manager, 0, 999);
+        set_seq(&manager, 1, 0);
+
+        assert_eq!(
+            pick(&manager, now),
+            1,
+            "with the tier term disabled the never-selected account wins on \
+             plain LRU, exactly as it did before this feature existed"
+        );
+    }
+
+    /// An account with no known live weekly reset keeps sorting FIRST — the
+    /// pre-tier "unknown quota → probe it" contract, which the bucket must
+    /// carry through rather than quietly re-rank. `roomy` here is both
+    /// never-selected AND resetting soon; the unmeasured account still beats it.
+    #[test]
+    fn an_unknown_weekly_reset_still_sorts_ahead_of_every_bucket() {
+        let manager = build_manager(config_with(
+            vec![account("unmeasured"), account("soon")],
+            24,
+        ));
+        let now = OffsetDateTime::now_utc();
+
+        // `unmeasured` deliberately gets NO weekly window at all.
+        set_weekly(&manager, 1, 1, now);
+        set_seq(&manager, 0, 999);
+        set_seq(&manager, 1, 0);
+
+        assert_eq!(
+            pick(&manager, now),
+            0,
+            "an account whose weekly window was never measured must be picked \
+             (and so probed) ahead of every bucketed account"
+        );
+    }
+
+    /// Unit-level check of the bucket arithmetic itself, independent of
+    /// selection: the floor division, the disabled arm, and the unknown-reset
+    /// sentinel. Widths are checked at the boundary (24h lands in bucket 1, not
+    /// 0) because an off-by-one here silently re-ranks the whole fleet.
+    #[test]
+    fn bucket_arithmetic_floors_and_handles_both_sentinels() {
+        let manager = build_manager(config_with(vec![account("a")], 24));
+        let now = OffsetDateTime::now_utc();
+
+        let tier = |hours: i64| {
+            set_weekly(&manager, 0, hours, now);
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            manager.reset_urgency_tier(&accounts[0], now)
+        };
+
+        assert_eq!(tier(2), 0, "2h into a 24h width is bucket 0");
+        assert_eq!(tier(23), 0, "23h is still bucket 0");
+        assert_eq!(tier(25), 1, "25h crosses into bucket 1");
+        assert_eq!(tier(100), 4, "100h floors to bucket 4");
+        assert_eq!(tier(152), 6, "the live fleet's furthest account, bucket 6");
+
+        // Unknown reset → the minimum, ahead of every bucket.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].quota.seven_day = None;
+        }
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                manager.reset_urgency_tier(&accounts[0], now),
+                i64::MIN,
+                "an unmeasured weekly window sorts ahead of every bucket"
+            );
+        }
+
+        // Disabled → a constant tie for everyone, including the unknown arm.
+        let off = build_manager(config_with(vec![account("a")], 0));
+        {
+            let accounts = off.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                off.reset_urgency_tier(&accounts[0], now),
+                0,
+                "a disabled tier term must tie, not rank"
+            );
+        }
     }
 }
