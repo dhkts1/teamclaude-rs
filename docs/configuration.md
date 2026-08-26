@@ -46,6 +46,7 @@ section below.
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
 | `usageRetentionDays` | u32 | **`90`** | no | how many days of usage ledger files to keep |
+| `resetUrgencyTierHours` | u32 | **`24`** | no | width of the reset-urgency bucket rotation ranks by inside a priority tier; `0` disables it, see below |
 | `accounts` | array | `[]` | no | the rotatable accounts |
 
 `switchThreshold` is **0.95**, not 0.90. The default function is
@@ -160,6 +161,54 @@ keep-warm; any other value is treated as a static key.
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
 nothing reads them.
+
+## `resetUrgencyTierHours`: spend the quota that is about to expire
+
+Unused weekly quota is worth nothing once its window resets. Accounts do not reset together —
+measured on a 13-account fleet on 2026-08-26, every account sat at priority 0 and their weekly
+resets were spread from 2.5 hours to 152.5 hours out, with the soonest-resetting account holding
+44% of a bucket that would be gone by morning and the furthest holding 92% it had five days to
+spend. Plain least-recently-used rotation spreads requests evenly over both, which wastes the
+first account's headroom to preserve headroom that was not under any time pressure.
+
+So rotation ranks inside a priority tier by **which bucket an account's governing weekly reset
+falls into**, before the least-recently-used tick. At the default 24-hour width that fleet
+splits like this:
+
+| bucket | accounts | resets in |
+|---|---|---|
+| 0 | four | 2.5h, 11.5h, 13.5h, 18.5h |
+| 1 | two | 27.5h, 33.5h |
+| 2 | two | 49.5h, 52.5h |
+| 3–6 | five | 79.5h … 152.5h |
+
+Bucket 0 absorbs today's traffic, and the four accounts in it still fan out among themselves on
+the usual least-recently-used order. As each one crosses its threshold it gates out normally and
+bucket 1 takes over.
+
+**The width is the whole design, not a tuning detail.** A raw reset instant is millisecond-precise
+and essentially never ties, so ranking on it directly would retire the least-recently-used tiebreak
+altogether and park every unpinned request on one account until it gated — the same deterministic
+pin that ordering by quota headroom was rejected for, and the pool pick carries no in-flight term
+to dilute a burst. Bucketing re-creates the tie. Narrower widths concentrate load (at 6 hours the
+soonest account sits alone in its bucket, which is the raw behaviour with extra steps); wider ones
+weaken the signal (at 48 hours, six of those thirteen collapse into one bucket).
+
+Two behaviours are deliberate:
+
+- An account whose weekly window has **no known live reset** sorts ahead of every bucket, so it
+  gets picked and therefore probed. This is the pre-existing "unknown quota → probe it" rule, not
+  a new one.
+- Nothing starves. Spending an account does not move its reset, but crossing that reset starts a
+  fresh window about seven days out, which drops the account to the back of the bucket order. Each
+  account's window comes due in turn.
+
+Set `"resetUrgencyTierHours": 0` to disable the term entirely and restore the previous
+`(priority, least-recently-selected, reset)` ordering — a config-only rollback, no rebuild.
+
+Like every key here except `groups` and `groupSettings`, this is read **once at boot**. An edit
+needs a restart before the serving process rotates by it, and `tcr status` reports the running
+process's view rather than the file's.
 
 ## `pacing.*`: opt-in, ships OFF
 

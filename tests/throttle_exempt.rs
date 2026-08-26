@@ -131,6 +131,7 @@ fn config(upstream: &str, throttle: ThrottleConfig, throttle_exempt_noise: bool)
         lock_account: None,
         control_account: None,
         control_reserve: 0.05,
+        reset_urgency_tier_hours: 24,
         http1_only: false,
         accounts: (0..POOL).map(account).collect(),
         group_settings: std::collections::HashMap::new(),
