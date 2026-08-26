@@ -212,10 +212,42 @@ A quarantined download that opens with no warning is the outcome all of the abov
 if macOS says *"cannot be opened because the developer cannot be verified"*, the build was signed
 with the wrong certificate class and step 2 of the pipeline did not run.
 
-## Known-unverified
+## Stages 5 and 6 are verified
 
-An App Store Connect API key now exists (2026-08-09) and `release-local.sh` supplies it, so the
-blocker on stages 5 and 6 is gone. What has **not** happened is a completed notarized run: those two
-stages are still written from Apple's documented interface rather than from a success. The first
-real release is the first test of them. Run it with `--dry-run` first, and verify the result with
-the section above from the downloaded DMG rather than from `build/`.
+They were not, until 0.2.26. This section used to say that no notarized run had ever completed and
+that stages 5 and 6 were written from Apple's documented interface rather than from a success. That
+is no longer true, and leaving it in place would have had the next releaser bracing for an untested
+step that has now run.
+
+On 2026-08-26, `release-local.sh v0.2.26` completed all nine stages: `notarytool submit --wait`
+returned `status: Accepted`, and the ticket stapled and validated. Verified afterwards from the
+**downloaded** DMG rather than `build/`, using the three commands in the section above —
+`stapler validate` passed, `spctl` returned `accepted / source=Notarized Developer ID`, and
+`codesign` reported `flags=0x10000(runtime)` with a `Timestamp=` line and
+`TeamIdentifier=UJQ3GQF56Y`.
+
+Still run `--dry-run` first, and still verify from the downloaded DMG. Those are cheap, and the
+things they catch are not the same things a previous release passing catches.
+
+## Known gap: a tag publishes the CLI release before the app is built
+
+`release.yml` (cargo-dist) fires on the tag push and publishes its GitHub Release immediately, with
+the CLI tarballs attached. The DMG and `appcast.xml` only arrive minutes later, when
+`release-local.sh` finishes. In that window the new tag is the **latest** release and carries no
+`appcast.xml`, so `releases/latest/download/appcast.xml` — the `SUFeedURL` every installed copy
+polls — returns **404**, and no install can check for updates.
+
+Observed on 0.2.26: confirmed 404 against the live URL, cleared by marking the tag prerelease so
+`latest` fell back to 0.2.25.
+
+`quarantine_if_assetless` in `release-tcrbar.sh` exists to close exactly this window, but it tests
+for a release with **no assets at all**. A cargo-dist release has thirteen, so the guard does not
+fire — it is aimed at a state this pipeline no longer produces. Until that predicate is widened to
+"no `appcast.xml` asset", either mark the tag prerelease by hand right after pushing it:
+
+```sh
+gh release edit vX.Y.Z --prerelease --repo dhkts1/teamclaude-rs
+```
+
+— stage 9 clears the flag itself once the assets are up — or push the tag only when you are ready to
+run `release-local.sh` immediately afterwards.
