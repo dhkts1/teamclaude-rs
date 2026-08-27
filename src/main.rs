@@ -555,7 +555,7 @@ fn run_ui() -> anyhow::Result<()> {
 /// shell alias.
 fn run_claude(args: RunArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let (config, _) = load_config(&config_path);
+    let (config, _) = load_config(&config_path)?;
     let port = config.proxy.port;
 
     // `--group`: validate the name and the claude version BEFORE spawning
@@ -1012,9 +1012,42 @@ fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDown
 /// how to wait (the TUI, or a headless block on Ctrl-C).
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
-    let (config, persist_path) = load_config(&config_path);
+    let (config, persist_path) = load_config(&config_path)?;
 
     init_tracing(args.headless);
+
+    // Auto-migrating `throttle` in memory (see `config::load`) is only half the
+    // fix Gil asked for — "our code should auto migrate" means the file itself
+    // stops carrying the stale key, so the operator is never re-warned on every
+    // boot and a later `tcr accounts`/`tcr status` sees a config that already
+    // reflects the split. This is deliberately the ONLY place that persists a
+    // migration: read-only CLI verbs migrate in memory and stay read-only. See
+    // `migration_persist_target` for what gates the write.
+    if let Some(path) = migration_persist_target(&config, &persist_path) {
+        match config::save(path, &config) {
+            Ok(()) => {
+                let msg = format!(
+                    "migrated the legacy `throttle` config key to `accountThrottle`/\
+                     `fleetThrottle` and rewrote {} — this should only happen once",
+                    path.display()
+                );
+                tracing::warn!("{msg}");
+                eprintln!("[tcr] {msg}");
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "auto-migrated the legacy `throttle` key in memory, but failed to \
+                     persist the migration to disk; it will re-run at every future boot \
+                     until this is fixed"
+                );
+                eprintln!(
+                    "[tcr] warning: could not persist the auto-migrated config to {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     // Spelled out rather than built from `ServeOptions::new`, which is
     // deliberately inert: writing the config back, owning the shared pin cache
@@ -1225,32 +1258,55 @@ fn stand_down_exit(stand_down: &server::StandDown) -> ! {
     ));
 }
 
+/// Where (if anywhere) `run_server` should persist an in-memory `throttle`
+/// migration: only when `load` actually migrated something, a file path exists
+/// to write it to, and no account is quarantined. Pulled out as a pure
+/// function so the decision is unit-testable without booting a real server —
+/// see the `migration_persist_target_*` tests below.
+///
+/// The quarantine gate mirrors `cli::load_for_edit`: writing back a `Config`
+/// while an account is quarantined would serialize over its raw JSON
+/// (`importFrom` pointer included) and drop it permanently, so this skips the
+/// write and leaves the on-disk file for a human to fix — same hazard, same
+/// guard.
+fn migration_persist_target<'a>(
+    config: &Config,
+    persist_path: &'a Option<PathBuf>,
+) -> Option<&'a Path> {
+    if config.migrated_legacy_throttle && config.quarantined_accounts.is_empty() {
+        persist_path.as_deref()
+    } else {
+        None
+    }
+}
+
 /// Load the config, deciding what may be written back:
 /// - missing file → in-memory defaults, keep the path so the first refresh
 ///   creates it;
-/// - corrupt/unreadable existing file → fail loudly and fall back to in-memory
-///   defaults, but DROP the persist path so the user's file is never clobbered
-///   with defaults — it can be fixed by hand and the proxy restarted.
-fn load_config(path: &Path) -> (Config, Option<PathBuf>) {
+/// - corrupt/unreadable existing file → **refuse to start**. This used to fall
+///   back to in-memory defaults (a zero-account fleet) and boot anyway — a
+///   proxy that binds its port and answers every request with 429 while
+///   looking alive, which is worse than refusing outright: a dead proxy that
+///   won't start is obvious, and this one was not (see `config::load`'s
+///   doc-comment on the migration this replaced). A missing file is a
+///   legitimate first run and still boots on defaults; a file that exists and
+///   fails to parse is now the operator's problem to fix, not something this
+///   binary papers over.
+fn load_config(path: &Path) -> anyhow::Result<(Config, Option<PathBuf>)> {
     match config::load(path) {
-        Ok(config) => (config, Some(path.to_path_buf())),
+        Ok(config) => Ok((config, Some(path.to_path_buf()))),
         Err(ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
                 "[tcr] no config at {} — starting with defaults",
                 path.display()
             );
-            (default_config(), Some(path.to_path_buf()))
+            Ok((default_config(), Some(path.to_path_buf())))
         }
-        Err(err) => {
-            eprintln!(
-                "[tcr] config at {} is unreadable/corrupt: {err}",
-                path.display()
-            );
-            eprintln!(
-                "[tcr] starting with in-memory defaults; the file will NOT be overwritten — fix it and restart"
-            );
-            (default_config(), None)
-        }
+        Err(err) => anyhow::bail!(
+            "config at {} is unreadable/corrupt: {err} — refusing to start rather than \
+             serve an empty fleet; fix the file and restart",
+            path.display()
+        ),
     }
 }
 
@@ -2299,5 +2355,88 @@ mod tests {
             err.to_string().contains("control character"),
             "the error must name the character class at fault: {err}"
         );
+    }
+
+    // --- legacy `throttle` migration: boot-time behaviour ---------------------
+
+    fn unique_config_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("tcr-main-{tag}-{}-{seq}.json", std::process::id()))
+    }
+
+    /// `migration_persist_target` gates the write `run_server` performs after a
+    /// migration: an active migration with nowhere quarantined and a real path
+    /// on disk gets rewritten.
+    #[test]
+    fn migration_persist_target_writes_when_clear() {
+        let path = unique_config_path("persist-target-clear");
+        let mut config = default_config();
+        config.migrated_legacy_throttle = true;
+        assert_eq!(
+            migration_persist_target(&config, &Some(path.clone())),
+            Some(path.as_path())
+        );
+    }
+
+    /// The quarantine gate is not optional (mirrors `cli::load_for_edit`):
+    /// writing back a `Config` while an account is quarantined would serialize
+    /// over that account's raw JSON (its `importFrom` pointer included) and
+    /// drop it permanently. A pending migration must stay in-memory-only until
+    /// a human clears the quarantine.
+    #[test]
+    fn migration_persist_target_is_none_when_an_account_is_quarantined() {
+        let path = unique_config_path("persist-target-quarantined");
+        let mut config = default_config();
+        config.migrated_legacy_throttle = true;
+        config.quarantined_accounts = vec!["acct-import".to_string()];
+        assert_eq!(migration_persist_target(&config, &Some(path)), None);
+    }
+
+    /// Nothing to persist when `load` never migrated anything.
+    #[test]
+    fn migration_persist_target_is_none_when_nothing_migrated() {
+        let path = unique_config_path("persist-target-unmigrated");
+        let config = default_config();
+        assert_eq!(migration_persist_target(&config, &Some(path)), None);
+    }
+
+    /// Nothing to persist without a file path (e.g. the corrupt-config fallback
+    /// used to drop the persist path — see `load_config`).
+    #[test]
+    fn migration_persist_target_is_none_without_a_persist_path() {
+        let mut config = default_config();
+        config.migrated_legacy_throttle = true;
+        assert_eq!(migration_persist_target(&config, &None), None);
+    }
+
+    /// A missing config file is a legitimate first run: `load_config` must
+    /// still boot on in-memory defaults, keeping the persist path so the first
+    /// refresh creates the file.
+    #[test]
+    fn load_config_boots_on_defaults_when_file_is_missing() {
+        let path = unique_config_path("missing");
+        let (config, persist_path) =
+            load_config(&path).expect("a missing config file must not refuse to boot");
+        assert!(config.accounts.is_empty());
+        assert_eq!(persist_path, Some(path));
+    }
+
+    /// The behaviour this task changed: a config that exists and fails to
+    /// parse (malformed JSON, NOT the legacy `throttle` key — that key is
+    /// migrated, never an error, per `config::load`) must make the server
+    /// REFUSE to boot rather than silently serve a zero-account fleet that
+    /// answers every request with 429 while looking alive.
+    #[test]
+    fn load_config_refuses_to_boot_on_a_corrupt_config() {
+        let path = unique_config_path("corrupt");
+        std::fs::write(&path, "{ this is not valid json").unwrap();
+        let err = load_config(&path).expect_err("a corrupt config must refuse to boot");
+        assert!(
+            err.to_string().contains("unreadable/corrupt"),
+            "the refusal must say why: {err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

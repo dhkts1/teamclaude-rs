@@ -672,9 +672,11 @@ pub struct Config {
     /// burst: 16`). Set `"fleetThrottle": {}` to disable it. Read at boot.
     ///
     /// Disabling BOTH is what the old `"throttle": {}` escape hatch used to mean.
-    /// Neither key on its own leaves the proxy unthrottled — that asymmetry is the
-    /// reason a stale `throttle` key is rejected outright rather than migrated (see
-    /// [`load`]).
+    /// Neither key on its own leaves the proxy unthrottled — that asymmetry is why
+    /// migrating a stale `throttle` key needs two branches rather than one: no
+    /// single new key means "unthrottled", so an inert legacy `throttle` has to map
+    /// onto BOTH buckets set inert, and only a migration that special-cases that
+    /// can preserve what the operator meant (see [`load`]).
     #[serde(default = "default_fleet_throttle")]
     pub fleet_throttle: ThrottleConfig,
     /// Hard account lock: when set to an account `name`, ALL traffic is pinned to
@@ -775,6 +777,14 @@ pub struct Config {
     /// `serde_json::from_str`, `Config::default()`-shaped construction).
     #[serde(skip)]
     pub quarantined_accounts: Vec<String>,
+    /// Set when [`load`] migrated a legacy `throttle` key into
+    /// `accountThrottle`/`fleetThrottle` on this load. `#[serde(skip)]` — never
+    /// read from or written to the file, same pattern as
+    /// [`Self::quarantined_accounts`]. The boot path in `main.rs` reads this to
+    /// decide whether to persist the migrated document back to disk once, so a
+    /// migrated install self-heals instead of re-warning on every start.
+    #[serde(skip)]
+    pub migrated_legacy_throttle: bool,
 }
 
 impl Config {
@@ -954,55 +964,78 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let data = fs::read_to_string(path)?;
     let mut doc: Value = serde_json::from_str(&data)?;
 
-    // A stale `throttle` key is REJECTED, never migrated. `Config` carries a
-    // `#[serde(flatten)] extra` catch-all, so an unrecognised key is normally
-    // absorbed in silence — for a rate limiter that failure mode is unacceptable:
-    // the config would look configured while the running proxy used defaults.
+    // A stale `throttle` key is MIGRATED, never rejected — "our code should auto
+    // migrate" (the mandate behind this function). `throttle` shipped through a
+    // Sparkle auto-update with no migration step of its own, so refusing to
+    // parse it left every affected install unable to boot: the CLI exited
+    // non-zero on every verb, and `main.rs::load_config`'s fallback for `tcr
+    // server` is worse — it swallows the error and boots a zero-account fleet
+    // that answers every request with 429 while looking alive. There is no
+    // input on which this key may still cause a parse error.
     //
-    // Rejecting rather than mapping is deliberate. The old key's escape-hatch form
-    // (`"throttle": {}`) meant "no throttling at all", and there is no longer any
-    // single key that means that, so any automatic mapping would silently change
-    // what a `{}` meant. Better to stop and make the operator say which limiter
-    // they meant.
+    // The two-branch rule:
     //
-    // CAUTION — what this rejection does and does not protect.
+    // * `throttle` parses into an ACTIVE `ThrottleConfig` (has an effective
+    //   `minSpacingMs`) — that is what the old single key actually did, a
+    //   per-organization limiter. It becomes `accountThrottle`, verbatim, and
+    //   `fleetThrottle` is left absent to take its own (looser) default. Tuning
+    //   is preserved exactly; the fleet ceiling is additive insurance.
+    // * `throttle` parses into an INERT `ThrottleConfig` (`{}`, a `burst` with
+    //   no spacing, or `minSpacingMs: 0`) — the old key's escape hatch meant "no
+    //   throttling at all", so both new keys are set to `{}` to preserve that
+    //   intent exactly.
     //
-    // For a CLI subcommand (`tcr accounts`, `tcr status`, ...) this is a hard
-    // failure: the error surfaces and the command exits non-zero.
+    // If `accountThrottle` or `fleetThrottle` is already present alongside
+    // `throttle` (a half-run of the old manual migration script), the new
+    // key(s) win and `throttle` is dropped with a warning — still no error. If
+    // `throttle` holds something that cannot parse as a `ThrottleConfig` at all
+    // (a string, a number), it is dropped with a warning — still no error.
     //
-    // For `tcr server` it is NOT. `main.rs::load_config` catches every
-    // non-NotFound error, warns on stderr, and falls back to `default_config()`
-    // — which is `from_str("{}")`, i.e. a fleet with ZERO accounts — while
-    // dropping the persist path. A proxy started that way looks alive and
-    // answers every request from an empty fleet. That is worse than refusing to
-    // boot, because a dead proxy is obvious and this one is not.
-    //
-    // Therefore the deploy order is LOAD-BEARING and it is:
-    //
-    //   1. migrate the config FIRST (scripts/migrate-throttle-config.sh)
-    //   2. THEN install the new binary
-    //
-    // and never the reverse. Migrating first is safe precisely because the OLD
-    // binary tolerates the new keys: `Config` carries a `#[serde(flatten)] extra`
-    // catch-all, so `accountThrottle`/`fleetThrottle` are absorbed and ignored,
-    // and with `throttle` removed the old binary falls back to its own
-    // `default_throttle()`. Verified 2026-08-27 against the installed 034880a
-    // binary: it loads a migrated config and exits 0.
-    //
-    // `tcr accounts --config <path>` remains a useful pre-flight, but note it
-    // exercises a DIFFERENT code path from the server, so a clean pre-flight does
-    // not by itself prove the server would have booted.
-    if doc.get("throttle").is_some() {
-        return Err(ConfigError::Parse(
-            <serde_json::Error as serde::de::Error>::custom(
-                "config key `throttle` no longer exists; it was split in two. \
-                 Use `accountThrottle` for the per-organization limiter (this is \
-                 what `throttle` used to do, and is almost certainly what you want) \
-                 and `fleetThrottle` for the looser fleet-wide ceiling. \
-                 Deleting the key instead of renaming it re-enables BOTH defaults. \
-                 To disable throttling entirely, set both to {}.",
-            ),
-        ));
+    // `migrated_legacy_throttle` records that this happened so the boot path in
+    // `main.rs` can persist the migrated document back to disk once, so the
+    // fix actually self-heals instead of re-warning on every start.
+    let mut migrated_legacy_throttle = false;
+    if let Some(throttle_value) = doc.as_object_mut().and_then(|obj| obj.remove("throttle")) {
+        migrated_legacy_throttle = true;
+        let has_new_keys = doc.as_object().is_some_and(|obj| {
+            obj.contains_key("accountThrottle") || obj.contains_key("fleetThrottle")
+        });
+        if has_new_keys {
+            tracing::warn!(
+                "config carries both a legacy `throttle` key and a new `accountThrottle`/\
+                 `fleetThrottle` key; the new key(s) win and the legacy `throttle` key is dropped"
+            );
+        } else {
+            match serde_json::from_value::<ThrottleConfig>(throttle_value.clone()) {
+                Ok(legacy) if legacy.is_active() => {
+                    tracing::warn!(
+                        min_spacing_ms = ?legacy.min_spacing_ms,
+                        burst = ?legacy.burst,
+                        "migrating legacy `throttle` key to `accountThrottle`; \
+                         `fleetThrottle` takes its own default"
+                    );
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.insert("accountThrottle".to_string(), throttle_value);
+                    }
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        "migrating inert legacy `throttle` key: disabling both \
+                         `accountThrottle` and `fleetThrottle`"
+                    );
+                    if let Some(obj) = doc.as_object_mut() {
+                        obj.insert("accountThrottle".to_string(), Value::Object(Map::new()));
+                        obj.insert("fleetThrottle".to_string(), Value::Object(Map::new()));
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "legacy `throttle` key does not parse as a throttle config; dropping it"
+                    );
+                }
+            }
+        }
     }
 
     let mut quarantined = Vec::new();
@@ -1030,6 +1063,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
 
     let mut config: Config = serde_json::from_value(doc)?;
     config.quarantined_accounts = quarantined;
+    config.migrated_legacy_throttle = migrated_legacy_throttle;
     Ok(config)
 }
 
@@ -2755,6 +2789,171 @@ mod tests {
         fs::remove_file(&out).ok();
     }
 
+    // --- legacy `throttle` auto-migration -------------------------------------
+    //
+    // Regression coverage for a shipped incident: a Sparkle auto-update split
+    // `throttle` into `accountThrottle`/`fleetThrottle` with no migration, and
+    // a stale `throttle` key used to be a hard `load` error. It must never be
+    // one again — every one of these loads successfully.
+
+    /// The incident's exact shape: an active legacy throttle migrates verbatim
+    /// into `accountThrottle`, and `fleetThrottle` takes its own default.
+    #[test]
+    fn legacy_throttle_key_migrates_to_account_throttle() {
+        let path = tmp_path("throttle-migrate-active");
+        fs::write(
+            &path,
+            r#"{ "accounts": [], "throttle": { "burst": 4, "minSpacingMs": 350 } }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(config.migrated_legacy_throttle);
+        assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
+        assert_eq!(config.account_throttle.effective_burst(), 4);
+        assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
+        assert_eq!(config.fleet_throttle.effective_burst(), 16);
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// The old key's escape hatch (`"throttle": {}`) meant "no throttling at
+    /// all" — migrating it must disable BOTH new buckets to preserve that.
+    #[test]
+    fn legacy_empty_throttle_disables_both_buckets() {
+        let path = tmp_path("throttle-migrate-empty");
+        fs::write(&path, r#"{ "accounts": [], "throttle": {} }"#).unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(config.migrated_legacy_throttle);
+        assert!(!config.account_throttle.is_active());
+        assert!(!config.fleet_throttle.is_active());
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// A `burst` with no `minSpacingMs` is inert per `ThrottleConfig::is_active`
+    /// — migration must treat it the same as `{}`, not as "active".
+    #[test]
+    fn legacy_throttle_burst_only_is_inert_and_disables_both_buckets() {
+        let path = tmp_path("throttle-migrate-burst-only");
+        fs::write(&path, r#"{ "accounts": [], "throttle": { "burst": 4 } }"#).unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(!config.account_throttle.is_active());
+        assert!(!config.fleet_throttle.is_active());
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `minSpacingMs: 0` normalizes to "unset" (`ThrottleConfig::
+    /// effective_min_spacing`'s footgun handling) — migration must see the
+    /// legacy key as inert here too.
+    #[test]
+    fn legacy_throttle_zero_spacing_is_inert_and_disables_both_buckets() {
+        let path = tmp_path("throttle-migrate-zero-spacing");
+        fs::write(
+            &path,
+            r#"{ "accounts": [], "throttle": { "minSpacingMs": 0 } }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(!config.account_throttle.is_active());
+        assert!(!config.fleet_throttle.is_active());
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// A half-run of the old manual migration script left BOTH the legacy key
+    /// and a new key in the same file. The new key wins; `throttle` is dropped;
+    /// this must still load without error.
+    #[test]
+    fn legacy_throttle_alongside_new_key_defers_to_the_new_key() {
+        let path = tmp_path("throttle-migrate-conflict");
+        fs::write(
+            &path,
+            r#"{ "accounts": [],
+                 "throttle": { "burst": 4, "minSpacingMs": 350 },
+                 "accountThrottle": { "burst": 9, "minSpacingMs": 999 } }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.account_throttle.effective_min_spacing(), Some(999));
+        assert_eq!(config.account_throttle.effective_burst(), 9);
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `throttle` holding something that cannot parse as a `ThrottleConfig` at
+    /// all (a bare string) must be dropped, not fail the whole load — dropping
+    /// it leaves both buckets at their normal (ON) defaults, same as if
+    /// `throttle` had never been present at all.
+    #[test]
+    fn legacy_throttle_unparseable_value_is_dropped_without_error() {
+        let path = tmp_path("throttle-migrate-unparseable");
+        fs::write(&path, r#"{ "accounts": [], "throttle": "nonsense" }"#).unwrap();
+
+        let config = load(&path).unwrap();
+        assert!(config.migrated_legacy_throttle);
+        assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
+        assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `migrated_legacy_throttle` is `#[serde(skip)]`, same contract as
+    /// `quarantined_accounts` — never written to the file.
+    #[test]
+    fn migrated_legacy_throttle_does_not_serialize() {
+        let path = tmp_path("throttle-migrate-no-serialize");
+        fs::write(
+            &path,
+            r#"{ "accounts": [], "throttle": { "burst": 4, "minSpacingMs": 350 } }"#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert!(config.migrated_legacy_throttle);
+
+        let out = tmp_path("throttle-migrate-no-serialize-out");
+        save(&out, &config).unwrap();
+        let value = read_json(&out);
+        assert!(
+            value.get("migratedLegacyThrottle").is_none()
+                && value.get("migrated_legacy_throttle").is_none(),
+            "migrated_legacy_throttle leaked into the saved file: {value}"
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&out).ok();
+    }
+
+    /// The auto-fix claim: persisting a migrated config must actually remove
+    /// `throttle` from the FILE BYTES, not just the in-memory struct, and must
+    /// write `accountThrottle` in its place.
+    #[test]
+    fn persisting_a_migrated_config_removes_throttle_from_the_file() {
+        let path = tmp_path("throttle-migrate-persist-roundtrip");
+        fs::write(
+            &path,
+            r#"{ "accounts": [], "throttle": { "burst": 4, "minSpacingMs": 350 } }"#,
+        )
+        .unwrap();
+        let config = load(&path).unwrap();
+        assert!(config.migrated_legacy_throttle);
+
+        save(&path, &config).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            !raw.contains(r#""throttle""#),
+            "persisted file still carries the legacy key: {raw}"
+        );
+        assert!(raw.contains("accountThrottle"), "persisted file: {raw}");
+
+        fs::remove_file(&path).ok();
+    }
+
     // --- group color ---------------------------------------------------------
 
     #[test]
@@ -3152,7 +3351,8 @@ mod tests {
     fn empty_object_disables_only_that_bucket() {
         // The escape hatch is now PER BUCKET. Disabling one leaves the other at its
         // default — there is no single key that means "unthrottled" any more, which
-        // is exactly why a stale `throttle` key is rejected rather than migrated.
+        // is exactly why migrating a stale `throttle` key branches on whether it
+        // was active rather than mapping it onto one new key uniformly.
         let config: Config =
             serde_json::from_str(r#"{ "accounts": [], "accountThrottle": {} }"#).unwrap();
         assert_eq!(config.account_throttle.min_spacing_ms, None);
@@ -4653,31 +4853,17 @@ mod tests {
         assert!(!config.account_throttle.is_active());
     }
 
-    /// The rejection lives in [`load`], not in `Deserialize`, because `Config`
+    /// The migration lives in [`load`], not in `Deserialize`, because `Config`
     /// carries a `#[serde(flatten)] extra` catch-all that would otherwise absorb a
     /// stale `throttle` key in silence and run on defaults. Every production caller
     /// goes through `load`; the only non-test `from_value::<Config>` is inside it.
+    /// A stale `throttle` key used to be a hard `load` error — see
+    /// `legacy_throttle_key_migrates_to_account_throttle` and its siblings above
+    /// for the auto-migration this replaced it with; this test only pins that the
+    /// already-renamed shape (no `throttle` key at all) keeps working.
     #[test]
-    fn legacy_throttle_key_is_rejected_by_load() {
-        let dir = std::env::temp_dir().join(format!("tcr-legacy-throttle-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("teamclaude.json");
-        fs::write(
-            &path,
-            r#"{ "accounts": [], "throttle": { "minSpacingMs": 350, "burst": 4 } }"#,
-        )
-        .unwrap();
-
-        let err = load(&path).expect_err("a stale `throttle` key must not boot");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("accountThrottle") && msg.contains("fleetThrottle"),
-            "the error must name BOTH replacements so the operator knows which they \
-             meant; got: {msg}"
-        );
-
-        // Control: the same document with the key renamed loads fine. Without this,
-        // the test above would still pass if `load` rejected every config.
+    fn renamed_throttle_key_loads_without_migration() {
+        let path = tmp_path("throttle-already-renamed");
         fs::write(
             &path,
             r#"{ "accounts": [], "accountThrottle": { "minSpacingMs": 350, "burst": 4 } }"#,
@@ -4685,7 +4871,8 @@ mod tests {
         .unwrap();
         let ok = load(&path).expect("the renamed key must load");
         assert_eq!(ok.account_throttle.effective_burst(), 4);
+        assert!(!ok.migrated_legacy_throttle);
 
-        fs::remove_dir_all(&dir).ok();
+        fs::remove_file(&path).ok();
     }
 }

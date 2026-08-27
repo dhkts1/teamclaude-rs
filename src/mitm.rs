@@ -1351,6 +1351,7 @@ mod tests {
     fn dummy_manager() -> Arc<Manager> {
         let config = crate::config::Config {
             quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
             proxy: crate::config::ProxyConfig {
                 port: 0,
                 api_key: None,

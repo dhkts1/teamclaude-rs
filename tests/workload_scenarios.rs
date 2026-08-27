@@ -209,6 +209,7 @@ impl Fleet {
         let account_names = accounts.iter().map(|(n, _)| (*n).to_string()).collect();
         let config = Config {
             quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: SWITCH_THRESHOLD,

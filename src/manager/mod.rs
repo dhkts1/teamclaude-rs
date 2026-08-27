@@ -2827,6 +2827,7 @@ mod tests {
     fn config_with(accounts: Vec<Account>) -> Config {
         Config {
             quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
