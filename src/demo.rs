@@ -82,6 +82,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         last_stream_error: None,
         refresh_lock: Arc::new(AsyncMutex::new(())),
         http: crate::manager::build_serving_client(false),
+        serves_since_client_build: 0,
     }
 }
 
