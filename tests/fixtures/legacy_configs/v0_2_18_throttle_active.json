@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "name": "alice",
+      "accessToken": "at-alice",
+      "refreshToken": "rt-alice",
+      "expiresAt": 1
+    }
+  ],
+  "throttle": {
+    "burst": 4,
+    "minSpacingMs": 350
+  }
+}

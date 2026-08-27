@@ -157,6 +157,7 @@ fn config(
     );
     Config {
         quarantined_accounts: Vec::new(),
+        migrated_legacy_throttle: false,
         proxy: ProxyConfig {
             port: 0,
             api_key: None,

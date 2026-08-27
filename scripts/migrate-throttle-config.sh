@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Rename the pre-split `throttle` key to `accountThrottle` + `fleetThrottle`.
 #
+# AS OF THE NEXT RELEASE, THE BINARY DOES THIS FOR YOU. `config::load` now
+# migrates a stale `throttle` key automatically (in memory always, and to disk
+# too on the server's boot path, once) instead of rejecting it — an
+# auto-updated install self-heals on its own next start, with no manual step.
+# This script has no callers in this repo any more. It stays useful for
+# exactly one case: pre-migrating a config before installing an OLDER binary
+# that still hard-rejects `throttle`, i.e. the reverse direction from normal
+# upgrades. Whether to delete it outright is a separate call, not made here.
+#
 # ORDER MATTERS. Run this BEFORE installing the new binary, never after.
 #
 #   1. scripts/migrate-throttle-config.sh          <- you are here

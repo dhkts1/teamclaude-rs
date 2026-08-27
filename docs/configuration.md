@@ -248,10 +248,22 @@ is also limited, which nobody here has measured. It is set far above observed tr
 does not bind in normal use.
 
 > **This replaced a single fleet-wide `throttle` key.** A config still carrying `throttle` is
-> **rejected at boot** with an error naming both replacements — it is not migrated and not
-> ignored. Rejecting is deliberate: the old key's escape-hatch form (`"throttle": {}`) meant
-> "no throttling at all", and no single key means that any more, so any automatic mapping
-> would silently change what a `{}` meant. Rename the key; do not delete it.
+> **migrated automatically at load** — the file self-heals the first time the server boots
+> with it, so a customer install that auto-updates onto the new binary never has to hand-edit
+> anything. The migration branches on whether the old key was active:
+>
+> - `throttle` **active** (has an effective `minSpacingMs`) → becomes `accountThrottle`,
+>   verbatim — that is what the single old key actually did, a per-organization limiter.
+>   `fleetThrottle` is left absent and takes its own default.
+> - `throttle` **inert** (`{}`, a `burst` with no spacing, or `minSpacingMs: 0`) → both
+>   `accountThrottle` and `fleetThrottle` are set to `{}`. The old key's escape-hatch form
+>   meant "no throttling at all", and no single new key means that any more, so an inert
+>   legacy key has to disable both buckets to preserve that intent.
+>
+> If a new key is already present alongside `throttle` (a half-run migration), the new key
+> wins and `throttle` is dropped. If `throttle` holds something that does not parse as a
+> throttle config at all, it is dropped. Every case loads and boots — there is no input on
+> which this key causes a load error any more.
 
 ### The absent-versus-empty inversion
 

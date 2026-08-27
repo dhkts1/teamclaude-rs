@@ -2410,6 +2410,7 @@ mod revalidation_sticky_tests {
     fn config_with(accounts: Vec<Account>) -> Config {
         Config {
             quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
@@ -2555,6 +2556,7 @@ mod sticky_divert_replay_tests {
     fn config_with(accounts: Vec<Account>) -> Config {
         Config {
             quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
@@ -2977,6 +2979,7 @@ mod reset_urgency_tests {
     fn config_with(accounts: Vec<Account>, tier_hours: u32) -> Config {
         Config {
             quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
