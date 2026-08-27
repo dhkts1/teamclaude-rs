@@ -215,7 +215,8 @@ impl Fleet {
             pacing,
             // Inert: the global egress throttle is an async sleep on the send
             // path and has no bearing on selection.
-            throttle: ThrottleConfig::default(),
+            account_throttle: ThrottleConfig::default(),
+            fleet_throttle: ThrottleConfig::default(),
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,

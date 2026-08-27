@@ -21,7 +21,7 @@ Everything else has a default.
 ```
 
 That runs the proxy on port 3456 against `https://api.anthropic.com`, rotating the one
-account at a 0.95 switch threshold, with the global egress throttle on.
+account at a 0.95 switch threshold, with both egress throttles on.
 
 In practice you never hand-write that block: `tcr login` performs the OAuth flow and
 writes the account for you. Hand-editing is for the *settings* keys below.
@@ -41,7 +41,8 @@ section below.
 | `upstream` | string | `"https://api.anthropic.com"` | no | API base URL every rotated request is sent to |
 | `switchThreshold` | float | **`0.95`** | no | fraction of an account's quota at which rotation prefers a different account |
 | `pacing` | object | both knobs unset → **OFF** | no | per-account concurrency/spacing, see below |
-| `throttle` | object | `{minSpacingMs: 350, burst: 4}` → **ON** | no | fleet-wide egress rate limiter, see below |
+| `accountThrottle` | object | `{minSpacingMs: 350, burst: 8}` → **ON** | no | per-organization egress rate limiter — the real one, see below |
+| `fleetThrottle` | object | `{minSpacingMs: 100, burst: 16}` → **ON** | no | fleet-wide ceiling above it, insurance only, see below |
 | `lockAccount` | string | absent → normal routing | no | pin ALL traffic to one account by `name` |
 | `http1Only` | bool | **`false`** (OFF) | no | force the upstream client onto HTTP/1.1, see below |
 | `pricing` | object | `{}` → the built-in table only | no | per-model price overrides for the usage figures, see below |
@@ -224,35 +225,69 @@ configured `0` for the cap is normalised back to "unset"; `Some(0)` would make
 It ships off on purpose. The doc comment on the pacing settings gives the reason: a
 per-account concurrency cap trades prompt-cache locality for load spread, and on a
 single-user proxy the cache is the scarce resource while the accounts are not. Turning it
-off leaves per-account concurrency genuinely unbounded; the global throttle below is a
-*rate* limiter and is explicitly not a substitute for a concurrency bound.
+off leaves per-account concurrency genuinely unbounded; the throttle buckets below are
+*rate* limiters and are explicitly not a substitute for a concurrency bound.
 
-## `throttle.*`: ships ON
+## `accountThrottle.*` and `fleetThrottle.*`: both ship ON
+
+There are two throttle buckets, and they are keyed on different things.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `throttle.minSpacingMs` | u64 | **`350`** with the key absent | no | steady-state emission interval across the whole fleet |
-| `throttle.burst` | u32 | **`4`** with the key absent | no | how many sends fire instantly after an idle period |
+| `accountThrottle.minSpacingMs` | u64 | **`350`** with the key absent | no | steady-state emission interval **per organization** |
+| `accountThrottle.burst` | u32 | **`8`** with the key absent | no | sends admitted instantly after that org has been idle |
+| `fleetThrottle.minSpacingMs` | u64 | **`100`** with the key absent | no | steady-state interval across **every** org combined |
+| `fleetThrottle.burst` | u32 | **`16`** with the key absent | no | sends admitted instantly after the whole fleet has been idle |
+
+`accountThrottle` is the real limiter. Anthropic sets rate limits at the **organization**
+level, so pacing per org is what matches the thing actually being limited, and total capacity
+scales *with* the size of your account pool rather than being divided across it.
+
+`fleetThrottle` is insurance. It exists only in case something shared — an IP, a client id —
+is also limited, which nobody here has measured. It is set far above observed traffic so it
+does not bind in normal use.
+
+> **This replaced a single fleet-wide `throttle` key.** A config still carrying `throttle` is
+> **rejected at boot** with an error naming both replacements — it is not migrated and not
+> ignored. Rejecting is deliberate: the old key's escape-hatch form (`"throttle": {}`) meant
+> "no throttling at all", and no single key means that any more, so any automatic mapping
+> would silently change what a `{}` meant. Rename the key; do not delete it.
 
 ### The absent-versus-empty inversion
 
-This is the one key in the file where leaving it out and writing an empty object do
+These are the keys in the file where leaving one out and writing an empty object do
 *opposite* things, and it surprises everyone:
 
-- `throttle` **absent** → `default_throttle()` → **ON** at `minSpacingMs: 350, burst: 4`.
-- `"throttle": {}` **present and empty** → every knob deserializes to `None` → `is_active()`
-  is false → **fully OFF**. This is the documented escape hatch, named as such in the doc
-  comment on the throttle settings.
+- `accountThrottle` **absent** → `default_account_throttle()` → **ON** at
+  `minSpacingMs: 350, burst: 8`. Same for `fleetThrottle` → `100` / `16`.
+- `"accountThrottle": {}` **present and empty** → every knob deserializes to `None` →
+  `is_active()` is false → that bucket is **OFF**.
 
-So the way to disable the throttle is to write the key, not to delete it. Deleting it turns
-the throttle back on.
+So the way to disable a bucket is to write its key, not to delete it. Deleting it turns that
+bucket back on.
 
-A fresh proxy is therefore rate-limited out of the box: a GCRA token bucket over the single
-upstream send site, four requests admitted instantly after idle and then one per 350ms
-across the entire fleet. 350ms mirrors the measured probe-path aggregate rate; burst 4
-covers a normal within-turn fan-out untaxed while staying below a cold-start fan-out so the
-throttle actually engages on the burst. Inside a present `throttle` object an unset `burst`
-is clamped to `1` (strict spacing), not to 4.
+**Disabling one bucket does not disable the other.** To go fully unthrottled you need both:
+
+```json
+"accountThrottle": {},
+"fleetThrottle": {}
+```
+
+A fresh proxy is therefore rate-limited out of the box. Inside a present throttle object an
+unset `burst` is clamped to `1` (strict spacing), not to the default.
+
+### On the 350ms
+
+It is worth knowing that this number is **not measured for the path it governs**. It
+originates as `PROBE_SPACING` (`src/probe.rs`), which was proven against `/api/oauth/usage`
+— the usage-probe endpoint, not `/v1/messages` — and was transplanted onto the serve path as
+a conservative starting value. Nobody has established where `/v1/messages` actually starts
+returning 429s, because finding that limit means crossing it, and a real 429 writes shared
+account state whose cost lands on every session rather than just the one probing. Treat 350
+as an unknown held deliberately tight, not as a limit anyone has observed.
+
+The per-org split was designed so this gap does not have to be closed: per-identity pacing is
+unchanged from the value already running in production, and only the fleet ceiling loosened.
 
 ## Keys read from the unmodelled map
 
@@ -290,7 +325,7 @@ Consequences worth knowing before you tune either number:
 | `sessionAffinity` | bool | **`true`** (ON) | no | pin a session to the account it started on |
 | `revalidationServe` | bool | **`true`** (ON) | no | serve over-threshold rather than synthesizing a 429 when the whole fleet reads over the soft threshold |
 | `loadBalanceMigration` | bool | **`false`** (OFF) | no | move an already-warm session to a cooler account to even out pinned-session counts |
-| `throttleExemptNoise` | bool | **`false`** (OFF) | no | skip the fleet-wide GCRA entirely for `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) instead of making it queue behind inference |
+| `throttleExemptNoise` | bool | **`false`** (OFF) | no | let `Noise`-classified traffic (`/api/event_logging*`, `/mcp-registry*`) skip the **per-org** bucket instead of queueing behind inference. It still pays `fleetThrottle`, so exempt traffic is never entirely unpaced |
 | `divertBudget` | u32 | **`0`** (unlimited) | no | max distinct destination accounts one session may be diverted to inside a single hold episode; `0` = unlimited, today's behaviour byte-for-byte |
 
 ### `sessionAffinity` also pins identity-less loopback requests

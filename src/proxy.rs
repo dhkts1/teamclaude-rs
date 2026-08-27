@@ -2325,12 +2325,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // it failed on — that arm used to log nothing at any level.
         let account_name = manager.account_name(idx);
 
-        // Global outbound throttle: pace the AGGREGATE egress so a cold fan-out
-        // cannot burst the shared upstream limiter. Inert unless configured. Placed
-        // after account selection/token so only real sends consume a slot; both the
-        // 401 force-refresh retry and the transient-429 retry loop back here, so
-        // every retry is paced automatically.
-        manager.throttle_send(&path).await;
+        // Outbound throttle: a PER-ORGANIZATION bucket (the real limiter — Anthropic
+        // limits per org) plus a much looser fleet-wide ceiling. Inert unless
+        // configured. Placed after account selection/token so only real sends consume
+        // a slot, and so the per-org bucket can be keyed off the account actually
+        // about to be hit; both the 401 force-refresh retry and the transient-429
+        // retry loop back here, so every retry is paced against whichever account it
+        // rotated to.
+        manager.throttle_send(&path, idx).await;
 
         let resp = match builder.send().await {
             Ok(resp) => resp,
@@ -3902,7 +3904,8 @@ mod tests {
             upstream: upstream.to_string(),
             switch_threshold: 0.90,
             pacing: crate::config::PacingConfig::default(),
-            throttle: crate::config::ThrottleConfig::default(),
+            account_throttle: crate::config::ThrottleConfig::default(),
+            fleet_throttle: crate::config::ThrottleConfig::default(),
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,

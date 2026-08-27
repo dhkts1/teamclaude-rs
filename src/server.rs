@@ -1603,7 +1603,8 @@ mod tests {
                 "quotaProbeSeconds": 1234,
                 "warmupSeconds": 777,
                 "pacing": { "minSpacingMs": 500 },
-                "throttle": {},
+                "accountThrottle": {},
+                "fleetThrottle": {},
                 "lockAccount": "test-fixture-account",
                 "controlAccount": "test-fixture-account",
                 "accounts": [
@@ -1653,11 +1654,18 @@ mod tests {
             "quota_probe_seconds=1234",
             "warmup_seconds=777",
             "pacing_active=true",
-            // The empty `"throttle": {}` object is the documented escape
-            // hatch (see `ThrottleConfig`'s doc-comment) — it overrides the
-            // default-ON throttle to fully inert, so `false` here IS the
-            // non-default assertion: the default build's boot line reads
-            // `throttle_active=true`.
+            // An empty `{}` object is the documented per-bucket escape hatch
+            // (see `ThrottleConfig`'s doc-comment) — it overrides that bucket's
+            // default-ON setting to fully inert. `throttle_active` is the OR of
+            // the two buckets, so BOTH must be `{}` to make it false, and
+            // `false` here IS the non-default assertion: the default build's
+            // boot line reads `throttle_active=true`.
+            //
+            // Note this fixture goes through `serde_json::from_str`, not
+            // `config::load`, so it does NOT get the legacy-`throttle`-key
+            // rejection. That is exactly how this test caught the rename: a
+            // stale `"throttle": {}` here landed silently in the `extra`
+            // catch-all and both buckets defaulted back ON.
             "throttle_active=false",
             "lock_account=\"test-fixture-account\"",
             "control_account=\"test-fixture-account\"",
