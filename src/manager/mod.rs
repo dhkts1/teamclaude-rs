@@ -377,7 +377,21 @@ pub struct AccountRuntime {
     /// keep) and wrapped in `Arc` so [`Manager::http_client`] can hand out
     /// cheap clones while still letting a test prove two accounts' clients are
     /// genuinely distinct instances via `Arc::ptr_eq`.
+    ///
+    /// REBUILT periodically, though — see [`MAX_SERVES_PER_CONNECTION`] and
+    /// [`Manager::recycle_client`]. "Never on every request" is not
+    /// "never": an h2 connection held open indefinitely ages into the reset
+    /// zone this field's own history describes.
     pub http: Arc<reqwest::Client>,
+    /// Upstream sends dispatched on the CURRENT [`Self::http`] since it was
+    /// built, and the trigger for retiring it (see
+    /// [`MAX_SERVES_PER_CONNECTION`]). Reset to 0 by the recycle, so it means
+    /// "age of this client in serves", never a lifetime total —
+    /// [`Self::requests`] is the lifetime counter and is deliberately NOT
+    /// reused here: it is a display statistic incremented on a different path
+    /// (`snapshot.rs`), and hanging connection lifetime off it would couple a
+    /// transport decision to a stats counter that is free to change meaning.
+    pub serves_since_client_build: u32,
 }
 
 // Test-only fault injection for `build_serving_client`: set via
@@ -401,6 +415,39 @@ thread_local! {
 pub(crate) fn fail_next_client_build() {
     FAIL_NEXT_CLIENT_BUILD.with(|f| f.set(true));
 }
+
+/// Upstream sends after which an account's HTTP client is retired and rebuilt,
+/// dropping its pooled h2 connection so the next send opens a fresh one.
+///
+/// Anthropic's edge eventually drains a long-lived h2 connection, and the
+/// settings in [`build_serving_client`] — `http2_keep_alive_while_idle` plus a
+/// 300s pool idle timeout — are deliberately chosen to keep ONE connection warm
+/// forever, so nothing retired it. Measured over one day's live log (2026-08-27,
+/// n=2136 `Reset(_, PROTOCOL_ERROR, Remote)` transport failures), the resets are
+/// concentrated by connection age, not by concurrency:
+///
+/// | stream id at reset | share |
+/// |---|---|
+/// | 1-99 (fresh connection) | 6.8% |
+/// | 100-999 | 21.5% |
+/// | 1000-4999 | 5.9% |
+/// | 5000-9999 | 21.9% |
+/// | 10000+ | 43.9% |
+///
+/// Median 9699, max 17449 — roughly 8700 requests multiplexed onto one socket.
+/// h2 client-initiated stream ids advance by 2, so N serves reaches stream id
+/// ~2N: 500 keeps a connection under ~1000, below the p25 of the observed reset
+/// distribution, while still amortising the handshake over 500 requests.
+///
+/// Retiring a connection is CHEAP and must not be confused with rotating an
+/// account. It costs one TCP+TLS handshake (~100-300ms, the cost
+/// [`build_serving_client`]'s keep-alive settings exist to avoid); it does NOT
+/// cost a prompt-cache miss, because Anthropic's prompt cache is keyed on the
+/// account and prefix server-side and has nothing to do with which socket the
+/// bytes arrived on. Account rotation is the expensive one (measured 5-10x the
+/// quota of a warm serve), and it is exactly what this constant exists to make
+/// rarer.
+const MAX_SERVES_PER_CONNECTION: u32 = 500;
 
 /// Build one upstream-forwarding HTTP client. Called once per account (see
 /// [`AccountRuntime::http`]) so every account's client is configured
@@ -580,6 +627,7 @@ impl AccountRuntime {
             last_stream_error: None,
             refresh_lock: Arc::new(AsyncMutex::new(())),
             http: build_serving_client(http1_only),
+            serves_since_client_build: 0,
         }
     }
 }
@@ -1381,19 +1429,78 @@ impl Manager {
     /// panic). For a terminal SSE (`text/event-stream`) serve the proxy MOVES the
     /// owned guard into the streamed body, so the decrement fires at stream
     /// completion — not at handler return, when axum has yet to poll the body.
-    /// Mutates only under the accounts write-lock (no second lock).
+    ///
+    /// Also ages the account's HTTP client: this is the one call taken exactly
+    /// once per upstream send, so it is where [`MAX_SERVES_PER_CONNECTION`] is
+    /// counted and where a due recycle is claimed. The accounts write-lock is
+    /// taken here and then AGAIN by [`Self::recycle_client`] — never nested, and
+    /// never held across the client build. It used to be a single uncontested
+    /// section; that is why the claim resets the counter rather than letting
+    /// `recycle_client` re-read it, which would race between the two sections.
     pub fn enter_in_flight(self: &Arc<Self>, idx: usize) -> InFlightGuard {
-        {
+        let claimed_recycle = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
-            if let Some(account) = accounts.get_mut(idx) {
-                account.in_flight = account.in_flight.saturating_add(1);
-                account.last_served_ms = crate::now_ms();
+            match accounts.get_mut(idx) {
+                Some(account) => {
+                    account.in_flight = account.in_flight.saturating_add(1);
+                    account.last_served_ms = crate::now_ms();
+                    account.serves_since_client_build =
+                        account.serves_since_client_build.saturating_add(1);
+                    // Claim the recycle under the SAME write lock that observes the
+                    // threshold, and reset the counter as the act of claiming it:
+                    // that is what makes the claim exclusive, so two sends crossing
+                    // the threshold concurrently cannot both rebuild — the loser
+                    // reads 0 and returns false.
+                    if account.serves_since_client_build >= MAX_SERVES_PER_CONNECTION {
+                        account.serves_since_client_build = 0;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
             }
+        };
+        if claimed_recycle {
+            self.recycle_client(idx);
         }
         InFlightGuard {
             manager: Arc::clone(self),
             idx,
         }
+    }
+
+    /// Retire account `idx`'s HTTP client and give it a fresh one, dropping the
+    /// pooled h2 connection that has now carried [`MAX_SERVES_PER_CONNECTION`]
+    /// sends before Anthropic's edge drains it out from under us.
+    ///
+    /// Requests already in flight are untouched. Each holds its own
+    /// `Arc<reqwest::Client>` clone, taken by [`Self::http_client`] before the
+    /// send, so the OLD client — and the connection carrying their streams —
+    /// stays alive until the last of them finishes and drops the final `Arc`.
+    /// Only sends selected after this point get the new pool. That is the whole
+    /// reason this swaps an `Arc` instead of reaching into the existing client.
+    ///
+    /// The replacement is built with NEITHER lock held, matching
+    /// [`Self::add_or_update_account`]'s Added path and for the same reason: a
+    /// panic in [`build_serving_client`] (which tests inject) must not poison
+    /// `self.accounts`.
+    fn recycle_client(&self, idx: usize) {
+        let fresh = build_serving_client(self.http1_only());
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let Some(account) = accounts.get_mut(idx) else {
+            // Stale index: accounts are appended, never removed, so this is not
+            // reachable on the live path — same rationale as `http_client`.
+            return;
+        };
+        account.http = fresh;
+        tracing::info!(
+            account_index = idx,
+            account = %account.name,
+            serves = MAX_SERVES_PER_CONNECTION,
+            "retiring the upstream connection after its serve budget — \
+             a fresh h2 connection costs a handshake, not a prompt-cache miss"
+        );
     }
 
     /// Flush the refreshed TOKENS to disk. Token refreshes already persist
@@ -4625,6 +4732,49 @@ mod tests {
             manager.accounts.read().expect("accounts lock poisoned")[0].in_flight,
             0,
             "dropping the guard decrements back to 0"
+        );
+    }
+
+    /// An account's upstream client is RETIRED once it has carried
+    /// [`MAX_SERVES_PER_CONNECTION`] sends, so its pooled h2 connection is
+    /// replaced before Anthropic's edge drains it (the reset distribution behind
+    /// that number is on the constant).
+    ///
+    /// The control half matters as much as the assertion: one send short of the
+    /// budget the client must be the SAME `Arc`. Without it this test would pass
+    /// against a build that recycled on EVERY send — which would throw away the
+    /// warm pool on every request, the exact thing `AccountRuntime::http`'s
+    /// doc-comment forbids.
+    #[test]
+    fn the_upstream_client_is_recycled_once_its_serve_budget_is_spent() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let original = manager.http_client(0).expect("account 0 exists");
+
+        for _ in 0..(MAX_SERVES_PER_CONNECTION - 1) {
+            drop(manager.enter_in_flight(0));
+        }
+        assert!(
+            Arc::ptr_eq(
+                &original,
+                &manager.http_client(0).expect("account 0 exists")
+            ),
+            "the pool must survive right up to the budget — rebuilding earlier pays a \
+             TCP+TLS handshake the keep-alive settings exist to avoid"
+        );
+
+        drop(manager.enter_in_flight(0));
+        assert!(
+            !Arc::ptr_eq(
+                &original,
+                &manager.http_client(0).expect("account 0 exists")
+            ),
+            "crossing the serve budget must hand out a NEW client, so the next send \
+             opens a fresh h2 connection instead of one about to be drained"
+        );
+        assert_eq!(
+            manager.accounts.read().expect("accounts lock poisoned")[0].serves_since_client_build,
+            0,
+            "the recycle resets the age counter, so the next budget starts clean"
         );
     }
 
