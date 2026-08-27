@@ -81,23 +81,68 @@ fn default_usage_retention_days() -> u32 {
 /// supported knob — set `"pacing": {"maxInFlightPerAccount": N}` (and/or
 /// `"minSpacingMs"`) to turn it back on, with exactly the behaviour it has today.
 ///
-/// This is NOT covered by the global egress throttle ([`default_throttle`],
-/// `src/manager/throttle.rs`): that is a RATE limiter (min-spacing + burst over
-/// the aggregate send site), not a concurrency bound, and it is deliberately not
-/// a substitute for one. Turning the cap off leaves per-account concurrency
-/// genuinely unbounded.
+/// This is NOT covered by the egress throttles ([`default_account_throttle`] /
+/// [`default_fleet_throttle`], `src/manager/throttle.rs`): those are RATE limiters
+/// (min-spacing + burst at the send site), not concurrency bounds, and they are
+/// deliberately not a substitute for one. Turning the cap off leaves per-account
+/// concurrency genuinely unbounded.
 fn default_pacing() -> PacingConfig {
     PacingConfig {
         max_in_flight_per_account: None,
         min_spacing_ms: None,
     }
 }
-/// Default global outbound throttle: ON. Absent `throttle` key → these
-/// evidence-anchored starting values; `"throttle": {}` → off (escape hatch).
-fn default_throttle() -> ThrottleConfig {
+/// Default PER-ORGANIZATION outbound throttle: ON. Absent `accountThrottle` key →
+/// these values; `"accountThrottle": {}` → off (escape hatch).
+///
+/// **This loosens instantaneous per-identity burst. Say so plainly.** Sustained
+/// rate is unchanged — 350ms is the interval a single identity was already held
+/// to, so an organization still sends at most one request per 350ms in the steady
+/// state. But `burst` rises 4 → 8, which means a burst CONCENTRATED on one
+/// organization now admits 8 instantly where it admitted 4. An 8-wide burst on
+/// one org cost `(8-4)*350 = 1400ms` before this change and costs 0 after.
+///
+/// That is a deliberate trade, not an oversight: one Claude Code turn fires
+/// roughly 4-6 requests (inference + `count_tokens` + a telemetry batch), and at
+/// `burst: 4` the tail of a single turn paid a 350ms tax. It is on the record in
+/// `tests/throttle_exempt.rs::shipped_tuning_passes_one_turn_untaxed`, which
+/// fails if anyone reverts the burst without meaning to.
+///
+/// The FAN-OUT speedup does not come from this. It comes from the bucket being
+/// per-org rather than shared, so capacity scales *with* the account pool instead
+/// of being divided across it — a spread burst is free at `burst: 4` too.
+fn default_account_throttle() -> ThrottleConfig {
     ThrottleConfig {
         min_spacing_ms: Some(350),
-        burst: Some(4),
+        burst: Some(8),
+    }
+}
+
+/// Default fleet-wide ceiling: ON, and deliberately far looser than
+/// [`default_account_throttle`].
+///
+/// This is INSURANCE against a mechanism nobody here has measured: that something
+/// SHARED across the accounts (the source IP, the client_id) is rate-limited in
+/// addition to the per-organization limits. Whether such a limiter exists is
+/// genuinely unknown — see [`ThrottleConfig`]'s note on what the evidence does and
+/// does not show.
+///
+/// **It is tuned so it can actually fire.** An earlier draft set `burst: 24`,
+/// ~14x above observed traffic, which made it unable to engage under any load the
+/// fleet realistically produces — insurance priced never to pay out is not
+/// insurance. `burst: 16` still leaves a 12-wide agent fan-out completely untaxed
+/// (the case this whole change exists to fix) while engaging on a genuine runaway,
+/// which is also the shape a shared-source abuse detector would key on. Sustained
+/// headroom is unchanged and large: measured 2026-08-26 the fleet sustained
+/// 0.69 req/s across 13 accounts, against this ceiling's 10 req/s.
+///
+/// `tests/throttle_exempt.rs::shipped_fleet_ceiling_can_actually_fire` is the
+/// guard: it drives a 24-wide runaway and asserts the ceiling engages. A ceiling
+/// never observed firing is indistinguishable from an absent one.
+fn default_fleet_throttle() -> ThrottleConfig {
+    ThrottleConfig {
+        min_spacing_ms: Some(100),
+        burst: Some(16),
     }
 }
 fn default_account_type() -> String {
@@ -515,31 +560,65 @@ impl PacingConfig {
     }
 }
 
-/// Global (fleet-wide) outbound request-initiation throttle (opt-in; default OFF).
+/// Knobs for one GCRA token bucket over the upstream send site: `burst` requests
+/// admit instantly after idle, then one per `minSpacingMs`.
 ///
-/// A GCRA token bucket over the SINGLE upstream send site: `burst` requests admit
-/// instantly after idle, then one per `minSpacingMs`. Unlike [`PacingConfig`] (which
-/// is PER-ACCOUNT and cannot damp a cross-account burst), this paces the AGGREGATE
-/// egress that Anthropic's shared IP/client_id burst limiter actually keys on —
-/// mirroring the probe path's `PROBE_SPACING`. Ships ON by default
-/// ([`default_throttle`]): absent `throttle` key → `minSpacingMs: 350, burst: 4`;
-/// `"throttle": {}` (empty object present) → all `None` → inert (escape hatch).
+/// The same shape is used for BOTH throttle layers, which differ only in what they
+/// are keyed on and how tight they are:
 ///
-/// 350ms mirrors the σ5-proven probe-path aggregate rate (PROBE_SPACING); burst 4
-/// covers a normal within-turn fan-out (main+haiku+quota) untaxed while staying far
-/// below a ~15-20 cold-start fan-out so the throttle engages on the burst. Both are
-/// evidence-anchored STARTING values, tunable live (docs/plans/throttle-live-sweep-runbook.md).
+/// * [`Config::account_throttle`] — keyed PER ORGANIZATION. This is the real
+///   limiter. Anthropic sets limits at the organization level, so pacing per-org is
+///   what actually matches the thing being limited.
+/// * [`Config::fleet_throttle`] — one bucket for everything. Insurance only, set far
+///   looser (see [`default_fleet_throttle`]).
+///
+/// **On the 350ms.** It originates as [`crate::probe::PROBE_SPACING`], proven on
+/// `/api/oauth/usage` — the usage-probe endpoint, NOT `/v1/messages`. It was
+/// transplanted onto the serve path as a starting value and has never been
+/// validated there. Treat it as a conservative unknown, not a measured limit;
+/// `docs/plans/throttle-live-sweep-runbook.md` is the (still unrun) procedure that
+/// would pin the real number.
+///
+/// **What was here before, and how far the evidence actually goes.** This
+/// doc-comment used to assert that the fleet-wide bucket paced "the AGGREGATE
+/// egress that Anthropic's shared IP/client_id burst limiter actually keys on,"
+/// with no evidence attached. It is still uncited, and it is still the reason the
+/// bucket was shaped the way it was — but be careful about how much the
+/// counter-evidence proves:
+///
+/// * Anthropic documents limits at the ORGANIZATION level, and this fleet's own
+///   readings show N accounts reporting N different utilizations. That is solid
+///   evidence that the QUOTA COUNTER is per-organization.
+/// * It is **not** evidence against a shared per-IP or per-client_id BURST
+///   limiter. Those are different mechanisms at different layers and coexist at
+///   essentially every CDN-fronted API. A first draft of this comment used the
+///   first bullet to refute the second claim; that was a non-sequitur.
+/// * The documented org-level limits describe Console/API-key organizations.
+///   These are Max SUBSCRIPTION OAuth accounts, whose quota arrives on
+///   `anthropic-ratelimit-unified-*` headers that appear nowhere in the public
+///   rate-limit documentation. Transferring the org-scoping conclusion across
+///   that boundary is plausible, not proven.
+///
+/// So: per-org pacing is the right PRIMARY shape on the evidence available, and
+/// whether any shared-identity limit exists remains genuinely unmeasured. That
+/// unmeasured risk is exactly what [`Config::fleet_throttle`] is for, and why it
+/// is tuned to a value it can actually reach rather than a decorative one.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ThrottleConfig {
-    /// Steady-state emission interval T (ms): after the burst budget is spent,
-    /// at most one upstream send is initiated per this many ms across the WHOLE fleet.
+    /// Steady-state emission interval T (ms): after the burst budget is spent, at
+    /// most one upstream send is initiated per this many ms **within whatever this
+    /// bucket is keyed on** — one organization for `accountThrottle`, the whole
+    /// fleet for `fleetThrottle`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_spacing_ms: Option<u64>,
     /// Bucket capacity B: how many sends may fire instantly after an idle period.
-    /// Absent → treated as 1 (strict spacing). Keep it BELOW the cold fan-out size
-    /// so the burst is actually paced, ABOVE the normal within-turn fan-out (~3) so
-    /// interactive turns are never delayed.
+    /// Absent → treated as 1 (strict spacing).
+    ///
+    /// Set it ABOVE the fan-out you want to pass untaxed and BELOW the one you want
+    /// paced. For `accountThrottle` that is one session's within-turn fan-out
+    /// (inference + `count_tokens` + telemetry); for `fleetThrottle` it is the
+    /// widest agent wave you consider normal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst: Option<u32>,
 }
@@ -583,11 +662,21 @@ pub struct Config {
     /// a concurrency bound.
     #[serde(default = "default_pacing")]
     pub pacing: PacingConfig,
-    /// Global outbound throttle. Absent → [`default_throttle`] (ON:
-    /// `minSpacingMs: 350, burst: 4`). Set `"throttle": {}` to disable (all knobs
-    /// `None`), or override the knobs to tune the live rate (read at boot).
-    #[serde(default = "default_throttle")]
-    pub throttle: ThrottleConfig,
+    /// Per-ORGANIZATION outbound throttle — the primary limiter. Absent →
+    /// [`default_account_throttle`] (ON: `minSpacingMs: 350, burst: 8`). Set
+    /// `"accountThrottle": {}` to disable it (all knobs `None`). Read at boot.
+    #[serde(default = "default_account_throttle")]
+    pub account_throttle: ThrottleConfig,
+    /// Fleet-wide ceiling across every organization — insurance, not the primary
+    /// limiter. Absent → [`default_fleet_throttle`] (ON: `minSpacingMs: 100,
+    /// burst: 16`). Set `"fleetThrottle": {}` to disable it. Read at boot.
+    ///
+    /// Disabling BOTH is what the old `"throttle": {}` escape hatch used to mean.
+    /// Neither key on its own leaves the proxy unthrottled — that asymmetry is the
+    /// reason a stale `throttle` key is rejected outright rather than migrated (see
+    /// [`load`]).
+    #[serde(default = "default_fleet_throttle")]
+    pub fleet_throttle: ThrottleConfig,
     /// Hard account lock: when set to an account `name`, ALL traffic is pinned to
     /// that one account — LRU rotation, session affinity, and load-balancing
     /// migration are ALL bypassed. Absent → normal routing (default). Tradeoff:
@@ -864,6 +953,58 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let data = fs::read_to_string(path)?;
     let mut doc: Value = serde_json::from_str(&data)?;
+
+    // A stale `throttle` key is REJECTED, never migrated. `Config` carries a
+    // `#[serde(flatten)] extra` catch-all, so an unrecognised key is normally
+    // absorbed in silence — for a rate limiter that failure mode is unacceptable:
+    // the config would look configured while the running proxy used defaults.
+    //
+    // Rejecting rather than mapping is deliberate. The old key's escape-hatch form
+    // (`"throttle": {}`) meant "no throttling at all", and there is no longer any
+    // single key that means that, so any automatic mapping would silently change
+    // what a `{}` meant. Better to stop and make the operator say which limiter
+    // they meant.
+    //
+    // CAUTION — what this rejection does and does not protect.
+    //
+    // For a CLI subcommand (`tcr accounts`, `tcr status`, ...) this is a hard
+    // failure: the error surfaces and the command exits non-zero.
+    //
+    // For `tcr server` it is NOT. `main.rs::load_config` catches every
+    // non-NotFound error, warns on stderr, and falls back to `default_config()`
+    // — which is `from_str("{}")`, i.e. a fleet with ZERO accounts — while
+    // dropping the persist path. A proxy started that way looks alive and
+    // answers every request from an empty fleet. That is worse than refusing to
+    // boot, because a dead proxy is obvious and this one is not.
+    //
+    // Therefore the deploy order is LOAD-BEARING and it is:
+    //
+    //   1. migrate the config FIRST (scripts/migrate-throttle-config.sh)
+    //   2. THEN install the new binary
+    //
+    // and never the reverse. Migrating first is safe precisely because the OLD
+    // binary tolerates the new keys: `Config` carries a `#[serde(flatten)] extra`
+    // catch-all, so `accountThrottle`/`fleetThrottle` are absorbed and ignored,
+    // and with `throttle` removed the old binary falls back to its own
+    // `default_throttle()`. Verified 2026-08-27 against the installed 034880a
+    // binary: it loads a migrated config and exits 0.
+    //
+    // `tcr accounts --config <path>` remains a useful pre-flight, but note it
+    // exercises a DIFFERENT code path from the server, so a clean pre-flight does
+    // not by itself prove the server would have booted.
+    if doc.get("throttle").is_some() {
+        return Err(ConfigError::Parse(
+            <serde_json::Error as serde::de::Error>::custom(
+                "config key `throttle` no longer exists; it was split in two. \
+                 Use `accountThrottle` for the per-organization limiter (this is \
+                 what `throttle` used to do, and is almost certainly what you want) \
+                 and `fleetThrottle` for the looser fleet-wide ceiling. \
+                 Deleting the key instead of renaming it re-enables BOTH defaults. \
+                 To disable throttling entirely, set both to {}.",
+            ),
+        ));
+    }
+
     let mut quarantined = Vec::new();
 
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
@@ -2995,32 +3136,56 @@ mod tests {
     }
 
     #[test]
-    fn absent_throttle_defaults_on() {
-        // No `throttle` key → default_throttle → ON with evidence-anchored knobs.
+    fn absent_throttle_keys_default_both_buckets_on() {
+        // Neither key present → both defaults → both ON. The per-org bucket is the
+        // tight one; the fleet ceiling is deliberately looser.
         let config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
-        assert!(config.throttle.is_active());
-        assert_eq!(config.throttle.effective_min_spacing(), Some(350));
-        assert_eq!(config.throttle.effective_burst(), 4);
+        assert!(config.account_throttle.is_active());
+        assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
+        assert_eq!(config.account_throttle.effective_burst(), 8);
+        assert!(config.fleet_throttle.is_active());
+        assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(100));
+        assert_eq!(config.fleet_throttle.effective_burst(), 16);
     }
 
     #[test]
-    fn empty_throttle_object_disables_throttle() {
-        // `"throttle": {}` is the escape hatch: empty object → both knobs None → inert.
-        let config: Config = serde_json::from_str(r#"{ "accounts": [], "throttle": {} }"#).unwrap();
-        assert_eq!(config.throttle.min_spacing_ms, None);
-        assert_eq!(config.throttle.burst, None);
-        assert!(!config.throttle.is_active());
+    fn empty_object_disables_only_that_bucket() {
+        // The escape hatch is now PER BUCKET. Disabling one leaves the other at its
+        // default — there is no single key that means "unthrottled" any more, which
+        // is exactly why a stale `throttle` key is rejected rather than migrated.
+        let config: Config =
+            serde_json::from_str(r#"{ "accounts": [], "accountThrottle": {} }"#).unwrap();
+        assert_eq!(config.account_throttle.min_spacing_ms, None);
+        assert_eq!(config.account_throttle.burst, None);
+        assert!(!config.account_throttle.is_active());
+        assert!(
+            config.fleet_throttle.is_active(),
+            "disabling the per-org bucket must NOT disable the fleet ceiling"
+        );
     }
 
     #[test]
-    fn explicit_throttle_enables() {
+    fn both_empty_objects_disable_throttling_entirely() {
         let config: Config = serde_json::from_str(
-            r#"{ "accounts": [], "throttle": { "minSpacingMs": 350, "burst": 5 } }"#,
+            r#"{ "accounts": [], "accountThrottle": {}, "fleetThrottle": {} }"#,
         )
         .unwrap();
-        assert!(config.throttle.is_active());
-        assert_eq!(config.throttle.effective_min_spacing(), Some(350));
-        assert_eq!(config.throttle.effective_burst(), 5);
+        assert!(!config.account_throttle.is_active());
+        assert!(!config.fleet_throttle.is_active());
+    }
+
+    #[test]
+    fn explicit_throttle_knobs_override_defaults() {
+        let config: Config = serde_json::from_str(
+            r#"{ "accounts": [],
+                 "accountThrottle": { "minSpacingMs": 350, "burst": 5 },
+                 "fleetThrottle": { "minSpacingMs": 40, "burst": 64 } }"#,
+        )
+        .unwrap();
+        assert_eq!(config.account_throttle.effective_min_spacing(), Some(350));
+        assert_eq!(config.account_throttle.effective_burst(), 5);
+        assert_eq!(config.fleet_throttle.effective_min_spacing(), Some(40));
+        assert_eq!(config.fleet_throttle.effective_burst(), 64);
     }
 
     #[test]
@@ -4482,9 +4647,45 @@ mod tests {
     fn throttle_zero_spacing_is_inert() {
         // `Some(0)` spacing normalizes to unset (footgun parity with pacing).
         let config: Config =
-            serde_json::from_str(r#"{ "accounts": [], "throttle": { "minSpacingMs": 0 } }"#)
+            serde_json::from_str(r#"{ "accounts": [], "accountThrottle": { "minSpacingMs": 0 } }"#)
                 .unwrap();
-        assert_eq!(config.throttle.effective_min_spacing(), None);
-        assert!(!config.throttle.is_active());
+        assert_eq!(config.account_throttle.effective_min_spacing(), None);
+        assert!(!config.account_throttle.is_active());
+    }
+
+    /// The rejection lives in [`load`], not in `Deserialize`, because `Config`
+    /// carries a `#[serde(flatten)] extra` catch-all that would otherwise absorb a
+    /// stale `throttle` key in silence and run on defaults. Every production caller
+    /// goes through `load`; the only non-test `from_value::<Config>` is inside it.
+    #[test]
+    fn legacy_throttle_key_is_rejected_by_load() {
+        let dir = std::env::temp_dir().join(format!("tcr-legacy-throttle-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("teamclaude.json");
+        fs::write(
+            &path,
+            r#"{ "accounts": [], "throttle": { "minSpacingMs": 350, "burst": 4 } }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("a stale `throttle` key must not boot");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("accountThrottle") && msg.contains("fleetThrottle"),
+            "the error must name BOTH replacements so the operator knows which they \
+             meant; got: {msg}"
+        );
+
+        // Control: the same document with the key renamed loads fine. Without this,
+        // the test above would still pass if `load` rejected every config.
+        fs::write(
+            &path,
+            r#"{ "accounts": [], "accountThrottle": { "minSpacingMs": 350, "burst": 4 } }"#,
+        )
+        .unwrap();
+        let ok = load(&path).expect("the renamed key must load");
+        assert_eq!(ok.account_throttle.effective_burst(), 4);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

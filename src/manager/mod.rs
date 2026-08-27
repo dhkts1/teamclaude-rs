@@ -882,9 +882,16 @@ pub struct Manager {
     /// construction. Default (all `None`) → inert → selection is byte-identical to
     /// the no-pacing build. See [`config::PacingConfig`].
     pacing: PacingConfig,
-    /// Global outbound throttle knobs, snapshotted from config at construction
-    /// (default all-`None` → inert → byte-identical to the no-throttle build).
-    throttle: ThrottleConfig,
+    /// Per-ORGANIZATION outbound throttle knobs, snapshotted from config at
+    /// construction (all-`None` → inert). This is the primary limiter: Anthropic
+    /// sets limits per organization, so this is the bucket that matches the thing
+    /// actually being limited.
+    account_throttle: ThrottleConfig,
+    /// Fleet-wide ceiling knobs, snapshotted from config at construction
+    /// (all-`None` → inert). Insurance against a shared-identity limit nobody has
+    /// measured; set far looser than [`Self::account_throttle`] so it does not bind
+    /// in normal use.
+    fleet_throttle: ThrottleConfig,
     /// Per-account usage buckets, pricing and the append-only ledger — the one
     /// place a served request's tokens are aggregated for display. Present on
     /// every `Manager`, but only the SERVING process attaches a ledger to it
@@ -915,10 +922,24 @@ pub struct Manager {
     /// Lock order: taken ALONE, never nested under `accounts` or `affinity` —
     /// same discipline as `select.rs:253-256`.
     control_idx: RwLock<Option<usize>>,
-    /// GCRA theoretical-arrival-time (epoch ms) for the global outbound throttle.
-    /// Guarded by an async mutex held ONLY for the O(1) slot update, released
-    /// before any sleep so concurrent callers stagger and sleep concurrently.
-    throttle_tat_ms: AsyncMutex<i64>,
+    /// GCRA theoretical-arrival-times (epoch ms) for the PER-ORGANIZATION throttle,
+    /// keyed by [`Self::throttle_bucket_key`].
+    ///
+    /// One mutex over the whole map rather than a mutex per key: the guard is held
+    /// only for an O(1) lookup-and-update and never across the sleep, so contention
+    /// is identical to the single scalar this replaced. A map (not a `Vec` indexed
+    /// by account) because the key is an ORG, and several accounts may share one.
+    ///
+    /// Entries are created on demand, so an account added at runtime needs no
+    /// coordination at the `accounts.push` sites.
+    ///
+    /// Lock order: taken ALONE. [`Self::throttle_send`] releases this guard before
+    /// touching [`Self::fleet_tat_ms`] — the two are never held together.
+    org_tat_ms: AsyncMutex<HashMap<String, i64>>,
+    /// GCRA theoretical-arrival-time (epoch ms) for the fleet-wide ceiling. Same
+    /// discipline as [`Self::org_tat_ms`]: held only for the O(1) update, released
+    /// before any sleep.
+    fleet_tat_ms: AsyncMutex<i64>,
     log: Mutex<VecDeque<RequestLogEntry>>,
     current: Mutex<Option<usize>>,
     /// Monotonic counter handed out one tick at a time by [`Manager::select`] to
@@ -1143,7 +1164,8 @@ impl Manager {
         // wire reflects it.
         let group_colors = config.group_colors();
         let pacing = config.pacing.clone();
-        let throttle = config.throttle.clone();
+        let account_throttle = config.account_throttle.clone();
+        let fleet_throttle = config.fleet_throttle.clone();
 
         let locked_idx = config.lock_account.as_ref().and_then(|name| {
             let idx = accounts.iter().position(|a| a.name == *name);
@@ -1209,10 +1231,12 @@ impl Manager {
             group_colors: RwLock::new(group_colors),
             groups_reload_mtime: Mutex::new(None),
             pacing,
-            throttle,
+            account_throttle,
+            fleet_throttle,
             locked_idx,
             control_idx: RwLock::new(control_idx),
-            throttle_tat_ms: AsyncMutex::new(0),
+            org_tat_ms: AsyncMutex::new(HashMap::new()),
+            fleet_tat_ms: AsyncMutex::new(0),
             log: Mutex::new(VecDeque::with_capacity(REQUEST_LOG_CAPACITY)),
             current: Mutex::new(None),
             select_seq: AtomicU64::new(1),
@@ -1910,12 +1934,16 @@ impl Manager {
         self.pacing.is_active()
     }
 
-    /// Whether the global outbound throttle does anything (see
+    /// Whether EITHER outbound throttle does anything (see
     /// [`config::ThrottleConfig::is_active`]). Read by the boot-line log in
     /// `server.rs`, not the request path — [`Self::throttle_send`] reads
-    /// `self.throttle` directly.
+    /// `self.account_throttle` / `self.fleet_throttle` directly.
+    ///
+    /// `true` when either bucket is live, because "throttling is on" is what the
+    /// boot line is telling the operator; a build with only the fleet ceiling armed
+    /// is still throttled.
     pub fn throttle_active(&self) -> bool {
-        self.throttle.is_active()
+        self.account_throttle.is_active() || self.fleet_throttle.is_active()
     }
 
     /// Persist ONLY the top-level `controlAccount` key, via
@@ -2696,7 +2724,8 @@ mod tests {
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
             pacing: PacingConfig::default(),
-            throttle: ThrottleConfig::default(),
+            account_throttle: ThrottleConfig::default(),
+            fleet_throttle: ThrottleConfig::default(),
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
