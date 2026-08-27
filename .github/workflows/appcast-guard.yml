@@ -1,0 +1,109 @@
+# Guarantee that whatever release is CURRENTLY newest carries an appcast.xml.
+#
+# WHY THIS EXISTS. Sparkle's feed URL is baked into every shipped TcrBar.app:
+#
+#     SUFeedURL = .../releases/latest/download/appcast.xml
+#
+# `/releases/latest/` follows whichever release is newest — not the newest
+# *TcrBar* release. So a release that carries no appcast asset silently becomes
+# the feed, the URL 404s, and every installed copy shows "An error occurred in
+# retrieving update information". The app cannot be fixed by shipping a new
+# build, because the broken URL is already compiled into the installs that are
+# failing. The only repair is to make the newest release carry the file.
+#
+# That is exactly what happened on 2026-08-27. v0.2.27 was first published as a
+# CLI-only cargo-dist release (tarballs, installer, checksums — no TcrBar.app,
+# no appcast), it became `/releases/latest/`, and the updater broke for everyone
+# until an appcast was uploaded by hand. It was the fifth failure of this class
+# in this project's history; `apps/macos/scripts/release-preflight.sh` check 4
+# ("no assetless GitHub Release is serving the update feed") was written for
+# precisely this and would have caught it — but that script runs before an APP
+# release, and the release that orphaned the feed was a CLI one. The check was
+# not missing. It was wired to the wrong trigger.
+#
+# So this enforces the invariant automatically, for EVERY release, rather than
+# relying on an operator remembering to run a script before the one release type
+# that happens not to build an app.
+#
+# NO SECRETS, DELIBERATELY. This needs only `contents: write` to attach a file
+# that is already public in the repository. It is kept OUT of `release-app.yml`
+# on purpose: that workflow holds the Developer ID key, the App Store Connect
+# key and Sparkle's update-signing key, and its header states it is
+# tag-triggered only so those keys are never exposed to a broader event. A
+# `release: published` trigger there would break that rule for no benefit.
+#
+# IDEMPOTENT. A release that already carries an appcast is left untouched, so a
+# real TcrBar release (which uploads its own, with the new version's entry and a
+# matching enclosure length) is never overwritten by the repository's copy.
+# Order does not matter: whichever of the two runs second is a no-op.
+name: Appcast feed guard
+
+on:
+  release:
+    types: [published]
+  # Manual repair hatch: if a release is already orphaning the feed, run this
+  # against it rather than uploading by hand.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to repair (e.g. v0.2.27)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: appcast-guard-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  ensure-appcast:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure the release carries appcast.xml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TAG}" ]; then
+            echo "::error::no tag resolved from the event or input"
+            exit 1
+          fi
+
+          # A draft release is not yet served by /releases/latest/, so there is
+          # nothing to protect and uploading would publish nothing useful.
+          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true" ]; then
+            echo "$TAG is a draft — /releases/latest/ does not point at it yet; nothing to do."
+            exit 0
+          fi
+
+          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx 'appcast.xml'; then
+            echo "$TAG already carries appcast.xml — leaving it alone."
+            echo "(A real TcrBar release uploads its own; this must never overwrite it.)"
+            exit 0
+          fi
+
+          if [ ! -f apps/macos/appcast.xml ]; then
+            echo "::error::apps/macos/appcast.xml is missing from the repository at $TAG"
+            exit 1
+          fi
+
+          echo "$TAG has no appcast.xml and is serving the Sparkle feed — attaching the repository copy."
+          gh release upload "$TAG" apps/macos/appcast.xml
+
+          # Verify the surface a user's updater actually reads, rather than
+          # trusting the upload's exit status. This is the whole point of the
+          # job; an upload that succeeded but left the feed 404ing would be a
+          # green run and a broken updater.
+          code="$(curl -sIL -o /dev/null -w '%{http_code}' \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml")"
+          if [ "$code" != "200" ]; then
+            echo "::error::feed still not resolving after upload (HTTP $code)"
+            exit 1
+          fi
+          echo "feed resolves (HTTP 200)"
