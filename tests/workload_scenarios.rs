@@ -221,6 +221,7 @@ impl Fleet {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            control_pooled: false,
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts: accounts.iter().map(|(n, p)| account(n, *p)).collect(),

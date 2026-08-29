@@ -702,11 +702,38 @@ pub struct Config {
     /// specifically; a control-preferred pick still uses the full threshold.
     /// Absent → 0.05. Clamped to `[0.0, 0.5]` by the manager at construction — a
     /// value outside that range in a hand-edited file is not trusted as-is.
-    /// **Inert while the control account stays `disabled`** (the default): a
-    /// disabled account never reaches a general pick's quota check at all. See
+    ///
+    /// **Live exactly when the control account can be picked at all**, which is
+    /// two cases and neither is the default: [`Self::control_pooled`], or an
+    /// explicit `--group g` ask where `g` carries
+    /// [`GroupSettings::allow_control_account`]. With both off the control
+    /// account is force-added to the pick's `tried` set before any quota check
+    /// runs, so this never gets consulted. See
     /// [`crate::manager::select::effective_threshold`].
     #[serde(default = "default_control_reserve")]
     pub control_reserve: f64,
+    /// Put the control account into GENERAL inference rotation, guarded only by
+    /// [`Self::control_reserve`]. Absent → `false` (default), which keeps the
+    /// long-standing rule that an inference request never selects the control
+    /// account.
+    ///
+    /// **This trades the control account's availability for its quota, and the
+    /// trade can be lost.** The reserve is our own arithmetic over Anthropic's
+    /// rate-limit headers, which lag; upstream is the oracle and answers 200s
+    /// for accounts it is about to bench. Measured on this fleet 2026-08-29: an
+    /// account tracked all the way up still crossed into
+    /// `quota.status == "rejected"`, and [`crate::manager::Manager::control_eligible`]
+    /// fails closed on `rejected` — so a pooled control account CAN burn itself
+    /// out of the identity plane it exists to anchor, and stay out until its
+    /// weekly window resets. Enable it when idle quota costs more than that
+    /// outage would; leave it off otherwise.
+    ///
+    /// Inert while the control account is `disabled` — `eligible`'s own terminal
+    /// gate excludes it from every general pick first, and this flag deliberately
+    /// does not reach past that. `disabled` remains the way to say "identity
+    /// plane only", exactly as the control-account design defines it.
+    #[serde(default)]
+    pub control_pooled: bool,
     /// Width, in hours, of the reset-urgency bucket rotation ranks by within a
     /// priority tier — see [`default_reset_urgency_tier_hours`] for why this is
     /// a bucket and not the raw reset instant. Absent → 24. `0` disables the

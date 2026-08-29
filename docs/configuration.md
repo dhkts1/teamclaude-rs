@@ -421,11 +421,17 @@ queue and does not fail — it falls back to the whole pool and serves from any 
 because dropping a servable request is worse than serving it from the wrong place. The
 fallback logs one line naming the group and the reason, at the moment it happens.
 
-The trap is `controlAccount`. That account is the identity plane's designated account, and
-inference requests **never** select it — not when it is enabled, not when it is idle, not
-ever. So a group whose only member is the control account can never serve inference. Every
-request asking for it falls back, on every request, permanently. Nothing about the group
-looks wrong: it has a member, a colour, and a healthy line in `tcr status`.
+The trap is `controlAccount`. That account is the identity plane's designated account, and by
+default inference requests **never** select it — not when it is enabled, not when it is idle.
+That is the point: it exists so login and quota bookkeeping keep coming from one stable
+account, and letting inference spend its quota is how you lose that. So by default a group
+whose only member is the control account can never serve inference. Every request asking for
+it falls back, on every request. Nothing about the group looks wrong: it has a member, a
+colour, and a healthy line in `tcr status`.
+
+Two opt-ins lift the exclusion, both off by default, and both keep the `controlReserve` floor
+below in force: `groupSettings.<label>.allowControlAccount` for one group, and
+[`controlPooled`](#controlpooled-spends-the-control-accounts-quota) for the whole pool.
 
 `tcr group ls` names this directly:
 
@@ -434,14 +440,52 @@ group research accounts=1 members=gil@example.com reserved=no routes=no route_bl
 group dev      accounts=2 members=a@example.com,b@example.com reserved=no routes=yes ...
 ```
 
-`routes=no` means the group exists and serves nothing. Two ways out: add a second, ordinary
-account to the group, or move the control account elsewhere with `tcr control --clear`.
-`tcr group add` prints the same warning at the moment you create the situation.
+`routes=no` means the group exists and serves nothing. Four ways out: add a second, ordinary
+account to the group; move the control account elsewhere with `tcr control --clear`; let this
+one group use it with `tcr group allow-control <label>`; or let the whole pool use it with
+`controlPooled`. `tcr group add` prints the same warning at the moment you create the
+situation.
 
 Reserving is the other half and solves a different problem. `tcr group reserve <label>` makes
 an account carrying that label off-limits to traffic that did *not* ask for one of its
 groups. That keeps other sessions off the account; it does **not** make `--group` strict, and
 a reserved group with no available member still falls back to the pool.
+
+## `controlPooled`: spends the control account's quota
+
+Off by default. On, the control account joins general inference rotation like any other
+account, and the only thing holding it back is the `controlReserve` floor: it stops being
+picked once its utilization reaches `switchThreshold - controlReserve` (0.95 - 0.05 = **0.90**
+on the defaults), leaving the last five points for the identity plane.
+
+```json
+{ "controlAccount": "ops@example.com", "controlPooled": true, "controlReserve": 0.05 }
+```
+
+Turn it on when a designated control account otherwise sits idle and that idle quota costs
+more than an identity-plane outage would. Read the rest of this section before you decide it
+does.
+
+**The floor can be lost, and it has been.** `controlReserve` is our own arithmetic over
+Anthropic's rate-limit headers, and those lag — upstream keeps answering `200` for accounts it
+is about to bench. Measured on a live 13-account fleet on 2026-08-29: an account tracked the
+whole way up still crossed into `quota.status == "rejected"`, which is upstream's verdict and
+not ours to argue with. A control account in that state fails `control_eligible`, so the
+identity plane loses its designated account and degrades to ordinary rotation until the weekly
+window resets — which can be most of a day.
+
+So the trade is: idle quota now, against an identity-plane outage you cannot shorten. Three
+alternatives cost less if they fit:
+
+- **`tcr group allow-control <label>`** — same access, scoped to sessions that explicitly ask
+  with `tcr run --group <label>`. The blast radius is one group instead of all traffic.
+- **`tcr control <some-idle-account>`** — move the designation onto an account you were not
+  going to spend anyway. Nothing is sacrificed and no flag is needed.
+- **`tcr control --clear`** — no control account at all. Bookkeeping calls rotate with
+  everything else, which is how the proxy behaved before the control account existed.
+
+Boot-time snapshot: an edit needs a proxy restart, and the `server started` log line reports
+`control_pooled=` so you can confirm which way the running process read it.
 
 ## `http1Only`: caps blast radius, costs multiplexing
 

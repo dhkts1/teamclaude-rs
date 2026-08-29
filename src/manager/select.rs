@@ -21,6 +21,11 @@ pub(super) enum RequestClass {
     /// `/v1/messages`, `/v1/messages/count_tokens` — pool only. **Never** the
     /// control account, even when `controlAccount` names an ENABLED (pooled)
     /// account — see [`Manager::select`]'s pool-pick exclusion.
+    ///
+    /// Two opt-ins lift that, both off by default, and both leave
+    /// [`Manager::pool_pick_respects_control_reserve`]'s floor in force:
+    /// `groupSettings.<g>.allowControlAccount` for one explicit `--group g` ask,
+    /// and [`crate::config::Config::control_pooled`] for the whole pool.
     Inference,
     /// `/api/event_logging*`, `/mcp-registry*` — high-volume noise. Follows the
     /// requesting connection ([`Manager::conn_affinity`]) rather than the
@@ -48,15 +53,20 @@ pub(super) enum RequestClass {
 /// produced while diagnosing it blamed pacing, which was unconfigured.
 ///
 /// [`Self::OnlyControl`] is the arm that matters: it is not a transient miss. No
-/// retry, no quota recovering and no restart fixes it, because the exclusion is
-/// unconditional for [`RequestClass::Inference`].
+/// retry and no quota recovering fixes it, because for [`RequestClass::Inference`]
+/// the exclusion holds for as long as it is configured to. It is not permanent
+/// either — `allowControlAccount` on this group, or `controlPooled` fleet-wide,
+/// clears the exclusion, and both are picked up without a restart. The arm simply
+/// cannot fire once one of them is on: `select_with_group` then passes
+/// `control_excluded: None`, and no member matches `Some(idx)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum GroupMiss {
     /// No configured account carries this label at all — a typo, or a label
     /// removed from every account while a client still asks for it.
     Unknown,
-    /// Every member is the control account, which an inference request never
-    /// selects. This group can NEVER serve inference.
+    /// Every member is the control account, which this inference request was
+    /// not allowed to select. Serves nothing until `allowControlAccount` is set
+    /// on the group or `controlPooled` is set fleet-wide.
     OnlyControl,
     /// Members exist and are selectable in principle, but every one is held out
     /// right now by a hard gate: disabled, errored, rate-limited, over its
@@ -846,10 +856,12 @@ impl Manager {
         } else {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
 
-            // Inference must NEVER select the control account, even one that is
-            // ENABLED (pooled) — the default-disabled control account is already
-            // excluded by `eligible`'s own disabled check, so this only starts
-            // doing real work the day `controlAccount` stops being disabled.
+            // By default inference NEVER selects the control account, so that
+            // inference load can never burn the one identity the control plane
+            // resolves to (`control-account-bridge-coder.md` §"the fix"). The
+            // default-disabled control account is already excluded by
+            // `eligible`'s own disabled check, so this only does real work when
+            // `controlAccount` names a non-disabled account.
             // Modeled as an extra `tried` member rather than a new parameter
             // threaded through `pick_eligible`/`pick_least_loaded`, so both
             // passes (and the pacing/least-loaded fallback) honour it for free.
@@ -869,19 +881,32 @@ impl Manager {
             // inference — `pool_pick_respects_control_reserve`'s reserve-floor
             // guard already applies unconditionally once the account becomes
             // selectable, so this carve-out stays safe without further changes.
-            let control_excluded: Option<usize> = if request_class == RequestClass::Inference {
-                self.control().filter(|&idx| {
-                    let opted_in = group.is_some_and(|g| {
-                        control_allowed_groups.contains(g)
-                            && accounts
-                                .get(idx)
-                                .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
-                    });
-                    !opted_in
-                })
-            } else {
-                None
-            };
+            //
+            // Fleet-wide carve-out: `controlPooled` drops the exclusion for
+            // EVERY inference pick, leaving `pool_pick_respects_control_reserve`
+            // as the only thing holding the control account back — the same
+            // reserve floor the group carve-out above already relies on, applied
+            // to the whole pool instead of one group. It is checked here, in the
+            // one place that decides candidacy, so the group carve-out, the
+            // group-miss classifier and both pick passes all agree for free.
+            //
+            // This is a deliberate trade, not a tightening: see
+            // `Config::control_pooled` for why the reserve is a floor over
+            // LAGGING headers and what it costs when upstream wins the race.
+            let control_excluded: Option<usize> =
+                if request_class == RequestClass::Inference && !self.control_pooled {
+                    self.control().filter(|&idx| {
+                        let opted_in = group.is_some_and(|g| {
+                            control_allowed_groups.contains(g)
+                                && accounts
+                                    .get(idx)
+                                    .is_some_and(|a| a.groups.iter().any(|gr| gr == g))
+                        });
+                        !opted_in
+                    })
+                } else {
+                    None
+                };
             let pool_tried: std::borrow::Cow<'_, HashSet<usize>> = match control_excluded {
                 Some(control_idx) if !tried.contains(&control_idx) => {
                     let mut t = tried.clone();
@@ -2420,6 +2445,7 @@ mod revalidation_sticky_tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            control_pooled: false,
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -2566,6 +2592,7 @@ mod sticky_divert_replay_tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            control_pooled: false,
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -2989,6 +3016,7 @@ mod reset_urgency_tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            control_pooled: false,
             reset_urgency_tier_hours: tier_hours,
             http1_only: false,
             accounts,

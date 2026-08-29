@@ -171,6 +171,7 @@ fn config(
         lock_account: None,
         control_account: None,
         control_reserve: 0.05,
+        control_pooled: false,
         reset_urgency_tier_hours: 24,
         http1_only: false,
         accounts: (0..POOL).map(account).collect(),

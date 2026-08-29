@@ -1005,6 +1005,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let throttle_active = manager.throttle_active();
     let lock_account = manager.locked_account_name();
     let control_account = manager.control_name();
+    let control_pooled = manager.control_pooled();
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         sha = build_info::SHA,
@@ -1024,6 +1025,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         throttle_active,
         lock_account,
         control_account,
+        control_pooled,
         "server started"
     );
 

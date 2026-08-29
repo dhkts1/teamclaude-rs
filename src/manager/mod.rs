@@ -1068,11 +1068,25 @@ pub struct Manager {
     /// minus this, applied ONLY when a general (non-control-preferred) pick
     /// evaluates the control account as a candidate. See
     /// [`select::effective_threshold`]. Resolved from `config.control_reserve`,
-    /// clamped to `[0.0, 0.5]`. **Currently inert**: the control account ships
-    /// `disabled`, so `Self::eligible` already excludes it from every general
-    /// pick before this reserve is ever consulted. It exists for the day
-    /// `controlAccount` names a POOLED (non-disabled) account.
+    /// clamped to `[0.0, 0.5]`.
+    ///
+    /// Consulted only once the control account is a CANDIDATE for a general
+    /// pick, which is [`Self::control_pooled`] or a `--group` ask that opted in
+    /// via `allowControlAccount`. Otherwise `select_with_group` force-adds the
+    /// control index to `tried` and this is never reached — and it is inert in
+    /// every case while the control account is `disabled`, because
+    /// [`Self::eligible`]'s terminal gate drops it first.
     control_reserve: f64,
+    /// Whether the control account takes GENERAL inference traffic, guarded by
+    /// [`Self::control_reserve`] alone. Boot-time snapshot of
+    /// `config.control_pooled`; default `false`, which preserves the rule that
+    /// an inference request never selects the control account.
+    ///
+    /// Read [`crate::config::Config::control_pooled`] before changing this: the
+    /// reserve is a floor over LAGGING headers, so `true` accepts that inference
+    /// can burn the control account into `rejected` and cost the identity plane
+    /// its anchor until the weekly window resets.
+    control_pooled: bool,
     /// Width in MILLISECONDS of the reset-urgency bucket that rotation ranks by
     /// within a priority tier, resolved once from
     /// [`crate::config::Config::reset_urgency_tier_hours`] at construction
@@ -1233,6 +1247,9 @@ impl Manager {
         // the field's own doc already promise `[0.0, 0.5]` — a hand-edited
         // config file is not bound by either.
         let control_reserve = config.control_reserve.clamp(0.0, 0.5);
+        // Read before `config` is moved into the struct below, same reason as
+        // `locked_name` above.
+        let control_pooled = config.control_pooled;
 
         // Hours → ms once, at construction. `i64::from` then a checked multiply:
         // a hand-edited `resetUrgencyTierHours` of, say, 100_000_000 would
@@ -1297,6 +1314,7 @@ impl Manager {
             conn_affinity: Mutex::new(HashMap::new()),
             divert_ledger: Mutex::new(HashMap::new()),
             control_reserve,
+            control_pooled,
             reset_urgency_tier_ms,
         });
 
@@ -2016,6 +2034,15 @@ impl Manager {
             .expect("accounts lock poisoned")
             .get(idx)
             .map(|a| a.name.clone())
+    }
+
+    /// Whether the control account also takes general inference traffic — the
+    /// boot-time `controlPooled` snapshot. Surfaced on the `server started` line
+    /// because it is the one routing flag whose cost is an OUTAGE rather than a
+    /// slowdown, and an operator reading that line after a restart needs to see
+    /// it without opening the config.
+    pub fn control_pooled(&self) -> bool {
+        self.control_pooled
     }
 
     /// The resolved `lockAccount` name, or `None` when unlocked / the name did
@@ -2837,6 +2864,7 @@ mod tests {
             lock_account: None,
             control_account: None,
             control_reserve: 0.05,
+            control_pooled: false,
             reset_urgency_tier_hours: 24,
             http1_only: false,
             accounts,
@@ -4310,6 +4338,59 @@ mod tests {
                 manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
                 Some(1),
                 "inference must route to the pool, never the control account"
+            );
+        }
+    }
+
+    /// `controlPooled` lifts the exclusion the test above pins down: the same
+    /// unpinned inference now reaches the control account, because
+    /// `select_with_group` stops force-adding the control index to `tried`.
+    /// Asserts REACHABILITY, not a fixed index — LRU decides the order, and
+    /// pinning the order here would be testing the tiebreak, not the flag.
+    #[test]
+    fn pooled_control_account_takes_inference() {
+        let mut config = config_with_control(vec![account("ctrl", 0), account("pool", 0)], "ctrl");
+        config.control_pooled = true;
+        let manager = build_manager(config, lock_refresher());
+        assert_eq!(manager.control(), Some(0));
+        let now = OffsetDateTime::now_utc();
+        let reached_control = (0..10).any(|_| {
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None) == Some(0)
+        });
+        assert!(
+            reached_control,
+            "controlPooled must let an inference pick reach the control account"
+        );
+    }
+
+    /// The guard the whole opt-in rests on, and the reason `controlPooled` is
+    /// not simply "delete the exclusion": a POOLED control account is held out
+    /// at `switchThreshold - controlReserve` (0.90 - 0.05 = 0.85), NOT at the
+    /// full threshold every other account gets.
+    ///
+    /// 0.86 is chosen to sit BELOW the full 0.90 on purpose — `eligible` still
+    /// passes this account, so the only thing that can hold it back is
+    /// [`super::select::Manager::pool_pick_respects_control_reserve`]. Raise it
+    /// to 0.90 and the test would pass for the wrong reason.
+    #[test]
+    fn pooled_control_account_is_held_out_by_the_reserve() {
+        let mut config = config_with_control(vec![account("ctrl", 0), account("pool", 0)], "ctrl");
+        config.control_pooled = true;
+        let manager = build_manager(config, lock_refresher());
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].quota.five_hour = Some(crate::quota::QuotaWindow {
+                utilization: 0.86,
+                reset: Some(now + time::Duration::seconds(300)),
+            });
+        }
+        for _ in 0..10 {
+            assert_eq!(
+                manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+                Some(1),
+                "a pooled control account past threshold-reserve must be held out, \
+                 leaving the identity plane the headroom the reserve exists to keep"
             );
         }
     }
