@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import Sparkle
 import SwiftUI
@@ -58,7 +59,26 @@ final class Updater: NSObject, ObservableObject {
     /// The user-initiated check. Sparkle drives every subsequent step, including
     /// telling the user when there is nothing to install — which a background
     /// check deliberately stays silent about.
+    ///
+    /// **The activation is the whole point of this method having a body.** This
+    /// app is `LSUIElement`, so it is not a foreground app, and every caller
+    /// here is a control inside the popover — which closes on the click. Sparkle
+    /// then puts its update window up on an app that is no longer frontmost, so
+    /// the window opens BEHIND whatever the user is looking at. From the panel
+    /// that reads as "the line closed the UI and did nothing", which is exactly
+    /// what it was reported as: the header's `Update available: …` looks like a
+    /// link, and clicking it appeared to do nothing at all.
+    ///
+    /// `MenuBarShell.openPanel()` already carries the same call for the same
+    /// reason — without it the popover opens without key focus. An accessory app
+    /// has to ask for the foreground every time it wants to be seen; this path
+    /// simply never did.
     func checkForUpdates() {
+        if #available(macOS 14.0, *) {
+            NSApp.activate()
+        } else {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         controller.updater.checkForUpdates()
     }
 }
