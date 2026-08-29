@@ -4,10 +4,11 @@
 
 # teamclaude-rs (`tcr`)
 
-A rotating Anthropic proxy that lives in your menu bar.
+A quota-aware scheduler for a pool of Claude accounts.
 
-Point Claude Code (or any Anthropic API client) at it, and it spreads requests across
-several Claude accounts, refreshes their OAuth tokens, and shows what each one has left.
+Point Claude Code (or any Anthropic API client) at it. It decides which account serves each
+request from what every account has left in every quota window, keeps a conversation on the
+account whose prompt cache is already warm, and shows you what the traffic would have cost.
 
 [![CI](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/dhkts1/teamclaude-rs/actions/workflows/ci.yml)
 [![License: PolyForm Noncommercial](https://img.shields.io/badge/License-PolyForm%20Noncommercial-yellow.svg)](LICENSE)
@@ -21,13 +22,52 @@ several Claude accounts, refreshes their OAuth tokens, and shows what each one h
 
 ## What it does
 
-- Rotates requests across a pool of Claude accounts, with `priority` as a hard tier.
-- Refreshes OAuth tokens in the background, so accounts do not expire out from under you.
-- Native macOS menu-bar app: live quota bars, per-account enable/disable, server supervision.
-- Two entry modes on one port (base-URL and forward-proxy), chosen per connection.
-- A live terminal dashboard, on macOS and Linux alike, showing everything the app shows.
-- Session affinity keeps a conversation on one account, so its prompt cache stays warm.
-- Drop-in for the Node [teamclaude](https://github.com/KarpelesLab/teamclaude): same config, certs and port.
+Every Claude account is rate-limited by several windows at once: a rolling five-hour session
+window, a weekly one, and a weekly window scoped to a single model family. Each tracks how much
+of it you have spent and when it resets, and accounts do not reset together. `tcr` learns all
+of them for every account, and schedules against them.
+
+**It does not round-robin.** Inside a priority tier, rotation ranks by which quota window
+resets soonest, because unused weekly quota is worth nothing once that window resets.
+Least-recently-selected breaks the tie, so requests still fan out instead of parking on one
+account. An account is skipped when it is disabled, erroring, on a rate-limit hold, too close
+to a limit, held back for a group this request did not ask for, or out of the model-scoped
+window this particular request needs. The full ordering is in
+[`docs/architecture.md`](docs/architecture.md#account-selection); the reset-urgency term, and
+how to turn it off, is in
+[`docs/configuration.md`](docs/configuration.md#reseturgencytierhours-spend-the-quota-that-is-about-to-expire).
+
+**The prompt cache is the expensive part.** Anthropic keys it per account, so moving a live
+conversation to a different account re-creates its whole cached prefix. A session therefore
+pins to one account and stays there. A single request that diverts around a transient fault
+does not move the pin; only an account-level failure re-keys it. Pins are written to disk
+continuously and restored at boot, which is what stops a restart from cold-starting every live
+conversation. Anthropic holds a prefix for five minutes, or an hour if the client asks for it,
+and a session that asked for the longer one keeps its pin longer to match.
+
+**Egress is paced per organization**, because that is the unit Anthropic limits: two accounts
+sharing one org get one org's rate, not two. A looser fleet-wide ceiling sits behind it. Quota
+probes, the zero-spend reads that keep an idle account's numbers current, run on their own
+randomized per-account schedule, so the fleet does not arrive upstream in one burst on an exact
+period, and a restart re-scatters it rather than re-aligning it.
+
+**Everything is priced.** Each served request goes to a local ledger against Anthropic's list
+rates, per account and per model, split across input, output, cache reads and cache writes. The
+panel and the terminal dashboard show spend today, the last hour's burn rate, the model mix and
+the cache hit rate, and the ledger replays from disk at boot so a restart does not reset the
+day. Nothing here is a bill: these accounts are subscriptions, and list price is simply the one
+unit that compares across accounts, models and days. Traffic that could not be priced shows no
+figure rather than a zero. An account that served nothing shows a real zero. A window holding a
+mix reports the priced part alongside the count it could not price.
+
+OAuth tokens are refreshed in the background, so accounts do not expire out from under you.
+Accounts carry labels, and a labelled set can be *reserved* so only traffic that asks for it
+routes there. One account can be nominated to serve the identity and control-plane calls a
+client makes alongside its prompts; inference never selects it, so it stays clean. Accounts can
+be added, enabled, disabled and removed against the running proxy, which matters because a
+restart is what costs you the warm pins above. There is a native macOS menu-bar app
+and a terminal dashboard, and `tcr` is a drop-in for the Node
+[teamclaude](https://github.com/KarpelesLab/teamclaude) — same config, certs and port.
 
 ## Install
 
@@ -76,22 +116,38 @@ trust it. `tcr` prints the CA path to advertise when it starts. Config lives at
 Every other key, its default and the file's permissions are in
 [`docs/configuration.md`](docs/configuration.md).
 
-## Menu bar app
+### Managing the fleet
+
+These act on the running proxy where one is up, so changing the pool does not cost a restart.
+Every flag is in [`docs/cli.md`](docs/cli.md).
+
+| Command | What it does |
+|---|---|
+| `tcr accounts [--probe]` | List the pool. `--probe` refreshes quota live instead of reading the file. |
+| `tcr status [--json]` | Probe every account and print the fleet. `--json` is what the panel and TUI read. |
+| `tcr priority <account> [N \| --first \| --last]` | Set the rotation tier. |
+| `tcr enable` / `tcr disable <account>` | Take an account in or out of rotation. |
+| `tcr remove <account>` | Delete an account, disabling it live first. |
+| `tcr control <account> [--clear \| --show]` | Nominate the account that serves control-plane traffic. |
+| `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
+| `tcr run --group <name>` | Start a session that prefers one group. |
+| `tcr update` | Update `tcr` in place, from the checkout or the published installer. |
+
+## Watching it
 
 `apps/macos` is a native front end over the same `tcr status --json` the TUI reads. The
-menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet capacity at
-a glance. Each row is one line per quota window — bar, percentage and the countdown to that
-window's reset — plus probe health and a menu that shells out to `tcr`, so you can steer the
-fleet from the panel. Each row also carries the Fable weekly window, with its own percentage
-and its own countdown, for an account the proxy has learned one for; an account it has not
-shows nothing there rather than a zero.
-The header line and each card also say what that traffic would have cost on the API — spend
-today, the last hour's burn rate, the model mix and the cache hit rate — attributed per account
-by the proxy as it serves, and replayed from disk after a restart. Nothing here is a bill:
-these accounts are subscriptions, and list price is simply the one unit that compares across
-accounts, models and days. An account the proxy never measured shows no figure at all rather
-than a zero.
-It can also supervise the proxy, and self-updates through [Sparkle](https://sparkle-project.org).
+menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet-wide capacity
+rather than the worst account, because one spent account in a rotating pool is the mechanism
+working, not an alarm. Each row is one line per quota window — bar, percentage and the
+countdown to that window's reset — plus probe health, the account's group tags, and a
+right-click menu that shells out to `tcr`, so you can steer the fleet from the panel.
+
+Rows also carry the model-scoped weekly window, Fable's on current plans, for an account the
+proxy has learned one for; an account it has not shows nothing there rather than a zero. That
+window is enforced as well as displayed: a request targeting that model skips an account which
+has exhausted it, and requests for every other model ignore it. The header and each card carry
+the spend figures described above. TcrBar can also supervise the proxy, hold the Mac awake
+while it does, and self-update through [Sparkle](https://sparkle-project.org).
 
 Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run
 `tcr ui`. Build it here with `apps/macos/scripts/install.sh`; releases: [`docs/RELEASING.md`](docs/RELEASING.md).
@@ -111,6 +167,9 @@ poll, an empty fleet and an offline read, because each one needs a different res
 
 ![tcr live TUI](assets/tui-demo.gif)
 
+The TUI runs on macOS and Linux alike and shows everything the panel does, plus the live
+session tree: which conversation is pinned to which account, and which ones diverted.
+
 `tcr demo` renders the real TUI against fake accounts (which is how these screenshots were
 made). It needs no config and contacts nothing.
 
@@ -123,8 +182,15 @@ eight bytes of each connection: a `CONNECT` for an Anthropic API host is TLS-ter
 a locally generated leaf, anything else is copied through as raw bytes, and plain HTTP is
 base-URL mode. Requests then run a bounded rotation loop: pick an eligible account, refresh
 its token if it is expiring, swap the client's credentials for the pooled one, send, and
-rotate on a 401, 429, 529 or transport failure. The request-flow diagram, the account
-selection ordering and the probe schedule are in [`docs/architecture.md`](docs/architecture.md).
+rotate on a 401, 429, 529 or transport failure.
+
+Quota comes from the response headers of traffic `tcr` already serves, kept fresh between
+requests by a zero-spend probe against Anthropic's OAuth usage endpoint. The probe makes no
+`/v1/messages` call, so an idle account's bars stay honest instead of freezing at their
+last-served value. A window that has passed its reset reads as fresh rather than full,
+computed against the clock at read time, so neither the display nor the scheduler can act on a
+stale bar. The request-flow diagram, the selection ordering and the probe schedule are in
+[`docs/architecture.md`](docs/architecture.md).
 
 ## Documentation
 
