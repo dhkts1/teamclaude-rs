@@ -46,12 +46,33 @@ import IOKit.pwr_mgt
 /// No measurement of that exists on this machine, so neither the doc-comment
 /// nor the panel claims an answer in either direction.
 ///
-/// **Not persisted across launches.** There is deliberately no `@AppStorage`
-/// here. A Mac that silently never sleeps because of a box ticked a week ago is
-/// a worse bug than having to tick it again — the symptom (a laptop that runs
-/// hot in a bag) is nowhere near the cause. Contrast `startServerAtLaunch`,
-/// which *is* persisted: being wrong about that one costs a spawn that stands
-/// down harmlessly.
+/// **Persisted across launches**, and it was not. The reversal is Gil's call
+/// (2026-08-30) and the reasoning it overturns is worth keeping, because it was
+/// not wrong about the danger:
+///
+/// > A Mac that silently never sleeps because of a box ticked a week ago is a
+/// > worse bug than having to tick it again — the symptom (a laptop that runs
+/// > hot in a bag) is nowhere near the cause.
+///
+/// What makes it safe now is that the state is no longer silent. ``MenuBarMark``
+/// draws a tinted cup beside the gauge for exactly as long as the assertions are
+/// held, in the menu bar, on every screen the operator looks at — the shape
+/// channel survives greyscale and colour vision deficiency, and the status
+/// item's tooltip names it too. The cause is not "nowhere near the symptom"; it
+/// is the one glyph that is always on screen. A setting whose whole job is "this
+/// machine stays up for long runs" and that has to be re-armed after every
+/// reboot is a setting that is off exactly when it was needed.
+///
+/// What is stored is the operator's INTENT — what ``setOn(_:)`` was asked for —
+/// not ``isOn``, which mirrors the token and is a fact about the machine.
+/// A take that fails leaves the panel honestly OFF and the stored intent ON, so
+/// the next launch tries again rather than quietly disabling itself. That split
+/// is also what keeps ``releaseOnQuit()`` from wiping the preference on the way
+/// out: quitting ends the assertions, it does not un-ask for them.
+///
+/// ``defaults`` is optional and `nil` means REMEMBER NOTHING — the PNG harness
+/// and the shell probe both drive `setOn` to draw the ON state, and a render must
+/// not write the operator's preferences. See ``AwakeController/harness()``.
 @MainActor
 public final class AwakeController: ObservableObject {
 
@@ -171,12 +192,50 @@ public final class AwakeController: ObservableObject {
 
     private let activity: Activity
 
-    public init(activity: Activity = .powerAssertions) {
+    /// The `UserDefaults` key. Do not change it — renaming it fails nothing and
+    /// silently un-arms a setting the operator chose, the same trap
+    /// ``LaunchPreference/startServerAtLaunchKey`` documents. `AwakeControllerTests`
+    /// pins the literal.
+    public static let keepAwakeKey = "keepThisMacAwake"
+
+    /// `nil` remembers nothing. See the type's doc-comment.
+    private let defaults: UserDefaults?
+
+    public init(activity: Activity = .powerAssertions, defaults: UserDefaults? = .standard) {
         self.activity = activity
+        self.defaults = defaults
     }
 
+    /// The pairing every harness wants: hold nothing, remember nothing.
+    ///
+    /// Named rather than left to two call sites to assemble, because the second
+    /// half is the one that is easy to forget and the damage is invisible —
+    /// rendering the ON scene with real defaults would write
+    /// ``keepAwakeKey`` into the operator's own preferences.
+    public static func harness() -> AwakeController {
+        AwakeController(activity: .inert, defaults: nil)
+    }
+
+    /// Take or release the assertions, and remember which was asked for.
+    ///
+    /// The store is written BEFORE the attempt on purpose: it records what was
+    /// asked, and a take that fails is still a request to keep this Mac awake.
     public func setOn(_ on: Bool) {
+        defaults?.set(on, forKey: Self.keepAwakeKey)
         if on { begin() } else { end() }
+    }
+
+    /// Re-arm at launch from the stored intent. Called once, from
+    /// `applicationDidFinishLaunching`, beside the `startServerAtLaunch` spawn.
+    ///
+    /// Deliberately NOT done in `init`: the render harness and the shell probe
+    /// build a controller too, and a constructor that reaches for the operator's
+    /// preferences would have them silently holding — or drawing — a state
+    /// nobody asked those processes for. It also goes through ``begin()``
+    /// rather than ``setOn(_:)``, so restoring writes nothing back.
+    public func restoreFromPreference() {
+        guard defaults?.bool(forKey: Self.keepAwakeKey) == true else { return }
+        begin()
     }
 
     public func toggle() {

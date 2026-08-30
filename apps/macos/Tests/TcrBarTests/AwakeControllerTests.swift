@@ -43,7 +43,7 @@ final class AwakeControllerTests: XCTestCase {
 
     func testOffToOnBeginsExactlyOneActivity() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.setOn(true)
 
@@ -59,7 +59,7 @@ final class AwakeControllerTests: XCTestCase {
     /// process.
     func testOnToOnDoesNotBeginASecondActivity() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.setOn(true)
         controller.setOn(true)
@@ -72,7 +72,7 @@ final class AwakeControllerTests: XCTestCase {
 
     func testOnToOffEndsExactlyTheTokenThatWasBegun() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.setOn(true)
         controller.setOn(false)
@@ -90,7 +90,7 @@ final class AwakeControllerTests: XCTestCase {
     /// to reach it is a spurious off.
     func testOffToOffEndsNothing() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.setOn(false)
         controller.setOn(false)
@@ -106,7 +106,7 @@ final class AwakeControllerTests: XCTestCase {
     /// that is not true.
     func testIsOnTracksTheLiveTokenAcrossEveryTransition() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         for on in [false, true, true, false, false, true, false] {
             controller.setOn(on)
@@ -118,7 +118,7 @@ final class AwakeControllerTests: XCTestCase {
 
     func testToggleFlipsAndReleases() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.toggle()
         XCTAssertTrue(controller.isOn)
@@ -129,7 +129,7 @@ final class AwakeControllerTests: XCTestCase {
 
     func testReleaseOnQuitEndsAHeldActivityAndIsSafeWhenNoneIsHeld() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.releaseOnQuit()
         XCTAssertEqual(fake.ended.count, 0, "nothing was held, so nothing may be ended")
@@ -148,7 +148,7 @@ final class AwakeControllerTests: XCTestCase {
     /// both that search and the README's gate.
     func testReasonNamesTheAppSoItIsGreppable() {
         let fake = RecordingActivity()
-        let controller = AwakeController(activity: fake.activity)
+        let controller = AwakeController(activity: fake.activity, defaults: nil)
 
         controller.setOn(true)
 
@@ -183,7 +183,7 @@ final class AwakeControllerTests: XCTestCase {
                 return nil
             },
             end: { _ in ended += 1 })
-        let controller = AwakeController(activity: activity)
+        let controller = AwakeController(activity: activity, defaults: nil)
 
         controller.setOn(true)
         XCTAssertFalse(controller.isOn, "nothing was taken, so the control must read OFF")
@@ -199,7 +199,7 @@ final class AwakeControllerTests: XCTestCase {
     /// The harness pair must hold nothing. If `.inert` ever became the real one,
     /// rendering PNGs would stop the machine sleeping.
     func testInertActivityIsSafeForTheRenderHarness() {
-        let controller = AwakeController(activity: .inert)
+        let controller = AwakeController(activity: .inert, defaults: nil)
         controller.setOn(true)
         XCTAssertTrue(controller.isOn, "the harness still needs the ON appearance")
         controller.setOn(false)

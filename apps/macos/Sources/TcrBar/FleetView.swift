@@ -656,7 +656,8 @@ struct FleetView: View {
             .help(
                 "Holds the three power assertions `caffeinate -i -m -s` holds, for "
                     + "as long as this is on. Released when you untick it or quit "
-                    + "TcrBar."
+                    + "TcrBar, and taken again the next time TcrBar starts — the "
+                    + "cup in the menu bar is on whenever it is held."
             )
             if awake.isOn {
                 Text("The display still sleeps. Sleep itself is only held off on AC power.")

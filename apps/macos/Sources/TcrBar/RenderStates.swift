@@ -140,11 +140,18 @@ enum RenderStates {
         NSAppearance.current = appearance.nsAppearance
         defer { NSAppearance.current = previous }
 
-        // `.inert`, never the real activity: drawing a checkbox in its ON state
-        // must not actually stop this machine sleeping. A harness with a side
-        // effect on the operator's power settings would be a worse bug than
+        // `.harness()`, never a real controller: drawing a checkbox in its ON
+        // state must not actually stop this machine sleeping. A harness with a
+        // side effect on the operator's power settings would be a worse bug than
         // anything it could catch.
-        let awake = AwakeController(activity: .inert)
+        //
+        // That sentence used to be satisfied by `activity: .inert` alone, and
+        // stopped being once the control started REMEMBERING its state: the
+        // `setOn` below would have written `keepThisMacAwake` into the
+        // operator's own defaults — true on scene 12, false on the next one —
+        // so a render would silently disarm a setting they had turned on.
+        // `.harness()` is inert on both halves.
+        let awake = AwakeController.harness()
         awake.setOn(scene.awake)
 
         let view =
