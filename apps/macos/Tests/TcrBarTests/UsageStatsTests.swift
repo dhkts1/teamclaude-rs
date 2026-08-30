@@ -252,16 +252,21 @@ final class UsageStatsTests: XCTestCase {
     /// ranking entirely, so this line named two models and collapsed nothing,
     /// while a third model with 32 of the fleet's 132 requests appeared
     /// nowhere — the panel read as "all opus" about a fleet that was not.
-    func testHeaderLineNamesTwoModelsAndSaysWhatIsMissing() throws {
+    ///
+    /// That third model is now NAMED, not counted: the `"+1"` this line used to
+    /// end its model list with said only that something was missing, without
+    /// saying what.
+    func testHeaderLineNamesEveryModelAndSaysWhatIsMissing() throws {
         let fleet = try mixedFleet()
         let line = try XCTUnwrap(fleet.usageSummaryLine)
         XCTAssertEqual(
             line,
-            "$14.0 today · $3.00/hr · opus-5 86% · sonnet-5 14% · +1 · cache 75% "
+            "$14.0 today · $3.00/hr · opus-5 86% · sonnet-5 14% · sonnet-4-5 ? · cache 75% "
                 + "· 32 unpriced today")
+        XCTAssertFalse(line.contains("+1"), "nothing is collapsed any more: \(line)")
     }
 
-    func testHeaderLineCollapsesTheThirdModel() throws {
+    func testHeaderLineNamesTheThirdModelRatherThanCountingIt() throws {
         let byModel = [
             "claude-opus-5": totals(cost: 6.0),
             "claude-sonnet-5": totals(cost: 3.0),
@@ -277,8 +282,46 @@ final class UsageStatsTests: XCTestCase {
                     todayByModel: byModel))
         ])
         let line = try XCTUnwrap(fleet.usageSummaryLine)
-        XCTAssertTrue(line.contains("opus-5 60% · sonnet-5 30% · +1"), line)
+        XCTAssertTrue(line.contains("opus-5 60% · sonnet-5 30% · haiku-5 10% · cache"), line)
         XCTAssertFalse(line.contains("unpriced"), "nothing was missing from this total: \(line)")
+    }
+
+    /// The case naming every model exposes, on the real fleet that motivated
+    /// it: $5,079 of opus beside $1.55 of haiku is a 0.03% slice, and
+    /// `Int((0.0003 * 100).rounded())` is `0`. `haiku-4-5 0%` states that a
+    /// model which served today spent nothing — the same false zero
+    /// ``QuotaFormat/percent(_:)`` refuses for a `nil`, arriving instead through
+    /// the rounding. It was unreachable while only the top two models were
+    /// named, because a slice that small is never in the top two.
+    func testATinySliceSaysLessThanOnePercentRatherThanZero() throws {
+        let fleet = Fleet(accounts: [
+            row(
+                name: "alice@example.com",
+                usage: UsageRow(
+                    today: totals(cost: 5081.20, input: 100, requests: 900),
+                    window: nil,
+                    lastHour: totals(cost: 1.0),
+                    todayByModel: [
+                        "claude-opus-5": totals(cost: 5079.65, requests: 800),
+                        "claude-haiku-4-5-20251001": totals(cost: 1.55, requests: 100),
+                    ]))
+        ])
+        let line = try XCTUnwrap(fleet.usageSummaryLine)
+        XCTAssertTrue(line.contains("opus-5 100% · haiku-4-5 <1%"), line)
+        XCTAssertFalse(
+            line.contains("haiku-4-5 0%"),
+            "this model served 100 requests and cost $1.55 — it did not spend nothing: \(line)")
+    }
+
+    /// The other side of that rule: a model that genuinely cost nothing prints
+    /// the zero, because the zero is then the measurement. `<1%` for a real
+    /// `0%` would be as wrong in the other direction.
+    func testAMeasuredZeroShareStillPrintsZero() throws {
+        XCTAssertEqual(QuotaFormat.share(0), "0%")
+        XCTAssertEqual(QuotaFormat.share(nil), "n/a")
+        XCTAssertEqual(QuotaFormat.share(0.0049), "<1%")
+        XCTAssertEqual(QuotaFormat.share(0.005), "1%", "this one rounds up on its own")
+        XCTAssertEqual(QuotaFormat.share(1), "100%")
     }
 
     // MARK: The card's 5h figures
@@ -455,7 +498,9 @@ final class UsageStatsTests: XCTestCase {
             try XCTUnwrap(share[0].share), 0.75, accuracy: 0.0001,
             "both spellings are the same model, so its share is the sum of the two")
         let line = try XCTUnwrap(fleet.usageSummaryLine)
-        XCTAssertFalse(line.contains("+1"), "there is no third model to collapse: \(line)")
+        XCTAssertTrue(
+            line.contains("opus-5 75% · sonnet-5 25% · cache"),
+            "two models ran, so the line names two — not three, one of them twice: \(line)")
         XCTAssertEqual(
             fleet.todayByModelLabel.keys.sorted(), ["opus-5", "sonnet-5"],
             "the merge happens on the label, before anything ranks or counts it")

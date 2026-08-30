@@ -102,7 +102,11 @@ enum ShellProbe {
         // Sparkle opening its own window underneath the measurement.
         let shell = MenuBarShell(
             poller: StatusPoller(pinnedState: .loaded(probeFleet())),
-            awake: AwakeController(activity: .inert),
+            // Inert on both halves: it holds nothing, and — because the probe
+            // drives `setOn(true)`/`setOn(false)` below to measure the two marks
+            // — it must also remember nothing, or a probe run would rewrite the
+            // operator's `keepThisMacAwake` preference. See `AwakeController.harness()`.
+            awake: AwakeController.harness(),
             updater: Updater(startingUpdater: false))
 
         var checks: [Check] = []

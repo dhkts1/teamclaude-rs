@@ -110,6 +110,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if shell.preference.startServerAtLaunch {
             shell.server.start()
         }
+        // Same shape, same place, same once-per-process guarantee: re-take the
+        // power assertions if that is how the operator left them. A reboot is
+        // exactly when a machine meant to stay up for long runs would otherwise
+        // come back asleep-capable with nothing on screen having changed.
+        //
+        // After `poller.start()` rather than before it only because the fleet is
+        // the thing worth being quickest about; the assertions are not racing
+        // anything. `AwakeController.restoreFromPreference` is a no-op unless the
+        // stored intent is ON.
+        shell.awake.restoreFromPreference()
     }
 
     func applicationWillTerminate(_ notification: Notification) {

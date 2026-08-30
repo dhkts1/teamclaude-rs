@@ -94,7 +94,13 @@ public enum KeepAwakeProbe {
             exit(2)
 
         case .hold(let seconds):
-            let controller = AwakeController()
+            // REAL assertions — that is the whole point of this probe — but
+            // `defaults: nil`, so the `setOn` calls that drive it do not write
+            // `keepThisMacAwake` into the operator's preferences. A gate that
+            // proves the mechanism works must not also arm the setting, and the
+            // inverse is worse: this probe releases at the end, which would
+            // store OFF and disarm a control the operator had turned on.
+            let controller = AwakeController(activity: .powerAssertions, defaults: nil)
             controller.setOn(true)
 
             // This guard can fail, and that is why it is here.
