@@ -256,6 +256,23 @@ public enum QuotaFormat {
         return "\(Int((value * 100).rounded()))%"
     }
 
+    /// ``percent(_:)`` for a share of a whole, where a positive value too small
+    /// to round to one percent prints `"<1%"` rather than `"0%"`.
+    ///
+    /// The header names EVERY model now, so this case is no longer hypothetical:
+    /// a fleet spending $5,000 on opus and $1.55 on haiku puts a 0.02% slice on
+    /// the line, and `haiku-4-5 0%` claims the model served nothing today. It
+    /// served; it is simply cheap. That is the same distinction ``percent(_:)``
+    /// keeps between `nil` and zero, one level down — here both ends are
+    /// measured, and the rounding is what would invent the zero.
+    ///
+    /// A share that IS zero still prints `"0%"`, because that is what it is.
+    public static func share(_ value: Double?) -> String {
+        guard let value else { return notMeasured }
+        if value > 0 && (value * 100).rounded() == 0 { return "<1%" }
+        return percent(value)
+    }
+
     /// `102` → `"102"`; `nil` → `"n/a"`.
     ///
     /// The `Int` counterpart to ``percent(_:)``, for a serving counter that
@@ -1970,8 +1987,9 @@ public struct Fleet: Equatable, Sendable {
     /// `claude-opus-5-20250929` are ONE model wearing two ids — which is the
     /// ordinary state during a rollout, some sessions pinning the dated id and
     /// others the alias. Grouping on the raw id and shortening afterwards drew
-    /// the same name twice, split its true share in half, and let the `+N`
-    /// clause count a model that does not exist.
+    /// the same name twice and split its true share in half — and back when the
+    /// header collapsed its tail to `"+N"`, that count included a model which
+    /// does not exist.
     public var todayByModelLabel: [String: UsageTotals] {
         var merged: [String: UsageTotals] = [:]
         for (id, totals) in todayByModel {
@@ -2004,10 +2022,11 @@ public struct Fleet: Equatable, Sendable {
         }
 
         /// `"opus-5 62%"`, `"opus-5 62%+"` when the cost behind it is a floor,
+        /// `"haiku-4-5 <1%"` for a slice too small to round to a percent,
         /// `"sonnet-4-5 ?"` when nothing under it could be priced at all.
         public var label: String {
             guard let share else { return "\(model) \(QuotaFormat.unknownShare)" }
-            return "\(model) \(QuotaFormat.percent(share))\(partial ? "+" : "")"
+            return "\(model) \(QuotaFormat.share(share))\(partial ? "+" : "")"
         }
     }
 
@@ -2025,11 +2044,11 @@ public struct Fleet: Equatable, Sendable {
     /// `"?"`. It used to be filtered out entirely, so a fleet running most of
     /// its traffic on a model this build has no rate for read as
     /// `opus-5 100%` — and, because the dropped model never reached
-    /// `share.count`, the `+N` clause that exists to say "there are more
-    /// models" did not fire either. A model with traffic is never absent from
-    /// this line; what is unknown about it is its cost, and `"?"` says exactly
-    /// that. ``todayUnpricedRequests`` still says how much of the total is
-    /// missing.
+    /// `share.count`, the `"+N"` clause the header then used to say "there are
+    /// more models" did not fire either. A model with traffic is never absent
+    /// from this line; what is unknown about it is its cost, and `"?"` says
+    /// exactly that. ``todayUnpricedRequests`` still says how much of the total
+    /// is missing.
     ///
     /// A label can also be PARTLY priceable, which is the case a two-state
     /// answer hid. ``todayByModelLabel`` canonicalizes ids before grouping, so
@@ -2105,10 +2124,23 @@ public struct Fleet: Equatable, Sendable {
     /// no line at all. A line of zeros would answer a question this build
     /// cannot answer.
     ///
-    /// Two models are named and the rest collapse to `"+N"`: the panel is
-    /// 380pt wide, and the third model's share is not what anyone opens it for.
-    /// An unpriced model is named with `"?"` where its percentage would go and
-    /// counts toward that `+N` like any other — see ``todayModelShare``.
+    /// EVERY model is named, biggest share first. Two were named and the rest
+    /// collapsed to `"+N"`, on the reasoning that a 380pt panel has no room for
+    /// the third.
+    ///
+    /// What that bought was not the panel's height — the line already wraps,
+    /// and `PanelHeight.headerOverflow` charges the wrap to the account list
+    /// (floor 120pt) rather than to the bottom of the panel, so the panel is
+    /// 520pt tall either way. It bought a few rows of account list. What it
+    /// cost was the answer: `+2` names no model, sizes none, and cannot be
+    /// clicked to expand, so a reader who wants the mix has to leave the panel
+    /// to get it. A fleet running four models is the ordinary case here, and
+    /// two of the four were being withheld to save two rows.
+    ///
+    /// An unpriced model is named with `"?"` where its percentage would go —
+    /// see ``todayModelShare`` — and a slice too small to round to one percent
+    /// prints `"<1%"` rather than `"0%"`, which is a claim of no traffic; see
+    /// ``QuotaFormat/share(_:)``, which owns that.
     /// `" · N unpriced today"` is appended whenever requests are missing from
     /// the cost, so a partial total says it is partial rather than passing
     /// itself off as the whole. It names its span because the line can now
@@ -2128,11 +2160,9 @@ public struct Fleet: Equatable, Sendable {
         if let rate = burnRateSegment {
             parts.append(rate)
         }
-        let share = todayModelShare
-        for entry in share.prefix(2) {
+        for entry in todayModelShare {
             parts.append(entry.label)
         }
-        if share.count > 2 { parts.append("+\(share.count - 2)") }
         parts.append("cache \(QuotaFormat.percent(todayCacheHitRatio))")
         if let unpriced = todayUnpricedRequests, unpriced > 0 {
             parts.append("\(unpriced) unpriced today")

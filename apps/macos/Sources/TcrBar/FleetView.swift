@@ -742,6 +742,7 @@ struct FleetView: View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             Hairline()
             HStack {
+                appBuildTag
                 Spacer()
                 Button("Take over port…") { confirmTakeover() }
                     .buttonStyle(.bordered)
@@ -758,6 +759,38 @@ struct FleetView: View {
             }
         }
         .padding(.top, Tok.tightSpacing)
+    }
+
+    /// Which TcrBar this is, in the last line of the panel.
+    ///
+    /// The panel names the running proxy's build (`server <sha>`) because that
+    /// process routinely lags its source. TcrBar has the same gap and, until
+    /// now, no answer for it: the bundle cannot be replaced while it runs, so
+    /// an update that looks installed can leave the old app on screen — and the
+    /// only way to find out was to quit and read About. ``AppBuild`` reads the
+    /// keys `scripts/build-tcrbar.sh` has always written.
+    ///
+    /// It rides the danger row rather than adding a line of its own because
+    /// that row is one right-aligned button with 250pt of empty space beside
+    /// it, and the panel's height is already the scarce thing here — this is
+    /// the one place a fact fits at no cost. It is not part of that group and
+    /// must not read as part of it, so it carries `.tertiary` and the detail
+    /// font, matching `server <sha>` above; every control in the danger group
+    /// is `Tok.spent`. Drawn last so it sits at the very bottom, which is where
+    /// a version tag is looked for.
+    ///
+    /// Absent rather than approximate: `swift run TcrBar` has no Info.plist, so
+    /// there is no version, so nothing is drawn.
+    @ViewBuilder
+    private var appBuildTag: some View {
+        if let label = AppBuild.label {
+            Text(label)
+                .font(Tok.detailDigitFont)
+                .foregroundStyle(.tertiary)
+                .lineLimit(1)
+                .textSelection(.enabled)
+                .help(AppBuild.buildDetail(buildNumber: AppBuild.buildNumber) ?? label)
+        }
     }
 
     /// The alert names the real cost in plain language, defaults to Cancel, and

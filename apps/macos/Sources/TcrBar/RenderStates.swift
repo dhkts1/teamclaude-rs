@@ -385,6 +385,25 @@ enum RenderStates {
     /// Measured and priced, but the server cannot name when this account's
     /// 5-hour window started, so `window` is null and the card falls back to
     /// the DAY's figures — which are still a measurement.
+    ///
+    /// Its day is split across FOUR priced models, which is what carries the
+    /// header line's own case. It was one model until the line stopped
+    /// collapsing its tail to `"+N"`; with two labels in the whole fleet, the
+    /// scene built to review that line could not show what it now does. Four
+    /// here plus the unpriced `sonnet-4-5` the other two rows carry gives the
+    /// header five entries — one more than the live fleet this was measured
+    /// against ran on 2026-08-30 — so the scene reviews the wrap at a width
+    /// past the ordinary case rather than short of it.
+    ///
+    /// `claude-haiku-4-5` is $0.0102 of $22.25 on purpose: 0.05% of the fleet's
+    /// day, which is the slice that rounds to zero. It draws `haiku-4-5 <1%`,
+    /// and a scene showing `haiku-4-5 0%` is the regression — a model that
+    /// served 2 requests reported as having spent nothing. See
+    /// ``QuotaFormat/share(_:)``.
+    ///
+    /// The buckets still sum to `today` on every field, the way the rest of
+    /// these fixtures do: 60+25+15+2 requests, and $6.90 + $2.00 + $0.50 +
+    /// $0.0102 = the $9.4102 above.
     private static let noWindowUsage = """
         {"today":{"requests":102,"inputTokens":174512,"cacheCreationTokens":1200000,
           "cacheCreation1hTokens":400000,"cacheReadTokens":7407414,"outputTokens":31860,
@@ -394,9 +413,21 @@ enum RenderStates {
           "cacheCreation1hTokens":47000,"cacheReadTokens":705000,"outputTokens":3756,
           "costUsd":1.1021,"unpricedRequests":0},
          "todayByModel":{
-           "claude-opus-5":{"requests":102,"inputTokens":174512,
-            "cacheCreationTokens":1200000,"cacheCreation1hTokens":400000,
-            "cacheReadTokens":7407414,"outputTokens":31860,"costUsd":9.4102,
+           "claude-opus-5":{"requests":60,"inputTokens":100000,
+            "cacheCreationTokens":700000,"cacheCreation1hTokens":230000,
+            "cacheReadTokens":4400000,"outputTokens":18000,"costUsd":6.9,
+            "unpricedRequests":0},
+           "claude-fable-5":{"requests":25,"inputTokens":45000,
+            "cacheCreationTokens":300000,"cacheCreation1hTokens":100000,
+            "cacheReadTokens":1900000,"outputTokens":8000,"costUsd":2.0,
+            "unpricedRequests":0},
+           "claude-sonnet-5":{"requests":15,"inputTokens":27000,
+            "cacheCreationTokens":190000,"cacheCreation1hTokens":65000,
+            "cacheReadTokens":1050000,"outputTokens":5300,"costUsd":0.5,
+            "unpricedRequests":0},
+           "claude-haiku-4-5-20251001":{"requests":2,"inputTokens":2512,
+            "cacheCreationTokens":10000,"cacheCreation1hTokens":5000,
+            "cacheReadTokens":57414,"outputTokens":560,"costUsd":0.0102,
             "unpricedRequests":0}}}
         """
 
@@ -556,14 +587,19 @@ enum RenderStates {
     ///  - `unmeasured@` — no `usage` at all: an empty slot, not a zero.
     ///
     /// The header line is the fleet's sum over the three measured rows, so it
-    /// also proves the unmeasured one contributes nothing rather than zero. Its
-    /// model share names `opus-5` with a percentage and `sonnet-4-5` with `?`:
-    /// the unpriced model has real traffic here and must not vanish from the
-    /// line, and a percentage is exactly what nobody can compute for it.
+    /// also proves the unmeasured one contributes nothing rather than zero. It
+    /// names every model: four priced ones, then `sonnet-4-5 ?` — the unpriced
+    /// model has real traffic here and must not vanish from the line, and a
+    /// percentage is exactly what nobody can compute for it.
     ///
-    /// The fully-priced card (`$5.61 · 12k out`, no marker) is scene 01's; a
-    /// second priced model in this fleet would push the `?` past the two the
-    /// header names, which is the one thing this scene exists to show.
+    /// Those five entries are also this scene's LAYOUT case, and the reason it
+    /// is worth looking at rather than only asserting on. The line wraps, and a
+    /// wrap is charged to the account list (`PanelHeight.headerOverflow`), so
+    /// what a reader must check here is that the list still has rows and the
+    /// footer has not moved. It read `opus-5 100% · sonnet-4-5 ?` while only
+    /// the top two models were named and the rest became `"+2"`.
+    ///
+    /// The fully-priced card (`$5.61 · 12k out`, no marker) is scene 01's.
     /// The same four rows also carry all four branches of the FABLE weekly
     /// slot on their 7d line, because that slot has the same shape of rule and
     /// the same way of being got wrong:
