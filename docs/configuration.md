@@ -150,7 +150,7 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
 | `orgName` | string | absent | no | organization display name; also what `--org` matches against |
 | `accessToken` | string | n/a | **yes** | the OAuth access token |
-| `refreshToken` | string | absent | no | used to mint a new access token before expiry |
+| `refreshToken` | string | absent | no | used to mint a new access token before expiry — absent means the account cannot refresh itself, see below |
 | `expiresAt` | i64 | absent | no | access-token expiry as **epoch milliseconds** |
 | `priority` | i64 | absent → `0` | no | rotation order, **lower value = preferred** |
 | `switchThreshold` | float | absent → the global value | no | per-account override of the top-level threshold |
@@ -162,6 +162,16 @@ keep-warm; any other value is treated as a static key.
 Per-account keys the proxy does not model (`models`, `upstream`, `sx`, anything inherited
 from the older Node proxy) parse fine and survive a load→save round trip untouched, but
 nothing reads them.
+
+**An account with no `refreshToken` is not broken, but it is on a clock.** It serves
+requests normally until `accessToken` expires, then goes dead — there is nothing for the
+refresh loop (`src/manager/refresh.rs`) to mint a new access token from, so it skips the
+account cleanly rather than erroring, and it stays skipped. The only account shape that
+produces this today is one added via `tcr login --token` (`docs/cli.md` §"`--token`: adding
+a `claude setup-token` credential"): that credential's `user:inference`-only scope means the
+token endpoint's refresh token is never surfaced to `tcr` at all, so there is genuinely
+nothing to store. `tcr login --token` prints this hazard on every successful add, and stamps
+`expiresAt` with its own best estimate of when that clock runs out.
 
 ## `resetUrgencyTierHours`: spend the quota that is about to expire
 

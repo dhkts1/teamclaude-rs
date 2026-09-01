@@ -330,6 +330,24 @@ struct LoginArgs {
     /// the same flag `tcr enable`/`tcr disable`/`tcr remove`/`tcr priority` take.
     #[arg(long)]
     org: Option<String>,
+    /// Add an account from a `claude setup-token` credential instead of the
+    /// browser flow — no value here. The token is read from stdin (prompted
+    /// when stdin is a TTY), never from argv: an argv value is visible in
+    /// `ps` and lands in shell history, both worse leaks than a stdin prompt.
+    /// A setup-token credential carries only the `user:inference` scope, so
+    /// there is no refresh token (the account serves until the token expires,
+    /// about a year, then goes dead — see the warning `tcr login --token`
+    /// prints) and usually no email (name it with `--name`, or answer the
+    /// prompt). Refuses to combine with `--account`/`--org`: an
+    /// inference-only token carries no identity for either flag to confirm,
+    /// and an assertion that cannot be evaluated must fail closed.
+    #[arg(long)]
+    token: bool,
+    /// Name the account added by `--token`, since its profile fetch usually
+    /// comes back empty (no email to name it from). Ignored by the browser
+    /// flow, which always has an email or its own prompt.
+    #[arg(long)]
+    name: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -945,10 +963,25 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 }
 
 /// `tcr login` — browser OAuth PKCE flow that authenticates a Claude account
-/// and appends (or updates) it in the drop-in config. The heavy lifting lives
-/// in [`oauth::login`]; this just resolves the config path and reports.
+/// and appends (or updates) it in the drop-in config, OR (`--token`) a
+/// `claude setup-token` credential read from stdin. The heavy lifting lives
+/// in [`oauth::login`] / [`oauth::login_with_token`]; this just resolves the
+/// config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    if args.token {
+        let name = oauth::login_with_token(
+            &config_path,
+            args.force,
+            args.name.as_deref(),
+            args.account.as_deref(),
+            args.org.as_deref(),
+        )
+        .await
+        .context("setup-token login failed")?;
+        println!("Logged in as '{name}'.");
+        return Ok(());
+    }
     let name = oauth::login(
         &config_path,
         args.force,

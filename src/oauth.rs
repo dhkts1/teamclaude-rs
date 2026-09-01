@@ -29,7 +29,15 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub struct Tokens {
     pub access_token: String,
-    pub refresh_token: String,
+    /// `None` only for a `claude setup-token` credential ([`login_with_token`]):
+    /// that mint carries only the `user:inference` scope, and the CLI that
+    /// produces it never surfaces a refresh token to the caller at all — so
+    /// there is nothing to store. Every OTHER producer of a `Tokens` MUST
+    /// yield `Some(...)`: [`tokens_from_exchange_body`] `bail!`s rather than
+    /// return `None`, and [`refresh_access_token_at`] falls back to the
+    /// refresh token it was just called with when the endpoint omits a
+    /// rotated one. See that fallback's doc comment before touching either.
+    pub refresh_token: Option<String>,
     /// Epoch **milliseconds** at which `access_token` expires.
     pub expires_at_ms: i64,
 }
@@ -100,6 +108,13 @@ pub fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
 
 /// Refresh an access token against [`TOKEN_ENDPOINT`], retrying `5xx`/network
 /// failures with exponential backoff. Auth rejections are returned immediately.
+///
+/// Always returns `Some(...)` in [`Tokens::refresh_token`] — see the fallback
+/// inside [`refresh_access_token_at`] and that field's doc comment. This is a
+/// load-bearing invariant: [`crate::manager::Manager::apply_refresh`] and
+/// [`crate::manager::Manager::persist_tokens`] write this value straight onto
+/// an existing account's row, so a stray `None` here would silently make a
+/// healthy account unrefreshable on its very next rotation.
 pub async fn refresh_access_token(
     client: &reqwest::Client,
     refresh_token: &str,
@@ -172,9 +187,10 @@ pub async fn refresh_access_token_at(
 
         return Ok(Tokens {
             access_token: data.access_token,
-            refresh_token: data
-                .refresh_token
-                .unwrap_or_else(|| refresh_token.to_string()),
+            refresh_token: Some(
+                data.refresh_token
+                    .unwrap_or_else(|| refresh_token.to_string()),
+            ),
             expires_at_ms,
         });
     }
@@ -258,6 +274,7 @@ impl TokenRefresher for NoRefresh {
 // onboard without hand-editing JSON.
 // ===========================================================================
 
+use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::path::Path;
 
@@ -583,7 +600,7 @@ fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
 
     Ok(Tokens {
         access_token: data.access_token,
-        refresh_token,
+        refresh_token: Some(refresh_token),
         expires_at_ms,
     })
 }
@@ -710,7 +727,7 @@ pub fn upsert_account(
             let account = &mut config.accounts[index];
             account.account_type = "oauth".to_string();
             account.access_token = tokens.access_token.clone();
-            account.refresh_token = Some(tokens.refresh_token.clone());
+            account.refresh_token = tokens.refresh_token.clone();
             account.expires_at = Some(tokens.expires_at_ms);
             // Backfill any identity field the stored entry was missing (e.g. a
             // legacy pre-org entry newly profiled), without overwriting known
@@ -741,7 +758,7 @@ pub fn upsert_account(
                 org_uuid,
                 org_name,
                 access_token: tokens.access_token.clone(),
-                refresh_token: Some(tokens.refresh_token.clone()),
+                refresh_token: tokens.refresh_token.clone(),
                 expires_at: Some(tokens.expires_at_ms),
                 priority: Some(next_priority),
                 switch_threshold: None,
@@ -1106,6 +1123,127 @@ pub async fn login(
     .await
 }
 
+/// Our ASSUMPTION about a `claude setup-token` credential's lifetime — one
+/// year, matching the `expires_in: 31536000` the Claude CLI requests when it
+/// mints one. Not something [`login_with_token`] can read out of the token
+/// itself (it never sees the token-endpoint response, only the finished
+/// access token pasted or piped in), so this is a best estimate, stamped so
+/// `tcr status` shows something truthful rather than "no expiry".
+const SETUP_TOKEN_ASSUMED_LIFETIME_MS: i64 = 365 * 24 * 60 * 60 * 1000;
+
+/// Read a `claude setup-token` access token from stdin — never from argv (see
+/// `--token`'s doc comment in `main.rs`: an argv value is visible in `ps` and
+/// lands in shell history). Prompts on stderr first when stdin is a
+/// terminal; reads a bare line straight through when it is piped. Never logs
+/// or prints the token back.
+fn read_setup_token() -> anyhow::Result<String> {
+    if std::io::stdin().is_terminal() {
+        eprint!("Paste the token from `claude setup-token`: ");
+        let _ = std::io::stderr().flush();
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("read setup-token from stdin")?;
+    let token = line.trim().to_string();
+    if token.is_empty() {
+        bail!("no token read from stdin — pipe or paste the output of `claude setup-token`");
+    }
+    Ok(token)
+}
+
+/// Add an account from a `claude setup-token` credential instead of the
+/// browser flow. Reuses every downstream layer [`login`] does — the same
+/// [`login_route`] guard against a live server, the same [`fetch_profile`] /
+/// [`finish_login`] pipeline — and replaces only the browser half: instead of
+/// a PKCE round trip, the access token is read from stdin
+/// ([`read_setup_token`]) and wrapped in a [`Tokens`] with `refresh_token:
+/// None` — a setup-token mint carries only the `user:inference` scope, and
+/// the Claude CLI that produces it never surfaces its refresh token to the
+/// caller, so there is genuinely nothing to store.
+///
+/// `--account`/`--org` are refused up front (before the port probe or the
+/// stdin read): an inference-only token carries no identity for
+/// [`assert_requested_identity`] to confirm, and an assertion that cannot be
+/// evaluated must fail closed rather than pass — so this calls [`finish_login`]
+/// directly, never `finish_login_checked`.
+///
+/// Because the scope is inference-only, [`fetch_profile`] will very likely
+/// come back all-`None` (no email, no org) — expected, not an error. The
+/// account name falls back to `--name`, then a prompt, exactly like the
+/// browser flow's own fallback ([`prompt_account_name`]).
+///
+/// Always prints [`crate::proxy::NO_REFRESH_TOKEN_WARNING`] on success: this
+/// account serves until its (assumed) one-year expiry and then goes dead,
+/// with nothing to renew it, and — unlike the live-add wire route — this
+/// offline path has no other caller that would say so.
+/// Name a setup-token account: the profile's email when the (usually failed)
+/// fetch happened to carry one, else `name` (`--name`), else a prompt —
+/// split out of [`login_with_token`] so the fallback chain is directly
+/// testable without a real stdin prompt.
+fn resolve_setup_token_name(profile: &Profile, name: Option<&str>, fallback: &str) -> String {
+    match &profile.email {
+        Some(email) => email.clone(),
+        None => match name {
+            Some(explicit) => explicit.to_string(),
+            None => prompt_account_name(fallback),
+        },
+    }
+}
+
+pub async fn login_with_token(
+    config_path: &Path,
+    force: bool,
+    name: Option<&str>,
+    account: Option<&str>,
+    org: Option<&str>,
+) -> anyhow::Result<String> {
+    if account.is_some() || org.is_some() {
+        bail!(
+            "--token cannot be combined with --account or --org: a `claude setup-token` \
+             credential carries only the user:inference scope, so it has no email and no \
+             account id for either flag to confirm against — an identity assertion that \
+             cannot be evaluated must fail closed rather than pass. Log in with --token alone \
+             (use --name to choose the account name), or drop --token and use the browser flow \
+             with --account instead. Nothing was written."
+        );
+    }
+
+    let port = login_target_port(config_path);
+    let incumbent = singleton::live_proxy_server(port);
+    let route = login_route(config_path, incumbent, port, force).await?;
+    if let LoginRoute::Refuse(msg) = route {
+        bail!("{}", msg);
+    }
+
+    let access_token = read_setup_token()?;
+    let tokens = Tokens {
+        access_token,
+        refresh_token: None,
+        expires_at_ms: crate::now_ms() + SETUP_TOKEN_ASSUMED_LIFETIME_MS,
+    };
+
+    let mut config = load_or_default(config_path)?;
+
+    let profile = fetch_profile(&tokens.access_token).await;
+    let fallback = format!("account-{}", config.accounts.len() + 1);
+    let resolved_name = resolve_setup_token_name(&profile, name, &fallback);
+
+    let result = finish_login(
+        config_path,
+        route,
+        &mut config,
+        &resolved_name,
+        &tokens,
+        profile,
+    )
+    .await;
+    if result.is_ok() {
+        eprintln!("[tcr] warning: {}", crate::proxy::NO_REFRESH_TOKEN_WARNING);
+    }
+    result
+}
+
 /// Whether `s` is plausibly an email address — no whitespace, and exactly one
 /// `@` with at least one character on each side. Deliberately not a full RFC
 /// 5322 validator: this only ever gates whether a value is safe to hand to
@@ -1296,7 +1434,7 @@ fn persist_via_file(
         org_uuid: profile.org_uuid,
         org_name: profile.org_name,
         access_token: tokens.access_token.clone(),
-        refresh_token: Some(tokens.refresh_token.clone()),
+        refresh_token: tokens.refresh_token.clone(),
         expires_at: Some(tokens.expires_at_ms),
         priority: None,
         switch_threshold: None,
@@ -1442,7 +1580,7 @@ async fn finish_login(
                 org_uuid: profile.org_uuid.clone(),
                 org_name: profile.org_name.clone(),
                 access_token: tokens.access_token.clone(),
-                refresh_token: Some(tokens.refresh_token.clone()),
+                refresh_token: tokens.refresh_token.clone(),
                 expires_at: Some(tokens.expires_at_ms),
                 priority: None,
                 switch_threshold: None,
@@ -1712,8 +1850,53 @@ mod tests {
         )
         .expect("a present refresh_token must return Ok");
         assert_eq!(tokens.access_token, "at");
-        assert_eq!(tokens.refresh_token, "rt");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
         assert_eq!(tokens.expires_at_ms, 1_700_000_000_000);
+    }
+
+    /// THE TRAP (bridge §"THE TRAP"): a refresh whose response omits a
+    /// rotated `refresh_token` must fall back to the token it was called
+    /// with — never `None`. `apply_refresh` (`manager/refresh.rs`) and
+    /// `persist_tokens` (`manager/mod.rs`) both write `tokens.refresh_token`
+    /// straight onto an existing account's row with no other check, so a
+    /// bare `None` here would silently make a healthy account unrefreshable
+    /// on its very next rotation, with no error and no log line.
+    ///
+    /// Watched failing: with the `unwrap_or_else` fallback in
+    /// `refresh_access_token_at` replaced by a bare `data.refresh_token`
+    /// (still type-correct — `Option<String>` on both sides, so this is a
+    /// silent behavioural regression, not a compile error), this test failed
+    /// with `left: None, right: Some("rt-original")`. Restored, it passes.
+    #[tokio::test]
+    async fn refresh_access_token_at_preserves_stored_refresh_token_when_response_omits_one() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = format!("http://127.0.0.1:{port}/");
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(|| async {
+                    // A real rotation response that omits `refresh_token` —
+                    // exactly the shape Anthropic's endpoint sends when it
+                    // does not rotate the refresh token on this call.
+                    axum::Json(serde_json::json!({
+                        "access_token": "at-fresh",
+                        "expires_at": 1_893_456_000_000i64
+                    }))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let tokens = refresh_access_token_at(&client, "rt-original", &endpoint)
+            .await
+            .expect("a refresh with no rotated refresh_token must still succeed");
+        assert_eq!(
+            tokens.refresh_token.as_deref(),
+            Some("rt-original"),
+            "must fall back to the refresh token it was called with, never None"
+        );
     }
 
     #[test]
@@ -1762,7 +1945,7 @@ mod tests {
     fn tokens(access: &str, refresh: &str, expires: i64) -> Tokens {
         Tokens {
             access_token: access.to_string(),
-            refresh_token: refresh.to_string(),
+            refresh_token: Some(refresh.to_string()),
             expires_at_ms: expires,
         }
     }
@@ -3642,5 +3825,159 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- setup-token (`tcr login --token`) ----------------------------------
+
+    /// An all-`None` [`Profile`] — the expected shape for a `claude
+    /// setup-token` credential, whose scope is inference-only and so its
+    /// `/api/oauth/profile` fetch will very likely fail.
+    fn all_none_profile() -> Profile {
+        Profile {
+            email: None,
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+        }
+    }
+
+    /// A setup-token-shaped write: [`finish_login`] given a [`Tokens`] with
+    /// `refresh_token: None` (what [`login_with_token`] always constructs)
+    /// must write `refreshToken` ABSENT from the JSON — not `null` — and
+    /// `expiresAt` set to the assumed one-year expiry.
+    ///
+    /// Watched failing: with `persist_via_file`'s account literal changed to
+    /// `refresh_token: Some("bogus-rt".to_string())` (a plausible slip if
+    /// someone "fixed" the E0308 that removing `Some(...)` around the new
+    /// `Option<String>` field would otherwise cause), this test failed with
+    /// `refreshToken must be ABSENT ... {"refreshToken":"bogus-rt",...}`.
+    /// Restored, it passes.
+    #[tokio::test]
+    async fn setup_token_account_writes_with_refresh_token_absent_and_expires_at_set() {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-setup-token-write-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, r#"{ "accounts": [] }"#).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let setup_tokens = Tokens {
+            access_token: "at-setup".to_string(),
+            refresh_token: None,
+            expires_at_ms: 1_893_456_000_000,
+        };
+
+        let name = finish_login(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "gina",
+            &setup_tokens,
+            all_none_profile(),
+        )
+        .await
+        .expect("a setup-token credential with no refresh token must still write");
+        assert_eq!(name, "gina");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let account = &doc["accounts"][0];
+        assert_eq!(account["name"], serde_json::json!("gina"));
+        assert!(
+            account.get("refreshToken").is_none(),
+            "refreshToken must be ABSENT (skip_serializing_if), not written as null or a \
+             leftover value: {account}"
+        );
+        assert_eq!(
+            account["expiresAt"],
+            serde_json::json!(1_893_456_000_000i64)
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `--token` combined with `--account` must refuse and write nothing —
+    /// checked byte-for-byte, not just "still has 2 accounts": an inference-
+    /// only token carries no identity for `--account` to confirm against.
+    ///
+    /// Watched failing: with the `account.is_some() || org.is_some()` guard
+    /// at the top of `login_with_token` deleted, this test hung waiting on a
+    /// real stdin read (the function fell through past the refusal straight
+    /// into `read_setup_token`) instead of returning the expected `Err` —
+    /// the observable failure for a test with no stdin to feed it. Restored,
+    /// it returns immediately with the refusal and the file is untouched.
+    #[tokio::test]
+    async fn login_with_token_refuses_with_account_and_writes_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-setup-token-refuse-account-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, two_account_seed()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = login_with_token(&path, false, None, Some("alice@example.com"), None)
+            .await
+            .expect_err("--token combined with --account must refuse");
+        assert!(err.to_string().contains("--account"), "{}", err.to_string());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "the file must be byte-identical — --token+--account must write nothing"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `--token` combined with `--org` (no `--account`) must refuse too — the
+    /// same "no identity to confirm against" reasoning applies to either flag
+    /// alone.
+    #[tokio::test]
+    async fn login_with_token_refuses_with_org_and_writes_nothing() {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-setup-token-refuse-org-{}-{}.json",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::write(&path, two_account_seed()).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = login_with_token(&path, false, None, None, Some("Corp"))
+            .await
+            .expect_err("--token combined with --org must refuse");
+        assert!(err.to_string().contains("--org"), "{}", err.to_string());
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "the file must be byte-identical — --token+--org must write nothing"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An all-`None` profile plus `--name` must produce that exact name,
+    /// without ever reaching the stdin prompt — the profile-email branch is
+    /// skipped (no email), the `--name` branch is taken instead of falling
+    /// through to `prompt_account_name`.
+    #[test]
+    fn resolve_setup_token_name_prefers_explicit_name_over_prompt() {
+        let name = resolve_setup_token_name(&all_none_profile(), Some("bob-work"), "account-1");
+        assert_eq!(name, "bob-work");
+    }
+
+    /// The profile's email still wins over `--name` when the fetch DID come
+    /// back with one — inference-only scope makes this the unlikely case,
+    /// not the impossible one.
+    #[test]
+    fn resolve_setup_token_name_prefers_profile_email_over_name() {
+        let name = resolve_setup_token_name(
+            &profile_named("carol@example.com"),
+            Some("ignored"),
+            "account-1",
+        );
+        assert_eq!(name, "carol@example.com");
     }
 }
