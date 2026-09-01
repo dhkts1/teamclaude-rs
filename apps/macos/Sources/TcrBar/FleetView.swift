@@ -1146,6 +1146,22 @@ struct AccountRow: View {
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
         } else if account.health == .needsRelogin {
             EmptyView()
+        } else if account.servesGroupTrafficOnly {
+            // Predicate lives on the model (`Account.servesGroupTrafficOnly`) so
+            // it is testable without SwiftUI and matches the server's ANY rule.
+            //
+            // This branch exists because its absence was itself the bug: a
+            // reserved account rendered `GIL` + `ROTATING` side by side, which
+            // reads as "tagged AND in the pool" — the exact state an operator
+            // reserves a group to prevent, shown as if nothing had happened.
+            StatusPill("group only", tint: Tok.inkFaint)
+                .help(
+                    "Reserved — serves only requests that ask for one of its "
+                        + "groups by name. Pool traffic never lands here, and this "
+                        + "group's own traffic never leaves it: a `--group` request "
+                        + "with no member free waits, or fails, rather than using "
+                        + "another account."
+                )
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
                 .help(

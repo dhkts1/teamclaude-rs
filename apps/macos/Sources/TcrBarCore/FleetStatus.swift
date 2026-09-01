@@ -1380,6 +1380,25 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
             )
         }
     }
+
+    /// Whether this account is held out of GENERAL rotation because at least one
+    /// of its groups is reserved — the panel's "group only" state, and the
+    /// reason it must not also claim to be "rotating".
+    ///
+    /// `contains`, deliberately not `allSatisfy`: the server blocks unrequested
+    /// traffic when ANY group on the account is reserved
+    /// (`Manager::reserved_blocks` — `groups.iter().any(...)`), so an account in
+    /// reserved `codereview` plus plain `dev` serves no pool traffic either.
+    /// Mirroring that with `allSatisfy` would label it "rotating" while the
+    /// server sent it nothing, which is the misreading this whole state exists
+    /// to end.
+    ///
+    /// Lives here rather than inline in the view so the rule is testable
+    /// without standing up SwiftUI, and so there is one place to correct if the
+    /// server's predicate ever changes.
+    public var servesGroupTrafficOnly: Bool {
+        groupTags.contains(where: \.isReserved)
+    }
 }
 
 /// One entry in ``Account/groupMenuActions``, the row-level context menu

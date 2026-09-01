@@ -1439,6 +1439,59 @@ impl Manager {
         }
     }
 
+    /// [`Self::retry_after_hint`], scoped to the members of one group.
+    ///
+    /// Exists for STRICT (reserved) groups. A strict `--group g` request can only
+    /// ever be served by a member of `g`, so sizing its wait with the fleet-wide
+    /// hint above times it against accounts the request will never be allowed to
+    /// use: any unrelated account un-gating sooner wins that `min`, the caller's
+    /// one-shot soft-wait is spent waking early, and the request answers a 429
+    /// while its own member is still seconds from free. The fleet-wide hint stays
+    /// exactly as it is — ungrouped traffic genuinely can use any account, and
+    /// that promise must keep holding for it.
+    ///
+    /// `Some(group)` (not `None`) reaches [`Self::account_gate`] on purpose: an
+    /// explicit ask is never reserved-blocked by its own group
+    /// ([`Self::reserved_blocks`]), so this reports the member's REAL gate — its
+    /// rate-limit hold or quota window — rather than the reservation that is the
+    /// whole reason we are here.
+    ///
+    /// Returns the same `60` default when no member advertises a recovery instant,
+    /// so a strict group whose members are all `Error`/disabled degrades to the
+    /// same honest "try again in a minute" as an exhausted fleet.
+    pub fn retry_after_hint_for_group(
+        &self,
+        now: OffsetDateTime,
+        is_fable: bool,
+        group: &str,
+    ) -> i64 {
+        let now_ms = odt_to_ms(now);
+        let reserved_groups = self.reserved_groups();
+        let accounts = self.accounts.read().expect("accounts lock poisoned");
+        let soonest = accounts
+            .iter()
+            .filter(|account| account.groups.iter().any(|g| g == group))
+            .filter_map(|account| {
+                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+                let (_, free_at) = Self::account_gate(
+                    account,
+                    threshold,
+                    now,
+                    now_ms,
+                    is_fable,
+                    Some(group),
+                    &reserved_groups,
+                );
+                free_at.map(odt_to_ms)
+            })
+            .filter(|&at| at > now_ms)
+            .min();
+        match soonest {
+            Some(at) => ((at - now_ms + 999) / 1000).max(1),
+            None => 60,
+        }
+    }
+
     /// Mark account `idx` as serving one more in-flight request: bump its
     /// `in_flight` count and stamp `last_served_ms`, returning an [`InFlightGuard`]
     /// that decrements the count on Drop. The proxy takes this the moment it picks
@@ -1639,6 +1692,22 @@ impl Manager {
             .read()
             .expect("reserved_groups lock poisoned")
             .clone()
+    }
+
+    /// Whether `group` is currently reserved — and therefore STRICT: its own
+    /// traffic never spills to a non-member (see
+    /// [`Self::select_with_group`]'s strict arm).
+    ///
+    /// A membership test rather than [`Self::reserved_groups`] + `contains`,
+    /// because the request path asks this per request and only ever needs the
+    /// one answer; cloning the set to look at a single key is waste on a hot
+    /// path. Reads the same hot-reloaded cache, so `tcr group unreserve` takes
+    /// effect on the next request with no restart.
+    pub fn is_group_reserved(&self, group: &str) -> bool {
+        self.reserved_groups
+            .read()
+            .expect("reserved_groups lock poisoned")
+            .contains(group)
     }
 
     /// A cloned snapshot of the currently control-account-allowed group
@@ -3462,6 +3531,103 @@ mod tests {
             ),
             Some(0),
             "--group codereview still selects its own reserved account"
+        );
+    }
+
+    /// Semantics test #2b: a RESERVED group is strict — when its members are
+    /// all gated, the ask returns `None` instead of spilling into the pool.
+    ///
+    /// This is the second half of what `reserved` means. Reservation already
+    /// keeps unrequested traffic OUT of the group
+    /// ([`reserved_group_blocks_unrequested_traffic_both_directions`]); this
+    /// keeps the group's own traffic IN. Without it, a reserved group's request
+    /// silently lands on an account the operator deliberately walled off from
+    /// it — measured on the live fleet 2026-09-01, 33 times in one day, every
+    /// one `reason="all-members-unavailable"`, after pool traffic had
+    /// rate-limited the group's only member.
+    ///
+    /// The contrast case is deliberately left to
+    /// [`group_preference_prefers_then_falls_back_to_the_pool`]: an
+    /// UNRESERVED group keeps the prefer-and-spill behaviour unchanged, so
+    /// strictness rides entirely on `reserved` and needs no second flag.
+    #[test]
+    fn a_reserved_group_never_falls_back_to_the_pool() {
+        let reserved_acct = account_in_groups("reserved-acct", 5, &["codereview"]);
+        let plain = account("plain", 0); // better priority — would win any pool pick
+        let manager = build_manager(
+            config_with_reserved(vec![reserved_acct, plain], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+
+        // Gate the group's only member out entirely (disabled = hard-ineligible),
+        // exactly as `group_preference_prefers_then_falls_back_to_the_pool` does.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].disabled = true;
+        }
+
+        // POSITIVE CONTROL: the pool itself is still perfectly servable. Without
+        // this, the `None` below would also be satisfied by a fleet where nothing
+        // at all could be picked — proving the assertion about strictness rather
+        // than about an empty pool.
+        assert_eq!(
+            manager.select_with_group(&HashSet::new(), now, None, None, "/v1/messages", None, None),
+            Some(1),
+            "control: the ungrouped pool is servable, so a None below is strictness, not exhaustion"
+        );
+
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            None,
+            "a reserved group must never spill into the pool — refuse and let the \
+             caller's exhaustion ladder soft-wait or answer an honest 429"
+        );
+    }
+
+    /// A strict group's retry hint is sized by when one of ITS members frees,
+    /// not by whichever account in the fleet un-gates first.
+    ///
+    /// The fleet-wide [`Manager::retry_after_hint`] minimises over every
+    /// account, so an unrelated account recovering sooner wins. For a strict
+    /// `--group` request that number is a promise about capacity the request is
+    /// not allowed to use: the caller spends its one-shot soft-wait, wakes to
+    /// find its own member still held, and answers a 429 that was avoidable.
+    /// The member here is held 10x longer than the non-member precisely so the
+    /// two hints cannot coincide by accident.
+    #[test]
+    fn a_strict_groups_retry_hint_is_sized_by_its_own_member() {
+        let member = account_in_groups("member", 0, &["codereview"]);
+        let outsider = account("outsider", 1);
+        let manager = build_manager(
+            config_with_reserved(vec![member, outsider], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+
+        manager.mark_rate_limited(0, 600); // the group's member
+        manager.mark_rate_limited(1, 60); // an unrelated account, free much sooner
+
+        let fleet = manager.retry_after_hint(now, false);
+        let scoped = manager.retry_after_hint_for_group(now, false, "codereview");
+
+        // Control: the fleet-wide hint really is won by the outsider, so the
+        // assertion below is measuring the group scoping and not a tautology.
+        assert!(
+            fleet <= 60,
+            "control: fleet-wide hint should follow the sooner outsider, got {fleet}s"
+        );
+        assert!(
+            scoped > 500,
+            "a strict group's hint must follow its own held member (~600s), got {scoped}s"
         );
     }
 
