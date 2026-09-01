@@ -184,7 +184,11 @@ impl Manager {
         let mut accounts = self.accounts.write().expect("accounts lock poisoned");
         if let Some(account) = accounts.get_mut(idx) {
             account.access_token = tokens.access_token.clone();
-            account.refresh_token = Some(tokens.refresh_token.clone());
+            // THE TRAP: `tokens.refresh_token` must be `Some(...)` on every
+            // reachable refresh success — see [`Tokens::refresh_token`]'s doc
+            // comment. Writing a bare `None` here would silently make a
+            // healthy account unrefreshable with no error and no log line.
+            account.refresh_token = tokens.refresh_token.clone();
             account.expires_at_ms = Some(tokens.expires_at_ms);
             account.refresh_retry_after_ms = cooldown_after;
             if account.status == AccountStatus::Error {

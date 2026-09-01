@@ -1620,8 +1620,11 @@ pub struct AddAccountResponse {
 
 /// Shown when the submitted account carries no refresh token: it will serve
 /// until its access token expires and then go dead, silently, unless the
-/// operator hears about it now.
-const NO_REFRESH_TOKEN_WARNING: &str =
+/// operator hears about it now. `pub(crate)` so [`crate::oauth::login_with_token`]
+/// can print the same hazard on the offline (file) route too — that path
+/// never goes through this module's `add_account_handler`, so nothing else
+/// would say it.
+pub(crate) const NO_REFRESH_TOKEN_WARNING: &str =
     "this account has no refresh token — it will serve until its access token expires, then go dead";
 
 /// Join whichever of the durable-persist warning and the no-refresh-token
@@ -8220,7 +8223,7 @@ mod tests {
                 Box::pin(async {
                     Ok(crate::oauth::Tokens {
                         access_token: "fresh-access".into(),
-                        refresh_token: "fresh-refresh".into(),
+                        refresh_token: Some("fresh-refresh".into()),
                         expires_at_ms: crate::now_ms() + 3_600_000,
                     })
                 })

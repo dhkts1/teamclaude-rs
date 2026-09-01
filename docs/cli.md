@@ -129,6 +129,8 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
 | `--org <name-or-uuid>` | string | none | narrow an ambiguous `--account` match to a single org — same flag `tcr enable`/`tcr disable`/`tcr remove`/`tcr priority` take |
+| `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
+| `--name <name>` | string | none | name the account added by `--token`, when its profile fetch comes back with no email |
 
 **`--account <name> [--org <org>]` targets one existing account and refuses to fix the
 wrong one.** Without it, `login` upserts by whatever identity the browser hands back — a
@@ -206,6 +208,66 @@ hatch for a proxy that answers but misbehaves. Detection is read-only throughout
 never signalled.
 
 The callback server binds a random loopback port, and tokens are never printed or logged.
+
+### `--token`: adding a `claude setup-token` credential
+
+`claude setup-token` mints a long-lived access token for a headless or CI-style login,
+without a browser. `tcr login --token` puts that token into the pool instead of running
+the browser flow — same downstream config write, same live-proxy-vs-file routing above,
+same "tokens are never printed or logged" guarantee, replacing only the browser half.
+
+The token is **read from stdin**, prompted for when stdin is a terminal:
+
+```
+claude setup-token | tcr login --token
+# or, interactively:
+tcr login --token
+Paste the token from `claude setup-token`: <paste>
+```
+
+It is never accepted as a `--token=<value>` argument, on purpose: an argv value is
+visible to every other process on the machine via `ps`, and shells routinely persist
+argv into history files. A prompt or a pipe are the only ways in.
+
+A `claude setup-token` credential is not shaped like a browser login, and two
+consequences follow directly from that:
+
+**There is no refresh token, ever — not "sometimes missing", genuinely never.** The
+mint requests only the `user:inference` scope, not the six scopes a normal `tcr login`
+gets, and even though the token endpoint itself does return a refresh token for this
+scope, the `claude` CLI that talks to it discards it before you ever see the output.
+There is nothing for `tcr` to capture. The account this adds therefore serves until its
+access token expires and then goes dead, with nothing to renew it — `tcr login --token`
+prints that hazard on every successful add, on both the live and the file route (the
+existing live-add warning above only fires through the running proxy's own wire route,
+which this offline path never touches). Its expiry is stamped as **one year from now**:
+that is `tcr`'s ASSUMPTION about what the mint requested (`expires_in: 31536000`, the
+value the Claude CLI asks for), not something read out of the token itself — `tcr
+status` shows that stamped date so an operator has something truthful to watch, rather
+than "no expiry".
+
+**There is usually no email either.** `/api/oauth/profile` needs more than
+`user:inference` to answer, so the profile fetch this add still makes will very likely
+come back empty — that is expected, not an error. Name the account with `--name`, or
+answer the prompt when it is omitted. Decline the prompt too and it is named `unnamed`,
+or the first free `unnamed-2`, `unnamed-3` when that is taken.
+
+That collision scan is load-bearing rather than cosmetic. An account added this way has
+no email and no account uuid, so it is the one kind of row `tcr` can only tell apart by
+its **name** — every other account is resolved by uuid and org. Two of them sharing one
+name would resolve to the same row, and the second `--token` login would overwrite the
+first one's credentials instead of adding an account. The browser flow's `account-N`
+fallback is derived from the account *count*, which hands out a name already in use as
+soon as a row is removed; that is harmless for a credential carrying an identity to be
+resolved by, and is exactly the bug here, which is why this path does not share it.
+
+**`--token` refuses outright when combined with `--account` or `--org`, and writes
+nothing.** Both flags exist to confirm that the identity a fresh login authenticates as
+matches a specific existing row — see `--account`'s own section above. An
+inference-only token carries no email and no account id for that confirmation to run
+against, so the check can never be evaluated, and an assertion that cannot be evaluated
+must fail closed rather than silently pass. Drop `--token` and use the browser flow with
+`--account` instead, or use `--token` alone.
 
 ---
 

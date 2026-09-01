@@ -1600,7 +1600,10 @@ impl Manager {
             if let crate::identity::Resolved::One(position) = placement {
                 if let Some(account) = config.accounts.get_mut(position) {
                     account.access_token = tokens.access_token.clone();
-                    account.refresh_token = Some(tokens.refresh_token.clone());
+                    // THE TRAP: same invariant as `apply_refresh` in
+                    // `manager/refresh.rs` — `tokens.refresh_token` must be
+                    // `Some(...)` on every reachable refresh success.
+                    account.refresh_token = tokens.refresh_token.clone();
                     account.expires_at = Some(tokens.expires_at_ms);
                 }
             }
@@ -2898,7 +2901,7 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 Ok::<Tokens, OAuthError>(Tokens {
                     access_token: "fresh-access".to_string(),
-                    refresh_token: "fresh-refresh".to_string(),
+                    refresh_token: Some("fresh-refresh".to_string()),
                     expires_at_ms: crate::now_ms() + 3_600_000,
                 })
             })
@@ -2934,7 +2937,7 @@ mod tests {
                 } else {
                     Ok(Tokens {
                         access_token: "fresh-access".to_string(),
-                        refresh_token: "fresh-refresh".to_string(),
+                        refresh_token: Some("fresh-refresh".to_string()),
                         expires_at_ms: crate::now_ms() + 3_600_000,
                     })
                 }
@@ -5140,7 +5143,7 @@ mod tests {
                         None,
                         &Tokens {
                             access_token: format!("new-at-{i}"),
-                            refresh_token: format!("new-rt-{i}"),
+                            refresh_token: Some(format!("new-rt-{i}")),
                             expires_at_ms: crate::now_ms() + 3_600_000,
                         },
                     );
