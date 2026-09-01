@@ -249,7 +249,17 @@ than "no expiry".
 **There is usually no email either.** `/api/oauth/profile` needs more than
 `user:inference` to answer, so the profile fetch this add still makes will very likely
 come back empty — that is expected, not an error. Name the account with `--name`, or
-answer the prompt when it is omitted.
+answer the prompt when it is omitted. Decline the prompt too and it is named `unnamed`,
+or the first free `unnamed-2`, `unnamed-3` when that is taken.
+
+That collision scan is load-bearing rather than cosmetic. An account added this way has
+no email and no account uuid, so it is the one kind of row `tcr` can only tell apart by
+its **name** — every other account is resolved by uuid and org. Two of them sharing one
+name would resolve to the same row, and the second `--token` login would overwrite the
+first one's credentials instead of adding an account. The browser flow's `account-N`
+fallback is derived from the account *count*, which hands out a name already in use as
+soon as a row is removed; that is harmless for a credential carrying an identity to be
+resolved by, and is exactly the bug here, which is why this path does not share it.
 
 **`--token` refuses outright when combined with `--account` or `--org`, and writes
 nothing.** Both flags exist to confirm that the identity a fresh login authenticates as

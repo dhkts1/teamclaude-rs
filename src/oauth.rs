@@ -1181,6 +1181,33 @@ fn read_setup_token() -> anyhow::Result<String> {
 /// fetch happened to carry one, else `name` (`--name`), else a prompt —
 /// split out of [`login_with_token`] so the fallback chain is directly
 /// testable without a real stdin prompt.
+/// The name a setup-token account falls back to when the operator declines to
+/// type one: `unnamed`, or the first free `unnamed-N` when that is taken.
+///
+/// Deliberately NOT the browser flow's `account-{len+1}` fallback. That one is
+/// derived from the account COUNT, so removing a row and adding another hands
+/// out a name already in use — harmless for a credential that carries an email
+/// and a uuid to be resolved by, and not harmless here. A setup-token account
+/// has neither (the scope is inference-only), so
+/// [`crate::identity::resolve`] can only match it on its NAME: two accounts
+/// sharing one would resolve onto the same row, and the second login would
+/// overwrite the first one's token instead of adding an account.
+///
+/// Scanning for the first free suffix rather than counting is what makes that
+/// structurally impossible instead of merely unlikely.
+fn unnamed_fallback(accounts: &[Account]) -> String {
+    const BASE: &str = "unnamed";
+    if !accounts.iter().any(|a| a.name == BASE) {
+        return BASE.to_string();
+    }
+    // Start at 2: `unnamed` itself is the first, so the next one a human reads
+    // should be `unnamed-2`, not `unnamed-1`.
+    (2..)
+        .map(|n| format!("{BASE}-{n}"))
+        .find(|candidate| !accounts.iter().any(|a| &a.name == candidate))
+        .expect("an unbounded range always yields a free name")
+}
+
 fn resolve_setup_token_name(profile: &Profile, name: Option<&str>, fallback: &str) -> String {
     match &profile.email {
         Some(email) => email.clone(),
@@ -1226,7 +1253,7 @@ pub async fn login_with_token(
     let mut config = load_or_default(config_path)?;
 
     let profile = fetch_profile(&tokens.access_token).await;
-    let fallback = format!("account-{}", config.accounts.len() + 1);
+    let fallback = unnamed_fallback(&config.accounts);
     let resolved_name = resolve_setup_token_name(&profile, name, &fallback);
 
     let result = finish_login(
@@ -3979,5 +4006,60 @@ mod tests {
             "account-1",
         );
         assert_eq!(name, "carol@example.com");
+    }
+
+    // --- the `unnamed` fallback ---------------------------------------------
+
+    /// An `Account` carrying nothing but a name — the only field
+    /// [`unnamed_fallback`] reads.
+    fn named_account(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-placeholder".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    #[test]
+    fn unnamed_fallback_is_plain_unnamed_when_free() {
+        assert_eq!(unnamed_fallback(&[]), "unnamed");
+        assert_eq!(
+            unnamed_fallback(&[named_account("alice@example.com")]),
+            "unnamed"
+        );
+    }
+
+    /// The collision case, and the reason this function exists at all: an
+    /// inference-only account has no email and no uuid, so `identity::resolve`
+    /// can only match it by NAME. Handing out `unnamed` twice would resolve the
+    /// second login onto the first row and overwrite its token instead of
+    /// adding an account.
+    #[test]
+    fn unnamed_fallback_skips_taken_names() {
+        assert_eq!(unnamed_fallback(&[named_account("unnamed")]), "unnamed-2");
+        assert_eq!(
+            unnamed_fallback(&[named_account("unnamed"), named_account("unnamed-2")]),
+            "unnamed-3"
+        );
+    }
+
+    /// Gaps are filled rather than skipped past — the name is chosen by
+    /// scanning for the first FREE suffix, never by counting rows, so removing
+    /// `unnamed-2` and adding an account reuses that slot instead of colliding
+    /// with `unnamed-3`. A count-derived fallback gets this wrong.
+    #[test]
+    fn unnamed_fallback_fills_a_gap_left_by_a_removed_account() {
+        let accounts = [named_account("unnamed"), named_account("unnamed-3")];
+        assert_eq!(unnamed_fallback(&accounts), "unnamed-2");
     }
 }
