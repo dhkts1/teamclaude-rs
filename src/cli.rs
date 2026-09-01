@@ -585,6 +585,17 @@ pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     match outcome {
         config::GroupReserveWrite::Updated => {
             println!("group '{group}' reserved. {remaining} unreserved enabled account(s) remain.");
+            // Say what reserving actually does, at the one moment an operator is
+            // guaranteed to be reading. The second half is the surprising one: it
+            // can make a `--group` request WAIT or 429 where it used to be served
+            // by someone else, and an operator who learns that from a stalled
+            // session instead of from here will read it as a hang.
+            println!(
+                "  · pool traffic will no longer use its accounts, and '{group}' traffic will no longer leave it"
+            );
+            println!(
+                "  · a --group {group} request with no member free now waits or returns 429 rather than using another account"
+            );
             if remaining < 3 {
                 eprintln!(
                     "warning: only {remaining} unreserved enabled account(s) remain — ordinary (unrequested) traffic may starve."

@@ -78,6 +78,44 @@ final class GroupTagTests: XCTestCase {
         XCTAssertEqual(account.groupTags.first?.isReserved, false)
     }
 
+    // MARK: - Account.servesGroupTrafficOnly (the "group only" row state)
+
+    /// An account whose only group is reserved serves no pool traffic, so the
+    /// row must not also claim to be "rotating" — the `GIL` + `ROTATING` pair
+    /// that read as "tagged AND pooled" and hid a real leak.
+    func testReservedGroupMakesAccountGroupOnly() {
+        let account = tagAccount(
+            "a@example.com", groups: ["codereview"], reservedGroups: ["codereview"])
+        XCTAssertTrue(account.servesGroupTrafficOnly)
+    }
+
+    /// The case an `allSatisfy` implementation gets wrong. The server holds an
+    /// account out of general rotation when ANY group is reserved, so one
+    /// reserved group plus one plain group is still group-only.
+    func testOneReservedGroupAmongPlainOnesIsStillGroupOnly() {
+        let account = tagAccount(
+            "a@example.com",
+            groups: ["dev", "codereview"],
+            reservedGroups: ["codereview"]
+        )
+        XCTAssertTrue(
+            account.servesGroupTrafficOnly,
+            "any reserved group holds the account out of the pool, not only all of them"
+        )
+    }
+
+    /// Tagged but unreserved is the silent no-op: the account still takes pool
+    /// traffic, so it genuinely is rotating and must keep saying so.
+    func testTaggedButUnreservedAccountStillRotates() {
+        let account = tagAccount("a@example.com", groups: ["dev"], reservedGroups: [])
+        XCTAssertFalse(account.servesGroupTrafficOnly)
+    }
+
+    /// An ungrouped account is plain rotation — no groups, nothing reserved.
+    func testUngroupedAccountIsNotGroupOnly() {
+        XCTAssertFalse(tagAccount("a@example.com", groups: nil).servesGroupTrafficOnly)
+    }
+
     // MARK: - GroupTagColor
 
     func testMalformedHexReturnsNilFromParse() {

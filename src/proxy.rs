@@ -2167,6 +2167,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             ) {
                 Some(idx) => idx,
                 None => {
+                    // A RESERVED group is strict: this request may only ever be
+                    // served by one of its members, so every answer below — the
+                    // wait it sizes, the revalidation it might attempt, the 429 it
+                    // finally returns — has to be scoped to that group rather than
+                    // to a fleet this request is not allowed to touch.
+                    //
+                    // Recomputed here rather than hoisted alongside `request_group`
+                    // at the top of the handler: `reserved` hot-reloads, so
+                    // `tcr group unreserve <g>` releases an already-stalled request
+                    // on its next pass through this arm instead of after a restart.
+                    let strict_group = request_group
+                        .as_deref()
+                        .filter(|g| manager.is_group_reserved(g));
                     if every_attempt_transport_failed(transport_failures, upstream_responses) {
                         // Nothing reached an upstream — but WHY decides the status.
                         // If any attempt died in the resolver, the honest answer is
@@ -2202,7 +2215,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // windows / long holds) has soonest_free >> the ceiling →
                     // soft_wait_secs returns None → fall through to the honest 429.
                     match soft_wait_secs(
-                        manager.retry_after_hint(now, request_is_fable),
+                        match strict_group {
+                            // Size the wait by when a MEMBER frees. The fleet-wide
+                            // hint would be won by any unrelated account un-gating
+                            // sooner, spending this request's one-shot soft-wait on
+                            // a recovery it cannot use and 429-ing while its own
+                            // member was still seconds away.
+                            Some(group) => {
+                                manager.retry_after_hint_for_group(now, request_is_fable, group)
+                            }
+                            None => manager.retry_after_hint(now, request_is_fable),
+                        },
                         soft_waited_exhaustion,
                     ) {
                         Some(secs) => {
@@ -2266,7 +2289,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             // refreshes stale quota; a 429 arms a real hold via the
                             // existing inline-429 handling. `None` (throttled, or
                             // nothing servable) keeps the honest exhausted 429.
-                            if manager.revalidation_serve_enabled() {
+                            // `strict_group.is_none()` guards the THIRD spill door,
+                            // and the least visible one. `select_revalidation`
+                            // passes `group: None` to its hard gate, which by
+                            // `Manager::reserved_blocks` EXCLUDES every account
+                            // carrying a reserved group — so for a strict request
+                            // it can only ever return a NON-member. Left ungated it
+                            // would hand the request to precisely the account the
+                            // reservation exists to keep it off, moments after the
+                            // strict arm in `select_with_group` refused to. A
+                            // reserved group falls straight through to the honest
+                            // 429 instead.
+                            if strict_group.is_none() && manager.revalidation_serve_enabled() {
                                 if let Some(idx) = manager.select_revalidation(
                                     &tried,
                                     now,
@@ -2280,6 +2314,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                         now,
                                         account_count,
                                         request_is_fable,
+                                        strict_group,
                                     );
                                 }
                             } else {
@@ -2288,6 +2323,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                     now,
                                     account_count,
                                     request_is_fable,
+                                    strict_group,
                                 );
                             }
                         }
@@ -3054,6 +3090,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             OffsetDateTime::now_utc(),
             account_count,
             request_is_fable,
+            request_group
+                .as_deref()
+                .filter(|g| manager.is_group_reserved(g)),
         )
     }
 }
@@ -3828,22 +3867,43 @@ fn error_response(
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
 /// `is_fable` scopes the hint to the request's model class so a Fable request is
 /// told the true Fable-weekly recovery instant (see [`Manager::retry_after_hint`]).
+/// `strict_group` names the RESERVED group this request asked for, when it asked
+/// for one. It changes both halves of the answer, because for a strict request
+/// the fleet-wide story is a lie in both:
+///
+/// - the hint is sized by [`Manager::retry_after_hint_for_group`], since an
+///   unrelated account un-gating sooner tells this client nothing about when it
+///   can be served; and
+/// - the message names the group instead of claiming every account is spent,
+///   which would send an operator to look at a fleet that is mostly idle.
 fn exhausted_response(
     manager: &Manager,
     now: OffsetDateTime,
     account_count: usize,
     is_fable: bool,
+    strict_group: Option<&str>,
 ) -> Response {
-    let retry_after = manager.retry_after_hint(now, is_fable);
+    let retry_after = match strict_group {
+        Some(group) => manager.retry_after_hint_for_group(now, is_fable, group),
+        None => manager.retry_after_hint(now, is_fable),
+    };
+    let detail = match strict_group {
+        Some(group) => format!(
+            "No account in reserved group '{group}' is available, and a reserved \
+             group never serves from outside itself. Retry in {retry_after}s."
+        ),
+        None => format!("All {account_count} accounts exhausted. Retry in {retry_after}s."),
+    };
     tracing::warn!(
         account_count,
         retry_after,
-        "returning fleet-exhausted 429 to client"
+        group = strict_group.unwrap_or("-"),
+        "returning exhausted 429 to client"
     );
     error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
-        &format!("All {account_count} accounts exhausted. Retry in {retry_after}s."),
+        &detail,
         Some(retry_after),
     )
 }

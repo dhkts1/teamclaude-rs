@@ -227,10 +227,26 @@ impl Account {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupSettings {
-    /// When `true`, an account carrying this group is off-limits to traffic
-    /// that did not ask for one of its groups — see
-    /// [`crate::manager::select::eligible`]'s doc-comment for the exact rule.
-    /// Absent/`false` (default) keeps today's prefer-only behaviour.
+    /// When `true`, this group is PRIVATE IN BOTH DIRECTIONS. This is the
+    /// canonical statement of what `reserved` means; every other mention should
+    /// point here rather than restate it.
+    ///
+    /// 1. **Nothing else comes in.** An account carrying this group is
+    ///    off-limits to traffic that did not ask for one of its groups — see
+    ///    [`crate::manager::select::eligible`] for the exact rule.
+    /// 2. **Its own traffic never leaves.** An explicit `--group` ask for this
+    ///    group is STRICT: when no member can serve, the request refuses rather
+    ///    than falling back to the pool, and the caller's exhaustion ladder
+    ///    soft-waits for a member or answers an honest 429. An UNRESERVED group
+    ///    keeps prefer-only semantics and still spills.
+    ///
+    /// Direction 2 is deliberately not a second flag. The two are one intent —
+    /// "this group is mine" — and splitting them produced a group that looked
+    /// private while still leaking: measured on the live fleet 2026-09-01, an
+    /// unreserved group's member absorbed 127 pool diverts in a day, and the
+    /// rate-limit that caused then spilled that group's own traffic 33 times.
+    ///
+    /// Absent/`false` (default) is prefer-only in both directions.
     #[serde(default)]
     pub reserved: bool,
     /// When `true`, an explicit `--group` ask for this group is allowed to

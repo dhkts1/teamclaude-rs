@@ -488,7 +488,20 @@ public struct GroupChip: View {
                 )
         )
         .fixedSize()
-        .help(tag.isReserved ? "\(tag.name) (reserved — held out of the general pool)" : tag.name)
+        .help(
+            tag.isReserved
+                // Both directions, because half the sentence is how the pool-facing
+                // half got read as the whole feature: "held out of the general pool"
+                // says nothing about whether THIS group's traffic can wander off to
+                // another account, and it can't.
+                ? "\(tag.name) (reserved — pool traffic never uses this account, "
+                    + "and --group \(tag.name) never serves from outside the group)"
+                // Named explicitly rather than left bare: a group tag with no lock is
+                // decoration, and reading it as isolation is what lets pool traffic
+                // sit on an account someone believed was private.
+                : "\(tag.name) (tagged only — not reserved, so pool traffic still "
+                    + "uses this account and --group \(tag.name) may be served by another)"
+        )
     }
 }
 
