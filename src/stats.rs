@@ -66,7 +66,9 @@ impl QuotaState {
 /// out, so a paced account still reads [`GateReason::Ok`].
 ///
 /// Serde-derived so it crosses the status endpoint's wire ([`crate::status`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum GateReason {
     /// In rotation — no hard gate is active.
