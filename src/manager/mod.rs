@@ -1141,6 +1141,20 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// What [`Manager::exhaustion_hint`] learned about an exhausted fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExhaustionHint {
+    /// Whole seconds until the soonest account frees, at least 1; the `60`
+    /// sentinel when `free_at` is `None`.
+    pub retry_after: i64,
+    /// The instant that account frees, when any account advertises one.
+    pub free_at: Option<OffsetDateTime>,
+    /// The gate holding that account — what `retry_after` is timed against.
+    pub binding: Option<GateReason>,
+    /// Every account out of rotation, counted by the gate holding it.
+    pub gated: BTreeMap<GateReason, usize>,
+}
+
 fn odt_to_ms(now: OffsetDateTime) -> i64 {
     (now.unix_timestamp_nanos() / 1_000_000) as i64
 }
@@ -1395,48 +1409,9 @@ impl Manager {
     /// A `retry-after` hint (seconds) for a synthetic 429 when every account is
     /// exhausted: the soonest instant at which SOME account genuinely re-enters
     /// rotation, clamped to at least 1s, defaulting to 60s when nothing is known.
-    ///
-    /// Honest by construction: it minimises over each account's
-    /// [`Self::account_gate`] `free_at` — the instant ALL of *that* account's
-    /// active gates clear — instead of the raw min over every window's reset. The
-    /// raw-min was bug-shaped: it counted a 5-hour reset of an account that stays
-    /// gated on its weekly bucket, and the reset of an `Error`/disabled account
-    /// that never self-frees at all, so it promised a recovery that would not
-    /// happen. Accounts that contribute nothing here (`Ok`, `Login`, `Disabled`,
-    /// or a gating window with no known reset) are correctly skipped.
-    ///
-    /// `is_fable` scopes the evaluation exactly as selection does: only a Fable
-    /// request is gated by the model-scoped weekly (`7d_oi`) bucket, so an
-    /// all-Fable-exhausted fleet reports that bucket's reset while non-Fable
-    /// traffic ignores it.
+    /// The seconds half of [`Self::exhaustion_hint`]; see it for the derivation.
     pub fn retry_after_hint(&self, now: OffsetDateTime, is_fable: bool) -> i64 {
-        let now_ms = odt_to_ms(now);
-        let reserved_groups = self.reserved_groups();
-        let accounts = self.accounts.read().expect("accounts lock poisoned");
-        let soonest = accounts
-            .iter()
-            .filter_map(|account| {
-                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-                // `group: None` — same "unrequested traffic" view `Self::snapshot`
-                // reports; a promise this hint makes must hold for the traffic
-                // that would actually hit the synthetic 429 it is sizing.
-                let (_, free_at) = Self::account_gate(
-                    account,
-                    threshold,
-                    now,
-                    now_ms,
-                    is_fable,
-                    None,
-                    &reserved_groups,
-                );
-                free_at.map(odt_to_ms)
-            })
-            .filter(|&at| at > now_ms)
-            .min();
-        match soonest {
-            Some(at) => ((at - now_ms + 999) / 1000).max(1),
-            None => 60,
-        }
+        self.exhaustion_hint(now, is_fable, None).retry_after
     }
 
     /// [`Self::retry_after_hint`], scoped to the members of one group.
@@ -1450,12 +1425,6 @@ impl Manager {
     /// exactly as it is — ungrouped traffic genuinely can use any account, and
     /// that promise must keep holding for it.
     ///
-    /// `Some(group)` (not `None`) reaches [`Self::account_gate`] on purpose: an
-    /// explicit ask is never reserved-blocked by its own group
-    /// ([`Self::reserved_blocks`]), so this reports the member's REAL gate — its
-    /// rate-limit hold or quota window — rather than the reservation that is the
-    /// whole reason we are here.
-    ///
     /// Returns the same `60` default when no member advertises a recovery instant,
     /// so a strict group whose members are all `Error`/disabled degrades to the
     /// same honest "try again in a minute" as an exhausted fleet.
@@ -1465,30 +1434,96 @@ impl Manager {
         is_fable: bool,
         group: &str,
     ) -> i64 {
+        self.exhaustion_hint(now, is_fable, Some(group)).retry_after
+    }
+
+    /// Everything a synthetic exhausted 429 can honestly tell the client, derived
+    /// once from the same per-account gate view selection uses.
+    ///
+    /// `retry_after` is the soonest instant at which SOME account genuinely
+    /// re-enters rotation, in whole seconds, clamped to at least 1. Honest by
+    /// construction: it minimises over each account's [`Self::account_gate`]
+    /// `free_at` — the instant ALL of *that* account's active gates clear —
+    /// instead of the raw min over every window's reset. The raw-min was
+    /// bug-shaped: it counted a 5-hour reset of an account that stays gated on
+    /// its weekly bucket, and the reset of an `Error`/disabled account that never
+    /// self-frees at all, so it promised a recovery that would not happen.
+    /// Accounts that contribute nothing (`Ok`, `Login`, `Disabled`, or a gating
+    /// window with no known reset) are skipped.
+    ///
+    /// When NO account advertises a recovery instant, `retry_after` is the `60`
+    /// sentinel and `free_at` is `None`. The two are reported separately on
+    /// purpose: a caller sizing a wait keeps reading the number, and a caller
+    /// writing a message can say "no reset time is known" instead of printing a
+    /// fixed 60 that a reader would take for a measurement. `proxy.rs` relies on
+    /// the sentinel staying above its soft-wait cap — see the compile-time
+    /// assertion beside `EXHAUSTION_SOFT_WAIT_MAX_SECS` there.
+    ///
+    /// `binding` is the gate that holds the soonest-freeing account — the one
+    /// whose clearing `retry_after` is timed against — so the 429 can carry the
+    /// matching `anthropic-ratelimit-unified-*` claim when that gate is a quota
+    /// window, and stay a plain 429 when it is not. `gated` counts every account
+    /// out of rotation by its gate, for the message.
+    ///
+    /// `is_fable` scopes the evaluation exactly as selection does: only a Fable
+    /// request is gated by the model-scoped weekly (`7d_oi`) bucket, so an
+    /// all-Fable-exhausted fleet reports that bucket's reset while non-Fable
+    /// traffic ignores it.
+    ///
+    /// `group` narrows the fleet to one group's members and, reaching
+    /// [`Self::account_gate`] as `Some(group)` on purpose, reports each member's
+    /// REAL gate rather than the reservation: an explicit ask is never
+    /// reserved-blocked by its own group ([`Self::reserved_blocks`]). `None` is
+    /// the "unrequested traffic" view [`Self::snapshot`] reports — a promise this
+    /// hint makes must hold for the traffic that would actually hit the 429.
+    pub fn exhaustion_hint(
+        &self,
+        now: OffsetDateTime,
+        is_fable: bool,
+        group: Option<&str>,
+    ) -> ExhaustionHint {
         let now_ms = odt_to_ms(now);
         let reserved_groups = self.reserved_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
-        let soonest = accounts
+        let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
+        let mut soonest: Option<(i64, GateReason)> = None;
+        for account in accounts
             .iter()
-            .filter(|account| account.groups.iter().any(|g| g == group))
-            .filter_map(|account| {
-                let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
-                let (_, free_at) = Self::account_gate(
-                    account,
-                    threshold,
-                    now,
-                    now_ms,
-                    is_fable,
-                    Some(group),
-                    &reserved_groups,
-                );
-                free_at.map(odt_to_ms)
-            })
-            .filter(|&at| at > now_ms)
-            .min();
+            .filter(|account| group.is_none_or(|g| account.groups.iter().any(|m| m == g)))
+        {
+            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+            let (reason, free_at) = Self::account_gate(
+                account,
+                threshold,
+                now,
+                now_ms,
+                is_fable,
+                group,
+                &reserved_groups,
+            );
+            if reason != GateReason::Ok {
+                *gated.entry(reason).or_insert(0) += 1;
+            }
+            let Some(at) = free_at.map(odt_to_ms).filter(|&at| at > now_ms) else {
+                continue;
+            };
+            if soonest.is_none_or(|(best, _)| at < best) {
+                soonest = Some((at, reason));
+            }
+        }
         match soonest {
-            Some(at) => ((at - now_ms + 999) / 1000).max(1),
-            None => 60,
+            Some((at, reason)) => ExhaustionHint {
+                retry_after: ((at - now_ms + 999) / 1000).max(1),
+                free_at: ms_to_odt(at),
+                binding: Some(reason),
+                gated,
+            },
+            None => ExhaustionHint {
+                retry_after: 60,
+                free_at: None,
+                binding: None,
+                gated,
+            },
         }
     }
 
@@ -8227,6 +8262,72 @@ mod tests {
             hint > 800,
             "must not report B's 100s or A's 200s reset, got {hint}"
         );
+    }
+
+    /// The full hint: the gate that TIMES the wait, and a count of every account
+    /// out of rotation by its gate. Same fleet as the test above, so the binding
+    /// gate is C's 5-hour window, while A's weekly and B's dead credential are
+    /// counted without being allowed to drive the time.
+    #[test]
+    fn exhaustion_hint_names_the_binding_gate_and_counts_every_gated_account() {
+        let now = OffsetDateTime::now_utc();
+        let at = |secs: i64| now + Duration::seconds(secs);
+        let mut a = AccountRuntime::from_config(&account("a", 0), false);
+        a.switch_threshold = Some(0.90);
+        a.quota.five_hour = Some(window(0.99, Some(at(200))));
+        a.quota.seven_day = Some(window(0.99, Some(at(5_000))));
+        let mut b = AccountRuntime::from_config(&account("b", 0), false);
+        b.switch_threshold = Some(0.90);
+        b.status = AccountStatus::Error;
+        b.quota.five_hour = Some(window(0.99, Some(at(100))));
+        let mut c = AccountRuntime::from_config(&account("c", 0), false);
+        c.switch_threshold = Some(0.90);
+        c.quota.five_hour = Some(window(0.99, Some(at(900))));
+
+        let manager = Manager::from_runtimes(vec![a, b, c]);
+        let hint = manager.exhaustion_hint(now, false, None);
+        assert_eq!(
+            hint.binding,
+            Some(GateReason::FiveHour),
+            "C's 5h window times the wait"
+        );
+        assert_eq!(
+            hint.free_at.map(odt_to_ms),
+            Some(odt_to_ms(at(900))),
+            "free_at is C's reset instant"
+        );
+        assert_eq!(
+            hint.retry_after,
+            manager.retry_after_hint(now, false),
+            "the seconds half is byte-identical to retry_after_hint"
+        );
+        let counts: Vec<(GateReason, usize)> = hint.gated.iter().map(|(r, n)| (*r, *n)).collect();
+        assert_eq!(
+            counts,
+            vec![
+                (GateReason::FiveHour, 1),
+                (GateReason::SevenDay, 1),
+                (GateReason::Login, 1)
+            ],
+            "every gated account is counted under the gate that binds IT"
+        );
+    }
+
+    /// When no account advertises a reset, the number stays the 60 sentinel the
+    /// proxy's soft-wait relies on, but `free_at`/`binding` are `None` so a
+    /// message can say "no reset known" instead of printing 60 as a measurement.
+    #[test]
+    fn exhaustion_hint_reports_an_unknown_reset_as_unknown_not_as_sixty_seconds() {
+        let now = OffsetDateTime::now_utc();
+        let mut a = AccountRuntime::from_config(&account("a", 0), false);
+        a.switch_threshold = Some(0.90);
+        a.quota.seven_day = Some(window(0.99, None));
+        let manager = Manager::from_runtimes(vec![a]);
+        let hint = manager.exhaustion_hint(now, false, None);
+        assert_eq!(hint.retry_after, 60);
+        assert_eq!(hint.free_at, None);
+        assert_eq!(hint.binding, None);
+        assert_eq!(hint.gated.get(&GateReason::SevenDay), Some(&1));
     }
 
     /// `next_session_key` hands out strictly-increasing, unique u64s starting at 1.

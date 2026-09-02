@@ -43,7 +43,7 @@ use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, InFlightGuard,
     Manager, SetControlOutcome, SetDisabledOutcome,
 };
-use crate::stats::{RequestLogEntry, SessionKind};
+use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
@@ -3866,16 +3866,32 @@ fn error_response(
 
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
 /// `is_fable` scopes the hint to the request's model class so a Fable request is
-/// told the true Fable-weekly recovery instant (see [`Manager::retry_after_hint`]).
+/// told the true Fable-weekly recovery instant (see [`Manager::exhaustion_hint`]).
 /// `strict_group` names the RESERVED group this request asked for, when it asked
 /// for one. It changes both halves of the answer, because for a strict request
 /// the fleet-wide story is a lie in both:
 ///
-/// - the hint is sized by [`Manager::retry_after_hint_for_group`], since an
-///   unrelated account un-gating sooner tells this client nothing about when it
-///   can be served; and
+/// - the hint is sized over the group's members only, since an unrelated
+///   account un-gating sooner tells this client nothing about when it can be
+///   served; and
 /// - the message names the group instead of claiming every account is spent,
 ///   which would send an operator to look at a fleet that is mostly idle.
+///
+/// The response speaks the client's language, not only ours. Claude Code labels
+/// any 429 that carries no `anthropic-ratelimit-unified-status` header "Server
+/// is temporarily limiting requests (not your usage limit)" — the opposite of
+/// the truth when every account is inside a quota window. So when the gate that
+/// times `retry-after` IS a quota window, the 429 also carries the unified
+/// `status: rejected`, the `reset` epoch and the `representative-claim` the
+/// client maps to its own limit types, and the client renders a usage limit with
+/// the real reset instant. A hold or an unknown gate stays a plain 429: an
+/// upstream `retry-after` is not the user's usage limit, and claiming one would
+/// be the same lie in the other direction.
+///
+/// The `retry-after` figure is computed live from when an account actually
+/// frees, never a constant — the only fixed number here is the 60 the hint falls
+/// back to when NO account advertises a reset, and the message says so rather
+/// than printing it as if it had been measured.
 fn exhausted_response(
     manager: &Manager,
     now: OffsetDateTime,
@@ -3883,29 +3899,103 @@ fn exhausted_response(
     is_fable: bool,
     strict_group: Option<&str>,
 ) -> Response {
-    let retry_after = match strict_group {
-        Some(group) => manager.retry_after_hint_for_group(now, is_fable, group),
-        None => manager.retry_after_hint(now, is_fable),
+    let hint = manager.exhaustion_hint(now, is_fable, strict_group);
+    let retry_after = hint.retry_after;
+    let causes = describe_gates(&hint.gated);
+    let when = match hint.free_at {
+        Some(at) => format!(
+            "Retry in {retry_after}s (soonest account frees at {}).",
+            at_utc(at)
+        ),
+        None => format!("No account reports a reset time; retry in {retry_after}s."),
     };
     let detail = match strict_group {
         Some(group) => format!(
             "No account in reserved group '{group}' is available, and a reserved \
-             group never serves from outside itself. Retry in {retry_after}s."
+             group never serves from outside itself{causes}. {when}"
         ),
-        None => format!("All {account_count} accounts exhausted. Retry in {retry_after}s."),
+        None => format!("All {account_count} accounts exhausted{causes}. {when}"),
     };
     tracing::warn!(
         account_count,
         retry_after,
+        binding = ?hint.binding,
         group = strict_group.unwrap_or("-"),
         "returning exhausted 429 to client"
     );
-    error_response(
+    let mut response = error_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
         &detail,
         Some(retry_after),
-    )
+    );
+    if let (Some(claim), Some(at)) = (hint.binding.and_then(unified_claim_for), hint.free_at) {
+        let headers = response.headers_mut();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-representative-claim",
+            HeaderValue::from_static(claim),
+        );
+        if let Ok(value) = HeaderValue::from_str(&at.unix_timestamp().to_string()) {
+            headers.insert("anthropic-ratelimit-unified-reset", value);
+        }
+    }
+    response
+}
+
+/// The `anthropic-ratelimit-unified-representative-claim` value for a gate, or
+/// `None` for a gate that is not a quota window. The values are the ones the
+/// Claude Code client maps to its limit types (`five_hour`, `seven_day`); the
+/// Fable weekly is reported as the plain weekly claim because the client has no
+/// Fable-specific one and a weekly reset is what it is.
+fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
+    match reason {
+        GateReason::FiveHour => Some("five_hour"),
+        GateReason::SevenDay | GateReason::FableWeekly => Some("seven_day"),
+        GateReason::Ok
+        | GateReason::Hold
+        | GateReason::Standard
+        | GateReason::Login
+        | GateReason::Rejected
+        | GateReason::Disabled
+        | GateReason::Reserved => None,
+    }
+}
+
+/// `: 3 in the 5-hour window, 1 on an upstream hold` — or empty when nothing is
+/// gated, so the message never ends in a dangling colon.
+fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> String {
+    let parts: Vec<String> = gated
+        .iter()
+        .map(|(reason, n)| {
+            let what = match reason {
+                GateReason::Ok => "in rotation",
+                GateReason::Hold => "on an upstream hold",
+                GateReason::FiveHour => "in the 5-hour window",
+                GateReason::SevenDay => "in the weekly window",
+                GateReason::FableWeekly => "in the Fable weekly window",
+                GateReason::Standard => "at a token limit",
+                GateReason::Login => "needing re-login",
+                GateReason::Rejected => "rejected upstream",
+                GateReason::Disabled => "disabled",
+                GateReason::Reserved => "reserved for another group",
+            };
+            format!("{n} {what}")
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", parts.join(", "))
+    }
+}
+
+/// `HH:MM:SS UTC` for a message a human reads next to a seconds count.
+fn at_utc(at: OffsetDateTime) -> String {
+    format!("{:02}:{:02}:{:02} UTC", at.hour(), at.minute(), at.second())
 }
 
 /// Whether a 502 is the honest verdict: at least one attempt failed in transport
@@ -9445,6 +9535,16 @@ mod tests {
 
     /// Boot an N-account fleet (all cloned from `dummy`) pointed at `upstream`.
     fn fleet(upstream: SocketAddr, names: &[&str]) -> Arc<Manager> {
+        fleet_configured(upstream, names, |_| {})
+    }
+
+    /// [`fleet`] with a hook to edit the config before the manager boots — for a
+    /// test that needs an unmodelled top-level key (`revalidationServe`) set.
+    fn fleet_configured(
+        upstream: SocketAddr,
+        names: &[&str],
+        configure: impl FnOnce(&mut Config),
+    ) -> Arc<Manager> {
         struct NoRefresh;
         impl crate::oauth::TokenRefresher for NoRefresh {
             fn refresh(&self, _t: String) -> crate::oauth::RefreshFuture {
@@ -9458,6 +9558,7 @@ mod tests {
             config.accounts.push(extra);
         }
         config.accounts.remove(0); // keep exactly `names`, in order
+        configure(&mut config);
         Manager::new(
             config,
             Arc::new(NoRefresh),
@@ -9486,6 +9587,28 @@ mod tests {
             .unwrap();
         let status = resp.status().as_u16();
         (status, resp.text().await.unwrap())
+    }
+
+    /// [`post_one_with_body`] plus the response HEADERS — for asserting what a
+    /// synthesized 429 tells a client that reads headers, not only its body.
+    async fn post_one_full(manager: Arc<Manager>) -> (u16, HeaderMap, String) {
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(manager)).await;
+        });
+        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
+            .unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status().as_u16();
+        let headers = resp.headers().clone();
+        (status, headers, resp.text().await.unwrap())
     }
 
     /// Serve `manager` on a fresh loopback listener and POST one `/v1/messages`,
@@ -10435,6 +10558,98 @@ mod tests {
             attempts.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "both accounts were tried once each before the fleet-exhausted 429"
+        );
+    }
+
+    /// A fleet spent on its 5-hour windows answers a 429 the client can READ as a
+    /// usage limit: `anthropic-ratelimit-unified-status: rejected`, the claim the
+    /// client maps to its five-hour type, and a `reset` equal to the window's real
+    /// reset — not a constant. Without those headers the client labels the 429
+    /// "not your usage limit", which is the opposite of what happened. The body
+    /// names the cause and the instant too, for a reader without a header view.
+    #[tokio::test]
+    async fn exhausted_429_carries_the_unified_headers_when_a_quota_window_binds() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
+        // Revalidation-serve (default ON) would probe an over-threshold account
+        // with a real send instead of failing the request; this test is about the
+        // 429 the client gets once nothing is servable, so it is off here.
+        let manager = fleet_configured(up_addr, &["a", "b"], |config| {
+            config
+                .extra
+                .insert("revalidationServe".to_string(), serde_json::json!(false));
+        });
+        let reset = OffsetDateTime::now_utc().unix_timestamp() + 900;
+        let mut spent = HeaderMap::new();
+        spent.insert(
+            "anthropic-ratelimit-unified-5h-utilization",
+            HeaderValue::from_static("0.99"),
+        );
+        spent.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            HeaderValue::from_str(&reset.to_string()).unwrap(),
+        );
+        for idx in 0..2 {
+            assert!(
+                manager.update_quota(idx, &spent),
+                "fixture must land a 5h window"
+            );
+        }
+
+        let (status, headers, body) = post_one_full(manager).await;
+        assert_eq!(
+            status, 429,
+            "no eligible account → exhausted 429; body: {body}"
+        );
+        let h = |name: &str| headers.get(name).map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            h("anthropic-ratelimit-unified-status").as_deref(),
+            Some("rejected")
+        );
+        assert_eq!(
+            h("anthropic-ratelimit-unified-representative-claim").as_deref(),
+            Some("five_hour")
+        );
+        assert_eq!(
+            h("anthropic-ratelimit-unified-reset").as_deref(),
+            Some(reset.to_string().as_str()),
+            "the reset is the window's own instant, not a synthesized one"
+        );
+        let retry_after: i64 = h("retry-after").unwrap().parse().unwrap();
+        assert!(
+            (895..=900).contains(&retry_after),
+            "retry-after is the live distance to that reset, got {retry_after}"
+        );
+        assert!(
+            body.contains("All 2 accounts exhausted: 2 in the 5-hour window.")
+                && body.contains("soonest account frees at"),
+            "the body names the cause and the instant: {body}"
+        );
+    }
+
+    /// An upstream `retry-after` hold is NOT the user's usage limit, so a fleet
+    /// held that way stays a plain 429: no unified headers, and a body that says
+    /// "hold" rather than claiming a window. Both accounts carry the hold a
+    /// transient upstream 429 arms (`mark_rate_limited`), 600s out.
+    #[tokio::test]
+    async fn exhausted_429_stays_plain_when_an_upstream_hold_binds() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+        for idx in 0..2 {
+            manager.mark_rate_limited(idx, 600);
+        }
+        let (status, headers, body) = post_one_full(manager).await;
+        assert_eq!(status, 429, "body: {body}");
+        assert!(
+            headers.get("anthropic-ratelimit-unified-status").is_none(),
+            "a hold must not be dressed up as a usage limit"
+        );
+        assert!(
+            headers.get("retry-after").is_some(),
+            "the live retry-after still ships"
+        );
+        assert!(
+            body.contains("2 on an upstream hold") && body.contains("Retry in "),
+            "the body names the hold: {body}"
         );
     }
 
