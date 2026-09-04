@@ -60,6 +60,20 @@ impl Manager {
                         account.warm_evidence_retry_after_ms = None;
                     }
                     clear_allowed_rejections(account, headers);
+                    if rejections.contains(&UnifiedRejectionKind::Overall)
+                        && [
+                            "anthropic-ratelimit-unified-5h-status",
+                            "anthropic-ratelimit-unified-7d-status",
+                        ]
+                        .iter()
+                        .all(|name| {
+                            header_is_allowed(headers, name) || header_is_rejected(headers, name)
+                        })
+                    {
+                        // Current scope evidence replaces the prior aggregate.
+                        // record_rejection rebuilds it from this response below.
+                        account.overall_rejected_until_ms = None;
+                    }
                     if account.quota.status.as_deref() == Some("rejected")
                         && rejections.contains(&UnifiedRejectionKind::FableWeekly)
                         && !rejections.contains(&UnifiedRejectionKind::Overall)
@@ -408,15 +422,55 @@ fn clear_allowed_rejections(account: &mut AccountRuntime, headers: &reqwest::hea
         account.overall_rejected_until_ms = None;
         account.five_hour_rejected_until_ms = None;
         account.seven_day_rejected_until_ms = None;
+        clear_stale_full_window(
+            &mut account.quota.five_hour,
+            headers,
+            "anthropic-ratelimit-unified-5h-utilization",
+        );
+        clear_stale_full_window(
+            &mut account.quota.seven_day,
+            headers,
+            "anthropic-ratelimit-unified-7d-utilization",
+        );
     }
     if header_is_allowed(headers, "anthropic-ratelimit-unified-5h-status") {
         account.five_hour_rejected_until_ms = None;
+        clear_stale_full_window(
+            &mut account.quota.five_hour,
+            headers,
+            "anthropic-ratelimit-unified-5h-utilization",
+        );
     }
     if header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status") {
         account.seven_day_rejected_until_ms = None;
+        clear_stale_full_window(
+            &mut account.quota.seven_day,
+            headers,
+            "anthropic-ratelimit-unified-7d-utilization",
+        );
     }
     if header_is_allowed(headers, "anthropic-ratelimit-unified-7d_oi-status") {
         account.fable_rejected_until_ms = None;
+        clear_stale_full_window(
+            &mut account.quota.seven_day_oi,
+            headers,
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+        );
+    }
+}
+
+fn clear_stale_full_window(
+    window: &mut Option<crate::quota::QuotaWindow>,
+    headers: &reqwest::header::HeaderMap,
+    utilization_name: &str,
+) {
+    let has_current_utilization = headers
+        .get(utilization_name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .is_some_and(f64::is_finite);
+    if !has_current_utilization && window.is_some_and(|window| window.utilization >= 1.0) {
+        *window = None;
     }
 }
 

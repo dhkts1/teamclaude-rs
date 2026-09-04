@@ -6111,10 +6111,15 @@ mod tests {
     fn current_allowed_status_beats_a_stale_full_window() {
         let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
         let now = OffsetDateTime::now_utc();
-        manager.accounts.write().unwrap()[0].quota.seven_day = Some(crate::quota::QuotaWindow {
-            utilization: 1.0,
-            reset: Some(now + Duration::hours(2)),
-        });
+        {
+            let mut accounts = manager.accounts.write().unwrap();
+            accounts[0].quota.seven_day = Some(crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::hours(2)),
+            });
+            accounts[0].overall_rejected_until_ms =
+                Some((now + Duration::days(7)).unix_timestamp() * 1000);
+        }
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "anthropic-ratelimit-unified-status",
@@ -6134,16 +6139,118 @@ mod tests {
             reqwest::header::HeaderValue::from_static("allowed"),
         );
         headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            reqwest::header::HeaderValue::from_static("invalid"),
+        );
+        headers.insert(
             "anthropic-ratelimit-unified-7d-reset",
             reqwest::header::HeaderValue::from_str(&(now.unix_timestamp() + 7200).to_string())
                 .unwrap(),
         );
 
-        manager.update_quota_with_rejections(0, &headers, 120, &[UnifiedRejectionKind::Overall]);
+        manager.update_quota_with_rejections(
+            0,
+            &headers,
+            120,
+            &[
+                UnifiedRejectionKind::Overall,
+                UnifiedRejectionKind::FiveHour,
+            ],
+        );
+
+        {
+            let accounts = manager.accounts.read().unwrap();
+            assert_eq!(
+                accounts[0].overall_rejected_until_ms,
+                Some((now.unix_timestamp() + 900) * 1000)
+            );
+            assert!(
+                accounts[0].quota.seven_day.is_none(),
+                "current allowed evidence must remove the stale full window"
+            );
+        }
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now + Duration::minutes(16),
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            Some(0),
+            "the current 15-minute rejection must replace the stale seven-day deadline"
+        );
+    }
+
+    #[test]
+    fn allowed_status_preserves_utilization_from_the_same_response() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            reqwest::header::HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            reqwest::header::HeaderValue::from_static("1.0"),
+        );
+
+        manager.update_quota_with_rejections(0, &headers, 0, &[]);
+
+        assert_eq!(
+            manager.accounts.read().unwrap()[0]
+                .quota
+                .seven_day
+                .map(|window| window.utilization),
+            Some(1.0),
+            "current utilization must not be removed by its current status"
+        );
+    }
+
+    #[test]
+    fn partial_scope_status_preserves_the_other_scope_in_an_overall_hold() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let now = OffsetDateTime::now_utc();
+        let weekly_reset = now + Duration::days(7);
+        {
+            let mut accounts = manager.accounts.write().unwrap();
+            accounts[0].quota.seven_day = Some(crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(weekly_reset),
+            });
+            accounts[0].overall_rejected_until_ms =
+                Some((weekly_reset.unix_timestamp_nanos() / 1_000_000) as i64);
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reqwest::header::HeaderValue::from_str(&(now.unix_timestamp() + 900).to_string())
+                .unwrap(),
+        );
+
+        manager.update_quota_with_rejections(
+            0,
+            &headers,
+            120,
+            &[
+                UnifiedRejectionKind::Overall,
+                UnifiedRejectionKind::FiveHour,
+            ],
+        );
 
         assert_eq!(
             manager.accounts.read().unwrap()[0].overall_rejected_until_ms,
-            Some((now.unix_timestamp() + 900) * 1000)
+            Some((weekly_reset.unix_timestamp_nanos() / 1_000_000) as i64),
+            "missing weekly status must retain the known weekly hold"
         );
     }
 
