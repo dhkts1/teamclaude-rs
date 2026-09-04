@@ -196,8 +196,16 @@ pub async fn fetch_usage(
     client: &reqwest::Client,
     access_token: &str,
 ) -> Result<Usage, ProbeError> {
+    fetch_usage_at(client, access_token, USAGE_URL).await
+}
+
+async fn fetch_usage_at(
+    client: &reqwest::Client,
+    access_token: &str,
+    usage_url: &str,
+) -> Result<Usage, ProbeError> {
     let resp = client
-        .get(USAGE_URL)
+        .get(usage_url)
         .header("Authorization", format!("Bearer {access_token}"))
         .header("anthropic-beta", OAUTH_USAGE_BETA)
         .header("Accept", "application/json")
@@ -316,6 +324,33 @@ impl ProbeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fetch_usage_reads_numeric_retry_after_from_the_wire() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 429 Too Many Requests\r\nretry-after: 321\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let error = fetch_usage_at(&client, "test-token", &format!("http://{address}/usage"))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.status, Some(429));
+        assert_eq!(error.retry_after_secs, Some(321));
+    }
 
     #[test]
     fn normalize_divides_percentage_by_100() {

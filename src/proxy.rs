@@ -2291,6 +2291,19 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             continue; // re-run select(); the re-admitted accounts are eligible again
                         }
                         None => {
+                            // A hard account lock has no failover. Normal selection
+                            // returned None because that one account already failed
+                            // this request. Revalidation must not escape the lock and
+                            // send the request through another pooled credential.
+                            if manager.locked_account_name().is_some() {
+                                return exhausted_response(
+                                    &manager,
+                                    now,
+                                    account_count,
+                                    request_is_fable,
+                                    strict_group,
+                                );
+                            }
                             // Not a transient park — the whole fleet reads over the
                             // SOFT switch threshold. Before synthesizing a 429, try a
                             // last-resort revalidation serve on the least-utilized
@@ -9512,6 +9525,34 @@ mod tests {
         )
     }
 
+    /// A real model-scoped Fable rejection. The overall header is rejected, but
+    /// both shared windows remain allowed, so only the Fable weekly scope binds.
+    fn raw_429_fable_rejected(retry_after: u32) -> String {
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\
+             retry-after: {retry_after}\r\n\
+             anthropic-ratelimit-unified-status: rejected\r\n\
+             anthropic-ratelimit-unified-5h-status: allowed\r\n\
+             anthropic-ratelimit-unified-7d-status: allowed_warning\r\n\
+             anthropic-ratelimit-unified-7d_oi-status: rejected\r\n\r\n"
+        )
+    }
+
+    /// A successful response that supplies live allowed evidence for every scope.
+    fn raw_200_all_scopes_allowed() -> String {
+        let body = br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\
+             anthropic-ratelimit-unified-status: allowed\r\n\
+             anthropic-ratelimit-unified-5h-status: allowed\r\n\
+             anthropic-ratelimit-unified-7d-status: allowed\r\n\
+             anthropic-ratelimit-unified-7d_oi-status: allowed\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+    }
+
     /// The per-account header block a real Anthropic response carries, as raw
     /// header lines. Includes `requests-remaining` and `tokens-limit` alongside the
     /// `unified-*` family precisely because the proxy itself only reads `unified-*`:
@@ -9677,14 +9718,14 @@ mod tests {
 
     /// Serve `manager` on a fresh loopback listener and POST one `/v1/messages`,
     /// returning the client-visible status.
-    async fn post_one(manager: Arc<Manager>) -> u16 {
+    async fn post_model(manager: Arc<Manager>, model: &str) -> u16 {
         let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(proxy, app(manager)).await;
         });
-        let body = serde_json::to_vec(&serde_json::json!({ "model": "claude-x", "messages": [] }))
-            .unwrap();
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "model": model, "messages": [] })).unwrap();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         client
             .post(format!("http://{proxy_addr}/v1/messages"))
@@ -9694,6 +9735,10 @@ mod tests {
             .unwrap()
             .status()
             .as_u16()
+    }
+
+    async fn post_one(manager: Arc<Manager>) -> u16 {
+        post_model(manager, "claude-x").await
     }
 
     /// [`post_one`] with session affinity LIVE, so a test can assert what happened to
@@ -9876,6 +9921,89 @@ mod tests {
             account.seven_day,
             Some(1.0),
             "the reported weekly utilization must still reach the quota model"
+        );
+    }
+
+    /// Reproduce the live mixed-model sequence through both HTTP hops. A Fable
+    /// rejection must not park Opus, and later allowed evidence must restore Fable.
+    #[tokio::test]
+    async fn fable_rejection_is_scoped_and_live_allowed_evidence_clears_it() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_429_fable_rejected(120)),
+            Some(raw_200_all_scopes_allowed()),
+            Some(raw_200()),
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a"]);
+
+        assert_eq!(
+            post_model(Arc::clone(&manager), "claude-fable-5").await,
+            429,
+            "the active Fable rejection must block a Fable request"
+        );
+        assert_eq!(
+            post_model(Arc::clone(&manager), "claude-opus-4-6").await,
+            200,
+            "the Fable-only rejection must not block Opus"
+        );
+        assert_eq!(
+            post_model(Arc::clone(&manager), "claude-fable-5").await,
+            200,
+            "the allowed response must clear the stale Fable rejection"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "each client request must make exactly one upstream attempt"
+        );
+    }
+
+    /// Reproduce a short rejection that expires while another account spends its
+    /// transient retry budget. The first account must re-enter this same request.
+    #[tokio::test]
+    async fn expired_request_local_rejection_can_reenter_selection() {
+        let (up_addr, attempts) = spawn_counted_upstream(vec![
+            Some(raw_429_rejected(1)),
+            Some(raw_429_transient(1)),
+            Some(raw_429_transient(1)),
+            Some(raw_429_transient(1)),
+            Some(raw_200()),
+        ])
+        .await;
+        let manager = fleet(up_addr, &["a", "b"]);
+
+        assert_eq!(
+            post_model(Arc::clone(&manager), "claude-opus-4-6").await,
+            200,
+            "the expired rejection must not remain in the request-local tried set"
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the final send must return to the account whose rejection expired"
+        );
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snap.accounts[0].requests, 1,
+            "account a must serve the retry"
+        );
+        assert_eq!(snap.accounts[1].requests, 0, "account b never served");
+    }
+
+    /// A locked request cannot rotate to a different account after rejection.
+    #[tokio::test]
+    async fn locked_account_stops_after_its_quota_rejection() {
+        let (up_addr, attempts) =
+            spawn_counted_upstream(vec![Some(raw_429_rejected(120)), Some(raw_200())]).await;
+        let manager = fleet_configured(up_addr, &["a", "b"], |config| {
+            config.lock_account = Some("a".to_string());
+        });
+
+        assert_eq!(post_one(manager).await, 429);
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the lock must prevent a retry on account b"
         );
     }
 

@@ -6091,6 +6091,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rejection_without_reset_headers_reuses_known_window_resets() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut accounts = manager.accounts.write().unwrap();
+            accounts[0].quota.five_hour = Some(crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::minutes(15)),
+            });
+            accounts[0].quota.seven_day = Some(crate::quota::QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::hours(2)),
+            });
+        }
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+
+        manager.update_quota_with_rejections(0, &headers, 120, &[UnifiedRejectionKind::Overall]);
+
+        assert_eq!(
+            manager.accounts.read().unwrap()[0].overall_rejected_until_ms,
+            Some(((now + Duration::hours(2)).unix_timestamp_nanos() / 1_000_000) as i64)
+        );
+    }
+
+    #[test]
+    fn probe_retry_after_has_a_seven_day_safety_cap() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let before = crate::now_ms();
+
+        manager.record_probe(
+            0,
+            ProbeStatus::RateLimited,
+            Some("rate limited".to_string()),
+            Some(u64::MAX),
+        );
+
+        let deadline = manager.accounts.read().unwrap()[0]
+            .probe_retry_after_ms
+            .unwrap();
+        assert!(deadline >= before + 7 * 24 * 60 * 60 * 1000);
+        assert!(deadline <= crate::now_ms() + 7 * 24 * 60 * 60 * 1000);
+    }
+
     /// A network/transport probe failure (no HTTP status, not a timeout) stays a
     /// VISIBLE `Error` — a persistent connectivity problem (upstream down, DNS/TLS,
     /// a proxy-env regression) must never hide behind a benign "busy". Only
