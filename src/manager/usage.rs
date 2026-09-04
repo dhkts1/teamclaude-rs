@@ -67,6 +67,7 @@ impl Manager {
                         && header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status")
                     {
                         account.quota.status = None;
+                        account.overall_rejected_until_ms = None;
                     }
                     let hold_until = crate::now_ms().saturating_add(
                         hold_seconds

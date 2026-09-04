@@ -6006,6 +6006,62 @@ mod tests {
     }
 
     #[test]
+    fn fable_only_evidence_clears_an_older_overall_rejection() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let mut shared = reqwest::header::HeaderMap::new();
+        shared.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        manager.update_quota_with_rejections(0, &shared, 3600, &[UnifiedRejectionKind::Overall]);
+
+        let mut fable_only = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ] {
+            fable_only.insert(
+                reqwest::header::HeaderName::from_static(name),
+                reqwest::header::HeaderValue::from_static(value),
+            );
+        }
+        manager.update_quota_with_rejections(
+            0,
+            &fable_only,
+            120,
+            &[UnifiedRejectionKind::FableWeekly],
+        );
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            Some(0),
+            "current shared allowed evidence must release Opus"
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            None,
+            "the current Fable rejection must remain active"
+        );
+    }
+
+    #[test]
     fn reset_only_rejection_uses_the_latest_reported_shared_reset() {
         let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
         let now = OffsetDateTime::now_utc().unix_timestamp();
