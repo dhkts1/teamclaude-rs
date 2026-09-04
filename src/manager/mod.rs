@@ -210,6 +210,14 @@ impl AccountStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnifiedRejectionKind {
+    Overall,
+    FiveHour,
+    SevenDay,
+    FableWeekly,
+}
+
 /// The mutable runtime state for one account (credentials + learned quota +
 /// counters). Kept separate from the persisted [`config::Account`].
 #[derive(Debug, Clone)]
@@ -320,6 +328,10 @@ pub struct AccountRuntime {
     /// min-spacing between two selects of the SAME account.
     pub last_served_ms: i64,
     pub rate_limited_until_ms: Option<i64>,
+    pub overall_rejected_until_ms: Option<i64>,
+    pub five_hour_rejected_until_ms: Option<i64>,
+    pub seven_day_rejected_until_ms: Option<i64>,
+    pub fable_rejected_until_ms: Option<i64>,
     /// A short self-clearing cooldown after a *transient* refresh failure. A
     /// transient failure leaves the access token UNCHANGED, so the access-token
     /// guard in [`Manager::ensure_fresh_inner`] can't catch a follower already
@@ -340,6 +352,8 @@ pub struct AccountRuntime {
     pub probe_status: ProbeStatus,
     pub last_probe_ms: Option<i64>,
     pub probe_error: Option<String>,
+    /// The next permitted usage probe time, from an upstream `retry-after` header.
+    pub probe_retry_after_ms: Option<i64>,
     /// Wall-clock ms of each stream failure observed on a stream this account
     /// served (see [`Manager::record_stream_error`]): an in-band SSE `error`
     /// event, or a stream that hit EOF without Anthropic's `message_stop`
@@ -617,12 +631,17 @@ impl AccountRuntime {
             in_flight: 0,
             last_served_ms: 0,
             rate_limited_until_ms: None,
+            overall_rejected_until_ms: None,
+            five_hour_rejected_until_ms: None,
+            seven_day_rejected_until_ms: None,
+            fable_rejected_until_ms: None,
             refresh_retry_after_ms: None,
             error_retry_after_ms: None,
             error_backoff_ms: 0,
             probe_status: ProbeStatus::Never,
             last_probe_ms: None,
             probe_error: None,
+            probe_retry_after_ms: None,
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
             refresh_lock: Arc::new(AsyncMutex::new(())),
@@ -3156,6 +3175,7 @@ mod tests {
                 Err(ProbeError {
                     status: None,
                     message: "no prober configured".into(),
+                    retry_after_secs: None,
                 })
             })
         }
@@ -3183,6 +3203,7 @@ mod tests {
                     Err(ProbeError {
                         status: Some(500),
                         message: "upstream boom".into(),
+                        retry_after_secs: None,
                     })
                 }
             })
@@ -3194,6 +3215,23 @@ mod tests {
     /// last-good utilization and reads as `RateLimited`, not `Error`.
     struct FirstOkThen429Prober {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct RetryAfterProber {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UsageProber for RetryAfterProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ProbeError {
+                    status: Some(429),
+                    message: "Too Many Requests".into(),
+                    retry_after_secs: Some(3600),
+                })
+            })
+        }
     }
     impl UsageProber for FirstOkThen429Prober {
         fn probe(&self, _access_token: String) -> ProbeFuture {
@@ -3212,6 +3250,7 @@ mod tests {
                     Err(ProbeError {
                         status: Some(429),
                         message: "Too Many Requests".into(),
+                        retry_after_secs: None,
                     })
                 }
             })
@@ -5868,6 +5907,190 @@ mod tests {
         assert!(snap.accounts[0].probe_error.is_some());
     }
 
+    #[tokio::test]
+    async fn probe_retry_after_blocks_the_next_probe_until_it_expires() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RetryAfterProber {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        manager.probe_all().await;
+        manager.probe_all().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        manager.accounts.write().unwrap()[0].probe_retry_after_ms = Some(crate::now_ms() - 1);
+        manager.probe_all().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fable_rejection_does_not_block_other_models() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            reqwest::header::HeaderValue::from_static("allowed_warning"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        manager.update_quota_with_rejections(
+            0,
+            &headers,
+            120,
+            &[UnifiedRejectionKind::FableWeekly],
+        );
+        let now = OffsetDateTime::now_utc();
+
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            None
+        );
+
+        manager.apply_usage(
+            0,
+            &Usage {
+                five_hour: None,
+                seven_day: None,
+                seven_day_oi: Some(UsageBucket {
+                    utilization: Some(0.25),
+                    reset_at_ms: Some(crate::now_ms() + 3_600_000),
+                }),
+            },
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                Some("claude-fable-5"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            Some(0),
+            "a successful probe must clear stale Fable rejection evidence"
+        );
+    }
+
+    #[test]
+    fn reset_only_rejection_uses_the_latest_reported_shared_reset() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reqwest::header::HeaderValue::from_str(&(now + 900).to_string()).unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            reqwest::header::HeaderValue::from_str(&(now + 7200).to_string()).unwrap(),
+        );
+
+        manager.update_quota_with_rejections(0, &headers, 120, &[UnifiedRejectionKind::Overall]);
+
+        assert_eq!(
+            manager.accounts.read().unwrap()[0].overall_rejected_until_ms,
+            Some((now + 7200) * 1000)
+        );
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::from_unix_timestamp(now + 3600).unwrap(),
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            None,
+            "normal selection must honor the reported rejection reset"
+        );
+    }
+
+    #[test]
+    fn current_allowed_status_beats_a_stale_full_window() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let now = OffsetDateTime::now_utc();
+        manager.accounts.write().unwrap()[0].quota.seven_day = Some(crate::quota::QuotaWindow {
+            utilization: 1.0,
+            reset: Some(now + Duration::hours(2)),
+        });
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-5h-reset",
+            reqwest::header::HeaderValue::from_str(&(now.unix_timestamp() + 900).to_string())
+                .unwrap(),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-status",
+            reqwest::header::HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            reqwest::header::HeaderValue::from_str(&(now.unix_timestamp() + 7200).to_string())
+                .unwrap(),
+        );
+
+        manager.update_quota_with_rejections(0, &headers, 120, &[UnifiedRejectionKind::Overall]);
+
+        assert_eq!(
+            manager.accounts.read().unwrap()[0].overall_rejected_until_ms,
+            Some((now.unix_timestamp() + 900) * 1000)
+        );
+    }
+
     /// A network/transport probe failure (no HTTP status, not a timeout) stays a
     /// VISIBLE `Error` — a persistent connectivity problem (upstream down, DNS/TLS,
     /// a proxy-env regression) must never hide behind a benign "busy". Only
@@ -5882,6 +6105,7 @@ mod tests {
                     Err(ProbeError {
                         status: None,
                         message: "error sending request: connection refused".into(),
+                        retry_after_secs: None,
                     })
                 })
             }
@@ -10049,7 +10273,7 @@ mod tests {
             1
         );
 
-        manager.record_probe(0, ProbeStatus::Ok, None);
+        manager.record_probe(0, ProbeStatus::Ok, None, None);
 
         assert_eq!(
             manager.accounts.read().unwrap()[0].consecutive_probe_failures,

@@ -2,6 +2,8 @@
 
 use super::*;
 
+const PROBE_MAX_RETRY_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
+
 impl Manager {
     /// Record the health of account `idx`'s most recent probe. A failing probe
     /// stamps a visible status + message (never a silently-frozen bar), while an
@@ -11,7 +13,13 @@ impl Manager {
     /// quota evidence, and — on the sweep that crosses
     /// [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`] — says once, greppably, that
     /// keep-warm is giving up on waiting for this account.
-    pub fn record_probe(&self, idx: usize, status: ProbeStatus, error: Option<String>) {
+    pub fn record_probe(
+        &self,
+        idx: usize,
+        status: ProbeStatus,
+        error: Option<String>,
+        retry_after_secs: Option<u64>,
+    ) {
         let gave_up_waiting = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             let Some(account) = accounts.get_mut(idx) else {
@@ -29,6 +37,7 @@ impl Manager {
                 // `quota_known` on this path, and the run of failures is over.
                 ProbeStatus::Ok => {
                     account.consecutive_probe_failures = 0;
+                    account.probe_retry_after_ms = None;
                     false
                 }
                 // Not a terminal outcome; it says nothing either way.
@@ -36,6 +45,13 @@ impl Manager {
                 ProbeStatus::Error | ProbeStatus::Timeout | ProbeStatus::RateLimited => {
                     account.consecutive_probe_failures =
                         account.consecutive_probe_failures.saturating_add(1);
+                    if status == ProbeStatus::RateLimited {
+                        if let Some(seconds) = retry_after_secs {
+                            let delay = seconds.min(PROBE_MAX_RETRY_AFTER_SECS) as i64 * 1000;
+                            account.probe_retry_after_ms =
+                                Some(crate::now_ms().saturating_add(delay));
+                        }
+                    }
                     // The CROSSING probe only, so a probe that stays broken logs
                     // once rather than every cadence. An account whose quota we did
                     // read has nothing to give up on.
@@ -103,6 +119,7 @@ impl Manager {
                     && (!a.disabled || control == Some(*idx))
                     && (a.status != AccountStatus::Error
                         || cooldown_elapsed(a.error_retry_after_ms, now_ms))
+                    && a.probe_retry_after_ms.is_none_or(|until| now_ms >= until)
             })
             .map(|(idx, _)| idx)
             .collect()
@@ -170,7 +187,7 @@ impl Manager {
         match result {
             Ok(usage) => {
                 self.apply_usage(idx, &usage);
-                self.record_probe(idx, ProbeStatus::Ok, None);
+                self.record_probe(idx, ProbeStatus::Ok, None, None);
             }
             Err(err) => {
                 let msg = err.message.to_lowercase();
@@ -192,7 +209,7 @@ impl Manager {
                     None if is_timeout => ProbeStatus::Timeout,
                     None => ProbeStatus::Error,
                 };
-                self.record_probe(idx, status, Some(err.message));
+                self.record_probe(idx, status, Some(err.message), err.retry_after_secs);
             }
         }
     }

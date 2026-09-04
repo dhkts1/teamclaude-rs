@@ -378,7 +378,7 @@ fn get_parsed<T: std::str::FromStr>(headers: &impl HeaderView, name: &str) -> Op
 
 /// Parse a reset header. Unified resets are epoch **seconds**; standard resets
 /// may be an RFC3339 timestamp — try both.
-fn get_reset(headers: &impl HeaderView, name: &str) -> Option<OffsetDateTime> {
+pub(crate) fn get_reset(headers: &impl HeaderView, name: &str) -> Option<OffsetDateTime> {
     let raw = headers.get_str(name)?.trim();
     if let Ok(secs) = raw.parse::<i64>() {
         return OffsetDateTime::from_unix_timestamp(secs).ok();

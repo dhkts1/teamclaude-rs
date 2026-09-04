@@ -41,7 +41,7 @@ use time::OffsetDateTime;
 use crate::config;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, InFlightGuard,
-    Manager, SetControlOutcome, SetDisabledOutcome,
+    Manager, SetControlOutcome, SetDisabledOutcome, UnifiedRejectionKind,
 };
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
@@ -2109,6 +2109,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // account that already failed it, in a loop. An account leaves this set the
     // moment it is re-admitted, so membership always means "currently parked".
     let mut parked_transient: HashSet<usize> = HashSet::new();
+    let mut rejected_this_request: HashSet<usize> = HashSet::new();
     // Same-account transport retries this request has spent, per account. The
     // failing resource in a transport error is the CONNECTION, not the account:
     // reqwest pools by `(scheme, authority)` and the account is only a Bearer
@@ -2154,6 +2155,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
+        let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
+        rejected_this_request.retain(|idx| {
+            if manager.rejection_active(*idx, now_ms, request_is_fable) {
+                true
+            } else {
+                tried.remove(idx);
+                false
+            }
+        });
         let idx = match next_idx.take() {
             Some(i) => i,
             None => match manager.select_with_group(
@@ -2518,7 +2528,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             "upstream response"
         );
         let up_headers = resp.headers().clone();
-        manager.update_quota(idx, &up_headers);
+        let rejections = quota_rejections(&up_headers);
+        let rejection_hold = parse_retry_after(&up_headers).unwrap_or(60);
+        let rejection_hold = if status == StatusCode::TOO_MANY_REQUESTS {
+            jittered_quota_hold(rejection_hold, now.nanosecond())
+        } else {
+            rejection_hold
+        };
+        manager.update_quota_with_rejections(idx, &up_headers, rejection_hold, &rejections);
         // Any non-429 is live proof a rate-limit hold no longer binds.
         if status.as_u16() != 429 {
             manager.clear_rate_limited(idx);
@@ -2610,14 +2627,24 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
                 unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
                 unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
-                quota_rejected = is_quota_rejected(&up_headers),
+                quota_rejected = !rejections.is_empty(),
                 "429 diagnostic"
             );
             let retry_after_raw = parse_retry_after(&up_headers);
             let retry_after = retry_after_raw.unwrap_or(60);
-            if is_quota_rejected(&up_headers) {
-                manager.mark_rate_limited(idx, jittered_quota_hold(retry_after, now.nanosecond()));
+            if rejections
+                .iter()
+                .any(|kind| rejection_applies(*kind, request_is_fable))
+            {
+                if rejections
+                    .iter()
+                    .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
+                {
+                    manager
+                        .mark_rate_limited(idx, jittered_quota_hold(retry_after, now.nanosecond()));
+                }
                 tried.insert(idx);
+                rejected_this_request.insert(idx);
                 continue;
             }
             let count = retried_429.entry(idx).or_insert(0);
@@ -3470,25 +3497,48 @@ fn build_response(
 
 /// Parse a numeric `retry-after` header (seconds). RFC-date form is ignored (the
 /// caller falls back to a default), matching the JS proxy.
-fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
+pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
     headers
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok())
 }
 
-/// Is any unified rate-limit window reporting `rejected` (durable exhaustion)?
-fn is_quota_rejected(headers: &HeaderMap) -> bool {
-    let rejected = |name: &str| {
+/// Return each unified quota scope that reports durable exhaustion.
+fn quota_rejections(headers: &HeaderMap) -> Vec<UnifiedRejectionKind> {
+    let status = |name: &str, expected: &str| {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| s.eq_ignore_ascii_case("rejected"))
+            .is_some_and(|s| s.eq_ignore_ascii_case(expected))
     };
-    rejected("anthropic-ratelimit-unified-status")
-        || rejected("anthropic-ratelimit-unified-5h-status")
-        || rejected("anthropic-ratelimit-unified-7d-status")
-        || rejected("anthropic-ratelimit-unified-7d_oi-status")
+    let allowed = |name: &str| status(name, "allowed") || status(name, "allowed_warning");
+    let five_rejected = status("anthropic-ratelimit-unified-5h-status", "rejected");
+    let seven_rejected = status("anthropic-ratelimit-unified-7d-status", "rejected");
+    let fable_rejected = status("anthropic-ratelimit-unified-7d_oi-status", "rejected");
+    let shared_allowed = allowed("anthropic-ratelimit-unified-5h-status")
+        && allowed("anthropic-ratelimit-unified-7d-status");
+    let overall_rejected = status("anthropic-ratelimit-unified-status", "rejected")
+        && !(fable_rejected && shared_allowed);
+
+    [
+        (overall_rejected, UnifiedRejectionKind::Overall),
+        (five_rejected, UnifiedRejectionKind::FiveHour),
+        (seven_rejected, UnifiedRejectionKind::SevenDay),
+        (fable_rejected, UnifiedRejectionKind::FableWeekly),
+    ]
+    .into_iter()
+    .filter_map(|(rejected, kind)| rejected.then_some(kind))
+    .collect()
+}
+
+fn rejection_applies(kind: UnifiedRejectionKind, is_fable: bool) -> bool {
+    !matches!(kind, UnifiedRejectionKind::FableWeekly) || is_fable
+}
+
+#[cfg(test)]
+fn is_quota_rejected(headers: &HeaderMap) -> bool {
+    !quota_rejections(headers).is_empty()
 }
 
 /// Sum the input side of a `usage` object: base input plus cache-creation and
@@ -5174,6 +5224,20 @@ mod tests {
             HeaderValue::from_static("allowed_warning"),
         );
         assert!(!is_quota_rejected(&allowed));
+
+        let mut fable_only = HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ] {
+            fable_only.insert(name, HeaderValue::from_str(value).unwrap());
+        }
+        assert_eq!(
+            quota_rejections(&fable_only),
+            vec![UnifiedRejectionKind::FableWeekly]
+        );
     }
 
     /// Boot smoke test on a FREE port (never 3456): driven through `axum::serve`

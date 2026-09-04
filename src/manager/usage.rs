@@ -32,6 +32,16 @@ impl Manager {
     /// every one of them to consume the bool would be pure churn unrelated to
     /// this fix.
     pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) -> bool {
+        self.update_quota_with_rejections(idx, headers, 0, &[])
+    }
+
+    pub(crate) fn update_quota_with_rejections(
+        &self,
+        idx: usize,
+        headers: &reqwest::header::HeaderMap,
+        hold_seconds: i64,
+        rejections: &[UnifiedRejectionKind],
+    ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
@@ -48,6 +58,23 @@ impl Manager {
                     if read_five_hour {
                         account.consecutive_warms_without_evidence = 0;
                         account.warm_evidence_retry_after_ms = None;
+                    }
+                    clear_allowed_rejections(account, headers);
+                    if account.quota.status.as_deref() == Some("rejected")
+                        && rejections.contains(&UnifiedRejectionKind::FableWeekly)
+                        && !rejections.contains(&UnifiedRejectionKind::Overall)
+                        && header_is_allowed(headers, "anthropic-ratelimit-unified-5h-status")
+                        && header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status")
+                    {
+                        account.quota.status = None;
+                    }
+                    let hold_until = crate::now_ms().saturating_add(
+                        hold_seconds
+                            .clamp(0, MAX_RATE_LIMIT_HOLD_SECONDS)
+                            .saturating_mul(1000),
+                    );
+                    for kind in rejections {
+                        record_rejection(account, headers, *kind, hold_until);
                     }
                     (flipped, read_five_hour)
                 }
@@ -283,6 +310,7 @@ impl Manager {
             match accounts.get_mut(idx) {
                 Some(account) => {
                     account.quota.apply_usage(usage);
+                    clear_rejections_from_usage(account, usage);
                     let flipped = !account.quota_known;
                     account.quota_known = true;
                     flipped
@@ -355,6 +383,126 @@ impl Manager {
             prune_stream_errors(&mut account.stream_error_times_ms, now_ms);
             account.last_stream_error = Some(kind.to_string());
         }
+    }
+}
+
+fn header_is_allowed(headers: &reqwest::header::HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case("allowed") || value.eq_ignore_ascii_case("allowed_warning")
+        })
+}
+
+fn header_is_rejected(headers: &reqwest::header::HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("rejected"))
+}
+
+fn clear_allowed_rejections(account: &mut AccountRuntime, headers: &reqwest::header::HeaderMap) {
+    if header_is_allowed(headers, "anthropic-ratelimit-unified-status") {
+        account.overall_rejected_until_ms = None;
+        account.five_hour_rejected_until_ms = None;
+        account.seven_day_rejected_until_ms = None;
+    }
+    if header_is_allowed(headers, "anthropic-ratelimit-unified-5h-status") {
+        account.five_hour_rejected_until_ms = None;
+    }
+    if header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status") {
+        account.seven_day_rejected_until_ms = None;
+    }
+    if header_is_allowed(headers, "anthropic-ratelimit-unified-7d_oi-status") {
+        account.fable_rejected_until_ms = None;
+    }
+}
+
+fn header_reset_ms(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+    crate::quota::get_reset(headers, name)
+        .map(|reset| (reset.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+fn window_reset_ms(window: Option<crate::quota::QuotaWindow>) -> Option<i64> {
+    window
+        .and_then(|window| window.reset)
+        .map(|reset| (reset.unix_timestamp_nanos() / 1_000_000) as i64)
+}
+
+fn record_rejection(
+    account: &mut AccountRuntime,
+    headers: &reqwest::header::HeaderMap,
+    kind: UnifiedRejectionKind,
+    hold_until: i64,
+) {
+    let reset = match kind {
+        UnifiedRejectionKind::Overall => [
+            (
+                "anthropic-ratelimit-unified-5h-status",
+                "anthropic-ratelimit-unified-5h-reset",
+                account.quota.five_hour,
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-status",
+                "anthropic-ratelimit-unified-7d-reset",
+                account.quota.seven_day,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(status_name, reset_name, window)| {
+            let explicit = header_is_rejected(headers, status_name);
+            let inferred = window.is_some_and(|window| window.utilization >= 1.0);
+            let has_current_status = headers.contains_key(status_name);
+            (explicit || (!has_current_status && inferred))
+                .then(|| header_reset_ms(headers, reset_name).or_else(|| window_reset_ms(window)))
+                .flatten()
+        })
+        .max(),
+        UnifiedRejectionKind::FiveHour => {
+            header_reset_ms(headers, "anthropic-ratelimit-unified-5h-reset")
+                .or_else(|| window_reset_ms(account.quota.five_hour))
+        }
+        UnifiedRejectionKind::SevenDay => {
+            header_reset_ms(headers, "anthropic-ratelimit-unified-7d-reset")
+                .or_else(|| window_reset_ms(account.quota.seven_day))
+        }
+        UnifiedRejectionKind::FableWeekly => {
+            header_reset_ms(headers, "anthropic-ratelimit-unified-7d_oi-reset")
+                .or_else(|| window_reset_ms(account.quota.seven_day_oi))
+        }
+    };
+    let until = reset.map_or(hold_until, |reset| reset.max(hold_until));
+    let slot = match kind {
+        UnifiedRejectionKind::Overall => &mut account.overall_rejected_until_ms,
+        UnifiedRejectionKind::FiveHour => &mut account.five_hour_rejected_until_ms,
+        UnifiedRejectionKind::SevenDay => &mut account.seven_day_rejected_until_ms,
+        UnifiedRejectionKind::FableWeekly => &mut account.fable_rejected_until_ms,
+    };
+    *slot = Some(slot.map_or(until, |current| current.max(until)));
+}
+
+fn bucket_is_below_limit(bucket: Option<&crate::probe::UsageBucket>) -> bool {
+    bucket
+        .and_then(|bucket| bucket.utilization)
+        .is_some_and(|utilization| utilization < 1.0)
+}
+
+fn clear_rejections_from_usage(account: &mut AccountRuntime, usage: &Usage) {
+    let five_hour_allowed = bucket_is_below_limit(usage.five_hour.as_ref());
+    let seven_day_allowed = bucket_is_below_limit(usage.seven_day.as_ref());
+    if five_hour_allowed {
+        account.five_hour_rejected_until_ms = None;
+    }
+    if seven_day_allowed {
+        account.seven_day_rejected_until_ms = None;
+    }
+    if bucket_is_below_limit(usage.seven_day_oi.as_ref()) {
+        account.fable_rejected_until_ms = None;
+    }
+    if five_hour_allowed && seven_day_allowed {
+        account.overall_rejected_until_ms = None;
+        account.quota.status = None;
     }
 }
 

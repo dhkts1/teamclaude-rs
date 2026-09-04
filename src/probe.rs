@@ -78,6 +78,7 @@ pub struct Usage {
 pub struct ProbeError {
     pub status: Option<u16>,
     pub message: String,
+    pub retry_after_secs: Option<u64>,
 }
 
 /// Parse a percentage-ish JSON scalar (number or numeric string) to `f64`.
@@ -206,10 +207,13 @@ pub async fn fetch_usage(
         .map_err(|e| ProbeError {
             status: None,
             message: e.to_string(),
+            retry_after_secs: None,
         })?;
 
     let status = resp.status();
     if !status.is_success() {
+        let retry_after_secs = crate::proxy::parse_retry_after(resp.headers())
+            .and_then(|seconds| u64::try_from(seconds).ok());
         let detail = resp.text().await.unwrap_or_default();
         let detail = detail.chars().take(200).collect::<String>();
         return Err(ProbeError {
@@ -219,12 +223,14 @@ pub async fn fetch_usage(
             } else {
                 detail
             },
+            retry_after_secs,
         });
     }
 
     let data: Value = resp.json().await.map_err(|e| ProbeError {
         status: Some(status.as_u16()),
         message: e.to_string(),
+        retry_after_secs: None,
     })?;
     Ok(usage_from_payload(&data))
 }

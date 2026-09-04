@@ -148,6 +148,7 @@ impl UsageProber for NeverProbes {
             Err(ProbeError {
                 status: None,
                 message: "no prober in workload tests".into(),
+                retry_after_secs: None,
             })
         })
     }
