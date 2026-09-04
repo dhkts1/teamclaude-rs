@@ -6062,6 +6062,83 @@ mod tests {
     }
 
     #[test]
+    fn partial_probe_clears_its_only_rejected_scope() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ] {
+            headers.insert(
+                reqwest::header::HeaderName::from_static(name),
+                reqwest::header::HeaderValue::from_static(value),
+            );
+        }
+        manager.update_quota_with_rejections(0, &headers, 3600, &[UnifiedRejectionKind::FiveHour]);
+
+        manager.apply_usage(
+            0,
+            &Usage {
+                five_hour: Some(UsageBucket {
+                    utilization: Some(0.25),
+                    reset_at_ms: Some(crate::now_ms() + 3_600_000),
+                }),
+                seven_day: None,
+                seven_day_oi: None,
+            },
+        );
+
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            Some(0),
+            "the partial probe cleared its one known rejected scope"
+        );
+    }
+
+    #[test]
+    fn live_allowed_status_clears_the_last_scoped_rejection() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let mut rejected = reqwest::header::HeaderMap::new();
+        rejected.insert(
+            "anthropic-ratelimit-unified-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        rejected.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("rejected"),
+        );
+        manager.update_quota_with_rejections(0, &rejected, 3600, &[UnifiedRejectionKind::FiveHour]);
+
+        let mut allowed = reqwest::header::HeaderMap::new();
+        allowed.insert(
+            "anthropic-ratelimit-unified-5h-status",
+            reqwest::header::HeaderValue::from_static("allowed"),
+        );
+        manager.update_quota_with_rejections(0, &allowed, 0, &[]);
+
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                OffsetDateTime::now_utc(),
+                Some("claude-opus-4-6"),
+                None,
+                "/v1/messages",
+                None,
+            ),
+            Some(0),
+            "live scope recovery must not expose stale aggregate text as a hard gate"
+        );
+    }
+
+    #[test]
     fn reset_only_rejection_uses_the_latest_reported_shared_reset() {
         let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
         let now = OffsetDateTime::now_utc().unix_timestamp();
@@ -6148,20 +6225,13 @@ mod tests {
                 .unwrap(),
         );
 
-        manager.update_quota_with_rejections(
-            0,
-            &headers,
-            120,
-            &[
-                UnifiedRejectionKind::Overall,
-                UnifiedRejectionKind::FiveHour,
-            ],
-        );
+        manager.update_quota_with_rejections(0, &headers, 120, &[UnifiedRejectionKind::FiveHour]);
 
         {
             let accounts = manager.accounts.read().unwrap();
+            assert_eq!(accounts[0].overall_rejected_until_ms, None);
             assert_eq!(
-                accounts[0].overall_rejected_until_ms,
+                accounts[0].five_hour_rejected_until_ms,
                 Some((now.unix_timestamp() + 900) * 1000)
             );
             assert!(
@@ -6237,15 +6307,7 @@ mod tests {
                 .unwrap(),
         );
 
-        manager.update_quota_with_rejections(
-            0,
-            &headers,
-            120,
-            &[
-                UnifiedRejectionKind::Overall,
-                UnifiedRejectionKind::FiveHour,
-            ],
-        );
+        manager.update_quota_with_rejections(0, &headers, 120, &[UnifiedRejectionKind::FiveHour]);
 
         assert_eq!(
             manager.accounts.read().unwrap()[0].overall_rejected_until_ms,

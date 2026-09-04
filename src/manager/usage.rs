@@ -59,19 +59,17 @@ impl Manager {
                         account.consecutive_warms_without_evidence = 0;
                         account.warm_evidence_retry_after_ms = None;
                     }
-                    clear_allowed_rejections(account, headers);
-                    if rejections.contains(&UnifiedRejectionKind::Overall)
-                        && [
-                            "anthropic-ratelimit-unified-5h-status",
-                            "anthropic-ratelimit-unified-7d-status",
-                        ]
-                        .iter()
-                        .all(|name| {
-                            header_is_allowed(headers, name) || header_is_rejected(headers, name)
-                        })
-                    {
-                        // Current scope evidence replaces the prior aggregate.
-                        // record_rejection rebuilds it from this response below.
+                    let cleared_modeled_rejection = clear_allowed_rejections(account, headers);
+                    if [
+                        "anthropic-ratelimit-unified-5h-status",
+                        "anthropic-ratelimit-unified-7d-status",
+                    ]
+                    .iter()
+                    .all(|name| {
+                        header_is_allowed(headers, name) || header_is_rejected(headers, name)
+                    }) {
+                        // Complete current scope evidence replaces any older
+                        // aggregate whose cause was not known.
                         account.overall_rejected_until_ms = None;
                     }
                     if account.quota.status.as_deref() == Some("rejected")
@@ -90,6 +88,21 @@ impl Manager {
                     );
                     for kind in rejections {
                         record_rejection(account, headers, *kind, hold_until);
+                    }
+                    let has_scoped_rejection = account.five_hour_rejected_until_ms.is_some()
+                        || account.seven_day_rejected_until_ms.is_some()
+                        || account.fable_rejected_until_ms.is_some();
+                    let recorded_scoped_rejection = rejections
+                        .iter()
+                        .any(|kind| !matches!(kind, UnifiedRejectionKind::Overall));
+                    if account.overall_rejected_until_ms.is_none()
+                        && (cleared_modeled_rejection
+                            || has_scoped_rejection
+                            || recorded_scoped_rejection)
+                    {
+                        // The structured markers now own this verdict. Do not
+                        // expose the raw aggregate text as a legacy permanent gate.
+                        account.quota.status = None;
                     }
                     (flipped, read_five_hour)
                 }
@@ -417,11 +430,15 @@ fn header_is_rejected(headers: &reqwest::header::HeaderMap, name: &str) -> bool 
         .is_some_and(|value| value.eq_ignore_ascii_case("rejected"))
 }
 
-fn clear_allowed_rejections(account: &mut AccountRuntime, headers: &reqwest::header::HeaderMap) {
+fn clear_allowed_rejections(
+    account: &mut AccountRuntime,
+    headers: &reqwest::header::HeaderMap,
+) -> bool {
+    let mut cleared = false;
     if header_is_allowed(headers, "anthropic-ratelimit-unified-status") {
-        account.overall_rejected_until_ms = None;
-        account.five_hour_rejected_until_ms = None;
-        account.seven_day_rejected_until_ms = None;
+        cleared |= account.overall_rejected_until_ms.take().is_some();
+        cleared |= account.five_hour_rejected_until_ms.take().is_some();
+        cleared |= account.seven_day_rejected_until_ms.take().is_some();
         clear_stale_full_window(
             &mut account.quota.five_hour,
             headers,
@@ -434,7 +451,7 @@ fn clear_allowed_rejections(account: &mut AccountRuntime, headers: &reqwest::hea
         );
     }
     if header_is_allowed(headers, "anthropic-ratelimit-unified-5h-status") {
-        account.five_hour_rejected_until_ms = None;
+        cleared |= account.five_hour_rejected_until_ms.take().is_some();
         clear_stale_full_window(
             &mut account.quota.five_hour,
             headers,
@@ -442,7 +459,7 @@ fn clear_allowed_rejections(account: &mut AccountRuntime, headers: &reqwest::hea
         );
     }
     if header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status") {
-        account.seven_day_rejected_until_ms = None;
+        cleared |= account.seven_day_rejected_until_ms.take().is_some();
         clear_stale_full_window(
             &mut account.quota.seven_day,
             headers,
@@ -450,13 +467,14 @@ fn clear_allowed_rejections(account: &mut AccountRuntime, headers: &reqwest::hea
         );
     }
     if header_is_allowed(headers, "anthropic-ratelimit-unified-7d_oi-status") {
-        account.fable_rejected_until_ms = None;
+        cleared |= account.fable_rejected_until_ms.take().is_some();
         clear_stale_full_window(
             &mut account.quota.seven_day_oi,
             headers,
             "anthropic-ratelimit-unified-7d_oi-utilization",
         );
     }
+    cleared
 }
 
 fn clear_stale_full_window(
@@ -544,6 +562,8 @@ fn bucket_is_below_limit(bucket: Option<&crate::probe::UsageBucket>) -> bool {
 }
 
 fn clear_rejections_from_usage(account: &mut AccountRuntime, usage: &Usage) {
+    let had_five_hour_rejection = account.five_hour_rejected_until_ms.is_some();
+    let had_seven_day_rejection = account.seven_day_rejected_until_ms.is_some();
     let five_hour_allowed = bucket_is_below_limit(usage.five_hour.as_ref());
     let seven_day_allowed = bucket_is_below_limit(usage.seven_day.as_ref());
     if five_hour_allowed {
@@ -555,8 +575,20 @@ fn clear_rejections_from_usage(account: &mut AccountRuntime, usage: &Usage) {
     if bucket_is_below_limit(usage.seven_day_oi.as_ref()) {
         account.fable_rejected_until_ms = None;
     }
+    let now_ms = crate::now_ms();
+    let cleared_a_known_shared_rejection = (five_hour_allowed && had_five_hour_rejection)
+        || (seven_day_allowed && had_seven_day_rejection);
+    let all_known_shared_rejections_cleared = cleared_a_known_shared_rejection
+        && account
+            .five_hour_rejected_until_ms
+            .is_none_or(|until| until <= now_ms)
+        && account
+            .seven_day_rejected_until_ms
+            .is_none_or(|until| until <= now_ms);
     if five_hour_allowed && seven_day_allowed {
         account.overall_rejected_until_ms = None;
+    }
+    if (five_hour_allowed && seven_day_allowed) || all_known_shared_rejections_cleared {
         account.quota.status = None;
     }
 }

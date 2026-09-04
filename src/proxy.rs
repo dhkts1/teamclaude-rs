@@ -3532,6 +3532,8 @@ fn quota_rejections(headers: &HeaderMap) -> Vec<UnifiedRejectionKind> {
     let shared_allowed = allowed("anthropic-ratelimit-unified-5h-status")
         && allowed("anthropic-ratelimit-unified-7d-status");
     let overall_rejected = status("anthropic-ratelimit-unified-status", "rejected")
+        && !five_rejected
+        && !seven_rejected
         && !(fable_rejected && shared_allowed);
 
     [
@@ -5250,6 +5252,20 @@ mod tests {
         assert_eq!(
             quota_rejections(&fable_only),
             vec![UnifiedRejectionKind::FableWeekly]
+        );
+
+        let mut five_hour_only = HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "rejected"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ] {
+            five_hour_only.insert(name, HeaderValue::from_str(value).unwrap());
+        }
+        assert_eq!(
+            quota_rejections(&five_hour_only),
+            vec![UnifiedRejectionKind::FiveHour],
+            "a known scope must not also create a duplicate overall rejection"
         );
     }
 

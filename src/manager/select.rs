@@ -1524,6 +1524,9 @@ impl Manager {
         }
         if account.quota.status.as_deref() == Some("rejected")
             && account.overall_rejected_until_ms.is_none()
+            && account.five_hour_rejected_until_ms.is_none()
+            && account.seven_day_rejected_until_ms.is_none()
+            && account.fable_rejected_until_ms.is_none()
         {
             return Some(GateReason::Rejected);
         }
@@ -1737,6 +1740,9 @@ impl Manager {
         }
         if account.quota.status.as_deref() == Some("rejected")
             && account.overall_rejected_until_ms.is_none()
+            && account.five_hour_rejected_until_ms.is_none()
+            && account.seven_day_rejected_until_ms.is_none()
+            && account.fable_rejected_until_ms.is_none()
         {
             return false;
         }
