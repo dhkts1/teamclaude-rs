@@ -340,6 +340,8 @@ pub struct AccountRuntime {
     pub probe_status: ProbeStatus,
     pub last_probe_ms: Option<i64>,
     pub probe_error: Option<String>,
+    /// The next permitted usage probe time, from an upstream `retry-after` header.
+    pub probe_retry_after_ms: Option<i64>,
     /// Wall-clock ms of each stream failure observed on a stream this account
     /// served (see [`Manager::record_stream_error`]): an in-band SSE `error`
     /// event, or a stream that hit EOF without Anthropic's `message_stop`
@@ -623,6 +625,7 @@ impl AccountRuntime {
             probe_status: ProbeStatus::Never,
             last_probe_ms: None,
             probe_error: None,
+            probe_retry_after_ms: None,
             stream_error_times_ms: VecDeque::new(),
             last_stream_error: None,
             refresh_lock: Arc::new(AsyncMutex::new(())),
@@ -3156,6 +3159,7 @@ mod tests {
                 Err(ProbeError {
                     status: None,
                     message: "no prober configured".into(),
+                    retry_after_secs: None,
                 })
             })
         }
@@ -3183,6 +3187,7 @@ mod tests {
                     Err(ProbeError {
                         status: Some(500),
                         message: "upstream boom".into(),
+                        retry_after_secs: None,
                     })
                 }
             })
@@ -3194,6 +3199,23 @@ mod tests {
     /// last-good utilization and reads as `RateLimited`, not `Error`.
     struct FirstOkThen429Prober {
         calls: Arc<AtomicUsize>,
+    }
+
+    struct RetryAfterProber {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl UsageProber for RetryAfterProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ProbeError {
+                    status: Some(429),
+                    message: "Too Many Requests".into(),
+                    retry_after_secs: Some(3600),
+                })
+            })
+        }
     }
     impl UsageProber for FirstOkThen429Prober {
         fn probe(&self, _access_token: String) -> ProbeFuture {
@@ -3212,6 +3234,7 @@ mod tests {
                     Err(ProbeError {
                         status: Some(429),
                         message: "Too Many Requests".into(),
+                        retry_after_secs: None,
                     })
                 }
             })
@@ -5868,6 +5891,47 @@ mod tests {
         assert!(snap.accounts[0].probe_error.is_some());
     }
 
+    #[tokio::test]
+    async fn probe_retry_after_blocks_the_next_probe_until_it_expires() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(RetryAfterProber {
+                calls: Arc::clone(&calls),
+            }),
+        );
+
+        manager.probe_all().await;
+        manager.probe_all().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        manager.accounts.write().unwrap()[0].probe_retry_after_ms = Some(crate::now_ms() - 1);
+        manager.probe_all().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn probe_retry_after_has_a_seven_day_safety_cap() {
+        let manager = build_manager(config_with(vec![account("a", 0)]), pacing_refresher());
+        let before = crate::now_ms();
+
+        manager.record_probe(
+            0,
+            ProbeStatus::RateLimited,
+            Some("rate limited".to_string()),
+            Some(u64::MAX),
+        );
+
+        let deadline = manager.accounts.read().unwrap()[0]
+            .probe_retry_after_ms
+            .unwrap();
+        assert!(deadline >= before + 7 * 24 * 60 * 60 * 1000);
+        assert!(deadline <= crate::now_ms() + 7 * 24 * 60 * 60 * 1000);
+    }
+
     /// A network/transport probe failure (no HTTP status, not a timeout) stays a
     /// VISIBLE `Error` — a persistent connectivity problem (upstream down, DNS/TLS,
     /// a proxy-env regression) must never hide behind a benign "busy". Only
@@ -5882,6 +5946,7 @@ mod tests {
                     Err(ProbeError {
                         status: None,
                         message: "error sending request: connection refused".into(),
+                        retry_after_secs: None,
                     })
                 })
             }
@@ -10049,7 +10114,7 @@ mod tests {
             1
         );
 
-        manager.record_probe(0, ProbeStatus::Ok, None);
+        manager.record_probe(0, ProbeStatus::Ok, None, None);
 
         assert_eq!(
             manager.accounts.read().unwrap()[0].consecutive_probe_failures,

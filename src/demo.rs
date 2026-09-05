@@ -78,6 +78,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         probe_status: ProbeStatus::Ok,
         last_probe_ms: Some(now - 12_000),
         probe_error: None,
+        probe_retry_after_ms: None,
         stream_error_times_ms: std::collections::VecDeque::new(),
         last_stream_error: None,
         refresh_lock: Arc::new(AsyncMutex::new(())),

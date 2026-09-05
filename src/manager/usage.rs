@@ -306,6 +306,27 @@ impl Manager {
     /// after the bounded hold, and either serves or is re-held. Durable
     /// exhaustion is separately kept out of rotation by the
     /// learned quota utilization, not by this short-term hold.
+    /// Record a MODEL-SCOPED quota rejection for account `idx` — upstream said
+    /// `rejected` on the `7d_oi` scope while both shared scopes stayed allowed
+    /// (issue #178). The deliberate contrast with [`Self::mark_rate_limited`] is
+    /// that this is not an account-level hold at all: it writes the rejection
+    /// into the learned `seven_day_oi` window, which is the durable-exhaustion
+    /// channel the doc-comment above names, and which the selector already reads
+    /// for exactly this model class ([`crate::quota::Quota::model_weekly_exhausted`],
+    /// `Manager::model_blocked`). So the account keeps serving every other model,
+    /// and the rejection frees at its own reset with no second deadline to
+    /// reconcile. See [`crate::quota::Quota::reject_model_weekly`].
+    pub fn mark_model_weekly_rejected(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            account.quota.reject_model_weekly(headers);
+            tracing::info!(
+                account = %account.name,
+                "model-scoped weekly quota rejection recorded"
+            );
+        }
+    }
+
     pub fn mark_rate_limited(&self, idx: usize, seconds: i64) {
         let hold = seconds.clamp(0, MAX_RATE_LIMIT_HOLD_SECONDS);
         let until = crate::now_ms() + hold * 1000;

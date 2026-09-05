@@ -4641,6 +4641,7 @@ mod tests {
                 Err(crate::probe::ProbeError {
                     status: Some(401),
                     message: "HTTP 401: token expired".to_string(),
+                    retry_after_secs: None,
                 })
             })
         }

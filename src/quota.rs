@@ -164,10 +164,41 @@ impl Quota {
                 utilization: util,
                 reset,
             });
+        } else if scope_is_allowed(headers, "anthropic-ratelimit-unified-7d_oi-status")
+            && self.seven_day_oi.is_some_and(|w| w.utilization >= 1.0)
+        {
+            // An `allowed` verdict for this scope carrying no utilization number is
+            // still first-hand evidence, and it is how a rejection recorded by
+            // [`Self::reject_model_weekly`] recovers before its reset. Overwrite the
+            // window with allowed evidence rather than dropping it: a dropped window
+            // loses its `reset`, which is what `account_gate` turns into the
+            // "frees at" the exhausted-fleet response reports.
+            let reported = get_reset(headers, "anthropic-ratelimit-unified-7d_oi-reset");
+            self.seven_day_oi = Some(QuotaWindow {
+                utilization: 0.0,
+                reset: resolve_reset(
+                    reported,
+                    self.seven_day_oi.and_then(|w| w.reset),
+                    now,
+                    SEVEN_DAY,
+                ),
+            });
         }
 
         if let Some(status) = headers.get_str("anthropic-ratelimit-unified-status") {
-            self.status = Some(status.to_string());
+            // The aggregate `rejected` is a terminal account gate
+            // (`Manager::account_terminal_gate`), so it must not be stored when the
+            // sub-scope headers say the rejection is model-scoped: the account still
+            // serves every other model class, and the scope is already recorded in
+            // `seven_day_oi`. Any other rejection — including one no sub-scope
+            // explains — still applies account-wide. See issue #178.
+            let model_scoped = matches!(
+                quota_rejections(headers).as_slice(),
+                [UnifiedRejectionKind::FableWeekly]
+            );
+            if !model_scoped {
+                self.status = Some(status.to_string());
+            }
         }
 
         if let Some(v) = get_parsed::<i64>(headers, "anthropic-ratelimit-tokens-limit") {
@@ -234,6 +265,30 @@ impl Quota {
     pub fn model_weekly_exhausted(&self, threshold: f64, now: OffsetDateTime) -> bool {
         self.seven_day_oi
             .is_some_and(|w| w.effective(now) >= threshold)
+    }
+
+    /// Record a model-scoped weekly rejection — upstream answered `rejected` on
+    /// `7d_oi` while both shared scopes stayed allowed (issue #178) — by writing
+    /// full utilization into the window the selector ALREADY gates Fable on. No
+    /// separate deadline is kept: [`Self::model_weekly_exhausted`] reads this
+    /// window live, so the rejection self-frees at its reset, and every existing
+    /// path that learns a `7d_oi` utilization or an `allowed` verdict overwrites
+    /// it. The reset comes from the matching header when present and otherwise
+    /// from [`resolve_reset`], which inherits the known reset and, failing that,
+    /// bounds the gate at one window — the account is never benched forever, and
+    /// the shared windows are untouched so Opus and Sonnet stay eligible.
+    pub fn reject_model_weekly(&mut self, headers: &impl HeaderView) {
+        let now = OffsetDateTime::now_utc();
+        let reported = get_reset(headers, "anthropic-ratelimit-unified-7d_oi-reset");
+        self.seven_day_oi = Some(QuotaWindow {
+            utilization: 1.0,
+            reset: resolve_reset(
+                reported,
+                self.seven_day_oi.and_then(|w| w.reset),
+                now,
+                SEVEN_DAY,
+            ),
+        });
     }
 
     /// Highest utilization across the dimensions that govern this request at `now`
@@ -384,6 +439,65 @@ fn get_reset(headers: &impl HeaderView, name: &str) -> Option<OffsetDateTime> {
         return OffsetDateTime::from_unix_timestamp(secs).ok();
     }
     OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
+}
+
+/// One scope of the unified rate limit, as reported by the `unified-*-status`
+/// header family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedRejectionKind {
+    /// The aggregate `unified-status`, when no sub-scope explains it.
+    Overall,
+    /// The shared 5-hour session window.
+    FiveHour,
+    /// The shared weekly window.
+    SevenDay,
+    /// The model-scoped weekly window (`7d_oi`, the Fable weekly).
+    FableWeekly,
+}
+
+fn header_says(headers: &impl HeaderView, name: &str, expected: &str) -> bool {
+    headers
+        .get_str(name)
+        .is_some_and(|s| s.eq_ignore_ascii_case(expected))
+}
+
+/// Does this scope report an allowed verdict (`allowed` or `allowed_warning`)?
+fn scope_is_allowed(headers: &impl HeaderView, name: &str) -> bool {
+    header_says(headers, name, "allowed") || header_says(headers, name, "allowed_warning")
+}
+
+/// Return each unified quota scope that reports durable exhaustion.
+///
+/// The aggregate `unified-status` is reported as [`UnifiedRejectionKind::Overall`]
+/// only when no sub-scope explains it, because upstream sets the aggregate to
+/// `rejected` whenever ANY scope is — so a Fable-only weekly rejection arrives
+/// with `unified-status: rejected`, `5h: allowed`, `7d: allowed_warning` and
+/// reads account-wide if the aggregate is taken at face value. That is issue
+/// #178: one Fable 429 benched a whole account for every model.
+///
+/// Written by YogevKr; verified by hand against the header block in #178.
+pub fn quota_rejections(headers: &impl HeaderView) -> Vec<UnifiedRejectionKind> {
+    let status = |name: &str, expected: &str| header_says(headers, name, expected);
+    let allowed = |name: &str| scope_is_allowed(headers, name);
+    let five_rejected = status("anthropic-ratelimit-unified-5h-status", "rejected");
+    let seven_rejected = status("anthropic-ratelimit-unified-7d-status", "rejected");
+    let fable_rejected = status("anthropic-ratelimit-unified-7d_oi-status", "rejected");
+    let shared_allowed = allowed("anthropic-ratelimit-unified-5h-status")
+        && allowed("anthropic-ratelimit-unified-7d-status");
+    let overall_rejected = status("anthropic-ratelimit-unified-status", "rejected")
+        && !five_rejected
+        && !seven_rejected
+        && !(fable_rejected && shared_allowed);
+
+    [
+        (overall_rejected, UnifiedRejectionKind::Overall),
+        (five_rejected, UnifiedRejectionKind::FiveHour),
+        (seven_rejected, UnifiedRejectionKind::SevenDay),
+        (fable_rejected, UnifiedRejectionKind::FableWeekly),
+    ]
+    .into_iter()
+    .filter_map(|(rejected, kind)| rejected.then_some(kind))
+    .collect()
 }
 
 #[cfg(test)]
@@ -816,5 +930,76 @@ mod tests {
             ..Quota::default()
         };
         assert!(!quota.is_near(0.90, now));
+    }
+
+    /// The exact header block from issue #178, applied the way a 429 applies it:
+    /// the account must come out blocked for Fable and eligible for everything
+    /// else. Both halves are asserted, because the bug was that the shared
+    /// windows went down with the model-scoped one.
+    #[test]
+    fn the_issue_178_header_block_blocks_only_fable() {
+        let now = OffsetDateTime::now_utc();
+        let headers = TestHeaders::new(&[
+            ("anthropic-ratelimit-unified-status", "rejected"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed_warning"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "rejected"),
+        ]);
+        let mut quota = Quota::default();
+        let _ = quota.update_from_headers(&headers);
+        quota.reject_model_weekly(&headers);
+
+        assert!(
+            quota.model_weekly_exhausted(0.90, now),
+            "the Fable weekly scope must read exhausted"
+        );
+        assert!(
+            !quota.is_near(0.90, now),
+            "the shared windows must stay allowed, so Opus and Sonnet still route here"
+        );
+        assert_ne!(
+            quota.status.as_deref(),
+            Some("rejected"),
+            "the aggregate must not be stored account-wide when a sub-scope explains it \
+             — `Manager::account_terminal_gate` reads it as a terminal gate"
+        );
+    }
+
+    /// Step 5/6 of issue #178's repro: a later response whose `7d_oi` scope reads
+    /// allowed clears the rejection. The window itself must survive — dropping it
+    /// would lose the `reset` that the exhausted-fleet response reports as "frees
+    /// at", which is the regression F-04 of the branch review named.
+    #[test]
+    fn allowed_seven_day_oi_status_clears_the_rejection_without_nulling_the_window() {
+        let now = OffsetDateTime::now_utc();
+        let reset_secs = (now + Duration::days(3)).unix_timestamp();
+        let mut quota = Quota::default();
+        quota.reject_model_weekly(&TestHeaders::new(&[(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            &reset_secs.to_string(),
+        )]));
+        assert!(quota.model_weekly_exhausted(0.90, now));
+
+        let allowed = TestHeaders::new(&[
+            ("anthropic-ratelimit-unified-status", "allowed"),
+            ("anthropic-ratelimit-unified-5h-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d-status", "allowed"),
+            ("anthropic-ratelimit-unified-7d_oi-status", "allowed"),
+        ]);
+        let _ = quota.update_from_headers(&allowed);
+
+        assert!(
+            !quota.model_weekly_exhausted(0.90, now),
+            "an allowed verdict on this scope must free Fable again"
+        );
+        let window = quota
+            .seven_day_oi
+            .expect("the learned window must survive the recovery, reset and all");
+        assert_eq!(window.utilization, 0.0);
+        assert_eq!(
+            window.reset.map(OffsetDateTime::unix_timestamp),
+            Some(reset_secs),
+            "the known reset must be inherited, not re-synthesized"
+        );
     }
 }

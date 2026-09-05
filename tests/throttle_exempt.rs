@@ -75,6 +75,7 @@ impl UsageProber for NeverProbes {
             Err(ProbeError {
                 status: None,
                 message: "no prober in throttle tests".into(),
+                retry_after_secs: None,
             })
         })
     }
