@@ -292,13 +292,27 @@ enum RenderStates {
         // `"null"` is the not-measured row — an older proxy, or an offline
         // read — and it must render as an EMPTY slot, never as `$0.00`; see
         // `unmeasuredUsage` and scene `14-usage-stats`.
-        usage: String = measuredUsage
+        usage: String = measuredUsage,
+        // Group labels, wire fields `"groups"`/`"reservedGroups"`
+        // (`FleetStatus.swift:933-953`). `nil` omits both keys entirely, the
+        // shape every existing call site keeps decoding — see
+        // `Account.groups`'s own doc-comment on why a missing key and an
+        // empty array are kept distinct rather than collapsed.
+        groups: [String]? = nil,
+        reservedGroups: [String]? = nil
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
             let at = Date().addingTimeInterval(Double(minutes) * 60)
             return "\(Int64(at.timeIntervalSince1970 * 1000))"
         }
+        func jsonArray(_ values: [String]) -> String {
+            "[" + values.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+        }
+        let groupsFragment =
+            groups.map { g in
+                "\"groups\":\(jsonArray(g)),\"reservedGroups\":\(jsonArray(reservedGroups ?? [])),"
+            } ?? ""
         let fh = fiveHour ?? quota
         let fhState = fiveHourState ?? state
         let sd = sevenDay ?? quota
@@ -319,7 +333,7 @@ enum RenderStates {
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
              "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
              "sevenDayOi":\(sevenDayOi),"sevenDayOiState":\(quote(sevenDayOiState)),
-             "held":\(held),
+             \(groupsFragment)"held":\(held),
              "fiveHourResetAtMs":\(resetAtMs(fiveHourResetInMinutes)),
              "sevenDayResetAtMs":\(resetAtMs(sevenDayResetInMinutes)),
              "sevenDayOiResetAtMs":\(resetAtMs(sevenDayOiResetInMinutes)),
@@ -486,7 +500,7 @@ enum RenderStates {
     /// are scene 14's job.
     private static var healthyJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498)),"
-            + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok"))]"
+            + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"]))]"
     }
 
     /// The bug this scene exists to catch: a 7d-red account must not paint
