@@ -476,6 +476,22 @@ pub fn installer_url_for_tag(tag: &str) -> anyhow::Result<String> {
     ))
 }
 
+/// The TcrBar dmg asset URL for one specific tag.
+///
+/// Same tag-pinning and same validation as [`installer_url_for_tag`], and for
+/// the same reason: the tag is interpolated into a URL PATH. The asset name
+/// drops a leading `v` from the tag (`.github/workflows/release-app.yml`
+/// names the dmg `TcrBar-<version>.dmg`, not `TcrBar-<tag>.dmg`), so a tag of
+/// `v0.2.32` resolves to `TcrBar-0.2.32.dmg`, and a tag with no leading `v`
+/// resolves to a name equal to itself.
+pub fn dmg_url_for_tag(tag: &str) -> anyhow::Result<String> {
+    validate_release_tag(tag)?;
+    let version = tag.strip_prefix('v').unwrap_or(tag);
+    Ok(format!(
+        "https://github.com/{RELEASE_REPO}/releases/download/{tag}/TcrBar-{version}.dmg"
+    ))
+}
+
 /// Accept only a release tag shape: `^v?[0-9A-Za-z][0-9A-Za-z.+_-]*$`.
 ///
 /// Written as an explicit character test rather than a regex because the crate
@@ -582,6 +598,31 @@ fn fetch_bytes(url: &str, accept: &str) -> anyhow::Result<Vec<u8>> {
         Ok(result) => result,
         Err(_) => bail!("the download thread panicked"),
     }
+}
+
+/// Resolve the newest published release's tag.
+///
+/// Composes [`latest_release_api_url`], the shared [`fetch_bytes`] HTTP
+/// client, and [`parse_latest_tag`] into the one call a caller outside this
+/// module needs — `fetch_bytes` itself stays private so there is exactly one
+/// place that builds the `https_only` reqwest client this module relies on
+/// for chain of custody.
+pub fn fetch_latest_release_tag() -> anyhow::Result<String> {
+    let body = fetch_bytes(&latest_release_api_url(), "application/vnd.github+json")
+        .context("could not reach the GitHub releases API")?;
+    parse_latest_tag(&String::from_utf8_lossy(&body))
+}
+
+/// Download the TcrBar dmg for `tag` to `dest`, using the same HTTP client
+/// (and the same TLS-only chain-of-custody guard) `tcr update` uses for the
+/// CLI installer script.
+pub fn download_tcrbar_dmg(tag: &str, dest: &Path) -> anyhow::Result<()> {
+    let url = dmg_url_for_tag(tag)?;
+    let bytes = fetch_bytes(&url, "application/octet-stream")
+        .with_context(|| format!("could not download the TcrBar dmg from {url}"))?;
+    std::fs::write(dest, &bytes)
+        .with_context(|| format!("could not write the downloaded dmg to {}", dest.display()))?;
+    Ok(())
 }
 
 /// Write the installer into a fresh private directory and mark it executable.
@@ -1652,6 +1693,30 @@ mod tests {
         assert!(!installer_url_for_tag("v0.1.0")
             .unwrap()
             .contains("/latest/"));
+    }
+
+    /// Mirrors `asset_and_api_urls_are_built_from_one_repo_constant` for the
+    /// dmg asset: the `v` is dropped from the file name (the release workflow
+    /// names the dmg `TcrBar-<version>.dmg`) but kept in the tag-pinned path.
+    #[test]
+    fn dmg_url_drops_the_v_from_the_filename_not_the_path() {
+        assert_eq!(
+            dmg_url_for_tag("v0.2.32").unwrap(),
+            "https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.32/TcrBar-0.2.32.dmg"
+        );
+        // A tag with no leading `v` names a file equal to itself.
+        assert_eq!(
+            dmg_url_for_tag("0.2.32").unwrap(),
+            "https://github.com/dhkts1/teamclaude-rs/releases/download/0.2.32/TcrBar-0.2.32.dmg"
+        );
+    }
+
+    /// Same guard as `installer_url_for_tag`, same reason: the tag lands in a
+    /// URL path here too.
+    #[test]
+    fn dmg_url_rejects_a_path_escaping_tag() {
+        assert!(dmg_url_for_tag("../../../../attacker/evil/releases/download/v1").is_err());
+        assert!(dmg_url_for_tag("").is_err());
     }
 
     /// The tag is interpolated into a URL PATH, so the repo pin is only real if

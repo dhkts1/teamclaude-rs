@@ -537,8 +537,35 @@ async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
 /// LaunchServices to open a bundle id, which resolves wherever the app was
 /// installed. A `tcr` that shells into a source tree would break the moment the
 /// checkout moved.
+/// The shared mount/swap logic, embedded once so `install.sh` and this binary
+/// never carry two copies that drift. See `scripts/install-tcrbar-from-dmg.sh`
+/// for what it does and why.
+#[cfg(target_os = "macos")]
+const INSTALL_TCRBAR_FROM_DMG_SH: &str = include_str!("../scripts/install-tcrbar-from-dmg.sh");
+
+/// Is a process literally named `TcrBar` running right now?
+///
+/// Matched by exact name (`pgrep -x`), not a path pattern like
+/// `apps/macos/scripts/install.sh` uses — this runs on a machine that may
+/// have TcrBar installed from a dmg, never built from source, so there is no
+/// destination path to derive a pattern from. `pgrep -x` still cannot
+/// distinguish it from an unrelated program that happens to share the name;
+/// that gap already exists in `apps/macos/scripts/uninstall.sh`.
+#[cfg(target_os = "macos")]
+fn tcrbar_is_running() -> anyhow::Result<bool> {
+    use anyhow::Context;
+    let status = std::process::Command::new("pgrep")
+        .args(["-x", "TcrBar"])
+        .status()
+        .context("failed to run `pgrep`")?;
+    Ok(status.success())
+}
+
+/// `tcr ui` — open TcrBar, installing it first if it is missing (macOS only).
 #[cfg(target_os = "macos")]
 fn run_ui() -> anyhow::Result<()> {
+    use std::io::{IsTerminal, Write as _};
+
     use anyhow::Context;
 
     let status = std::process::Command::new("open")
@@ -550,13 +577,76 @@ fn run_ui() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // `open -b` fails when the bundle id is not registered, which almost always
-    // means "not installed" rather than "broken". Say which, and say how to fix
-    // it, rather than surfacing LaunchServices' own opaque exit code.
-    anyhow::bail!(
-        "TcrBar is not installed. Build and install it with:\n    \
-         bash apps/macos/scripts/install.sh"
-    )
+    // `open -b` fails when the bundle id is not registered, which almost
+    // always means "not installed" rather than "broken".
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "TcrBar is not installed. Run `tcr ui` in a terminal to install it, or \
+             download the dmg from https://github.com/dhkts1/teamclaude-rs/releases/latest"
+        );
+    }
+
+    if tcrbar_is_running()? {
+        anyhow::bail!(
+            "a process named TcrBar is already running but is not registered with \
+             LaunchServices under io.github.dhkts1.tcrbar — quit it before `tcr ui` \
+             installs a fresh copy, then run `tcr ui` again. Installing over a running \
+             copy is refused: its own bundled `tcr` may be an executing image inside \
+             the very bundle being replaced."
+        );
+    }
+
+    eprint!("TcrBar is not installed. Download and install it to /Applications? [y/N] ");
+    std::io::stderr()
+        .flush()
+        .context("failed to flush the prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("failed to read the answer")?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes") {
+        anyhow::bail!("not installing — re-run `tcr ui` when you're ready.");
+    }
+
+    let tag = update::fetch_latest_release_tag()
+        .context("could not resolve the latest TcrBar release")?;
+    println!("tcr: downloading TcrBar {tag}…");
+
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("tcr-ui-install-")
+        .tempdir()
+        .context("could not create a temp directory for the download")?;
+    let dmg_path = tmp_dir.path().join("TcrBar.dmg");
+    update::download_tcrbar_dmg(&tag, &dmg_path)
+        .with_context(|| format!("could not download the TcrBar {tag} dmg"))?;
+
+    let script_path = tmp_dir.path().join("install-tcrbar-from-dmg.sh");
+    std::fs::write(&script_path, INSTALL_TCRBAR_FROM_DMG_SH)
+        .context("could not write the install script to a temp file")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+            .context("could not make the install script executable")?;
+    }
+
+    let install_status = std::process::Command::new("bash")
+        .arg(&script_path)
+        .arg(&dmg_path)
+        .status()
+        .context("failed to run the TcrBar install script")?;
+    if !install_status.success() {
+        anyhow::bail!("installing TcrBar {tag} failed with {install_status}");
+    }
+
+    let status = std::process::Command::new("open")
+        .args(["-b", "io.github.dhkts1.tcrbar"])
+        .status()
+        .context("failed to run `open`")?;
+    if !status.success() {
+        anyhow::bail!("TcrBar {tag} was installed but `open -b` still failed with {status}");
+    }
+    Ok(())
 }
 
 /// Non-macOS builds keep the subcommand so `--help` is identical everywhere, and
