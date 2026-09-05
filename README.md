@@ -16,6 +16,11 @@ account whose prompt cache is already warm, and shows you what the traffic would
 
 [Install](#install) · [Usage](#usage) · [Configuration](docs/configuration.md) · [CLI](docs/cli.md) · [Security](#security)
 
+[![Download TcrBar for macOS](https://img.shields.io/badge/Download-TcrBar%20for%20macOS-blue?style=for-the-badge)](https://github.com/dhkts1/teamclaude-rs/releases/latest)
+[![Install the CLI](https://img.shields.io/badge/Install-the%20CLI-lightgrey?style=for-the-badge)](#install)
+
+<sub>TcrBar is a `.dmg` on the release page</sub>
+
 <img src="assets/tcrbar-panel-healthy.png" alt="TcrBar menu-bar panel showing a healthy fleet" width="400">
 
 </div>
@@ -74,6 +79,9 @@ and a terminal dashboard, and `tcr` is a drop-in for the Node
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh | sh
 ```
+
+This installs the `tcr` CLI only; TcrBar is the `.dmg` on the
+[release page](https://github.com/dhkts1/teamclaude-rs/releases/latest).
 
 Or from source, with a Rust toolchain. Use the script rather than `cp`, because [`cp` onto a
 running binary rewrites the same inode and macOS then kills it](CONTRIBUTING.md#installing-it-onto-your-path):
