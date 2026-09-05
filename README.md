@@ -77,11 +77,16 @@ and a terminal dashboard, and `tcr` is a drop-in for the Node
 ## Install
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/teamclaude-rs/main/install.sh | sh
 ```
 
-This installs the `tcr` CLI only; TcrBar is the `.dmg` on the
-[release page](https://github.com/dhkts1/teamclaude-rs/releases/latest).
+This installs the `tcr` CLI, and on macOS also installs TcrBar from the `.dmg` on the
+[release page](https://github.com/dhkts1/teamclaude-rs/releases/latest) — set `TCR_SKIP_UI=1` to skip that
+second step. For the `tcr` CLI only, on any platform, use the cargo-dist installer directly:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh | sh
+```
 
 Or from source, with a Rust toolchain. Use the script rather than `cp`, because [`cp` onto a
 running binary rewrites the same inode and macOS then kills it](CONTRIBUTING.md#installing-it-onto-your-path):
