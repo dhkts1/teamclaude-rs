@@ -9,7 +9,7 @@ resolver = "2"
 
 [package]
 name = "teamclaude-rs"
-version = "0.2.32"
+version = "0.2.33"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
 # Noncommercial license, so this crate must never reach crates.io, whose terms
