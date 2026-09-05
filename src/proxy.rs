@@ -18,6 +18,14 @@
 //!   includes `cache_creation_input_tokens` + `cache_read_input_tokens` (the JS
 //!   proxy counted only `input_tokens`). It is applied **once** per served
 //!   request, so a retry that rotated accounts never double-counts.
+//! - When every account attempt fails in transport (`bad_gateway`), the shape
+//!   tells the client whether resending is free: `503` + `retry-after` +
+//!   `x-should-retry: true` when every failure died at connect (nothing ever
+//!   left the box); `502` + `x-should-retry: false` when at least one attempt
+//!   failed AFTER connecting, so a connection existed and the request's fate
+//!   upstream is unknown — a blind retry there risks double-sending a POST.
+//!   `offline_unavailable` (DNS/name-resolution failure — a fact about this
+//!   machine, not any account) is unaffected and stays a `503`.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -2077,6 +2085,14 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // case it actually describes — nothing ever reached an upstream at all.
     let mut transport_failures = 0usize;
     let mut upstream_responses = 0usize;
+    // Set the moment any transport failure fails PAST the connect phase
+    // (`!err.is_connect()`, offline/DNS excluded — that is machine-level, not
+    // this). A connect-phase failure never left this box, so replaying it is
+    // free; a non-connect failure means a connection existed and the request
+    // may already have been written to it, so whether the upstream received or
+    // acted on it is unknown. One such attempt anywhere in the ladder taints the
+    // terminal answer for the whole request — see [`bad_gateway`]'s two shapes.
+    let mut unknown_outcome_transport_failure = false;
     // Accounts upstream refused with a 403 on OUR pooled credential, in the order
     // seen. Every entry here is also an `upstream_responses` and a `tried` — a 403
     // is a real answer, not a transport gap, and there is nothing to retry on the
@@ -2192,7 +2208,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         if offline_failures > 0 {
                             return offline_unavailable(offline_failures);
                         }
-                        return bad_gateway(transport_failures);
+                        return bad_gateway(transport_failures, unknown_outcome_transport_failure);
                     }
                     // Every upstream answer this request got was a 403 refusing OUR
                     // credential — refusals are the WHOLE story, not one dead
@@ -2476,6 +2492,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         continue;
                     }
                     return offline_unavailable(offline_failures);
+                }
+                // Past the connect phase: a connection existed and the request may
+                // already be in flight on the wire, so this attempt's outcome upstream
+                // is unknown regardless of whether it now gets retried in place or the
+                // ladder rotates away from it. See `unknown_outcome_transport_failure`.
+                if !err.is_connect() {
+                    unknown_outcome_transport_failure = true;
                 }
                 let transport_attempt = transport_retried.entry(idx).or_insert(0);
                 if !err.is_connect() && *transport_attempt < MAX_SAME_ACCOUNT_TRANSPORT_RETRIES {
@@ -3116,7 +3139,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // failure was the WHOLE story (same rule as the mid-loop check above);
     // otherwise an upstream did answer us and the honest verdict is exhausted quota.
     if every_attempt_transport_failed(transport_failures, upstream_responses) {
-        bad_gateway(transport_failures)
+        bad_gateway(transport_failures, unknown_outcome_transport_failure)
     } else {
         exhausted_response(
             &manager,
@@ -4036,21 +4059,69 @@ fn every_attempt_transport_failed(transport_failures: usize, upstream_responses:
     transport_failures > 0 && upstream_responses == 0
 }
 
-/// 502 when every attempt hit a transport failure (upstream unreachable). Gated
-/// by [`every_attempt_transport_failed`], and the count is in the message so the
-/// line states what was actually observed rather than asserting a fleet-wide
-/// claim it cannot support.
-fn bad_gateway(transport_failures: usize) -> Response {
-    tracing::warn!(
-        transport_failures,
-        "returning 502 to client — every attempt failed in transport, none reached an upstream"
-    );
-    error_response(
-        StatusCode::BAD_GATEWAY,
-        "proxy_error",
-        &format!("Upstream unreachable: all {transport_failures} attempt(s) failed in transport."),
-        None,
-    )
+/// 503 or 502 when every attempt hit a transport failure (upstream unreachable).
+/// Gated by [`every_attempt_transport_failed`]; `unknown_outcome` (set by
+/// `unknown_outcome_transport_failure` in [`handle`]) picks which of the two
+/// shapes is honest:
+///
+/// - `false`: every attempt died at CONNECT — nothing ever left this box, so a
+///   client resending the request costs nothing extra it has not already paid.
+///   `503` + `retry-after` + `x-should-retry: true`.
+/// - `true`: at least one attempt got PAST connect before failing — a
+///   connection existed and the request may have already reached the upstream,
+///   so its effect there is unknown and a blind client retry could double-send
+///   a POST. `502` + `x-should-retry: false`; main previously answered this
+///   case identically to the safe one, which is the gap
+///   `data/plans/review-yogev-fork.md` § network-recovery (A-05, minimal
+///   version) named as worth fixing.
+///
+/// `retry-after` reuses [`OFFLINE_RETRY_AFTER_SECS`] rather than a new constant:
+/// both are "a network hiccup, not a durable fault, come back in a few
+/// seconds", and that number is already the one a live measurement
+/// (2026-08-10, see its doc-comment) established for exactly that recommendation.
+fn bad_gateway(transport_failures: usize, unknown_outcome: bool) -> Response {
+    if unknown_outcome {
+        tracing::warn!(
+            transport_failures,
+            "returning 502 to client — every attempt failed in transport and at least one \
+             got past the connect phase, so its outcome upstream is unknown; telling the \
+             client not to retry automatically"
+        );
+        let mut response = error_response(
+            StatusCode::BAD_GATEWAY,
+            "proxy_error",
+            &format!(
+                "Upstream unreachable: all {transport_failures} attempt(s) failed in transport, \
+                 and at least one may have reached the upstream before failing. Its outcome is \
+                 unknown — do not retry this request automatically."
+            ),
+            None,
+        );
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("false"));
+        response
+    } else {
+        tracing::warn!(
+            transport_failures,
+            retry_after = OFFLINE_RETRY_AFTER_SECS,
+            "returning 503 to client — every attempt failed at the connect phase; nothing \
+             reached an upstream, so retrying is safe"
+        );
+        let mut response = error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proxy_error",
+            &format!(
+                "Upstream unreachable: all {transport_failures} attempt(s) failed before a \
+                 connection was made. Safe to retry in {OFFLINE_RETRY_AFTER_SECS}s."
+            ),
+            Some(OFFLINE_RETRY_AFTER_SECS),
+        );
+        response
+            .headers_mut()
+            .insert("x-should-retry", HeaderValue::from_static("true"));
+        response
+    }
 }
 
 /// `503 + Retry-After` when name resolution kept failing: this machine is off the
@@ -5234,7 +5305,8 @@ mod tests {
     /// proceeds upstream. The loopback exemption (the production path via
     /// `mitm::serve`) is covered separately by `loopback_client_is_exempt`.
     /// The upstream points at a dead local port so the request never reaches the
-    /// real Anthropic API — it fails transport and returns 502.
+    /// real Anthropic API — it fails transport at connect and returns 503 (safe
+    /// to retry, see [`bad_gateway`]).
     #[tokio::test]
     async fn auth_rejects_without_key_and_attempts_upstream_with_key() {
         // 127.0.0.1:1 is reliably connection-refused, so the upstream forward
@@ -5266,15 +5338,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             with_key.status().as_u16(),
-            502,
-            "authenticated request proceeds upstream (dead port → 502), never 401"
+            503,
+            "authenticated request proceeds upstream (dead port → 503), never 401"
         );
     }
 
     /// Loopback exemption: served through the production hybrid listener
     /// (`mitm::serve`, which injects `ClientAddr`), a KEYLESS request from a
     /// loopback client must NOT be 401 even though a proxy key is configured — it
-    /// proceeds upstream (dead port → 502). This is what lets `claude` (which
+    /// proceeds upstream (dead port → 503). This is what lets `claude` (which
     /// sends no proxy key, only its own OAuth) talk to the local proxy, exactly
     /// as it did with the JS proxy's loopback exemption.
     #[tokio::test]
@@ -5298,8 +5370,8 @@ mod tests {
         );
         assert_eq!(
             resp.status().as_u16(),
-            502,
-            "the exempt request proceeds upstream (dead port → 502)"
+            503,
+            "the exempt request proceeds upstream (dead port → 503)"
         );
     }
 
@@ -10084,15 +10156,28 @@ mod tests {
     /// reaches an upstream HTTP status and `every_attempt_transport_failed` holds.
     /// This is what stops the fix above from turning a genuinely unreachable upstream
     /// into a misleading 429.
+    ///
+    /// The scripted upstream's `None` accepts the connection and reads the request
+    /// before hanging up — a NON-connect failure (`is_connect() == false`), so this
+    /// is exactly the "outcome unknown" case: the request may have already reached
+    /// the upstream. `x-should-retry: false` is the assertion that pins this to the
+    /// review's minimal fix (`data/plans/review-yogev-fork.md` § network-recovery,
+    /// A-05) rather than the pre-existing bare 502.
     #[tokio::test]
     async fn all_transport_failures_still_502() {
         let up_addr = spawn_scripted_upstream(vec![None]).await; // every connection blips
         let manager = fleet(up_addr, &["a", "b"]);
 
-        let status = post_one(manager.clone()).await;
+        let (status, headers, _body) = post_one_full(manager.clone()).await;
         assert_eq!(
             status, 502,
             "no attempt reached an upstream at all — 502 is the honest verdict"
+        );
+        assert_eq!(
+            headers.get("x-should-retry").and_then(|v| v.to_str().ok()),
+            Some("false"),
+            "a post-connect transport failure means the request's fate upstream is \
+             unknown — the client must not blindly resend it"
         );
 
         let snap = manager.snapshot(OffsetDateTime::now_utc());
@@ -10239,11 +10324,12 @@ mod tests {
     /// worst-case time-to-502 — ~80s to ~160s on an eight-account fleet — with a
     /// per-account in-flight slot held for the whole of it.
     ///
-    /// Read off the 502 the client actually receives, whose body carries the
+    /// Read off the 503 the client actually receives, whose body carries the
     /// attempt count: two accounts that each fail to connect ONCE is `2`, and the
     /// retry firing here would make it `4`. An unreachable upstream is a dead
     /// port — the one shape that produces `is_connect()` for real rather than by
-    /// simulation.
+    /// simulation. 503, not 502: every attempt died at connect, so nothing ever
+    /// left this box and retrying is free — see [`bad_gateway`].
     #[tokio::test]
     async fn a_connect_failure_is_not_retried_on_the_same_account() {
         // Bind then drop: the address is guaranteed to have been free, and now
@@ -10255,15 +10341,26 @@ mod tests {
         };
         let manager = fleet(dead, &["a", "b"]);
 
-        let (status, body) = post_one_with_body(manager).await;
+        let (status, headers, body) = post_one_full(manager).await;
         assert_eq!(
-            status, 502,
-            "nothing reached an upstream, so the honest answer is a gateway error: {body}"
+            status, 503,
+            "nothing reached an upstream, and every attempt died at connect — the honest \
+             answer is a recoverable gateway error: {body}"
         );
         assert!(
             body.contains("all 2 attempt(s)"),
             "one connect attempt per account. `all 4 attempt(s)` means each was \
              retried into a second connect timeout for no new information: {body}"
+        );
+        assert_eq!(
+            headers.get("x-should-retry").and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "nothing ever left this box, so telling the client to retry costs nothing extra"
+        );
+        assert_eq!(
+            headers.get("retry-after").and_then(|v| v.to_str().ok()),
+            Some(OFFLINE_RETRY_AFTER_SECS.to_string().as_str()),
+            "the client needs guidance on when to come back"
         );
     }
 
@@ -11207,9 +11304,10 @@ mod tests {
     /// Boot the proxy over a fresh loopback listener with a DEAD upstream
     /// (127.0.0.1:1, reliably connection-refused) and no proxy key, returning its
     /// address. A request the host guard lets THROUGH reaches the rotation loop
-    /// and fails transport → 502; a request the guard REJECTS returns its local
-    /// status (421) with no egress. The 421-vs-502 split is what proves whether
-    /// the guard fired.
+    /// and fails transport → 503 (connection-refused is a pure connect-phase
+    /// failure — see [`bad_gateway`] — so it is the safe-to-retry shape, not a
+    /// 502); a request the guard REJECTS returns its local status (421) with no
+    /// egress. The 421-vs-503 split is what proves whether the guard fired.
     async fn spawn_dead_upstream_proxy() -> SocketAddr {
         let manager = Manager::with_live_refresher(dummy_config(None, "http://127.0.0.1:1"), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11251,7 +11349,7 @@ mod tests {
 
     /// Test 1 — a forward-proxy IMDS probe in ABSOLUTE-form (the shape an AWS SDK
     /// emits when `HTTP_PROXY` points at tcr) is rejected locally with 421, read
-    /// from the request-target's authority. 421 (not the 502 a real forward to the
+    /// from the request-target's authority. 421 (not the 503 a real forward to the
     /// dead upstream would give) proves the guard fired BEFORE any egress.
     #[tokio::test]
     async fn misroute_absolute_form_imds_rejected_locally_421() {
@@ -11292,10 +11390,12 @@ mod tests {
 
     /// Test 3 — FALSE-REJECT REGRESSION GATE (non-negotiable). A legitimate
     /// base-URL request (origin-form `/v1/messages`, loopback `Host`) MUST pass
-    /// the guard and reach the rotation loop → dead upstream → 502. A 421 here
-    /// would mean the guard wrongly rejected real Anthropic traffic.
+    /// the guard and reach the rotation loop → dead upstream → 503 (connection
+    /// refused is a pure connect-phase failure, so it is the safe-to-retry shape —
+    /// see [`bad_gateway`]). A 421 here would mean the guard wrongly rejected real
+    /// Anthropic traffic.
     #[tokio::test]
-    async fn base_url_loopback_proceeds_not_rejected_502() {
+    async fn base_url_loopback_proceeds_not_rejected_503() {
         let addr = spawn_dead_upstream_proxy().await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         let resp = client
@@ -11306,16 +11406,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             resp.status().as_u16(),
-            502,
-            "the guard must let a loopback base-URL request through (dead upstream → 502), never 421"
+            503,
+            "the guard must let a loopback base-URL request through (dead upstream → 503), never 421"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("x-should-retry")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "a pure connect-phase failure never reached an upstream, so retrying is free"
         );
     }
 
     /// Test 4 — the MITM-terminated shape (origin-form `/v1/messages`, `Host:
     /// api.anthropic.com`) passes the guard via the allowlist branch
-    /// (`crate::mitm::host_allowed`) → rotation loop → dead upstream → 502.
+    /// (`crate::mitm::host_allowed`) → rotation loop → dead upstream → 503.
     #[tokio::test]
-    async fn anthropic_host_proceeds_not_rejected_502() {
+    async fn anthropic_host_proceeds_not_rejected_503() {
         let addr = spawn_dead_upstream_proxy().await;
         let status = raw_request_status(
             addr,
@@ -11326,8 +11433,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            status, 502,
-            "an api.anthropic.com request must pass the guard (dead upstream → 502), never 421"
+            status, 503,
+            "an api.anthropic.com request must pass the guard (dead upstream → 503), never 421"
         );
     }
 
@@ -11335,7 +11442,7 @@ mod tests {
     /// written byte for byte. The `drive` harness builds its URI through `http::Uri`
     /// in-process; this proves the same shapes survive hyper's own request-line
     /// parser and are refused there too, so the guard is not an artifact of the test
-    /// harness. 400 — not the 502 a forwarded request to the dead upstream gives —
+    /// harness. 400 — not the 503 a forwarded request to the dead upstream gives —
     /// is what proves it fired BEFORE any egress.
     #[tokio::test]
     async fn traversal_targets_refused_over_a_raw_socket_400() {
@@ -11359,11 +11466,11 @@ mod tests {
             .await;
             assert_eq!(
                 status, 400,
-                "{target} must be refused locally, never forwarded (502)"
+                "{target} must be refused locally, never forwarded (503)"
             );
         }
         // The control: the same socket, the same dead upstream, an ordinary path.
-        // 502 proves the guard rejects the ambiguous shape and nothing else.
+        // 503 proves the guard rejects the ambiguous shape and nothing else.
         let status = raw_request_status(
             addr,
             "POST /v1/messages HTTP/1.1\r\n\
@@ -11373,8 +11480,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            status, 502,
-            "an ordinary path still reaches the rotation loop (dead upstream → 502)"
+            status, 503,
+            "an ordinary path still reaches the rotation loop (dead upstream → 503)"
         );
     }
 }
