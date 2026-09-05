@@ -32,16 +32,6 @@ impl Manager {
     /// every one of them to consume the bool would be pure churn unrelated to
     /// this fix.
     pub fn update_quota(&self, idx: usize, headers: &reqwest::header::HeaderMap) -> bool {
-        self.update_quota_with_rejections(idx, headers, 0, &[])
-    }
-
-    pub(crate) fn update_quota_with_rejections(
-        &self,
-        idx: usize,
-        headers: &reqwest::header::HeaderMap,
-        hold_seconds: i64,
-        rejections: &[UnifiedRejectionKind],
-    ) -> bool {
         let (newly_known, read_five_hour) = {
             let mut accounts = self.accounts.write().expect("accounts lock poisoned");
             match accounts.get_mut(idx) {
@@ -58,51 +48,6 @@ impl Manager {
                     if read_five_hour {
                         account.consecutive_warms_without_evidence = 0;
                         account.warm_evidence_retry_after_ms = None;
-                    }
-                    let cleared_modeled_rejection = clear_allowed_rejections(account, headers);
-                    if [
-                        "anthropic-ratelimit-unified-5h-status",
-                        "anthropic-ratelimit-unified-7d-status",
-                    ]
-                    .iter()
-                    .all(|name| {
-                        header_is_allowed(headers, name) || header_is_rejected(headers, name)
-                    }) {
-                        // Complete current scope evidence replaces any older
-                        // aggregate whose cause was not known.
-                        account.overall_rejected_until_ms = None;
-                    }
-                    if account.quota.status.as_deref() == Some("rejected")
-                        && rejections.contains(&UnifiedRejectionKind::FableWeekly)
-                        && !rejections.contains(&UnifiedRejectionKind::Overall)
-                        && header_is_allowed(headers, "anthropic-ratelimit-unified-5h-status")
-                        && header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status")
-                    {
-                        account.quota.status = None;
-                        account.overall_rejected_until_ms = None;
-                    }
-                    let hold_until = crate::now_ms().saturating_add(
-                        hold_seconds
-                            .clamp(0, MAX_RATE_LIMIT_HOLD_SECONDS)
-                            .saturating_mul(1000),
-                    );
-                    for kind in rejections {
-                        record_rejection(account, headers, *kind, hold_until);
-                    }
-                    let has_scoped_rejection = account.five_hour_rejected_until_ms.is_some()
-                        || account.seven_day_rejected_until_ms.is_some()
-                        || account.fable_rejected_until_ms.is_some();
-                    let recorded_scoped_rejection = rejections
-                        .iter()
-                        .any(|kind| !matches!(kind, UnifiedRejectionKind::Overall));
-                    if account.overall_rejected_until_ms.is_none()
-                        && (cleared_modeled_rejection
-                            || has_scoped_rejection
-                            || recorded_scoped_rejection)
-                    {
-                        // The structured markers now own this verdict. Do not
-                        // expose the raw aggregate text as a legacy permanent gate.
-                        account.quota.status = None;
                     }
                     (flipped, read_five_hour)
                 }
@@ -338,7 +283,6 @@ impl Manager {
             match accounts.get_mut(idx) {
                 Some(account) => {
                     account.quota.apply_usage(usage);
-                    clear_rejections_from_usage(account, usage);
                     let flipped = !account.quota_known;
                     account.quota_known = true;
                     flipped
@@ -362,6 +306,27 @@ impl Manager {
     /// after the bounded hold, and either serves or is re-held. Durable
     /// exhaustion is separately kept out of rotation by the
     /// learned quota utilization, not by this short-term hold.
+    /// Record a MODEL-SCOPED quota rejection for account `idx` — upstream said
+    /// `rejected` on the `7d_oi` scope while both shared scopes stayed allowed
+    /// (issue #178). The deliberate contrast with [`Self::mark_rate_limited`] is
+    /// that this is not an account-level hold at all: it writes the rejection
+    /// into the learned `seven_day_oi` window, which is the durable-exhaustion
+    /// channel the doc-comment above names, and which the selector already reads
+    /// for exactly this model class ([`crate::quota::Quota::model_weekly_exhausted`],
+    /// `Manager::model_blocked`). So the account keeps serving every other model,
+    /// and the rejection frees at its own reset with no second deadline to
+    /// reconcile. See [`crate::quota::Quota::reject_model_weekly`].
+    pub fn mark_model_weekly_rejected(&self, idx: usize, headers: &reqwest::header::HeaderMap) {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        if let Some(account) = accounts.get_mut(idx) {
+            account.quota.reject_model_weekly(headers);
+            tracing::info!(
+                account = %account.name,
+                "model-scoped weekly quota rejection recorded"
+            );
+        }
+    }
+
     pub fn mark_rate_limited(&self, idx: usize, seconds: i64) {
         let hold = seconds.clamp(0, MAX_RATE_LIMIT_HOLD_SECONDS);
         let until = crate::now_ms() + hold * 1000;
@@ -411,185 +376,6 @@ impl Manager {
             prune_stream_errors(&mut account.stream_error_times_ms, now_ms);
             account.last_stream_error = Some(kind.to_string());
         }
-    }
-}
-
-fn header_is_allowed(headers: &reqwest::header::HeaderMap, name: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value.eq_ignore_ascii_case("allowed") || value.eq_ignore_ascii_case("allowed_warning")
-        })
-}
-
-fn header_is_rejected(headers: &reqwest::header::HeaderMap, name: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("rejected"))
-}
-
-fn clear_allowed_rejections(
-    account: &mut AccountRuntime,
-    headers: &reqwest::header::HeaderMap,
-) -> bool {
-    let mut cleared = false;
-    if header_is_allowed(headers, "anthropic-ratelimit-unified-status") {
-        cleared |= account.overall_rejected_until_ms.take().is_some();
-        cleared |= account.five_hour_rejected_until_ms.take().is_some();
-        cleared |= account.seven_day_rejected_until_ms.take().is_some();
-        clear_stale_full_window(
-            &mut account.quota.five_hour,
-            headers,
-            "anthropic-ratelimit-unified-5h-utilization",
-        );
-        clear_stale_full_window(
-            &mut account.quota.seven_day,
-            headers,
-            "anthropic-ratelimit-unified-7d-utilization",
-        );
-    }
-    if header_is_allowed(headers, "anthropic-ratelimit-unified-5h-status") {
-        cleared |= account.five_hour_rejected_until_ms.take().is_some();
-        clear_stale_full_window(
-            &mut account.quota.five_hour,
-            headers,
-            "anthropic-ratelimit-unified-5h-utilization",
-        );
-    }
-    if header_is_allowed(headers, "anthropic-ratelimit-unified-7d-status") {
-        cleared |= account.seven_day_rejected_until_ms.take().is_some();
-        clear_stale_full_window(
-            &mut account.quota.seven_day,
-            headers,
-            "anthropic-ratelimit-unified-7d-utilization",
-        );
-    }
-    if header_is_allowed(headers, "anthropic-ratelimit-unified-7d_oi-status") {
-        cleared |= account.fable_rejected_until_ms.take().is_some();
-        clear_stale_full_window(
-            &mut account.quota.seven_day_oi,
-            headers,
-            "anthropic-ratelimit-unified-7d_oi-utilization",
-        );
-    }
-    cleared
-}
-
-fn clear_stale_full_window(
-    window: &mut Option<crate::quota::QuotaWindow>,
-    headers: &reqwest::header::HeaderMap,
-    utilization_name: &str,
-) {
-    let has_current_utilization = headers
-        .get(utilization_name)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .is_some_and(f64::is_finite);
-    if !has_current_utilization && window.is_some_and(|window| window.utilization >= 1.0) {
-        *window = None;
-    }
-}
-
-fn header_reset_ms(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
-    crate::quota::get_reset(headers, name)
-        .map(|reset| (reset.unix_timestamp_nanos() / 1_000_000) as i64)
-}
-
-fn window_reset_ms(window: Option<crate::quota::QuotaWindow>) -> Option<i64> {
-    window
-        .and_then(|window| window.reset)
-        .map(|reset| (reset.unix_timestamp_nanos() / 1_000_000) as i64)
-}
-
-fn record_rejection(
-    account: &mut AccountRuntime,
-    headers: &reqwest::header::HeaderMap,
-    kind: UnifiedRejectionKind,
-    hold_until: i64,
-) {
-    let reset = match kind {
-        UnifiedRejectionKind::Overall => [
-            (
-                "anthropic-ratelimit-unified-5h-status",
-                "anthropic-ratelimit-unified-5h-reset",
-                account.quota.five_hour,
-            ),
-            (
-                "anthropic-ratelimit-unified-7d-status",
-                "anthropic-ratelimit-unified-7d-reset",
-                account.quota.seven_day,
-            ),
-        ]
-        .into_iter()
-        .filter_map(|(status_name, reset_name, window)| {
-            let explicit = header_is_rejected(headers, status_name);
-            let inferred = window.is_some_and(|window| window.utilization >= 1.0);
-            let has_current_status = headers.contains_key(status_name);
-            (explicit || (!has_current_status && inferred))
-                .then(|| header_reset_ms(headers, reset_name).or_else(|| window_reset_ms(window)))
-                .flatten()
-        })
-        .max(),
-        UnifiedRejectionKind::FiveHour => {
-            header_reset_ms(headers, "anthropic-ratelimit-unified-5h-reset")
-                .or_else(|| window_reset_ms(account.quota.five_hour))
-        }
-        UnifiedRejectionKind::SevenDay => {
-            header_reset_ms(headers, "anthropic-ratelimit-unified-7d-reset")
-                .or_else(|| window_reset_ms(account.quota.seven_day))
-        }
-        UnifiedRejectionKind::FableWeekly => {
-            header_reset_ms(headers, "anthropic-ratelimit-unified-7d_oi-reset")
-                .or_else(|| window_reset_ms(account.quota.seven_day_oi))
-        }
-    };
-    let until = reset.map_or(hold_until, |reset| reset.max(hold_until));
-    let slot = match kind {
-        UnifiedRejectionKind::Overall => &mut account.overall_rejected_until_ms,
-        UnifiedRejectionKind::FiveHour => &mut account.five_hour_rejected_until_ms,
-        UnifiedRejectionKind::SevenDay => &mut account.seven_day_rejected_until_ms,
-        UnifiedRejectionKind::FableWeekly => &mut account.fable_rejected_until_ms,
-    };
-    *slot = Some(slot.map_or(until, |current| current.max(until)));
-}
-
-fn bucket_is_below_limit(bucket: Option<&crate::probe::UsageBucket>) -> bool {
-    bucket
-        .and_then(|bucket| bucket.utilization)
-        .is_some_and(|utilization| utilization < 1.0)
-}
-
-fn clear_rejections_from_usage(account: &mut AccountRuntime, usage: &Usage) {
-    let had_five_hour_rejection = account.five_hour_rejected_until_ms.is_some();
-    let had_seven_day_rejection = account.seven_day_rejected_until_ms.is_some();
-    let five_hour_allowed = bucket_is_below_limit(usage.five_hour.as_ref());
-    let seven_day_allowed = bucket_is_below_limit(usage.seven_day.as_ref());
-    if five_hour_allowed {
-        account.five_hour_rejected_until_ms = None;
-    }
-    if seven_day_allowed {
-        account.seven_day_rejected_until_ms = None;
-    }
-    if bucket_is_below_limit(usage.seven_day_oi.as_ref()) {
-        account.fable_rejected_until_ms = None;
-    }
-    let now_ms = crate::now_ms();
-    let cleared_a_known_shared_rejection = (five_hour_allowed && had_five_hour_rejection)
-        || (seven_day_allowed && had_seven_day_rejection);
-    let all_known_shared_rejections_cleared = cleared_a_known_shared_rejection
-        && account
-            .five_hour_rejected_until_ms
-            .is_none_or(|until| until <= now_ms)
-        && account
-            .seven_day_rejected_until_ms
-            .is_none_or(|until| until <= now_ms);
-    if five_hour_allowed && seven_day_allowed {
-        account.overall_rejected_until_ms = None;
-    }
-    if (five_hour_allowed && seven_day_allowed) || all_known_shared_rejections_cleared {
-        account.quota.status = None;
     }
 }
 

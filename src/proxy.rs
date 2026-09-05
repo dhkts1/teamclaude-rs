@@ -41,8 +41,9 @@ use time::OffsetDateTime;
 use crate::config;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, InFlightGuard,
-    Manager, SetControlOutcome, SetDisabledOutcome, UnifiedRejectionKind,
+    Manager, SetControlOutcome, SetDisabledOutcome,
 };
+use crate::quota::{quota_rejections, UnifiedRejectionKind};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 
 /// Cap on a buffered request body (256 MiB) — a single-user localhost proxy has
@@ -2109,7 +2110,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // account that already failed it, in a loop. An account leaves this set the
     // moment it is re-admitted, so membership always means "currently parked".
     let mut parked_transient: HashSet<usize> = HashSet::new();
-    let mut rejected_this_request: HashSet<usize> = HashSet::new();
     // Same-account transport retries this request has spent, per account. The
     // failing resource in a transport error is the CONNECTION, not the account:
     // reqwest pools by `(scheme, authority)` and the account is only a Bearer
@@ -2155,15 +2155,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
 
     for _ in 0..max_attempts {
         let now = OffsetDateTime::now_utc();
-        let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
-        rejected_this_request.retain(|idx| {
-            if manager.rejection_active(*idx, now_ms, request_is_fable) {
-                true
-            } else {
-                tried.remove(idx);
-                false
-            }
-        });
         let idx = match next_idx.take() {
             Some(i) => i,
             None => match manager.select_with_group(
@@ -2542,13 +2533,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         );
         let up_headers = resp.headers().clone();
         let rejections = quota_rejections(&up_headers);
-        let rejection_hold = parse_retry_after(&up_headers).unwrap_or(60);
-        let rejection_hold = if status == StatusCode::TOO_MANY_REQUESTS {
-            jittered_quota_hold(rejection_hold, now.nanosecond())
-        } else {
-            rejection_hold
-        };
-        manager.update_quota_with_rejections(idx, &up_headers, rejection_hold, &rejections);
+        manager.update_quota(idx, &up_headers);
         // Any non-429 is live proof a rate-limit hold no longer binds.
         if status.as_u16() != 429 {
             manager.clear_rate_limited(idx);
@@ -2632,11 +2617,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 retry_after_parsed = format!("{:?}", parse_retry_after(&up_headers)),
                 unified_status = header_str("anthropic-ratelimit-unified-status"),
                 // The MODEL-SCOPED twin of `unified_status`. Logged to make one
-                // specific class observable: a Fable-weekly-only rejection that
-                // `is_quota_rejected` reads as account-wide, arming a 3600s hold that
-                // then re-keys the session. If this ever reads `rejected` while
-                // `unified_status` does not, that is the case — diagnostic only, no
-                // routing reads this.
+                // specific class observable: a Fable-weekly-only rejection, which
+                // upstream also reports in the aggregate `unified_status`. Reading
+                // the aggregate alone benched the whole account and re-keyed the
+                // session (issue #178); `quota_rejections` now separates the two,
+                // and this line is how a live response is checked against it —
+                // diagnostic only, no routing reads it.
                 unified_7d_oi_status = header_str("anthropic-ratelimit-unified-7d_oi-status"),
                 unified_5h_reset = header_str("anthropic-ratelimit-unified-5h-reset"),
                 unified_7d_reset = header_str("anthropic-ratelimit-unified-7d-reset"),
@@ -2645,10 +2631,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             );
             let retry_after_raw = parse_retry_after(&up_headers);
             let retry_after = retry_after_raw.unwrap_or(60);
-            if rejections
-                .iter()
-                .any(|kind| rejection_applies(*kind, request_is_fable))
-            {
+            if !rejections.is_empty() {
+                // A model-scoped rejection is recorded in the window the selector
+                // already gates that model class on, NOT as an account-wide hold:
+                // the account still serves every other model class, and the window
+                // self-frees at its own reset (issue #178). A rejection any shared
+                // scope reports is account-wide and still arms the hold — clamped
+                // to `MAX_RATE_LIMIT_HOLD_SECONDS` by `mark_rate_limited`, whose
+                // doc-comment explains why durable exhaustion must be carried by
+                // the learned quota rather than by an unbounded hold.
+                if rejections.contains(&UnifiedRejectionKind::FableWeekly) {
+                    manager.mark_model_weekly_rejected(idx, &up_headers);
+                }
                 if rejections
                     .iter()
                     .any(|kind| !matches!(kind, UnifiedRejectionKind::FableWeekly))
@@ -2657,7 +2651,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         .mark_rate_limited(idx, jittered_quota_hold(retry_after, now.nanosecond()));
                 }
                 tried.insert(idx);
-                rejected_this_request.insert(idx);
                 continue;
             }
             let count = retried_429.entry(idx).or_insert(0);
@@ -3484,7 +3477,7 @@ enum ServedBy {
 ///
 /// This is the CLIENT boundary, and the strip belongs here and nowhere earlier:
 /// the proxy's own quota model is built from these same headers upstream of this
-/// call — `manager.update_quota` and the `is_quota_rejected` gate both read the
+/// call — `manager.update_quota` and the `quota_rejections` gate both read the
 /// untouched `up_headers`. Stripping at ingest would blind the rotation logic
 /// while looking like it fixed something.
 fn build_response(
@@ -3515,40 +3508,6 @@ pub(crate) fn parse_retry_after(headers: &HeaderMap) -> Option<i64> {
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok())
-}
-
-/// Return each unified quota scope that reports durable exhaustion.
-fn quota_rejections(headers: &HeaderMap) -> Vec<UnifiedRejectionKind> {
-    let status = |name: &str, expected: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| s.eq_ignore_ascii_case(expected))
-    };
-    let allowed = |name: &str| status(name, "allowed") || status(name, "allowed_warning");
-    let five_rejected = status("anthropic-ratelimit-unified-5h-status", "rejected");
-    let seven_rejected = status("anthropic-ratelimit-unified-7d-status", "rejected");
-    let fable_rejected = status("anthropic-ratelimit-unified-7d_oi-status", "rejected");
-    let shared_allowed = allowed("anthropic-ratelimit-unified-5h-status")
-        && allowed("anthropic-ratelimit-unified-7d-status");
-    let overall_rejected = status("anthropic-ratelimit-unified-status", "rejected")
-        && !five_rejected
-        && !seven_rejected
-        && !(fable_rejected && shared_allowed);
-
-    [
-        (overall_rejected, UnifiedRejectionKind::Overall),
-        (five_rejected, UnifiedRejectionKind::FiveHour),
-        (seven_rejected, UnifiedRejectionKind::SevenDay),
-        (fable_rejected, UnifiedRejectionKind::FableWeekly),
-    ]
-    .into_iter()
-    .filter_map(|(rejected, kind)| rejected.then_some(kind))
-    .collect()
-}
-
-fn rejection_applies(kind: UnifiedRejectionKind, is_fable: bool) -> bool {
-    !matches!(kind, UnifiedRejectionKind::FableWeekly) || is_fable
 }
 
 #[cfg(test)]
@@ -9972,38 +9931,6 @@ mod tests {
             3,
             "each client request must make exactly one upstream attempt"
         );
-    }
-
-    /// Reproduce a short rejection that expires while another account spends its
-    /// transient retry budget. The first account must re-enter this same request.
-    #[tokio::test]
-    async fn expired_request_local_rejection_can_reenter_selection() {
-        let (up_addr, attempts) = spawn_counted_upstream(vec![
-            Some(raw_429_rejected(1)),
-            Some(raw_429_transient(1)),
-            Some(raw_429_transient(1)),
-            Some(raw_429_transient(1)),
-            Some(raw_200()),
-        ])
-        .await;
-        let manager = fleet(up_addr, &["a", "b"]);
-
-        assert_eq!(
-            post_model(Arc::clone(&manager), "claude-opus-4-6").await,
-            200,
-            "the expired rejection must not remain in the request-local tried set"
-        );
-        assert_eq!(
-            attempts.load(std::sync::atomic::Ordering::SeqCst),
-            5,
-            "the final send must return to the account whose rejection expired"
-        );
-        let snap = manager.snapshot(OffsetDateTime::now_utc());
-        assert_eq!(
-            snap.accounts[0].requests, 1,
-            "account a must serve the retry"
-        );
-        assert_eq!(snap.accounts[1].requests, 0, "account b never served");
     }
 
     /// A locked request cannot rotate to a different account after rejection.

@@ -1522,41 +1522,10 @@ impl Manager {
         if account.status == AccountStatus::Error {
             return Some(GateReason::Login);
         }
-        if account.quota.status.as_deref() == Some("rejected")
-            && account.overall_rejected_until_ms.is_none()
-            && account.five_hour_rejected_until_ms.is_none()
-            && account.seven_day_rejected_until_ms.is_none()
-            && account.fable_rejected_until_ms.is_none()
-        {
+        if account.quota.status.as_deref() == Some("rejected") {
             return Some(GateReason::Rejected);
         }
         None
-    }
-
-    fn shared_rejection_active(account: &AccountRuntime, now_ms: i64) -> bool {
-        account
-            .overall_rejected_until_ms
-            .is_some_and(|until| now_ms < until)
-            || account
-                .five_hour_rejected_until_ms
-                .is_some_and(|until| now_ms < until)
-            || account
-                .seven_day_rejected_until_ms
-                .is_some_and(|until| now_ms < until)
-    }
-
-    pub(crate) fn rejection_active(&self, idx: usize, now_ms: i64, is_fable: bool) -> bool {
-        self.accounts
-            .read()
-            .expect("accounts lock poisoned")
-            .get(idx)
-            .is_some_and(|account| {
-                Self::shared_rejection_active(account, now_ms)
-                    || (is_fable
-                        && account
-                            .fable_rejected_until_ms
-                            .is_some_and(|until| now_ms < until))
-            })
     }
 
     /// The ACCOUNT-level HARD gates alone — the blocks that mean *this account is
@@ -1605,9 +1574,6 @@ impl Manager {
         reserved: &HashSet<String>,
     ) -> bool {
         if Self::account_terminal_gate(account).is_some() {
-            return false;
-        }
-        if Self::shared_rejection_active(account, now_ms) {
             return false;
         }
         if Self::hold_outlives_cache(account, now_ms) {
@@ -1671,12 +1637,7 @@ impl Manager {
         is_fable: bool,
     ) -> bool {
         let threshold = account.switch_threshold.unwrap_or(global_threshold);
-        let now_ms = (now.unix_timestamp_nanos() / 1_000_000) as i64;
-        is_fable
-            && (account.quota.model_weekly_exhausted(threshold, now)
-                || account
-                    .fable_rejected_until_ms
-                    .is_some_and(|until| now_ms < until))
+        is_fable && account.quota.model_weekly_exhausted(threshold, now)
     }
 
     /// Can this account SERVE this request at all, soft gates aside: the
@@ -1738,15 +1699,7 @@ impl Manager {
         if account.status == AccountStatus::Error {
             return false;
         }
-        if account.quota.status.as_deref() == Some("rejected")
-            && account.overall_rejected_until_ms.is_none()
-            && account.five_hour_rejected_until_ms.is_none()
-            && account.seven_day_rejected_until_ms.is_none()
-            && account.fable_rejected_until_ms.is_none()
-        {
-            return false;
-        }
-        if Self::shared_rejection_active(account, now_ms) {
+        if account.quota.status.as_deref() == Some("rejected") {
             return false;
         }
         if let Some(until) = account.rate_limited_until_ms {
@@ -1853,9 +1806,6 @@ impl Manager {
         reserved: &HashSet<String>,
     ) -> bool {
         if account.disabled || account.status == AccountStatus::Error {
-            return false;
-        }
-        if Self::shared_rejection_active(account, now_ms) {
             return false;
         }
         // A rate-limit hold blocks the account only while it is still in the
@@ -2012,25 +1962,6 @@ impl Manager {
                     gates.push((GateReason::FableWeekly, window.live_reset(now)));
                 }
             }
-        }
-        for (reason, until) in [
-            (GateReason::FiveHour, account.five_hour_rejected_until_ms),
-            (GateReason::SevenDay, account.seven_day_rejected_until_ms),
-            (GateReason::Rejected, account.overall_rejected_until_ms),
-        ] {
-            if until.is_some_and(|deadline| now_ms < deadline) {
-                gates.push((reason, until.and_then(ms_to_odt)));
-            }
-        }
-        if is_fable
-            && account
-                .fable_rejected_until_ms
-                .is_some_and(|deadline| now_ms < deadline)
-        {
-            gates.push((
-                GateReason::FableWeekly,
-                account.fable_rejected_until_ms.and_then(ms_to_odt),
-            ));
         }
         // Standard (API-key) token/request limits — mirror `Quota::is_near`
         // (quota.rs) so account_gate agrees with eligible(): a standard-limited
