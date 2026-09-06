@@ -56,6 +56,33 @@ final class WhatsNewTests: XCTestCase {
         XCTAssertNil(WhatsNewStore(defaults: nil).lastSeenVersion)
     }
 
+    // MARK: launch marker
+
+    func testLaunchMarkerKeyIsPinned() {
+        XCTAssertEqual(LaunchVersionMarker.lastLaunchedVersionKey, "lastLaunchedVersion")
+    }
+
+    /// Fresh install → not an update; same version again → not an update; a
+    /// changed version → an update exactly once, then not again.
+    @MainActor
+    func testLaunchMarkerFlagsOnlyTheFirstLaunchOfAChangedVersion() {
+        let suite = "WhatsNewTests.marker.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(LaunchVersionMarker(defaults: defaults).noteLaunch(current: "0.2.35"))
+        XCTAssertFalse(LaunchVersionMarker(defaults: defaults).noteLaunch(current: "0.2.35"))
+        XCTAssertTrue(LaunchVersionMarker(defaults: defaults).noteLaunch(current: "0.2.36"))
+        XCTAssertFalse(LaunchVersionMarker(defaults: defaults).noteLaunch(current: "0.2.36"))
+        XCTAssertFalse(LaunchVersionMarker(defaults: defaults).noteLaunch(current: nil))
+    }
+
+    @MainActor
+    func testLaunchMarkerWithNilDefaultsNeverFlags() {
+        let marker = LaunchVersionMarker(defaults: nil)
+        XCTAssertFalse(marker.noteLaunch(current: "0.2.35"))
+        XCTAssertFalse(marker.noteLaunch(current: "0.2.36"))
+    }
+
     // MARK: feed location
 
     /// The literal `build-tcrbar.sh` writes into `SUFeedURL`.

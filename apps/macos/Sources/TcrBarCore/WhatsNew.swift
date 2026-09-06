@@ -36,6 +36,38 @@ public final class WhatsNewStore: ObservableObject {
     }
 }
 
+// MARK: - Which version launched last
+
+/// Remembers the version that last LAUNCHED — distinct from
+/// ``WhatsNewStore/lastSeenVersion``, which moves only once notes were shown.
+/// This one moves on every launch, unconditionally, so "is this the first
+/// launch after an update?" is answered exactly once per update, whether or
+/// not GitHub was reachable. It gates the port takeover on that launch: an
+/// update that could not fetch its notes must not re-take the port on every
+/// launch until it can.
+@MainActor
+public final class LaunchVersionMarker {
+    /// The `UserDefaults` key. Do not change it.
+    public static let lastLaunchedVersionKey = "lastLaunchedVersion"
+
+    private let defaults: UserDefaults?
+
+    public init(defaults: UserDefaults? = .standard) {
+        self.defaults = defaults
+    }
+
+    /// Record `current` as launched and say whether it differs from the
+    /// version that launched before it. `false` on a fresh install (nothing
+    /// recorded) and when `current` is unknown — neither is an update.
+    public func noteLaunch(current: String?) -> Bool {
+        guard let current, !current.isEmpty else { return false }
+        let previous = defaults?.string(forKey: Self.lastLaunchedVersionKey)
+        defaults?.set(current, forKey: Self.lastLaunchedVersionKey)
+        guard let previous, !previous.isEmpty else { return false }
+        return previous != current
+    }
+}
+
 // MARK: - Gate
 
 /// The pure decision behind "show the notes on this launch?". Split out so the
