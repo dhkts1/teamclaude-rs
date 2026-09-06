@@ -1218,6 +1218,56 @@ fn resolve_setup_token_name(profile: &Profile, name: Option<&str>, fallback: &st
     }
 }
 
+/// What one authenticated call said about a pasted setup token, before it is
+/// written anywhere.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetupTokenCheck {
+    /// Upstream accepted the credential (2xx, or a 429/5xx — a quota or server
+    /// answer is still one that got past auth).
+    Accepted,
+    /// Upstream refused the credential (401 or 403). Nothing may be written.
+    Rejected { status: u16 },
+    /// The call never got an upstream answer (DNS, TLS, timeout). Proves
+    /// nothing either way.
+    Unreachable { message: String },
+}
+
+/// Make ONE authenticated call with `access_token` against `upstream` — the
+/// same 1-token `POST /v1/messages` the warmer sends — and classify the answer.
+///
+/// This exists because a `claude setup-token` credential is the one kind of
+/// account nothing else ever validates: it has no refresh token, so the prober
+/// skips it, a refresh has nothing to send, and the proxy's 401 arm can only
+/// sideline it after the first real request has already failed. A bad paste
+/// therefore used to be accepted silently and reported `active` for as long
+/// as the config held it. The Messages endpoint is used rather than the
+/// profile endpoint because the profile fetch usually fails for an
+/// inference-only scope whether the token is good or not, so it cannot tell
+/// the two apart. The call is a real 1-token completion: it spends a trivial
+/// amount of quota and starts the account's 5h window, which a login is about
+/// to do anyway.
+pub async fn verify_setup_token(upstream: &str, access_token: &str) -> SetupTokenCheck {
+    use crate::warmer::AccountWarmer as _;
+    let warmer = crate::warmer::LiveWarmer::new();
+    match warmer
+        .warm(access_token.to_string(), upstream.to_string())
+        .await
+    {
+        Ok(_) => SetupTokenCheck::Accepted,
+        Err(crate::warmer::WarmError {
+            status: Some(status @ (401 | 403)),
+            ..
+        }) => SetupTokenCheck::Rejected { status },
+        Err(crate::warmer::WarmError {
+            status: Some(_), ..
+        }) => SetupTokenCheck::Accepted,
+        Err(crate::warmer::WarmError {
+            status: None,
+            message,
+        }) => SetupTokenCheck::Unreachable { message },
+    }
+}
+
 pub async fn login_with_token(
     config_path: &Path,
     force: bool,
@@ -1251,6 +1301,24 @@ pub async fn login_with_token(
     };
 
     let mut config = load_or_default(config_path)?;
+
+    // One authenticated call BEFORE anything is written: a rejected token is
+    // refused here, because nothing downstream would ever catch it (see
+    // `verify_setup_token`).
+    match verify_setup_token(&config.upstream, &tokens.access_token).await {
+        SetupTokenCheck::Accepted => {}
+        SetupTokenCheck::Rejected { status } => bail!(
+            "upstream refused this token (HTTP {status}) — it is expired, revoked or mistyped. \
+             Mint a fresh one with `claude setup-token` and try again. Nothing was written."
+        ),
+        SetupTokenCheck::Unreachable { message } => {
+            eprintln!(
+                "[tcr] warning: could not reach {} to verify the token ({message}) — \
+                 storing it unverified; a bad token will be marked `error` on its first request",
+                config.upstream
+            );
+        }
+    }
 
     let profile = fetch_profile(&tokens.access_token).await;
     let fallback = unnamed_fallback(&config.accounts);
@@ -3983,6 +4051,85 @@ mod tests {
         );
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// A canned upstream that answers every connection with `status_line` and an
+    /// empty body, for [`verify_setup_token`]. Returns its base URL.
+    async fn canned_upstream(status_line: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 {status_line}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The bug this guards: a pasted token upstream refuses with 401 must be
+    /// classified `Rejected`, so `login_with_token` writes nothing. Before the
+    /// check existed the account was stored and reported `active` while every
+    /// request it served came back 401.
+    #[tokio::test]
+    async fn verify_setup_token_classifies_401_as_rejected() {
+        let upstream = canned_upstream("401 Unauthorized").await;
+        assert_eq!(
+            verify_setup_token(&upstream, "bad-token").await,
+            SetupTokenCheck::Rejected { status: 401 }
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_setup_token_classifies_403_as_rejected() {
+        let upstream = canned_upstream("403 Forbidden").await;
+        assert_eq!(
+            verify_setup_token(&upstream, "refused-token").await,
+            SetupTokenCheck::Rejected { status: 403 }
+        );
+    }
+
+    /// A 2xx is acceptance, and so is a 429: a quota answer is one that got past
+    /// auth, and refusing a valid-but-exhausted token would block the operator
+    /// from adding an account they mean to use once its window resets.
+    #[tokio::test]
+    async fn verify_setup_token_accepts_2xx_and_429() {
+        let ok = canned_upstream("200 OK").await;
+        assert_eq!(
+            verify_setup_token(&ok, "good-token").await,
+            SetupTokenCheck::Accepted
+        );
+        let exhausted = canned_upstream("429 Too Many Requests").await;
+        assert_eq!(
+            verify_setup_token(&exhausted, "exhausted-token").await,
+            SetupTokenCheck::Accepted
+        );
+    }
+
+    /// No upstream answer at all proves nothing about the token — the caller
+    /// stores it with a warning rather than refusing an offline operator.
+    #[tokio::test]
+    async fn verify_setup_token_reports_dead_upstream_as_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        assert!(matches!(
+            verify_setup_token(&format!("http://{addr}"), "any-token").await,
+            SetupTokenCheck::Unreachable { .. }
+        ));
     }
 
     /// An all-`None` profile plus `--name` must produce that exact name,

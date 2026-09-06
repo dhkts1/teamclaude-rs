@@ -269,6 +269,19 @@ against, so the check can never be evaluated, and an assertion that cannot be ev
 must fail closed rather than silently pass. Drop `--token` and use the browser flow with
 `--account` instead, or use `--token` alone.
 
+**The token is checked before it is written.** `tcr login --token` makes one authenticated
+call with it — the same 1-token `POST /v1/messages` the keep-warm sends — and refuses on a
+401 or 403, writing nothing: mint a fresh one and try again. A 429 or a 5xx is accepted (an
+answer that got past auth proves the credential), and an unreachable upstream stores the
+token with a warning rather than blocking an offline add. This check exists because an
+account added this way is the one kind nothing else ever validates: with no refresh
+token there is nothing to refresh and nothing to probe, so a mistyped or revoked token
+used to be stored and reported `active` while every request it served came back 401. The
+proxy now closes the other half too — a 401 on an account with no refresh token marks it
+`error` on the spot (it cannot be rotation churn, since the token never changes), so a
+credential that dies later shows as `error` in `tcr status` after its first failed request
+instead of never.
+
 ---
 
 ## `tcr accounts`
@@ -284,9 +297,9 @@ zeroes.
 
 ---
 
-## Account resolution: `remove`, `priority`, `enable`, `disable`
+## Account resolution: `remove`, `priority`, `enable`, `disable`, `token`
 
-These four take a positional `<query>` naming one account, and they all resolve it the same
+These five take a positional `<query>` naming one account, and they all resolve it the same
 way.
 
 The rule is: **exact `name`, and if nothing matched, exact email**, where "email" means the
@@ -365,6 +378,17 @@ The four outcomes:
 If you have set `proxy.apiKey`, these two commands need it; they go through the same
 loopback-plus-key gate as every other `/_tcr/` route, with no loopback exemption. See
 [configuration.md](configuration.md#proxyapikey-is-a-security-control-not-a-convenience).
+
+### `tcr token <query>`
+
+Prints the account's current access token to stdout — one line, nothing else — so it can
+be piped or copied. Flags: `--config`, `--org`. Read-only; a non-matching query exits
+non-zero with the file untouched. It reads the file rather than the running proxy, which is
+current enough: every refresh the proxy performs is written straight back to the file.
+
+The token is a credential. Pipe it (`tcr token alice@example.com | pbcopy`); do not paste
+it into a chat, a ticket, or a command line that lands in shell history. TcrBar's
+right-click **Copy Access Token** runs exactly this and puts stdout on the pasteboard.
 
 ---
 

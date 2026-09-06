@@ -9,8 +9,11 @@
 //!   new token was applied it retries the SAME account; if the force was
 //!   coalesced/cooldown-suppressed or the refresh failed (no new token) it rotates
 //!   away WITHOUT sidelining — a healthy account is never marked `Error` for losing
-//!   a race to the refresh throttle. Only a second `401` on a genuinely refreshed
-//!   token sidelines it. A stale-token `401` is never passed to the client.
+//!   a race to the refresh throttle. A second `401` rotates too — it is rotation
+//!   churn, not proof of death; only a REJECTED refresh sets `Error`. The one
+//!   exception is an account with no refresh token (`tcr login --token`): its
+//!   token can neither churn nor be renewed, so a single `401` marks it `Error`.
+//!   A stale-token `401` is never passed to the client.
 //! - A `429` with a `rejected` unified status is durable quota exhaustion →
 //!   throttle + rotate; a transient `429` waits (bounded) and retries the same
 //!   account, or rotates once the wait would be too long.
@@ -2565,6 +2568,25 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // 401 → force-refresh once, then retry the SAME account with the fresh
         // token. Neither arm may set the terminal `Error` status — see below.
         if status == StatusCode::UNAUTHORIZED {
+            // A 401 on an account with NO refresh token is not churn — there is no
+            // refresh that could have rotated the token out from under this
+            // request, and none that could ever revive it. The credential is dead
+            // and only a re-login cures it, so `Error` (terminal, skipped by
+            // selection) is the truthful state. Without this arm a `tcr login
+            // --token` account whose token was rejected sat Active forever: never
+            // probed (`probeable_indices` wants a refresh token), never refreshed
+            // (`refresh_plan` has nothing to send), and rotated away from on every
+            // request while `tcr status` reported it healthy.
+            if !manager.has_refresh_token(idx) {
+                tracing::error!(
+                    account = account_name.as_deref().unwrap_or("?"),
+                    account_index = idx,
+                    "upstream 401 on an account with no refresh token — credential rejected, re-login needed"
+                );
+                manager.mark_error(idx);
+                tried.insert(idx);
+                continue;
+            }
             if forced_401.insert(idx) {
                 if manager.ensure_fresh_force(idx).await {
                     next_idx = Some(idx);
@@ -8474,6 +8496,75 @@ mod tests {
             manager.account_status(0),
             Some(AccountStatus::Active),
             "a forced refresh that produced no new token must rotate, not sideline the account"
+        );
+    }
+
+    /// The inverse of the two 401 tests around it: an account with NO refresh
+    /// token (`tcr login --token`) that 401s must be marked `Error` on the spot.
+    /// The churn argument that protects refreshable accounts does not apply —
+    /// nothing can have rotated its token, and nothing can ever renew it — and
+    /// before this arm existed such a row stayed `active` in `tcr status` for
+    /// as long as the config held it, 401ing every request it was handed.
+    #[tokio::test]
+    async fn single_401_on_account_without_refresh_token_marks_error() {
+        struct NeverCalled;
+        impl crate::oauth::TokenRefresher for NeverCalled {
+            fn refresh(&self, _refresh_token: String) -> crate::oauth::RefreshFuture {
+                Box::pin(async {
+                    panic!("a refresh must never be attempted for an account with no refresh token")
+                })
+            }
+        }
+
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let mut config = dummy_config(None, &format!("http://{up_addr}"));
+        config.accounts[0].refresh_token = None;
+        let manager = Manager::new(
+            config,
+            Arc::new(NeverCalled),
+            Arc::new(crate::probe::LiveUsageProber::new()),
+            Arc::new(crate::warmer::LiveWarmer::new()),
+            None,
+        );
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = manager.clone();
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let _ = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.account_status(0),
+            Some(AccountStatus::Error),
+            "a 401 on an account that cannot refresh is a dead credential, not churn"
         );
     }
 

@@ -84,10 +84,12 @@ impl Manager {
     /// successful refresh would flip an `Error` row back to `Active`, silently
     /// re-inserting it into rotation". That reasoning no longer holds, and its premise
     /// has since been removed on both sides:
-    /// - `Error` now arises ONLY from a REJECTED refresh (the `AuthRejected` arm). A
-    ///   request-level 401 no longer condemns a row (that was rotation churn falsely
-    ///   sidelining healthy accounts — fixed 2026-07-17), and the port-takeover
-    ///   singleton removed token-wars, the main source of *transient* rejections.
+    /// - `Error` now arises ONLY from a REJECTED refresh (the `AuthRejected` arm), or
+    ///   from a request-level 401 on a row with NO refresh token — one that never
+    ///   reaches this filter anyway. A request-level 401 on a refreshable row no
+    ///   longer condemns it (that was rotation churn falsely sidelining healthy
+    ///   accounts — fixed 2026-07-17), and the port-takeover singleton removed
+    ///   token-wars, the main source of *transient* rejections.
     /// - Recovery requires a **successful refresh**, which a genuinely dead
     ///   credential cannot produce — so a re-probe can only ever revive a row that was
     ///   never actually dead. The feared "silently re-insert a dead account" is

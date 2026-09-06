@@ -912,6 +912,11 @@ struct AccountRow: View {
     /// Defaults to `false` so every other call site (the live panel) is
     /// unchanged.
     var snapshotMode: Bool = false
+    /// The last "Copy Access Token" that did not land — `tcr`'s own words,
+    /// drawn under the row like the other failure lines. Row-local rather
+    /// than a controller: nothing else needs to know, and a copy that did
+    /// land leaves no state at all (the pasteboard is the only evidence).
+    @State private var tokenCopyFailure: TokenCommand.Failure?
 
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
@@ -1376,6 +1381,11 @@ struct AccountRow: View {
         Button("Copy Account Name") {
             copyToPasteboard(account.name)
         }
+        // The token is a secret: it goes from `tcr token`'s stdout straight
+        // to the pasteboard and is never rendered, logged or kept.
+        Button("Copy Access Token") {
+            Task { await performCopyToken() }
+        }
         Divider()
         groupMenuItems
         Divider()
@@ -1593,6 +1603,18 @@ struct AccountRow: View {
     /// Shared by "Copy Account Name" and the per-group command copy — one
     /// place that clears then sets, so every copy in this menu behaves the
     /// same way.
+    /// `tcr token <name>` off the main actor, then the pasteboard. A failure
+    /// replaces any earlier one on this row; a success clears it.
+    private func performCopyToken() async {
+        switch await TokenCommand.fetch(query: account.name) {
+        case .success(let token):
+            copyToPasteboard(token)
+            tokenCopyFailure = nil
+        case .failure(let failure):
+            tokenCopyFailure = failure
+        }
+    }
+
     private func copyToPasteboard(_ text: String) {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
@@ -1895,6 +1917,12 @@ struct AccountRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = removeController.failure(for: account.name) {
+                Label(failure.summary, systemImage: Tok.unreadableGlyph)
+                    .font(Tok.detailFont)
+                    .foregroundStyle(Tok.spent)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let failure = tokenCopyFailure {
                 Label(failure.summary, systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.spent)

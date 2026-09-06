@@ -159,6 +159,18 @@ impl Manager {
             .map(|a| a.access_token.clone())
     }
 
+    /// Whether account `idx` carries a refresh token. `false` for a
+    /// `claude setup-token` credential (`tcr login --token`), whose access token
+    /// can never be renewed — so for such a row an upstream 401 is proof the
+    /// credential is dead, not rotation churn (see the proxy's 401 arm).
+    pub fn has_refresh_token(&self, idx: usize) -> bool {
+        self.accounts
+            .read()
+            .expect("accounts lock poisoned")
+            .get(idx)
+            .is_some_and(|a| a.refresh_token.is_some())
+    }
+
     /// Display name of account `idx`, for the request log.
     pub fn account_name(&self, idx: usize) -> Option<String> {
         self.accounts
