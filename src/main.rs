@@ -51,6 +51,9 @@ enum Command {
     Remove(RemoveArgs),
     /// Set an account's rotation priority (lower value = preferred).
     Priority(PriorityArgs),
+    /// Print an account's current access token to stdout (a secret — pipe it, do
+    /// not paste it into a chat or a shell history).
+    Token(TokenArgs),
     /// Enable an account (clears the `disabled` flag).
     Enable(EnableArgs),
     /// Disable an account (holds it out of rotation).
@@ -81,6 +84,19 @@ struct AccountsArgs {
 
 #[derive(clap::Args)]
 struct RemoveArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Account name, or its bare email if the name carries an org suffix. Exact
+    /// and case-sensitive — not a substring.
+    query: String,
+    /// Narrow an ambiguous match to a single org (name or uuid).
+    #[arg(long)]
+    org: Option<String>,
+}
+
+#[derive(clap::Args)]
+struct TokenArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
@@ -409,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Login(args)) => run_login(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
+        Some(Command::Token(args)) => run_token(args),
         Some(Command::Priority(args)) => run_priority(args),
         Some(Command::Enable(args)) => run_enable(args).await,
         Some(Command::Disable(args)) => run_disable(args).await,
@@ -433,6 +450,12 @@ async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
 async fn run_remove(args: RemoveArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     cli::remove_account(&config_path, &args.query, args.org.as_deref()).await
+}
+
+/// `tcr token <query> [--org]` — print the account's access token.
+fn run_token(args: TokenArgs) -> anyhow::Result<()> {
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    cli::print_access_token(&config_path, &args.query, args.org.as_deref())
 }
 
 /// `tcr priority <query> [N|--first|--last] [--org]` — set rotation priority.

@@ -333,6 +333,28 @@ pub fn set_priority(
     Ok(())
 }
 
+/// `tcr token <query>` — print the matched account's access token to stdout,
+/// nothing else, so a caller can pipe or copy it. Exists for TcrBar's "Copy
+/// Access Token" row action: the app never reads the config file itself
+/// (it holds live credentials), so every credential read is a subprocess.
+///
+/// Reads the FILE, not the running proxy — close enough, because every
+/// refresh the proxy performs is persisted straight back to the file
+/// (`Manager::persist_tokens`); the window where the two differ is the
+/// write itself. Read-only: a non-matching query errors with the file
+/// untouched, and nothing is logged — the token goes to stdout only.
+pub fn print_access_token(
+    config_path: &Path,
+    query: &str,
+    org: Option<&str>,
+) -> anyhow::Result<()> {
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let idx = resolve_account(&config.accounts, query, org)?;
+    println!("{}", config.accounts[idx].access_token);
+    Ok(())
+}
+
 /// Printed after every group mutation that actually changed the file.
 ///
 /// Used to say "will not see this until it restarts" — true before
