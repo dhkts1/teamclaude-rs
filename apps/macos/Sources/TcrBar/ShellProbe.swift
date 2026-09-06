@@ -107,7 +107,13 @@ enum ShellProbe {
             // — it must also remember nothing, or a probe run would rewrite the
             // operator's `keepThisMacAwake` preference. See `AwakeController.harness()`.
             awake: AwakeController.harness(),
-            updater: Updater(startingUpdater: false))
+            updater: Updater(startingUpdater: false),
+            // Same posture for the release notes: remembers nothing, and a
+            // fetcher that cannot reach anything — a probe run must neither
+            // write `lastSeenVersion` nor touch the network.
+            whatsNew: WhatsNewController(
+                store: WhatsNewStore(defaults: nil), fetcher: NeverFetches(),
+                location: nil, currentVersion: nil))
 
         var checks: [Check] = []
         var notes: [String] = []
@@ -551,5 +557,12 @@ enum ShellProbe {
         }
         let json = "[\(rows.joined(separator: ","))]"
         return (try? Fleet.decode(Data(json.utf8))) ?? Fleet(accounts: [])
+    }
+}
+
+/// A `ReleaseFetching` that refuses every call — for harness runs.
+struct NeverFetches: ReleaseFetching {
+    func fetchRelease(at url: URL) async throws -> ReleaseNotes {
+        throw ReleaseFetchError.network("harness run: no network")
     }
 }

@@ -51,6 +51,11 @@ final class MenuBarShell {
     /// to find it, so an updater that only existed while the panel was open would
     /// make the CLI's call do nothing on an app nobody had clicked.
     let updater: Updater
+    /// The release-notes window and its state. Owned here so the notes loaded
+    /// at launch are the ones the footer button reopens, and so the
+    /// right-click menu can reach it with the panel closed.
+    let whatsNew: WhatsNewController
+    let whatsNewWindow: WhatsNewWindow
 
     let statusItem: NSStatusItem
     let popover: NSPopover
@@ -72,7 +77,8 @@ final class MenuBarShell {
         preference: LaunchPreference? = nil,
         updater: Updater? = nil,
         groupController: GroupController? = nil,
-        removeController: RemoveAccountController? = nil
+        removeController: RemoveAccountController? = nil,
+        whatsNew: WhatsNewController? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -84,6 +90,16 @@ final class MenuBarShell {
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
         self.removeController = removeController ?? RemoveAccountController()
+        // The controller's `init` is inert; nothing fetches until `AppDelegate`
+        // calls `checkAfterLaunch()`, which the shell probe never does.
+        self.whatsNew =
+            whatsNew
+            ?? WhatsNewController(
+                store: WhatsNewStore(),
+                fetcher: GitHubReleaseClient(version: AppBuild.shortVersion),
+                location: ReleaseFeedLocation.from(bundle: .main),
+                currentVersion: AppBuild.shortVersion)
+        self.whatsNewWindow = WhatsNewWindow(controller: self.whatsNew)
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -120,7 +136,8 @@ final class MenuBarShell {
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
                 accounts: self.accounts, control: self.control, awake: self.awake,
                 preference: self.preference, updater: self.updater,
-                groupController: self.groupController, removeController: self.removeController))
+                groupController: self.groupController, removeController: self.removeController,
+                onWhatsNew: { [weak self] in self?.openWhatsNew() }))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -267,6 +284,11 @@ final class MenuBarShell {
         updateItem.isEnabled = updater.canCheckForUpdates
         menu.addItem(updateItem)
 
+        let notesItem = NSMenuItem(
+            title: "What's New…", action: #selector(quickWhatsNew), keyEquivalent: "")
+        notesItem.target = self
+        menu.addItem(notesItem)
+
         let quitItem = NSMenuItem(
             title: "Quit", action: #selector(quickQuit), keyEquivalent: "")
         quitItem.target = self
@@ -281,6 +303,15 @@ final class MenuBarShell {
     @objc private func quickRefresh() { Task { await poller.pollOnce() } }
     @objc private func quickToggleAwake() { awake.toggle() }
     @objc private func quickCheckForUpdates() { updater.checkForUpdates() }
+    @objc private func quickWhatsNew() { openWhatsNew() }
+
+    /// The on-demand route: footer button, right-click item. Shows the window
+    /// at once (loading state) and lets the controller fill it in.
+    func openWhatsNew() {
+        closePanel()
+        whatsNewWindow.present()
+        Task { await whatsNew.showOnDemand() }
+    }
     @objc private func quickQuit() { NSApplication.shared.terminate(nil) }
 
     func openPanel() {
@@ -334,6 +365,7 @@ struct FleetPanel: View {
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
     @ObservedObject var removeController: RemoveAccountController
+    var onWhatsNew: () -> Void = {}
 
     var body: some View {
         FleetView(
@@ -346,7 +378,8 @@ struct FleetPanel: View {
             updater: updater,
             groupController: groupController,
             removeController: removeController,
-            startServerAtLaunch: $preference.startServerAtLaunch
+            startServerAtLaunch: $preference.startServerAtLaunch,
+            onWhatsNew: onWhatsNew
         )
     }
 }
