@@ -118,7 +118,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // `--headless` is the flag that matters here — without it the child dies
         // on startup trying to put a TUI on a pipe.
         if shell.preference.startServerAtLaunch {
-            shell.server.start()
+            // The first launch after an UPDATE takes the port; every other
+            // launch stands down to an incumbent. When TcrBar quits for an
+            // update it stops its own child, so normally nothing holds the port
+            // and the two are the same spawn. The case this exists for is a
+            // proxy that outlived the old app — one it never supervised, or
+            // one it failed to stop — which the old `--no-replace` start
+            // quietly yielded to, leaving the just-updated app showing
+            // "Take over port…" for the operator to press by hand (0.2.35).
+            // The operator chose the update; the proxy it replaces is by
+            // definition the pre-update one.
+            if LaunchVersionMarker().noteLaunch(current: AppBuild.shortVersion) {
+                NSLog("TcrBar: first launch of \(AppBuild.shortVersion ?? "?") — taking the port")
+                shell.server.startTakingOverPort()
+            } else {
+                shell.server.start()
+            }
         }
         // Same shape, same place, same once-per-process guarantee: re-take the
         // power assertions if that is how the operator left them. A reboot is

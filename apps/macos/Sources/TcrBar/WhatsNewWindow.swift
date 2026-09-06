@@ -31,12 +31,16 @@ final class WhatsNewWindow {
         let window = self.window ?? makeWindow()
         self.window = window
         window.title = controller.title
-        if #available(macOS 14.0, *) {
-            NSApp.activate()
-        } else {
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        // `ignoringOtherApps: true` on purpose, and `orderFrontRegardless()` on
+        // top of `makeKeyAndOrderFront`. On macOS 14 a bare `NSApp.activate()`
+        // is cooperative — it only takes focus when the user just interacted
+        // with this app, which is true for the popover (a click opened it)
+        // and false here: this fires from a launch, seconds after a Sparkle
+        // relaunch, with the operator looking at something else. Shipped that
+        // way in 0.2.35 the window came up BEHIND the frontmost window.
+        NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
         installKeyMonitor()
     }
 

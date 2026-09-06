@@ -3669,10 +3669,13 @@ mod tests {
             config_with_reserved(vec![member, outsider], &["codereview"]),
             lock_refresher(),
         );
-        let now = OffsetDateTime::now_utc();
-
         manager.mark_rate_limited(0, 600); // the group's member
         manager.mark_rate_limited(1, 60); // an unrelated account, free much sooner
+                                          // AFTER the marks: each `mark_rate_limited` reads its own clock, so a
+                                          // `now` taken before them is a few microseconds earlier than the
+                                          // holds' anchor and the 60 s hint rounds up to 61 — which failed the
+                                          // `<= 60` control on CI (#189) with nothing wrong in the code.
+        let now = OffsetDateTime::now_utc();
 
         let fleet = manager.retry_after_hint(now, false);
         let scoped = manager.retry_after_hint_for_group(now, false, "codereview");
