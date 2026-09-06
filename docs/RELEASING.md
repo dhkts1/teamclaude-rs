@@ -99,6 +99,18 @@ Flags:
 - `--tag vX.Y.Z` — must equal `v<Cargo.toml version>`. Mismatch aborts.
 - `--verify-only <path/to/TcrBar.app>` — run the signature asserts against an existing bundle.
 
+## The app shows the release notes after an update
+
+On the first launch of a version the operator has not seen, TcrBar fetches the GitHub Release
+for its own tag (`releases/tags/v<version>`, unauthenticated) and shows the `## What's new`
+section of the release body in a window — the whole body when that heading is absent. The
+window can be reopened any time from the panel footer or the right-click menu (**What's New…**).
+
+So the `## What's new` section IS the changelog; write it into the release body when the tag is
+cut (`gh release edit vX.Y.Z --notes-file …`). Until the Release object exists for the tag the
+app gets a 404, says nothing, and tries again on the next launch — it records a version as seen
+only once notes were actually shown. A fresh install records the current version silently.
+
 ## What the pipeline does
 
 1. `build-tcrbar.sh` — Swift build, bundle assembly, `tcr` bundled alongside, local signature.

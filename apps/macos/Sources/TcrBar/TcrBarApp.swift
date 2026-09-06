@@ -88,6 +88,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let shell = MenuBarShell()
         self.shell = shell
+        // The one call that can open the release-notes window unbidden: only
+        // after an update (a version the operator has not seen notes for), and
+        // only once the notes actually loaded. Never awaited — a hung network
+        // must not hold up launch — and never reached by the render or probe
+        // harnesses, which build the shell without this delegate.
+        Task {
+            if await shell.whatsNew.checkAfterLaunch() {
+                shell.whatsNewWindow.present()
+            }
+        }
         // Was `FleetView.onAppear`, which under `MenuBarExtra` meant the fleet
         // was not polled until the panel had been opened once — the menu-bar
         // glyph sat at its `.pending` gauge until then.

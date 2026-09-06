@@ -46,6 +46,9 @@ struct FleetView: View {
     /// whatever the panel happens to show. Runtime is untouched — the default is
     /// `false` and the live panel still scrolls.
     var snapshotMode: Bool = false
+    /// Opens the "What's new" window. A closure rather than the controller so
+    /// the render harness passes `{}` and can neither fetch nor open anything.
+    var onWhatsNew: () -> Void = {}
 
     /// Surfaced in place rather than swallowed: a button that silently does
     /// nothing is worse than one that says why.
@@ -562,6 +565,8 @@ struct FleetView: View {
                     "Ask the release feed whether a newer TcrBar exists. "
                         + "Also reachable as `tcrbar://check-for-updates`."
                 )
+            Button("What's New…") { onWhatsNew() }
+                .help("The release notes for the TcrBar you are running.")
             Button("Quit") { NSApplication.shared.terminate(nil) }
             Spacer(minLength: 0)
         }
