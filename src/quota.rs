@@ -267,6 +267,19 @@ impl Quota {
             .is_some_and(|w| w.effective(now) >= threshold)
     }
 
+    /// Has upstream ACTUALLY rejected on the model-scoped weekly (`7d_oi`)
+    /// bucket — as opposed to merely predicted it via `switchThreshold`? The
+    /// only writer of a `1.0` utilization into `seven_day_oi` is
+    /// [`Self::reject_model_weekly`], fired on a real upstream rejection; a
+    /// live fleet's own reported `7d_oi` has been observed sitting at
+    /// 0.95-0.98 while upstream keeps answering 200s, so `>= threshold` (used
+    /// by [`Self::model_weekly_exhausted`]) is a PREDICTION and this is the
+    /// AUTHORITY. Reuses [`QuotaWindow::effective`], so a past-reset rejection
+    /// reads fresh as `0.0` (not rejected) once its window rolls over.
+    pub fn model_weekly_rejected(&self, now: OffsetDateTime) -> bool {
+        self.seven_day_oi.is_some_and(|w| w.effective(now) >= 1.0)
+    }
+
     /// Record a model-scoped weekly rejection — upstream answered `rejected` on
     /// `7d_oi` while both shared scopes stayed allowed (issue #178) — by writing
     /// full utilization into the window the selector ALREADY gates Fable on. No
@@ -914,6 +927,65 @@ mod tests {
             ..Quota::default()
         };
         assert!(!quota.model_weekly_exhausted(0.90, now));
+    }
+
+    /// Fable weekly gate (three-tier): `model_weekly_rejected` is the AUTHORITY
+    /// check, distinct from the PREDICTION `model_weekly_exhausted` — a bucket
+    /// sitting at 0.96 (over a 0.95 threshold, the observed live-fleet shape)
+    /// is exhausted-by-prediction but NOT upstream-rejected.
+    #[test]
+    fn model_weekly_rejected_false_when_only_over_threshold() {
+        let now = OffsetDateTime::now_utc();
+        let quota = Quota {
+            seven_day_oi: Some(QuotaWindow {
+                utilization: 0.96,
+                reset: Some(now + Duration::hours(2)),
+            }),
+            ..Quota::default()
+        };
+        assert!(
+            quota.model_weekly_exhausted(0.95, now),
+            "0.96 is over the 0.95 threshold — predicted exhausted"
+        );
+        assert!(
+            !quota.model_weekly_rejected(now),
+            "0.96 is not 1.0 — upstream has not actually rejected"
+        );
+    }
+
+    #[test]
+    fn model_weekly_rejected_true_only_at_or_over_1_0() {
+        let now = OffsetDateTime::now_utc();
+        let quota = Quota {
+            seven_day_oi: Some(QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now + Duration::hours(2)),
+            }),
+            ..Quota::default()
+        };
+        assert!(quota.model_weekly_rejected(now));
+    }
+
+    #[test]
+    fn model_weekly_rejected_false_when_oi_absent() {
+        let now = OffsetDateTime::now_utc();
+        assert!(!Quota::default().model_weekly_rejected(now));
+    }
+
+    /// A `7d_oi` rejection past its reset must read fresh (`0.0`), the same
+    /// bug-#2 shape `model_weekly_exhausted_reads_fresh_after_reset` already
+    /// guards for the prediction side.
+    #[test]
+    fn model_weekly_rejected_reads_fresh_after_reset() {
+        let now = OffsetDateTime::now_utc();
+        let quota = Quota {
+            seven_day_oi: Some(QuotaWindow {
+                utilization: 1.0,
+                reset: Some(now - Duration::hours(1)),
+            }),
+            ..Quota::default()
+        };
+        assert!(!quota.model_weekly_rejected(now));
     }
 
     /// Regression guard: `is_near` must keep IGNORING the `7d_oi` bucket, so a
