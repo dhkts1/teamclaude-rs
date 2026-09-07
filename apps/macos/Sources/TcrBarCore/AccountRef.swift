@@ -37,6 +37,26 @@ public struct AccountRef: Hashable, Sendable {
     /// and every by-account dictionary key resolve to this, so a row's SwiftUI
     /// identity and its verdict's dictionary key cannot disagree.
     public var id: String { name }
+
+    /// The name split for DISPLAY into the email half and the org half, so the
+    /// row can put them on two different lines and truncate neither.
+    ///
+    /// The row used to draw the whole name on one line and middle-truncate it,
+    /// which on a qualified name produced `henry@ex…ample-team` — a string that
+    /// is neither readable nor typable, and the suffix is exactly the part that
+    /// says which of a person's orgs this row is. Splitting means line one holds
+    /// an ordinary email and the suffix rides the designations line as its own
+    /// tag, whole.
+    ///
+    /// The split is at the FIRST separator and the remainder is kept intact,
+    /// separator included: `a@b/x/y` yields `("a@b", "/x/y")`, never `("a@b",
+    /// "/x")` with `/y` dropped on the floor. A name is an identity — this may
+    /// re-present it, never lose a byte of it. `orgTag` is `nil` for a bare
+    /// email, which renders exactly as it always has.
+    public var displayHalves: (email: String, orgTag: String?) {
+        guard let slash = name.firstIndex(of: "/") else { return (name, nil) }
+        return (String(name[name.startIndex..<slash]), String(name[slash...]))
+    }
 }
 
 extension Account {

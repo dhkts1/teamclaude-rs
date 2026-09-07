@@ -1185,12 +1185,20 @@ struct AccountRow: View {
     /// group names are the single biggest contributor to the width — the live
     /// fleet's `HENRY-TEAM-PARKED` alone is wider than three status pills.
     ///
-    /// Drawn only when there is something to say; an account with no plan and
-    /// no groups reserves no space at all.
+    /// Drawn only when there is something to say; an account with no plan, no
+    /// groups and a bare-email name reserves no space at all.
+    ///
+    /// The org half of the name leads this line — before the plan — because it
+    /// is part of the row's IDENTITY rather than a fact about it. It is here at
+    /// all only because line one has no room for it; putting it first keeps the
+    /// two halves as close to each other as two lines allow.
     @ViewBuilder
     private var designationsLine: some View {
-        if account.plan != nil || !account.groupTags.isEmpty {
+        if account.ref.displayHalves.orgTag != nil || account.plan != nil
+            || !account.groupTags.isEmpty
+        {
             HStack(spacing: Tok.tightSpacing) {
+                orgIndicator
                 planIndicator
                 // At most two tags, the rest collapsed into a `+N` chip whose
                 // tooltip names them all. The cap stays even with a line to
@@ -1205,6 +1213,32 @@ struct AccountRow: View {
                 }
                 Spacer(minLength: 0)
             }
+        }
+    }
+
+    /// The `/<org-slug>` half of the name, verbatim and never truncated —
+    /// `fixedSize()`, like every other tag on this line.
+    ///
+    /// Rendered dim, at the tag font, because it is a continuation of the name
+    /// above rather than a separate label: it reads as part of an identity that
+    /// wrapped, which is what it is. The text is EXACTLY what the operator would
+    /// type, separator included, so a name can be reassembled by reading the two
+    /// lines left to right.
+    ///
+    /// Absent on a bare-email name, which is every row on a fleet where nobody
+    /// holds two orgs — those rows look exactly as they always have.
+    @ViewBuilder
+    private var orgIndicator: some View {
+        if let orgTag = account.ref.displayHalves.orgTag {
+            Text(orgTag)
+                .font(Tok.pillFont)
+                .foregroundStyle(Tok.inkFaint)
+                .fixedSize()
+                .textSelection(.enabled)
+                .help(
+                    "The organization half of this account's name — the full name is "
+                        + "\(account.name), which is what every `tcr` command takes."
+                )
         }
     }
 
@@ -1828,20 +1862,35 @@ struct AccountRow: View {
     private var information: some View {
         VStack(alignment: .leading, spacing: Tok.rowLineSpacing) {
             HStack(spacing: Tok.tightSpacing) {
-                Text(account.name)
+                // The EMAIL HALF only. The `/<org-slug>` half is a tag on the
+                // designations line below — see `orgIndicator`.
+                //
+                // This line used to carry the whole name and middle-truncate
+                // it, which on a qualified name rendered `henry@ex…ample-team`:
+                // not readable, not typable, and truncating the one thing that
+                // says which of a person's orgs the row is. Splitting the two
+                // halves across two lines is what lets BOTH be shown whole,
+                // rather than choosing which end to sacrifice.
+                //
+                // `.help` deliberately stays the FULL name, not this half: the
+                // tooltip is the "what do I type" answer, and the answer is the
+                // whole thing.
+                // WRAPS rather than truncates. Splitting the org half off is
+                // not on its own enough: line one also carries the live-state
+                // pills, every one of them `fixedSize()`, so on a row wearing
+                // two of them a perfectly ordinary address still ran out of
+                // room — `henry.mitchell@examp…` with ROTATING + UNMEASURED
+                // beside it. The pills cannot yield, so the name has to be
+                // allowed a second line instead of losing its tail.
+                //
+                // `fixedSize(horizontal:vertical:)` is what makes the wrap
+                // real: without it the `Text` reports the one-line height it
+                // was offered and clips, rather than growing.
+                Text(account.ref.displayHalves.email)
                     .font(Tok.bodyFont)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
-                    .lineLimit(1)
-                    // Middle truncation, because the distinguishing part of a
-                    // name is at its ENDS: the local part at the front, and the
-                    // `/<org-slug>` suffix at the back on a row belonging to one
-                    // of a person's several orgs. Tail truncation would eat that
-                    // suffix, which is the one thing telling those rows apart —
-                    // and the thing the operator types to address one.
-                    //
-                    // It still hides the middle, so the full value stays
-                    // reachable: `.help` on hover and `.textSelection` to copy.
-                    .truncationMode(.middle)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                     .help(account.name)
                     .textSelection(.enabled)
                 controlIndicator

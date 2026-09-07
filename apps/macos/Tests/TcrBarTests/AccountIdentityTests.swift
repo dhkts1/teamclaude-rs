@@ -39,6 +39,48 @@ final class AccountIdentityTests: XCTestCase {
         )
     }
 
+    /// The row draws a name on two lines — the email, then the `/org` half as
+    /// its own tag — so that neither has to be truncated. The split must lose
+    /// nothing: reading the two halves left to right has to reproduce the name
+    /// byte-for-byte, because that string is what the operator types back.
+    ///
+    /// The third case is the one worth having: a name with a SECOND separator
+    /// keeps the whole remainder in the tag. Splitting on every `/` would drop
+    /// `/y` on the floor and quietly display a name that addresses nothing.
+    func testDisplayHalvesSplitAtTheFirstSeparatorAndLoseNothing() {
+        let bare = AccountRef(name: "alice@example.com").displayHalves
+        XCTAssertEqual(bare.email, "alice@example.com")
+        XCTAssertNil(bare.orgTag, "a bare email has no tag — that row renders as it always has")
+
+        let qualified = AccountRef(name: "alice@example.com/acme").displayHalves
+        XCTAssertEqual(qualified.email, "alice@example.com")
+        XCTAssertEqual(
+            qualified.orgTag, "/acme",
+            "the tag carries the separator, so the two halves concatenate back to the name"
+        )
+
+        let pathological = AccountRef(name: "alice@example.com/x/y").displayHalves
+        XCTAssertEqual(pathological.email, "alice@example.com")
+        XCTAssertEqual(
+            pathological.orgTag, "/x/y",
+            "a second separator stays INSIDE the tag — splitting on it would drop /y"
+        )
+
+        // The property behind all three, stated once: nothing is lost.
+        for name in [
+            "alice@example.com",
+            "alice@example.com/acme",
+            "alice@example.com/x/y",
+            "alice@example.com/",
+        ] {
+            let halves = AccountRef(name: name).displayHalves
+            XCTAssertEqual(
+                halves.email + (halves.orgTag ?? ""), name,
+                "the two halves must reassemble into exactly the name"
+            )
+        }
+    }
+
     /// A row's identity is its name, with nothing appended: the `id` a
     /// dictionary is keyed by and the string handed to `tcr` are the same bytes,
     /// so a key can never be built that `tcr` would not accept.
