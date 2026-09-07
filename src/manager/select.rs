@@ -1025,6 +1025,35 @@ impl Manager {
                 }
             }
 
+            // Fable last resort (three-tier gate, replacing the old hard two-tier
+            // one): reached only when BOTH passes above already came up empty AND
+            // a reserved strict group did not just intentionally return `None`
+            // (`strict_group` is a per-group PRIVACY decision, never a candidate
+            // pool to widen). The threshold applied by `model_blocked` above is a
+            // PREDICTION (`switchThreshold` against `7d_oi`, observed sitting at
+            // 0.95-0.98 on a real fleet); upstream — `Quota::reject_model_weekly`,
+            // the only writer of a genuine `1.0` — is the AUTHORITY. A prediction
+            // must never itself produce the user-facing 429; only relax the gate
+            // once every other option is exhausted, so on a healthy fleet this
+            // path costs nothing (identical to today) and on a mispredicted one it
+            // spends one real request to convert the guess into a fact.
+            if best.is_none() && is_fable && strict_group.is_none() {
+                if let Some(idx) = self.pick_fable_last_resort(&accounts, pool_tried, now, now_ms) {
+                    if let Some(account) = accounts.get(idx) {
+                        let seven_day_oi =
+                            account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
+                        tracing::info!(
+                            account = %account.name,
+                            seven_day_oi,
+                            "fable: last resort — every account is over the predicted \
+                             Fable-weekly threshold and none was rejected upstream; \
+                             trying the freshest"
+                        );
+                    }
+                    best = Some(idx);
+                }
+            }
+
             // Stamp the chosen account so the next select prefers a different one.
             if let Some(idx) = best {
                 let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
@@ -2223,6 +2252,86 @@ impl Manager {
         best
     }
 
+    /// The Fable last-resort pick (three-tier gate): reached only when
+    /// [`Self::pick_eligible`] and [`Self::pick_least_loaded`] both already
+    /// returned `None` for a Fable request. Mirrors [`Self::eligible`]'s
+    /// non-model gates (disabled/error/live hold/shared five-hour and
+    /// seven-day windows/standard limits/group) but — unlike `eligible` and
+    /// `pick_least_loaded` — does **not** hard-skip on
+    /// [`Self::model_blocked`]'s prediction; it excludes only an account
+    /// upstream has genuinely rejected on `7d_oi`
+    /// ([`crate::quota::Quota::model_weekly_rejected`]). Ignores `group`
+    /// (always `None`, matching the soft fallback's own widening) — this pass
+    /// only runs once the whole pool is already being considered.
+    ///
+    /// Sort key ascending, freshest first: `(7d_oi utilization, priority,
+    /// reset-urgency bucket, last_selected_seq, weekly reset)`. Preferring the
+    /// LOWEST live `7d_oi` spends the one probe request on the account most
+    /// likely to still have real headroom, rather than the one already
+    /// closest to a genuine reject.
+    ///
+    /// Read-only.
+    fn pick_fable_last_resort(
+        &self,
+        accounts: &[AccountRuntime],
+        tried: &HashSet<usize>,
+        now: OffsetDateTime,
+        now_ms: i64,
+    ) -> Option<usize> {
+        let reserved_groups = self.reserved_groups();
+        let mut best: Option<usize> = None;
+        let mut best_key: Option<(u64, i64, i64, u64, i128)> = None;
+        for (idx, account) in accounts.iter().enumerate() {
+            if tried.contains(&idx) {
+                continue;
+            }
+            if account.disabled || account.status == AccountStatus::Error {
+                continue;
+            }
+            if let Some(until) = account.rate_limited_until_ms {
+                if now_ms < until {
+                    continue;
+                }
+            }
+            let threshold = account.switch_threshold.unwrap_or(self.global_threshold);
+            // The shared (non-Fable) gates still apply in full — this pass
+            // relaxes ONLY the Fable-specific `7d_oi` prediction, never the
+            // account's other windows.
+            if account.quota.is_near(threshold, now) {
+                continue;
+            }
+            // The one gate this pass relaxes from a prediction to the
+            // authority: skip only a `7d_oi` upstream has actually rejected.
+            if account.quota.model_weekly_rejected(now) {
+                continue;
+            }
+            if Self::reserved_blocks(account, None, &reserved_groups) {
+                continue;
+            }
+            if !self.pool_pick_respects_control_reserve(idx, account, now) {
+                continue;
+            }
+            let seven_day_oi = account.quota.seven_day_oi.map_or(0.0, |w| w.effective(now));
+            let oi_bucket = (seven_day_oi.max(0.0) * 1_000_000.0) as u64;
+            let reset = account
+                .quota
+                .governing_weekly_reset(now)
+                .map_or(i128::MIN, |r| r.unix_timestamp() as i128);
+            let key = (
+                oi_bucket,
+                account.priority,
+                self.reset_urgency_tier(account, now),
+                account.last_selected_seq,
+                reset,
+            );
+            if best_key.is_none_or(|b| key < b) {
+                best = Some(idx);
+                best_key = Some(key);
+            }
+        }
+        best
+    }
+
     /// Lookup half of [`Manager::conn_affinity`]: the account this connection
     /// was last served on, or `None` if never recorded or the entry has aged
     /// past [`CONN_AFFINITY_TTL_MS`] (treated as absent — the connection is
@@ -3268,5 +3377,281 @@ mod reset_urgency_tests {
                 "a disabled tier term must tie, not rank"
             );
         }
+    }
+}
+
+/// The Fable weekly last-resort gate (`docs/plans/fable-gate-bridge-coder.md`):
+/// on a real fleet the model-scoped weekly bucket (`7d_oi`) rests at 0.95-0.98
+/// against a `switchThreshold` of 0.95, so every pooled account hard-failed
+/// `model_blocked` and a Fable request 429'd even though upstream had never
+/// once rejected on that bucket. These drive the REAL `select()` (not the
+/// pure predicates) across the three tiers the fix adds: predicted-near is
+/// still eligible normally, predicted-over-but-not-rejected is skipped on the
+/// first two passes and usable as a last resort, and genuinely-rejected
+/// (`>= 1.0`, the only value [`crate::quota::Quota::reject_model_weekly`]
+/// writes) is never picked.
+#[cfg(test)]
+mod fable_last_resort_tests {
+    use super::*;
+    use crate::config::{Account, ProxyConfig};
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::quota::QuotaWindow;
+    use crate::warmer::LiveWarmer;
+    use std::collections::HashSet;
+    use time::Duration;
+
+    const FABLE_MODEL: &str = "claude-fable-5";
+
+    fn account(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn config_with(accounts: Vec<Account>, switch_threshold: f64) -> Config {
+        Config {
+            quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
+            proxy: ProxyConfig::default(),
+            upstream: "https://api.anthropic.com".to_string(),
+            switch_threshold,
+            pacing: PacingConfig::default(),
+            account_throttle: ThrottleConfig::default(),
+            fleet_throttle: ThrottleConfig::default(),
+            lock_account: None,
+            control_account: None,
+            control_reserve: 0.05,
+            control_pooled: false,
+            reset_urgency_tier_hours: 24,
+            http1_only: false,
+            accounts,
+            group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn build_manager(config: Config) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// Set account `idx`'s `7d_oi` utilization, resetting two hours out (safely
+    /// in the future for the lifetime of a unit test).
+    fn set_seven_day_oi(manager: &Manager, idx: usize, utilization: f64) {
+        let now = OffsetDateTime::now_utc();
+        let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+        accounts[idx].quota.seven_day_oi = Some(QuotaWindow {
+            utilization,
+            reset: Some(now + Duration::hours(2)),
+        });
+    }
+
+    /// The regression this unit exists to fix: every pooled account sits at
+    /// 0.96 against a 0.95 threshold (the live-fleet shape from the bridge's
+    /// evidence) — the OLD two-tier gate hard-skipped every one of them and
+    /// `select()` returned `None`, which the proxy turns into a synthesized
+    /// 429. The new three-tier gate must still serve the request.
+    #[test]
+    fn fleet_all_over_predicted_threshold_is_still_served() {
+        let manager = build_manager(config_with(
+            vec![account("acct-a"), account("acct-b"), account("acct-c")],
+            0.95,
+        ));
+        for idx in 0..3 {
+            set_seven_day_oi(&manager, idx, 0.96);
+        }
+        let now = OffsetDateTime::now_utc();
+        let served = manager.select(
+            &HashSet::new(),
+            now,
+            Some(FABLE_MODEL),
+            None,
+            "/v1/messages",
+            None,
+        );
+        assert!(
+            served.is_some(),
+            "a fleet predicted-over-threshold but never rejected upstream must \
+             still serve a Fable request via the last resort, not synthesize a 429"
+        );
+    }
+
+    /// An account upstream has ACTUALLY rejected on `7d_oi` (utilization
+    /// `1.0`, the only value `reject_model_weekly` writes) must never be the
+    /// last-resort pick, even though it would otherwise sort first by having
+    /// the lowest priority/seq tie. The other two accounts are merely
+    /// predicted-over, so the pick must land on one of THEM.
+    #[test]
+    fn a_genuinely_rejected_account_is_never_the_last_resort_pick() {
+        let manager = build_manager(config_with(
+            vec![account("acct-a"), account("acct-b"), account("acct-c")],
+            0.95,
+        ));
+        set_seven_day_oi(&manager, 0, 1.0); // genuinely rejected upstream
+        set_seven_day_oi(&manager, 1, 0.96); // predicted-over, not rejected
+        set_seven_day_oi(&manager, 2, 0.97); // predicted-over, not rejected
+
+        let now = OffsetDateTime::now_utc();
+        let served = manager
+            .select(
+                &HashSet::new(),
+                now,
+                Some(FABLE_MODEL),
+                None,
+                "/v1/messages",
+                None,
+            )
+            .expect("two accounts remain usable as a last resort");
+        assert_ne!(
+            served, 0,
+            "the account genuinely rejected upstream (utilization 1.0) must \
+             never be the last-resort pick"
+        );
+    }
+
+    /// Every account genuinely rejected upstream (`>= 1.0` on all three) — the
+    /// fleet really is exhausted, so `select()` must still answer `None` and
+    /// let the proxy's real 429 fire. The last resort must not paper over an
+    /// authority-confirmed exhaustion.
+    #[test]
+    fn fleet_fully_rejected_upstream_still_returns_none() {
+        let manager = build_manager(config_with(
+            vec![account("acct-a"), account("acct-b")],
+            0.95,
+        ));
+        set_seven_day_oi(&manager, 0, 1.0);
+        set_seven_day_oi(&manager, 1, 1.0);
+
+        let now = OffsetDateTime::now_utc();
+        let served = manager.select(
+            &HashSet::new(),
+            now,
+            Some(FABLE_MODEL),
+            None,
+            "/v1/messages",
+            None,
+        );
+        assert_eq!(
+            served, None,
+            "genuine exhaustion (every account rejected upstream) must still 429"
+        );
+    }
+
+    /// A non-Fable request against the same over-predicted-threshold fleet must
+    /// be byte-identical to today: `is_near` already ignores `7d_oi` for
+    /// non-Fable traffic, so this request was never gated on it and the new
+    /// last-resort path (gated on `is_fable`) must never even be consulted.
+    #[test]
+    fn a_non_fable_request_is_unaffected() {
+        let manager = build_manager(config_with(
+            vec![account("acct-a"), account("acct-b")],
+            0.95,
+        ));
+        set_seven_day_oi(&manager, 0, 0.96);
+        set_seven_day_oi(&manager, 1, 0.97);
+
+        let now = OffsetDateTime::now_utc();
+        let served = manager.select(
+            &HashSet::new(),
+            now,
+            Some("claude-opus-4-6"),
+            None,
+            "/v1/messages",
+            None,
+        );
+        assert!(
+            served.is_some(),
+            "a non-Fable request must never be gated by the Fable-weekly bucket, \
+             last resort or otherwise"
+        );
+    }
+
+    /// An account still UNDER the predicted threshold is preferred over one
+    /// already over it — the last resort only ever widens the pool once the
+    /// normal picks already found nothing, it never changes the ORDER a
+    /// healthy fleet picks in.
+    #[test]
+    fn an_account_under_threshold_is_preferred_over_one_above_it() {
+        let manager = build_manager(config_with(vec![account("fresh"), account("stale")], 0.95));
+        set_seven_day_oi(&manager, 0, 0.50); // fresh: well under threshold
+        set_seven_day_oi(&manager, 1, 0.96); // stale: over threshold
+
+        let now = OffsetDateTime::now_utc();
+        let served = manager
+            .select(
+                &HashSet::new(),
+                now,
+                Some(FABLE_MODEL),
+                None,
+                "/v1/messages",
+                None,
+            )
+            .expect("the fresh account is eligible normally");
+        assert_eq!(
+            served, 0,
+            "an account under the predicted threshold must be picked over one \
+             above it, without ever touching the last resort"
+        );
+    }
+
+    /// Hard constraint from the bridge: a RESERVED strict group must still
+    /// return `None` when its own member cannot serve, even though a last-resort
+    /// candidate exists elsewhere in the pool — the last resort widens ONLY the
+    /// whole-pool soft fallback, never a reservation, which is a privacy
+    /// decision, not a load-balancing one.
+    #[test]
+    fn a_reserved_strict_group_still_returns_none_with_a_last_resort_candidate_elsewhere() {
+        let mut priv_account = account("gil-private");
+        priv_account.groups = Some(vec!["priv".to_string()]);
+        let mut config = config_with(vec![priv_account, account("pool-account")], 0.95);
+        config.group_settings.insert(
+            "priv".to_string(),
+            crate::config::GroupSettings {
+                reserved: true,
+                ..Default::default()
+            },
+        );
+        let manager = build_manager(config);
+        set_seven_day_oi(&manager, 0, 0.96); // the reserved group's only member
+        set_seven_day_oi(&manager, 1, 0.50); // pool-only, would serve as a last resort
+
+        let now = OffsetDateTime::now_utc();
+        let served = manager.select_with_group(
+            &HashSet::new(),
+            now,
+            Some(FABLE_MODEL),
+            None,
+            "/v1/messages",
+            None,
+            Some("priv"),
+        );
+        assert_eq!(
+            served, None,
+            "a reserved group's own request must refuse rather than spill to \
+             the whole pool's last resort"
+        );
     }
 }
