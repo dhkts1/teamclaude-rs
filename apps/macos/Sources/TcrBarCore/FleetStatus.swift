@@ -1045,17 +1045,14 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let rateLimitTier: String?
     public let seatTier: String?
 
-    /// The org this account is scoped to. Load-bearing, not informational:
-    /// every `tcr` account verb takes `--org <name-or-uuid-prefix>`, and this
-    /// is the ONLY thing that lets the panel address one of two rows sharing an
-    /// email. Without it "Copy Access Token" failed with `'…' is ambiguous —
-    /// matches 2 accounts`, because the command it built carried a name and
-    /// nothing to narrow it by.
+    /// The org this account is scoped to — a fact to SHOW, not an address.
     ///
-    /// ``orgUuid`` is what the panel passes: it is exact, where ``orgName`` is
-    /// a display string two orgs can share. `nil` from a server built before
-    /// these keys existed, which is why every call site treats the flag as
-    /// optional rather than required.
+    /// It was briefly the only thing that let the panel address one of two rows
+    /// sharing an email: without it, "Copy Access Token" failed with `'…' is
+    /// ambiguous — matches 2 accounts`, because the command it built carried a
+    /// name and nothing to narrow it by. Account names are unique now, so the
+    /// name is the address and these are back to being ordinary facts about the
+    /// row. `nil` from a server built before these keys existed.
     public let orgUuid: String?
     public let orgName: String?
 
@@ -1165,10 +1162,11 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.gate = gate
     }
 
-    /// This row's identity, ORG-QUALIFIED — `name` alone is not unique.
+    /// This row's identity — its name, which `tcr` guarantees is unique.
     ///
-    /// This was a live defect, not a theoretical one. Two rows sharing an email
-    /// in different orgs collapsed to one SwiftUI identity in
+    /// The guarantee is the point. This was a live defect, not a theoretical
+    /// one: two rows sharing an email in different orgs collapsed to one
+    /// SwiftUI identity in
     /// `ForEach(…, id: \.element.id)`, so the panel painted the FIRST row's
     /// numbers on both and neither wore its own pill — while `tcr status
     /// --json` reported them correctly and differently. Every by-name

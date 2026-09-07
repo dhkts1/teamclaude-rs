@@ -1352,6 +1352,8 @@ mod tests {
         let config = crate::config::Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: crate::config::ProxyConfig {
                 port: 0,
                 api_key: None,

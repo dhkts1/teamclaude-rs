@@ -421,17 +421,16 @@ final class ToggleVerdictTests: XCTestCase {
 /// is why `disabled` is the only field compared.
 ///
 /// Takes the ``AccountRef`` rather than a bare name so a fixture row and the
-/// verdict looking it up carry the SAME identity — including its org, which is
-/// what the lookup now matches on.
+/// verdict looking it up carry the SAME identity.
 private func account(_ ref: AccountRef, disabled: Bool) -> Account {
-    account(name: ref.name, orgUuid: ref.orgUuid, disabled: disabled)
+    account(name: ref.name, disabled: disabled)
 }
 
 private func account(_ name: String, disabled: Bool) -> Account {
-    account(name: name, orgUuid: nil, disabled: disabled)
+    account(name: name, disabled: disabled)
 }
 
-private func account(name: String, orgUuid: String?, disabled: Bool) -> Account {
+private func account(name: String, disabled: Bool) -> Account {
     Account(
         name: name,
         priority: 1,
@@ -454,7 +453,6 @@ private func account(name: String, orgUuid: String?, disabled: Bool) -> Account 
         streamErrorCount: 0,
         source: .live,
         serverSha: "abc1234",
-        serverDirty: false,
-        orgUuid: orgUuid
+        serverDirty: false
     )
 }

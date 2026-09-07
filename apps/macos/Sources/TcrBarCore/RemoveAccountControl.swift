@@ -1,8 +1,8 @@
 import Combine
 import Foundation
 
-/// Deleting a single account from the config — `tcr remove <query> [--org
-/// <org>]` (`src/cli.rs`'s `remove_account`, dispatched from `src/main.rs`'s
+/// Deleting a single account from the config — `tcr remove <query>`
+/// (`src/cli.rs`'s `remove_account`, dispatched from `src/main.rs`'s
 /// `run_remove`). Same shape as ``AccountCommand``/``GroupCommand``, and for
 /// the same reasons:
 ///
@@ -25,12 +25,10 @@ import Foundation
 ///  4. **Exit 0 with anything on stderr is not a clean success.** Same
 ///     three-arm ``Outcome`` as ``AccountCommand``/``GroupCommand``.
 public enum RemoveAccountCommand {
-    /// `tcr remove <query>`, or `tcr remove <query> --org <org>` to narrow an
-    /// ambiguous match. `query` is passed positionally and verbatim — no
+    /// `tcr remove <query>`. `query` is passed positionally and verbatim — no
     /// shell involved, so nothing here needs to escape it.
-    public static func arguments(query: String, org: String? = nil) -> [String] {
-        guard let org else { return ["remove", query] }
-        return ["remove", query, "--org", org]
+    public static func arguments(query: String) -> [String] {
+        ["remove", query]
     }
 
     /// Why a delete did not happen. `tcr`'s own words, unparaphrased.
@@ -68,7 +66,7 @@ public enum RemoveAccountCommand {
     }
 
     /// Blocking invocation — always called off the main actor.
-    nonisolated static func perform(query: String, org: String? = nil) -> Outcome {
+    nonisolated static func perform(query: String) -> Outcome {
         switch TcrTool.resolve() {
         case .failure(let notFound):
             return .failed(
@@ -79,7 +77,7 @@ public enum RemoveAccountCommand {
         case .success(let executable):
             do {
                 let output = try TcrTool.run(
-                    executable: executable, arguments: arguments(query: query, org: org))
+                    executable: executable, arguments: arguments(query: query))
                 return classify(exitCode: output.exitCode, stderr: output.stderr)
             } catch {
                 return .failed(Failure(exitCode: -1, message: error.localizedDescription))
@@ -123,10 +121,10 @@ public final class RemoveAccountController: ObservableObject {
         case accepted(notice: String?)
     }
 
-    /// `tcr remove <name> [--org <uuid>]`. The org comes from the row itself
-    /// (``AccountRef/orgUuid``) rather than being left `nil`: on this fleet a
-    /// bare name matches two accounts and `tcr` refuses rather than guessing,
-    /// so a delete of either row failed as ambiguous.
+    /// `tcr remove <name>`. The name is the whole address: it is unique across
+    /// the config, so it names this row or nothing. It used to name two rows on
+    /// this fleet, and `tcr` refused rather than guessing — so a delete of
+    /// either one failed as ambiguous.
     @discardableResult
     public func remove(account: AccountRef) async -> Attempt {
         let key = account.id
@@ -136,7 +134,7 @@ public final class RemoveAccountController: ObservableObject {
         defer { pending.remove(key) }
 
         let outcome = await Task.detached(priority: .userInitiated) {
-            RemoveAccountCommand.perform(query: account.name, org: account.orgUuid)
+            RemoveAccountCommand.perform(query: account.name)
         }.value
 
         switch outcome {

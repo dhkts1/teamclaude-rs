@@ -162,6 +162,8 @@ fn config(
     Config {
         quarantined_accounts: Vec::new(),
         migrated_legacy_throttle: false,
+        renamed_accounts: Vec::new(),
+        rename_write_error: None,
         proxy: ProxyConfig {
             port: 0,
             api_key: None,

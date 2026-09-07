@@ -2,10 +2,14 @@ import XCTest
 
 @testable import TcrBarCore
 
-/// The fleet holds one email twice — a personal Max org and a company Team org.
-/// Everything here guards the consequences of that, which were all real:
-/// two rows collapsing into one in the panel, and every per-account command
-/// refusing as ambiguous.
+/// One person holding two orgs — a personal Max org and a company Team org.
+/// Everything here guards the consequences of that, which were all real: two
+/// rows collapsing into one in the panel, and every per-account command refusing
+/// as ambiguous.
+///
+/// The fixture carries the names `tcr` gives that fleet: the personal row keeps
+/// the bare email, the Team row is `email/<org-slug>`. That IS the fix — the
+/// panel's job is now to key on those names and not undo it.
 final class AccountIdentityTests: XCTestCase {
 
     private let personal = "11111111-1111-1111-1111-111111111111"
@@ -17,30 +21,74 @@ final class AccountIdentityTests: XCTestCase {
     /// row, so the panel drew the first row's numbers on both and neither wore
     /// its own gate pill, while `tcr status --json` reported them correctly and
     /// differently.
-    func testTwoRowsSharingAnEmailInDifferentOrgsHaveDistinctIds() throws {
+    func testTheTwoRowsOfOnePersonsTwoOrgsHaveDistinctIds() throws {
         let fleet = try Fleet.decode(Data(duplicateEmailJSON.utf8))
         XCTAssertEqual(fleet.accounts.count, 2)
 
         let ids = Set(fleet.accounts.map(\.id))
         XCTAssertEqual(
             ids.count, 2,
-            "two rows sharing a name must be two identities — one id means the panel "
-                + "renders one row's numbers twice"
+            "two rows must be two identities — one id means the panel renders one "
+                + "row's numbers twice"
         )
         XCTAssertEqual(
-            Set(fleet.accounts.map(\.name)).count, 1,
-            "the control: the two rows really do share a name, so this test is not "
-                + "passing because the fixture made them different"
+            fleet.accounts.map(\.name),
+            ["henry@example.com", "henry@example.com/example-team"],
+            "the control: the ids differ because the NAMES differ, which is what "
+                + "tcr guarantees — not because this app added something to them"
         )
     }
 
-    /// A server that reports no org — an older build — must render exactly as it
-    /// does today, and with no org there genuinely is no more identity to have.
-    func testIdFallsBackToTheBareNameWithoutAnOrg() {
+    /// The row draws a name on two lines — the email, then the `/org` half as
+    /// its own tag — so that neither has to be truncated. The split must lose
+    /// nothing: reading the two halves left to right has to reproduce the name
+    /// byte-for-byte, because that string is what the operator types back.
+    ///
+    /// The third case is the one worth having: a name with a SECOND separator
+    /// keeps the whole remainder in the tag. Splitting on every `/` would drop
+    /// `/y` on the floor and quietly display a name that addresses nothing.
+    func testDisplayHalvesSplitAtTheFirstSeparatorAndLoseNothing() {
+        let bare = AccountRef(name: "alice@example.com").displayHalves
+        XCTAssertEqual(bare.email, "alice@example.com")
+        XCTAssertNil(bare.orgTag, "a bare email has no tag — that row renders as it always has")
+
+        let qualified = AccountRef(name: "alice@example.com/acme").displayHalves
+        XCTAssertEqual(qualified.email, "alice@example.com")
+        XCTAssertEqual(
+            qualified.orgTag, "/acme",
+            "the tag carries the separator, so the two halves concatenate back to the name"
+        )
+
+        let pathological = AccountRef(name: "alice@example.com/x/y").displayHalves
+        XCTAssertEqual(pathological.email, "alice@example.com")
+        XCTAssertEqual(
+            pathological.orgTag, "/x/y",
+            "a second separator stays INSIDE the tag — splitting on it would drop /y"
+        )
+
+        // The property behind all three, stated once: nothing is lost.
+        for name in [
+            "alice@example.com",
+            "alice@example.com/acme",
+            "alice@example.com/x/y",
+            "alice@example.com/",
+        ] {
+            let halves = AccountRef(name: name).displayHalves
+            XCTAssertEqual(
+                halves.email + (halves.orgTag ?? ""), name,
+                "the two halves must reassemble into exactly the name"
+            )
+        }
+    }
+
+    /// A row's identity is its name, with nothing appended: the `id` a
+    /// dictionary is keyed by and the string handed to `tcr` are the same bytes,
+    /// so a key can never be built that `tcr` would not accept.
+    func testIdIsExactlyTheName() {
         XCTAssertEqual(AccountRef(name: "alice@example.com").id, "alice@example.com")
         XCTAssertEqual(
-            AccountRef(name: "alice@example.com", orgUuid: "").id, "alice@example.com",
-            "an empty string is not an org — it must not produce a trailing separator"
+            AccountRef(name: "alice@example.com/acme").id, "alice@example.com/acme",
+            "a qualified name is passed through untouched — no separator of our own"
         )
     }
 
@@ -141,103 +189,103 @@ final class AccountIdentityTests: XCTestCase {
 
     // MARK: - the commands each row issues
 
-    /// Every per-account verb passes `--org` when the row has one. Without it
-    /// `tcr` refuses: `'…' is ambiguous — matches 2 accounts … Narrow with
-    /// --org`, which is what "Copy Access Token" failed with on this fleet.
-    func testEveryPerAccountCommandCarriesTheOrgWhenThereIsOne() {
+    /// Every per-account verb carries the row's NAME and nothing else. The
+    /// qualified name is what addresses the Team row, and it must reach `tcr`
+    /// byte-for-byte — a panel that stripped the `/example-team` half would
+    /// silently act on the personal row instead.
+    func testEveryPerAccountCommandCarriesTheRowsFullName() {
+        let teamRow = "henry@example.com/example-team"
         XCTAssertEqual(
-            TokenCommand.arguments(query: "henry@example.com", org: personal),
-            ["token", "henry@example.com", "--org", personal]
+            TokenCommand.arguments(query: teamRow),
+            ["token", teamRow]
         )
         XCTAssertEqual(
-            RemoveAccountCommand.arguments(query: "henry@example.com", org: personal),
-            ["remove", "henry@example.com", "--org", personal]
+            RemoveAccountCommand.arguments(query: teamRow),
+            ["remove", teamRow]
         )
         XCTAssertEqual(
-            AccountCommand.arguments(enabled: false, name: "henry@example.com", org: personal),
-            ["disable", "henry@example.com", "--org", personal]
+            AccountCommand.arguments(enabled: false, name: teamRow),
+            ["disable", teamRow]
         )
         XCTAssertEqual(
-            AccountCommand.arguments(enabled: true, name: "henry@example.com", org: personal),
-            ["enable", "henry@example.com", "--org", personal]
+            AccountCommand.arguments(enabled: true, name: teamRow),
+            ["enable", teamRow]
+        )
+        XCTAssertEqual(
+            ControlAccountCommand.setArguments(name: teamRow),
+            ["control", teamRow]
         )
         XCTAssertTrue(
             LoginLauncher.script(
                 forExecutableAt: "/usr/local/bin/tcr",
-                reloggingIn: "henry@example.com",
-                org: personal
-            ).contains("--account 'henry@example.com' --org '\(personal)'"),
-            "a re-login resolves through the same refuse-on-ambiguity path"
+                reloggingIn: teamRow
+            ).contains("--account '\(teamRow)'"),
+            "a re-login names the same row every other verb does"
         )
     }
 
-    /// The group verbs are the ones Gil hit: `tcr group add` took no `--org` at
-    /// all, so the panel could not name which of two same-email rows to label,
-    /// and the CLI refused.
-    func testGroupCommandsCarryTheOrgWhenThereIsOne() {
+    /// No verb may build an `--org` flag any more: `tcr` does not take one, so
+    /// one here would abort the command outright. This is the panel's half of
+    /// the same gate the Rust side keeps.
+    func testNoCommandBuildsAnOrgFlag() {
+        let built: [[String]] = [
+            TokenCommand.arguments(query: "henry@example.com"),
+            RemoveAccountCommand.arguments(query: "henry@example.com"),
+            AccountCommand.arguments(enabled: true, name: "henry@example.com"),
+            AccountCommand.arguments(enabled: false, name: "henry@example.com"),
+            ControlAccountCommand.setArguments(name: "henry@example.com"),
+            ControlAccountCommand.setArguments(name: nil),
+            GroupCommand.addArguments(group: "gil", account: "henry@example.com"),
+            GroupCommand.removeArguments(group: "gil", account: "henry@example.com"),
+        ]
+        for arguments in built {
+            XCTAssertFalse(arguments.contains("--org"), "\(arguments) must not narrow by org")
+        }
+        let script = LoginLauncher.script(
+            forExecutableAt: "/usr/local/bin/tcr", reloggingIn: "henry@example.com")
+        XCTAssertFalse(script.contains("--org"), script)
+    }
+
+    /// The group verbs are the ones Gil hit: `tcr group add` labelled whichever
+    /// same-email row came first and reported success. The name it takes now
+    /// resolves to one row or to none.
+    func testGroupCommandsCarryTheRowsFullName() {
+        let teamRow = "henry@example.com/example-team"
         XCTAssertEqual(
-            GroupCommand.addArguments(group: "gil", account: "henry@example.com", org: team),
-            ["group", "add", "gil", "henry@example.com", "--org", team]
+            GroupCommand.addArguments(group: "gil", account: teamRow),
+            ["group", "add", "gil", teamRow]
         )
         XCTAssertEqual(
-            GroupCommand.removeArguments(group: "gil", account: "henry@example.com", org: team),
-            ["group", "rm", "gil", "henry@example.com", "--org", team]
+            GroupCommand.removeArguments(group: "gil", account: teamRow),
+            ["group", "rm", "gil", teamRow]
         )
         XCTAssertEqual(
             GroupCommand.addArguments(group: "gil", account: "solo@example.com"),
-            ["group", "add", "gil", "solo@example.com"],
-            "no org means the argument vector it always built"
-        )
-        XCTAssertEqual(
-            GroupCommand.removeArguments(group: "gil", account: "solo@example.com", org: ""),
-            ["group", "rm", "gil", "solo@example.com"],
-            "an empty org is not an org — never `--org ''`, which matches nothing"
+            ["group", "add", "gil", "solo@example.com"]
         )
     }
 
-    /// Two same-email rows must not share a group failure or an in-flight
-    /// spinner, for the same reason they must not share a toggle verdict.
-    func testGroupFailuresAreKeyedPerRowNotPerName() {
-        let personalRef = AccountRef(name: "henry@example.com", orgUuid: personal)
-        let teamRef = AccountRef(name: "henry@example.com", orgUuid: team)
+    /// The two rows must not share a group failure or an in-flight spinner, for
+    /// the same reason they must not share a toggle verdict.
+    func testGroupFailuresAreKeyedPerRow() {
+        let personalRef = AccountRef(name: "henry@example.com")
+        let teamRef = AccountRef(name: "henry@example.com/example-team")
         XCTAssertNotEqual(
             GroupController.memberKey(group: "gil", account: personalRef),
             GroupController.memberKey(group: "gil", account: teamRef)
         )
     }
 
-    /// And the negative: a row with no org builds precisely the command it built
-    /// before, with no empty flag appended. A stray `--org ''` would match
-    /// nothing and break every single-org fleet.
-    func testNoOrgMeansNoFlagAtAll() {
-        XCTAssertEqual(
-            TokenCommand.arguments(query: "solo@example.com"),
-            ["token", "solo@example.com"]
-        )
-        XCTAssertEqual(
-            RemoveAccountCommand.arguments(query: "solo@example.com"),
-            ["remove", "solo@example.com"]
-        )
-        XCTAssertEqual(
-            AccountCommand.arguments(enabled: true, name: "solo@example.com"),
-            ["enable", "solo@example.com"]
-        )
-        let script = LoginLauncher.script(
-            forExecutableAt: "/usr/local/bin/tcr", reloggingIn: "solo@example.com")
-        XCTAssertTrue(script.contains("--account 'solo@example.com'"))
-        XCTAssertFalse(script.contains("--org"), "no org means no flag, never an empty one")
-    }
-
-    /// An org value is quoted the same POSIX way the path and the name already
-    /// are — it goes onto a command line in a `.command` file, so unquoted
-    /// interpolation is injection.
-    func testTheOrgArgumentIsShellQuoted() {
+    /// A name is shell-quoted the same POSIX way the path already is — it goes
+    /// onto a command line in a `.command` file, so unquoted interpolation is
+    /// injection. An account name is attacker-adjacent input in principle, and
+    /// it now has a slash in it as a matter of course.
+    func testTheAccountArgumentIsShellQuoted() {
         let script = LoginLauncher.script(
             forExecutableAt: "/usr/local/bin/tcr",
-            reloggingIn: "solo@example.com",
-            org: "it's; rm -rf /"
+            reloggingIn: "it's; rm -rf /"
         )
-        XCTAssertTrue(script.contains("--org 'it'\\''s; rm -rf /'"))
+        XCTAssertTrue(script.contains("--account 'it'\\''s; rm -rf /'"), script)
     }
 
     // MARK: - fixtures
@@ -254,7 +302,7 @@ final class AccountIdentityTests: XCTestCase {
           "cacheReadTokens":1,"cacheHitRatio":0.5,"probeStatus":"ok","probeError":null,
           "lastStreamError":null,"streamErrorCount":0,"source":"live",
           "serverSha":"abc1234","serverDirty":false},
-         {"name":"henry@example.com","priority":1,"status":"active","disabled":false,
+         {"name":"henry@example.com/example-team","priority":1,"status":"active","disabled":false,
           "plan":"Team Standard","organizationType":"claude_team",
           "rateLimitTier":"default_raven","seatTier":"team_standard",
           "orgUuid":"\(team)","orgName":"Example Team",

@@ -2596,6 +2596,8 @@ mod revalidation_sticky_tests {
         Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
@@ -2746,6 +2748,8 @@ mod sticky_divert_replay_tests {
         Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
@@ -3179,6 +3183,8 @@ mod reset_urgency_tests {
         Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
@@ -3428,6 +3434,8 @@ mod fable_last_resort_tests {
         Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold,

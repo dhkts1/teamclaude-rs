@@ -11,14 +11,13 @@ import Foundation
 ///     `tcr disable <name>` — exactly like the server control, and this process
 ///     stays credential-free.
 ///  2. **A failed call must never look like a success.** `query` on the Rust side
-///     (`src/identity.rs`, `match_accounts`) is an EXACT match on the account name,
-///     falling back to an exact match on the email part — case-sensitive `==` both
-///     times, no substring anywhere. Passing the row's own `name` therefore resolves
-///     to that row or to nothing, except where two accounts share an email across
-///     orgs, which `match_one` returns as ambiguous rather than picking one. The
-///     exit code and stderr are still captured and surfaced in the row, and the UI
-///     never optimistically flips its own copy of `disabled` — it re-polls and
-///     shows whatever `tcr status` then reports.
+///     (`src/identity.rs`, `match_accounts`) is an EXACT match on the account
+///     name — case-sensitive `==`, no substring, no email-part fallback. Names
+///     are unique across a config by construction, so passing the row's own
+///     `name` resolves to that row or to nothing. The exit code and stderr are
+///     still captured and surfaced in the row, and the UI never optimistically
+///     flips its own copy of `disabled` — it re-polls and shows whatever
+///     `tcr status` then reports.
 ///  3. **Exit 0 with anything on stderr is not a clean success.** `tcr` reports
 ///     durability on the success path: it exits 0 having parked the live rotation
 ///     and warns on stderr that no config entry matched, so the account returns to
@@ -42,22 +41,9 @@ public enum AccountCommand {
     /// The complete argument vector. `name` is passed positionally and
     /// verbatim; nothing here is shell-interpreted.
     ///
-    /// `org` narrows an ambiguous name, exactly as it does for
-    /// ``TokenCommand/arguments(query:org:)`` and
-    /// ``RemoveAccountCommand/arguments(query:org:)``. It is not optional
-    /// decoration: point 2 above says a name resolves "to that row or to
-    /// nothing, except where two accounts share an email across orgs, which
-    /// `match_one` returns as ambiguous rather than picking one" — and that
-    /// exception is the fleet's ordinary state, not a corner. Without the flag
-    /// the toggle simply refuses on those rows.
-    ///
-    /// Omitted entirely when `org` is `nil`, so a row from a server that
-    /// reports no org builds precisely the command it built before.
-    ///
     /// `enabled: true` means "put this account back in rotation".
-    public static func arguments(enabled: Bool, name: String, org: String? = nil) -> [String] {
-        guard let org else { return [enabled ? "enable" : "disable", name] }
-        return [enabled ? "enable" : "disable", name, "--org", org]
+    public static func arguments(enabled: Bool, name: String) -> [String] {
+        [enabled ? "enable" : "disable", name]
     }
 
     /// Why a toggle did not happen. Carries the CLI's own words; this app does not
@@ -119,7 +105,7 @@ public enum AccountCommand {
             do {
                 let output = try TcrTool.run(
                     executable: executable,
-                    arguments: arguments(enabled: enabled, name: name, org: account.orgUuid)
+                    arguments: arguments(enabled: enabled, name: name)
                 )
                 return classify(enabling: enabled, exitCode: output.exitCode, stderr: output.stderr)
             } catch {
@@ -133,8 +119,8 @@ public enum AccountCommand {
 /// Per-account toggle state for the panel: which rows have a call in flight, and
 /// which rows have a failure that has not been superseded by a later attempt.
 ///
-/// Keyed by ``AccountRef/id`` — the ORG-QUALIFIED identity, not the bare name.
-/// Keying by name collapsed the fleet's two same-email rows into one entry, so a
+/// Keyed by ``AccountRef/id``, the one definition of a row's identity. When two
+/// rows could share an email this key collapsed them into one entry, so a
 /// failure or an in-flight spinner belonging to one row rendered on both. That
 /// key must stay identical to the one `ForEach` uses, which is why both come
 /// from ``AccountRef`` rather than being spelled out twice.

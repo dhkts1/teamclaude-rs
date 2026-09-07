@@ -71,17 +71,14 @@ public enum LoginLauncher {
     /// into an `echo`: an account name is attacker-adjacent input in
     /// principle, and unquoted interpolation into a `.command` file is
     /// injection.
-    /// `org` narrows an ambiguous `--account`, exactly as it does for every
-    /// other account verb. It is not optional polish on this fleet: `tcr
-    /// login --account` resolves through the same `resolve_account` that
-    /// refuses rather than guessing (`src/oauth.rs`,
-    /// `assert_requested_identity`), so a re-login on either of two rows
-    /// sharing an email failed outright. Quoted the same POSIX way as the
-    /// path and the name, for the same reason.
+    /// The name is the whole address `tcr login --account` needs: it resolves
+    /// through the same `resolve_account` every other verb uses, which refuses
+    /// rather than guessing (`src/oauth.rs`, `assert_requested_identity`). That
+    /// refusal used to be reachable — a re-login on either of two rows sharing
+    /// an email failed outright — and unique names removed the tie itself.
     public static func script(
         forExecutableAt path: String,
-        reloggingIn name: String? = nil,
-        org: String? = nil
+        reloggingIn name: String? = nil
     ) -> String {
         // Single-quote the path and escape any embedded single quote the POSIX
         // way ('\'') so the shell receives exactly one argument whatever the path
@@ -105,14 +102,7 @@ public enum LoginLauncher {
 
                 """
             let quotedName = "'" + name.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            let orgArgument: String
-            if let org, !org.isEmpty {
-                let quotedOrg = "'" + org.replacingOccurrences(of: "'", with: "'\\''") + "'"
-                orgArgument = " --org \(quotedOrg)"
-            } else {
-                orgArgument = ""
-            }
-            accountArgument = " --account \(quotedName)\(orgArgument)"
+            accountArgument = " --account \(quotedName)"
         } else {
             hint = ""
             accountArgument = ""
@@ -147,7 +137,6 @@ public enum LoginLauncher {
     @discardableResult
     public static func launch(
         reloggingIn name: String? = nil,
-        org: String? = nil,
         uuid: () -> UUID = UUID.init,
         resolve: () -> Result<URL, TcrTool.NotFound> = { TcrTool.resolve() },
         open: (URL) -> Void = { NSWorkspace.shared.open($0) }
@@ -158,7 +147,7 @@ public enum LoginLauncher {
         case .failure(let missing): return .failure(.toolMissing(searched: missing.searched))
         }
 
-        let script = script(forExecutableAt: executable.path, reloggingIn: name, org: org)
+        let script = script(forExecutableAt: executable.path, reloggingIn: name)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("tcr-login-\(uuid().uuidString).command")
 

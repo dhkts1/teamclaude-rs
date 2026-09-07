@@ -31,8 +31,8 @@ public enum ControlAccountCommand {
 
     /// `tcr control <name>` to set it, or `tcr control --clear` to clear it.
     /// `name` is passed positionally and verbatim, exactly like
-    /// ``AccountCommand/arguments(enabled:name:)`` — no `--org`, nothing that
-    /// could be mistaken for a flag.
+    /// ``AccountCommand/arguments(enabled:name:)`` — nothing here could be
+    /// mistaken for a flag.
     public static func setArguments(name: String?) -> [String] {
         guard let name else { return ["control", "--clear"] }
         return ["control", name]
@@ -169,24 +169,16 @@ public final class ControlAccountController: ObservableObject {
 
     public func isPending(_ name: String) -> Bool { pending.contains(name) }
     public func failure(for name: String) -> ControlAccountCommand.Failure? { failures[name] }
-    /// Deliberately keyed on the bare NAME, unlike every other per-account
-    /// lookup in this app, which moved to ``AccountRef/id`` when the fleet's
-    /// two same-email rows were found colliding.
+    /// Keyed on the NAME, which is now the same thing as ``AccountRef/id`` —
+    /// they agree by construction rather than by coincidence.
     ///
-    /// This one cannot follow, and pretending otherwise would be the worse
-    /// choice. The stored `controlAccount` (`src/config.rs`, `Config::control_account`)
-    /// is a bare string, and the server resolves it by name to the FIRST
-    /// matching row (`Manager::assemble`'s `accounts.iter().position`), then
-    /// stamps `control: true` on the wire for every row whose name equals it
-    /// (`src/cli.rs`, `render_accounts_json`). So on a duplicated email the
-    /// SERVER already reports both rows as control, and an org-qualified check
-    /// here would show one row as control and the other not — disagreeing with
-    /// the process that actually routes the traffic, which is a worse lie than
-    /// agreeing with it.
-    ///
-    /// Making this correct is a SERVER change: `controlAccount` has to carry an
-    /// org, or the wire has to name the resolved index. Reported separately
-    /// rather than half-fixed here.
+    /// That was a real defect while an email could name two rows. The stored
+    /// `controlAccount` was resolved to the FIRST matching row, and the wire
+    /// then stamped `control: true` on EVERY row whose name equalled it, so the
+    /// panel showed both rows as control and matched a server that was itself
+    /// confused. `tcr` fixed it below this app by making the name unique
+    /// (`src/config.rs`, `migrate_duplicate_names`), which is why this check can
+    /// be the plain equality it looks like.
     public func isControl(_ name: String) -> Bool { !unavailable && current == name }
 
     /// Re-read `tcr control --show`. Safe to call any time — on panel open,

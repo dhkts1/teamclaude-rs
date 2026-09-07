@@ -41,6 +41,12 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # An `--org` flag on an account verb narrows nothing now that account
+      # names are unique, so one would be a lie in `--help`. It came back once
+      # already, one verb at a time — see the script's own header.
+      - name: No --org flag
+        run: scripts/check-no-org-flag.sh
+
       # --locked: fail if CI would silently rewrite Cargo.lock. Pins the exact
       # dependency set that was reviewed — important for an auth-handling proxy.
       - name: Clippy

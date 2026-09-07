@@ -13,8 +13,8 @@ final class RemoveAccountCommandTests: XCTestCase {
 
     private let alice = "alice@example.com"
 
-    // MARK: - argument shape (bridge: normal name, a name needing shell
-    // quoting, and the `--org` form)
+    // MARK: - argument shape (a normal name, a name needing shell quoting, and
+    // an org-qualified name)
 
     /// A normal query, passed positionally and verbatim.
     func testArgumentsWithAnOrdinaryName() {
@@ -33,11 +33,12 @@ final class RemoveAccountCommandTests: XCTestCase {
         )
     }
 
-    /// `--org` narrows an ambiguous match, mirroring the CLI's own flag.
-    func testArgumentsWithOrgAppendsTheFlag() {
+    /// A qualified name — the shape `tcr` gives the second of one person's two
+    /// orgs — is one argument, passed through whole.
+    func testArgumentsPassAQualifiedNameWhole() {
         XCTAssertEqual(
-            RemoveAccountCommand.arguments(query: alice, org: "acme"),
-            ["remove", alice, "--org", "acme"]
+            RemoveAccountCommand.arguments(query: "\(alice)/acme"),
+            ["remove", "\(alice)/acme"]
         )
     }
 

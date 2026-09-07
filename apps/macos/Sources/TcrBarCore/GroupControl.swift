@@ -59,27 +59,17 @@ public enum GroupRouting {
 ///     can apply a change to the file only and warn that a running proxy was
 ///     too old for the control route.
 public enum GroupCommand {
-    /// `tcr group add <group> <account> [--org <uuid>]`. `group` and `account`
-    /// are positional and verbatim.
-    ///
-    /// `org` narrows a name two accounts share, the same way every other
-    /// per-account verb takes it. On this fleet it is what makes the command
-    /// work at all: the same email is logged into two orgs, and `tcr` refuses an
-    /// ambiguous name rather than guessing which row to label. Omitted entirely
-    /// when `nil`, so a single-org row builds the argument vector it always did.
-    public static func addArguments(group: String, account: String, org: String? = nil)
-        -> [String]
-    {
-        guard let org, !org.isEmpty else { return ["group", "add", group, account] }
-        return ["group", "add", group, account, "--org", org]
+    /// `tcr group add <group> <account>`. `group` and `account` are positional
+    /// and verbatim. The account name is unique, so it labels that row or
+    /// nothing — this is the command that used to label the wrong row and report
+    /// success, back when one email named two of them.
+    public static func addArguments(group: String, account: String) -> [String] {
+        ["group", "add", group, account]
     }
 
-    /// `tcr group rm <group> <account> [--org <uuid>]`.
-    public static func removeArguments(group: String, account: String, org: String? = nil)
-        -> [String]
-    {
-        guard let org, !org.isEmpty else { return ["group", "rm", group, account] }
-        return ["group", "rm", group, account, "--org", org]
+    /// `tcr group rm <group> <account>`.
+    public static func removeArguments(group: String, account: String) -> [String] {
+        ["group", "rm", group, account]
     }
 
     /// `tcr group rm <group> --all` — removes the whole group.
@@ -348,32 +338,30 @@ public final class GroupController: ObservableObject {
         }
     }
 
-    /// The failure key for one member's add/remove: the group and the ROW's
-    /// org-qualified identity, so two same-email rows in different orgs cannot
-    /// share an in-flight spinner or an error line — the same reason every other
-    /// per-account dictionary keys on ``AccountRef/id``.
+    /// The failure key for one member's add/remove: the group and the ROW's own
+    /// identity, so two rows cannot share an in-flight spinner or an error line
+    /// — the same reason every other per-account dictionary keys on
+    /// ``AccountRef/id``.
     /// `nonisolated` because it is a pure string join with no state to touch —
     /// callers need it to build a key without hopping to the main actor.
     public nonisolated static func memberKey(group: String, account: AccountRef) -> String {
         "\(group)/\(account.id)"
     }
 
-    /// `tcr group add <group> <account> [--org <uuid>]`.
+    /// `tcr group add <group> <account>`.
     @discardableResult
     public func add(account: AccountRef, to group: String) async -> Attempt {
         await run(
             key: Self.memberKey(group: group, account: account), group: group,
-            arguments: GroupCommand.addArguments(
-                group: group, account: account.name, org: account.orgUuid))
+            arguments: GroupCommand.addArguments(group: group, account: account.name))
     }
 
-    /// `tcr group rm <group> <account> [--org <uuid>]`.
+    /// `tcr group rm <group> <account>`.
     @discardableResult
     public func remove(account: AccountRef, from group: String) async -> Attempt {
         await run(
             key: Self.memberKey(group: group, account: account), group: group,
-            arguments: GroupCommand.removeArguments(
-                group: group, account: account.name, org: account.orgUuid))
+            arguments: GroupCommand.removeArguments(group: group, account: account.name))
     }
 
     /// `tcr group rm <group> --all`.

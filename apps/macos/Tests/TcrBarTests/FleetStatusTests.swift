@@ -1353,12 +1353,12 @@ final class AccountCommandTests: XCTestCase {
     }
 
     func testTheNameIsNeverTruncatedOrFlagged() {
-        // `query` resolves by exact name, then exact email (`src/identity.rs`,
-        // `match_accounts`) — an abbreviated name matches nothing at all. Pass it
-        // whole; the row already knows the exact value.
+        // `query` resolves by exact name (`src/identity.rs`, `match_accounts`) —
+        // an abbreviated name matches nothing at all. Pass it whole; the row
+        // already knows the exact value.
         let name = "alice+tag@example.com"
         let arguments = AccountCommand.arguments(enabled: false, name: name)
-        XCTAssertEqual(arguments.count, 2, "no flags, no --org, nothing else")
+        XCTAssertEqual(arguments.count, 2, "the verb and the name, nothing else")
         XCTAssertEqual(arguments[1], name)
         XCTAssertFalse(arguments.contains { $0.hasPrefix("--") })
     }

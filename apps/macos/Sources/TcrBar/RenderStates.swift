@@ -578,12 +578,23 @@ enum RenderStates {
         return "[\(worst),\(ordinary)]"
     }
 
-    /// THE SAME EMAIL, TWICE — the shape that broke the panel.
+    /// ONE PERSON, TWO ORGS — the shape that broke the panel, and the names it
+    /// wears now that `tcr` has fixed it.
     ///
-    /// Both rows carry `henry@example.com`; only the org differs. Before
-    /// ``AccountRef`` they collapsed to one SwiftUI identity, so the panel drew
-    /// the FIRST row's numbers on both and neither wore its own gate pill,
-    /// while `tcr status --json` reported the two correctly and differently.
+    /// Both rows used to carry `henry@example.com`; only the org differed. They
+    /// collapsed to one SwiftUI identity, so the panel drew the FIRST row's
+    /// numbers on both and neither wore its own gate pill, while `tcr status
+    /// --json` reported the two correctly and differently. `tcr` now gives the
+    /// second row its own name (`src/config.rs`, `migrate_duplicate_names`), so
+    /// the PNG must show BOTH halves of the Team row's name and truncate
+    /// neither: the email on line one, the `/example-team` half as the first tag
+    /// on the designations line. Read left to right across the two lines, that
+    /// is exactly what a person types to address the row.
+    ///
+    /// The email is deliberately a realistic length rather than a short one.
+    /// A short address leaves slack that hides the very overflow this scene
+    /// exists to make visible — the previous fixture's `henry@example.com`
+    /// rendered as `henry@ex…ample-team` the moment the suffix shared its line.
     ///
     /// The two rows are deliberately as unlike each other as a pair can be —
     /// one spent and rejected, one fresh and never probed, and different plans
@@ -591,11 +602,11 @@ enum RenderStates {
     /// shows two identical rows, the collapse is back.
     private static var duplicateEmailJSON: String {
         let old = account(
-            "henry@example.com", quota: "1.0", state: "spent", probe: "ok", held: hold,
+            "henry.mitchell@example.com", quota: "1.0", state: "spent", probe: "ok", held: hold,
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111",
             gate: "rejected")
         let fresh = account(
-            "henry@example.com", quota: "null", state: "ok", probe: "never",
+            "henry.mitchell@example.com/example-team", quota: "null", state: "ok", probe: "never",
             usage: unmeasuredUsage,
             plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222",
             gate: "ok")

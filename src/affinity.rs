@@ -216,6 +216,51 @@ pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, Confi
     Ok(count)
 }
 
+/// Carry the pin file's [`StoredPin::name`]s across an account rename, so warm
+/// sessions survive `config::load`'s duplicate-name migration.
+///
+/// Returns how many pins were rewritten. A pin whose name matches no rename is
+/// left exactly as it was, and a file that cannot be read or parsed is left
+/// alone entirely — it is a cache, so the worst case is the cold prompt prefix
+/// those sessions would have paid anyway. That is also why the whole thing is
+/// infallible: a rename is not worth failing a boot over.
+///
+/// Only pins with no `account_uuid` actually NEED this — [`load`] resolves the
+/// rest through [`identity::resolve`], which compares uuid and org and never
+/// looks at the name. Rewriting all of them keeps the file honest about what it
+/// points at, which is what the next person to read it will assume.
+pub fn rename_pins(path: &Path, renames: &[(String, String)]) -> usize {
+    if renames.is_empty() {
+        return 0;
+    }
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(mut file) = serde_json::from_str::<PinFile>(&data) else {
+        return 0;
+    };
+    if file.version != FORMAT_VERSION {
+        return 0;
+    }
+    let mut rewritten = 0;
+    for pin in &mut file.pins {
+        if let Some((_, to)) = renames.iter().find(|(from, _)| *from == pin.name) {
+            pin.name.clone_from(to);
+            rewritten += 1;
+        }
+    }
+    if rewritten > 0 {
+        if let Err(err) = crate::config::write_atomic(
+            path,
+            &serde_json::to_string_pretty(&file).unwrap_or_default(),
+        ) {
+            tracing::warn!(error = %err, "could not carry session-affinity pins across the account rename");
+            return 0;
+        }
+    }
+    rewritten
+}
+
 /// Read `path` and resolve each pin against `accounts`, dropping anything stale
 /// or not resolvable to exactly one account.
 ///
@@ -647,5 +692,86 @@ mod tests {
             !report.pins.contains_key(&0),
             "the oldest pin is the one dropped"
         );
+    }
+
+    // ---- carrying pins across the account rename ---------------------------
+
+    /// A pin on a renamed account keeps pointing at it, and one on an untouched
+    /// account is not disturbed. Without this, every session pinned to a renamed
+    /// row resolves to nothing on the next boot and pays a full cold prefix —
+    /// the most expensive event in this system.
+    #[test]
+    fn rename_pins_rewrites_only_the_renamed_names() {
+        let path = tmp("rename");
+        save(
+            &path,
+            &[
+                pin(1, "henry@example.com", None, None, 100),
+                pin(2, "alice@example.com", None, None, 100),
+                pin(3, "henry@example.com", None, None, 200),
+            ],
+            0,
+        )
+        .expect("write pins");
+
+        let renamed = rename_pins(
+            &path,
+            &[(
+                "henry@example.com".to_string(),
+                "henry@example.com/token".to_string(),
+            )],
+        );
+        assert_eq!(renamed, 2, "both pins on that account follow it");
+
+        // The rewritten pins resolve against the RENAMED fleet — the property
+        // that actually matters, rather than the file's bytes.
+        let accounts = [
+            acct("henry@example.com/token", None, None),
+            acct("alice@example.com", None, None),
+        ];
+        let report = load(&path, &accounts, 200, i64::MAX);
+        assert_eq!(report.pins.len(), 3);
+        assert_eq!(report.pins.get(&1).map(|(idx, _)| *idx), Some(0));
+        assert_eq!(report.pins.get(&3).map(|(idx, _)| *idx), Some(0));
+        assert_eq!(
+            report.pins.get(&2).map(|(idx, _)| *idx),
+            Some(1),
+            "the untouched account's pin is untouched"
+        );
+        assert_eq!(report.unresolved, 0);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Nothing to do is not a failure, and neither is a missing file: this runs
+    /// at boot on a cache, so every unhappy path must return quietly rather than
+    /// hold up a server start.
+    #[test]
+    fn rename_pins_is_quiet_on_nothing_to_do() {
+        let path = tmp("rename-quiet");
+        assert_eq!(rename_pins(&path, &[]), 0, "no renames, no read");
+
+        let missing = path.with_file_name("does-not-exist.json");
+        assert_eq!(
+            rename_pins(&missing, &[("a".to_string(), "b".to_string())]),
+            0,
+            "no pin file yet — the ordinary first-boot case"
+        );
+
+        std::fs::write(&path, "{ not json").expect("write junk");
+        assert_eq!(
+            rename_pins(&path, &[("a".to_string(), "b".to_string())]),
+            0,
+            "a corrupt cache is dropped, never a boot failure"
+        );
+
+        save(&path, &[pin(1, "solo@example.com", None, None, 100)], 0).expect("write pins");
+        assert_eq!(
+            rename_pins(&path, &[("a".to_string(), "b".to_string())]),
+            0,
+            "a rename matching no pin rewrites nothing"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 }

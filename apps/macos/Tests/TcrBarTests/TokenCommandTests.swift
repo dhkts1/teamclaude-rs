@@ -14,8 +14,9 @@ final class TokenCommandTests: XCTestCase {
     func testArgumentsPassQueryPositionally() {
         XCTAssertEqual(TokenCommand.arguments(query: "alice@example.com"), ["token", "alice@example.com"])
         XCTAssertEqual(
-            TokenCommand.arguments(query: "alice@example.com", org: "acme"),
-            ["token", "alice@example.com", "--org", "acme"])
+            TokenCommand.arguments(query: "alice@example.com/acme"),
+            ["token", "alice@example.com/acme"],
+            "a qualified name is one argument, passed through whole")
     }
 
     func testExitZeroWithTokenIsSuccessTrimmed() {

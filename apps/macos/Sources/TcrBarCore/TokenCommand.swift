@@ -1,7 +1,7 @@
 import Foundation
 
 /// Reading one account's access token for the row's "Copy Access Token"
-/// action — `tcr token <query> [--org <org>]` (`src/cli.rs`'s
+/// action — `tcr token <query>` (`src/cli.rs`'s
 /// `print_access_token`). A subprocess, like every other credential touch in
 /// this app: `~/.config/teamclaude.json` holds live OAuth tokens and this app
 /// never opens it directly.
@@ -12,9 +12,8 @@ import Foundation
 /// account, not the credential.
 public enum TokenCommand {
     /// `query` is passed positionally and verbatim — no shell involved.
-    public static func arguments(query: String, org: String? = nil) -> [String] {
-        guard let org else { return ["token", query] }
-        return ["token", query, "--org", org]
+    public static func arguments(query: String) -> [String] {
+        ["token", query]
     }
 
     /// Why no token was produced. `tcr`'s own words, unparaphrased.
@@ -51,7 +50,7 @@ public enum TokenCommand {
     }
 
     /// Blocking invocation — always called off the main actor.
-    nonisolated static func perform(query: String, org: String? = nil) -> Result<String, Failure> {
+    nonisolated static func perform(query: String) -> Result<String, Failure> {
         switch TcrTool.resolve() {
         case .failure(let notFound):
             return .failure(
@@ -62,7 +61,7 @@ public enum TokenCommand {
         case .success(let executable):
             do {
                 let output = try TcrTool.run(
-                    executable: executable, arguments: arguments(query: query, org: org))
+                    executable: executable, arguments: arguments(query: query))
                 return classify(exitCode: output.exitCode, stdout: output.stdout, stderr: output.stderr)
             } catch {
                 return .failure(Failure(exitCode: -1, message: error.localizedDescription))
@@ -71,9 +70,9 @@ public enum TokenCommand {
     }
 
     /// Run `tcr token` off the main actor and hand back the token, or why not.
-    public static func fetch(query: String, org: String? = nil) async -> Result<String, Failure> {
+    public static func fetch(query: String) async -> Result<String, Failure> {
         await Task.detached(priority: .userInitiated) {
-            perform(query: query, org: org)
+            perform(query: query)
         }.value
     }
 }
