@@ -976,6 +976,40 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// group's ``GroupTag/background`` `nil`.
     public let groupColors: [String: String]?
 
+    /// The customer-facing plan label the SERVER derived (`Max 20x`, `Team 5x`,
+    /// `Team Standard`, …). Derived once, in Rust
+    /// (`tcr_status_wire::plan_label`), and never re-derived here: a second
+    /// implementation of the mapping is a second thing to get wrong, and the
+    /// one guarantee this field exists to give is that every surface names a
+    /// row's plan identically.
+    ///
+    /// `nil` for an account that has never been profiled, and for any server
+    /// built before this key existed. Both render as no tag at all — never a
+    /// guessed label, because the whole job of this field is telling two rows
+    /// with the SAME NAME apart, and a fabricated one defeats it.
+    public let plan: String?
+
+    /// The three raw profile strings the label was derived FROM, kept for a
+    /// reader that wants the provider's own vocabulary rather than English.
+    /// Optional for the same forward-compat reason ``groups`` is.
+    public let organizationType: String?
+    public let rateLimitTier: String?
+    public let seatTier: String?
+
+    /// The org this account is scoped to. Load-bearing, not informational:
+    /// every `tcr` account verb takes `--org <name-or-uuid-prefix>`, and this
+    /// is the ONLY thing that lets the panel address one of two rows sharing an
+    /// email. Without it "Copy Access Token" failed with `'…' is ambiguous —
+    /// matches 2 accounts`, because the command it built carried a name and
+    /// nothing to narrow it by.
+    ///
+    /// ``orgUuid`` is what the panel passes: it is exact, where ``orgName`` is
+    /// a display string two orgs can share. `nil` from a server built before
+    /// these keys existed, which is why every call site treats the flag as
+    /// optional rather than required.
+    public let orgUuid: String?
+    public let orgName: String?
+
     /// Explicit memberwise init, needed only because adding `fiveHourState`/
     /// `sevenDayState` after the struct already had test fixtures constructing
     /// it directly would otherwise force every one of them to grow two new
@@ -1016,7 +1050,13 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         reservedGroups: [String]? = nil,
         controlAllowedGroups: [String]? = nil,
         groupColors: [String: String]? = nil,
-        usage: UsageRow? = nil
+        usage: UsageRow? = nil,
+        plan: String? = nil,
+        organizationType: String? = nil,
+        rateLimitTier: String? = nil,
+        seatTier: String? = nil,
+        orgUuid: String? = nil,
+        orgName: String? = nil
     ) {
         self.name = name
         self.priority = priority
@@ -1051,9 +1091,28 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.controlAllowedGroups = controlAllowedGroups
         self.groupColors = groupColors
         self.usage = usage
+        self.plan = plan
+        self.organizationType = organizationType
+        self.rateLimitTier = rateLimitTier
+        self.seatTier = seatTier
+        self.orgUuid = orgUuid
+        self.orgName = orgName
     }
 
-    public var id: String { name }
+    /// This row's identity, ORG-QUALIFIED — `name` alone is not unique.
+    ///
+    /// This was a live defect, not a theoretical one. Two rows sharing an email
+    /// in different orgs collapsed to one SwiftUI identity in
+    /// `ForEach(…, id: \.element.id)`, so the panel painted the FIRST row's
+    /// numbers on both and neither wore its own pill — while `tcr status
+    /// --json` reported them correctly and differently. Every by-name
+    /// dictionary in the panel (pending verdicts, failures, restart-needed)
+    /// collided the same way, for the same reason.
+    ///
+    /// Delegates to ``AccountRef/id`` rather than restating the rule, so this
+    /// row's SwiftUI identity and the key its verdict is stored under cannot
+    /// drift apart — the drift being the bug itself.
+    public var id: String { ref.id }
 
     /// Worst-first ordering key. A disabled account is not an alarm — it is an
     /// operator decision — so it sorts below a spent one. This does *not* drive

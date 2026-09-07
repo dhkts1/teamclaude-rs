@@ -169,6 +169,24 @@ public final class ControlAccountController: ObservableObject {
 
     public func isPending(_ name: String) -> Bool { pending.contains(name) }
     public func failure(for name: String) -> ControlAccountCommand.Failure? { failures[name] }
+    /// Deliberately keyed on the bare NAME, unlike every other per-account
+    /// lookup in this app, which moved to ``AccountRef/id`` when the fleet's
+    /// two same-email rows were found colliding.
+    ///
+    /// This one cannot follow, and pretending otherwise would be the worse
+    /// choice. The stored `controlAccount` (`src/config.rs`, `Config::control_account`)
+    /// is a bare string, and the server resolves it by name to the FIRST
+    /// matching row (`Manager::assemble`'s `accounts.iter().position`), then
+    /// stamps `control: true` on the wire for every row whose name equals it
+    /// (`src/cli.rs`, `render_accounts_json`). So on a duplicated email the
+    /// SERVER already reports both rows as control, and an org-qualified check
+    /// here would show one row as control and the other not — disagreeing with
+    /// the process that actually routes the traffic, which is a worse lie than
+    /// agreeing with it.
+    ///
+    /// Making this correct is a SERVER change: `controlAccount` has to carry an
+    /// org, or the wire has to name the resolved index. Reported separately
+    /// rather than half-fixed here.
     public func isControl(_ name: String) -> Bool { !unavailable && current == name }
 
     /// Re-read `tcr control --show`. Safe to call any time — on panel open,

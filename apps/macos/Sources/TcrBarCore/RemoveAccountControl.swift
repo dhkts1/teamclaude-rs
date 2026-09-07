@@ -94,7 +94,7 @@ public enum RemoveAccountCommand {
 /// listed until restart" notice, since the row itself has no way to reflect
 /// a boot-time config change on its own.
 ///
-/// Keyed by account name, same as ``AccountController``. Never cleared: like
+/// Keyed by ``AccountRef/id``, same as ``AccountController``. Never cleared: like
 /// ``GroupController/appliedPendingRestart``, there is no live config reload
 /// for this field, so once a delete lands it stays pending-restart until the
 /// app relaunches (which matches reality) — the panel is expected to keep
@@ -107,11 +107,13 @@ public final class RemoveAccountController: ObservableObject {
 
     public init() {}
 
-    public func isPending(_ name: String) -> Bool { pending.contains(name) }
-    public func failure(for name: String) -> RemoveAccountCommand.Failure? { failures[name] }
-    /// Whether `name` was successfully deleted from the config this session —
-    /// the fact the "restart to apply" notice is drawn from.
-    public func needsRestart(_ name: String) -> Bool { removed.contains(name) }
+    public func isPending(_ account: AccountRef) -> Bool { pending.contains(account.id) }
+    public func failure(for account: AccountRef) -> RemoveAccountCommand.Failure? {
+        failures[account.id]
+    }
+    /// Whether this account was successfully deleted from the config this
+    /// session — the fact the "restart to apply" notice is drawn from.
+    public func needsRestart(_ account: AccountRef) -> Bool { removed.contains(account.id) }
 
     /// What a call did, as far as the subprocess can say — mirrors
     /// ``AccountController/Attempt``/``GroupController/Attempt``.
@@ -121,30 +123,31 @@ public final class RemoveAccountController: ObservableObject {
         case accepted(notice: String?)
     }
 
-    /// `tcr remove <name>`. `org` narrows an ambiguous match, mirroring the
-    /// CLI's own `--org` flag; the panel does not currently offer a way to
-    /// set it, so callers pass `nil` until that becomes a real ambiguity to
-    /// solve.
+    /// `tcr remove <name> [--org <uuid>]`. The org comes from the row itself
+    /// (``AccountRef/orgUuid``) rather than being left `nil`: on this fleet a
+    /// bare name matches two accounts and `tcr` refuses rather than guessing,
+    /// so a delete of either row failed as ambiguous.
     @discardableResult
-    public func remove(account name: String, org: String? = nil) async -> Attempt {
-        guard !pending.contains(name) else { return .skipped }
-        pending.insert(name)
-        failures[name] = nil
-        defer { pending.remove(name) }
+    public func remove(account: AccountRef) async -> Attempt {
+        let key = account.id
+        guard !pending.contains(key) else { return .skipped }
+        pending.insert(key)
+        failures[key] = nil
+        defer { pending.remove(key) }
 
         let outcome = await Task.detached(priority: .userInitiated) {
-            RemoveAccountCommand.perform(query: name, org: org)
+            RemoveAccountCommand.perform(query: account.name, org: account.orgUuid)
         }.value
 
         switch outcome {
         case .clean:
-            removed.insert(name)
+            removed.insert(key)
             return .accepted(notice: nil)
         case .spoke(let notice):
-            removed.insert(name)
+            removed.insert(key)
             return .accepted(notice: notice)
         case .failed(let failure):
-            failures[name] = failure
+            failures[key] = failure
             return .refused
         }
     }

@@ -65,6 +65,8 @@ enum RenderStates {
             ("01-healthy", .loaded(fleet(healthyJSON)), false, nil),
             ("01c-divergent-windows", .loaded(fleet(divergentWindowsJSON)), false, nil),
             ("01d-unmeasured-window-proof", .loaded(fleet(unmeasuredWindowJSON)), false, nil),
+            ("01e-plan-labels", .loaded(fleet(planLabelsJSON)), false, nil),
+            ("01f-duplicate-email", .loaded(fleet(duplicateEmailJSON)), false, nil),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
@@ -299,7 +301,19 @@ enum RenderStates {
         // `Account.groups`'s own doc-comment on why a missing key and an
         // empty array are kept distinct rather than collapsed.
         groups: [String]? = nil,
-        reservedGroups: [String]? = nil
+        reservedGroups: [String]? = nil,
+        // The plan label the SERVER derived, wire field `"plan"`. `nil` omits
+        // the key entirely — the never-profiled row and the older-server row
+        // alike, both of which must draw NO tag rather than a guessed one, so
+        // every scene that does not opt in is also the negative case.
+        plan: String? = nil,
+        // The org this row belongs to, wire field `"orgUuid"`. It is what makes
+        // two rows sharing a name distinct: `Account.id` is org-qualified, so a
+        // fixture pair with one email and two orgs renders as TWO rows here and
+        // collapsed to one before that fix. `nil` omits the key, which is the
+        // older-server shape.
+        orgUuid: String? = nil,
+        gate: String? = nil
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
@@ -328,8 +342,12 @@ enum RenderStates {
         func quote(_ raw: String) -> String {
             raw == "null" ? "null" : "\"\(raw)\""
         }
+        let planFragment = plan.map { "\"plan\":\"\($0)\"," } ?? ""
+        let orgFragment = orgUuid.map { "\"orgUuid\":\"\($0)\"," } ?? ""
+        let gateFragment = gate.map { "\"gate\":\"\($0)\"," } ?? ""
         return """
             {"name":"\(name)","priority":0,"status":"\(status)","disabled":\(disabled),
+             \(planFragment)\(orgFragment)\(gateFragment)
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
              "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
              "sevenDayOi":\(sevenDayOi),"sevenDayOiState":\(quote(sevenDayOiState)),
@@ -499,8 +517,54 @@ enum RenderStates {
     /// `near` or `spent`: this is the healthy scene, and the two tinted shapes
     /// are scene 14's job.
     private static var healthyJSON: String {
-        "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498)),"
-            + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"]))]"
+        "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498, plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")),"
+            + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"], plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
+    }
+
+    /// The three plan labels a real fleet produces, side by side — `Max 20x`,
+    /// `Team 5x`, `Team Standard` — plus one row with NO plan at all.
+    ///
+    /// The fourth row is the point as much as the first three: an account that
+    /// has never been profiled must draw no tag, not a guessed one, and a
+    /// screenshot is the only place that negative is actually visible.
+    private static var planLabelsJSON: String {
+        let rows = [
+            account(
+                "alice@example.com", quota: "0.12", state: "ok",
+                plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111"),
+            account(
+                "bob@example.com", quota: "0.31", state: "ok",
+                plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"),
+            account(
+                "carol@example.com", quota: "0.44", state: "ok",
+                plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222"),
+            account("dave@example.com", quota: "0.08", state: "ok"),
+        ]
+        return "[\(rows.joined(separator: ","))]"
+    }
+
+    /// THE SAME EMAIL, TWICE — the shape that broke the panel.
+    ///
+    /// Both rows carry `henry@example.com`; only the org differs. Before
+    /// ``AccountRef`` they collapsed to one SwiftUI identity, so the panel drew
+    /// the FIRST row's numbers on both and neither wore its own gate pill,
+    /// while `tcr status --json` reported the two correctly and differently.
+    ///
+    /// The two rows are deliberately as unlike each other as a pair can be —
+    /// one spent and rejected, one fresh and never probed, and different plans
+    /// — because that is what makes the failure legible in a PNG: if the render
+    /// shows two identical rows, the collapse is back.
+    private static var duplicateEmailJSON: String {
+        let old = account(
+            "henry@example.com", quota: "1.0", state: "spent", probe: "ok", held: hold,
+            plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111",
+            gate: "rejected")
+        let fresh = account(
+            "henry@example.com", quota: "null", state: "ok", probe: "never",
+            usage: unmeasuredUsage,
+            plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "ok")
+        return "[\(old),\(fresh)]"
     }
 
     /// The bug this scene exists to catch: a 7d-red account must not paint
