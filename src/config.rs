@@ -691,6 +691,86 @@ impl ThrottleConfig {
     }
 }
 
+/// The `controlAccount` key on disk: either the legacy bare account name every
+/// config written before this change carries, or an identity object — the same
+/// `name`/`accountUuid`/`orgUuid`/`orgName` fields `accounts[]` entries store —
+/// that survives a restart when an email is duplicated across two rows.
+/// `#[serde(untagged)]` is unambiguous here because the two shapes are
+/// structurally disjoint: a JSON string can never parse as the object variant
+/// and vice versa.
+///
+/// [`save_control_account`] always WRITES the identity shape once a real
+/// [`Account`] is known — it never re-emits the legacy string — but every
+/// reader (this type's own `Deserialize`, and boot resolution in
+/// `crate::manager::Manager::assemble`) keeps accepting the legacy shape
+/// unchanged, so a config nobody has re-saved since this change still loads
+/// and resolves exactly as before.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged, rename_all = "camelCase")]
+pub enum ControlAccountRef {
+    /// Written by every `tcr` build before this change: just the account's
+    /// `name`. Resolved by name/email alone (no org filter) — see
+    /// [`Self::org_filter`] — which is byte-identical to the old
+    /// `position(|a| a.name == *name)` lookup for the common case, a unique
+    /// name, and only starts refusing (rather than guessing) once that name is
+    /// duplicated.
+    Legacy(String),
+    /// The shape a `set` writes going forward: the same identity fields
+    /// `accounts[]` entries carry, so a duplicated email round-trips onto the
+    /// specific row it was set on.
+    ///
+    /// `rename_all = "camelCase"` is repeated here, not just at the enum
+    /// level, because serde's container `rename_all` renames VARIANT names for
+    /// an enum, not the FIELDS of a struct variant — the two are separate
+    /// attribute targets and only the variant-level one reaches these fields.
+    #[serde(rename_all = "camelCase")]
+    Identity {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_uuid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_uuid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_name: Option<String>,
+    },
+}
+
+impl ControlAccountRef {
+    /// The account name/email, present in both shapes.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Legacy(name) => name,
+            Self::Identity { name, .. } => name,
+        }
+    }
+
+    /// The org discriminator to narrow a name/email match by, for boot
+    /// resolution — `None` for the legacy shape (it never carried one) and for
+    /// an identity object that itself has neither field. Prefers the uuid over
+    /// the name, matching [`crate::identity::org_key_of`]'s own preference.
+    pub fn org_filter(&self) -> Option<&str> {
+        match self {
+            Self::Legacy(_) => None,
+            Self::Identity {
+                org_uuid, org_name, ..
+            } => crate::identity::org_key_of(org_uuid.as_deref(), org_name.as_deref()),
+        }
+    }
+}
+
+impl From<&Account> for ControlAccountRef {
+    /// Always builds the IDENTITY shape — see this type's doc-comment for why
+    /// a set always upgrades the key rather than re-writing the legacy string.
+    fn from(account: &Account) -> Self {
+        Self::Identity {
+            name: account.name.clone(),
+            account_uuid: account.account_uuid.clone(),
+            org_uuid: account.org_uuid.clone(),
+            org_name: account.org_name.clone(),
+        }
+    }
+}
+
 /// Top-level config document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -733,15 +813,21 @@ pub struct Config {
     /// fail rather than rotating. Set to the exact `accounts[].name`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lock_account: Option<String>,
-    /// The identity-bound control account: the one name that `_tcr/accounts/control`
-    /// resolves to and that stays PROBEABLE (usage tracked) even while `disabled`.
-    /// Unlike [`Self::lock_account`] this does NOT change selection by itself —
-    /// see the manager's `control_idx` doc for the resolution and the routing this
-    /// key only sets up for (part 2). Absent → no control account (default).
-    /// `skip_serializing_if` so clearing it REMOVES the key rather than writing
-    /// `null` — same contract as `lock_account` would want if it grew a setter.
+    /// The identity-bound control account: the one account that
+    /// `_tcr/accounts/control` resolves to and that stays PROBEABLE (usage
+    /// tracked) even while `disabled`. Unlike [`Self::lock_account`] this does
+    /// NOT change selection by itself — see the manager's `control_idx` doc for
+    /// the resolution and the routing this key only sets up for (part 2).
+    /// Absent → no control account (default). `skip_serializing_if` so clearing
+    /// it REMOVES the key rather than writing `null` — same contract as
+    /// `lock_account` would want if it grew a setter.
+    ///
+    /// [`ControlAccountRef`] accepts a legacy bare name (every config on disk
+    /// before this change) or an identity object; boot resolution refuses to
+    /// guess when a bare name is duplicated rather than silently binding to
+    /// whichever row sorts first — see `crate::manager::Manager::assemble`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_account: Option<String>,
+    pub control_account: Option<ControlAccountRef>,
     /// Quota headroom reserved for the control account against GENERAL
     /// (non-control-preferred) picks — part of the routing half (part 2) of the
     /// control-account feature. `threshold - control_reserve` is the effective
@@ -2022,18 +2108,32 @@ fn merge_plan(
     }
 }
 
-/// What a targeted [`save_control_account`] did to the on-disk document.
-/// Simpler than [`DisabledWrite`]: `controlAccount` is a single top-level
-/// string, not a per-entry flag located by identity, so there is no
-/// `NoEntry`/`Ambiguous` — the key is either already what was asked, or it
-/// isn't, and the caller is free to name an account nothing on disk carries
-/// yet (resolution to a live rotation slot happens in the manager, not here).
+/// What a targeted [`save_control_account`] did to the on-disk document. Same
+/// shape as [`DisabledWrite`] now, and for the same reason: writing the
+/// identity object requires resolving `target` against the on-disk
+/// `accounts[]` first, and an identity matching more than one entry cannot be
+/// written without guessing which row "is" the control account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlWrite {
     /// The key was set (or removed) and the file rewritten.
     Updated,
     /// The document already said exactly this; nothing was written.
     Unchanged,
+    /// More than one on-disk entry carries `target`'s identity; nothing was
+    /// written. Same refusal as [`DisabledWrite::Ambiguous`], for the same
+    /// reason: guessing which entry the new control account "is" risks
+    /// silently binding control to the wrong row.
+    Ambiguous,
+}
+
+impl std::fmt::Display for ControlWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Updated => "updated",
+            Self::Unchanged => "unchanged",
+            Self::Ambiguous => "more than one entry on disk carries this identity",
+        })
+    }
 }
 
 /// Persist ONLY the top-level `controlAccount` key into the file at `path`,
@@ -2045,13 +2145,26 @@ pub enum ControlWrite {
 /// file's RAW JSON document via [`read_document`] + [`write_atomic`], never on
 /// a `Config` round-trip through [`save`].
 ///
-/// `name == None` REMOVES the key (matches `#[serde(skip_serializing_if =
+/// `target == None` REMOVES the key (matches `#[serde(skip_serializing_if =
 /// "Option::is_none")]` on [`Config::control_account`]) rather than writing
 /// `null` — the same "clear removes, never sets to a null-ish literal"
 /// contract [`save_disabled`] uses for `disabled == false`.
-pub fn save_control_account(path: &Path, name: Option<&str>) -> Result<ControlWrite, ConfigError> {
+///
+/// `target == Some(account)` writes the [`ControlAccountRef::Identity`] shape
+/// built from `account`'s own identity fields — never the legacy bare-string
+/// shape, even when the document currently has one — after checking, via
+/// [`locate_account_entry`] (the same resolver [`find_account_entry`] is built
+/// on, reused rather than re-implemented), that `account`'s identity does not
+/// match more than one on-disk entry. It is deliberately NOT an error for
+/// `account` to match NO on-disk entry: the caller is free to name a rotation
+/// slot that has not been written to disk yet, exactly as the legacy `&str`
+/// signature always allowed.
+pub fn save_control_account(
+    path: &Path,
+    target: Option<&Account>,
+) -> Result<ControlWrite, ConfigError> {
     let mut doc = read_document(path)?;
-    let outcome = merge_control_account(&mut doc, name);
+    let outcome = merge_control_account(&mut doc, target);
     if outcome == ControlWrite::Updated {
         write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
     }
@@ -2452,9 +2565,17 @@ fn merge_group_color(
 
 /// Set or remove the top-level `controlAccount` key in `doc`. Reports whether
 /// the document actually changed, so the caller can skip a pointless rewrite
-/// of a credential file.
-fn merge_control_account(doc: &mut Map<String, Value>, name: Option<&str>) -> ControlWrite {
-    let desired = name.map(|n| Value::String(n.to_string()));
+/// of a credential file. See [`save_control_account`].
+fn merge_control_account(doc: &mut Map<String, Value>, target: Option<&Account>) -> ControlWrite {
+    if let Some(account) = target {
+        if let EntryMatch::Many = locate_account_entry(doc, account) {
+            return ControlWrite::Ambiguous;
+        }
+    }
+    let desired = target.map(|account| {
+        serde_json::to_value(ControlAccountRef::from(account))
+            .expect("ControlAccountRef always serializes")
+    });
     if doc.get("controlAccount").cloned() == desired {
         return ControlWrite::Unchanged;
     }
@@ -3615,7 +3736,29 @@ mod tests {
                 .unwrap();
         assert_eq!(
             config.control_account,
-            Some("alice@example.com".to_string())
+            Some(ControlAccountRef::Legacy("alice@example.com".to_string()))
+        );
+    }
+
+    /// The identity-object shape — what a `set` writes going forward — parses
+    /// back to the exact fields it carries, `orgUuid` included.
+    #[test]
+    fn control_account_parses_identity_object() {
+        let config: Config = serde_json::from_str(
+            r#"{ "accounts": [], "controlAccount": {
+                "name": "alice@example.com",
+                "orgUuid": "11111111-1111-1111-1111-111111111111"
+            } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.control_account,
+            Some(ControlAccountRef::Identity {
+                name: "alice@example.com".to_string(),
+                account_uuid: None,
+                org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+                org_name: None,
+            })
         );
     }
 
@@ -4432,22 +4575,23 @@ mod tests {
 
     // --- save_control_account -----------------------------------------------
 
-    /// Setting `controlAccount` writes the top-level key and changes nothing
-    /// else — same "raw document, not a `Config` round trip" contract as
-    /// `save_disabled`. This is also `control_persist_preserves_unmodelled_top_level_keys`
-    /// from the bridge: a key nothing here models (`routes`) survives the write.
+    /// Setting `controlAccount` writes the top-level key — as the identity
+    /// object, not the legacy string — and changes nothing else — same "raw
+    /// document, not a `Config` round trip" contract as `save_disabled`. This is
+    /// also `control_persist_preserves_unmodelled_top_level_keys` from the
+    /// bridge: a key nothing here models (`routes`) survives the write.
     #[test]
     fn set_control_writes_the_key_and_changes_nothing_else() {
         let path = tmp_path("control-write");
         fs::write(&path, DISABLE_SAMPLE).unwrap();
 
         assert_eq!(
-            save_control_account(&path, Some("acct-a")).unwrap(),
+            save_control_account(&path, Some(&by_name("acct-a"))).unwrap(),
             ControlWrite::Updated
         );
 
         let mut after = read_json(&path);
-        assert_eq!(after["controlAccount"], json!("acct-a"));
+        assert_eq!(after["controlAccount"], json!({"name": "acct-a"}));
         after
             .as_object_mut()
             .expect("document is an object")
@@ -4460,7 +4604,7 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// Clearing (`name: None`) REMOVES the key rather than writing `null` —
+    /// Clearing (`target: None`) REMOVES the key rather than writing `null` —
     /// matching `#[serde(skip_serializing_if = "Option::is_none")]` on
     /// `Config::control_account`, and a set→clear round trip leaves the file
     /// exactly as it started.
@@ -4469,7 +4613,7 @@ mod tests {
         let path = tmp_path("control-roundtrip");
         fs::write(&path, DISABLE_SAMPLE).unwrap();
 
-        save_control_account(&path, Some("acct-a")).unwrap();
+        save_control_account(&path, Some(&by_name("acct-a"))).unwrap();
         assert_eq!(
             save_control_account(&path, None).unwrap(),
             ControlWrite::Updated
@@ -4502,13 +4646,86 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), DISABLE_SAMPLE);
 
-        save_control_account(&path, Some("acct-a")).unwrap();
+        save_control_account(&path, Some(&by_name("acct-a"))).unwrap();
         let with_control = fs::read_to_string(&path).unwrap();
         assert_eq!(
-            save_control_account(&path, Some("acct-a")).unwrap(),
+            save_control_account(&path, Some(&by_name("acct-a"))).unwrap(),
             ControlWrite::Unchanged
         );
         assert_eq!(fs::read_to_string(&path).unwrap(), with_control);
+        fs::remove_file(&path).ok();
+    }
+
+    /// Two on-disk entries share `target`'s identity (both share a name and
+    /// carry no uuid, so [`crate::identity::same_identity`] cannot tell them
+    /// apart): the write is refused, `ControlWrite::Ambiguous`, and the file is
+    /// untouched — mirroring [`DisabledWrite::Ambiguous`] for the same reason.
+    #[test]
+    fn control_write_on_duplicated_identity_is_refused() {
+        let path = tmp_path("control-ambiguous");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "dup@example.com", "accessToken": "at-1" },
+                { "name": "dup@example.com", "accessToken": "at-2" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_control_account(&path, Some(&by_name("dup@example.com"))).unwrap(),
+            ControlWrite::Ambiguous
+        );
+        assert!(
+            read_json(&path).get("controlAccount").is_none(),
+            "an ambiguous write must not land on disk"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// An identity object carrying an `accountUuid` shared by both on-disk rows
+    /// PLUS `orgUuid` resolves the write to the RIGHT one of the two —
+    /// the "legacy two-org shape" `locate_account_entry`'s doc-comment
+    /// describes: one person, two orgs, one uuid. (Without a shared
+    /// `accountUuid` on both sides, `same_identity` cannot use the org at all —
+    /// see `control_write_on_duplicated_identity_is_refused` — so this is the
+    /// realistic disambiguating shape, not an arbitrary one.)
+    #[test]
+    fn control_write_with_org_uuid_disambiguates_duplicated_email() {
+        let path = tmp_path("control-org-disambiguates");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "dup@example.com", "accessToken": "at-1",
+                  "accountUuid": "33333333-3333-3333-3333-333333333333",
+                  "orgUuid": "11111111-1111-1111-1111-111111111111" },
+                { "name": "dup@example.com", "accessToken": "at-2",
+                  "accountUuid": "33333333-3333-3333-3333-333333333333",
+                  "orgUuid": "22222222-2222-2222-2222-222222222222" }
+            ] }"#,
+        )
+        .unwrap();
+        let target = crate::identity::probe(
+            "dup@example.com",
+            Some("33333333-3333-3333-3333-333333333333".to_string()),
+            Some("22222222-2222-2222-2222-222222222222".to_string()),
+            None,
+        );
+
+        assert_eq!(
+            save_control_account(&path, Some(&target)).unwrap(),
+            ControlWrite::Updated
+        );
+
+        let after = read_json(&path);
+        assert_eq!(
+            after["controlAccount"],
+            json!({
+                "name": "dup@example.com",
+                "accountUuid": "33333333-3333-3333-3333-333333333333",
+                "orgUuid": "22222222-2222-2222-2222-222222222222"
+            })
+        );
         fs::remove_file(&path).ok();
     }
 

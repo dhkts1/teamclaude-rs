@@ -731,11 +731,9 @@ pub enum SetControlOutcome {
 }
 
 /// What [`Manager::set_control`] achieved about DURABILITY — whether the
-/// control account will still be set (or cleared) after a restart. Simpler
-/// than [`DisablePersist`]: `controlAccount` is a single top-level key
-/// resolved by NAME, not a per-account flag located by identity, so there is
-/// no `NoEntry`/`Ambiguous` arm on the durable side — see
-/// [`config::ControlWrite`].
+/// control account will still be set (or cleared) after a restart. Same shape
+/// as [`DisablePersist`] now that `controlAccount` is resolved by IDENTITY, not
+/// by a bare name — see [`config::ControlWrite`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlPersist {
     /// The config file carries the control account (or its absence) — written
@@ -744,6 +742,10 @@ pub enum ControlPersist {
     /// No config file behind this manager (`tcr demo`, `tcr status --probe`,
     /// tests). Memory-only BY DESIGN.
     NoConfigFile,
+    /// More than one on-disk entry carries this identity; the write was
+    /// refused rather than landed on a guess. See
+    /// [`config::ControlWrite::Ambiguous`].
+    Ambiguous,
     /// The write itself failed (unreadable, malformed, or unwritable file).
     WriteFailed,
 }
@@ -756,6 +758,9 @@ impl ControlPersist {
     pub fn warning(self) -> Option<&'static str> {
         match self {
             Self::Persisted | Self::NoConfigFile => None,
+            Self::Ambiguous => Some(
+                "NOT SAVED: two config entries share this account's identity — give each its own orgUuid",
+            ),
             Self::WriteFailed => {
                 Some("NOT SAVED: writing the config failed — this will not survive a restart")
             }
@@ -1298,16 +1303,31 @@ impl Manager {
         let reset_urgency_tier_ms =
             i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
 
-        let control_idx = config.control_account.as_ref().and_then(|name| {
-            let idx = accounts.iter().position(|a| a.name == *name);
-            if idx.is_none() {
-                let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
-                tracing::error!(
-                    control_account = %name, available = ?names,
-                    "controlAccount name did not match any account — running with NO control account"
-                );
+        let control_idx = config.control_account.as_ref().and_then(|identity| {
+            match crate::identity::match_one(&accounts[..], identity.name(), identity.org_filter())
+            {
+                crate::identity::Match::One(idx) => Some(idx),
+                crate::identity::Match::None => {
+                    let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+                    tracing::error!(
+                        control_account = %identity.name(), available = ?names,
+                        "controlAccount did not match any account — running with NO control account"
+                    );
+                    None
+                }
+                // Two or more accounts share this identity (the reason
+                // `save_control_account` now stores org alongside the name):
+                // picking the first one silently, as the old `position(...)`
+                // scan did, risks binding control to a disabled Team-seat row
+                // while the account that resolved it live stays unpinned.
+                crate::identity::Match::Ambiguous(candidates) => {
+                    tracing::error!(
+                        control_account = %identity.name(), candidates = ?candidates,
+                        "controlAccount matches more than one account — refusing to guess, running with NO control account"
+                    );
+                    None
+                }
             }
-            idx
         });
 
         let usage = crate::usage::UsageTracker::new(
@@ -2232,7 +2252,7 @@ impl Manager {
     ///
     /// A missing `config_path` (tests, `tcr demo`, `tcr status --probe`) is a
     /// SILENT no-op — those managers must never touch a real config file.
-    fn persist_control(&self, name: Option<String>) -> ControlPersist {
+    fn persist_control(&self, target: Option<config::Account>) -> ControlPersist {
         let Some(path) = &self.config_path else {
             return ControlPersist::NoConfigFile;
         };
@@ -2243,7 +2263,7 @@ impl Manager {
             .lock()
             .expect("config write lock poisoned");
         // INV2 — no `self.config` guard is alive on this line.
-        let outcome = config::save_control_account(path, name.as_deref());
+        let outcome = config::save_control_account(path, target.as_ref());
         // INV3 — memory is touched only on the arms where the FILE now carries
         // the desired state.
         if matches!(
@@ -2251,8 +2271,9 @@ impl Manager {
             Ok(config::ControlWrite::Updated) | Ok(config::ControlWrite::Unchanged)
         ) {
             let mut config = self.config.lock().expect("config lock poisoned");
-            config.control_account = name.clone();
+            config.control_account = target.as_ref().map(config::ControlAccountRef::from);
         }
+        let name = target.as_ref().map(|a| a.name.as_str());
         match outcome {
             Ok(config::ControlWrite::Updated) => {
                 tracing::info!(
@@ -2268,6 +2289,14 @@ impl Manager {
                 );
                 ControlPersist::Persisted
             }
+            Ok(config::ControlWrite::Ambiguous) => {
+                tracing::error!(
+                    control_account = ?name,
+                    path = %path.display(),
+                    "more than one config entry carries this account's identity; refusing to guess, so the control account will NOT survive a restart"
+                );
+                ControlPersist::Ambiguous
+            }
             Err(err) => {
                 tracing::error!(
                     error = %err,
@@ -2282,22 +2311,30 @@ impl Manager {
 
     /// Set (`idx = Some(_)`) or clear (`idx = None`) the control account by
     /// rotation index, and persist it. Mirrors [`Self::set_disabled`]'s
-    /// resolve-name-then-persist shape: the name is read out under a released
-    /// `accounts` READ lock before `control_idx` is taken, so the two never
-    /// nest (same discipline `set_disabled` documents for `accounts`/`config`).
+    /// resolve-identity-then-persist shape: the identity is read out under a
+    /// released `accounts` READ lock before `control_idx` is taken, so the two
+    /// never nest (same discipline `set_disabled` documents for
+    /// `accounts`/`config`).
     fn set_control(&self, idx: Option<usize>) -> ControlPersist {
-        let name = idx.and_then(|i| {
+        let target = idx.and_then(|i| {
             self.accounts
                 .read()
                 .expect("accounts lock poisoned")
                 .get(i)
-                .map(|a| a.name.clone())
+                .map(|a| {
+                    crate::identity::probe(
+                        &a.name,
+                        a.account_uuid.clone(),
+                        a.org_uuid.clone(),
+                        a.org_name.clone(),
+                    )
+                })
         });
         {
             let mut control = self.control_idx.write().expect("control lock poisoned");
             *control = idx;
         }
-        self.persist_control(name)
+        self.persist_control(target)
     }
 
     /// Resolve a user-supplied `(query, org)` against the LIVE rotation and set
@@ -4362,7 +4399,9 @@ mod tests {
 
     fn config_with_control(accounts: Vec<Account>, control: &str) -> Config {
         let mut config = config_with(accounts);
-        config.control_account = Some(control.to_string());
+        config.control_account = Some(crate::config::ControlAccountRef::Legacy(
+            control.to_string(),
+        ));
         config
     }
 
@@ -4461,6 +4500,119 @@ mod tests {
             lock_refresher(),
         );
         assert_eq!(unmatched.control(), None);
+    }
+
+    /// The exact bug this unit fixes: a legacy bare-string `controlAccount`
+    /// that names a DUPLICATED email must not silently bind to whichever row
+    /// sorts first (the old `position(...)` behaviour) — it must refuse and run
+    /// with no control account, same as an unmatched name.
+    #[test]
+    fn assemble_refuses_legacy_control_name_on_duplicated_email() {
+        let dup_a = Account {
+            org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            ..account("dup@example.com", 0)
+        };
+        let dup_b = Account {
+            org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            disabled: Some(true),
+            ..account("dup@example.com", 0)
+        };
+        let config = config_with_control(vec![dup_a, dup_b], "dup@example.com");
+        let manager = build_manager(config, lock_refresher());
+        assert_eq!(
+            manager.control(),
+            None,
+            "an ambiguous legacy name must run with NO control account, never a guess"
+        );
+    }
+
+    /// An identity object carrying `orgUuid` resolves boot control to the RIGHT
+    /// one of two same-email rows — the fix's other half: a `controlAccount`
+    /// written with org information survives a restart instead of collapsing
+    /// back to the ambiguous legacy behaviour.
+    #[test]
+    fn assemble_resolves_identity_control_account_by_org_uuid() {
+        let dup_a = Account {
+            org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            ..account("dup@example.com", 0)
+        };
+        let dup_b = Account {
+            org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            ..account("dup@example.com", 0)
+        };
+        let mut config = config_with(vec![dup_a, dup_b]);
+        config.control_account = Some(crate::config::ControlAccountRef::Identity {
+            name: "dup@example.com".to_string(),
+            account_uuid: None,
+            org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            org_name: None,
+        });
+        let manager = build_manager(config, lock_refresher());
+        assert_eq!(
+            manager.control(),
+            Some(1),
+            "orgUuid must pick the second row, not the first"
+        );
+    }
+
+    /// Full round trip through the durable half: setting control on a
+    /// duplicated email via [`Manager::set_control_by_query`] persists the
+    /// IDENTITY shape (not the bare name), and a fresh `Manager` built from the
+    /// reloaded file resolves to the SAME row — not just "a" row. Both rows
+    /// share an `accountUuid` (one person, two orgs — the realistic shape a
+    /// duplicated email takes) so the durable write can disambiguate them at
+    /// all; see `control_write_with_org_uuid_disambiguates_duplicated_email` in
+    /// `config.rs` for why an org alone, with no shared uuid, cannot.
+    #[test]
+    fn set_control_on_duplicated_email_survives_a_reload() {
+        let path = tmp_config_path("control-survives-reload");
+        let dup_a = Account {
+            account_uuid: Some("33333333-3333-3333-3333-333333333333".to_string()),
+            org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            refresh_token: Some("rt-first".to_string()),
+            ..account("dup@example.com", 0)
+        };
+        let dup_b = Account {
+            account_uuid: Some("33333333-3333-3333-3333-333333333333".to_string()),
+            org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+            refresh_token: Some("rt-second".to_string()),
+            ..account("dup@example.com", 0)
+        };
+        let config = config_with(vec![dup_a, dup_b]);
+        config::save(&path, &config).expect("write test config");
+        let manager = build_manager_with_path(config, path.clone());
+
+        let outcome = manager.set_control_by_query(
+            Some("dup@example.com"),
+            Some("22222222-2222-2222-2222-222222222222"),
+        );
+        assert_eq!(
+            outcome,
+            SetControlOutcome::Applied {
+                name: Some("dup@example.com".to_string()),
+                persist: ControlPersist::Persisted,
+            }
+        );
+        assert_eq!(manager.control(), Some(1), "resolved the SECOND row live");
+
+        // The identity object, not the bare name, must be what landed on disk.
+        let on_disk = config::load(&path).expect("reload persisted config");
+        assert_eq!(
+            on_disk.control_account,
+            Some(crate::config::ControlAccountRef::Identity {
+                name: "dup@example.com".to_string(),
+                account_uuid: Some("33333333-3333-3333-3333-333333333333".to_string()),
+                org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
+                org_name: None,
+            })
+        );
+
+        // A brand-new Manager built from the reloaded file resolves to the
+        // SAME row (index 1, `rt-second`) — not just "a" row.
+        let reloaded_manager = build_manager_with_path(on_disk, path.clone());
+        assert_eq!(reloaded_manager.control(), Some(1));
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// Absent `controlAccount` → `control() == None`.

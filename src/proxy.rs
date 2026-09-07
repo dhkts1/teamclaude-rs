@@ -6355,10 +6355,17 @@ mod tests {
             "the live manager must resolve the new control account"
         );
 
-        // 2. …and the file's top-level key carries it too.
+        // 2. …and the file's top-level key carries it too — as the identity
+        // object [`crate::config::save_control_account`] now writes (never the
+        // legacy bare string), so a duplicated email can survive a restart.
         assert_eq!(
             control_account_in_file(&path),
-            Some(serde_json::json!("alice@example.com"))
+            Some(serde_json::json!({
+                "name": "alice@example.com",
+                "accountUuid": "22222222-a",
+                "orgUuid": "11111111-1111-1111-1111-aaaaaaaaaaaa",
+                "orgName": "Org aaaaaaaaaaaa",
+            }))
         );
 
         // Clearing (`query: null`) removes it from both halves.

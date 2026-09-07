@@ -398,7 +398,7 @@ fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usiz
 ///
 /// `None` when there is nothing to say, which is every ordinary add.
 fn control_account_group_notice(config: &Config, account: &str, group: &str) -> Option<String> {
-    if config.control_account.as_deref() != Some(account) {
+    if config.control_account.as_ref().map(|c| c.name()) != Some(account) {
         return None;
     }
     Some(format!(
@@ -865,7 +865,7 @@ fn group_membership(config: &Config) -> (std::collections::BTreeMap<&str, Vec<&s
 const ROUTE_BLOCK_CONTROL_ONLY: &str = "control-account-only";
 
 fn group_routes(config: &Config, group: &str, members: &[&str]) -> bool {
-    match config.control_account.as_deref() {
+    match config.control_account.as_ref().map(|c| c.name()) {
         Some(control) => {
             members.iter().any(|member| *member != control) || config.group_allows_control(group)
         }
@@ -1362,16 +1362,18 @@ fn write_control_account(
     org: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let config = load_for_edit(config_path)?;
-    let name = match query {
+    let target = match query {
         None => None,
-        Some(q) => Some(
-            config.accounts[resolve_account(&config.accounts, q, org)?]
-                .name
-                .clone(),
-        ),
+        Some(q) => Some(config.accounts[resolve_account(&config.accounts, q, org)?].clone()),
     };
-    config::save_control_account(config_path, name.as_deref())
+    let name = target.as_ref().map(|a| a.name.clone());
+    let outcome = config::save_control_account(config_path, target.as_ref())
         .with_context(|| format!("save config at {}", config_path.display()))?;
+    if let config::ControlWrite::Ambiguous = outcome {
+        bail!(
+            "more than one config entry shares this account's identity — give each its own orgUuid, then retry"
+        );
+    }
     Ok(name)
 }
 
@@ -1465,7 +1467,10 @@ pub async fn show_control(config_path: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("load config at {}", config_path.display()))?;
     let control = match fetch_live_status(&config).await {
         Ok(payload) => payload.control,
-        Err(_) => config.control_account.clone(),
+        Err(_) => config
+            .control_account
+            .as_ref()
+            .map(|c| c.name().to_string()),
     };
     match control {
         Some(name) => println!("{name}"),
@@ -2469,7 +2474,10 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
                 // way, so this is the same reading a live server would derive
                 // at boot.
                 let http1_only = config.http1_only;
-                let control = config.control_account.clone();
+                let control = config
+                    .control_account
+                    .as_ref()
+                    .map(|c| c.name().to_string());
                 let group_colors = config.group_colors();
                 let snapshot = snapshot_offline(
                     config,
