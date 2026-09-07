@@ -175,6 +175,11 @@ impl Manager {
                 control_allowed_groups.sort();
                 AccountSnapshot {
                     name: a.name.clone(),
+                    organization_type: a.organization_type.clone(),
+                    rate_limit_tier: a.rate_limit_tier.clone(),
+                    seat_tier: a.seat_tier.clone(),
+                    org_uuid: a.org_uuid.clone(),
+                    org_name: a.org_name.clone(),
                     priority: a.priority,
                     // `Throttled` is cleared from the enum only when the account
                     // next serves a non-429 (proxy.rs), so a naturally-expired hold

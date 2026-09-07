@@ -2476,6 +2476,9 @@ mod revalidation_sticky_tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -2623,6 +2626,9 @@ mod sticky_divert_replay_tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -2782,6 +2788,9 @@ mod reserved_gate_agreement_tests {
                 switch_threshold: None,
                 disabled: None,
                 groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                organization_type: None,
+                rate_limit_tier: None,
+                seat_tier: None,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -2907,6 +2916,9 @@ mod group_miss_tests {
                 switch_threshold: None,
                 disabled: disabled.then_some(true),
                 groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+                organization_type: None,
+                rate_limit_tier: None,
+                seat_tier: None,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -3047,6 +3059,9 @@ mod reset_urgency_tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }

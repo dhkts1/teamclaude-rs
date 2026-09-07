@@ -244,6 +244,33 @@ pub struct AccountStatus {
     /// predates the opt-in omits it entirely.
     #[serde(default)]
     pub control_allowed_groups: Vec<String>,
+    /// The account's plan as the profile endpoint reported it, verbatim, and the
+    /// two fields that refine it — mirroring [`AccountSnapshot`]'s three.
+    ///
+    /// On this wire (server → CLI) rather than derived at either end, because
+    /// only the server has them: they are read from the config the SERVING
+    /// process loaded, and the CLI's live path has no config of its own to
+    /// consult. The customer-facing label is still derived once, one layer out,
+    /// by `render_accounts`/`render_accounts_json`.
+    ///
+    /// `#[serde(default)]` for the same forward-compat reason as `groups` above,
+    /// and it degrades honestly in both directions: an older server omits the
+    /// keys, a newer client reads `None`, and every surface renders "plan
+    /// unknown" — which is the truth about a server that cannot report one.
+    #[serde(default)]
+    pub organization_type: Option<String>,
+    #[serde(default)]
+    pub rate_limit_tier: Option<String>,
+    #[serde(default)]
+    pub seat_tier: Option<String>,
+    /// The org this account is scoped to — see [`AccountSnapshot::org_uuid`]
+    /// for why a client needs it (every account verb takes `--org`, and a row
+    /// with only a name cannot narrow a duplicated email). `#[serde(default)]`
+    /// for the same forward-compat reason as the fields above.
+    #[serde(default)]
+    pub org_uuid: Option<String>,
+    #[serde(default)]
+    pub org_name: Option<String>,
     /// Proxy-computed usage and cost — see [`AccountSnapshot::usage`].
     ///
     /// Both skew directions degrade HONESTLY, which is exactly what
@@ -329,6 +356,11 @@ impl StatusPayload {
                 groups: a.groups.clone(),
                 reserved_groups: a.reserved_groups.clone(),
                 control_allowed_groups: a.control_allowed_groups.clone(),
+                organization_type: a.organization_type.clone(),
+                rate_limit_tier: a.rate_limit_tier.clone(),
+                seat_tier: a.seat_tier.clone(),
+                org_uuid: a.org_uuid.clone(),
+                org_name: a.org_name.clone(),
                 usage: a.usage.clone(),
             })
             .collect();
@@ -360,6 +392,11 @@ impl StatusPayload {
                 thresholds.push(a.threshold);
                 AccountSnapshot {
                     name: a.name,
+                    organization_type: a.organization_type,
+                    rate_limit_tier: a.rate_limit_tier,
+                    seat_tier: a.seat_tier,
+                    org_uuid: a.org_uuid,
+                    org_name: a.org_name,
                     priority: a.priority,
                     status: a.status,
                     disabled: a.disabled,
@@ -411,6 +448,11 @@ mod tests {
         StatsSnapshot {
             accounts: vec![AccountSnapshot {
                 name: "alice@example.com".to_string(),
+                organization_type: Some("claude_team".to_string()),
+                rate_limit_tier: Some("default_raven".to_string()),
+                seat_tier: Some("team_standard".to_string()),
+                org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
+                org_name: Some("Example Org".to_string()),
                 priority: 0,
                 status: "active".to_string(),
                 disabled: false,

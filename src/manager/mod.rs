@@ -38,7 +38,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::config::{self, Config, PacingConfig, ThrottleConfig};
 use crate::oauth::{self, LiveRefresher, TokenRefresher, Tokens};
-use crate::probe::{LiveUsageProber, ProbeStatus, Usage, UsageProber};
+use crate::probe::{LiveUsageProber, PlanProber, ProbeStatus, Usage, UsageProber};
 use crate::quota::Quota;
 use crate::stats::{
     AccountSnapshot, GateReason, RequestLogEntry, SessionKind, SessionSnapshot, StatsSnapshot,
@@ -231,6 +231,14 @@ pub struct AccountRuntime {
     /// when the config carried no `groups` key) so [`Manager::eligible`] can test
     /// membership without an `Option` at every call site.
     pub groups: Vec<String>,
+    /// The account's plan, verbatim as the profile endpoint reported it, and
+    /// the two fields that refine it — mirrors [`config::Account`]'s three, read
+    /// from config at boot and BACKFILLED by the probe loop
+    /// ([`Manager::probe_account`]) for a fleet that logged in before these
+    /// fields existed. `None` means "never profiled", never a default plan.
+    pub organization_type: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    pub seat_tier: Option<String>,
     pub switch_threshold: Option<f64>,
     pub access_token: String,
     pub refresh_token: Option<String>,
@@ -596,6 +604,9 @@ impl AccountRuntime {
             priority: account.priority.unwrap_or(0),
             disabled: account.disabled.unwrap_or(false),
             groups: account.groups.clone().unwrap_or_default(),
+            organization_type: account.organization_type.clone(),
+            rate_limit_tier: account.rate_limit_tier.clone(),
+            seat_tier: account.seat_tier.clone(),
             switch_threshold: account.switch_threshold,
             access_token: account.access_token.clone(),
             refresh_token: account.refresh_token.clone(),
@@ -853,6 +864,16 @@ pub struct Manager {
     refresher: Arc<dyn TokenRefresher>,
     /// Reads each account's quota from the zero-spend usage endpoint on a timer.
     prober: Arc<dyn UsageProber>,
+    /// Reads an account's PLAN from the profile endpoint, once, the first time
+    /// the probe loop meets a row that has none — see
+    /// [`Self::backfill_plan_if_unknown`].
+    ///
+    /// Swappable rather than a constructor argument: every one of the fifteen
+    /// `Manager::new` call sites would otherwise grow a parameter for a seam
+    /// only the plan backfill's own tests use. `RwLock` because the swap
+    /// happens once, before the manager serves anything, and every later access
+    /// is a read.
+    plan_prober: RwLock<Arc<dyn PlanProber>>,
     /// Warms idle accounts to keep their 5h window live (opt-in; see [`Self::warm_all`]).
     warmer: Arc<dyn AccountWarmer>,
     /// Ensures two keep-warm sweeps never overlap (mirrors the JS `_running` flag).
@@ -1299,6 +1320,7 @@ impl Manager {
             usage,
             refresher,
             prober,
+            plan_prober: RwLock::new(Arc::new(crate::probe::LivePlanProber)),
             warmer,
             warm_in_flight: AtomicBool::new(false),
             warm_wake: Notify::new(),
@@ -2583,6 +2605,23 @@ impl Manager {
                         if row.org_name.is_none() {
                             row.org_name = account.org_name.clone();
                         }
+                        // Plan fields are OVERWRITTEN where the submission has
+                        // one, not backfilled like the identity fields above —
+                        // a plan changes (an org upgrades, an account joins a
+                        // Team) while an identity does not. A `None` still
+                        // writes nothing, so a re-add that carried no profile
+                        // never blanks a plan we already know. Same rule as
+                        // `config::merge_account`'s durable half; see
+                        // `config::Account::organization_type`.
+                        if account.organization_type.is_some() {
+                            row.organization_type = account.organization_type.clone();
+                        }
+                        if account.rate_limit_tier.is_some() {
+                            row.rate_limit_tier = account.rate_limit_tier.clone();
+                        }
+                        if account.seat_tier.is_some() {
+                            row.seat_tier = account.seat_tier.clone();
+                        }
                         // F5: carry the row's REAL routing state, not
                         // `identity::probe`'s None placeholders — see
                         // `persist_replaced`'s doc-comment for the restart-un-bench
@@ -2604,6 +2643,14 @@ impl Manager {
                             // are configured routing state, not identity, so a
                             // credential re-add/refresh must not silently clear them.
                             groups: (!row.groups.is_empty()).then(|| row.groups.clone()),
+                            // Carried for the same reason as `groups` above,
+                            // with one difference: these were just merged from
+                            // the submission a few lines up, so `row` already
+                            // holds the newest reading and the durable write
+                            // gets it rather than the pre-merge value.
+                            organization_type: row.organization_type.clone(),
+                            rate_limit_tier: row.rate_limit_tier.clone(),
+                            seat_tier: row.seat_tier.clone(),
                             extra: serde_json::Map::new(),
                         };
                         Resolution::Updated {
@@ -2948,6 +2995,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3358,6 +3408,167 @@ mod tests {
             Arc::new(NoWarmer),
             Some(path),
         )
+    }
+
+    /// A plan prober that answers one canned reading and counts its calls — the
+    /// counter is the point, not decoration: the backfill's whole contract is
+    /// that it runs ONCE per account and never again.
+    struct CountingPlanProber {
+        plan: crate::probe::Plan,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::probe::PlanProber for CountingPlanProber {
+        fn plan(&self, _access_token: String) -> crate::probe::PlanFuture {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let plan = self.plan.clone();
+            Box::pin(async move { plan })
+        }
+    }
+
+    /// The reason this feature has a backfill at all: fifteen accounts logged in
+    /// before the plan fields existed, and re-authenticating each in a browser is
+    /// not an answer. One probe learns the plan, writes it to the runtime row AND
+    /// to disk, and never asks again.
+    #[tokio::test]
+    async fn probing_backfills_a_missing_plan_once_and_persists_it() {
+        let path = tmp_config_path("plan-backfill");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "priority": 0 }
+            ] }"#,
+        )
+        .unwrap();
+        let config = crate::config::load(&path).unwrap();
+        let manager = build_manager_with_path(config, path.clone());
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan {
+                organization_type: Some("claude_team".to_string()),
+                rate_limit_tier: Some("default_raven".to_string()),
+                seat_tier: Some("team_standard".to_string()),
+            },
+            calls: Arc::clone(&calls),
+        }));
+
+        manager.probe_account(0).await;
+
+        {
+            let accounts = manager.accounts.read().expect("lock");
+            assert_eq!(
+                accounts[0].organization_type.as_deref(),
+                Some("claude_team")
+            );
+            assert_eq!(accounts[0].seat_tier.as_deref(), Some("team_standard"));
+        }
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk["accounts"][0]["organizationType"], "claude_team",
+            "a plan learned only in memory is re-fetched on every restart forever"
+        );
+        assert_eq!(on_disk["accounts"][0]["seatTier"], "team_standard");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // The steady state: an account that HAS a plan is never asked again, so
+        // this costs zero extra HTTP calls per cadence for the fleet's whole life.
+        manager.probe_account(0).await;
+        manager.probe_account(0).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "the backfill must run once per account, not once per probe"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A profile fetch that failed says nothing about the account's quota or its
+    /// credential. Recording a probe failure over a cosmetic label would bench a
+    /// healthy account, so this path must be entirely silent on failure — and
+    /// must ask again next time rather than latching.
+    #[tokio::test]
+    async fn a_failed_plan_fetch_records_nothing_and_never_fails_the_probe() {
+        let path = tmp_config_path("plan-fetch-fails");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "priority": 0 }
+            ] }"#,
+        )
+        .unwrap();
+        let config = crate::config::load(&path).unwrap();
+        let manager = build_manager_with_path(config, path.clone());
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            // An all-`None` reading is exactly what `fetch_profile` returns on
+            // any failure — network, non-2xx, or a malformed body.
+            plan: crate::probe::Plan::default(),
+            calls: Arc::clone(&calls),
+        }));
+
+        manager.probe_account(0).await;
+
+        assert_eq!(
+            manager.accounts.read().expect("lock")[0].organization_type,
+            None,
+            "nothing was learned, so nothing is recorded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a failed profile fetch must not rewrite the credential file"
+        );
+
+        manager.probe_account(0).await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "a failure must not latch — the account still has no plan, so the \
+             next probe asks again"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An account whose plan came from config at boot is already answered, so
+    /// the probe loop never spends a request on it.
+    #[tokio::test]
+    async fn an_account_that_already_has_a_plan_is_never_re_fetched() {
+        let path = tmp_config_path("plan-already-known");
+        std::fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-a",
+                  "refreshToken": "rt-a", "priority": 0,
+                  "organizationType": "claude_max",
+                  "rateLimitTier": "default_claude_max_20x" }
+            ] }"#,
+        )
+        .unwrap();
+        let config = crate::config::load(&path).unwrap();
+        let manager = build_manager_with_path(config, path.clone());
+        assert_eq!(
+            manager.accounts.read().expect("lock")[0]
+                .rate_limit_tier
+                .as_deref(),
+            Some("default_claude_max_20x"),
+            "the plan is read from config at boot, not only learned by probing"
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        manager.set_plan_prober(Arc::new(CountingPlanProber {
+            plan: crate::probe::Plan::default(),
+            calls: Arc::clone(&calls),
+        }));
+
+        manager.probe_account(0).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        std::fs::remove_file(&path).ok();
     }
 
     /// A unique temp path per test — the suite runs tests in parallel threads of

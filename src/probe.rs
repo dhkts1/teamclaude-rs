@@ -285,6 +285,68 @@ impl UsageProber for LiveUsageProber {
     }
 }
 
+/// What one account's plan reads as, straight off the profile endpoint: the
+/// three raw strings, verbatim, with no interpretation applied — the label is
+/// derived from them exactly once, by [`tcr_status_wire::plan_label`].
+///
+/// All-`None` is the honest answer for a fetch that failed or returned nothing
+/// usable, and it is what makes a failure cost nothing: the plan backfill
+/// records no fields, marks no probe failed, and simply asks again on the next
+/// probe.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub organization_type: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    pub seat_tier: Option<String>,
+}
+
+impl Plan {
+    /// Whether this reading carries anything at all worth recording. A fetch
+    /// that came back empty must not trigger a config write or overwrite a
+    /// runtime field with a `None` we did not learn.
+    pub fn is_empty(&self) -> bool {
+        self.organization_type.is_none()
+            && self.rate_limit_tier.is_none()
+            && self.seat_tier.is_none()
+    }
+}
+
+/// Future returned by [`PlanProber::plan`]. `'static` for the same reason
+/// [`ProbeFuture`] is: it is awaited after every manager lock is released.
+pub type PlanFuture = Pin<Box<dyn Future<Output = Plan> + Send>>;
+
+/// Abstraction over "turn an access token into that account's plan", so the
+/// backfill in the probe loop can be exercised without hitting the network —
+/// the same seam, and for the same reason, as [`UsageProber`] beside it.
+///
+/// Infallible by design: it returns an empty [`Plan`] rather than a `Result`.
+/// A plan is a nice-to-have label, and the probe loop's real job is quota. If
+/// this call fails there is nothing for a caller to decide — record nothing,
+/// leave the account's probe health alone (a failed PROFILE fetch must never
+/// paint a red probe on a perfectly healthy account), and try again next time.
+pub trait PlanProber: Send + Sync {
+    fn plan(&self, access_token: String) -> PlanFuture;
+}
+
+/// The production plan prober: [`crate::oauth::fetch_profile`], the same HTTP
+/// body login already uses. Deliberately not a second client with a second set
+/// of proxy/timeout settings to keep in step — one call to the profile
+/// endpoint, one implementation of it.
+pub struct LivePlanProber;
+
+impl PlanProber for LivePlanProber {
+    fn plan(&self, access_token: String) -> PlanFuture {
+        Box::pin(async move {
+            let profile = crate::oauth::fetch_profile(&access_token).await;
+            Plan {
+                organization_type: profile.organization_type,
+                rate_limit_tier: profile.rate_limit_tier,
+                seat_tier: profile.seat_tier,
+            }
+        })
+    }
+}
+
 /// Health of an account's most recent probe, surfaced to the TUI. A failing
 /// probe becomes a visible [`ProbeStatus::Error`]/[`ProbeStatus::Timeout`],
 /// never a silently-frozen bar.

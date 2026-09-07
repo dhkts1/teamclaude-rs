@@ -609,18 +609,29 @@ fn tokens_from_exchange_body(text: &str) -> anyhow::Result<Tokens> {
 /// optional so a partial or failed fetch degrades gracefully: `email` names the
 /// account (falls back to a prompt when absent) and `account_uuid`/`org_uuid`/
 /// `org_name` key the account's identity so multi-org logins stay distinct.
-struct Profile {
+pub struct Profile {
     email: Option<String>,
     account_uuid: Option<String>,
     org_uuid: Option<String>,
     org_name: Option<String>,
+    /// `organization.organization_type`, verbatim — the account's PLAN. See
+    /// [`crate::config::Account::organization_type`] for why this field and not
+    /// `account.has_claude_max`.
+    pub organization_type: Option<String>,
+    /// `organization.rate_limit_tier`, verbatim — what separates Max 20x from
+    /// Max 5x.
+    pub rate_limit_tier: Option<String>,
+    /// `organization.seat_tier`, verbatim — which seat this row holds on a
+    /// seated org (`team_standard`, `team_tier_1`). `None` on Max and Pro,
+    /// which have no seats.
+    pub seat_tier: Option<String>,
 }
 
 /// Fetch the account+org identity from the profile endpoint. Returns an
 /// all-`None` [`Profile`] on any failure (network, non-2xx, or malformed body)
 /// so the caller can still prompt for a name and login without org info. Serde
 /// ignores unknown fields, so extra profile keys are harmless.
-async fn fetch_profile(access_token: &str) -> Profile {
+pub async fn fetch_profile(access_token: &str) -> Profile {
     #[derive(Deserialize)]
     struct ProfileResponse {
         account: Option<ProfileAccount>,
@@ -635,6 +646,9 @@ async fn fetch_profile(access_token: &str) -> Profile {
     struct ProfileOrg {
         uuid: Option<String>,
         name: Option<String>,
+        organization_type: Option<String>,
+        rate_limit_tier: Option<String>,
+        seat_tier: Option<String>,
     }
 
     async fn inner(access_token: &str) -> Option<ProfileResponse> {
@@ -660,7 +674,18 @@ async fn fetch_profile(access_token: &str) -> Profile {
                 email: non_empty(account.as_ref().and_then(|a| a.email.clone())),
                 account_uuid: non_empty(account.and_then(|a| a.uuid)),
                 org_uuid: non_empty(organization.as_ref().and_then(|o| o.uuid.clone())),
-                org_name: non_empty(organization.and_then(|o| o.name)),
+                org_name: non_empty(organization.as_ref().and_then(|o| o.name.clone())),
+                organization_type: non_empty(
+                    organization
+                        .as_ref()
+                        .and_then(|o| o.organization_type.clone()),
+                ),
+                rate_limit_tier: non_empty(
+                    organization
+                        .as_ref()
+                        .and_then(|o| o.rate_limit_tier.clone()),
+                ),
+                seat_tier: non_empty(organization.and_then(|o| o.seat_tier)),
             }
         }
         None => Profile {
@@ -668,6 +693,9 @@ async fn fetch_profile(access_token: &str) -> Profile {
             account_uuid: None,
             org_uuid: None,
             org_name: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
         },
     }
 }
@@ -707,14 +735,19 @@ fn prompt_account_name(fallback: &str) -> String {
 /// fields (today's real config), `identity::resolve` falls back to name
 /// equality — so a single-org re-login matches its existing entry exactly as
 /// before.
+/// Takes the whole [`Profile`] rather than its fields one by one: the plan
+/// fields joined the identity ones here, and five loose `Option<String>`
+/// positional arguments of the same type are a call site where two of them can
+/// be transposed with nothing to catch it.
 pub fn upsert_account(
     config: &mut Config,
     name: &str,
     tokens: &Tokens,
-    account_uuid: Option<String>,
-    org_uuid: Option<String>,
-    org_name: Option<String>,
+    profile: &Profile,
 ) -> anyhow::Result<()> {
+    let account_uuid = profile.account_uuid.clone();
+    let org_uuid = profile.org_uuid.clone();
+    let org_name = profile.org_name.clone();
     let probe = crate::identity::probe(
         name,
         account_uuid.clone(),
@@ -741,6 +774,20 @@ pub fn upsert_account(
             if account.org_name.is_none() {
                 account.org_name = org_name;
             }
+            // OVERWRITTEN, not backfilled, unlike the identity fields above —
+            // an org upgrades its plan, so the first reading must not be pinned
+            // forever. Same rule `config::merge_account` applies on disk; see
+            // `config::Account::organization_type`. A `None` writes nothing, so
+            // a profile fetch that failed never blanks a known plan.
+            if profile.organization_type.is_some() {
+                account.organization_type = profile.organization_type.clone();
+            }
+            if profile.rate_limit_tier.is_some() {
+                account.rate_limit_tier = profile.rate_limit_tier.clone();
+            }
+            if profile.seat_tier.is_some() {
+                account.seat_tier = profile.seat_tier.clone();
+            }
             Ok(())
         }
         crate::identity::Resolved::None => {
@@ -764,6 +811,9 @@ pub fn upsert_account(
                 switch_threshold: None,
                 disabled: None,
                 groups: None,
+                organization_type: profile.organization_type.clone(),
+                rate_limit_tier: profile.rate_limit_tier.clone(),
+                seat_tier: profile.seat_tier.clone(),
                 extra: serde_json::Map::new(),
             });
             Ok(())
@@ -943,6 +993,9 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
         switch_threshold: None,
         disabled: None,
         groups: None,
+        organization_type: None,
+        rate_limit_tier: None,
+        seat_tier: None,
         extra: serde_json::Map::new(),
     };
     match crate::cli::post_add_account(config, &probe).await {
@@ -1535,6 +1588,9 @@ fn persist_via_file(
         switch_threshold: None,
         disabled: None,
         groups: None,
+        organization_type: profile.organization_type,
+        rate_limit_tier: profile.rate_limit_tier,
+        seat_tier: profile.seat_tier,
         extra: serde_json::Map::new(),
     };
     match config::save_account(config_path, &account) {
@@ -1681,6 +1737,14 @@ async fn finish_login(
                 switch_threshold: None,
                 disabled: None,
                 groups: None,
+                // Carried on the SERVER route too, and for free: the request
+                // body this posts is a serialized `config::Account`, so the two
+                // serde fields put the plan on the wire without a second
+                // payload shape to keep in step. Pinned by
+                // `add_account_request_carries_the_plan_fields`.
+                organization_type: profile.organization_type.clone(),
+                rate_limit_tier: profile.rate_limit_tier.clone(),
+                seat_tier: profile.seat_tier.clone(),
                 extra: serde_json::Map::new(),
             };
             match crate::cli::post_add_account(config, &account).await {
@@ -2037,12 +2101,127 @@ mod tests {
 
     // --- config append / update --------------------------------------------
 
+    /// An identity-only [`Profile`] for the [`upsert_account`] tests — the
+    /// three fields those tests vary, with no plan and no email (the name is
+    /// passed separately).
+    fn ident(
+        account_uuid: Option<&str>,
+        org_uuid: Option<&str>,
+        org_name: Option<&str>,
+    ) -> Profile {
+        Profile {
+            email: None,
+            account_uuid: account_uuid.map(str::to_string),
+            org_uuid: org_uuid.map(str::to_string),
+            org_name: org_name.map(str::to_string),
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+        }
+    }
+
     fn tokens(access: &str, refresh: &str, expires: i64) -> Tokens {
         Tokens {
             access_token: access.to_string(),
             refresh_token: Some(refresh.to_string()),
             expires_at_ms: expires,
         }
+    }
+
+    /// A plan is not an identity: an org that upgraded, or an account that
+    /// joined a Team, must show its NEW plan after a re-login rather than the
+    /// one it was first seen on. This is the one place `upsert_account` treats
+    /// a field differently from the uuid/org fields beside it.
+    #[test]
+    fn upsert_overwrites_a_stale_plan_while_still_backfilling_identity() {
+        let mut config: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "me@example.com", "type": "oauth", "accessToken": "old-at",
+                  "orgName": "Kept", "organizationType": "claude_max",
+                  "rateLimitTier": "default_claude_max_5x" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let mut profile = ident(None, None, Some("Ignored"));
+        profile.organization_type = Some("claude_team".to_string());
+        profile.rate_limit_tier = Some("default_raven".to_string());
+        profile.seat_tier = Some("team_standard".to_string());
+        upsert_account(
+            &mut config,
+            "me@example.com",
+            &tokens("new-at", "new-rt", 999),
+            &profile,
+        )
+        .unwrap();
+
+        let account = &config.accounts[0];
+        assert_eq!(
+            account.org_name.as_deref(),
+            Some("Kept"),
+            "identity stays backfill-only — a known org name is never overwritten"
+        );
+        assert_eq!(account.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(account.rate_limit_tier.as_deref(), Some("default_raven"));
+        assert_eq!(account.seat_tier.as_deref(), Some("team_standard"));
+    }
+
+    /// A profile fetch that failed carries no plan, and "I did not learn this"
+    /// must never blank a plan already on the row.
+    #[test]
+    fn upsert_never_blanks_a_known_plan_when_the_profile_carried_none() {
+        let mut config: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "me@example.com", "type": "oauth", "accessToken": "old-at",
+                  "organizationType": "claude_team", "seatTier": "team_standard" }
+            ] }"#,
+        )
+        .unwrap();
+
+        upsert_account(
+            &mut config,
+            "me@example.com",
+            &tokens("new-at", "new-rt", 999),
+            &ident(None, None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.accounts[0].organization_type.as_deref(),
+            Some("claude_team")
+        );
+        assert_eq!(
+            config.accounts[0].seat_tier.as_deref(),
+            Some("team_standard")
+        );
+    }
+
+    /// A brand-new account carries the plan the login just read.
+    #[test]
+    fn upsert_stores_the_plan_on_a_freshly_appended_account() {
+        let mut config: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        upsert_account(
+            &mut config,
+            "new@example.com",
+            &tokens("at1", "rt1", 111),
+            &profile_with_plan(
+                "new@example.com",
+                "claude_max",
+                Some("default_claude_max_20x"),
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.accounts[0].organization_type.as_deref(),
+            Some("claude_max")
+        );
+        assert_eq!(
+            config.accounts[0].rate_limit_tier.as_deref(),
+            Some("default_claude_max_20x")
+        );
+        assert_eq!(config.accounts[0].seat_tier, None);
     }
 
     #[test]
@@ -2052,9 +2231,7 @@ mod tests {
             &mut config,
             "new@example.com",
             &tokens("at1", "rt1", 111),
-            None,
-            None,
-            None,
+            &ident(None, None, None),
         )
         .unwrap();
 
@@ -2082,9 +2259,7 @@ mod tests {
             &mut config,
             "me@example.com",
             &tokens("new-at", "new-rt", 999),
-            None,
-            None,
-            None,
+            &ident(None, None, None),
         )
         .unwrap();
 
@@ -2112,9 +2287,7 @@ mod tests {
             &mut config,
             "second@example.com",
             &tokens("at2", "rt2", 200),
-            None,
-            None,
-            None,
+            &ident(None, None, None),
         )
         .unwrap();
 
@@ -2132,18 +2305,14 @@ mod tests {
             &mut config,
             "me@example.com",
             &tokens("at-corp", "rt-corp", 100),
-            Some("uuid-person".into()),
-            Some("org-corp".into()),
-            Some("Corp".into()),
+            &ident(Some("uuid-person"), Some("org-corp"), Some("Corp")),
         )
         .unwrap();
         upsert_account(
             &mut config,
             "me@example.com",
             &tokens("at-pers", "rt-pers", 200),
-            Some("uuid-person".into()),
-            Some("org-personal".into()),
-            Some("Personal".into()),
+            &ident(Some("uuid-person"), Some("org-personal"), Some("Personal")),
         )
         .unwrap();
 
@@ -2169,9 +2338,7 @@ mod tests {
             &mut config,
             "me@example.com",
             &tokens("new-at", "new-rt", 999),
-            Some("uuid-person".into()),
-            Some("org-corp".into()),
-            Some("Corp".into()),
+            &ident(Some("uuid-person"), Some("org-corp"), Some("Corp")),
         )
         .unwrap();
 
@@ -2214,9 +2381,7 @@ mod tests {
             &mut config,
             "me@example.com",
             &tokens("at-NEW", "rt-NEW", 999),
-            Some("u1".to_string()),
-            None,
-            None,
+            &ident(Some("u1"), None, None),
         )
         .unwrap();
 
@@ -2262,9 +2427,7 @@ mod tests {
             &mut config,
             "me@example.com",
             &tokens("at-NEW", "rt-NEW", 999),
-            Some("u1".to_string()),
-            Some("org-a".to_string()),
-            Some("Org A".to_string()),
+            &ident(Some("u1"), Some("org-a"), Some("Org A")),
         )
         .expect_err("an unbreakable tie must refuse rather than guess");
         assert!(err.to_string().contains("ambiguous"), "{err}");
@@ -2799,6 +2962,28 @@ mod tests {
             account_uuid: None,
             org_uuid: None,
             org_name: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+        }
+    }
+
+    /// A [`Profile`] carrying an email and a plan — the shape a real profile
+    /// fetch returns for a seated org.
+    fn profile_with_plan(
+        email: &str,
+        organization_type: &str,
+        rate_limit_tier: Option<&str>,
+        seat_tier: Option<&str>,
+    ) -> Profile {
+        Profile {
+            email: Some(email.to_string()),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            organization_type: Some(organization_type.to_string()),
+            rate_limit_tier: rate_limit_tier.map(str::to_string),
+            seat_tier: seat_tier.map(str::to_string),
         }
     }
 
@@ -2921,6 +3106,9 @@ mod tests {
             account_uuid: None,
             org_uuid: None,
             org_name: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
         };
         let err = finish_login_checked(
             &path,
@@ -3068,6 +3256,9 @@ mod tests {
             account_uuid: account_uuid.map(str::to_string),
             org_uuid: org_uuid.map(str::to_string),
             org_name: org_name.map(str::to_string),
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
         }
     }
 
@@ -3353,6 +3544,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         let rotate_config = load_or_default(&path).unwrap();
@@ -3555,6 +3749,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -3653,6 +3850,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -3836,6 +4036,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -3933,6 +4136,9 @@ mod tests {
             account_uuid: None,
             org_uuid: None,
             org_name: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
         }
     }
 
@@ -4173,6 +4379,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }
