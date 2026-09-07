@@ -144,11 +144,11 @@ gate above; it is not a credential anything downstream of the proxy needs.
 
 | json key | type | default | required | what it does |
 |---|---|---|---|---|
-| `name` | string | n/a | **yes** | display name; `tcr login` writes the account email here |
+| `name` | string | n/a | **yes** | the account's name, and the only way any command addresses it. **Unique across the file** — `tcr` renames duplicates on load; see `docs/cli.md` § "Account names are unique". `tcr login` writes the account email here, or `email/<org-slug>` when another row already carries that email |
 | `type` | string | `"oauth"` | no | `"oauth"` accounts are refreshed, probed and kept warm; anything else is a static-key account |
 | `accountUuid` | string | absent | no | spliced into the outbound body's `metadata.user_id.account_uuid` so it agrees with the injected token |
 | `orgUuid` | string | absent | no | organization identity, used to match an in-memory account back to its on-disk entry |
-| `orgName` | string | absent | no | organization display name; also what `--org` matches against |
+| `orgName` | string | absent | no | organization display name; also what a duplicated `name` is renamed from (`Henry Token` → `henry-token`) |
 | `accessToken` | string | n/a | **yes** | the OAuth access token |
 | `refreshToken` | string | absent | no | used to mint a new access token before expiry — absent means the account cannot refresh itself, see below |
 | `expiresAt` | i64 | absent | no | access-token expiry as **epoch milliseconds** |

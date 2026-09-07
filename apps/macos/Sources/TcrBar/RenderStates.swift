@@ -578,12 +578,17 @@ enum RenderStates {
         return "[\(worst),\(ordinary)]"
     }
 
-    /// THE SAME EMAIL, TWICE — the shape that broke the panel.
+    /// ONE PERSON, TWO ORGS — the shape that broke the panel, and the names it
+    /// wears now that `tcr` has fixed it.
     ///
-    /// Both rows carry `henry@example.com`; only the org differs. Before
-    /// ``AccountRef`` they collapsed to one SwiftUI identity, so the panel drew
-    /// the FIRST row's numbers on both and neither wore its own gate pill,
-    /// while `tcr status --json` reported the two correctly and differently.
+    /// Both rows used to carry `henry@example.com`; only the org differed. They
+    /// collapsed to one SwiftUI identity, so the panel drew the FIRST row's
+    /// numbers on both and neither wore its own gate pill, while `tcr status
+    /// --json` reported the two correctly and differently. `tcr` now gives the
+    /// second row its own name (`src/config.rs`, `migrate_duplicate_names`), so
+    /// the PNG must show the personal row as `henry@example.com` and the Team
+    /// row as `henry@example.com/example-team` — the full name, suffix visible,
+    /// because that is what a person types to address it.
     ///
     /// The two rows are deliberately as unlike each other as a pair can be —
     /// one spent and rejected, one fresh and never probed, and different plans
@@ -595,7 +600,7 @@ enum RenderStates {
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111",
             gate: "rejected")
         let fresh = account(
-            "henry@example.com", quota: "null", state: "ok", probe: "never",
+            "henry@example.com/example-team", quota: "null", state: "ok", probe: "never",
             usage: unmeasuredUsage,
             plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222",
             gate: "ok")

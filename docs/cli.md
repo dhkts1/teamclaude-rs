@@ -128,18 +128,27 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 | `--config <path>` | path | `~/.config/teamclaude.json` | config to write into |
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
-| `--org <name-or-uuid>` | string | none | narrow an ambiguous `--account` match to a single org — same flag `tcr enable`/`tcr disable`/`tcr remove`/`tcr priority` take |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
-| `--name <name>` | string | none | name the account added by `--token`, when its profile fetch comes back with no email |
+| `--name <name>` | string | none | name this account explicitly instead of letting `login` mint a name for it; refused when another account already has that name |
 
-**`--account <name> [--org <org>]` targets one existing account and refuses to fix the
+**A login names the account itself, and never asks on the happy path.** The name is the
+profile's email when no other account carries it, and `email/<org-slug>` when one does —
+so signing into a second organization of the same person lands beside the first row
+instead of on top of it. `<org-slug>` is the organization's name lower-cased with every
+run of non-alphanumerics collapsed to `-` (`Henry Token` → `henry-token`), falling back
+to the first eight characters of the org uuid when the organization reports no name.
+`--name` overrides all of that, and is refused if the name is already in use: taking a
+name off an existing row is how a login overwrites the wrong credential.
+
+**`--account <name>` targets one existing account and refuses to fix the
 wrong one.** Without it, `login` upserts by whatever identity the browser hands back — a
 default-browser OAuth flow carries whatever claude.ai session is already signed in, so
 re-logging in a dead account can silently refresh a *different*, already-healthy one and
-report success while the broken account stays broken. `--account`/`--org` resolve
+report success while the broken account stays broken. `--account` resolves
 `<name>` against the config with the same rule `tcr enable`/`tcr disable` use
-(case-sensitive, no substrings; `--org` narrows an otherwise-ambiguous email match by org
-name or org uuid). It also passes the resolved account's email as OAuth's `login_hint`,
+(exact, case-sensitive, no substrings). A re-login keeps the row's existing name rather
+than minting a new one — that name is what its pins, group labels and `controlAccount`
+key already point at. It also passes the resolved account's email as OAuth's `login_hint`,
 which pre-selects that address on a clean login page — this part is ergonomics only, not
 a guarantee: it is unverified whether the hint overrides a browser that is *already*
 signed in as someone else, which is exactly the case the default-browser flow produces.
@@ -261,8 +270,8 @@ fallback is derived from the account *count*, which hands out a name already in 
 soon as a row is removed; that is harmless for a credential carrying an identity to be
 resolved by, and is exactly the bug here, which is why this path does not share it.
 
-**`--token` refuses outright when combined with `--account` or `--org`, and writes
-nothing.** Both flags exist to confirm that the identity a fresh login authenticates as
+**`--token` refuses outright when combined with `--account`, and writes
+nothing.** That flag exists to confirm that the identity a fresh login authenticates as
 matches a specific existing row — see `--account`'s own section above. An
 inference-only token carries no email and no account id for that confirmation to run
 against, so the check can never be evaluated, and an assertion that cannot be evaluated
@@ -302,29 +311,57 @@ zeroes.
 These five take a positional `<query>` naming one account, and they all resolve it the same
 way.
 
-The rule is: **exact `name`, and if nothing matched, exact email**, where "email" means the
-name with a trailing ` (Org)` suffix stripped. Both comparisons are `==` on the raw string.
-That means resolution is **case-sensitive and never a substring**. Given an account named
-`alice@example.com (Acme)`:
+The rule is: **the account's exact `name`**, compared with `==` on the raw string. That
+means resolution is **case-sensitive and never a substring**. A name is unique across the
+config (see "Account names are unique" below), so an exact name is a complete answer and
+there is nothing to narrow it by. Given an account named `alice@example.com/acme`:
 
 ```
-tcr disable "alice@example.com (Acme)"   # matches: exact name
-tcr disable alice@example.com            # matches: exact email, org suffix stripped
+tcr disable alice@example.com/acme       # matches: exact name
+tcr disable alice@example.com            # NO MATCH unless a row is named exactly that
+tcr disable acme                         # NO MATCH: the suffix is not a name
 tcr disable alice                        # NO MATCH: not a substring
 tcr disable alice@                       # NO MATCH: not a prefix
-tcr disable ALICE@EXAMPLE.COM            # NO MATCH: case-sensitive
+tcr disable ALICE@EXAMPLE.COM/ACME       # NO MATCH: case-sensitive
 ```
 
 A query matching nothing is an error and the config is left byte-identical: resolution runs
-before any mutation, so there is no partial write. A query matching two or more accounts is
-also an error, and it lists the candidates and tells you to narrow with `--org`.
+before any mutation, so there is no partial write.
 
-`--org <name-or-uuid>` filters the candidates to one organization. It matches an org name
-exactly, or an org uuid exactly or by prefix.
+### Account names are unique
+
+`tcr` will not let two accounts share a name, so a name is the whole address every account
+verb takes. There used to be an `--org` flag on each of these verbs; it is gone, because a
+flag that no longer narrows anything is a lie in `--help`.
+
+It existed because the name was the email, and one person's two organizations — a personal
+Max org and a company Team seat — produced two rows carrying the same one. Every by-name
+path was a latent bug: `tcr token` refused as ambiguous, `tcr group add` labelled whichever
+row came first and reported success, and the menu-bar panel drew one row's numbers on both.
+
+**A config holding duplicates migrates itself, once.** On the next load, one row per
+duplicated name keeps the bare email — the row on a personal plan (`claude_max` /
+`claude_pro`), else the lowest priority number — and every other row becomes
+`email/<org-slug>` from its stored `orgName`, falling back to the first eight characters of
+its `orgUuid`. It prints one line per rename:
+
+```
+[tcr] renamed account: henry@example.com -> henry@example.com/henry-token (org Henry Token)
+```
+
+The loader never refuses a duplicated config — that would take a fleet down on upgrade —
+and it writes the result straight back, so the rename happens once rather than on every
+boot. `controlAccount` follows if it named a renamed row, group labels ride along
+untouched (they are per-entry), and the session-affinity pin file is rewritten in the same
+pass so warm sessions keep their prompt cache. If the write itself fails, the server still
+boots and says so, and a CLI verb that would edit the config refuses rather than writing
+under names that exist nowhere else.
+
+A config edited by hand back into a duplicate is simply migrated again on the next load.
 
 ### `tcr remove <query>`
 
-Deletes the account from the config. Flags: `--config`, `--org`.
+Deletes the account from the config. Flags: `--config`.
 
 This is destructive and there is no confirmation prompt. The entry is removed and the file
 is rewritten in place; the access and refresh tokens go with it, so recovering the account
@@ -334,8 +371,7 @@ so removing an account is not a way to stop traffic going to it. Use `tcr disabl
 
 ### `tcr priority <query> [N]`
 
-Sets rotation priority. **Lower value is preferred.** Flags: `--first`, `--last`, `--config`,
-`--org`.
+Sets rotation priority. **Lower value is preferred.** Flags: `--first`, `--last`, `--config`.
 
 | form | effect |
 |---|---|
@@ -353,8 +389,7 @@ not reach a running proxy.
 
 ### `tcr enable <query>` and `tcr disable <query>`
 
-`disable` holds an account out of rotation; `enable` clears the flag. Flags: `--config`,
-`--org`.
+`disable` holds an account out of rotation; `enable` clears the flag. Flags: `--config`.
 
 **These act on the running proxy first, not on the file.** A file-only write was the
 original bug: the proxy reads `disabled` from the config once, at startup, and never again,
@@ -382,7 +417,7 @@ loopback-plus-key gate as every other `/_tcr/` route, with no loopback exemption
 ### `tcr token <query>`
 
 Prints the account's current access token to stdout — one line, nothing else — so it can
-be piped or copied. Flags: `--config`, `--org`. Read-only; a non-matching query exits
+be piped or copied. Flags: `--config`. Read-only; a non-matching query exits
 non-zero with the file untouched. It reads the file rather than the running proxy, which is
 current enough: every refresh the proxy performs is written straight back to the file.
 
@@ -424,9 +459,10 @@ the wire so a Fable-scoped caption and tint have something to read.
 
 ### The plan and org keys on `--json`
 
-Every row carries which plan the account is on, and which org it belongs to. Together these answer
-the question a fleet holding the same email twice cannot otherwise answer — *which* of these two
-rows is this? — and give a script something to pass to `--org`.
+Every row carries which plan the account is on, and which org it belongs to — facts to SHOW
+beside a row, not a way to address it. The `name` is the address, and it is unique. These
+answer the question a reader looking at two rows of one person's two organizations still
+has: *which* of these is the company seat?
 
 | key | shape | what it is |
 |---|---|---|
@@ -434,8 +470,8 @@ rows is this? — and give a script something to pass to `--org`.
 | `organizationType` | string or `null` | the provider's own word, verbatim: `claude_max`, `claude_team`, `claude_pro`, `claude_enterprise` |
 | `rateLimitTier` | string or `null` | verbatim, e.g. `default_claude_max_20x` — the rate-limit multiplier, when it names one |
 | `seatTier` | string or `null` | verbatim, e.g. `team_standard` / `team_tier_1` — which seat this row holds. `null` on Max and Pro, which have no seats |
-| `orgUuid` | string or `null` | the org this account is scoped to. Pass it to `--org` to address this row unambiguously when two rows share a name |
-| `orgName` | string or `null` | the org's display name. Two orgs can share one, so prefer `orgUuid` when narrowing |
+| `orgUuid` | string or `null` | the org this account is scoped to |
+| `orgName` | string or `null` | the org's display name. Two orgs can share one, which is why `orgUuid` is the exact fact and this is the readable one |
 
 `plan` is DERIVED from the three raw keys, in one place, so the JSON, the plain text (`plan=`), the
 TUI and the macOS panel cannot disagree. The plan word comes from `organizationType`; the suffix

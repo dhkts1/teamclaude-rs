@@ -1271,26 +1271,34 @@ fn migrate_duplicate_names(path: &Path, config: &mut Config, file_index: &[usize
             .map(|(_, rename)| rename.to.clone())
     });
 
+    // Both channels, deliberately, matching what `main.rs` already does for the
+    // legacy-`throttle` migration a dozen lines from its own call to this.
+    // `tracing` alone reaches nobody here: a CLI verb never installs a
+    // subscriber at all, and `run_server` loads the config BEFORE
+    // `init_tracing`, so the tracing line is dropped on the floor on every path
+    // that can reach this code. Renaming a person's accounts under them is the
+    // last thing that may happen silently.
+    let say = |line: &str| {
+        tracing::warn!("{line}");
+        eprintln!("[tcr] {line}");
+    };
+
     for (index, rename) in &renames {
-        match &rename.org {
-            Some(org) => tracing::warn!(
-                "renamed account: {} -> {} (org {org})",
-                rename.from,
-                rename.to
-            ),
-            None => tracing::warn!(
-                "renamed account: {} -> {} (no org on file)",
-                rename.from,
-                rename.to
-            ),
-        }
+        let where_from = match &rename.org {
+            Some(org) => format!("org {org}"),
+            None => "no org on file".to_string(),
+        };
+        say(&format!(
+            "renamed account: {} -> {} ({where_from})",
+            rename.from, rename.to
+        ));
         config.accounts[*index].name = rename.to.clone();
     }
     if let Some(name) = &control_rename {
-        tracing::warn!(
+        say(&format!(
             "control account followed the rename to '{name}' — it named the first row in file \
              order, which is the row the server resolved it to"
-        );
+        ));
         config.control_account = Some(ControlAccountRef::Name(name.clone()));
     }
 
@@ -1303,6 +1311,7 @@ fn migrate_duplicate_names(path: &Path, config: &mut Config, file_index: &[usize
             Some("could not map every renamed account back to its entry in the file".to_string());
     } else if let Err(err) = save_renames(path, &writes, control_rename.as_deref()) {
         tracing::error!(error = %err, "could not persist the account renames");
+        eprintln!("[tcr] could not persist the account renames: {err}");
         config.rename_write_error = Some(err.to_string());
     }
 
@@ -4902,7 +4911,7 @@ mod tests {
     /// `orgUuid` resolves the write to the RIGHT one of the two — the "legacy
     /// two-org shape" `locate_account_entry`'s doc-comment describes: one
     /// person, two orgs, one uuid. That resolution is still how a WRITE finds
-    /// its row, and it is the one thing `--org` never was: an identity
+    /// its row, and it is the one thing the old org flag never was: an identity
     /// comparison, not a query.
     ///
     /// The file here is fed to `save_control_account` directly rather than
@@ -5713,6 +5722,275 @@ mod tests {
         let ok = load(&path).expect("the renamed key must load");
         assert_eq!(ok.account_throttle.effective_burst(), 4);
         assert!(!ok.migrated_legacy_throttle);
+
+        fs::remove_file(&path).ok();
+    }
+
+    // ---- the duplicate-name migration -------------------------------------
+
+    /// The fleet's actual shape: one person, a personal Max org and a company
+    /// Team org, one email between them, and `controlAccount` naming it.
+    const DUPLICATE_NAME_FILE: &str = r#"{
+      "upstream": "https://api.anthropic.com",
+      "controlAccount": "henry@example.com",
+      "routes": { "hand-edited": "must survive" },
+      "accounts": [
+        { "name": "henry@example.com", "type": "oauth", "accessToken": "at-personal",
+          "refreshToken": "rt-personal", "expiresAt": 1893456000000, "priority": 1,
+          "accountUuid": "aaaaaaaa-1111-1111-1111-111111111111",
+          "orgUuid": "11111111-1111-1111-1111-111111111111",
+          "orgName": "Henry Personal", "organizationType": "claude_max",
+          "groups": ["gil"] },
+        { "name": "henry@example.com", "type": "oauth", "accessToken": "at-team",
+          "refreshToken": "rt-team", "expiresAt": 1893456000000, "priority": 0,
+          "accountUuid": "aaaaaaaa-1111-1111-1111-111111111111",
+          "orgUuid": "22222222-2222-2222-2222-222222222222",
+          "orgName": "Henry Token", "organizationType": "claude_team" },
+        { "name": "alice@example.com", "type": "oauth", "accessToken": "at-alice",
+          "expiresAt": 1893456000000, "priority": 2, "sx": "unmodelled" }
+      ]
+    }"#;
+
+    /// The whole contract of the migration, in one pass: the personal row keeps
+    /// the bare email, the Team row takes its org's slug, `controlAccount`
+    /// still names the personal row, and NOTHING else in the document moves.
+    ///
+    /// Note the priorities are deliberately inverted (`claude_max` carries the
+    /// HIGHER number). A keeper chosen by priority would pick the Team row, so
+    /// this only passes if the personal-plan rule is what actually ran.
+    #[test]
+    fn load_renames_a_duplicated_name_and_touches_nothing_else() {
+        let path = tmp_path("rename-migration");
+        fs::write(&path, DUPLICATE_NAME_FILE).unwrap();
+        let before = read_json(&path);
+
+        let config = load(&path).expect("a duplicated name loads, it never refuses");
+
+        assert_eq!(config.accounts[0].name, "henry@example.com");
+        assert_eq!(config.accounts[1].name, "henry@example.com/henry-token");
+        assert_eq!(config.accounts[2].name, "alice@example.com");
+        assert_eq!(
+            config.control_account,
+            Some(ControlAccountRef::Name("henry@example.com".to_string())),
+            "control stays on the personal row, which kept the bare email"
+        );
+        assert_eq!(config.renamed_accounts.len(), 1);
+        assert_eq!(config.renamed_accounts[0].from, "henry@example.com");
+        assert_eq!(
+            config.renamed_accounts[0].to,
+            "henry@example.com/henry-token"
+        );
+        assert_eq!(
+            config.renamed_accounts[0].org.as_deref(),
+            Some("Henry Token")
+        );
+        assert_eq!(config.rename_write_error, None);
+
+        // The rename is DURABLE, and it is the only thing that changed. Diffing
+        // the whole document — not just re-reading the field we wrote — is what
+        // catches a targeted edit that quietly dropped an unmodelled key.
+        let mut after = read_json(&path);
+        assert_eq!(
+            after["accounts"][1]["name"],
+            json!("henry@example.com/henry-token")
+        );
+        after["accounts"][1]["name"] = json!("henry@example.com");
+        assert_eq!(
+            after, before,
+            "the write touched something other than the renamed row's name"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Loading the migrated file again renames nothing and rewrites nothing.
+    /// Without this the migration could be "working" by renaming on every boot,
+    /// handing out a new name each time.
+    #[test]
+    fn a_second_load_of_a_migrated_file_changes_nothing() {
+        let path = tmp_path("rename-idempotent");
+        fs::write(&path, DUPLICATE_NAME_FILE).unwrap();
+        load(&path).expect("first load migrates");
+        let after_first = fs::read_to_string(&path).unwrap();
+
+        let second = load(&path).expect("second load");
+        assert!(second.renamed_accounts.is_empty(), "nothing left to rename");
+        assert_eq!(second.accounts[1].name, "henry@example.com/henry-token");
+        assert_eq!(
+            after_first,
+            fs::read_to_string(&path).unwrap(),
+            "the second load must leave the file byte-identical"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// When the row that gets renamed is the FIRST one in file order — the row
+    /// a running server resolves `controlAccount` to today — the key follows it,
+    /// so control lands on the same account it was on before the upgrade.
+    #[test]
+    fn control_follows_the_rename_when_it_named_the_renamed_row() {
+        let path = tmp_path("rename-control-follows");
+        // No personal plan on either row, so the keeper is decided by priority:
+        // the SECOND row (priority 0) keeps the bare email, and the first — the
+        // one `controlAccount` resolves to today — is the one renamed.
+        fs::write(
+            &path,
+            r#"{
+              "controlAccount": "henry@example.com",
+              "accounts": [
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 1, "accountUuid": "aaaa-1", "orgUuid": "org-a",
+                  "orgName": "Henry Token" },
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-b",
+                  "priority": 0, "accountUuid": "aaaa-1", "orgUuid": "org-b",
+                  "orgName": "Henry Personal" }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("loads");
+        assert_eq!(config.accounts[0].name, "henry@example.com/henry-token");
+        assert_eq!(config.accounts[1].name, "henry@example.com");
+        assert_eq!(
+            config.control_account,
+            Some(ControlAccountRef::Name(
+                "henry@example.com/henry-token".to_string()
+            )),
+            "control must follow the FIRST row, which is the one the server resolved it to"
+        );
+        assert_eq!(
+            read_json(&path)["controlAccount"],
+            json!("henry@example.com/henry-token"),
+            "and durably, not only in memory"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// With no `orgName` to slug, the name falls back to the first eight
+    /// characters of the org uuid — a name is still needed, and a stable one.
+    #[test]
+    fn a_row_with_no_org_name_is_named_from_its_org_uuid() {
+        let path = tmp_path("rename-uuid-fallback");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 0, "accountUuid": "aaaa-1", "orgUuid": "abcdefgh-1111" },
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-b",
+                  "priority": 1, "accountUuid": "aaaa-1", "orgUuid": "zyxwvuts-2222" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("loads");
+        assert_eq!(config.accounts[0].name, "henry@example.com");
+        assert_eq!(config.accounts[1].name, "henry@example.com/zyxwvuts");
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// A quarantined entry sits BEFORE the duplicated pair in the file, so the
+    /// in-memory index and the on-disk index differ. The rename must land on the
+    /// on-disk row — writing by the in-memory index would rename the wrong
+    /// account, and the two indices agree in every other fixture here, so
+    /// nothing else in this file could catch it.
+    #[test]
+    fn the_rename_writes_by_the_files_own_index_not_the_in_memory_one() {
+        let path = tmp_path("rename-after-quarantine");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "credential-less@example.com", "type": "oauth", "importFrom": "elsewhere" },
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 0, "accountUuid": "aaaa-1", "orgUuid": "org-a",
+                  "orgName": "Henry Personal" },
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-b",
+                  "priority": 1, "accountUuid": "aaaa-1", "orgUuid": "org-b",
+                  "orgName": "Henry Token" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("loads");
+        assert_eq!(
+            config.quarantined_accounts,
+            vec!["credential-less@example.com"]
+        );
+        assert_eq!(config.accounts[0].name, "henry@example.com");
+        assert_eq!(config.accounts[1].name, "henry@example.com/henry-token");
+
+        // On disk the rows are at 1 and 2, and the quarantined row is still
+        // there untouched — `load` drops it from memory, never from the file.
+        let after = read_json(&path);
+        assert_eq!(
+            after["accounts"][0]["name"],
+            json!("credential-less@example.com")
+        );
+        assert_eq!(after["accounts"][0]["importFrom"], json!("elsewhere"));
+        assert_eq!(after["accounts"][1]["name"], json!("henry@example.com"));
+        assert_eq!(
+            after["accounts"][2]["name"],
+            json!("henry@example.com/henry-token")
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Three rows on one email: the personal row keeps it and the other two get
+    /// distinct names. A minting rule that only ever considered the ORIGINAL
+    /// names would hand the same name to both.
+    #[test]
+    fn three_rows_sharing_a_name_all_end_up_distinct() {
+        let path = tmp_path("rename-three-way");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-a",
+                  "priority": 0, "orgName": "Acme" },
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-b",
+                  "priority": 1, "orgName": "Acme", "organizationType": "claude_max" },
+                { "name": "henry@example.com", "type": "oauth", "accessToken": "at-c",
+                  "priority": 2, "orgName": "Acme" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).expect("loads");
+        let names: Vec<&str> = config.accounts.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "henry@example.com/acme",
+                "henry@example.com",
+                "henry@example.com/acme-2"
+            ],
+            "the Max row keeps the email; the other two get distinct names"
+        );
+        assert_eq!(
+            names.iter().collect::<HashSet<_>>().len(),
+            3,
+            "the whole point: three rows, three names"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// A config that never had a duplicate is not rewritten at all — no rename
+    /// pass, no write, and `renamed_accounts` empty. The migration must be
+    /// invisible to the fleets it does not concern.
+    #[test]
+    fn a_config_with_unique_names_is_left_byte_identical() {
+        let path = tmp_path("rename-noop");
+        fs::write(&path, DISABLE_SAMPLE).unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        let config = load(&path).expect("loads");
+        assert!(config.renamed_accounts.is_empty());
+        assert_eq!(config.rename_write_error, None);
+        assert_eq!(before, fs::read_to_string(&path).unwrap());
 
         fs::remove_file(&path).ok();
     }

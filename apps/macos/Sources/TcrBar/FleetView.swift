@@ -697,9 +697,7 @@ struct FleetView: View {
     /// way — a button that silently does nothing is worse than one that says
     /// why.
     private func reloginAccount(_ account: AccountRef) {
-        if case .failure(let why) = LoginLauncher.launch(
-            reloggingIn: account.name, org: account.orgUuid)
-        {
+        if case .failure(let why) = LoginLauncher.launch(reloggingIn: account.name) {
             switch why {
             case .toolMissing(let searched):
                 loginError = "tcr not found (searched \(searched.count) locations)."
@@ -1713,15 +1711,14 @@ struct AccountRow: View {
     /// Shared by "Copy Account Name" and the per-group command copy — one
     /// place that clears then sets, so every copy in this menu behaves the
     /// same way.
-    /// `tcr token <name> [--org <uuid>]` off the main actor, then the
-    /// pasteboard. A failure replaces any earlier one on this row; a success
-    /// clears it.
+    /// `tcr token <name>` off the main actor, then the pasteboard. A failure
+    /// replaces any earlier one on this row; a success clears it.
     ///
-    /// The `--org` is what makes this work at all on a fleet holding one email
-    /// twice: without it `tcr` refused with `'…' is ambiguous — matches 2
-    /// accounts … Narrow with --org`, so neither row's token could be copied.
+    /// The name is enough because `tcr` guarantees it is unique. On a fleet
+    /// holding one email twice it was not, and this refused with `'…' is
+    /// ambiguous — matches 2 accounts`, so neither row's token could be copied.
     private func performCopyToken() async {
-        switch await TokenCommand.fetch(query: account.name, org: account.orgUuid) {
+        switch await TokenCommand.fetch(query: account.name) {
         case .success(let token):
             copyToPasteboard(token)
             tokenCopyFailure = nil
@@ -1835,10 +1832,15 @@ struct AccountRow: View {
                     .font(Tok.bodyFont)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(1)
-                    // Middle truncation eats the middle of an address, which is
-                    // exactly the part that distinguishes two accounts on the
-                    // same domain. Truncation hides content, so the full value
-                    // has to stay reachable somewhere.
+                    // Middle truncation, because the distinguishing part of a
+                    // name is at its ENDS: the local part at the front, and the
+                    // `/<org-slug>` suffix at the back on a row belonging to one
+                    // of a person's several orgs. Tail truncation would eat that
+                    // suffix, which is the one thing telling those rows apart —
+                    // and the thing the operator types to address one.
+                    //
+                    // It still hides the middle, so the full value stays
+                    // reachable: `.help` on hover and `.textSelection` to copy.
                     .truncationMode(.middle)
                     .help(account.name)
                     .textSelection(.enabled)
