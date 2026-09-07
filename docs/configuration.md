@@ -446,8 +446,8 @@ below in force: `groupSettings.<label>.allowControlAccount` for one group, and
 `tcr group ls` names this directly:
 
 ```
-group research accounts=1 members=gil@example.com reserved=no routes=no route_block=control-account-only ...
-group dev      accounts=2 members=a@example.com,b@example.com reserved=no routes=yes ...
+group research accounts=1 members=gil@example.com reserved=no parked=no routes=no route_block=control-account-only ...
+group dev      accounts=2 members=a@example.com,b@example.com reserved=no parked=no routes=yes ...
 ```
 
 `routes=no` means the group exists and serves nothing. Four ways out: add a second, ordinary
@@ -458,8 +458,30 @@ situation.
 
 Reserving is the other half and solves a different problem. `tcr group reserve <label>` makes
 an account carrying that label off-limits to traffic that did *not* ask for one of its
-groups. That keeps other sessions off the account; it does **not** make `--group` strict, and
-a reserved group with no available member still falls back to the pool.
+groups, and it makes the group's own traffic strict in the same breath: a `--group <label>`
+request with no member free waits or answers 429 rather than spilling onto an account outside
+the group. The two directions are one intent, which is why they are one flag.
+
+### `parked`: a whole group out of rotation
+
+`tcr group park <label>` holds **every** account carrying that label out of rotation, the way
+`tcr disable` holds one account out: no request reaches it, not even an explicit `--group
+<label>` ask. `tcr group unpark <label>` releases them. It is one `groupSettings` key, so a
+running proxy picks it up on its next cadence check — no restart.
+
+```
+tcr group park henry-team
+tcr status | grep parked_groups        # parked_groups=henry-team on every member
+tcr group unpark henry-team
+```
+
+Two things it deliberately is not:
+
+- **Not a reservation.** A reserved group still serves its own `--group` asks; a parked one
+  serves nothing. The flags are independent and compose — a group can be both.
+- **Not a per-account write.** Parking never touches `accounts[].disabled`, so unparking does
+  not re-enable a member you benched by hand: that row stays disabled until `tcr enable`
+  says otherwise, and `tcr status` keeps reporting it as `disabled` rather than `parked`.
 
 ## `controlPooled`: spends the control account's quota
 

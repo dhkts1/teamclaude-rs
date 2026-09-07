@@ -99,6 +99,8 @@ enum RenderStates {
             ("13-control-account", .loaded(fleet(healthyJSON)), false, "alice@example.com"),
             // Every spend branch at once — see `usageStatsJSON`.
             ("14-usage-stats", .loaded(fleet(usageStatsJSON)), false, nil),
+            // A parked group beside a live one — see `parkedGroupJSON`.
+            ("15-parked-group", .loaded(fleet(parkedGroupJSON)), false, nil),
         ]
     }
 
@@ -310,6 +312,15 @@ enum RenderStates {
         // empty array are kept distinct rather than collapsed.
         groups: [String]? = nil,
         reservedGroups: [String]? = nil,
+        // The parked subset, wire field `"parkedGroups"`. Rides with `groups`
+        // exactly as `reservedGroups` does, so a scene that passes no `groups`
+        // is also the negative case for this key.
+        parkedGroups: [String]? = nil,
+        // Fleet-wide group colours, wire field `"groupColors"`, repeated per
+        // row the way the server sends them. `nil` omits the key — the
+        // older-server shape, which every pre-existing scene keeps, and which
+        // draws every tag in the neutral fallback.
+        groupColors: [String: String]? = nil,
         // The plan label the SERVER derived, wire field `"plan"`. `nil` omits
         // the key entirely — the never-profiled row and the older-server row
         // alike, both of which must draw NO tag rather than a guessed one, so
@@ -334,6 +345,16 @@ enum RenderStates {
         let groupsFragment =
             groups.map { g in
                 "\"groups\":\(jsonArray(g)),\"reservedGroups\":\(jsonArray(reservedGroups ?? [])),"
+                    + "\"parkedGroups\":\(jsonArray(parkedGroups ?? [])),"
+            } ?? ""
+        let colorsFragment =
+            groupColors.map { colors in
+                let pairs =
+                    colors
+                    .sorted { $0.key < $1.key }
+                    .map { "\"\($0.key)\":\"\($0.value)\"" }
+                    .joined(separator: ",")
+                return "\"groupColors\":{\(pairs)},"
             } ?? ""
         let fh = fiveHour ?? quota
         let fhState = fiveHourState ?? state
@@ -359,7 +380,7 @@ enum RenderStates {
              "quota":\(quota),"quotaState":"\(state)","fiveHour":\(fh),
              "fiveHourState":\(quote(fhState)),"sevenDay":\(sd),"sevenDayState":\(quote(sdState)),
              "sevenDayOi":\(sevenDayOi),"sevenDayOiState":\(quote(sevenDayOiState)),
-             \(groupsFragment)"held":\(held),
+             \(groupsFragment)\(colorsFragment)"held":\(held),
              "fiveHourResetAtMs":\(resetAtMs(fiveHourResetInMinutes)),
              "sevenDayResetAtMs":\(resetAtMs(sevenDayResetInMinutes)),
              "sevenDayOiResetAtMs":\(resetAtMs(sevenDayOiResetInMinutes)),
@@ -577,6 +598,51 @@ enum RenderStates {
             orgUuid: "11111111-1111-1111-1111-111111111111")
         return "[\(worst),\(ordinary)]"
     }
+
+    /// A PARKED GROUP BESIDE A LIVE ONE — the state a screenshot is the only
+    /// honest check on, because every part of it is visual.
+    ///
+    /// Four rows, and the last two are the point:
+    ///  - two members of parked `henry-team`, one of which is ALSO disabled by
+    ///    hand. Both draw `PARKED`, but for different reasons, and the fixture
+    ///    exists to show that the panel does not need them to look different:
+    ///    the consequence is identical, and the group tag says which is which.
+    ///  - a member of live `dev`, the control: if the dimming is wrong, or
+    ///    applied to every tag, this row shows it.
+    ///  - an ungrouped row, so the scene also carries a tag-less baseline.
+    ///
+    /// The pass condition is that the two parked tags read as held back — dim
+    /// wash, pause glyph — while `DEV` beside them stays at full strength and
+    /// still identifiable by colour. A tag that dims into illegibility fails
+    /// this scene as surely as one that does not dim at all.
+    private static var parkedGroupJSON: String {
+        let parkedLive = account(
+            "alice@example.com", quota: "0.12", state: "ok",
+            groups: ["henry-team"], parkedGroups: ["henry-team"],
+            groupColors: parkedSceneColors,
+            plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111",
+            gate: "parked")
+        let parkedAndDisabled = account(
+            "bob@example.com", quota: "0.31", state: "ok", disabled: true,
+            groups: ["henry-team"], parkedGroups: ["henry-team"],
+            groupColors: parkedSceneColors,
+            plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "disabled")
+        let live = account(
+            "carol@example.com", quota: "0.44", state: "ok",
+            groups: ["dev"], groupColors: parkedSceneColors,
+            plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222",
+            gate: "ok")
+        let ungrouped = account("dave@example.com", quota: "0.08", state: "ok", gate: "ok")
+        return "[\(parkedLive),\(parkedAndDisabled),\(live),\(ungrouped)]"
+    }
+
+    /// Real colours for the parked scene: dimming is invisible against the
+    /// neutral fallback every other scene draws, so this one carries the
+    /// `groupColors` the server actually sends.
+    private static let parkedSceneColors: [String: String] = [
+        "henry-team": "#32d74b", "dev": "#0a84ff",
+    ]
 
     /// ONE PERSON, TWO ORGS — the shape that broke the panel, and the names it
     /// wears now that `tcr` has fixed it.

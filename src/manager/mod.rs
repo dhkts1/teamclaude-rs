@@ -927,6 +927,13 @@ pub struct Manager {
     /// never held across the accounts/affinity locks. See
     /// [`Manager::eligible`]'s `reserved_group` doc for the rule this drives.
     reserved_groups: RwLock<HashSet<String>>,
+    /// The set of group labels marked `parked` (`tcr group park`) — every
+    /// member is out of rotation while its label is in here. Seeded at
+    /// construction and **hot-reloaded** thereafter, same cadence and same
+    /// `RwLock` reasoning as [`Self::reserved_groups`]: parking a group is one
+    /// `groupSettings` key, so a running proxy picks it up on its next natural
+    /// cadence check with no restart. See [`Manager::parked_blocks`].
+    parked_groups: RwLock<HashSet<String>>,
     /// The set of group labels opted in to `allowControlAccount` (`tcr group
     /// allow-control`). Seeded from the config at construction and
     /// **hot-reloaded** thereafter, same cadence and same `RwLock` reasoning
@@ -1256,6 +1263,7 @@ impl Manager {
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
         let reserved_groups = config.reserved_group_names();
+        let parked_groups = config.parked_group_names();
         let control_allowed_groups = config.control_allowed_group_names();
         // Snapshotted at construction, same restart-to-take-effect contract as
         // `reserved_groups` above and `config::Account::groups` itself — a
@@ -1344,6 +1352,7 @@ impl Manager {
             proxy_api_key,
             global_threshold,
             reserved_groups: RwLock::new(reserved_groups),
+            parked_groups: RwLock::new(parked_groups),
             control_allowed_groups: RwLock::new(control_allowed_groups),
             group_colors: RwLock::new(group_colors),
             groups_reload_mtime: Mutex::new(None),
@@ -1522,6 +1531,7 @@ impl Manager {
     ) -> ExhaustionHint {
         let now_ms = odt_to_ms(now);
         let reserved_groups = self.reserved_groups();
+        let parked_groups = self.parked_groups();
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let mut gated: BTreeMap<GateReason, usize> = BTreeMap::new();
         let mut soonest: Option<(i64, GateReason)> = None;
@@ -1538,6 +1548,7 @@ impl Manager {
                 is_fable,
                 group,
                 &reserved_groups,
+                &parked_groups,
             );
             if reason != GateReason::Ok {
                 *gated.entry(reason).or_insert(0) += 1;
@@ -1767,6 +1778,15 @@ impl Manager {
             .clone()
     }
 
+    /// A cloned snapshot of the currently-parked group names. Same
+    /// clone-not-guard reasoning as [`Self::reserved_groups`].
+    pub(super) fn parked_groups(&self) -> HashSet<String> {
+        self.parked_groups
+            .read()
+            .expect("parked_groups lock poisoned")
+            .clone()
+    }
+
     /// Whether `group` is currently reserved — and therefore STRICT: its own
     /// traffic never spills to a non-member (see
     /// [`Self::select_with_group`]'s strict arm).
@@ -1793,7 +1813,7 @@ impl Manager {
     }
 
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
-    /// `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
+    /// `parked`, `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
     /// the last check — the fix for group edits appearing to do nothing
     /// (`docs/plans/live-reload-bridge.md`, problem 1). Called from a natural
     /// cadence point ([`Self::select_with_group`], [`Self::select_revalidation`],
@@ -1890,6 +1910,7 @@ impl Manager {
     /// still reloads the right row instead of silently dropping its groups.
     fn apply_group_reload(&self, fresh: &Config) {
         let new_reserved = fresh.reserved_group_names();
+        let new_parked = fresh.parked_group_names();
         let new_control_allowed = fresh.control_allowed_group_names();
         let new_colors = fresh.group_colors();
         let mut changed: Vec<String> = Vec::new();
@@ -1906,6 +1927,20 @@ impl Manager {
                     sorted_groups(&new_reserved)
                 ));
                 *reserved = new_reserved;
+            }
+        }
+        {
+            let mut parked = self
+                .parked_groups
+                .write()
+                .expect("parked_groups lock poisoned");
+            if *parked != new_parked {
+                changed.push(format!(
+                    "parked groups: {:?} -> {:?}",
+                    sorted_groups(&parked),
+                    sorted_groups(&new_parked)
+                ));
+                *parked = new_parked;
             }
         }
         {
@@ -3740,6 +3775,7 @@ mod tests {
                 (*group).to_string(),
                 crate::config::GroupSettings {
                     reserved: true,
+                    parked: false,
                     allow_control_account: false,
                     color: None,
                     extra: serde_json::Map::new(),
@@ -3954,6 +3990,209 @@ mod tests {
         );
     }
 
+    // ---- parked groups (a whole group out of rotation) ------------------------
+
+    /// Like [`config_with_reserved`] but sets `parked` instead — the two flags
+    /// are independent, so nothing here touches `reserved`.
+    fn config_with_parked(accounts: Vec<Account>, parked: &[&str]) -> Config {
+        let mut config = config_with(accounts);
+        for group in parked {
+            config.group_settings.insert(
+                (*group).to_string(),
+                crate::config::GroupSettings {
+                    reserved: false,
+                    parked: true,
+                    allow_control_account: false,
+                    color: None,
+                    extra: serde_json::Map::new(),
+                },
+            );
+        }
+        config
+    }
+
+    /// THE HARD GATE. A member of a parked group is never selected — not by
+    /// unrequested traffic, and not by an explicit `--group` ask for the parked
+    /// group itself, which is where parking differs from reservation: an
+    /// explicit ask lifts a reservation and does not lift a park.
+    ///
+    /// The last assertion is the one that makes the ask honest rather than
+    /// silently rerouted: with the ONLY member of the asked-for group parked,
+    /// the request refuses (`None`) instead of spilling onto an unrelated
+    /// account, exactly as a reserved group's own ask does when no member can
+    /// serve.
+    #[test]
+    fn parked_group_member_is_never_selected() {
+        let parked_acct = account_in_groups("parked-acct", 0, &["codereview"]);
+        let plain = account("plain", 5); // worse priority — must lose ordinarily
+        let manager = build_manager(
+            config_with_parked(vec![parked_acct, plain], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1),
+            "a parked account must be excluded from unrequested traffic despite better priority"
+        );
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            Some(1),
+            "a --group ask for a parked group must not select the parked member"
+        );
+
+        // Same fixture with the parked group as the fleet's ONLY group member
+        // pool: the ask has nowhere honest to go, so it refuses.
+        let only_parked = build_manager(
+            config_with_parked(
+                vec![account_in_groups("parked-acct", 0, &["codereview"])],
+                &["codereview"],
+            ),
+            lock_refresher(),
+        );
+        assert_eq!(
+            only_parked.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            None,
+            "with every member parked the ask must refuse, not serve from somewhere else"
+        );
+    }
+
+    /// A pin does not survive its group being parked: the pin is RE-KEYED, not
+    /// merely diverted for one request — the same treatment a newly-reserved
+    /// group's pin gets, because `parked_blocks` sits inside `account_hard_ok`.
+    #[test]
+    fn pin_reclaim_when_the_pinned_accounts_group_is_parked() {
+        let acct = account_in_groups("acct", 0, &["codereview"]);
+        let other = account("other", 5);
+        let manager = build_manager(
+            config_with_parked(vec![acct, other], &["codereview"]),
+            lock_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        let key = 4242u64;
+        {
+            let mut affinity = manager.affinity.lock().expect("affinity lock poisoned");
+            affinity.insert(key, (0, now_ms));
+        }
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("the unparked account is still eligible");
+        assert_eq!(served, 1, "a parked account must not keep serving its pin");
+        let pinned_now = manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx);
+        assert_eq!(
+            pinned_now,
+            Some(1),
+            "the pin itself must move off the parked account"
+        );
+    }
+
+    /// The LIVE half: nothing is parked at boot, a config write parks the
+    /// group, and the very next request — with no restart — sees the gate. This
+    /// is the claim `tcr group park`'s own help makes to the operator, so it is
+    /// measured rather than assumed.
+    #[test]
+    fn reload_picks_up_a_group_being_parked() {
+        let path = tmp_config_path("reload-group-park");
+        let boot = reload_config(&[("acct", 0, &["codereview"]), ("other", 5, &[])]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(0),
+            "at boot nothing is parked, so the better-priority account serves"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let parked_config = config_with_parked(
+            vec![
+                account_in_groups("acct", 0, &["codereview"]),
+                account("other", 5),
+            ],
+            &["codereview"],
+        );
+        config::save(&path, &parked_config).expect("write parked reload config");
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(1),
+            "a group parked on disk must take effect on the next request, with no restart"
+        );
+        let snapshot = manager.snapshot(now);
+        assert_eq!(
+            snapshot.accounts[0].gate,
+            GateReason::Parked,
+            "and the fleet view names the gate"
+        );
+        assert_eq!(
+            snapshot.accounts[0].parked_groups,
+            vec!["codereview".to_string()],
+            "naming WHICH group parked the row"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The two flags are independent and the row's own `disabled` wins the
+    /// REASON: a hand-disabled member of a parked group reads `disabled`, so
+    /// the panel never tells an operator a group parked a row they benched
+    /// themselves.
+    #[test]
+    fn a_disabled_member_of_a_parked_group_still_reads_disabled() {
+        let mut disabled_member = account_in_groups("benched", 0, &["codereview"]);
+        disabled_member.disabled = Some(true);
+        let manager = build_manager(
+            config_with_parked(
+                vec![
+                    disabled_member,
+                    account_in_groups("live", 1, &["codereview"]),
+                    account("other", 5),
+                ],
+                &["codereview"],
+            ),
+            lock_refresher(),
+        );
+        let snapshot = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snapshot.accounts[0].gate,
+            GateReason::Disabled,
+            "the row's own choice outranks its group's"
+        );
+        assert_eq!(
+            snapshot.accounts[1].gate,
+            GateReason::Parked,
+            "its sibling, benched only by the group, says so"
+        );
+        assert_eq!(
+            snapshot.accounts[0].parked_groups,
+            vec!["codereview".to_string()],
+            "the parked group is still REPORTED on the disabled row — only the gate differs"
+        );
+    }
+
     // ---- control-account opt-in groups (`allowControlAccount`) ----------------
 
     /// Like [`config_with_reserved`] but sets `allowControlAccount` instead —
@@ -3970,6 +4209,7 @@ mod tests {
                 (*group).to_string(),
                 crate::config::GroupSettings {
                     reserved: false,
+                    parked: false,
                     allow_control_account: true,
                     color: None,
                     extra: serde_json::Map::new(),
@@ -4012,6 +4252,7 @@ mod tests {
             "research".to_string(),
             crate::config::GroupSettings {
                 reserved: false,
+                parked: false,
                 allow_control_account: true,
                 color: None,
                 extra: serde_json::Map::new(),
@@ -4329,6 +4570,7 @@ mod tests {
             "research".to_string(),
             crate::config::GroupSettings {
                 reserved: false,
+                parked: false,
                 allow_control_account: true,
                 color: None,
                 extra: serde_json::Map::new(),
@@ -5315,6 +5557,7 @@ mod tests {
                 None,
                 None,
                 &HashSet::new(),
+                &HashSet::new(),
             ),
             "served 0ms ago (< 1000ms) → skipped"
         );
@@ -5331,6 +5574,7 @@ mod tests {
                 false,
                 None,
                 None,
+                &HashSet::new(),
                 &HashSet::new(),
             ),
             "after the spacing window → eligible again"
@@ -5512,6 +5756,7 @@ mod tests {
                 false,
                 None,
                 None,
+                &HashSet::new(),
                 &HashSet::new(),
             ),
             "cap=0 → account stays eligible regardless of in_flight (no dark pool)"
@@ -8208,12 +8453,48 @@ mod tests {
         AccountRuntime::from_config(&account("gate", 0), false)
     }
 
+    /// One fixture for [`gate_and_hard_ok_agree_on_every_variant`]: a runtime
+    /// that exhibits one [`GateReason`], whether that block is ACCOUNT-level
+    /// (`account_hard_ok == false`) or request-scoped, and the two group sets
+    /// the request is judged against.
+    struct GateCase {
+        label: &'static str,
+        runtime: AccountRuntime,
+        account_level: bool,
+        reserved: HashSet<String>,
+        parked: HashSet<String>,
+    }
+
+    impl GateCase {
+        /// The common shape: the runtime alone exhibits the gate, with nothing
+        /// reserved and nothing parked. Only `Reserved` and `Parked` — the two
+        /// gates that depend on more than the runtime — build one by hand.
+        fn plain(label: &'static str, runtime: AccountRuntime, account_level: bool) -> Self {
+            Self {
+                label,
+                runtime,
+                account_level,
+                reserved: HashSet::new(),
+                parked: HashSet::new(),
+            }
+        }
+    }
+
     #[test]
     fn account_gate_ok_when_healthy() {
         let now = OffsetDateTime::now_utc();
         let a = gate_runtime();
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Ok, None)
         );
     }
@@ -8234,6 +8515,7 @@ mod tests {
                 odt_to_ms(now),
                 false,
                 None,
+                &HashSet::new(),
                 &HashSet::new()
             ),
             (GateReason::Disabled, None)
@@ -8250,6 +8532,7 @@ mod tests {
                 odt_to_ms(now),
                 false,
                 None,
+                &HashSet::new(),
                 &HashSet::new()
             ),
             (GateReason::Login, None)
@@ -8268,7 +8551,16 @@ mod tests {
         a.quota.five_hour = Some(window(0.99, Some(soon)));
         a.quota.seven_day = Some(window(0.99, Some(later)));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::SevenDay, Some(later))
         );
     }
@@ -8283,7 +8575,16 @@ mod tests {
         a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
         a.quota.seven_day = Some(window(0.99, None));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::SevenDay, None)
         );
     }
@@ -8297,12 +8598,30 @@ mod tests {
         let mut a = gate_runtime();
         a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Ok, None),
             "the non-Fable view ignores the model-scoped weekly"
         );
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), true, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                true,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::FableWeekly, Some(reset)),
             "a Fable evaluation gates on it"
         );
@@ -8320,7 +8639,16 @@ mod tests {
         a.quota.tokens_remaining = Some(50); // 95% spent, over the 0.90 threshold
         a.quota.standard_reset = Some(reset);
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Standard, Some(reset))
         );
     }
@@ -8343,7 +8671,16 @@ mod tests {
 
         // The Standard gate (later reset) wins max_by_key over the +8s Hold.
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, now_ms, false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                now_ms,
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Standard, Some(reset)),
             "the standard reset outlasts the short hold"
         );
@@ -8363,7 +8700,16 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let a = gate_runtime(); // all standard fields None by default
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Ok, None),
             "OAuth accounts never gate on the standard dimension"
         );
@@ -8380,7 +8726,16 @@ mod tests {
         a.quota.tokens_remaining = Some(10); // 99% spent, over threshold
         a.quota.standard_reset = Some(now - Duration::seconds(1)); // already refreshed
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, odt_to_ms(now), false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                odt_to_ms(now),
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Ok, None),
             "an expired standard window no longer gates"
         );
@@ -8397,11 +8752,20 @@ mod tests {
         // `account_gate` had no arm for it, so the TUI showed a rejected account as
         // healthy and in rotation.
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, now_ms, false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                now_ms,
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Rejected, None)
         );
         assert!(
-            !Manager::account_hard_ok(&a, now_ms, None, &HashSet::new()),
+            !Manager::account_hard_ok(&a, now_ms, None, &HashSet::new(), &HashSet::new()),
             "and it stays hard-gated, exactly as before"
         );
 
@@ -8410,7 +8774,16 @@ mod tests {
         // to come back at its 5h reset.
         a.quota.five_hour = Some(window(0.99, Some(now + Duration::seconds(300))));
         assert_eq!(
-            Manager::account_gate(&a, 0.90, now, now_ms, false, None, &HashSet::new()),
+            Manager::account_gate(
+                &a,
+                0.90,
+                now,
+                now_ms,
+                false,
+                None,
+                &HashSet::new(),
+                &HashSet::new()
+            ),
             (GateReason::Rejected, None),
             "a rejected account must not advertise a window reset as its recovery"
         );
@@ -8432,7 +8805,7 @@ mod tests {
         let now_ms = odt_to_ms(now);
         let reset = now + Duration::seconds(5_000);
 
-        const ALL: [GateReason; 10] = [
+        const ALL: [GateReason; 11] = [
             GateReason::Ok,
             GateReason::Hold,
             GateReason::FiveHour,
@@ -8443,6 +8816,7 @@ mod tests {
             GateReason::Disabled,
             GateReason::Rejected,
             GateReason::Reserved,
+            GateReason::Parked,
         ];
 
         for reason in ALL {
@@ -8452,27 +8826,28 @@ mod tests {
             // Per case: a label, a runtime that actually exhibits `reason`, whether
             // that block is ACCOUNT-level (`account_hard_ok == false`) or
             // request-scoped (`account_hard_ok` stays true, the pin survives), and
-            // the reserved-group set the request evaluates against (empty for
-            // every reason but `Reserved` itself, which is the one whose gate
-            // depends on more than the runtime alone).
-            let cases: Vec<(&str, AccountRuntime, bool, HashSet<String>)> = match reason {
-                GateReason::Ok => vec![("healthy", gate_runtime(), true, HashSet::new())],
+            // and the reserved / parked group sets the request evaluates
+            // against (both empty for every reason but `Reserved` and `Parked`
+            // themselves, the two whose gate depends on more than the runtime
+            // alone).
+            let cases: Vec<GateCase> = match reason {
+                GateReason::Ok => vec![GateCase::plain("healthy", gate_runtime(), true)],
 
                 // Terminal: a fact about the credential, for every model class.
                 GateReason::Disabled => {
                     let mut a = gate_runtime();
                     a.disabled = true;
-                    vec![("operator-disabled", a, false, HashSet::new())]
+                    vec![GateCase::plain("operator-disabled", a, false)]
                 }
                 GateReason::Login => {
                     let mut a = gate_runtime();
                     a.status = AccountStatus::Error;
-                    vec![("dead credential", a, false, HashSet::new())]
+                    vec![GateCase::plain("dead credential", a, false)]
                 }
                 GateReason::Rejected => {
                     let mut a = gate_runtime();
                     a.quota.status = Some("rejected".to_string());
-                    vec![("upstream rejected", a, false, HashSet::new())]
+                    vec![GateCase::plain("upstream rejected", a, false)]
                 }
                 // Reservation is not a preference: unrequested traffic (`group:
                 // None`, matching every other case in this loop) against an
@@ -8481,8 +8856,28 @@ mod tests {
                 GateReason::Reserved => {
                     let mut a = gate_runtime();
                     a.groups = vec!["codereview".to_string()];
-                    let reserved: HashSet<String> = ["codereview".to_string()].into();
-                    vec![("reserved group, unrequested traffic", a, false, reserved)]
+                    vec![GateCase {
+                        label: "reserved group, unrequested traffic",
+                        runtime: a,
+                        account_level: false,
+                        reserved: ["codereview".to_string()].into(),
+                        parked: HashSet::new(),
+                    }]
+                }
+                // Parking is not a preference either, and unlike reservation it
+                // does not even depend on the request's ask: a member of a
+                // parked group is ACCOUNT-level-blocked for every request —
+                // see `Self::parked_blocks`.
+                GateReason::Parked => {
+                    let mut a = gate_runtime();
+                    a.groups = vec!["codereview".to_string()];
+                    vec![GateCase {
+                        label: "parked group",
+                        runtime: a,
+                        account_level: false,
+                        reserved: HashSet::new(),
+                        parked: ["codereview".to_string()].into(),
+                    }]
                 }
 
                 // The one reason that splits on DURATION: past the cache TTL a hold
@@ -8493,8 +8888,8 @@ mod tests {
                     let mut short = gate_runtime();
                     short.rate_limited_until_ms = Some(now_ms + 30_000);
                     vec![
-                        ("hold outliving the cache", long, false, HashSet::new()),
-                        ("hold clearing while warm", short, true, HashSet::new()),
+                        GateCase::plain("hold outliving the cache", long, false),
+                        GateCase::plain("hold clearing while warm", short, true),
                     ]
                 }
 
@@ -8503,33 +8898,41 @@ mod tests {
                 GateReason::FiveHour => {
                     let mut a = gate_runtime();
                     a.quota.five_hour = Some(window(0.99, Some(reset)));
-                    vec![("5h over threshold", a, true, HashSet::new())]
+                    vec![GateCase::plain("5h over threshold", a, true)]
                 }
                 GateReason::SevenDay => {
                     let mut a = gate_runtime();
                     a.quota.seven_day = Some(window(0.99, Some(reset)));
-                    vec![("7d over threshold", a, true, HashSet::new())]
+                    vec![GateCase::plain("7d over threshold", a, true)]
                 }
                 GateReason::FableWeekly => {
                     let mut a = gate_runtime();
                     a.quota.seven_day_oi = Some(window(0.99, Some(reset)));
-                    vec![("7d_oi over threshold", a, true, HashSet::new())]
+                    vec![GateCase::plain("7d_oi over threshold", a, true)]
                 }
                 GateReason::Standard => {
                     let mut a = gate_runtime();
                     a.quota.tokens_limit = Some(1_000);
                     a.quota.tokens_remaining = Some(10); // 99% spent
                     a.quota.standard_reset = Some(reset);
-                    vec![("standard limit spent", a, true, HashSet::new())]
+                    vec![GateCase::plain("standard limit spent", a, true)]
                 }
             };
 
-            for (label, runtime, account_level, reserved) in cases {
-                let (gate, _) =
-                    Manager::account_gate(&runtime, 0.90, now, now_ms, is_fable, None, &reserved);
+            for case in cases {
+                let GateCase {
+                    label,
+                    runtime,
+                    account_level,
+                    reserved,
+                    parked,
+                } = case;
+                let (gate, _) = Manager::account_gate(
+                    &runtime, 0.90, now, now_ms, is_fable, None, &reserved, &parked,
+                );
                 assert_eq!(gate, reason, "fixture `{label}` must exhibit {reason:?}");
 
-                let hard_ok = Manager::account_hard_ok(&runtime, now_ms, None, &reserved);
+                let hard_ok = Manager::account_hard_ok(&runtime, now_ms, None, &reserved, &parked);
                 assert_eq!(
                     hard_ok, account_level,
                     "`{label}`: account_hard_ok disagrees with {reason:?}'s classification"

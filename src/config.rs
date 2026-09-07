@@ -280,6 +280,19 @@ pub struct GroupSettings {
     /// Absent/`false` (default) is prefer-only in both directions.
     #[serde(default)]
     pub reserved: bool,
+    /// When `true`, every account carrying this group is OUT OF ROTATION, the
+    /// same way a per-account `disabled` is: it is never selected, never
+    /// pinned, and an established pin on it is re-keyed away. One key holds a
+    /// whole group out and one key releases it, which is the whole point —
+    /// the alternative an operator reaches for otherwise is `tcr disable` per
+    /// member plus a label to remember which ones.
+    ///
+    /// Independent of [`Self::reserved`] and of a member's own `disabled`:
+    /// a group can be both parked and reserved, and unparking a group does not
+    /// re-enable a member that was disabled by hand. Absent/`false` (default)
+    /// is ordinary rotation.
+    #[serde(default)]
+    pub parked: bool,
     /// When `true`, an explicit `--group` ask for this group is allowed to
     /// select the control account — see
     /// [`crate::manager::select::select_with_group`]'s `control_excluded`
@@ -965,6 +978,23 @@ impl Config {
     /// reserved" default the field's own doc-comment promises.
     pub fn is_group_reserved(&self, group: &str) -> bool {
         self.group_settings.get(group).is_some_and(|s| s.reserved)
+    }
+
+    /// The set of group labels currently marked `parked`. Same cheap,
+    /// one-shot-use posture as [`Self::reserved_group_names`].
+    pub fn parked_group_names(&self) -> HashSet<String> {
+        self.group_settings
+            .iter()
+            .filter(|(_, s)| s.parked)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether `group` is currently marked `parked`. `false` for a group name
+    /// with no `groupSettings` entry at all — same "absent means not parked"
+    /// default the field's own doc-comment promises.
+    pub fn is_group_parked(&self, group: &str) -> bool {
+        self.group_settings.get(group).is_some_and(|s| s.parked)
     }
 
     /// The set of group labels currently opted in to `allowControlAccount`.
@@ -2601,6 +2631,88 @@ fn merge_group_reserved(
         doc.remove("groupSettings");
     }
     GroupReserveWrite::Updated
+}
+
+/// What a targeted [`save_group_parked`] did to the on-disk document. Same
+/// shape as [`GroupReserveWrite`] and for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupParkWrite {
+    /// `groupSettings.<group>.parked` was set (or its whole entry removed) and
+    /// the file rewritten.
+    Updated,
+    /// The group already carried (or already lacked) `parked`, so nothing was
+    /// written and the file is byte-identical.
+    Unchanged,
+}
+
+/// Persist ONLY `groupSettings.<group>.parked` into the file at `path`,
+/// leaving every other key — every account, every other group's settings —
+/// exactly as the user left it. Same read-modify-write shape as
+/// [`save_group_reserved`] and for the same reason.
+///
+/// Setting `parked` to `false` drops the `parked` key rather than writing
+/// `false`, and drops the group's whole `groupSettings` entry once it is empty
+/// — same drops-the-key contract [`merge_group_reserved`] uses, so a group that
+/// has ever been parked and then unparked carries no permanent litter.
+pub fn save_group_parked(
+    path: &Path,
+    group: &str,
+    parked: bool,
+) -> Result<GroupParkWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_group_parked(&mut doc, group, parked);
+    if outcome == GroupParkWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+fn merge_group_parked(doc: &mut Map<String, Value>, group: &str, parked: bool) -> GroupParkWrite {
+    let already = doc
+        .get("groupSettings")
+        .and_then(Value::as_object)
+        .and_then(|settings| settings.get(group))
+        .and_then(Value::as_object)
+        .and_then(|entry| entry.get("parked"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if already == parked {
+        return GroupParkWrite::Unchanged;
+    }
+
+    let settings = doc
+        .entry("groupSettings".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    // Same corrupt-hand-edit guard as `merge_group_reserved`: `already` above
+    // already proved a non-object carried no usable `parked` value.
+    if !settings.is_object() {
+        *settings = Value::Object(Map::new());
+    }
+    let settings_obj = settings.as_object_mut().expect("just ensured object");
+
+    if parked {
+        let entry = settings_obj
+            .entry(group.to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !entry.is_object() {
+            *entry = Value::Object(Map::new());
+        }
+        entry
+            .as_object_mut()
+            .expect("just ensured object")
+            .insert("parked".to_string(), Value::Bool(true));
+    } else if let Some(entry) = settings_obj.get_mut(group) {
+        if let Some(obj) = entry.as_object_mut() {
+            obj.remove("parked");
+            if obj.is_empty() {
+                settings_obj.remove(group);
+            }
+        }
+    }
+    if settings_obj.is_empty() {
+        doc.remove("groupSettings");
+    }
+    GroupParkWrite::Updated
 }
 
 /// What a targeted [`save_group_allow_control`] did to the on-disk document.

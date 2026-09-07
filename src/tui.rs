@@ -1052,6 +1052,10 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             "RESERVED".to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
+        // An operator's own choice, exactly like `Disabled` above — one config
+        // key holding the whole group back — so it wears the same dim treatment
+        // rather than the red of a gate nobody chose.
+        GateReason::Parked => ("PARKED".to_string(), dim),
     }
 }
 
@@ -1487,6 +1491,7 @@ mod tests {
             last_stream_error: None,
             groups: Vec::new(),
             reserved_groups: Vec::new(),
+            parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage: None,
         }

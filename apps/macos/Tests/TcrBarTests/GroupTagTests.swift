@@ -116,6 +116,57 @@ final class GroupTagTests: XCTestCase {
         XCTAssertFalse(tagAccount("a@example.com", groups: nil).servesGroupTrafficOnly)
     }
 
+    // MARK: - Account.isParkedByGroup (a whole group out of rotation)
+
+    /// `isParked` is its own channel: a group can be parked without being
+    /// reserved, reserved without being parked, or both — and the tag has to
+    /// carry all three states, because the view draws two independent cues.
+    func testParkedAndReservedAreIndependentOnTheTag() {
+        let account = tagAccount(
+            "a@example.com",
+            groups: ["dev", "codereview", "henry-team"],
+            reservedGroups: ["codereview", "henry-team"],
+            parkedGroups: ["henry-team"]
+        )
+        let byName = Dictionary(uniqueKeysWithValues: account.groupTags.map { ($0.name, $0) })
+        XCTAssertEqual(byName["henry-team"]?.isParked, true)
+        XCTAssertEqual(byName["henry-team"]?.isReserved, true, "both at once is a real state")
+        XCTAssertEqual(byName["codereview"]?.isParked, false, "reserved is not parked")
+        XCTAssertEqual(byName["dev"]?.isParked, false)
+    }
+
+    /// `nil` `parkedGroups` (a server built before parking) degrades to nothing
+    /// parked — the same forward-compat contract `reservedGroups` carries, and
+    /// the safe direction: the panel says a row rotates only because the server
+    /// never claimed otherwise.
+    func testNilParkedGroupsDegradesToNothingParked() {
+        let account = tagAccount("a@example.com", groups: ["dev"], parkedGroups: nil)
+        XCTAssertEqual(account.groupTags.first?.isParked, false)
+        XCTAssertFalse(account.isParkedByGroup)
+    }
+
+    /// The case an `allSatisfy` implementation gets wrong, for parking this
+    /// time: the server blocks the account when ANY group is parked, so one
+    /// parked group among plain ones still holds the row out.
+    func testOneParkedGroupAmongPlainOnesStillParksTheRow() {
+        let account = tagAccount(
+            "a@example.com", groups: ["dev", "henry-team"], parkedGroups: ["henry-team"])
+        XCTAssertTrue(account.isParkedByGroup)
+        XCTAssertEqual(
+            account.parkedGroupNames, ["henry-team"],
+            "and it names the one group to unpark, not every label on the row")
+    }
+
+    /// A group the row does not carry cannot park it, even if the wire says so
+    /// — `parkedGroupNames` is derived from the tags, so it can never send an
+    /// operator to unpark a label this account is not in.
+    func testParkedGroupsOutsideTheRowsOwnMembershipAreIgnored() {
+        let account = tagAccount(
+            "a@example.com", groups: ["dev"], parkedGroups: ["some-other-team"])
+        XCTAssertFalse(account.isParkedByGroup)
+        XCTAssertEqual(account.parkedGroupNames, [])
+    }
+
     // MARK: - GroupTagColor
 
     func testMalformedHexReturnsNilFromParse() {
@@ -155,6 +206,7 @@ private func tagAccount(
     _ name: String,
     groups: [String]?,
     reservedGroups: [String]? = nil,
+    parkedGroups: [String]? = nil,
     groupColors: [String: String]? = nil
 ) -> Account {
     Account(
@@ -182,6 +234,7 @@ private func tagAccount(
         serverDirty: false,
         groups: groups,
         reservedGroups: reservedGroups,
+        parkedGroups: parkedGroups,
         groupColors: groupColors
     )
 }

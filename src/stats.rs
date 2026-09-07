@@ -105,6 +105,15 @@ pub enum GateReason {
     /// self-frees on its own (only `tcr group unreserve` clears it), so it
     /// carries no clear-instant, same as [`Self::Disabled`].
     Reserved,
+    /// This account belongs to a group marked `parked` (`tcr group park`), so
+    /// it is out of rotation entirely — unlike [`Self::Reserved`] this is a
+    /// fact about the ACCOUNT, independent of what the request asked for: an
+    /// explicit `--group` ask for the parked group does not lift it. Never
+    /// self-frees (only `tcr group unpark` clears it), so it carries no
+    /// clear-instant. Reported only when the account is not ALSO
+    /// [`Self::Disabled`] on its own, so the panel never says a row is
+    /// parked-by-group when it was parked by hand.
+    Parked,
 }
 
 /// A single account's live-computed view.
@@ -209,6 +218,12 @@ pub struct AccountSnapshot {
     /// (`tcr group reserve`), sorted. Always an array, `[]` when none — a
     /// config fact, never `null`. See [`GateReason::Reserved`].
     pub reserved_groups: Vec<String>,
+    /// The subset of [`Self::groups`] currently marked `parked`
+    /// (`tcr group park`), sorted. Always an array, `[]` when none — a config
+    /// fact, never `null`, same contract as [`Self::reserved_groups`] beside
+    /// it. Non-empty means this account is out of rotation; see
+    /// [`GateReason::Parked`].
+    pub parked_groups: Vec<String>,
     /// The subset of [`Self::groups`] that have opted in to letting an explicit
     /// `--group` ask select the control account (`tcr group allow-control`),
     /// sorted. Always an array, `[]` when none — a config fact, never `null`,

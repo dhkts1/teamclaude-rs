@@ -164,7 +164,7 @@ struct GroupArgs {
     action: GroupAction,
 }
 
-/// `tcr group ls|add|rm|reserve|unreserve|allow-control|disallow-control|color` — the argument shape here is a
+/// `tcr group ls|add|rm|reserve|unreserve|park|unpark|allow-control|disallow-control|color` — the argument shape here is a
 /// CONTRACT with the TcrBar panel, which shells out to it (`TcrTool.run`); do
 /// not change it.
 #[derive(Subcommand)]
@@ -181,6 +181,14 @@ enum GroupAction {
     Reserve(GroupReserveArgs),
     /// Clear a group's reserved flag.
     Unreserve(GroupUnreserveArgs),
+    /// Park a group: every account carrying it is held out of rotation, the
+    /// way `tcr disable` holds one account out — no request reaches it, not
+    /// even an explicit `--group` ask. A running proxy picks this up live (no
+    /// restart) on its next natural cadence check.
+    Park(GroupParkArgs),
+    /// Clear a group's parked flag and put its members back in rotation. An
+    /// account disabled on its own stays disabled.
+    Unpark(GroupUnparkArgs),
     /// Opt a group in to selecting the control account on an explicit
     /// `--group` ask — otherwise inference never selects it. A running proxy
     /// picks this up live (no restart) on its next natural cadence check.
@@ -246,6 +254,24 @@ struct GroupUnreserveArgs {
     #[arg(long)]
     config: Option<PathBuf>,
     /// The group label to unreserve.
+    group: String,
+}
+
+#[derive(clap::Args)]
+struct GroupParkArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to park.
+    group: String,
+}
+
+#[derive(clap::Args)]
+struct GroupUnparkArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// The group label to unpark.
     group: String,
 }
 
@@ -506,6 +532,14 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         GroupAction::Unreserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
             cli::unreserve_group(&config_path, &a.group)
+        }
+        GroupAction::Park(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::park_group(&config_path, &a.group)
+        }
+        GroupAction::Unpark(a) => {
+            let config_path = a.config.unwrap_or_else(config::default_path);
+            cli::unpark_group(&config_path, &a.group)
         }
         GroupAction::AllowControl(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
