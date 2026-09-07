@@ -114,6 +114,19 @@ public final class ServerController: ObservableObject {
 
     @Published public private(set) var state: State = .idle
 
+    /// The pid of the child this controller currently supervises, or `0`
+    /// when there is none. Read from `AbnormalTerminationGuard`'s signal
+    /// handler, which cannot safely call back into a `@MainActor` class — a
+    /// signal handler can only load a value some other thread already
+    /// wrote, and `sig_atomic_t` is the type POSIX guarantees is safe to
+    /// read that way without a lock.
+    ///
+    /// Set the instant `spawn()` confirms the child is running, and cleared
+    /// both in ``stop()`` and when `terminationHandler` fires, so a signal
+    /// that lands after the child has already exited never sends `SIGTERM`
+    /// to a since-reused pid.
+    public nonisolated(unsafe) static var supervisedChildPID: sig_atomic_t = 0
+
     private var child: Process?
     /// A capability probe is in flight for the takeover path. Guards the window
     /// between the click and the spawn, where `child` is still nil and a second
@@ -361,12 +374,14 @@ public final class ServerController: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.child = nil
+                Self.supervisedChildPID = 0
                 self.state = Self.classifyExit(intent: intent, exitCode: code, stderr: text)
             }
         }
         do {
             try process.run()
             child = process
+            Self.supervisedChildPID = sig_atomic_t(process.processIdentifier)
             state = .supervising(pid: process.processIdentifier)
         } catch {
             child = nil
@@ -379,9 +394,11 @@ public final class ServerController: ObservableObject {
     public func stop() {
         guard let process = child, process.isRunning else {
             child = nil
+            Self.supervisedChildPID = 0
             return
         }
         process.terminate()
+        Self.supervisedChildPID = 0
     }
 
     /// Called on app quit so a supervised child does not outlive its supervisor.
