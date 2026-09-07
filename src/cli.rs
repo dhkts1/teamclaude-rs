@@ -3652,9 +3652,14 @@ mod tests {
     /// would aim every one of these tests at the running server.
     async fn config_on_a_dead_port(tag: &str) -> std::path::PathBuf {
         let port = dead_port().await;
-        let json = TWO_ACCOUNTS.replace("\"port\": 3456", &format!("\"port\": {port}"));
-        assert!(
-            !json.contains("\"port\": 3456") && json.contains(&format!("\"port\": {port}")),
+        let json = TWO_ACCOUNTS.replace("\"port\": 3456 }", &format!("\"port\": {port} }}"));
+        // Compare the PARSED value, not the text: a substring check for
+        // `"port": 3456` also matched a drawn port of 34560–34569 and tripped
+        // this guard on a healthy substitution (about one Linux run in 3,000).
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["proxy"]["port"],
+            serde_json::json!(port),
             "the port substitution must apply, or this test talks to the live proxy"
         );
         write_config(tag, &json)
