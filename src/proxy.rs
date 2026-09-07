@@ -61,6 +61,12 @@ use crate::stats::{GateReason, RequestLogEntry, SessionKind};
 /// no legitimate payload near this, but an unbounded read is a DoS surface. The
 /// non-stream *response* body is bounded by the same cap (see [`read_capped_body`]).
 const MAX_BODY_BYTES: usize = 256 * 1024 * 1024;
+/// Cap on the upstream error body copied into a log line (see
+/// [`log_upstream_error_body`]). Large enough to carry Anthropic's whole error
+/// envelope (`{"type":"error","error":{"type":...,"message":...}}`, typically
+/// well under 1 KiB) with room to spare, small enough that a log line never
+/// carries an upstream's full multi-KiB HTML error page.
+const ERROR_BODY_LOG_CAP: usize = 2 * 1024;
 /// Header `tcr run --group <name>` sets via `ANTHROPIC_CUSTOM_HEADERS` (see
 /// `src/main.rs`'s `compose_group_header`), which Claude Code forwards
 /// verbatim as a real outbound header on every `/v1/messages` request. `pub`
@@ -3182,6 +3188,15 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 );
                 manager.record_usage(idx, record);
             }
+        } else {
+            // The "upstream response" line above (:2587) has never carried a
+            // body: it fires before this buffer exists, and for a streamed 2xx
+            // there never is one to log. `bytes` is already fully buffered by
+            // the time we get here regardless of status — logging from it adds
+            // no extra body read on the response path, only diagnosis for what
+            // was previously an opaque status code (64 `status=400` lines with
+            // no error type or message, measured 2026-09-07).
+            log_upstream_error_body(idx, account_name.as_deref(), status, &bytes);
         }
         return build_response(
             status,
@@ -3258,6 +3273,48 @@ where
         collected.extend_from_slice(&chunk);
     }
     Ok(Bytes::from(collected))
+}
+
+/// Log a non-2xx upstream RESPONSE body: `error.type` and `error.message` pulled
+/// out as their own greppable fields (Anthropic's error envelope is
+/// `{"type":"error","error":{"type":...,"message":...}}`), plus the body itself
+/// capped at [`ERROR_BODY_LOG_CAP`] for the shapes that don't parse (an upstream
+/// 5xx can arrive as an HTML error page, not JSON). Fixes the blind spot logged
+/// in `src/proxy.rs`'s "upstream response" line, which fires before this body
+/// is even read and so has never carried more than the bare status code — 64
+/// `status=400` lines on 2026-09-07 with no way to tell one 400 from another.
+///
+/// Response bodies ONLY. A request body can carry the client's own prompt
+/// content and must never reach a log line in this public repo; nothing here
+/// is wired to one.
+fn log_upstream_error_body(
+    idx: usize,
+    account_name: Option<&str>,
+    status: StatusCode,
+    body: &Bytes,
+) {
+    let capped = &body[..body.len().min(ERROR_BODY_LOG_CAP)];
+    let body_text = String::from_utf8_lossy(capped);
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let error_type = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("type"))
+        .and_then(|t| t.as_str());
+    let error_message = parsed
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .and_then(|e| e.get("message"))
+        .and_then(|m| m.as_str());
+    tracing::warn!(
+        account_index = idx,
+        account = account_name.unwrap_or("?"),
+        status = status.as_u16(),
+        error.r#type = error_type.unwrap_or("<unparsed>"),
+        error.message = error_message.unwrap_or("<unparsed>"),
+        body = %body_text,
+        "upstream error response"
+    );
 }
 
 /// Clone request headers for the upstream call, dropping hop-by-hop headers,
@@ -3944,12 +4001,29 @@ where
 }
 
 /// A JSON error response in Anthropic's error envelope.
+///
+/// Every proxy-GENERATED refusal is built here, so this is the one place that
+/// can log all of them — the second blind spot measured 2026-09-07: the
+/// fleet-exhausted message never appeared in the log at all (`grep -cE
+/// 'quota exhausted on all|accounts exhausted'` -> `0` for a day the fleet sat
+/// at 0.95+ on `7d_oi`), because the only line near it (`"returning exhausted
+/// 429 to client"`, see [`exhausted_response`]) never carried the message
+/// text itself. Callers that already log their own richer context (account
+/// count considered, the gate that bound the hint, and so on) still hit this
+/// line too — a second, low-detail line is cheap; a refusal with NO line at
+/// all is the bug this exists to close.
 fn error_response(
     status: StatusCode,
     err_type: &str,
     message: &str,
     retry_after: Option<i64>,
 ) -> Response {
+    tracing::warn!(
+        status = status.as_u16(),
+        error.r#type = err_type,
+        error.message = message,
+        "proxy-generated error response"
+    );
     let payload = serde_json::json!({
         "type": "error",
         "error": { "type": err_type, "message": message },
@@ -8944,6 +9018,105 @@ mod tests {
             "expected a usage log line carrying the real synthesized token \
              counts (cache_read=90, cache_creation=3, input_total=100, output=11), \
              got: {log:?}"
+        );
+    }
+
+    /// THE BITING TEST for the upstream-error blind spot this bridge closes:
+    /// before this fix, `src/proxy.rs`'s only per-response log line was
+    /// "upstream response" (`account`, `path`, `status` — nothing else), so a
+    /// non-2xx status was opaque: 64 `status=400` lines on 2026-09-07 with no
+    /// way to tell one 400 from another. A real request against a real fake
+    /// upstream returning 400 with Anthropic's error envelope must now produce
+    /// a log line carrying the body's `error.type` and `error.message` as their
+    /// own greppable fields.
+    #[tokio::test]
+    async fn buffered_request_logs_upstream_error_type_and_message_on_non_2xx() {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = upstream.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let body = br#"{"type":"error","error":{"type":"invalid_request_error","message":"messages.0.content: unexpected field wombat"}}"#;
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.write_all(body).await;
+                });
+            }
+        });
+
+        let manager =
+            Manager::with_live_refresher(dummy_config(None, &format!("http://{up_addr}")), None);
+
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let served = Arc::clone(&manager);
+        tokio::spawn(async move {
+            let _ = axum::serve(proxy, app(served)).await;
+        });
+
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/messages"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 400);
+        let _ = resp.bytes().await.unwrap();
+
+        let log = sink.contents();
+        assert!(
+            log.contains("error.type=\"invalid_request_error\"")
+                && log.contains("unexpected field wombat"),
+            "expected a log line carrying the upstream body's error.type \
+             (invalid_request_error) and error.message text, got: {log:?}"
+        );
+    }
+
+    /// The SECOND blind spot this bridge closes: a proxy-GENERATED refusal
+    /// (never touched an upstream at all) previously left no trace carrying
+    /// its own message — `grep -cE 'quota exhausted on all|accounts exhausted'`
+    /// returned `0` for a day the fleet-exhausted message almost certainly
+    /// fired. `error_response` is the single constructor every such refusal
+    /// goes through, so a direct call must now log a line carrying its
+    /// `error.type` and `error.message`.
+    #[test]
+    fn error_response_logs_its_own_type_and_message() {
+        let sink = SharedBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _ = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limit_error",
+            "All 13 accounts exhausted. Retry in 42s.",
+            Some(42),
+        );
+
+        let log = sink.contents();
+        assert!(
+            log.contains("error.type=\"rate_limit_error\"") && log.contains("accounts exhausted"),
+            "expected error_response's own construction-site log line to \
+             carry error.type and the message text, got: {log:?}"
         );
     }
 
