@@ -1,5 +1,33 @@
 import AppKit
+import Darwin
 import TcrBarCore
+
+/// The signals a native crash (an uncaught `NSException` converts to
+/// `SIGABRT` via `abort()`, the runaway-layout crash this pairs with among
+/// them) or a fatal Swift-runtime trap raises. Installed once, in
+/// ``TcrBarEntry/main()``, before anything that could spawn the child these
+/// handlers exist to stop from being orphaned.
+private let abnormalTerminationSignals: [Int32] = [
+    SIGABRT, SIGSEGV, SIGILL, SIGBUS, SIGFPE,
+]
+
+/// The handler itself. A free, non-capturing function because `signal(2)`
+/// takes a C function pointer, which cannot close over anything — this is
+/// why the pid it needs lives in a static var
+/// (`ServerController.supervisedChildPID`) rather than being passed in.
+///
+/// Everything it does beyond the one call into
+/// `AbnormalTerminationGuard.terminateSupervisedChild(pid:)` is restoring
+/// the default disposition and re-raising, which is what makes the process
+/// still crash, still print the same report, and still exit with the same
+/// code it would have without this handler installed — the only thing this
+/// adds is that the child is no longer orphaned first.
+private func tcrbarHandleAbnormalTermination(_ signalNumber: Int32) {
+    AbnormalTerminationGuard.terminateSupervisedChild(
+        pid: pid_t(ServerController.supervisedChildPID))
+    signal(signalNumber, SIG_DFL)
+    raise(signalNumber)
+}
 
 /// The real entry point.
 ///
@@ -18,6 +46,12 @@ enum TcrBarEntry {
 
     @MainActor
     static func main() {
+        // Before anything else — including the four harness paths below,
+        // none of which spawn a child, but a handler installed after the
+        // spawn point would race the very crash it exists to catch.
+        for signalNumber in abnormalTerminationSignals {
+            signal(signalNumber, tcrbarHandleAbnormalTermination)
+        }
         // First, and the only one of the four that needs no AppKit at all: it
         // draws nothing, it holds a power assertion and prints.
         if let probe = KeepAwakeProbe.request() {

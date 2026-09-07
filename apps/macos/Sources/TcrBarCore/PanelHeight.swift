@@ -126,4 +126,43 @@ public enum PanelHeight {
         let summed = rowHeights.reduce(0, +) + gaps + separator
         return min(max(summed, spacing), budget)
     }
+
+    /// The grain every `GeometryReader` measurement this panel feeds into a
+    /// `PreferenceKey` is snapped to before it is published.
+    ///
+    /// Matches `Tok.hairlineWidth` — the finest unit this panel already
+    /// draws at — rather than a whole point, so quantizing costs no
+    /// perceptible precision.
+    public static let measurementGrain: CGFloat = 0.5
+
+    /// Snap a raw `GeometryReader` measurement to ``measurementGrain``.
+    ///
+    /// `FleetView` publishes three of these every frame — one per account
+    /// row plus the two spend-line measurements — through
+    /// `.preference(key:value:)`, and `onPreferenceChange` re-fires (and
+    /// re-triggers `@State`, and therefore another layout pass) whenever the
+    /// published value is not bit-for-bit equal to the last one. A resize
+    /// this arithmetic itself drives — `.frame(height: visibleRowsHeight(...))`
+    /// sizes the very `ScrollView` whose rows are being measured — has no
+    /// guarantee of reporting the identical `CGFloat` on consecutive passes:
+    /// window resize and AppKit's safe-area-inset recomputation both round
+    /// sub-pixel geometry a hair differently frame to frame, so the raw value
+    /// can drift by float epsilon forever without ever landing on the same
+    /// bits twice. That is a genuine non-terminating case for
+    /// `onPreferenceChange`, which is what a runaway `NSPopover` layout
+    /// (`_NSPopoverWindow`, "already had more Update Constraints in Window
+    /// passes than there are views") looks like from AppKit's side — its
+    /// guard is a *pass count*, not a convergence detector, so it fires
+    /// exactly when this loop keeps going.
+    ///
+    /// Quantizing turns that infinite, arbitrarily-fine domain into a finite
+    /// one: two measurements within half the grain of each other now publish
+    /// the identical value, so once the *real* layout has settled (the rows'
+    /// actual heights stop changing, even if AppKit keeps reporting them
+    /// with fresh sub-pixel noise), the published preference stops changing
+    /// too, `onPreferenceChange` stops firing, and the layout pass that
+    /// triggered it is the last one.
+    public static func quantized(_ measurement: CGFloat) -> CGFloat {
+        (measurement / measurementGrain).rounded() * measurementGrain
+    }
 }

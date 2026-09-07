@@ -164,4 +164,35 @@ final class PanelHeightTests: XCTestCase {
             budget: PanelHeight.panelMaxHeight)
         XCTAssertEqual(atCap, PanelHeight.panelMaxHeight)
     }
+
+    // MARK: - `quantized` — the runaway `NSPopover` layout fix
+
+    func testQuantizedSnapsRawMeasurementsToTheGrain() {
+        XCTAssertEqual(PanelHeight.quantized(41.998), 42.0)
+        XCTAssertEqual(PanelHeight.quantized(42.24), 42.0)
+        XCTAssertEqual(PanelHeight.quantized(42.26), 42.5)
+    }
+
+    /// The claim the fix rests on: a `GeometryReader` measurement that never
+    /// repeats bit-for-bit across layout passes — the shape AppKit's own
+    /// safe-area-inset recomputation produces on an `NSPopover` resize, and
+    /// exactly what `onPreferenceChange` cannot tell apart from a row that is
+    /// still genuinely growing — publishes the SAME quantized value once every
+    /// raw measurement lands within half a grain of the others. That equality
+    /// is what stops `onPreferenceChange` from re-firing, `@State` from
+    /// re-assigning, and the layout pass it triggers from ever running again.
+    ///
+    /// Fails on the change this guards against: quantizing removed (return the
+    /// raw measurement unchanged) leaves 20 distinct published values instead
+    /// of one, which is the non-terminating case this arithmetic exists to
+    /// close off.
+    func testQuantizedStopsSubPixelJitterFromEverPublishingADifferentValue() {
+        let jitter: [CGFloat] = (0..<20).map { 118.0 + CGFloat($0) * 0.00001 }
+        XCTAssertEqual(Set(jitter).count, jitter.count, "the raw values really do all differ")
+
+        let quantizedValues = Set(jitter.map(PanelHeight.quantized))
+        XCTAssertEqual(
+            quantizedValues, [118.0],
+            "every measurement within the grain must publish the identical value")
+    }
 }

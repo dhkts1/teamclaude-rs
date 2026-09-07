@@ -180,7 +180,8 @@ struct FleetView: View {
                 .background(
                     GeometryReader { proxy in
                         Color.clear.preference(
-                            key: UsageLineHeightKey.self, value: proxy.size.height)
+                            key: UsageLineHeightKey.self,
+                            value: PanelHeight.quantized(proxy.size.height))
                     }
                 )
                 .overlay(alignment: .topLeading) {
@@ -191,7 +192,8 @@ struct FleetView: View {
                         .background(
                             GeometryReader { proxy in
                                 Color.clear.preference(
-                                    key: UsageLineBaselineKey.self, value: proxy.size.height)
+                                    key: UsageLineBaselineKey.self,
+                                    value: PanelHeight.quantized(proxy.size.height))
                             }
                         )
                 }
@@ -357,7 +359,8 @@ struct FleetView: View {
         .background(
             GeometryReader { proxy in
                 Color.clear.preference(
-                    key: RowHeightsKey.self, value: [account.id: proxy.size.height])
+                    key: RowHeightsKey.self,
+                    value: [account.id: PanelHeight.quantized(proxy.size.height)])
             }
         )
     }
