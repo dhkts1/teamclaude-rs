@@ -164,7 +164,8 @@ enum ShellProbe {
                     + "bounds=\(Int(bounds.width))x\(Int(bounds.height)))"))
 
         guard let button else {
-            report(checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
+            report(
+                checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
                 notes: notes)
             exit(1)
         }
@@ -306,7 +307,8 @@ enum ShellProbe {
         //     so the gauge is right in both while the cup stays cyan in both.
         checks.append(appearanceCheck())
 
-        report(checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
+        report(
+            checks, environment: environment(shell, occlusionAtOpen: occlusionAtOpen),
             notes: notes)
         exit(checks.allSatisfy(\.passed) ? 0 : 1)
     }
@@ -429,7 +431,9 @@ enum ShellProbe {
                     colour.alphaComponent > 0.35
                 else { continue }
                 out.opaque += 1
-                let r = colour.redComponent, g = colour.greenComponent, b = colour.blueComponent
+                let r = colour.redComponent
+                let g = colour.greenComponent
+                let b = colour.blueComponent
                 if g - r > 0.15 && b - r > 0.15 {
                     out.cyan += 1
                 } else {
@@ -501,8 +505,9 @@ enum ShellProbe {
     /// One line per assertion, and the verdict grep-able on its own line.
     private static func report(_ checks: [Check], environment: String, notes: [String]) {
         for check in checks.sorted(by: { $0.number < $1.number }) {
-            print("shell-probe: \(check.passed ? "PASS" : "FAIL") \(check.number). "
-                + "\(check.name) — \(check.detail)")
+            print(
+                "shell-probe: \(check.passed ? "PASS" : "FAIL") \(check.number). "
+                    + "\(check.name) — \(check.detail)")
         }
         for note in notes {
             print("shell-probe: NOTE \(note)")
@@ -532,6 +537,8 @@ enum ShellProbe {
         let rows = (1...13).map { index in
             """
             {"name":"probe-\(index)@example.com","priority":0,"status":"active",
+             "plan":"\(index % 2 == 0 ? "Team Standard" : "Max 20x")",
+             "orgUuid":"\(index % 2 == 0 ? "22222222-2222-2222-2222-222222222222" : "11111111-1111-1111-1111-111111111111")",
              "disabled":false,"quota":0.\(index % 9 + 1),"quotaState":"ok",
              "fiveHour":0.1,"sevenDay":0.1,
              "sevenDayOi":0.1,"sevenDayOiState":"ok","sevenDayOiResetAtMs":\(fableReset),

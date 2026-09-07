@@ -348,7 +348,7 @@ struct FleetView: View {
             accounts: accounts,
             control: control,
             onChanged: { await poller.pollOnce() },
-            onRelogin: { reloginAccount(account.name) },
+            onRelogin: { reloginAccount(account.ref) },
             groupController: groupController,
             removeController: removeController,
             allAccounts: fleet.accounts,
@@ -696,8 +696,10 @@ struct FleetView: View {
     /// through so the Terminal script can name it. Surfaces a failure the same
     /// way — a button that silently does nothing is worse than one that says
     /// why.
-    private func reloginAccount(_ name: String) {
-        if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
+    private func reloginAccount(_ account: AccountRef) {
+        if case .failure(let why) = LoginLauncher.launch(
+            reloggingIn: account.name, org: account.orgUuid)
+        {
             switch why {
             case .toolMissing(let searched):
                 loginError = "tcr not found (searched \(searched.count) locations)."
@@ -1141,6 +1143,40 @@ struct AccountRow: View {
     /// a phantom checkmark on an older `tcr` build (which cannot even confirm
     /// the concept exists) would be worse than the feature simply not
     /// appearing yet.
+    /// The account's plan, beside the name — `MAX 20X`, `TEAM 5X`,
+    /// `TEAM STANDARD`.
+    ///
+    /// It sits next to the NAME rather than out with the rotation pills because
+    /// it is a fact about which account this is, not about how it is behaving
+    /// right now. On this fleet the same email appears twice, and before this
+    /// tag existed the two rows were visually identical — the panel simply had
+    /// no way to say which was the personal Max org and which the company Team.
+    ///
+    /// Silent when the server reports no plan (never profiled, or a build that
+    /// predates the field). A guessed label here would defeat the one thing the
+    /// tag is for. `Tok.inkFaint` — the neutral hue, not one of the quota or
+    /// rotation status colours: a plan is a designation, not a measured state,
+    /// and tinting it like one would make an ordinary account look alarming.
+    ///
+    /// Dim TEXT rather than a ``StatusPill``, and that is a width decision, not
+    /// a taste one. As a pill this read `TEAM STANDARD` — uppercased, tracked,
+    /// padded and bordered — and the row is `Tok.panelWidth` (380pt) wide: the
+    /// pill's chrome pushed the name past its budget and rendered it as `h…m`.
+    /// A tag whose whole job is telling two same-named rows apart must not be
+    /// the thing that erases the name. Plain text at the same font, with no
+    /// chrome and no uppercasing, is narrow enough for the worst row (unmeasured
+    /// + rotating + the longest label) and still reads as secondary.
+    @ViewBuilder
+    private var planIndicator: some View {
+        if let plan = account.plan, !plan.isEmpty {
+            Text(plan)
+                .font(Tok.pillFont)
+                .foregroundStyle(Tok.inkFaint)
+                .fixedSize()
+                .help("This account's plan, as Anthropic reports it for its organization.")
+        }
+    }
+
     @ViewBuilder
     private var controlIndicator: some View {
         if control.isControl(account.name) {
@@ -1192,6 +1228,14 @@ struct AccountRow: View {
     /// actionable.
     private var rowAccessibilityLabel: String {
         var parts = [account.name]
+        // Spoken right after the name, for the same reason the tag is drawn
+        // there: on a fleet holding one email twice, the plan is what tells a
+        // listener WHICH of two identically-named rows they are on. Without it
+        // a VoiceOver user hears the same name announced twice with no way to
+        // tell the personal Max org from the company Team one.
+        if let plan = account.plan, !plan.isEmpty {
+            parts.append(plan)
+        }
         // Spoken beside the name for the same reason `controlIndicator` is
         // drawn beside it: this is an identity fact, not a rotation/quota one,
         // and a VoiceOver user reaching the row should not have to open the
@@ -1259,22 +1303,22 @@ struct AccountRow: View {
         // spoken when it did, because a gate that decides whether Fable
         // requests can land here is not a sighted-user-only fact.
         if let fable = account.fableWeeklySpokenLabel(now: Date()) { parts.append(fable) }
-        if let failure = accounts.failure(for: account.name) {
+        if let failure = accounts.failure(for: account.ref) {
             parts.append("last action failed: \(failure.summary)")
         }
-        if let failure = removeController.failure(for: account.name) {
+        if let failure = removeController.failure(for: account.ref) {
             parts.append("last action failed: \(failure.summary)")
         }
         // Spoken for the same reason the pill is: a confirmation only a sighted
         // user gets is half built, and the `✓` in `rowLabel` is punctuation to a
         // screen reader.
-        if let verdict = accounts.verdict(for: account.name, reportedDisabled: account.disabled) {
+        if let verdict = accounts.verdict(for: account.ref, reportedDisabled: account.disabled) {
             parts.append(verdict.spokenLabel)
         }
         // Same reason `removalNoticeLine` is drawn at all: a VoiceOver user
         // gets no other signal that the delete landed but the row did not
         // change, since nothing here re-derives the fleet from the config.
-        if removeController.needsRestart(account.name) {
+        if removeController.needsRestart(account.ref) {
             parts.append("removed from config and stopped, stays listed as disabled until the proxy restarts")
         }
         return parts.joined(separator: ", ")
@@ -1359,7 +1403,7 @@ struct AccountRow: View {
         Button(enabling ? "Enable" : "Disable") {
             Task { await performToggle(enabling: enabling) }
         }
-        .disabled(accounts.isPending(account.name))
+        .disabled(accounts.isPending(account.ref))
         if account.health == .needsRelogin {
             Button("Re-login…") { onRelogin() }
         }
@@ -1372,14 +1416,18 @@ struct AccountRow: View {
         if !control.unavailable {
             if control.isControl(account.name) {
                 Button("Clear Control Account") {
-                    Task { await performSetControl(name: nil, key: account.name) }
+                    Task { await performSetControl(name: nil, key: account.id) }
                 }
-                .disabled(control.isPending(account.name))
+                .disabled(control.isPending(account.id))
             } else {
                 Button("Use as Control Account") {
-                    Task { await performSetControl(name: account.name, key: account.name) }
+                    // `name` is what `tcr control` stores (a bare string — see
+                    // `ControlAccountController.isControl`), while `key` is
+                    // this row's own identity, so the spinner lands on the row
+                    // that was clicked even when two rows share a name.
+                    Task { await performSetControl(name: account.name, key: account.id) }
                 }
-                .disabled(control.isPending(account.name))
+                .disabled(control.isPending(account.id))
             }
         }
         Divider()
@@ -1401,7 +1449,7 @@ struct AccountRow: View {
         Button("Delete Account…") {
             confirmDeleteAccount()
         }
-        .disabled(removeController.isPending(account.name))
+        .disabled(removeController.isPending(account.ref))
     }
 
     /// One entry per ``Account/groupMenuActions``, wired directly to
@@ -1602,16 +1650,21 @@ struct AccountRow: View {
         delete.keyEquivalent = ""
 
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        Task { await removeController.remove(account: account.name) }
+        Task { await removeController.remove(account: account.ref) }
     }
 
     /// Shared by "Copy Account Name" and the per-group command copy — one
     /// place that clears then sets, so every copy in this menu behaves the
     /// same way.
-    /// `tcr token <name>` off the main actor, then the pasteboard. A failure
-    /// replaces any earlier one on this row; a success clears it.
+    /// `tcr token <name> [--org <uuid>]` off the main actor, then the
+    /// pasteboard. A failure replaces any earlier one on this row; a success
+    /// clears it.
+    ///
+    /// The `--org` is what makes this work at all on a fleet holding one email
+    /// twice: without it `tcr` refused with `'…' is ambiguous — matches 2
+    /// accounts … Narrow with --org`, so neither row's token could be copied.
     private func performCopyToken() async {
-        switch await TokenCommand.fetch(query: account.name) {
+        switch await TokenCommand.fetch(query: account.name, org: account.orgUuid) {
         case .success(let token):
             copyToPasteboard(token)
             tokenCopyFailure = nil
@@ -1707,13 +1760,13 @@ struct AccountRow: View {
         // cannot see it — `disabled` flipped, so the comparison confirms.
         // Losing it here is what let the row stamp `parked ✓` on a change
         // that would not survive a restart.
-        let attempt = await accounts.setEnabled(enabling, account: account.name)
+        let attempt = await accounts.setEnabled(enabling, account: account.ref)
         guard case .accepted(let notice) = attempt else { return }
         let readback = await onChanged()
         accounts.record(
             readback: readback,
             requestedEnabled: enabling,
-            account: account.name,
+            account: account.ref,
             notice: notice
         )
     }
@@ -1732,6 +1785,15 @@ struct AccountRow: View {
                     .truncationMode(.middle)
                     .help(account.name)
                     .textSelection(.enabled)
+                    // The name outranks everything beside it for width. Without
+                    // this the plan tag — `TEAM STANDARD` is the long one —
+                    // took its space from the name, and a row rendered as
+                    // `h…m TEAM STANDARD`: the tag exists to tell two rows
+                    // apart, so a tag that erases the name it is qualifying is
+                    // worse than no tag. Pills are `fixedSize()` and small; the
+                    // name is the row's identity and shrinks last.
+                    .layoutPriority(1)
+                planIndicator
                 controlIndicator
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
@@ -1913,7 +1975,7 @@ struct AccountRow: View {
                     .foregroundStyle(Tok.spent)
                     .lineLimit(2)
             }
-            if let failure = accounts.failure(for: account.name) {
+            if let failure = accounts.failure(for: account.ref) {
                 // `tcr`'s own words, verbatim. A toggle that did not happen must
                 // never be indistinguishable from one that did.
                 Label(failure.summary, systemImage: Tok.unreadableGlyph)
@@ -1921,7 +1983,7 @@ struct AccountRow: View {
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if let failure = removeController.failure(for: account.name) {
+            if let failure = removeController.failure(for: account.ref) {
                 Label(failure.summary, systemImage: Tok.unreadableGlyph)
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.spent)
@@ -2012,7 +2074,7 @@ struct AccountRow: View {
     /// colour the line above reserves for a `tcr` failure.
     @ViewBuilder
     private var removalNoticeLine: some View {
-        if removeController.needsRestart(account.name) {
+        if removeController.needsRestart(account.ref) {
             Label(
                 "Removed from config and stopped. Stays listed as disabled until the proxy restarts.",
                 systemImage: "arrow.triangle.2.circlepath"
@@ -2033,7 +2095,7 @@ struct AccountRow: View {
     /// tellable apart.
     @ViewBuilder
     private var verdictLine: some View {
-        if let verdict = accounts.verdict(for: account.name, reportedDisabled: account.disabled) {
+        if let verdict = accounts.verdict(for: account.ref, reportedDisabled: account.disabled) {
             Label(verdict.rowLabel, systemImage: Self.verdictGlyph(verdict))
                 .font(Tok.detailFont)
                 .foregroundStyle(Self.verdictTint(verdict))
@@ -2095,7 +2157,7 @@ struct AccountRow: View {
     /// `disabled` field so the label always names what the click will do.
     private var toggleButton: some View {
         let enabling = account.disabled
-        let pending = accounts.isPending(account.name)
+        let pending = accounts.isPending(account.ref)
         // A bare "…" names neither the action nor its progress, and a screen
         // reader announces it as punctuation. The button is already disabled
         // while in flight, so its label is the only signal anything is happening.

@@ -75,7 +75,7 @@ final class RemoveAccountCommandTests: XCTestCase {
 @MainActor
 final class RemoveAccountControllerTests: XCTestCase {
 
-    private let alice = "alice@example.com"
+    private let alice = AccountRef(name: "alice@example.com")
 
     func testNeverRemovedByDefault() {
         let controller = RemoveAccountController()

@@ -17,7 +17,7 @@ import XCTest
 /// Account names are obviously fake — this repository is public.
 final class ToggleVerdictTests: XCTestCase {
 
-    private let alice = "alice@example.com"
+    private let alice = AccountRef(name: "alice@example.com")
 
     /// `tcr`'s own words on the success path, from the live reproduction: the park
     /// applied to the running rotation, no config entry matched it, so it comes
@@ -381,7 +381,9 @@ final class ToggleVerdictTests: XCTestCase {
             .notHonoured(requestedEnabled: false)
         )
         // A verdict for one account must not surface on another row.
-        XCTAssertNil(controller.verdict(for: "bob@example.com", reportedDisabled: false, now: now))
+        XCTAssertNil(
+            controller.verdict(
+                for: AccountRef(name: "bob@example.com"), reportedDisabled: false, now: now))
     }
 
     /// The whole path the row takes, with the durability warning in it: what the
@@ -417,7 +419,19 @@ final class ToggleVerdictTests: XCTestCase {
 /// Inert account with only the fields this comparison reads. `status` is
 /// deliberately "active" even when parked — that is what live output does, and it
 /// is why `disabled` is the only field compared.
+///
+/// Takes the ``AccountRef`` rather than a bare name so a fixture row and the
+/// verdict looking it up carry the SAME identity — including its org, which is
+/// what the lookup now matches on.
+private func account(_ ref: AccountRef, disabled: Bool) -> Account {
+    account(name: ref.name, orgUuid: ref.orgUuid, disabled: disabled)
+}
+
 private func account(_ name: String, disabled: Bool) -> Account {
+    account(name: name, orgUuid: nil, disabled: disabled)
+}
+
+private func account(name: String, orgUuid: String?, disabled: Bool) -> Account {
     Account(
         name: name,
         priority: 1,
@@ -440,6 +454,7 @@ private func account(_ name: String, disabled: Bool) -> Account {
         streamErrorCount: 0,
         source: .live,
         serverSha: "abc1234",
-        serverDirty: false
+        serverDirty: false,
+        orgUuid: orgUuid
     )
 }

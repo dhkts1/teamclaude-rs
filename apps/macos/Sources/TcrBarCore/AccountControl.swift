@@ -39,12 +39,25 @@ import Foundation
 /// ``ToggleVerdict``. The panel still only ever asserts what `tcr status`
 /// reports; it just no longer treats exit 0 as evidence that anything happened.
 public enum AccountCommand {
-    /// The complete argument vector. `name` is passed positionally and verbatim —
-    /// no `--org`, no flags, nothing that could name a process.
+    /// The complete argument vector. `name` is passed positionally and
+    /// verbatim; nothing here is shell-interpreted.
+    ///
+    /// `org` narrows an ambiguous name, exactly as it does for
+    /// ``TokenCommand/arguments(query:org:)`` and
+    /// ``RemoveAccountCommand/arguments(query:org:)``. It is not optional
+    /// decoration: point 2 above says a name resolves "to that row or to
+    /// nothing, except where two accounts share an email across orgs, which
+    /// `match_one` returns as ambiguous rather than picking one" — and that
+    /// exception is the fleet's ordinary state, not a corner. Without the flag
+    /// the toggle simply refuses on those rows.
+    ///
+    /// Omitted entirely when `org` is `nil`, so a row from a server that
+    /// reports no org builds precisely the command it built before.
     ///
     /// `enabled: true` means "put this account back in rotation".
-    public static func arguments(enabled: Bool, name: String) -> [String] {
-        [enabled ? "enable" : "disable", name]
+    public static func arguments(enabled: Bool, name: String, org: String? = nil) -> [String] {
+        guard let org else { return [enabled ? "enable" : "disable", name] }
+        return [enabled ? "enable" : "disable", name, "--org", org]
     }
 
     /// Why a toggle did not happen. Carries the CLI's own words; this app does not
@@ -92,7 +105,8 @@ public enum AccountCommand {
     }
 
     /// Blocking invocation — always called off the main actor.
-    nonisolated static func perform(enabled: Bool, name: String) -> Outcome {
+    nonisolated static func perform(enabled: Bool, account: AccountRef) -> Outcome {
+        let name = account.name
         switch TcrTool.resolve() {
         case .failure(let notFound):
             return .failed(
@@ -105,7 +119,7 @@ public enum AccountCommand {
             do {
                 let output = try TcrTool.run(
                     executable: executable,
-                    arguments: arguments(enabled: enabled, name: name)
+                    arguments: arguments(enabled: enabled, name: name, org: account.orgUuid)
                 )
                 return classify(enabling: enabled, exitCode: output.exitCode, stderr: output.stderr)
             } catch {
@@ -119,7 +133,11 @@ public enum AccountCommand {
 /// Per-account toggle state for the panel: which rows have a call in flight, and
 /// which rows have a failure that has not been superseded by a later attempt.
 ///
-/// Keyed by account name, which is `Account.id`.
+/// Keyed by ``AccountRef/id`` — the ORG-QUALIFIED identity, not the bare name.
+/// Keying by name collapsed the fleet's two same-email rows into one entry, so a
+/// failure or an in-flight spinner belonging to one row rendered on both. That
+/// key must stay identical to the one `ForEach` uses, which is why both come
+/// from ``AccountRef`` rather than being spelled out twice.
 @MainActor
 public final class AccountController: ObservableObject {
     @Published public private(set) var pending: Set<String> = []
@@ -130,8 +148,10 @@ public final class AccountController: ObservableObject {
 
     public init() {}
 
-    public func isPending(_ name: String) -> Bool { pending.contains(name) }
-    public func failure(for name: String) -> AccountCommand.Failure? { failures[name] }
+    public func isPending(_ account: AccountRef) -> Bool { pending.contains(account.id) }
+    public func failure(for account: AccountRef) -> AccountCommand.Failure? {
+        failures[account.id]
+    }
 
     /// Record what the poll that followed a successful toggle reported. Called by
     /// the row immediately after its refresh, so the verdict describes the same
@@ -142,17 +162,18 @@ public final class AccountController: ObservableObject {
     public func record(
         readback: PollState,
         requestedEnabled: Bool,
-        account name: String,
+        account: AccountRef,
         notice: String? = nil,
         now: Date = Date()
     ) {
+        let key = account.id
         let verdict = ToggleReadback.verdict(
             requestedEnabled: requestedEnabled,
-            account: name,
+            account: account,
             readback: readback,
             notice: notice
         )
-        verdicts[name] = RecordedVerdict(verdict: verdict, at: now)
+        verdicts[key] = RecordedVerdict(verdict: verdict, at: now)
         // Every verdict ages out (see ``ToggleReadback/visible(_:reportedDisabled:now:)``),
         // and `visible` is the authority on how long. This timer exists only so the
         // expiry is actually DRAWN: nothing else republishes when the deadline
@@ -164,12 +185,12 @@ public final class AccountController: ObservableObject {
         // normally clear on agreement long before their deadline, but the case the
         // deadline exists for — an account that left the fleet, where agreement can
         // never come — is exactly the case where nothing else would ever clear it.
-        let recorded = verdicts[name]
+        let recorded = verdicts[key]
         let lifetime = ToggleReadback.lifetime(of: verdict)
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(lifetime * 1_000_000_000))
-            guard let self, self.verdicts[name] == recorded else { return }
-            self.verdicts[name] = nil
+            guard let self, self.verdicts[key] == recorded else { return }
+            self.verdicts[key] = nil
         }
     }
 
@@ -177,11 +198,11 @@ public final class AccountController: ObservableObject {
     /// what the *current* fleet read says about the account, which is what stops a
     /// confirmation from outliving its truth.
     public func verdict(
-        for name: String,
+        for account: AccountRef,
         reportedDisabled: Bool?,
         now: Date = Date()
     ) -> ToggleVerdict? {
-        ToggleReadback.visible(verdicts[name], reportedDisabled: reportedDisabled, now: now)
+        ToggleReadback.visible(verdicts[account.id], reportedDisabled: reportedDisabled, now: now)
     }
 
     /// What a click did, as far as the subprocess can say.
@@ -201,19 +222,20 @@ public final class AccountController: ObservableObject {
     /// to decide whether a status refresh is worth doing, never to update a local
     /// copy of `disabled`.
     @discardableResult
-    public func setEnabled(_ enabled: Bool, account name: String) async -> Attempt {
-        guard !pending.contains(name) else { return .skipped }
-        pending.insert(name)
+    public func setEnabled(_ enabled: Bool, account: AccountRef) async -> Attempt {
+        let key = account.id
+        guard !pending.contains(key) else { return .skipped }
+        pending.insert(key)
         // A new attempt clears the previous verdict; a stale error beside a
         // now-succeeding row would be its own lie. The read-back verdict goes for
         // the same reason: a `parked ✓` left over from the last click must not sit
         // beside a call that is still in flight and might not be honoured.
-        failures[name] = nil
-        verdicts[name] = nil
-        defer { pending.remove(name) }
+        failures[key] = nil
+        verdicts[key] = nil
+        defer { pending.remove(key) }
 
         let outcome = await Task.detached(priority: .userInitiated) {
-            AccountCommand.perform(enabled: enabled, name: name)
+            AccountCommand.perform(enabled: enabled, account: account)
         }.value
 
         switch outcome {
@@ -222,7 +244,7 @@ public final class AccountController: ObservableObject {
         case .spoke(let notice):
             return .accepted(notice: notice)
         case .failed(let failure):
-            failures[name] = failure
+            failures[key] = failure
             return .refused
         }
     }

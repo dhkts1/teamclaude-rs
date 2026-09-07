@@ -225,25 +225,31 @@ public enum ToggleReadback {
     /// prose to decide how bad it is.
     public static func verdict(
         requestedEnabled: Bool,
-        account name: String,
+        account ref: AccountRef,
         readback: PollState,
         notice: String? = nil
     ) -> ToggleVerdict {
         let plain = plainVerdict(
-            requestedEnabled: requestedEnabled, account: name, readback: readback)
+            requestedEnabled: requestedEnabled, account: ref, readback: readback)
         guard let notice, !notice.isEmpty else { return plain }
         return .spokeUp(notice: notice, about: plain)
     }
 
     /// The read-back comparison alone, with no knowledge of what `tcr` printed.
+    ///
+    /// The row is found by ORG-QUALIFIED id, not by name. Matching on name alone
+    /// picked whichever of the fleet's two same-email rows came first, so a
+    /// toggle of one could be "confirmed" against the OTHER row's `disabled` —
+    /// a confirmation of something that never happened, which is precisely the
+    /// class of lie this type exists to prevent.
     private static func plainVerdict(
         requestedEnabled: Bool,
-        account name: String,
+        account ref: AccountRef,
         readback: PollState
     ) -> ToggleVerdict {
         switch readback {
         case .loaded(let fleet):
-            guard let account = fleet.accounts.first(where: { $0.name == name }) else {
+            guard let account = fleet.accounts.first(where: { $0.id == ref.id }) else {
                 return .unverified(
                     requestedEnabled: requestedEnabled,
                     reason: "the fleet no longer lists this account"
