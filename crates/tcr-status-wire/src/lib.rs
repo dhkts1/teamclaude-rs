@@ -146,7 +146,7 @@ pub struct AccountStatusRow {
     pub quota_state: String,
     /// Kebab-case `GateReason` token: `"ok"`, `"hold"`, `"five-hour"`,
     /// `"seven-day"`, `"fable-weekly"`, `"standard"`, `"login"`, `"rejected"`,
-    /// `"disabled"`, or `"reserved"`.
+    /// `"disabled"`, `"reserved"`, or `"parked"`.
     pub gate: String,
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
@@ -181,6 +181,15 @@ pub struct AccountStatusRow {
     pub rate_limited_until_ms: Option<i64>,
     pub groups: Vec<String>,
     pub reserved_groups: Vec<String>,
+    /// The subset of [`Self::groups`] marked `parked`
+    /// (`groupSettings.<g>.parked`) — a non-empty list means this account is
+    /// held out of rotation entirely, the same way `disabled` does. Rides
+    /// beside `reserved_groups` and for the same reason: the panel names the
+    /// group that parked a row, which it cannot do from membership alone.
+    /// `#[serde(default)]` so a row from a server predating the field decodes
+    /// as "nothing parked" rather than failing.
+    #[serde(default)]
+    pub parked_groups: Vec<String>,
     /// The subset of [`Self::groups`] that have opted in to letting an explicit
     /// `--group` ask select the control account (`groupSettings.<g>.allowControlAccount`).
     /// Rides beside `reserved_groups` and for the same reason: the panel decides

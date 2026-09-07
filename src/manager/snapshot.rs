@@ -116,6 +116,7 @@ impl Manager {
         // config file's mtime has not moved.
         self.reload_groups_if_changed();
         let reserved = self.reserved_groups();
+        let parked = self.parked_groups();
         let control_allowed = self.control_allowed_groups();
         let now_ms = odt_to_ms(now);
         // (1) UNDER THE AFFINITY LOCK ONLY: copy every session's PIN out into a
@@ -158,7 +159,7 @@ impl Manager {
                 // traffic see right now", the same question `retry_after_hint`
                 // asks (see `Self::account_gate`'s doc-comment).
                 let (gate, free_at) =
-                    Self::account_gate(a, threshold, now, now_ms, false, None, &reserved);
+                    Self::account_gate(a, threshold, now, now_ms, false, None, &reserved, &parked);
                 let mut reserved_groups: Vec<String> = a
                     .groups
                     .iter()
@@ -166,6 +167,13 @@ impl Manager {
                     .cloned()
                     .collect();
                 reserved_groups.sort();
+                let mut parked_groups: Vec<String> = a
+                    .groups
+                    .iter()
+                    .filter(|g| parked.contains(*g))
+                    .cloned()
+                    .collect();
+                parked_groups.sort();
                 let mut control_allowed_groups: Vec<String> = a
                     .groups
                     .iter()
@@ -229,6 +237,7 @@ impl Manager {
                     last_stream_error: a.last_stream_error.clone(),
                     groups: a.groups.clone(),
                     reserved_groups,
+                    parked_groups,
                     control_allowed_groups,
                     // Always populated here: this snapshot is built by a
                     // process that has a usage tracker, so the numbers are

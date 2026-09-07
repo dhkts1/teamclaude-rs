@@ -432,6 +432,12 @@ public struct StatusPill: View {
 /// meaning riding the same channel (filled vs. outlined, a different hue)
 /// would ask the reader to disentangle two facts from one visual cue. The
 /// glyph is a second, independent channel.
+///
+/// A PARKED group takes a pause glyph plus a dimmed wash of its own colour —
+/// the hue still names the group, the dimming says "held back", and the two
+/// glyphs stack for a group that is both. Dimming is used here and not for
+/// `reserved` because parking is the stronger fact: a reserved group still
+/// serves its own traffic, a parked one serves none.
 public struct GroupChip: View {
     private let tag: GroupTag
 
@@ -444,13 +450,28 @@ public struct GroupChip: View {
     /// translucent wash over an operator-chosen hue would mis-render the
     /// luminance ``foreground`` was computed against.
     private var background: Color {
-        guard let rgb = tag.background else { return Tok.wash(Tok.inkFaint) }
-        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+        // A parked group is dimmed rather than recoloured: the hue still has to
+        // say WHICH group this is, so the state rides opacity plus the glyph
+        // below, two channels neither of which is the identity one. Applied to
+        // the neutral fallback too — a colourless tag is exactly the case where
+        // the reader has the least else to go on.
+        let base = tag.background.map { Color(red: $0.red, green: $0.green, blue: $0.blue) }
+        let solid = base ?? Tok.wash(Tok.inkFaint)
+        return tag.isParked ? solid.opacity(Self.parkedOpacity) : solid
     }
 
+    /// Enough to read as "held back" beside a live tag on the same row, not so
+    /// little that the group's own colour stops being identifiable. Named
+    /// rather than inlined because `background` and `border` must move
+    /// together — two literals here would drift.
+    private static let parkedOpacity: Double = 0.35
+
     private var border: Color {
-        guard let rgb = tag.background else { return Tok.line(Tok.inkFaint) }
-        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue).opacity(0.6)
+        let base = tag.background.map {
+            Color(red: $0.red, green: $0.green, blue: $0.blue).opacity(0.6)
+        }
+        let edge = base ?? Tok.line(Tok.inkFaint)
+        return tag.isParked ? edge.opacity(Self.parkedOpacity) : edge
     }
 
     /// Chosen from the background's relative luminance
@@ -462,12 +483,32 @@ public struct GroupChip: View {
     /// is already tuned against the dark panel the same way every other
     /// `StatusPill` is.
     private var foreground: Color {
+        // A PARKED chip's fill is a dimmed wash of the group's hue, so the
+        // black/white choice below — computed against the FULL-strength colour
+        // — is the wrong answer for it: `#32d74b` is dark enough to ask for
+        // white text, and at 35% over a light panel that white sat on a pale
+        // green and was barely readable (caught in `15-parked-group-light.png`,
+        // not by the type checker). A wash takes panel ink, exactly as the
+        // no-colour fallback below already does.
+        //
+        // `ink`, not the secondary `inkDim`: measured off the rendered PNG,
+        // `inkDim` on the dimmed dark-mode chip is 3.98:1, under AA for text
+        // this small, while `ink` reads 6.5:1 dark and 12.9:1 light. The wash
+        // is what says "held back"; the label still has to be readable.
+        if tag.isParked { return Tok.ink }
         guard let rgb = tag.background else { return Tok.ink }
         return GroupTagColor.isLight(rgb) ? .black : .white
     }
 
     public var body: some View {
         HStack(spacing: 2) {
+            if tag.isParked {
+                // Its own glyph, drawn BEFORE the lock so the two read as two
+                // facts when a group is both parked and reserved. A dimmed tag
+                // alone would be ambiguous with an unresolved colour.
+                Image(systemName: "pause.fill")
+                    .font(.system(size: Tok.detailFontSize - 2, weight: .bold))
+            }
             if tag.isReserved {
                 Image(systemName: "lock.fill")
                     .font(.system(size: Tok.detailFontSize - 2, weight: .bold))
@@ -489,18 +530,24 @@ public struct GroupChip: View {
         )
         .fixedSize()
         .help(
-            tag.isReserved
-                // Both directions, because half the sentence is how the pool-facing
-                // half got read as the whole feature: "held out of the general pool"
-                // says nothing about whether THIS group's traffic can wander off to
-                // another account, and it can't.
-                ? "\(tag.name) (reserved — pool traffic never uses this account, "
-                    + "and --group \(tag.name) never serves from outside the group)"
-                // Named explicitly rather than left bare: a group tag with no lock is
-                // decoration, and reading it as isolation is what lets pool traffic
-                // sit on an account someone believed was private.
-                : "\(tag.name) (tagged only — not reserved, so pool traffic still "
-                    + "uses this account and --group \(tag.name) may be served by another)"
+            tag.isParked
+                // Said first and on its own: a parked group serves nothing at
+                // all, so whether it is ALSO reserved changes nothing an
+                // operator can act on right now.
+                ? "\(tag.name) (parked — every member is out of rotation until "
+                    + "`tcr group unpark \(tag.name)`)"
+                : tag.isReserved
+                    // Both directions, because half the sentence is how the pool-facing
+                    // half got read as the whole feature: "held out of the general pool"
+                    // says nothing about whether THIS group's traffic can wander off to
+                    // another account, and it can't.
+                    ? "\(tag.name) (reserved — pool traffic never uses this account, "
+                        + "and --group \(tag.name) never serves from outside the group)"
+                        // Named explicitly rather than left bare: a group tag with no lock is
+                        // decoration, and reading it as isolation is what lets pool traffic
+                        // sit on an account someone believed was private.
+                    : "\(tag.name) (tagged only — not reserved, so pool traffic still "
+                        + "uses this account and --group \(tag.name) may be served by another)"
         )
     }
 }

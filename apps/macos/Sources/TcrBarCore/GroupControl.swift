@@ -77,6 +77,26 @@ public enum GroupCommand {
         ["group", "rm", group, "--all"]
     }
 
+    /// `tcr group park <group>` / `tcr group unpark <group>` — hold every
+    /// member of the group out of rotation, or release them.
+    ///
+    /// The one mutation in this type that a running proxy picks up WITHOUT a
+    /// restart: parking is a single `groupSettings` key, and the proxy re-reads
+    /// that file on its own cadence (`Manager::reload_groups_if_changed`). The
+    /// membership commands above are not like that, which is why this type's
+    /// header rule 1 says a change waits for a restart and why this pair says
+    /// otherwise here rather than letting the general statement cover it.
+    public static func parkArguments(group: String) -> [String] {
+        ["group", "park", group]
+    }
+
+    /// The other half of ``parkArguments(group:)``. Separate argv rather than a
+    /// boolean parameter because that is what the CLI takes, and this file's
+    /// job is to spell `tcr`'s own vocabulary rather than invent one.
+    public static func unparkArguments(group: String) -> [String] {
+        ["group", "unpark", group]
+    }
+
     /// `tcr run --group <group>` — start a Claude Code session that PREFERS this
     /// group. The only argv here that is not a mutation, and the only one a
     /// person actually wants off a group row: every other entry in this menu
@@ -314,8 +334,14 @@ public final class GroupController: ObservableObject {
         case accepted(notice: String?)
     }
 
+    /// `marksRestartNeeded` is `false` for the one mutation the running proxy
+    /// applies on its own — parking — so the panel never tells an operator to
+    /// restart for a change that is already live. Every membership command
+    /// leaves it `true`, which is the pre-existing behaviour.
     @discardableResult
-    private func run(key: String, group: String, arguments: [String]) async -> Attempt {
+    private func run(
+        key: String, group: String, arguments: [String], marksRestartNeeded: Bool = true
+    ) async -> Attempt {
         guard !pending.contains(key) else { return .skipped }
         pending.insert(key)
         failures[key] = nil
@@ -327,10 +353,10 @@ public final class GroupController: ObservableObject {
 
         switch outcome {
         case .clean:
-            appliedPendingRestart.insert(group)
+            if marksRestartNeeded { appliedPendingRestart.insert(group) }
             return .accepted(notice: nil)
         case .spoke(let notice):
-            appliedPendingRestart.insert(group)
+            if marksRestartNeeded { appliedPendingRestart.insert(group) }
             return .accepted(notice: notice)
         case .failed(let failure):
             failures[key] = failure
@@ -368,5 +394,23 @@ public final class GroupController: ObservableObject {
     @discardableResult
     public func removeAll(group: String) async -> Attempt {
         await run(key: group, group: group, arguments: GroupCommand.removeAllArguments(group: group))
+    }
+
+    /// `tcr group park <group>` / `tcr group unpark <group>`, from the group's
+    /// own menu — one call, either direction, so the menu item is a toggle
+    /// rather than two entries a reader has to tell apart.
+    ///
+    /// Keyed on `"park/<group>"`, not the bare group name: a park and a
+    /// whole-group delete are different calls about the same label, and sharing
+    /// ``removeAll(group:)``'s key would let one show the other's spinner or
+    /// error.
+    @discardableResult
+    public func setParked(group: String, parked: Bool) async -> Attempt {
+        let arguments =
+            parked
+            ? GroupCommand.parkArguments(group: group)
+            : GroupCommand.unparkArguments(group: group)
+        return await run(
+            key: "park/\(group)", group: group, arguments: arguments, marksRestartNeeded: false)
     }
 }

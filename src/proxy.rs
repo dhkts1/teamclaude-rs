@@ -4064,7 +4064,8 @@ fn unified_claim_for(reason: GateReason) -> Option<&'static str> {
         | GateReason::Login
         | GateReason::Rejected
         | GateReason::Disabled
-        | GateReason::Reserved => None,
+        | GateReason::Reserved
+        | GateReason::Parked => None,
     }
 }
 
@@ -4085,6 +4086,7 @@ fn describe_gates(gated: &std::collections::BTreeMap<GateReason, usize>) -> Stri
                 GateReason::Rejected => "rejected upstream",
                 GateReason::Disabled => "disabled",
                 GateReason::Reserved => "reserved for another group",
+                GateReason::Parked => "in a parked group",
             };
             format!("{n} {what}")
         })

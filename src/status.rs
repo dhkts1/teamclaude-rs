@@ -238,6 +238,12 @@ pub struct AccountStatus {
     /// reservation entirely.
     #[serde(default)]
     pub reserved_groups: Vec<String>,
+    /// The parked subset of [`Self::groups`], mirroring
+    /// [`AccountSnapshot::parked_groups`]. `#[serde(default)]` for the same
+    /// forward-compat reason as `reserved_groups` above — an older server
+    /// predates parking entirely.
+    #[serde(default)]
+    pub parked_groups: Vec<String>,
     /// The opted-in subset of [`Self::groups`] — see
     /// [`AccountSnapshot::control_allowed_groups`]. `#[serde(default)]` for the
     /// same forward-compat reason as the two fields above: a server that
@@ -354,6 +360,7 @@ impl StatusPayload {
                 last_stream_error: a.last_stream_error.clone(),
                 groups: a.groups.clone(),
                 reserved_groups: a.reserved_groups.clone(),
+                parked_groups: a.parked_groups.clone(),
                 control_allowed_groups: a.control_allowed_groups.clone(),
                 organization_type: a.organization_type.clone(),
                 rate_limit_tier: a.rate_limit_tier.clone(),
@@ -422,6 +429,7 @@ impl StatusPayload {
                     last_stream_error: a.last_stream_error,
                     groups: a.groups,
                     reserved_groups: a.reserved_groups,
+                    parked_groups: a.parked_groups,
                     control_allowed_groups: a.control_allowed_groups,
                     usage: a.usage,
                 }
@@ -478,6 +486,7 @@ mod tests {
                 last_stream_error: None,
                 groups: vec!["codereview".to_string()],
                 reserved_groups: vec!["codereview".to_string()],
+                parked_groups: Vec::new(),
                 control_allowed_groups: vec!["codereview".to_string()],
                 usage: None,
             }],

@@ -457,6 +457,28 @@ Unlike the shared `sevenDay` bucket, this window gates **Fable requests only** �
 request never checks it, and `held[]`/the general `quotaState` never reflect it either. It exists on
 the wire so a Fable-scoped caption and tint have something to read.
 
+### The group keys on `--json`
+
+Each row carries its group labels plus the subsets that change what the row can serve. All
+three are always arrays — `[]`, never `null`: "this account has no groups" is a known fact,
+not an unmeasured one.
+
+| key | shape | what it is |
+|---|---|---|
+| `groups` | array of strings | every label this account carries |
+| `reservedGroups` | array of strings | the subset marked `reserved` — the row serves only traffic that asked for one of its groups |
+| `parkedGroups` | array of strings | the subset marked `parked` (`tcr group park`) — non-empty means the row is out of rotation entirely, and names which group did it |
+
+A parked row's `gate` reads `"parked"`, beside the existing `"disabled"`, `"reserved"`,
+`"login"`, `"rejected"`, `"hold"`, `"five-hour"`, `"seven-day"`, `"fable-weekly"`,
+`"standard"` and `"ok"`. A row that is BOTH parked by its group and disabled on its own
+reports `"disabled"` — the row's own state outranks the group's, so the output never
+attributes a bench to a group when a person did it.
+
+```
+tcr status --json | jq -r '.[] | select(.parkedGroups | length > 0) | "\(.name)\t\(.parkedGroups | join(","))"'
+```
+
 ### The plan and org keys on `--json`
 
 Every row carries which plan the account is on, and which org it belongs to — facts to SHOW

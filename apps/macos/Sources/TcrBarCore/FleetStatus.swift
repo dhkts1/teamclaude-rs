@@ -111,7 +111,8 @@ extension QuotaState: Decodable {
 ///
 /// Rust spells these kebab-case (`src/stats.rs`'s `GateReason`, serialized by
 /// `gate_reason_token`): `ok`, `hold`, `five-hour`, `seven-day`,
-/// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`.
+/// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`,
+/// `parked`.
 ///
 /// [`Self/rejected`] is the one the panel could not see before this existed,
 /// and it is the reason the type does. Anthropic's own
@@ -1001,6 +1002,15 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// not this, but the two fields are decoded identically on principle.
     public let reservedGroups: [String]?
 
+    /// Which of this account's own `groups` are PARKED (`tcr group park`,
+    /// `groupSettings.<g>.parked`, carried on the wire as `"parkedGroups"`).
+    /// Non-empty means the server holds this row out of rotation entirely —
+    /// not merely out of the general pool, the way `reservedGroups` does.
+    /// Optional for the same forward-compat reason `reservedGroups` is: a
+    /// server built before parking existed sends no such key, and its rows must
+    /// keep decoding. `nil` and `[]` both mean "nothing parked".
+    public let parkedGroups: [String]?
+
     /// Which of this account's own `groups` have opted in to letting an
     /// explicit `--group` ask select the control account
     /// (`groupSettings.<g>.allowControlAccount`, carried on the wire as
@@ -1109,6 +1119,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         serverDirty: Bool?,
         groups: [String]? = nil,
         reservedGroups: [String]? = nil,
+        parkedGroups: [String]? = nil,
         controlAllowedGroups: [String]? = nil,
         groupColors: [String: String]? = nil,
         usage: UsageRow? = nil,
@@ -1150,6 +1161,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.serverDirty = serverDirty
         self.groups = groups
         self.reservedGroups = reservedGroups
+        self.parkedGroups = parkedGroups
         self.controlAllowedGroups = controlAllowedGroups
         self.groupColors = groupColors
         self.usage = usage
@@ -1495,13 +1507,36 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// the bridge is explicit that silence is correct here.
     public var groupTags: [GroupTag] {
         let reserved = Set(reservedGroups ?? [])
+        let parked = Set(parkedGroups ?? [])
         return (groups ?? []).sorted().map { name in
             GroupTag(
                 name: name,
                 isReserved: reserved.contains(name),
+                isParked: parked.contains(name),
                 background: (groupColors?[name]).flatMap(GroupTagColor.parse)
             )
         }
+    }
+
+    /// Whether this account is out of rotation because one of its groups is
+    /// parked — the panel's parked-by-group state, distinct from the row's own
+    /// `disabled`.
+    ///
+    /// `contains`, deliberately not `allSatisfy`, and for the same reason
+    /// ``servesGroupTrafficOnly`` gives: the server blocks the account when ANY
+    /// of its groups is parked (`Manager::parked_blocks` — `groups.iter()
+    /// .any(...)`), so an account in parked `codereview` plus plain `dev`
+    /// serves nothing either.
+    public var isParkedByGroup: Bool {
+        groupTags.contains(where: \.isParked)
+    }
+
+    /// The parked groups this row actually carries, sorted — what the pill's
+    /// help names so an operator learns WHICH group to unpark rather than
+    /// hunting for it. Derived from ``groupTags`` rather than the raw wire
+    /// array so it can never name a group the row is not in.
+    public var parkedGroupNames: [String] {
+        groupTags.filter(\.isParked).map(\.name)
     }
 
     /// Whether this account is held out of GENERAL rotation because at least one
@@ -1548,15 +1583,24 @@ public struct GroupTag: Equatable, Sendable, Identifiable {
     /// ``background`` alone — colour already carries the group's identity,
     /// so the view distinguishes a reserved tag by shape/glyph, not hue.
     public let isReserved: Bool
+    /// Held out of rotation ENTIRELY — every member of this group, until an
+    /// operator unparks it. Independent of ``isReserved``: a group can be
+    /// both, and the view draws them as two separate cues because they are two
+    /// separate facts.
+    public let isParked: Bool
     /// The wire-resolved colour for this group, or `nil` when the server
     /// never sent one (older build, or this group missing from
     /// ``Account/groupColors``) — the view falls back to a neutral token
     /// rather than guessing a colour client-side.
     public let background: GroupTagColor.RGB?
 
-    public init(name: String, isReserved: Bool, background: GroupTagColor.RGB?) {
+    public init(
+        name: String, isReserved: Bool, isParked: Bool = false,
+        background: GroupTagColor.RGB?
+    ) {
         self.name = name
         self.isReserved = isReserved
+        self.isParked = isParked
         self.background = background
     }
 

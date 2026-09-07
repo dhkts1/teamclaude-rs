@@ -35,6 +35,21 @@ final class GroupCommandTests: XCTestCase {
         )
     }
 
+    /// The park pair. Pinned verbatim because this argv is a CONTRACT with the
+    /// CLI's own subcommand shape (`src/main.rs`'s `GroupAction`), and the
+    /// panel has no way to discover a rename: a wrong verb here exits non-zero
+    /// at the moment an operator clicks, not at build time.
+    func testParkAndUnparkArguments() {
+        XCTAssertEqual(
+            GroupCommand.parkArguments(group: group),
+            ["group", "park", "codereview"]
+        )
+        XCTAssertEqual(
+            GroupCommand.unparkArguments(group: group),
+            ["group", "unpark", "codereview"]
+        )
+    }
+
     // MARK: - classification
 
     func testCleanExitZeroNoStderr() {
@@ -283,5 +298,22 @@ final class GroupControllerTests: XCTestCase {
         let controller = GroupController()
         XCTAssertNil(controller.failure(for: "\(group)/\(account)"))
         XCTAssertFalse(controller.isPending("\(group)/\(account)"))
+    }
+
+    /// The park toggle's key is the group's own, prefixed — NOT the bare group
+    /// name that ``GroupController/removeAll(group:)`` uses, and not a member
+    /// key. Sharing either would let a park show a delete's spinner or error.
+    /// Asserted through the public surface (`isPending`/`failure(for:)`), which
+    /// is what the view reads, rather than by restating the string in the view.
+    func testParkKeyDoesNotCollideWithDeleteOrMemberKeys() {
+        let controller = GroupController()
+        XCTAssertFalse(controller.isPending("park/\(group)"))
+        XCTAssertFalse(controller.isPending(group), "the whole-group delete key is separate")
+        XCTAssertNil(controller.failure(for: "park/\(group)"))
+        XCTAssertNotEqual(
+            "park/\(group)",
+            GroupController.memberKey(group: group, account: AccountRef(name: account)),
+            "a park must never share a member's key either"
+        )
     }
 }

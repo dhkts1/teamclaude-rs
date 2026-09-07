@@ -659,6 +659,83 @@ pub fn unreserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `tcr group park <group>` — hold every member of `group` out of rotation
+/// with one write (`groupSettings.<group>.parked = true`). A running proxy
+/// picks it up live, no restart: parking is one `groupSettings` key, on the
+/// same reload cadence `reserve` uses.
+///
+/// No safety rail like [`reserve_group`]'s unreserved-pool floor, deliberately:
+/// parking every account is a legitimate thing to ask for (the whole fleet
+/// down for the evening), and unlike a reservation it says so plainly in the
+/// output rather than leaving the fleet looking healthy. Idempotent: parking an
+/// already-parked group succeeds and says so. Parking a group nobody carries
+/// writes the setting and says that too, exactly as `reserve` does.
+pub fn park_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    if let Err(reason) = validate_group_label_chars(group) {
+        bail!("group {group:?}: invalid group label — {reason}");
+    }
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let members = config
+        .accounts
+        .iter()
+        .filter(|a| {
+            a.groups
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|g| g == group)
+        })
+        .count();
+
+    let outcome = config::save_group_parked(config_path, group, true)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupParkWrite::Updated => {
+            println!("group '{group}' parked. {members} account(s) held out of rotation.");
+            println!(
+                "  · no request reaches them, not even an explicit --group {group} ask, until you unpark"
+            );
+            println!("  · an account disabled on its own stays disabled after `tcr group unpark`");
+            if members == 0 {
+                eprintln!(
+                    "warning: no account currently carries '{group}' — the setting is written and applies to whoever joins it."
+                );
+            }
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
+        }
+        config::GroupParkWrite::Unchanged => {
+            println!("group '{group}' is already parked; nothing changed. {members} account(s) held out of rotation.");
+        }
+    }
+    Ok(())
+}
+
+/// `tcr group unpark <group>` — clear `group`'s `parked` flag and put its
+/// members back in rotation. Never refused: unparking only ever GROWS what can
+/// serve. Deliberately does NOT run [`validate_group_label_chars`] — same
+/// reasoning as [`unreserve_group`]: it must be able to clear a label that
+/// somehow reached the config with a bad character, and refusing would make the
+/// park permanent.
+///
+/// Touches only the group's own key: a member that carries its own `disabled`
+/// stays disabled, because the two flags are independent.
+pub fn unpark_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
+    let outcome = config::save_group_parked(config_path, group, false)
+        .with_context(|| format!("save config at {}", config_path.display()))?;
+    match outcome {
+        config::GroupParkWrite::Updated => {
+            println!("group '{group}' unparked.");
+            println!("  · a member disabled on its own is still disabled — `tcr enable <account>`");
+            println!("{GROUP_LIVE_RELOAD_NOTE}");
+        }
+        config::GroupParkWrite::Unchanged => {
+            println!("group '{group}' was not parked; nothing changed.");
+        }
+    }
+    Ok(())
+}
+
 /// `tcr group allow-control <group>` — opt `group` in to selecting the
 /// control account (`groupSettings.<group>.allowControlAccount = true`): from
 /// the next restart, an explicit `--group group` ask for inference may select
@@ -893,10 +970,15 @@ fn render_groups_text(config: &Config) -> String {
         let routes = group_routes(config, group, members);
         let _ = writeln!(
             out,
-            "group {group:width$} accounts={} members={} reserved={} allows_control={} routes={}{} color={color} color_source={}",
+            "group {group:width$} accounts={} members={} reserved={} parked={} allows_control={} routes={}{} color={color} color_source={}",
             members.len(),
             members.join(","),
             if config.is_group_reserved(group) {
+                "yes"
+            } else {
+                "no"
+            },
+            if config.is_group_parked(group) {
                 "yes"
             } else {
                 "no"
@@ -933,6 +1015,7 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
                 "accounts": members.len(),
                 "members": members,
                 "reserved": config.is_group_reserved(group),
+                "parked": config.is_group_parked(group),
                 "allowsControl": config.group_allows_control(group),
                 "routes": routes,
                 "routeBlock": if routes {
@@ -1805,6 +1888,15 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         } else {
             format!(" reserved_groups={}", a.reserved_groups.join(","))
         };
+        // Parked subset of `groups=`, greppable via `parked_groups=codereview`
+        // — same "nothing to say" idiom as `reserved_groups=` above. A row with
+        // this token is out of rotation; `state=`/`gate` says so too, this says
+        // WHICH group did it.
+        let parked_groups = if a.parked_groups.is_empty() {
+            String::new()
+        } else {
+            format!(" parked_groups={}", a.parked_groups.join(","))
+        };
         // The account's plan, greppable via `plan=Max 20x` and named by the one
         // function that names it anywhere (`tcr_status_wire::plan_label`).
         // Omitted entirely — never `plan=unknown` — for an account that has
@@ -1820,7 +1912,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             None => String::new(),
         };
         out.push_str(&format!(
-            "account {} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}\n",
+            "account {} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}{}\n",
             a.name,
             a.priority,
             plan,
@@ -1837,6 +1929,7 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
             if a.disabled { " disabled" } else { "" },
             groups,
             reserved_groups,
+            parked_groups,
         ));
     }
     out
@@ -2134,6 +2227,11 @@ fn render_accounts_json(
                 // mark a section reserved; name and shape are a fixed contract,
                 // do not change them.
                 reserved_groups: a.reserved_groups.clone(),
+                // The subset of `groups` currently PARKED (`tcr group park`),
+                // sorted. Same never-`null` contract as `reservedGroups` above,
+                // and the field the panel reads to name the group that parked a
+                // row rather than merely dimming it.
+                parked_groups: a.parked_groups.clone(),
                 control_allowed_groups: Vec::new(),
                 // Every group on the FLEET (not just this row's own groups)
                 // mapped to its resolved color — server-wide like `http1Only`
@@ -3302,6 +3400,150 @@ mod tests {
         let path = write_config("reserve-bad-label", TWO_ACCOUNTS);
         let result = reserve_group(&path, "bad\nlabel");
         assert!(result.is_err(), "a newline in the label must be rejected");
+        fs::remove_file(&path).ok();
+    }
+
+    // --- group park / unpark ------------------------------------------------
+
+    /// Mirrors [`reserve_then_unreserve_round_trips_and_is_idempotent`]:
+    /// parking persists, is scoped to the named group, survives a reload, and
+    /// both directions are idempotent. Unlike `reserve` there is no
+    /// pool-floor rail to trip, so the success path is the whole story.
+    #[test]
+    fn park_then_unpark_round_trips_and_is_idempotent() {
+        let path = write_config("park-roundtrip", GROUPED_ACCOUNTS);
+        park_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(config.is_group_parked("codereview"));
+        assert!(
+            !config.is_group_parked("dev"),
+            "only the named group changes"
+        );
+
+        // Idempotent: parking an already-parked group succeeds.
+        park_group(&path, "codereview").unwrap();
+        assert!(load(&path).is_group_parked("codereview"));
+
+        unpark_group(&path, "codereview").unwrap();
+        assert!(!load(&path).is_group_parked("codereview"));
+
+        // Idempotent the other way too.
+        unpark_group(&path, "codereview").unwrap();
+        assert!(!load(&path).is_group_parked("codereview"));
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// The two flags COMPOSE and neither write disturbs the other: a group can
+    /// be parked and reserved at once, and clearing one leaves the other
+    /// standing. Both were decided up front as independent, so this is the test
+    /// that keeps them that way.
+    #[test]
+    fn park_and_reserve_are_independent_flags() {
+        let path = write_config("park-and-reserve", GROUPED_ACCOUNTS);
+        reserve_group(&path, "codereview").unwrap();
+        park_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(config.is_group_reserved("codereview"));
+        assert!(config.is_group_parked("codereview"));
+
+        unpark_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(
+            config.is_group_reserved("codereview"),
+            "unparking must not clear the reservation"
+        );
+        assert!(!config.is_group_parked("codereview"));
+
+        park_group(&path, "codereview").unwrap();
+        unreserve_group(&path, "codereview").unwrap();
+        let config = load(&path);
+        assert!(
+            config.is_group_parked("codereview"),
+            "unreserving must not clear the park"
+        );
+        assert!(!config.is_group_reserved("codereview"));
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Unparking is not a re-enable: a member the operator disabled by hand is
+    /// still disabled afterwards. The two facts live in different places in the
+    /// file (an account's `disabled`, a group's `parked`), and this pins that
+    /// `unpark`'s targeted write never reaches across.
+    #[test]
+    fn unparking_leaves_a_members_own_disabled_alone() {
+        let path = write_config("park-keeps-disabled", GROUPED_ACCOUNTS);
+        let alice = load(&path)
+            .accounts
+            .into_iter()
+            .find(|a| a.name == "alice@example.com")
+            .expect("alice is in the fixture");
+        config::save_disabled(&path, &alice, true).expect("bench alice by hand");
+        park_group(&path, "codereview").unwrap();
+        unpark_group(&path, "codereview").unwrap();
+
+        let config = load(&path);
+        let alice = config
+            .accounts
+            .iter()
+            .find(|a| a.name == "alice@example.com")
+            .expect("alice survives the round trip");
+        assert_eq!(
+            alice.disabled,
+            Some(true),
+            "a member disabled on its own stays disabled after unpark"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// `tcr group park` rejects the same bad-character labels `tcr group
+    /// reserve`/`add` already do — reuses [`validate_group_label_chars`], no
+    /// second validator. `unpark` deliberately does NOT validate, so a label
+    /// that somehow reached the file can always be cleared.
+    #[test]
+    fn park_rejects_bad_label_and_unpark_does_not() {
+        let path = write_config("park-bad-label", TWO_ACCOUNTS);
+        assert!(
+            park_group(&path, "bad\nlabel").is_err(),
+            "a newline in the label must be rejected"
+        );
+        assert!(
+            unpark_group(&path, "bad\nlabel").is_ok(),
+            "unpark must be able to clear a label park would refuse to write"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// Both `ls` surfaces carry the flag, and they agree.
+    #[test]
+    fn ls_reports_a_parked_group_on_both_surfaces() {
+        let path = write_config("ls-parked", GROUPED_ACCOUNTS);
+        park_group(&path, "codereview").unwrap();
+        let config = load(&path);
+
+        let codereview = group_line(&render_groups_text(&config), "codereview");
+        assert!(
+            codereview.contains("parked=yes"),
+            "text ls must mark the parked group: {codereview}"
+        );
+        let dev = group_line(&render_groups_text(&config), "dev");
+        assert!(
+            dev.contains("parked=no"),
+            "an ordinary group must not be flagged parked: {dev}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_groups_json(&config).unwrap()).unwrap();
+        let rows = json["groups"].as_array().expect("groups array");
+        let row = rows
+            .iter()
+            .find(|r| r["group"] == "codereview")
+            .expect("codereview row");
+        assert_eq!(row["parked"], serde_json::json!(true));
+        let plain = rows.iter().find(|r| r["group"] == "dev").expect("dev row");
+        assert_eq!(plain["parked"], serde_json::json!(false));
+
         fs::remove_file(&path).ok();
     }
 
@@ -5466,6 +5708,7 @@ mod tests {
             },
             groups: groups.iter().map(|g| g.to_string()).collect(),
             reserved_groups: Vec::new(),
+            parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage,
         }
@@ -6310,6 +6553,7 @@ mod tests {
             last_stream_error: None,
             groups: Vec::new(),
             reserved_groups: Vec::new(),
+            parked_groups: Vec::new(),
             control_allowed_groups: Vec::new(),
             usage: None,
         };
@@ -6319,6 +6563,7 @@ mod tests {
                 gate: crate::stats::GateReason::Reserved,
                 groups: vec!["dev".to_string(), "codereview".to_string()],
                 reserved_groups: vec!["codereview".to_string()],
+                parked_groups: Vec::new(),
                 control_allowed_groups: Vec::new(),
                 usage: None,
                 ..base.clone()
@@ -6398,5 +6643,100 @@ mod tests {
             vec!["codereview".to_string()]
         );
         assert_eq!(rebuilt.accounts[1].reserved_groups, Vec::<String>::new());
+    }
+
+    /// The same two surfaces for `parkedGroups`: an array on the JSON wire —
+    /// `[]`, never `null`, when nothing is parked — the `"parked"` gate token
+    /// beside it, and a full round trip through the server→client payload.
+    /// Both halves in one test because they are one contract: the panel reads
+    /// the field to name the group, and the token to know the row is out.
+    #[test]
+    fn parked_groups_render_as_an_array_and_round_trip_with_their_gate() {
+        let (mut snapshot, thresholds) = reserved_groups_snapshot();
+        snapshot.accounts[0].gate = crate::stats::GateReason::Parked;
+        snapshot.accounts[0].reserved_groups = Vec::new();
+        snapshot.accounts[0].parked_groups = vec!["codereview".to_string()];
+
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &Default::default(),
+        );
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&json).expect("valid json");
+        let alice = rows
+            .iter()
+            .find(|r| r["name"] == "alice@example.com")
+            .expect("alice row");
+        assert_eq!(
+            alice["parkedGroups"],
+            serde_json::json!(["codereview"]),
+            "parked subset of alice's groups: {alice}"
+        );
+        assert_eq!(alice["gate"], serde_json::json!("parked"));
+        let dave = rows
+            .iter()
+            .find(|r| r["name"] == "dave@example.com")
+            .expect("dave row");
+        assert_eq!(
+            dave["parkedGroups"],
+            serde_json::json!([]),
+            "nothing parked renders [], never null: {dave}"
+        );
+
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &snapshot,
+            &thresholds,
+            false,
+            None,
+            Default::default(),
+        );
+        let wire = serde_json::to_string(&payload).expect("serialize");
+        assert!(
+            wire.contains("\"parkedGroups\":[\"codereview\"]"),
+            "parkedGroups is camelCase on the wire: {wire}"
+        );
+        let back: crate::status::StatusPayload = serde_json::from_str(&wire).expect("deserialize");
+        let (rebuilt, _) = back.into_snapshot();
+        assert_eq!(
+            rebuilt.accounts[0].parked_groups,
+            vec!["codereview".to_string()]
+        );
+        assert_eq!(rebuilt.accounts[0].gate, crate::stats::GateReason::Parked);
+        assert_eq!(rebuilt.accounts[1].parked_groups, Vec::<String>::new());
+    }
+
+    /// A server that predates the field sends no `parkedGroups` key at all, and
+    /// its rows must still decode — `#[serde(default)]`'s whole job. Same
+    /// forward-compat guard `reservedGroups` carries.
+    #[test]
+    fn a_payload_without_parked_groups_still_deserializes() {
+        let (snapshot, thresholds) = reserved_groups_snapshot();
+        let payload = crate::status::StatusPayload::from_snapshot(
+            &snapshot,
+            &thresholds,
+            false,
+            None,
+            Default::default(),
+        );
+        let mut wire: serde_json::Value =
+            serde_json::to_value(&payload).expect("payload serializes");
+        for account in wire["accounts"]
+            .as_array_mut()
+            .expect("accounts is an array")
+        {
+            account
+                .as_object_mut()
+                .expect("account row is an object")
+                .remove("parkedGroups")
+                .expect("the field was there to remove — the positive control");
+        }
+        let back: crate::status::StatusPayload =
+            serde_json::from_value(wire).expect("a row with no parkedGroups key still decodes");
+        let (rebuilt, _) = back.into_snapshot();
+        assert_eq!(rebuilt.accounts[0].parked_groups, Vec::<String>::new());
     }
 }

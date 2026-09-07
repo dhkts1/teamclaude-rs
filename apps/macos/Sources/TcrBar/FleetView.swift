@@ -1266,6 +1266,24 @@ struct AccountRow: View {
         if account.disabled {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
+        } else if account.isParkedByGroup {
+            // The SAME word as the row's own `disabled` above, deliberately:
+            // the consequence is identical (no traffic lands here), and giving
+            // one fact two names is how a reader learns to distrust both. What
+            // differs is the cause, so the help names the group to unpark —
+            // otherwise an operator sees a parked row with an enabled account
+            // and has nowhere to go.
+            //
+            // Ordered after `disabled` for the same reason the server orders
+            // its gate that way: a row benched by hand says so, and is never
+            // reported as parked-by-group.
+            StatusPill("parked", tint: Tok.disabled)
+                .help(
+                    "Out of the rotation — every member of "
+                        + "\(account.parkedGroupNames.joined(separator: ", ")) is held back. "
+                        + "`tcr group unpark "
+                        + "\(account.parkedGroupNames.first ?? "")` puts them back, live."
+                )
         } else if account.health == .needsRelogin {
             EmptyView()
         } else if account.isRejected {
@@ -1338,6 +1356,12 @@ struct AccountRow: View {
         // cause, so this element is not left silent either.
         if account.disabled {
             parts.append("parked, out of rotation")
+        } else if account.isParkedByGroup {
+            // Names the group, because a listener has no help tooltip to reach
+            // for — the pill's own text is the same word either way.
+            parts.append(
+                "parked with group \(account.parkedGroupNames.joined(separator: ", ")), "
+                    + "out of rotation")
         } else if account.health == .needsRelogin {
             parts.append("not in rotation")
         } else if account.isRejected {
@@ -1586,6 +1610,14 @@ struct AccountRow: View {
                 Button(copyRun.title) {
                     copyToPasteboard(copyRun.copiedText)
                 }
+                // One click, either direction, with the current state on the
+                // item itself — the only administrative entry in this menu that
+                // takes effect without a restart, which is why it can be a
+                // toggle at all rather than an instruction to go and edit the
+                // config. It sits above the two removals because holding a
+                // group back is the reversible thing to want; deleting it is
+                // not.
+                parkToggle(for: group)
                 Button("Remove from \(group)") {
                     Task { await groupController.remove(account: account.ref, from: group) }
                 }
@@ -1604,6 +1636,30 @@ struct AccountRow: View {
                 addToGroupMenu
             }
         }
+    }
+
+    /// The Park/Unpark toggle for one group, with a checkmark showing the
+    /// state it is in right now.
+    ///
+    /// The state is read from the FLEET (`allAccounts`), not from this row: a
+    /// group is parked or not for everyone, and reading this row alone would
+    /// draw an unchecked item on a member the wire happened to omit. Disabled
+    /// while the call is in flight, so a second click cannot queue a second
+    /// subprocess against the same label.
+    @ViewBuilder
+    private func parkToggle(for group: String) -> some View {
+        let parked = allAccounts.contains { ($0.parkedGroups ?? []).contains(group) }
+        Button {
+            Task { await groupController.setParked(group: group, parked: !parked) }
+        } label: {
+            // A leading checkmark rather than `Toggle`: `Menu` contents are
+            // rasterised nowhere (see `RenderStates`' header) and a plain
+            // Button with an explicit mark is what the rest of this menu uses.
+            Label(
+                parked ? "Unpark group “\(group)”" : "Park group “\(group)”",
+                systemImage: parked ? "checkmark" : "pause.circle")
+        }
+        .disabled(groupController.isPending("park/\(group)"))
     }
 
     /// Every group this account is not already a member of, fleet-wide —
