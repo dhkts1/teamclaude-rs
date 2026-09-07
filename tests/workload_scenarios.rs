@@ -114,6 +114,9 @@ fn account(name: &str, priority: i64) -> Account {
         switch_threshold: None,
         disabled: None,
         groups: None,
+        organization_type: None,
+        rate_limit_tier: None,
+        seat_tier: None,
         extra: serde_json::Map::new(),
     }
 }

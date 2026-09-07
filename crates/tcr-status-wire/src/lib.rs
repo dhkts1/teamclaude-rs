@@ -203,6 +203,264 @@ pub struct AccountStatusRow {
     /// [`UsageRow`]'s doc-comment: absent is "not measured", never zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageRow>,
+    /// The organization's plan as the profile endpoint reported it, VERBATIM
+    /// (`claude_max`, `claude_team`, `claude_pro`, `claude_enterprise`) — for a
+    /// script that wants the provider's own word rather than our label. `None`
+    /// when this account has never been profiled.
+    #[serde(default)]
+    pub organization_type: Option<String>,
+    /// The organization's rate-limit tier, verbatim
+    /// (`default_claude_max_20x`, `default_raven`) — the field that separates
+    /// Max 20x from Max 5x, on the wire for the same script-facing reason as
+    /// [`Self::organization_type`].
+    #[serde(default)]
+    pub rate_limit_tier: Option<String>,
+    /// The organization's seat tier, verbatim (`organization.seat_tier`) —
+    /// `team_standard` and `team_tier_1` both observed on one live Team org.
+    /// `None` on Max and Pro rows, which have no seats: the field is a property
+    /// of a seated org, not of every account.
+    #[serde(default)]
+    pub seat_tier: Option<String>,
+    /// The customer-facing plan label ("Max 20x", "Team Premium", ...) derived
+    /// from the three raw fields above by [`plan_label`] — the ONE place that mapping
+    /// exists, so the CLI's plain text, the TUI and the macOS panel cannot
+    /// disagree about what a row's plan is called.
+    ///
+    /// `None` when nothing is known, and that is load-bearing: a fabricated
+    /// label is worse than a blank, because the whole point of this field is
+    /// telling two rows with the SAME NAME apart.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// The org this account is scoped to. On the wire so a CLIENT can address
+    /// this row unambiguously: every `tcr` account verb takes `--org
+    /// <name-or-uuid-prefix>`, and a client holding only `name` cannot narrow a
+    /// duplicated email — the panel's "Copy Access Token" failed with "matches 2
+    /// accounts" for exactly this reason.
+    ///
+    /// `orgUuid` is what a client should pass: it is exact, whereas `orgName` is
+    /// a display string that two orgs can share. `orgName` rides along because a
+    /// row that has one and no uuid can still narrow by it.
+    #[serde(default)]
+    pub org_uuid: Option<String>,
+    #[serde(default)]
+    pub org_name: Option<String>,
+}
+
+/// The customer-facing plan label for one account, derived from the three raw
+/// profile fields — `organization.organization_type`,
+/// `organization.rate_limit_tier` and `organization.seat_tier`.
+///
+/// The single place this mapping exists. It lives in the wire crate rather than
+/// the binary because both consumers need it: the server fills the `plan` field
+/// from here, and so does the CLI's OFFLINE path, which has no server to ask.
+///
+/// `organization_type` is the PLAN WORD — Max, Pro, Team, Enterprise. The other
+/// two supply at most one SUFFIX after it, and the rate-limit multiplier wins
+/// when both could:
+///
+/// | plan word | suffix from | example |
+/// |---|---|---|
+/// | any | `rate_limit_tier` ending `_20x` / `_5x` | `Max 20x`, `Team 5x` |
+/// | Team / Enterprise, no multiplier | `seat_tier` | `Team Standard`, `Team Tier 2` |
+/// | Max / Pro, no multiplier | nothing | `Max`, `Pro` |
+///
+/// The multiplier outranks the seat because it is the stronger statement about
+/// what the account can actually do. Measured on a live fleet: a premium Team
+/// seat reads `seat_tier=team_tier_1` with `rate_limit_tier=default_claude_max_5x`,
+/// while a standard one reads `seat_tier=team_standard` with
+/// `rate_limit_tier=default_raven`. Labelling the first by its seat would print
+/// "Team Tier 1", which tells a reader nothing; "Team 5x" tells them the size of
+/// the account they are about to route traffic to.
+///
+/// `account.has_claude_max` is deliberately not an input — measured on the same
+/// fleet it reads `true` on Team rows too, so a label derived from it would call
+/// a Team account "Max".
+///
+/// Anything this function does not recognize survives VERBATIM rather than being
+/// bucketed into the nearest known value: an unknown `organization_type` is
+/// returned as-is with no suffix, and an unknown seat is appended raw (`Team
+/// team_trial`) rather than dropped. A new plan or seat name is a thing we have
+/// not seen yet; showing it unchanged is honest, mapping it onto "Max" or
+/// silently discarding it is a claim nobody made. `None` in gives `None` out for
+/// the same reason: an unprofiled account's plan is unknown, and "unknown" is
+/// not "Pro".
+pub fn plan_label(
+    organization_type: Option<&str>,
+    rate_limit_tier: Option<&str>,
+    seat_tier: Option<&str>,
+) -> Option<String> {
+    /// The rate-limit multiplier a tier names, if it names one.
+    fn multiplier(rate_limit_tier: Option<&str>) -> Option<&'static str> {
+        let tier = rate_limit_tier?;
+        if tier.ends_with("_20x") {
+            Some("20x")
+        } else if tier.ends_with("_5x") {
+            Some("5x")
+        } else {
+            // A tier that names no multiplier (`default_raven`) is not a size
+            // we failed to read — it is a tier from a different vocabulary, and
+            // guessing a multiplier off it would be inventing a number.
+            None
+        }
+    }
+
+    /// What kind of seat this is, in words. `team_tier_1` → `Tier 1`; an
+    /// unrecognized seat rides along verbatim rather than being dropped, since
+    /// it is a real difference between two otherwise identical rows.
+    fn seat_words(seat_tier: &str) -> String {
+        if seat_tier.ends_with("_standard") {
+            return "Standard".to_string();
+        }
+        match seat_tier.split("_tier_").nth(1) {
+            Some(n) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                format!("Tier {n}")
+            }
+            _ => seat_tier.to_string(),
+        }
+    }
+
+    let org_type = organization_type?;
+    let (plan, seated) = match org_type {
+        "claude_max" => ("Max", false),
+        "claude_pro" => ("Pro", false),
+        "claude_team" => ("Team", true),
+        "claude_enterprise" => ("Enterprise", true),
+        // An unknown plan gets no suffix at all: we cannot know whether it is
+        // seated, so neither refinement is safe to attach to it.
+        other => return Some(other.to_string()),
+    };
+
+    Some(match multiplier(rate_limit_tier) {
+        Some(mult) => format!("{plan} {mult}"),
+        None => match seat_tier.filter(|_| seated) {
+            Some(seat) => format!("{plan} {}", seat_words(seat)),
+            None => plan.to_string(),
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three labels the live fleet actually produces, from the exact field
+    /// triples measured on it — not synthetic combinations.
+    #[test]
+    fn plan_label_names_the_three_rows_the_live_fleet_produces() {
+        assert_eq!(
+            plan_label(Some("claude_max"), Some("default_claude_max_20x"), None),
+            Some("Max 20x".to_string())
+        );
+        assert_eq!(
+            plan_label(
+                Some("claude_team"),
+                Some("default_claude_max_5x"),
+                Some("team_tier_1")
+            ),
+            Some("Team 5x".to_string()),
+            "a premium Team seat carries a 5x multiplier, and the multiplier is \
+             the useful half: 'Team Tier 1' names a seat nobody can size"
+        );
+        assert_eq!(
+            plan_label(
+                Some("claude_team"),
+                Some("default_raven"),
+                Some("team_standard")
+            ),
+            Some("Team Standard".to_string()),
+            "a standard seat's tier names no multiplier, so the seat is what is \
+             left to say"
+        );
+    }
+
+    #[test]
+    fn plan_label_falls_back_to_the_seat_only_when_no_multiplier_is_named() {
+        assert_eq!(
+            plan_label(Some("claude_team"), None, Some("team_tier_2")),
+            Some("Team Tier 2".to_string()),
+            "a seat tier with no multiplier beside it is spelled out"
+        );
+        assert_eq!(
+            plan_label(Some("claude_team"), Some("default_raven"), None),
+            Some("Team".to_string()),
+            "no multiplier and no seat means no suffix — never a guessed Standard"
+        );
+        assert_eq!(
+            plan_label(Some("claude_enterprise"), None, Some("enterprise_standard")),
+            Some("Enterprise Standard".to_string())
+        );
+        assert_eq!(
+            plan_label(Some("claude_enterprise"), Some("something_20x"), None),
+            Some("Enterprise 20x".to_string())
+        );
+    }
+
+    #[test]
+    fn plan_label_ignores_a_seat_on_an_unseated_plan() {
+        assert_eq!(
+            plan_label(Some("claude_max"), None, Some("team_standard")),
+            Some("Max".to_string()),
+            "Max has no seats, so a stray seat value must not become part of its name"
+        );
+        assert_eq!(
+            plan_label(Some("claude_pro"), None, Some("team_tier_1")),
+            Some("Pro".to_string())
+        );
+        assert_eq!(
+            plan_label(Some("claude_max"), Some("default_claude_max_5x"), None),
+            Some("Max 5x".to_string())
+        );
+        assert_eq!(
+            plan_label(Some("claude_max"), Some("something_else"), None),
+            Some("Max".to_string()),
+            "a tier naming no multiplier leaves the size off rather than guessing one"
+        );
+    }
+
+    #[test]
+    fn plan_label_returns_an_unknown_organization_type_verbatim() {
+        assert_eq!(
+            plan_label(
+                Some("claude_something_new"),
+                Some("default_claude_max_20x"),
+                Some("team_standard")
+            ),
+            Some("claude_something_new".to_string()),
+            "an unrecognized plan must survive verbatim, never be bucketed into a \
+             known one — and it takes no suffix, because we cannot know whether it \
+             is seated or what its tier vocabulary means"
+        );
+    }
+
+    #[test]
+    fn plan_label_returns_an_unknown_seat_tier_verbatim() {
+        assert_eq!(
+            plan_label(Some("claude_team"), None, Some("team_trial")),
+            Some("Team team_trial".to_string()),
+            "an unrecognized seat is a real difference between two rows — it rides \
+             along verbatim rather than being dropped or read as standard"
+        );
+        assert_eq!(
+            plan_label(Some("claude_team"), None, Some("team_tier_x")),
+            Some("Team team_tier_x".to_string()),
+            "a tier suffix that is not a number is not a tier number"
+        );
+    }
+
+    #[test]
+    fn plan_label_is_none_when_the_plan_is_unknown() {
+        assert_eq!(
+            plan_label(None, None, None),
+            None,
+            "an unprofiled account has no label — never a fabricated default"
+        );
+        assert_eq!(
+            plan_label(None, Some("default_claude_max_20x"), Some("team_standard")),
+            None,
+            "neither refinement ever names a plan on its own: non-Max orgs carry \
+             tiers, and a seat without a plan is not a plan"
+        );
+    }
 }
 
 impl AccountStatusRow {

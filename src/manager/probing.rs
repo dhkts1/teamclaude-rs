@@ -186,6 +186,8 @@ impl Manager {
             other => other,
         };
 
+        self.backfill_plan_if_unknown(idx).await;
+
         match result {
             Ok(usage) => {
                 self.apply_usage(idx, &usage);
@@ -214,5 +216,132 @@ impl Manager {
                 self.record_probe(idx, status, Some(err.message), err.retry_after_secs);
             }
         }
+    }
+
+    /// Learn account `idx`'s plan ONCE, from the profile endpoint, using the
+    /// token the probe loop already has in hand — then record it on the runtime
+    /// row and persist it through [`config::save_plan`].
+    ///
+    /// This exists because the fields it fills are new and the fleet is not: an
+    /// account logged in before they existed carries none of them, and asking
+    /// an operator to re-authenticate every account in a browser to learn a
+    /// label is not a plan. The probe loop is the right host — it already runs
+    /// per account on a cadence, already holds a fresh token, and already
+    /// tolerates a network failure.
+    ///
+    /// Three properties this must have, all of them things it would be easy to
+    /// get wrong:
+    ///
+    /// 1. **It runs once per account, not once per probe.** The `is_some` gate
+    ///    is on `organization_type` — an account that has one is done, and the
+    ///    steady state after the first sweep is zero extra HTTP calls forever.
+    ///    Without the gate this is an extra request per account per cadence,
+    ///    which is exactly the fingerprintable chatter the randomized schedule
+    ///    exists to remove.
+    /// 2. **A failure records nothing and fails nothing.** No probe status is
+    ///    written on this path at all: a profile fetch that could not reach the
+    ///    endpoint says nothing about the account's quota or its credential, and
+    ///    painting a red probe on a healthy account over a cosmetic label would
+    ///    be the worse bug by far. The account simply still has no plan, so the
+    ///    next probe asks again.
+    /// 3. **The durable write is surgical.** `config::save_plan` re-reads the
+    ///    document from disk and touches only these keys on only this row —
+    ///    never a whole-`Config` save of the server's boot-time snapshot, which
+    ///    is the clobber `save_disabled`'s doc-comment names. A write failure is
+    ///    logged and dropped: the runtime row still carries the plan for this
+    ///    process's lifetime, so the panel shows it now and the write is retried
+    ///    on the next restart.
+    async fn backfill_plan_if_unknown(&self, idx: usize) {
+        let (already_known, token) = {
+            let accounts = self.accounts.read().expect("accounts lock poisoned");
+            let Some(account) = accounts.get(idx) else {
+                return;
+            };
+            (
+                account.organization_type.is_some(),
+                account.access_token.clone(),
+            )
+        };
+        if already_known || token.is_empty() {
+            return;
+        }
+
+        let prober = {
+            let guard = self.plan_prober.read().expect("plan prober lock poisoned");
+            guard.clone()
+        };
+        let plan = prober.plan(token).await;
+        if plan.is_empty() {
+            return;
+        }
+
+        // Re-resolve the row under the write lock: the await above released
+        // every lock, and an account can be added or removed through
+        // `add_or_update_account` in that window. Matching on NAME rather than
+        // trusting `idx` is what keeps a concurrent removal from stamping one
+        // account's plan onto another's row.
+        let target = {
+            let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+            let Some(account) = accounts.get_mut(idx) else {
+                return;
+            };
+            if plan.organization_type.is_some() {
+                account.organization_type = plan.organization_type.clone();
+            }
+            if plan.rate_limit_tier.is_some() {
+                account.rate_limit_tier = plan.rate_limit_tier.clone();
+            }
+            if plan.seat_tier.is_some() {
+                account.seat_tier = plan.seat_tier.clone();
+            }
+            tracing::info!(
+                account = %account.name,
+                organization_type = ?account.organization_type,
+                rate_limit_tier = ?account.rate_limit_tier,
+                seat_tier = ?account.seat_tier,
+                "learned this account's plan from the profile endpoint"
+            );
+            // The identity probe `save_plan` locates the on-disk row by. Built
+            // from the row's own stored identity, exactly like
+            // `Manager::persist_replaced` does, so the two orgs of one email
+            // resolve to different entries rather than tying.
+            crate::identity::probe(
+                &account.name,
+                account.account_uuid.clone(),
+                account.org_uuid.clone(),
+                account.org_name.clone(),
+            )
+        };
+
+        let Some(path) = self.config_path.as_ref() else {
+            return;
+        };
+        match config::save_plan(
+            path,
+            &target,
+            plan.organization_type.as_deref(),
+            plan.rate_limit_tier.as_deref(),
+            plan.seat_tier.as_deref(),
+        ) {
+            Ok(config::PlanWrite::Updated | config::PlanWrite::Unchanged) => {}
+            Ok(outcome) => tracing::warn!(
+                account = %target.name, %outcome,
+                "learned this account's plan but could not persist it — it will be \
+                 re-fetched after a restart"
+            ),
+            Err(err) => tracing::warn!(
+                account = %target.name, error = %err,
+                "learned this account's plan but could not persist it — it will be \
+                 re-fetched after a restart"
+            ),
+        }
+    }
+
+    /// Swap in a different [`PlanProber`] — the test seam for
+    /// [`Self::backfill_plan_if_unknown`], which otherwise reaches the real
+    /// profile endpoint. Not a runtime knob: call it before the manager serves
+    /// anything.
+    pub fn set_plan_prober(&self, prober: Arc<dyn crate::probe::PlanProber>) {
+        *self.plan_prober.write().expect("plan prober lock poisoned") = prober;
     }
 }

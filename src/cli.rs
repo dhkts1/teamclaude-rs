@@ -1809,10 +1809,25 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         } else {
             format!(" reserved_groups={}", a.reserved_groups.join(","))
         };
+        // The account's plan, greppable via `plan=Max 20x` and named by the one
+        // function that names it anywhere (`tcr_status_wire::plan_label`).
+        // Omitted entirely — never `plan=unknown` — for an account that has
+        // never been profiled, matching the `fable=`/`groups=` "nothing to say"
+        // idiom. This is the only token that tells two rows sharing an email
+        // apart, so a fabricated value here would be worse than silence.
+        let plan = match tcr_status_wire::plan_label(
+            a.organization_type.as_deref(),
+            a.rate_limit_tier.as_deref(),
+            a.seat_tier.as_deref(),
+        ) {
+            Some(label) => format!(" plan={label}"),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "account {} priority={} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}\n",
+            "account {} priority={}{} {} {}{}{} state={} status={}{} probe={}{}{}{}{}{}\n",
             a.name,
             a.priority,
+            plan,
             five_hour,
             seven_day,
             fable,
@@ -2154,6 +2169,36 @@ fn render_accounts_json(
                     StatusSource::Offline => None,
                     StatusSource::Live => a.usage.clone(),
                 },
+                // The plan, three raw fields and one label. Real on BOTH paths
+                // like `groups`/`control` above: this is a config fact read
+                // from disk, not a serving counter, so the offline path knows
+                // it exactly as well as the server does and gets no
+                // null-when-offline guard.
+                //
+                // The raw provider strings ride alongside the label so a script
+                // can key on the vocabulary Anthropic actually uses
+                // (`jq 'select(.organizationType == "claude_team")'`) without
+                // parsing English that exists to be read by a human.
+                organization_type: a.organization_type.clone(),
+                rate_limit_tier: a.rate_limit_tier.clone(),
+                seat_tier: a.seat_tier.clone(),
+                // Derived HERE, once, from `tcr_status_wire::plan_label` — the
+                // same function the TUI and the plain-text renderer call, so
+                // three surfaces cannot disagree about what one row's plan is
+                // named. `null` for an account that has never been profiled: a
+                // fabricated label would defeat the entire point of a field
+                // whose job is telling two identically-named rows apart.
+                plan: tcr_status_wire::plan_label(
+                    a.organization_type.as_deref(),
+                    a.rate_limit_tier.as_deref(),
+                    a.seat_tier.as_deref(),
+                ),
+                // The org, so a client can address this row unambiguously —
+                // `--org` is what every account verb narrows a duplicated email
+                // with, and without this on the wire a client holding only the
+                // name has nothing to pass. Real on both paths, like `groups`.
+                org_uuid: a.org_uuid.clone(),
+                org_name: a.org_name.clone(),
             };
             // Round-trip through `Value` rather than serializing the struct
             // directly: `serde_json::Value`'s map is a `BTreeMap`, so keys come
@@ -3781,6 +3826,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }
@@ -3871,6 +3919,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         let applied = post_add_account(&config, &account)
@@ -3922,6 +3973,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         let err = post_add_account(&config, &account)
@@ -5220,9 +5274,22 @@ mod tests {
         quota_state: QuotaState,
         groups: &[&str],
         usage: Option<tcr_status_wire::UsageRow>,
+        // `plan` is `(organizationType, rateLimitTier, seatTier)` — the three
+        // raw strings, exactly as the profile endpoint spells them. `org` is
+        // `(orgUuid, orgName)`, what a client passes to `--org` to address this
+        // row when a name is ambiguous. Grouped rather than five more
+        // positional `Option<&str>` arguments, which at this arity is a call
+        // site nobody can read.
+        plan: (Option<&str>, Option<&str>, Option<&str>),
+        org: (Option<&str>, Option<&str>),
     ) -> AccountSnapshot {
         AccountSnapshot {
             name: name.to_string(),
+            organization_type: plan.0.map(str::to_string),
+            rate_limit_tier: plan.1.map(str::to_string),
+            seat_tier: plan.2.map(str::to_string),
+            org_uuid: org.0.map(str::to_string),
+            org_name: org.1.map(str::to_string),
             priority,
             status: status.to_string(),
             disabled,
@@ -5430,6 +5497,13 @@ mod tests {
                 // Every request priced: `costUsd` is a complete figure and
                 // `unpricedRequests` is 0.
                 Some(contract_usage("claude-sonnet-5")),
+                // `Max 20x` — the multiplier suffix, and the plan the fleet's
+                // personal rows carry.
+                (Some("claude_max"), Some("default_claude_max_20x"), None),
+                (
+                    Some("11111111-1111-1111-1111-111111111111"),
+                    Some("Example Personal"),
+                ),
             ),
             // `near`: at threshold, so `held` carries a window — the only row
             // that exercises the nested object.
@@ -5454,6 +5528,17 @@ mod tests {
                 // client renderer is most likely to get wrong — silently
                 // presenting a partial sum as the whole spend.
                 Some(contract_usage("claude-sonnet-4-5-20250929")),
+                // `Team 5x` — a premium Team seat, where the multiplier
+                // OUTRANKS the seat (`team_tier_1` is not what shows).
+                (
+                    Some("claude_team"),
+                    Some("default_claude_max_5x"),
+                    Some("team_tier_1"),
+                ),
+                (
+                    Some("22222222-2222-2222-2222-222222222222"),
+                    Some("Example Team"),
+                ),
             ),
             // `spent`: fully consumed, and carrying a probe error string.
             contract_account(
@@ -5472,6 +5557,18 @@ mod tests {
                 QuotaState::Exhausted,
                 &[],
                 Some(contract_usage("claude-sonnet-5")),
+                // `Team Standard` — a standard seat, whose tier names no
+                // multiplier, so the SEAT is the suffix. Same org as bob above,
+                // which is the pairing that makes `orgUuid` worth carrying.
+                (
+                    Some("claude_team"),
+                    Some("default_raven"),
+                    Some("team_standard"),
+                ),
+                (
+                    Some("22222222-2222-2222-2222-222222222222"),
+                    Some("Example Team"),
+                ),
             ),
             // Never probed AND disabled: the four quota fractions and
             // `cacheHitRatio` are all null. This row is the one that shipped a
@@ -5499,6 +5596,12 @@ mod tests {
                 // disk is rebuilt on merge while the live process keeps serving
                 // until someone restarts it.
                 None,
+                // NEVER PROFILED: all three plan keys null and `plan` null with
+                // them. The row both decoders must render as "plan unknown"
+                // rather than inventing one — and the shape every account has
+                // until its first probe backfills it.
+                (None, None, None),
+                (None, None),
             ),
         ];
         let mut accounts = accounts;
@@ -5867,6 +5970,112 @@ mod tests {
         );
     }
 
+    /// `plan=` on the text path: the derived label, greppable, on every account
+    /// that has been profiled — and the token omitted ENTIRELY, never
+    /// `plan=unknown`, for one that has not. This is the only token that tells
+    /// two rows sharing an email apart, so a fabricated value is worse than
+    /// silence.
+    #[test]
+    fn plan_text_line_greppable_and_omitted_when_never_profiled() {
+        let (snapshot, _thresholds) = status_contract_snapshot();
+        let text = render_accounts(&snapshot, StatusSource::Live);
+        let line_for = |name: &str| {
+            text.lines()
+                .find(|l| l.contains(name))
+                .unwrap_or_else(|| panic!("{name} line"))
+                .to_string()
+        };
+
+        let alice = line_for("alice@example.com");
+        assert!(
+            alice.contains("plan=Max 20x"),
+            "the multiplier suffix is what a Max row shows: {alice}"
+        );
+        let bob = line_for("bob@example.com");
+        assert!(
+            bob.contains("plan=Team 5x"),
+            "a premium Team seat shows its multiplier, not `team_tier_1`: {bob}"
+        );
+        let carol = line_for("carol@example.com");
+        assert!(
+            carol.contains("plan=Team Standard"),
+            "a standard seat's tier names no multiplier, so the seat shows: {carol}"
+        );
+        let dave = line_for("dave@example.com");
+        assert!(
+            !dave.contains("plan="),
+            "a never-profiled account omits the token entirely: {dave}"
+        );
+    }
+
+    /// The same three facts on the JSON path, plus the raw provider strings a
+    /// script keys on and the `orgUuid` it narrows an ambiguous name with.
+    #[test]
+    fn plan_and_org_render_on_the_json_path() {
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Live,
+            None,
+            false,
+            None,
+            &std::collections::BTreeMap::new(),
+        );
+        let rows: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(rows[0]["plan"], "Max 20x");
+        assert_eq!(rows[0]["organizationType"], "claude_max");
+        assert_eq!(rows[0]["rateLimitTier"], "default_claude_max_20x");
+        assert!(
+            rows[0]["seatTier"].is_null(),
+            "a Max row has no seat — null, not an empty string"
+        );
+        assert_eq!(rows[0]["orgUuid"], "11111111-1111-1111-1111-111111111111");
+
+        assert_eq!(rows[1]["plan"], "Team 5x");
+        assert_eq!(rows[1]["seatTier"], "team_tier_1");
+        assert_eq!(rows[2]["plan"], "Team Standard");
+        assert_eq!(
+            rows[1]["orgUuid"], rows[2]["orgUuid"],
+            "two rows in one org report the same orgUuid — what a client narrows by"
+        );
+
+        assert!(
+            rows[3]["plan"].is_null() && rows[3]["organizationType"].is_null(),
+            "a never-profiled row publishes null, never a fabricated default"
+        );
+        assert!(
+            rows[3]["orgUuid"].is_null(),
+            "and no org to narrow by either"
+        );
+    }
+
+    /// The plan is a CONFIG fact, not a serving counter, so it is real on the
+    /// offline path too — unlike `requests`/`streamErrorCount`, which are null
+    /// there. A `plan` that vanished whenever the proxy was down would be
+    /// useless in exactly the moment an operator is reading `tcr status`.
+    #[test]
+    fn plan_is_reported_on_the_offline_path_too() {
+        let (snapshot, thresholds) = status_contract_snapshot();
+        let json = render_accounts_json(
+            &snapshot,
+            &thresholds,
+            StatusSource::Offline,
+            None,
+            false,
+            None,
+            &std::collections::BTreeMap::new(),
+        );
+        let rows: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(rows[0]["plan"], "Max 20x");
+        assert!(
+            rows[0]["requests"].is_null(),
+            "the control: a real serving counter IS null offline, so this test is \
+             not simply reading a path where nothing is nulled"
+        );
+    }
+
     /// `sevenDayOiState` and `sevenDayOiResetAtMs` render from a snapshot that
     /// carries the Fable weekly pair, and both keys are `null` — never absent,
     /// never a fabricated `0`/`"ok"` — for an account whose window was never
@@ -5928,6 +6137,11 @@ mod tests {
     fn reserved_groups_snapshot() -> (StatsSnapshot, Vec<f64>) {
         let base = AccountSnapshot {
             name: String::new(),
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            org_uuid: None,
+            org_name: None,
             priority: 0,
             status: "active".to_string(),
             disabled: false,

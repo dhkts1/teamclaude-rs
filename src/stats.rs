@@ -111,6 +111,24 @@ pub enum GateReason {
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
     pub name: String,
+    /// The account's plan as the profile endpoint reported it, verbatim, plus
+    /// the two fields that refine it — carried straight from
+    /// [`crate::manager::AccountRuntime`]. The customer-facing LABEL is derived
+    /// from these by [`tcr_status_wire::plan_label`] one layer out, so this
+    /// snapshot stays the provider's own word and exactly one place turns it
+    /// into English. `None` means never profiled.
+    pub organization_type: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    pub seat_tier: Option<String>,
+    /// The org this account is scoped to, carried from
+    /// [`crate::manager::AccountRuntime`]. Present so a CLIENT can DISAMBIGUATE
+    /// this row: every account verb (`tcr token`, `remove`, `enable`,
+    /// `disable`, `priority`) takes `--org <name-or-uuid-prefix>`, and without
+    /// an org on the row a caller holding only the name cannot narrow it — which
+    /// is exactly the state the panel was in when "Copy Access Token" failed on
+    /// a duplicated email with "matches 2 accounts".
+    pub org_uuid: Option<String>,
+    pub org_name: Option<String>,
     pub priority: i64,
     pub status: String,
     pub disabled: bool,

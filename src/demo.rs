@@ -49,6 +49,13 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         priority,
         disabled: false,
         groups: Vec::new(),
+        // A believable default plan, overridden per row below so the demo shows
+        // the mix a real fleet has — which is the whole reason the plan is on
+        // the row at all: two accounts that look identical until one says Max
+        // 20x and the other Team.
+        organization_type: Some("claude_max".to_string()),
+        rate_limit_tier: Some("default_claude_max_20x".to_string()),
+        seat_tier: None,
         switch_threshold: None,
         access_token: "demo-access-token".to_string(),
         refresh_token: Some("demo-refresh-token".to_string()),
@@ -125,6 +132,9 @@ fn demo_accounts() -> Vec<AccountRuntime> {
 
     // team-prod — green, and the CURRENT serving account (▶ marker).
     let mut team_prod = base("team-prod", 0);
+    team_prod.organization_type = Some("claude_team".to_string());
+    team_prod.rate_limit_tier = Some("default_claude_max_5x".to_string());
+    team_prod.seat_tier = Some("team_tier_1".to_string());
     team_prod.quota.five_hour = Some(five_hour(0.30));
     team_prod.quota.seven_day = Some(seven_day(0.15));
     team_prod.requests = 890;
@@ -145,6 +155,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
 
     // backup — dead credential: red "error" status, failing probe, no quota.
     let mut backup = base("backup", 10);
+    backup.rate_limit_tier = Some("default_claude_max_5x".to_string());
     backup.status = AccountStatus::Error;
     backup.probe_status = ProbeStatus::Error;
     backup.probe_error = Some("refresh token rejected (HTTP 401)".to_string());

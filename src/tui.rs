@@ -549,7 +549,27 @@ fn render_accounts(
             let last_used = fmt_age_opt(account.last_used, now);
 
             // Columns shared by both layouts, in their shared order.
-            let name = Cell::from(format!("{marker}{}", account.name));
+            //
+            // The plan rides IN the name cell, dim, rather than taking a column
+            // of its own: it is a fact ABOUT the name — the thing that tells two
+            // identically-named rows apart — and a column would cost width on
+            // every row to say nothing about the fifteen that share a plan.
+            // Absent (not "unknown") for an account that has never been
+            // profiled, matching the plain-text renderer's omitted `plan=`.
+            let name = match tcr_status_wire::plan_label(
+                account.organization_type.as_deref(),
+                account.rate_limit_tier.as_deref(),
+                account.seat_tier.as_deref(),
+            ) {
+                Some(plan) => Cell::from(Line::from(vec![
+                    Span::raw(format!("{marker}{}", account.name)),
+                    Span::styled(
+                        format!(" {plan}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ),
+                ])),
+                None => Cell::from(format!("{marker}{}", account.name)),
+            };
             let priority = Cell::from(account.priority.to_string());
             let status = Cell::from(account.status.clone()).style(status_style(&account.status));
             let gate = Cell::from(gate_label).style(gate_style);
@@ -1436,6 +1456,11 @@ mod tests {
     fn snap_gate(name: &str, gate: GateReason, free_at: Option<OffsetDateTime>) -> AccountSnapshot {
         AccountSnapshot {
             name: name.to_string(),
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            org_uuid: None,
+            org_name: None,
             priority: 0,
             status: "active".to_string(),
             disabled: matches!(gate, GateReason::Disabled),

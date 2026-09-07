@@ -1578,6 +1578,21 @@ struct AddAccountRequest {
     priority: Option<i64>,
     #[serde(default)]
     switch_threshold: Option<f64>,
+    /// The account's plan, as the login that produced these credentials read it
+    /// off the profile endpoint (see [`config::Account::organization_type`]).
+    ///
+    /// Named explicitly rather than inherited: this struct MIRRORS
+    /// `config::Account`'s wire shape, it is not that type, so a field added to
+    /// `Account` alone is silently dropped here — the body still deserializes,
+    /// the route still answers 200, and the account lands with no plan while
+    /// the file route has one. `add_account_request_carries_the_plan_fields`
+    /// pins it.
+    #[serde(default)]
+    organization_type: Option<String>,
+    #[serde(default)]
+    rate_limit_tier: Option<String>,
+    #[serde(default)]
+    seat_tier: Option<String>,
 }
 
 /// The 200 body of [`ADD_ACCOUNT_PATH`]. Deserializable too — unit 3's CLI
@@ -1777,6 +1792,9 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         switch_threshold: parsed.switch_threshold,
         disabled: None,
         groups: None,
+        organization_type: parsed.organization_type,
+        rate_limit_tier: parsed.rate_limit_tier,
+        seat_tier: parsed.seat_tier,
         extra: serde_json::Map::new(),
     };
     // Captured before the move below: on an ambiguous match this is the ONLY
@@ -4209,6 +4227,53 @@ mod tests {
     use super::*;
     use crate::config::{Account, Config, ProxyConfig};
 
+    /// The server login route carries the plan. This is a SEAM, not a
+    /// formality: `AddAccountRequest` only MIRRORS `config::Account`'s wire
+    /// shape, so a field added to `Account` alone is silently dropped here —
+    /// the body still deserializes, the route still answers 200, and the
+    /// account lands with no plan while the file route has one. Serializing a
+    /// real `Account` and deserializing it as the request is exactly the hop
+    /// `post_add_account` performs, so this fails the moment the two shapes
+    /// drift apart.
+    #[test]
+    fn add_account_request_carries_the_plan_fields() {
+        let mut account = Account {
+            name: "alice@example.com".to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: "at-a".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            priority: None,
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: Some("claude_team".to_string()),
+            rate_limit_tier: Some("default_raven".to_string()),
+            seat_tier: Some("team_standard".to_string()),
+            extra: serde_json::Map::new(),
+        };
+        let body = serde_json::to_string(&account).expect("serialize the account login sends");
+        let parsed: AddAccountRequest =
+            serde_json::from_str(&body).expect("the route must accept the body login sends");
+
+        assert_eq!(parsed.organization_type.as_deref(), Some("claude_team"));
+        assert_eq!(parsed.rate_limit_tier.as_deref(), Some("default_raven"));
+        assert_eq!(parsed.seat_tier.as_deref(), Some("team_standard"));
+
+        // And an older client that sends none of them still parses — the keys
+        // are `#[serde(default)]`, so the route did not just become stricter.
+        account.organization_type = None;
+        account.rate_limit_tier = None;
+        account.seat_tier = None;
+        let older = serde_json::to_string(&account).expect("serialize a plan-less account");
+        let parsed: AddAccountRequest =
+            serde_json::from_str(&older).expect("a body with no plan keys must still parse");
+        assert_eq!(parsed.organization_type, None);
+    }
+
     fn dummy_config(api_key: Option<&str>, upstream: &str) -> Config {
         Config {
             quarantined_accounts: Vec::new(),
@@ -4243,6 +4308,9 @@ mod tests {
                 switch_threshold: None,
                 disabled: None,
                 groups: None,
+                organization_type: None,
+                rate_limit_tier: None,
+                seat_tier: None,
                 extra: serde_json::Map::new(),
             }],
             group_settings: std::collections::HashMap::new(),
@@ -5688,6 +5756,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         Config {
@@ -7473,6 +7544,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         };
         let resp = client

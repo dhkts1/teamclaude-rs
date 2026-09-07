@@ -204,6 +204,37 @@ pub struct Account {
     /// today even before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<Vec<String>>,
+    /// The organization's plan, VERBATIM as the profile endpoint reported it
+    /// (`organization.organization_type`): `claude_max`, `claude_team`,
+    /// `claude_pro`, and by the same naming pattern `claude_enterprise`.
+    ///
+    /// The raw provider string is what lands on disk, deliberately — the file
+    /// is the honest record of what upstream said, and the customer-facing
+    /// label is DERIVED from it by [`tcr_status_wire::plan_label`], in exactly
+    /// one place. An unrecognized value therefore survives a round-trip and
+    /// shows verbatim rather than being mis-bucketed into a plan we happen to
+    /// know the name of.
+    ///
+    /// NOT `account.has_claude_max`, which is a different fact and a tempting
+    /// wrong one: measured on a live fleet, it reads `true` on Team rows too,
+    /// so it cannot tell a Max org from a Team org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization_type: Option<String>,
+    /// The organization's rate-limit tier, verbatim
+    /// (`organization.rate_limit_tier`) — what distinguishes Max 20x
+    /// (`default_claude_max_20x`) from Max 5x. Non-Max orgs carry their own
+    /// values (`default_raven` observed on a Team org), which is why the tier
+    /// alone is never read as the plan; see [`Self::organization_type`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_tier: Option<String>,
+    /// The organization's seat tier, verbatim (`organization.seat_tier`) —
+    /// which seat a seated org's row holds (`team_standard` and `team_tier_1`
+    /// both observed on one live Team org). `None` on Max and Pro rows, which
+    /// have no seats at all, which is why it refines only the seated plans in
+    /// [`tcr_status_wire::plan_label`] — and only when `rate_limit_tier` names
+    /// no multiplier, which outranks it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_tier: Option<String>,
     /// Any per-account keys we do not model (e.g. `models`, `upstream`, `sx`).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -1879,6 +1910,118 @@ fn merge_disabled(doc: &mut Map<String, Value>, target: &Account, disabled: bool
     DisabledWrite::Updated
 }
 
+/// What a targeted [`save_plan`] did to the on-disk document. Same shape as
+/// [`DisabledWrite`], and for the same reason: the caller has to be able to say
+/// in one line whether the plan it just learned will survive a restart, or
+/// whether it will be re-fetched on every probe forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanWrite {
+    /// The plan fields were written and the file rewritten.
+    Updated,
+    /// The entry already carried exactly these values, so nothing was written
+    /// and the file is byte-identical. This is the steady state once a
+    /// backfilled fleet has been written once.
+    Unchanged,
+    /// Nothing on disk carries that identity — deleted or renamed since the
+    /// caller loaded the config. Nothing was written.
+    NoEntry,
+    /// More than one entry carries that identity; nothing was written. Same
+    /// refusal, for the same reason, as [`DisabledWrite::Ambiguous`] — and it
+    /// is not hypothetical here: the fleet this backfill exists for is exactly
+    /// the one holding the same email in two orgs.
+    Ambiguous,
+}
+
+impl std::fmt::Display for PlanWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Updated => "updated",
+            Self::Unchanged => "unchanged",
+            Self::NoEntry => "no matching entry on disk",
+            Self::Ambiguous => "more than one entry on disk carries this identity",
+        })
+    }
+}
+
+/// Persist ONLY the plan fields (`organizationType`, `rateLimitTier`,
+/// `seatTier`) of the one account matching `target`'s identity, leaving every
+/// other key — and every other account — exactly as the user left it.
+///
+/// Same read-modify-write shape as [`save_disabled`], and for the same reason it
+/// spells out: the running server's `Config` is a boot-time snapshot, so writing
+/// it whole (what [`save`] does) reverts every setting the user edited while the
+/// proxy ran. This one runs on the probe loop, which is the worst possible place
+/// to hold a stale snapshot — it fires every few minutes for the whole life of
+/// the process.
+///
+/// A `None` argument writes nothing for that field rather than removing the key:
+/// the caller is a profile fetch that may legitimately have learned one field and
+/// not another — a Max org genuinely has no seat tier — and "I did not learn
+/// this" must never erase what we already know. All `None` is therefore
+/// [`PlanWrite::Unchanged`], never a rewrite.
+///
+/// Values are OVERWRITTEN when they differ — a plan changes (see the doc-comment
+/// on [`Account::organization_type`]) — which is what makes the `Unchanged`
+/// comparison, rather than a presence check, the right guard here.
+pub fn save_plan(
+    path: &Path,
+    target: &Account,
+    organization_type: Option<&str>,
+    rate_limit_tier: Option<&str>,
+    seat_tier: Option<&str>,
+) -> Result<PlanWrite, ConfigError> {
+    let mut doc = read_document(path)?;
+    let outcome = merge_plan(
+        &mut doc,
+        target,
+        organization_type,
+        rate_limit_tier,
+        seat_tier,
+    );
+    if outcome == PlanWrite::Updated {
+        write_atomic(path, &serde_json::to_string_pretty(&doc)?)?;
+    }
+    Ok(outcome)
+}
+
+/// Set the plan fields on the one entry in `doc` matching `target`. Reports
+/// whether the document actually changed, so the caller can skip a pointless
+/// rewrite of a credential file on every probe. See [`save_plan`].
+fn merge_plan(
+    doc: &mut Map<String, Value>,
+    target: &Account,
+    organization_type: Option<&str>,
+    rate_limit_tier: Option<&str>,
+    seat_tier: Option<&str>,
+) -> PlanWrite {
+    let entry = match find_account_entry(doc, target) {
+        Ok(entry) => entry,
+        Err(DisabledWrite::Ambiguous) => return PlanWrite::Ambiguous,
+        // `find_account_entry` returns only `NoEntry`/`Ambiguous` on the error
+        // side; the remaining arms are the total-function tail.
+        Err(_) => return PlanWrite::NoEntry,
+    };
+    let mut changed = false;
+    for (key, value) in [
+        ("organizationType", organization_type),
+        ("rateLimitTier", rate_limit_tier),
+        ("seatTier", seat_tier),
+    ] {
+        let Some(value) = value else { continue };
+        let desired = Value::String(value.to_string());
+        if entry.get(key) == Some(&desired) {
+            continue;
+        }
+        entry.insert(key.to_string(), desired);
+        changed = true;
+    }
+    if changed {
+        PlanWrite::Updated
+    } else {
+        PlanWrite::Unchanged
+    }
+}
+
 /// What a targeted [`save_control_account`] did to the on-disk document.
 /// Simpler than [`DisabledWrite`]: `controlAccount` is a single top-level
 /// string, not a per-entry flag located by identity, so there is no
@@ -2549,6 +2692,27 @@ fn merge_account(
                     if let Some(name) = &account.org_name {
                         entry.insert("orgName".to_string(), Value::String(name.clone()));
                     }
+                }
+                // Plan fields are OVERWRITTEN, not backfilled — the opposite of
+                // the identity fields above, deliberately. An identity does not
+                // change (that is what makes it an identity), so a stored value
+                // is authoritative and a fresh one that disagrees is a reason to
+                // refuse. A PLAN changes: an org upgrades from Max 5x to Max 20x,
+                // a personal account joins a Team. Backfilling those would pin
+                // the fleet's first reading forever and quietly show a stale
+                // plan on every surface. A `None` still writes nothing, so a
+                // caller with no reading never blanks a value we do have.
+                if let Some(org_type) = &account.organization_type {
+                    entry.insert(
+                        "organizationType".to_string(),
+                        Value::String(org_type.clone()),
+                    );
+                }
+                if let Some(tier) = &account.rate_limit_tier {
+                    entry.insert("rateLimitTier".to_string(), Value::String(tier.clone()));
+                }
+                if let Some(seat) = &account.seat_tier {
+                    entry.insert("seatTier".to_string(), Value::String(seat.clone()));
                 }
             }
             Ok(AccountWrite::Updated)
@@ -4671,6 +4835,209 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
+    // --- save_plan (the durable half of the probe-loop plan backfill) -------
+
+    /// The whole point of the backfill: a fleet already on disk with no plan
+    /// fields at all gets them, on the one matching row, without a re-login.
+    #[test]
+    fn save_plan_writes_all_three_fields_onto_a_row_that_had_none() {
+        let path = tmp_path("plan-backfill");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a" },
+                { "name": "bob@example.com", "accessToken": "at-b" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_plan(
+                &path,
+                &by_name("alice@example.com"),
+                Some("claude_team"),
+                Some("default_raven"),
+                Some("team_tier_1"),
+            )
+            .unwrap(),
+            PlanWrite::Updated
+        );
+
+        let after = read_json(&path);
+        assert_eq!(after["accounts"][0]["organizationType"], "claude_team");
+        assert_eq!(after["accounts"][0]["rateLimitTier"], "default_raven");
+        assert_eq!(after["accounts"][0]["seatTier"], "team_tier_1");
+        assert!(
+            after["accounts"][1].get("organizationType").is_none(),
+            "only the matching row is touched — a targeted write, not a whole-file save"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A plan CHANGES (an org upgrades), so a differing value overwrites —
+    /// unlike the identity fields, which are backfill-only.
+    #[test]
+    fn save_plan_overwrites_a_stale_plan_rather_than_backfilling() {
+        let path = tmp_path("plan-upgrade");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a",
+                  "organizationType": "claude_max", "rateLimitTier": "default_claude_max_5x" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_plan(
+                &path,
+                &by_name("alice@example.com"),
+                Some("claude_max"),
+                Some("default_claude_max_20x"),
+                None,
+            )
+            .unwrap(),
+            PlanWrite::Updated
+        );
+        assert_eq!(
+            read_json(&path)["accounts"][0]["rateLimitTier"],
+            "default_claude_max_20x",
+            "an upgraded org must not keep showing the tier it was first seen on"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The steady state after the first backfill sweep: nothing changed, so the
+    /// credential file is not rewritten on every probe for the rest of time.
+    #[test]
+    fn save_plan_is_unchanged_when_the_row_already_says_exactly_this() {
+        let path = tmp_path("plan-steady");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a",
+                  "organizationType": "claude_team", "seatTier": "team_standard" }
+            ] }"#,
+        )
+        .unwrap();
+        let before = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            save_plan(
+                &path,
+                &by_name("alice@example.com"),
+                Some("claude_team"),
+                None,
+                Some("team_standard"),
+            )
+            .unwrap(),
+            PlanWrite::Unchanged
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "an unchanged plan must leave the file byte-identical"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// A `None` says "I did not learn this", never "erase what you have" — a
+    /// Max org has no seat tier, and that must not blank one already stored.
+    #[test]
+    fn save_plan_never_erases_a_field_the_caller_did_not_learn() {
+        let path = tmp_path("plan-partial");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-a",
+                  "organizationType": "claude_team", "seatTier": "team_tier_1" }
+            ] }"#,
+        )
+        .unwrap();
+
+        save_plan(
+            &path,
+            &by_name("alice@example.com"),
+            Some("claude_team"),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_json(&path)["accounts"][0]["seatTier"],
+            "team_tier_1",
+            "a field the caller passed None for must survive untouched"
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// The fleet this backfill exists for is exactly the one holding the same
+    /// email in two orgs, so the ambiguous case is the live case, not a corner.
+    #[test]
+    fn save_plan_refuses_an_identity_matching_two_entries() {
+        let path = tmp_path("plan-ambiguous");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "me@example.com", "accessToken": "at-one" },
+                { "name": "me@example.com", "accessToken": "at-two" }
+            ] }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            save_plan(
+                &path,
+                &by_name("me@example.com"),
+                Some("claude_max"),
+                None,
+                None,
+            )
+            .unwrap(),
+            PlanWrite::Ambiguous
+        );
+        let after = read_json(&path);
+        assert!(after["accounts"][0].get("organizationType").is_none());
+        assert!(after["accounts"][1].get("organizationType").is_none());
+        fs::remove_file(&path).ok();
+    }
+
+    /// `save_account`'s update path treats the plan the opposite way to the
+    /// identity fields beside it: overwrite, because a plan changes.
+    #[test]
+    fn save_account_overwrites_the_plan_while_backfilling_identity() {
+        let path = tmp_path("plan-on-relogin");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "accessToken": "at-old", "orgName": "Kept",
+                  "organizationType": "claude_max", "rateLimitTier": "default_claude_max_5x" }
+            ] }"#,
+        )
+        .unwrap();
+
+        let mut account = full_account("alice@example.com", "at-new");
+        account.org_name = Some("Ignored".to_string());
+        account.organization_type = Some("claude_team".to_string());
+        account.rate_limit_tier = Some("default_raven".to_string());
+        account.seat_tier = Some("team_standard".to_string());
+        assert_eq!(
+            save_account(&path, &account).unwrap(),
+            AccountWrite::Updated
+        );
+
+        let after = read_json(&path);
+        assert_eq!(
+            after["accounts"][0]["orgName"], "Kept",
+            "identity stays backfill-only — a stored org name is never overwritten"
+        );
+        assert_eq!(after["accounts"][0]["organizationType"], "claude_team");
+        assert_eq!(after["accounts"][0]["rateLimitTier"], "default_raven");
+        assert_eq!(after["accounts"][0]["seatTier"], "team_standard");
+        fs::remove_file(&path).ok();
+    }
+
     // --- save_account (the durable half of live account-add) ----------------
 
     /// A full, valid account record — the shape `Manager::add_or_update_account`
@@ -4690,6 +5057,9 @@ mod tests {
             switch_threshold: None,
             disabled: None,
             groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
             extra: serde_json::Map::new(),
         }
     }

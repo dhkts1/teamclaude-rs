@@ -422,6 +422,39 @@ Unlike the shared `sevenDay` bucket, this window gates **Fable requests only** �
 request never checks it, and `held[]`/the general `quotaState` never reflect it either. It exists on
 the wire so a Fable-scoped caption and tint have something to read.
 
+### The plan and org keys on `--json`
+
+Every row carries which plan the account is on, and which org it belongs to. Together these answer
+the question a fleet holding the same email twice cannot otherwise answer — *which* of these two
+rows is this? — and give a script something to pass to `--org`.
+
+| key | shape | what it is |
+|---|---|---|
+| `plan` | string or `null` | the customer-facing label: `Max 20x`, `Team 5x`, `Team Standard`, `Pro`, … `null` for an account never profiled — never a fabricated default |
+| `organizationType` | string or `null` | the provider's own word, verbatim: `claude_max`, `claude_team`, `claude_pro`, `claude_enterprise` |
+| `rateLimitTier` | string or `null` | verbatim, e.g. `default_claude_max_20x` — the rate-limit multiplier, when it names one |
+| `seatTier` | string or `null` | verbatim, e.g. `team_standard` / `team_tier_1` — which seat this row holds. `null` on Max and Pro, which have no seats |
+| `orgUuid` | string or `null` | the org this account is scoped to. Pass it to `--org` to address this row unambiguously when two rows share a name |
+| `orgName` | string or `null` | the org's display name. Two orgs can share one, so prefer `orgUuid` when narrowing |
+
+`plan` is DERIVED from the three raw keys, in one place, so the JSON, the plain text (`plan=`), the
+TUI and the macOS panel cannot disagree. The plan word comes from `organizationType`; the suffix
+after it is the `rateLimitTier` multiplier (`_20x` / `_5x`) when there is one, otherwise — on Team
+and Enterprise only — the seat (`team_standard` → `Standard`, `team_tier_2` → `Tier 2`). The
+multiplier wins because it is the stronger statement: a premium Team seat reads `team_tier_1` with a
+`_5x` tier, and `Team 5x` says what the account can do where `Team Tier 1` says nothing. An
+`organizationType` we do not recognize is passed through verbatim rather than bucketed into a plan we
+do — a new plan name shows as itself:
+
+```
+tcr status --json | jq -r '.[] | "\(.name)\t\(.plan // "unprofiled")\t\(.orgUuid // "-")"'
+```
+
+The plan is learned at login, and backfilled for accounts that logged in before these keys existed:
+the background quota probe fetches the profile once for any account that has no `organizationType`,
+records it, and writes it to the config. So a fresh checkout shows `null` until each account's first
+probe, not forever.
+
 ### The `usage` object on `--json`
 
 Every row carries `usage`: what that account spent, aggregated by the proxy as it served each
