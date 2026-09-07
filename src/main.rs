@@ -229,6 +229,9 @@ struct GroupAddArgs {
     /// Account name (its bare email — `Account.name` IS the email). Exact,
     /// case-sensitive.
     account: String,
+    /// Narrow an ambiguous match to a single org (name or uuid).
+    #[arg(long)]
+    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -243,6 +246,11 @@ struct GroupRmArgs {
     /// "both" and "neither".
     #[arg(required_unless_present = "all", conflicts_with = "all")]
     account: Option<String>,
+    /// Narrow an ambiguous match to a single org (name or uuid). Meaningless
+    /// with `--all`, which walks every member by identity and has no name to
+    /// disambiguate.
+    #[arg(long, conflicts_with = "all")]
+    org: Option<String>,
     /// Remove the group from every member instead of one account — deletes
     /// the group, since groups exist only while some account carries the
     /// label.
@@ -513,11 +521,17 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         }
         GroupAction::Add(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::add_to_group(&config_path, &a.group, &a.account)
+            cli::add_to_group(&config_path, &a.group, &a.account, a.org.as_deref())
         }
         GroupAction::Rm(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::remove_from_group(&config_path, &a.group, a.account.as_deref(), a.all)
+            cli::remove_from_group(
+                &config_path,
+                &a.group,
+                a.account.as_deref(),
+                a.org.as_deref(),
+                a.all,
+            )
         }
         GroupAction::Reserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);

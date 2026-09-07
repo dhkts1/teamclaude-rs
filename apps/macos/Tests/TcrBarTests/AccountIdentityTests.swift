@@ -95,6 +95,31 @@ final class AccountIdentityTests: XCTestCase {
         XCTAssertEqual(fleet.accounts[1].orgUuid, team)
     }
 
+    /// The gate the panel had no way to see. Anthropic's own rejection takes an
+    /// account out of selection while `status` stays `"active"` and the quota
+    /// bars can look ordinary, so before this decoded the row was drawn as
+    /// eligible for traffic the router will never send it.
+    func testTheRejectedGateDecodes() throws {
+        let fleet = try Fleet.decode(Data(duplicateEmailJSON.utf8))
+        XCTAssertEqual(fleet.accounts[0].gate, .rejected)
+        XCTAssertTrue(fleet.accounts[0].isRejected)
+        XCTAssertFalse(
+            fleet.accounts[1].isRejected,
+            "the control: the sibling row carries no gate and must not inherit one"
+        )
+    }
+
+    /// A gate token this build does not know must stay readable rather than
+    /// throwing the row away — the same tolerance `QuotaState` has.
+    func testAnUnknownGateTokenIsKeptVerbatim() {
+        XCTAssertEqual(GateReason(token: "fable-weekly"), .unknown("fable-weekly"))
+        XCTAssertEqual(GateReason(token: "fable-weekly").token, "fable-weekly")
+        XCTAssertFalse(
+            GateReason(token: "five-hour") == .rejected,
+            "only `rejected` is rejected — a quota gate is not Anthropic's verdict"
+        )
+    }
+
     /// The forward-compat contract every optional field on this row carries: a
     /// server built before these keys existed omits them entirely, and its rows
     /// must still decode rather than throwing the panel back to a fabricated
@@ -105,6 +130,12 @@ final class AccountIdentityTests: XCTestCase {
         XCTAssertNil(account.plan)
         XCTAssertNil(account.organizationType)
         XCTAssertNil(account.orgUuid)
+        XCTAssertNil(
+            account.gate,
+            "absent is `nil`, not `.ok` — this server does not report a gate, which "
+                + "is not the same as reporting that there is none"
+        )
+        XCTAssertFalse(account.isRejected)
         XCTAssertEqual(account.id, "solo@example.com")
     }
 
@@ -137,6 +168,41 @@ final class AccountIdentityTests: XCTestCase {
                 org: personal
             ).contains("--account 'henry@example.com' --org '\(personal)'"),
             "a re-login resolves through the same refuse-on-ambiguity path"
+        )
+    }
+
+    /// The group verbs are the ones Gil hit: `tcr group add` took no `--org` at
+    /// all, so the panel could not name which of two same-email rows to label,
+    /// and the CLI refused.
+    func testGroupCommandsCarryTheOrgWhenThereIsOne() {
+        XCTAssertEqual(
+            GroupCommand.addArguments(group: "gil", account: "henry@example.com", org: team),
+            ["group", "add", "gil", "henry@example.com", "--org", team]
+        )
+        XCTAssertEqual(
+            GroupCommand.removeArguments(group: "gil", account: "henry@example.com", org: team),
+            ["group", "rm", "gil", "henry@example.com", "--org", team]
+        )
+        XCTAssertEqual(
+            GroupCommand.addArguments(group: "gil", account: "solo@example.com"),
+            ["group", "add", "gil", "solo@example.com"],
+            "no org means the argument vector it always built"
+        )
+        XCTAssertEqual(
+            GroupCommand.removeArguments(group: "gil", account: "solo@example.com", org: ""),
+            ["group", "rm", "gil", "solo@example.com"],
+            "an empty org is not an org — never `--org ''`, which matches nothing"
+        )
+    }
+
+    /// Two same-email rows must not share a group failure or an in-flight
+    /// spinner, for the same reason they must not share a toggle verdict.
+    func testGroupFailuresAreKeyedPerRowNotPerName() {
+        let personalRef = AccountRef(name: "henry@example.com", orgUuid: personal)
+        let teamRef = AccountRef(name: "henry@example.com", orgUuid: team)
+        XCTAssertNotEqual(
+            GroupController.memberKey(group: "gil", account: personalRef),
+            GroupController.memberKey(group: "gil", account: teamRef)
         )
     }
 
@@ -182,6 +248,7 @@ final class AccountIdentityTests: XCTestCase {
           "plan":"Max 20x","organizationType":"claude_max",
           "rateLimitTier":"default_claude_max_20x","seatTier":null,
           "orgUuid":"\(personal)","orgName":"Example Personal",
+          "gate":"rejected",
           "quota":1.0,"quotaState":"spent","fiveHour":1.0,"sevenDay":1.0,
           "sevenDayOi":null,"held":[],"requests":13011,"inputTokens":1,"outputTokens":1,
           "cacheReadTokens":1,"cacheHitRatio":0.5,"probeStatus":"ok","probeError":null,

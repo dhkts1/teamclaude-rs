@@ -67,6 +67,14 @@ enum RenderStates {
             ("01d-unmeasured-window-proof", .loaded(fleet(unmeasuredWindowJSON)), false, nil),
             ("01e-plan-labels", .loaded(fleet(planLabelsJSON)), false, nil),
             ("01f-duplicate-email", .loaded(fleet(duplicateEmailJSON)), false, nil),
+            // The control account is pinned to the worst row deliberately: the
+            // CONTROL pill is one of the six things competing for its width,
+            // and a fixture that left it off would not be the row that
+            // overflowed.
+            (
+                "01g-widest-row", .loaded(fleet(widestRowJSON)), false,
+                "henry.fitzgerald@example.com"
+            ),
             ("02-mixed-thirteen", .loaded(fleet(mixedJSON)), false, nil),
             ("03-zero-capacity", .loaded(fleet(exhaustedJSON)), false, nil),
             ("04-unmeasured-row", .loaded(fleet(unmeasuredJSON)), false, nil),
@@ -541,6 +549,33 @@ enum RenderStates {
             account("dave@example.com", quota: "0.08", state: "ok"),
         ]
         return "[\(rows.joined(separator: ","))]"
+    }
+
+    /// THE WIDEST ROW THE FLEET CAN PRODUCE — the shape that overflowed the
+    /// panel, reproduced so a PNG can prove it does not any more.
+    ///
+    /// Everything that competes for width at once: the control marker, a
+    /// reserved group (`GROUP ONLY`), a quota pill, TWO group tags one of which
+    /// is long, the longest plan label, and a 30-character email. On the live
+    /// fleet this row rendered wider than `Tok.panelWidth`, so both card edges
+    /// were clipped and the header truncated to "…eady · 15 ok".
+    ///
+    /// The pass condition is not "it looks tidy" — it is that NOTHING is
+    /// clipped and the name is still readable. A second, ordinary row is
+    /// included as the control: if the panel is over-wide for a structural
+    /// reason, both rows show it, and the bug is not the one this scene names.
+    private static var widestRowJSON: String {
+        let worst = account(
+            "henry.fitzgerald@example.com", quota: "0.62", state: "ok",
+            groups: ["gil", "henry-team-parked"],
+            reservedGroups: ["gil"],
+            plan: "Team Standard",
+            orgUuid: "22222222-2222-2222-2222-222222222222")
+        let ordinary = account(
+            "bob@example.com", quota: "0.31", state: "ok",
+            plan: "Max 20x",
+            orgUuid: "11111111-1111-1111-1111-111111111111")
+        return "[\(worst),\(ordinary)]"
     }
 
     /// THE SAME EMAIL, TWICE — the shape that broke the panel.
