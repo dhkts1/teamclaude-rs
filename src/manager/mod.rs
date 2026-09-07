@@ -511,18 +511,12 @@ pub(crate) fn build_serving_client(http1_only: bool) -> Arc<reqwest::Client> {
     Arc::new(builder.build().expect("build reqwest client"))
 }
 
-/// A rotation slot answers a user's account query by the same three fields a
-/// config record does, so [`Manager::set_disabled_by_query`] can run the CLI's
-/// own resolution rule over the LIVE fleet.
+/// A rotation slot answers a user's account query by the same field a config
+/// record does, so [`Manager::set_disabled_by_query`] can run the CLI's own
+/// resolution rule over the LIVE fleet.
 impl crate::identity::Queryable for AccountRuntime {
     fn query_name(&self) -> &str {
         &self.name
-    }
-    fn query_org_name(&self) -> Option<&str> {
-        self.org_name.as_deref()
-    }
-    fn query_org_uuid(&self) -> Option<&str> {
-        self.org_uuid.as_deref()
     }
 }
 
@@ -531,14 +525,12 @@ impl crate::identity::Queryable for AccountRuntime {
 /// `Applied` carries the RESOLVED name plus the durable half's fate, which the
 /// caller must surface — see [`DisablePersist::warning`].
 ///
-/// The name is resolved, not echoed, because the query may have been the account's
-/// bare EMAIL where its stored name carries an org suffix (`me@example.com
-/// (Acme)`) — so the answer has to say what was actually parked. It is NOT a
-/// substring or case-insensitive match: [`crate::identity::match_accounts`] tries
-/// exact name, then exact email, byte-for-byte and untrimmed. Do not "fix"
-/// resolution to match a looser description; a widened rule is how a query
-/// silently parks an account nobody named, which is exactly what the `Ambiguous`
-/// arm below exists to refuse.
+/// The name is resolved, not echoed, so the answer says what was actually
+/// parked. It is NOT a substring or case-insensitive match:
+/// [`crate::identity::match_accounts`] is the account's exact name,
+/// byte-for-byte and untrimmed. Do not "fix" resolution to match a looser
+/// description; a widened rule is how a query silently parks an account nobody
+/// named, which is exactly what the `Ambiguous` arm below exists to refuse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetDisabledOutcome {
     Applied {
@@ -547,8 +539,9 @@ pub enum SetDisabledOutcome {
     },
     /// The query named no account in the live rotation.
     NoMatch,
-    /// The query named more than one, listed here so the caller can tell the user
-    /// what to pass `--org` for.
+    /// The query named more than one — only reachable on a config hand-edited
+    /// past the loader's rename migration. Listed here so the caller can tell
+    /// the user which rows to go fix.
     Ambiguous(Vec<String>),
 }
 
@@ -725,8 +718,9 @@ pub enum SetControlOutcome {
     },
     /// The query named no account in the live rotation.
     NoMatch,
-    /// The query named more than one, listed so the caller can tell the user
-    /// what to pass `--org` for.
+    /// The query named more than one — only reachable on a config hand-edited
+    /// past the loader's rename migration. Listed so the caller can tell the
+    /// user which rows to go fix.
     Ambiguous(Vec<String>),
 }
 
@@ -1304,8 +1298,7 @@ impl Manager {
             i64::from(config.reset_urgency_tier_hours).saturating_mul(3_600_000);
 
         let control_idx = config.control_account.as_ref().and_then(|identity| {
-            match crate::identity::match_one(&accounts[..], identity.name(), identity.org_filter())
-            {
+            match crate::identity::match_one(&accounts[..], identity.name()) {
                 crate::identity::Match::One(idx) => Some(idx),
                 crate::identity::Match::None => {
                     let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
@@ -1315,9 +1308,9 @@ impl Manager {
                     );
                     None
                 }
-                // Two or more accounts share this identity (the reason
-                // `save_control_account` now stores org alongside the name):
-                // picking the first one silently, as the old `position(...)`
+                // Two or more accounts share this name — only reachable on a
+                // config hand-edited past `config::load`'s rename migration.
+                // Picking the first one silently, as the old `position(...)`
                 // scan did, risks binding control to a disabled Team-seat row
                 // while the account that resolved it live stays unpinned.
                 crate::identity::Match::Ambiguous(candidates) => {
@@ -2147,15 +2140,10 @@ impl Manager {
     ///
     /// The read guard is released before `set_disabled` takes its write guard —
     /// `RwLock` is not reentrant, so holding it across the call would deadlock.
-    pub fn set_disabled_by_query(
-        &self,
-        query: &str,
-        org: Option<&str>,
-        disabled: bool,
-    ) -> SetDisabledOutcome {
+    pub fn set_disabled_by_query(&self, query: &str, disabled: bool) -> SetDisabledOutcome {
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            match crate::identity::match_one(&accounts[..], query, org) {
+            match crate::identity::match_one(&accounts[..], query) {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetDisabledOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
@@ -2337,18 +2325,14 @@ impl Manager {
         self.persist_control(target)
     }
 
-    /// Resolve a user-supplied `(query, org)` against the LIVE rotation and set
+    /// Resolve a user-supplied `query` against the LIVE rotation and set
     /// the control account to whatever it names — the whole operation the
     /// control endpoint performs. `query = None` CLEARS the control account
     /// (there is nothing to resolve, so this never reaches `match_one`).
     ///
     /// Resolution runs over `self.accounts` — never the boot-time config
     /// snapshot — for the same reason [`Self::set_disabled_by_query`] does.
-    pub fn set_control_by_query(
-        &self,
-        query: Option<&str>,
-        org: Option<&str>,
-    ) -> SetControlOutcome {
+    pub fn set_control_by_query(&self, query: Option<&str>) -> SetControlOutcome {
         let Some(query) = query else {
             return SetControlOutcome::Applied {
                 name: None,
@@ -2357,7 +2341,7 @@ impl Manager {
         };
         let (idx, name) = {
             let accounts = self.accounts.read().expect("accounts lock poisoned");
-            match crate::identity::match_one(&accounts[..], query, org) {
+            match crate::identity::match_one(&accounts[..], query) {
                 crate::identity::Match::One(idx) => (idx, accounts[idx].name.clone()),
                 crate::identity::Match::None => return SetControlOutcome::NoMatch,
                 crate::identity::Match::Ambiguous(names) => {
@@ -2423,7 +2407,7 @@ impl Manager {
     /// — the SAME rule the durable half ([`config::save_account`]) and `tcr
     /// login` (`oauth::upsert_account`) already run — never
     /// [`crate::identity::match_one`]. `match_one` goes through
-    /// [`crate::identity::Queryable`], which exposes only name and org: it
+    /// [`crate::identity::Queryable`], which exposes only the name: it
     /// cannot compare `account_uuid`, so it was structurally unable to tell two
     /// different people sharing a display name apart. Unifying on `resolve`
     /// fixes that (a differing `account_uuid` never matches, so a same-named
@@ -2434,16 +2418,12 @@ impl Manager {
     /// which one account that is, on both halves, every time — not only when
     /// there happen to be two orgs in play.
     ///
-    /// One `match_one`-style fallback survives, deliberately narrow: when
-    /// `account` carries NO identity fields at all (a bare name — the ordinary
-    /// single-account case), `resolve`'s exact name-equality miss is retried
-    /// through `match_one` so a bare email still finds a stored display name
-    /// carrying an org suffix (`email (Org)`), the way the CLI's own query
-    /// resolution always has. It is gated on "no identity fields submitted"
-    /// and nothing looser: widening it to a submission that DOES carry an
-    /// `account_uuid` would resurrect the exact bug this rewrite fixes, by
-    /// matching on name/email again after the uuid comparison already said
-    /// "different person".
+    /// A submission carrying no identity fields at all (a bare name) still
+    /// finds its row: `same_identity` falls back to name equality when either
+    /// side has no uuid, and names are unique, so `resolve` answers that case
+    /// on its own. It used to need a `match_one` retry on top, because a bare
+    /// email had to find a stored `email (Org)` display name — a shape that
+    /// existed only while names were not unique.
     ///
     /// Resolve AND mutate under ONE write-lock acquisition of `self.accounts` —
     /// closing a TOCTOU the old two-lock version had: it resolved under a READ
@@ -2502,9 +2482,6 @@ impl Manager {
             account.org_uuid.clone(),
             account.org_name.clone(),
         );
-        let bare_identity = account.account_uuid.is_none()
-            && account.org_uuid.is_none()
-            && account.org_name.is_none();
 
         /// What the locked resolve-and-mutate section below produced, so the
         /// durable write can run after `self.accounts`'s lock is released —
@@ -2589,15 +2566,6 @@ impl Manager {
                                 .map(|a| a.name.clone())
                                 .collect();
                             return AddAccountOutcome::Ambiguous(names);
-                        }
-                        crate::identity::Resolved::None if bare_identity => {
-                            match crate::identity::match_one(&accounts[..], &account.name, None) {
-                                crate::identity::Match::One(idx) => Some(idx),
-                                crate::identity::Match::None => None,
-                                crate::identity::Match::Ambiguous(names) => {
-                                    return AddAccountOutcome::Ambiguous(names);
-                                }
-                            }
                         }
                         crate::identity::Resolved::None => None,
                     };
@@ -3052,6 +3020,8 @@ mod tests {
         Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
@@ -4399,9 +4369,7 @@ mod tests {
 
     fn config_with_control(accounts: Vec<Account>, control: &str) -> Config {
         let mut config = config_with(accounts);
-        config.control_account = Some(crate::config::ControlAccountRef::Legacy(
-            control.to_string(),
-        ));
+        config.control_account = Some(crate::config::ControlAccountRef::Name(control.to_string()));
         config
     }
 
@@ -4526,23 +4494,24 @@ mod tests {
         );
     }
 
-    /// An identity object carrying `orgUuid` resolves boot control to the RIGHT
-    /// one of two same-email rows — the fix's other half: a `controlAccount`
-    /// written with org information survives a restart instead of collapsing
-    /// back to the ambiguous legacy behaviour.
+    /// A `controlAccount` written by an OLDER tcr — the identity object, with
+    /// its org fields — still resolves at boot, by its `name` alone. Nothing
+    /// writes that shape now, and a config carrying one must still come up on
+    /// the right row rather than with no control account at all.
+    ///
+    /// The two rows have distinct names here because `config::load` guarantees
+    /// that; the object's `orgUuid` is the field this deliberately no longer
+    /// reads, and the row it names is the one that must win.
     #[test]
-    fn assemble_resolves_identity_control_account_by_org_uuid() {
-        let dup_a = Account {
-            org_uuid: Some("11111111-1111-1111-1111-111111111111".to_string()),
-            ..account("dup@example.com", 0)
-        };
-        let dup_b = Account {
+    fn assemble_resolves_a_legacy_identity_control_account_by_name() {
+        let personal = account("dup@example.com", 0);
+        let team = Account {
             org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
-            ..account("dup@example.com", 0)
+            ..account("dup@example.com/team", 0)
         };
-        let mut config = config_with(vec![dup_a, dup_b]);
+        let mut config = config_with(vec![personal, team]);
         config.control_account = Some(crate::config::ControlAccountRef::Identity {
-            name: "dup@example.com".to_string(),
+            name: "dup@example.com/team".to_string(),
             account_uuid: None,
             org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
             org_name: None,
@@ -4551,20 +4520,22 @@ mod tests {
         assert_eq!(
             manager.control(),
             Some(1),
-            "orgUuid must pick the second row, not the first"
+            "the object's name must pick the second row, not the first"
         );
     }
 
-    /// Full round trip through the durable half: setting control on a
-    /// duplicated email via [`Manager::set_control_by_query`] persists the
-    /// IDENTITY shape (not the bare name), and a fresh `Manager` built from the
-    /// reloaded file resolves to the SAME row — not just "a" row. Both rows
-    /// share an `accountUuid` (one person, two orgs — the realistic shape a
-    /// duplicated email takes) so the durable write can disambiguate them at
-    /// all; see `control_write_with_org_uuid_disambiguates_duplicated_email` in
-    /// `config.rs` for why an org alone, with no shared uuid, cannot.
+    /// Full round trip through the durable half, on the fleet shape that used
+    /// to make this impossible: one person, two orgs, one email. The loader
+    /// gives the second row its own name; setting control by that name persists
+    /// the NAME (nothing else is needed — a name is unique), and a fresh
+    /// `Manager` built from the reloaded file resolves to the SAME row, not
+    /// just "a" row.
+    ///
+    /// The duplicated-email file is written first and read back through
+    /// `config::load` deliberately: the migration is the step under test as much
+    /// as the control write is.
     #[test]
-    fn set_control_on_duplicated_email_survives_a_reload() {
+    fn set_control_on_a_migrated_duplicate_survives_a_reload() {
         let path = tmp_config_path("control-survives-reload");
         let dup_a = Account {
             account_uuid: Some("33333333-3333-3333-3333-333333333333".to_string()),
@@ -4578,33 +4549,36 @@ mod tests {
             refresh_token: Some("rt-second".to_string()),
             ..account("dup@example.com", 0)
         };
-        let config = config_with(vec![dup_a, dup_b]);
-        config::save(&path, &config).expect("write test config");
-        let manager = build_manager_with_path(config, path.clone());
+        config::save(&path, &config_with(vec![dup_a, dup_b])).expect("write test config");
 
-        let outcome = manager.set_control_by_query(
-            Some("dup@example.com"),
-            Some("22222222-2222-2222-2222-222222222222"),
-        );
+        // The loader renames the second row — no org name on file, so the name
+        // falls back to the first eight characters of its org uuid.
+        let migrated = config::load(&path).expect("load migrates the duplicate");
+        assert_eq!(migrated.accounts[0].name, "dup@example.com");
+        assert_eq!(migrated.accounts[1].name, "dup@example.com/22222222");
+        let manager = build_manager_with_path(migrated, path.clone());
+
+        let outcome = manager.set_control_by_query(Some("dup@example.com/22222222"));
         assert_eq!(
             outcome,
             SetControlOutcome::Applied {
-                name: Some("dup@example.com".to_string()),
+                name: Some("dup@example.com/22222222".to_string()),
                 persist: ControlPersist::Persisted,
             }
         );
         assert_eq!(manager.control(), Some(1), "resolved the SECOND row live");
 
-        // The identity object, not the bare name, must be what landed on disk.
+        // The bare name is the whole key on disk now.
         let on_disk = config::load(&path).expect("reload persisted config");
         assert_eq!(
             on_disk.control_account,
-            Some(crate::config::ControlAccountRef::Identity {
-                name: "dup@example.com".to_string(),
-                account_uuid: Some("33333333-3333-3333-3333-333333333333".to_string()),
-                org_uuid: Some("22222222-2222-2222-2222-222222222222".to_string()),
-                org_name: None,
-            })
+            Some(crate::config::ControlAccountRef::Name(
+                "dup@example.com/22222222".to_string()
+            ))
+        );
+        assert!(
+            on_disk.renamed_accounts.is_empty(),
+            "the second load has nothing left to rename"
         );
 
         // A brand-new Manager built from the reloaded file resolves to the
@@ -4740,7 +4714,7 @@ mod tests {
         assert_eq!(pinned, 0);
 
         // Set the control account to `ctrl` (index 1) at runtime.
-        manager.set_control_by_query(Some("ctrl"), None);
+        manager.set_control_by_query(Some("ctrl"));
         assert_eq!(manager.control(), Some(1));
 
         // The SAME session's next identity-plane request must still return its
@@ -4790,7 +4764,7 @@ mod tests {
 
         // Set control to "c" (index 2) — a DIFFERENT account — after the pin
         // already exists.
-        manager.set_control_by_query(Some("c"), None);
+        manager.set_control_by_query(Some("c"));
         assert_eq!(manager.control(), Some(2));
 
         // Bias ordinary LRU firmly toward "b" (index 1): stamp "c" (control)
@@ -5196,7 +5170,7 @@ mod tests {
             lock_refresher(),
         );
 
-        let outcome = manager.set_control_by_query(Some("gil"), None);
+        let outcome = manager.set_control_by_query(Some("gil"));
         assert_eq!(
             outcome,
             SetControlOutcome::Applied {
@@ -5207,7 +5181,7 @@ mod tests {
         assert_eq!(manager.control(), Some(0));
         assert_eq!(manager.control_name(), Some("gil".to_string()));
 
-        let cleared = manager.set_control_by_query(None, None);
+        let cleared = manager.set_control_by_query(None);
         assert_eq!(
             cleared,
             SetControlOutcome::Applied {
@@ -5225,11 +5199,11 @@ mod tests {
             lock_refresher(),
         );
         assert_eq!(
-            manager.set_control_by_query(Some("ghost"), None),
+            manager.set_control_by_query(Some("ghost")),
             SetControlOutcome::NoMatch
         );
         assert_eq!(
-            manager.set_control_by_query(Some("dup"), None),
+            manager.set_control_by_query(Some("dup")),
             SetControlOutcome::Ambiguous(vec!["dup".to_string(), "dup".to_string()])
         );
         assert_eq!(
@@ -5971,7 +5945,7 @@ mod tests {
             config_with(vec![account("ok", 0), account("gil", 0)]),
             refresher,
         );
-        manager.set_control_by_query(Some("gil"), None);
+        manager.set_control_by_query(Some("gil"));
         manager.set_disabled(1, true);
 
         assert_eq!(
@@ -5993,7 +5967,7 @@ mod tests {
             config_with(vec![account("gil", 0), account("ok", 0), account("off", 0)]),
             refresher,
         );
-        manager.set_control_by_query(Some("gil"), None);
+        manager.set_control_by_query(Some("gil"));
         manager.set_disabled(0, true); // the control account itself, disabled
         manager.set_disabled(2, true); // an unrelated account, disabled
 
@@ -9760,39 +9734,51 @@ mod tests {
     }
 
     /// Preservation guard: a submission with NO identity fields at all (a bare
-    /// name) must still find a stored row whose display name carries an org
-    /// suffix, via the CLI's own email-of fallback — `identity::resolve`'s exact
-    /// name equality alone would miss it and append a duplicate. This is the
-    /// one case the bare-name `match_one` fallback exists for.
+    /// name) resolves on NAME EQUALITY alone — `same_identity`'s fallback when
+    /// either side has no uuid — and a name that matches nothing is APPENDED,
+    /// never merged onto a row whose name merely looks similar.
+    ///
+    /// This used to need a `match_one` retry on top, so a bare email could find
+    /// a stored `alice@example.com (Corp)`. That display-name shape existed only
+    /// because names were not unique; a submission naming a row that is not
+    /// there is now a new account, which is the honest reading.
     #[test]
-    fn add_or_update_account_bare_email_still_matches_a_display_name_with_org_suffix() {
-        let display_named = Account {
-            name: "alice@example.com (Corp)".to_string(),
+    fn add_or_update_account_with_a_bare_name_matches_only_that_exact_name() {
+        let stored = Account {
             refresh_token: Some("rt-old".to_string()),
-            ..account("alice@example.com (Corp)", 0)
+            ..account("alice@example.com/corp", 0)
         };
         let (manager, path) =
-            build_manager_with_disk(config_with(vec![display_named]), "f-bare-email-fallback");
+            build_manager_with_disk(config_with(vec![stored]), "f-bare-name-exact");
 
-        let submission = Account {
+        // The exact stored name updates in place.
+        let same_row = Account {
             access_token: "at-fresh".to_string(),
             refresh_token: Some("rt-fresh".to_string()),
+            ..account("alice@example.com/corp", 0)
+        };
+        match manager.add_or_update_account(same_row) {
+            AddAccountOutcome::Updated { idx, .. } => assert_eq!(idx, 0),
+            other => panic!("an exact name must update its own row: {other:?}"),
+        }
+
+        // A different name is a different account, appended.
+        let other_row = Account {
+            access_token: "at-other".to_string(),
+            refresh_token: Some("rt-other".to_string()),
             ..account("alice@example.com", 0)
         };
-        let outcome = manager.add_or_update_account(submission);
-        let idx = match outcome {
-            AddAccountOutcome::Updated { idx, .. } => idx,
-            other => panic!("a bare email must still match its display-named row: {other:?}"),
-        };
-        assert_eq!(idx, 0);
+        match manager.add_or_update_account(other_row) {
+            AddAccountOutcome::Added { idx, .. } => assert_eq!(idx, 1),
+            other => panic!("an unmatched name must be appended: {other:?}"),
+        }
         assert_eq!(
             manager
                 .accounts
                 .read()
                 .expect("accounts lock poisoned")
                 .len(),
-            1,
-            "no duplicate appended"
+            2
         );
 
         std::fs::remove_file(&path).ok();

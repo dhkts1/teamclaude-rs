@@ -216,6 +216,51 @@ pub fn save(path: &Path, pins: &[StoredPin], now_ms: i64) -> Result<usize, Confi
     Ok(count)
 }
 
+/// Carry the pin file's [`StoredPin::name`]s across an account rename, so warm
+/// sessions survive `config::load`'s duplicate-name migration.
+///
+/// Returns how many pins were rewritten. A pin whose name matches no rename is
+/// left exactly as it was, and a file that cannot be read or parsed is left
+/// alone entirely — it is a cache, so the worst case is the cold prompt prefix
+/// those sessions would have paid anyway. That is also why the whole thing is
+/// infallible: a rename is not worth failing a boot over.
+///
+/// Only pins with no `account_uuid` actually NEED this — [`load`] resolves the
+/// rest through [`identity::resolve`], which compares uuid and org and never
+/// looks at the name. Rewriting all of them keeps the file honest about what it
+/// points at, which is what the next person to read it will assume.
+pub fn rename_pins(path: &Path, renames: &[(String, String)]) -> usize {
+    if renames.is_empty() {
+        return 0;
+    }
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return 0;
+    };
+    let Ok(mut file) = serde_json::from_str::<PinFile>(&data) else {
+        return 0;
+    };
+    if file.version != FORMAT_VERSION {
+        return 0;
+    }
+    let mut rewritten = 0;
+    for pin in &mut file.pins {
+        if let Some((_, to)) = renames.iter().find(|(from, _)| *from == pin.name) {
+            pin.name.clone_from(to);
+            rewritten += 1;
+        }
+    }
+    if rewritten > 0 {
+        if let Err(err) = crate::config::write_atomic(
+            path,
+            &serde_json::to_string_pretty(&file).unwrap_or_default(),
+        ) {
+            tracing::warn!(error = %err, "could not carry session-affinity pins across the account rename");
+            return 0;
+        }
+    }
+    rewritten
+}
+
 /// Read `path` and resolve each pin against `accounts`, dropping anything stale
 /// or not resolvable to exactly one account.
 ///

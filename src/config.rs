@@ -691,33 +691,25 @@ impl ThrottleConfig {
     }
 }
 
-/// The `controlAccount` key on disk: either the legacy bare account name every
-/// config written before this change carries, or an identity object — the same
-/// `name`/`accountUuid`/`orgUuid`/`orgName` fields `accounts[]` entries store —
-/// that survives a restart when an email is duplicated across two rows.
-/// `#[serde(untagged)]` is unambiguous here because the two shapes are
-/// structurally disjoint: a JSON string can never parse as the object variant
-/// and vice versa.
+/// The `controlAccount` key on disk: an account `name`, or the identity object
+/// (`name`/`accountUuid`/`orgUuid`/`orgName`) a `tcr` from the duplicated-email
+/// era wrote. `#[serde(untagged)]` is unambiguous here because the two shapes
+/// are structurally disjoint: a JSON string can never parse as the object
+/// variant and vice versa.
 ///
-/// [`save_control_account`] always WRITES the identity shape once a real
-/// [`Account`] is known — it never re-emits the legacy string — but every
-/// reader (this type's own `Deserialize`, and boot resolution in
-/// `crate::manager::Manager::assemble`) keeps accepting the legacy shape
-/// unchanged, so a config nobody has re-saved since this change still loads
-/// and resolves exactly as before.
+/// A name is the whole key now — `Account.name` is unique across a config by
+/// construction (see [`crate::identity`]) — so [`save_control_account`] always
+/// writes the STRING, and the object shape survives only as something older
+/// configs are read back from. Reading one costs nothing and collapses it to
+/// its name on the next write.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged, rename_all = "camelCase")]
 pub enum ControlAccountRef {
-    /// Written by every `tcr` build before this change: just the account's
-    /// `name`. Resolved by name/email alone (no org filter) — see
-    /// [`Self::org_filter`] — which is byte-identical to the old
-    /// `position(|a| a.name == *name)` lookup for the common case, a unique
-    /// name, and only starts refusing (rather than guessing) once that name is
-    /// duplicated.
-    Legacy(String),
-    /// The shape a `set` writes going forward: the same identity fields
-    /// `accounts[]` entries carry, so a duplicated email round-trips onto the
-    /// specific row it was set on.
+    /// The account's `name`, which resolves to exactly one row.
+    Name(String),
+    /// The identity object a `tcr` between `8411f3e` and this change wrote, when
+    /// a name could name two rows. Accepted, never written; only `name` is read
+    /// from it.
     ///
     /// `rename_all = "camelCase"` is repeated here, not just at the enum
     /// level, because serde's container `rename_all` renames VARIANT names for
@@ -736,38 +728,19 @@ pub enum ControlAccountRef {
 }
 
 impl ControlAccountRef {
-    /// The account name/email, present in both shapes.
+    /// The account name, present in both shapes.
     pub fn name(&self) -> &str {
         match self {
-            Self::Legacy(name) => name,
+            Self::Name(name) => name,
             Self::Identity { name, .. } => name,
-        }
-    }
-
-    /// The org discriminator to narrow a name/email match by, for boot
-    /// resolution — `None` for the legacy shape (it never carried one) and for
-    /// an identity object that itself has neither field. Prefers the uuid over
-    /// the name, matching [`crate::identity::org_key_of`]'s own preference.
-    pub fn org_filter(&self) -> Option<&str> {
-        match self {
-            Self::Legacy(_) => None,
-            Self::Identity {
-                org_uuid, org_name, ..
-            } => crate::identity::org_key_of(org_uuid.as_deref(), org_name.as_deref()),
         }
     }
 }
 
 impl From<&Account> for ControlAccountRef {
-    /// Always builds the IDENTITY shape — see this type's doc-comment for why
-    /// a set always upgrades the key rather than re-writing the legacy string.
+    /// Always the NAME — see this type's doc-comment.
     fn from(account: &Account) -> Self {
-        Self::Identity {
-            name: account.name.clone(),
-            account_uuid: account.account_uuid.clone(),
-            org_uuid: account.org_uuid.clone(),
-            org_name: account.org_name.clone(),
-        }
+        Self::Name(account.name.clone())
     }
 }
 
@@ -945,6 +918,34 @@ pub struct Config {
     /// migrated install self-heals instead of re-warning on every start.
     #[serde(skip)]
     pub migrated_legacy_throttle: bool,
+    /// The renames [`load`] applied on this load because two `accounts[]`
+    /// entries carried the same `name`. Empty on every load of an already-unique
+    /// config, which after the first migration is every load.
+    ///
+    /// `#[serde(skip)]`, same pattern and same reason as
+    /// [`Self::quarantined_accounts`]. Read by the boot path to rewrite the
+    /// session-affinity pin file, which is keyed by name, so warm sessions
+    /// survive the migration.
+    #[serde(skip)]
+    pub renamed_accounts: Vec<AccountRename>,
+    /// Why the durable half of the rename migration did not happen, when it did
+    /// not. The in-memory `accounts` are renamed either way — a server must boot
+    /// — but a CLI verb about to WRITE this config refuses on it, because a
+    /// second process would re-derive different names from the same duplicates.
+    #[serde(skip)]
+    pub rename_write_error: Option<String>,
+}
+
+/// One account [`load`] renamed to restore unique names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountRename {
+    /// The duplicated name the entry carried on disk.
+    pub from: String,
+    /// The unique name it now carries, minted by [`crate::identity::mint_name`].
+    pub to: String,
+    /// The org the new name was derived from, for the log line. `None` when the
+    /// entry stored no org at all and the name fell through to a counter.
+    pub org: Option<String>,
 }
 
 impl Config {
@@ -1199,17 +1200,28 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     }
 
     let mut quarantined = Vec::new();
+    // Where each surviving account sat in the FILE's `accounts` array, before
+    // the quarantine drop shifted the in-memory indices. The rename migration
+    // below writes by that index, so it must be the on-disk one.
+    let mut file_index = Vec::new();
 
     if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
         let had_accounts = !accounts.is_empty();
-        accounts.retain(|entry| match unusable_account(entry) {
-            None => true,
+        let mut position = 0usize;
+        accounts.retain(|entry| {
+            let index = position;
+            position += 1;
+            match unusable_account(entry) {
+            None => {
+                file_index.push(index);
+                true
+            }
             Some((name, reason)) => {
                 tracing::warn!(account = %name, missing = reason, "No token for \"{name}\", skipping");
                 quarantined.push(name);
                 false
             }
-        });
+        }});
         if had_accounts && accounts.is_empty() {
             return Err(ConfigError::Parse(
                 <serde_json::Error as serde::de::Error>::custom(format!(
@@ -1224,7 +1236,208 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let mut config: Config = serde_json::from_value(doc)?;
     config.quarantined_accounts = quarantined;
     config.migrated_legacy_throttle = migrated_legacy_throttle;
+    migrate_duplicate_names(path, &mut config, &file_index);
     Ok(config)
+}
+
+/// Restore unique account names on a config that has duplicates, in memory AND
+/// on disk, once.
+///
+/// Never refuses. A loader that rejected a duplicated config would take the
+/// whole fleet down the moment it upgraded — the config is what it is, and it
+/// was written by earlier `tcr` builds that permitted it. So: rename, log a line
+/// per rename, continue. The durable write failing is recorded on
+/// [`Config::rename_write_error`] rather than returned, because a server has to
+/// boot either way; the CLI's own load ([`crate::cli::load_for_edit`]) reads
+/// that field and refuses to run an edit verb on top of it, since a rename that
+/// never reached disk is one every future process re-derives.
+fn migrate_duplicate_names(path: &Path, config: &mut Config, file_index: &[usize]) {
+    let renames = plan_renames(&config.accounts);
+    if renames.is_empty() {
+        return;
+    }
+
+    // The control account, if it names a duplicated row, currently resolves to
+    // the FIRST row in file order carrying that name — that is what the running
+    // server does with it today, so that is the row it must keep pointing at.
+    let control_rename = config.control_account.as_ref().and_then(|control| {
+        let first = config
+            .accounts
+            .iter()
+            .position(|a| a.name == control.name())?;
+        renames
+            .iter()
+            .find(|(index, _)| *index == first)
+            .map(|(_, rename)| rename.to.clone())
+    });
+
+    for (index, rename) in &renames {
+        match &rename.org {
+            Some(org) => tracing::warn!(
+                "renamed account: {} -> {} (org {org})",
+                rename.from,
+                rename.to
+            ),
+            None => tracing::warn!(
+                "renamed account: {} -> {} (no org on file)",
+                rename.from,
+                rename.to
+            ),
+        }
+        config.accounts[*index].name = rename.to.clone();
+    }
+    if let Some(name) = &control_rename {
+        tracing::warn!(
+            "control account followed the rename to '{name}' — it named the first row in file \
+             order, which is the row the server resolved it to"
+        );
+        config.control_account = Some(ControlAccountRef::Name(name.clone()));
+    }
+
+    let writes: Vec<(usize, &str)> = renames
+        .iter()
+        .filter_map(|(index, rename)| Some((*file_index.get(*index)?, rename.to.as_str())))
+        .collect();
+    if writes.len() != renames.len() {
+        config.rename_write_error =
+            Some("could not map every renamed account back to its entry in the file".to_string());
+    } else if let Err(err) = save_renames(path, &writes, control_rename.as_deref()) {
+        tracing::error!(error = %err, "could not persist the account renames");
+        config.rename_write_error = Some(err.to_string());
+    }
+
+    config.renamed_accounts = renames.into_iter().map(|(_, rename)| rename).collect();
+}
+
+/// The rename each duplicated-name account needs, as `(index into `accounts`,
+/// rename)`, in fleet order. Empty when every name is already unique.
+///
+/// One row per duplicated name keeps the bare email: the one whose
+/// `organizationType` is a personal plan (`claude_max` / `claude_pro`), else the
+/// lowest priority number, else the first in file order. That is the row a
+/// person means when they type their own email — the personal account is the one
+/// they had before their company gave them a seat.
+fn plan_renames(accounts: &[Account]) -> Vec<(usize, AccountRename)> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for account in accounts {
+        *counts.entry(account.name.as_str()).or_default() += 1;
+    }
+    let duplicated: HashSet<&str> = counts
+        .iter()
+        .filter(|(_, n)| **n > 1)
+        .map(|(name, _)| *name)
+        .collect();
+    if duplicated.is_empty() {
+        return Vec::new();
+    }
+
+    // Every name in the fleet is off-limits as a minted name, and so is every
+    // name minted earlier in this same pass.
+    let mut taken: HashSet<String> = accounts.iter().map(|a| a.name.clone()).collect();
+    let mut renames = Vec::new();
+    for name in {
+        // Deterministic order, so two runs over one file plan the same renames.
+        let mut names: Vec<&str> = duplicated.into_iter().collect();
+        names.sort_unstable();
+        names
+    } {
+        let rows: Vec<usize> = accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.name == name)
+            .map(|(i, _)| i)
+            .collect();
+        let keeper = rows
+            .iter()
+            .copied()
+            .find(|&i| is_personal_plan(accounts[i].organization_type.as_deref()))
+            .unwrap_or_else(|| {
+                // `min_by_key` keeps the FIRST row on a tie, which is the file
+                // order this falls back to when no priority distinguishes them.
+                rows.iter()
+                    .copied()
+                    .min_by_key(|&i| accounts[i].priority.unwrap_or(0))
+                    .expect("a duplicated name has at least two rows")
+            });
+        for index in rows {
+            if index == keeper {
+                continue;
+            }
+            let account = &accounts[index];
+            let minted = crate::identity::mint_name(
+                crate::identity::email_of(&account.name),
+                account.org_name.as_deref(),
+                account.org_uuid.as_deref(),
+                &taken,
+            );
+            taken.insert(minted.clone());
+            renames.push((
+                index,
+                AccountRename {
+                    from: account.name.clone(),
+                    to: minted,
+                    org: account
+                        .org_name
+                        .clone()
+                        .or_else(|| account.org_uuid.clone()),
+                },
+            ));
+        }
+    }
+    renames.sort_by_key(|(index, _)| *index);
+    renames
+}
+
+/// Whether an `organizationType` names a plan a person holds in their own right
+/// rather than through a seat someone granted them.
+fn is_personal_plan(organization_type: Option<&str>) -> bool {
+    matches!(organization_type, Some("claude_max") | Some("claude_pro"))
+}
+
+/// Write the migration's renames — and the `controlAccount` that followed one —
+/// into the file at `path`, touching NOTHING else.
+///
+/// Same targeted read-modify-write shape as [`save_disabled`], and for the same
+/// reason it spells out: a whole-`Config` [`save`] would reformat and re-emit
+/// every key in the document, including ones this process never modelled, at the
+/// worst possible moment — the boot of a build the operator just upgraded to.
+///
+/// Entries are addressed by their INDEX in the file's own `accounts` array, not
+/// by identity. Identity is exactly what cannot distinguish these rows: the
+/// migration exists for duplicates, and a pair written before org UUIDs were
+/// stored is two rows `same_identity` calls one.
+fn save_renames(
+    path: &Path,
+    renames: &[(usize, &str)],
+    control_account: Option<&str>,
+) -> Result<(), ConfigError> {
+    let mut doc = read_document(path)?;
+    let entries = doc
+        .get_mut("accounts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            ConfigError::Parse(<serde_json::Error as serde::de::Error>::custom(
+                "the accounts key is not an array",
+            ))
+        })?;
+    for (index, name) in renames {
+        let entry = entries
+            .get_mut(*index)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| {
+                ConfigError::Parse(<serde_json::Error as serde::de::Error>::custom(format!(
+                    "accounts[{index}] is not an object"
+                )))
+            })?;
+        entry.insert("name".to_string(), Value::String((*name).to_string()));
+    }
+    if let Some(name) = control_account {
+        doc.insert(
+            "controlAccount".to_string(),
+            Value::String(name.to_string()),
+        );
+    }
+    write_atomic(path, &serde_json::to_string_pretty(&doc)?)
 }
 
 /// Persist `config` to `path` atomically (temp file in the same dir + rename),
@@ -3736,12 +3949,13 @@ mod tests {
                 .unwrap();
         assert_eq!(
             config.control_account,
-            Some(ControlAccountRef::Legacy("alice@example.com".to_string()))
+            Some(ControlAccountRef::Name("alice@example.com".to_string()))
         );
     }
 
-    /// The identity-object shape — what a `set` writes going forward — parses
-    /// back to the exact fields it carries, `orgUuid` included.
+    /// The identity-object shape an older `tcr` wrote still parses back to the
+    /// exact fields it carries, `orgUuid` included — nothing writes it now, and
+    /// a config that has one must still load.
     #[test]
     fn control_account_parses_identity_object() {
         let config: Config = serde_json::from_str(
@@ -4575,9 +4789,10 @@ mod tests {
 
     // --- save_control_account -----------------------------------------------
 
-    /// Setting `controlAccount` writes the top-level key — as the identity
-    /// object, not the legacy string — and changes nothing else — same "raw
-    /// document, not a `Config` round trip" contract as `save_disabled`. This is
+    /// Setting `controlAccount` writes the top-level key — the account's NAME,
+    /// which is unique and therefore the whole key — and changes nothing else,
+    /// same "raw document, not a `Config` round trip" contract as
+    /// `save_disabled`. This is
     /// also `control_persist_preserves_unmodelled_top_level_keys` from the
     /// bridge: a key nothing here models (`routes`) survives the write.
     #[test]
@@ -4591,7 +4806,7 @@ mod tests {
         );
 
         let mut after = read_json(&path);
-        assert_eq!(after["controlAccount"], json!({"name": "acct-a"}));
+        assert_eq!(after["controlAccount"], json!("acct-a"));
         after
             .as_object_mut()
             .expect("document is an object")
@@ -4683,13 +4898,16 @@ mod tests {
         fs::remove_file(&path).ok();
     }
 
-    /// An identity object carrying an `accountUuid` shared by both on-disk rows
-    /// PLUS `orgUuid` resolves the write to the RIGHT one of the two —
-    /// the "legacy two-org shape" `locate_account_entry`'s doc-comment
-    /// describes: one person, two orgs, one uuid. (Without a shared
-    /// `accountUuid` on both sides, `same_identity` cannot use the org at all —
-    /// see `control_write_on_duplicated_identity_is_refused` — so this is the
-    /// realistic disambiguating shape, not an arbitrary one.)
+    /// A target carrying an `accountUuid` shared by both on-disk rows PLUS
+    /// `orgUuid` resolves the write to the RIGHT one of the two — the "legacy
+    /// two-org shape" `locate_account_entry`'s doc-comment describes: one
+    /// person, two orgs, one uuid. That resolution is still how a WRITE finds
+    /// its row, and it is the one thing `--org` never was: an identity
+    /// comparison, not a query.
+    ///
+    /// The file here is fed to `save_control_account` directly rather than
+    /// through `config::load`, which would have renamed the second row first.
+    /// This is the layer below that.
     #[test]
     fn control_write_with_org_uuid_disambiguates_duplicated_email() {
         let path = tmp_path("control-org-disambiguates");
@@ -4718,14 +4936,7 @@ mod tests {
         );
 
         let after = read_json(&path);
-        assert_eq!(
-            after["controlAccount"],
-            json!({
-                "name": "dup@example.com",
-                "accountUuid": "33333333-3333-3333-3333-333333333333",
-                "orgUuid": "22222222-2222-2222-2222-222222222222"
-            })
-        );
+        assert_eq!(after["controlAccount"], json!("dup@example.com"));
         fs::remove_file(&path).ok();
     }
 

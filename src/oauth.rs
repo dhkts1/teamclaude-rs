@@ -1098,7 +1098,7 @@ pub async fn login(
     config_path: &Path,
     force: bool,
     account: Option<&str>,
-    org: Option<&str>,
+    name_override: Option<&str>,
 ) -> anyhow::Result<String> {
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
@@ -1115,7 +1115,7 @@ pub async fn login(
     let hint = match account {
         Some(query) => {
             let probe_config = load_or_default(config_path)?;
-            let idx = crate::cli::resolve_account(&probe_config.accounts, query, org)?;
+            let idx = crate::cli::resolve_account(&probe_config.accounts, query)?;
             let email = crate::identity::email_of(&probe_config.accounts[idx].name);
             // Only ever send something address-shaped: a non-email display
             // name (e.g. an account named "work") produces `login_hint=work`
@@ -1155,13 +1155,9 @@ pub async fn login(
     // file surfaces as an error so login never clobbers it with defaults).
     let mut config = load_or_default(config_path)?;
 
-    // Fetch the account+org identity; name from the profile email, else prompt.
+    // Fetch the account+org identity, then MINT a name for it.
     let profile = fetch_profile(&tokens.access_token).await;
-    let fallback = format!("account-{}", config.accounts.len() + 1);
-    let name = match &profile.email {
-        Some(email) => email.clone(),
-        None => prompt_account_name(&fallback),
-    };
+    let name = mint_login_name(&config, &profile, account, name_override)?;
 
     finish_login_checked(
         config_path,
@@ -1171,9 +1167,67 @@ pub async fn login(
         &tokens,
         profile,
         account,
-        org,
     )
     .await
+}
+
+/// The name a browser login writes under.
+///
+/// Nothing is prompted for on the happy path. The profile's email is minted into
+/// a free name by [`crate::identity::mint_name`] — the bare email when no other
+/// row carries it, `email/<org-slug>` when one does — so a second org of the same
+/// person lands beside the first instead of on top of it.
+///
+/// Three things override or replace that, in order:
+///
+/// * `name_override` (`--name`) wins outright, and is REFUSED when some other
+///   account already holds it. Taking a name off an existing row is how a login
+///   overwrites the wrong credential, and it is the one case a name collision
+///   would be silent rather than migrated.
+/// * A RE-login (`--account`) keeps the name the row already has. Renaming a
+///   row on re-login would break the pins, groups and control-account key that
+///   name is the identity for; the row is confirmed to be the same account by
+///   [`assert_requested_identity`] a moment later.
+/// * A profile with no email at all — the inference-only case — is the only path
+///   left that prompts ([`prompt_account_name`]), and the name it comes back
+///   with is minted for uniqueness too.
+fn mint_login_name(
+    config: &Config,
+    profile: &Profile,
+    requested_account: Option<&str>,
+    name_override: Option<&str>,
+) -> anyhow::Result<String> {
+    let taken: std::collections::HashSet<String> =
+        config.accounts.iter().map(|a| a.name.clone()).collect();
+
+    if let Some(explicit) = name_override {
+        if taken.contains(explicit) {
+            bail!(
+                "'{explicit}' is already the name of another account — account names are unique. \
+                 Pick a different --name, or re-login that account with `tcr login --account \
+                 {explicit}`. Nothing was changed."
+            );
+        }
+        return Ok(explicit.to_string());
+    }
+
+    // A re-login keeps the row's own name: it IS the identity every pin, group
+    // and `controlAccount` key already points at.
+    if let Some(query) = requested_account {
+        let idx = crate::cli::resolve_account(&config.accounts, query)?;
+        return Ok(config.accounts[idx].name.clone());
+    }
+
+    let base = match &profile.email {
+        Some(email) => email.clone(),
+        None => prompt_account_name(&unnamed_fallback(&config.accounts)),
+    };
+    Ok(crate::identity::mint_name(
+        &base,
+        profile.org_name.as_deref(),
+        profile.org_uuid.as_deref(),
+        &taken,
+    ))
 }
 
 /// Our ASSUMPTION about a `claude setup-token` credential's lifetime — one
@@ -1215,7 +1269,7 @@ fn read_setup_token() -> anyhow::Result<String> {
 /// the Claude CLI that produces it never surfaces its refresh token to the
 /// caller, so there is genuinely nothing to store.
 ///
-/// `--account`/`--org` are refused up front (before the port probe or the
+/// `--account` is refused up front (before the port probe or the
 /// stdin read): an inference-only token carries no identity for
 /// [`assert_requested_identity`] to confirm, and an assertion that cannot be
 /// evaluated must fail closed rather than pass — so this calls [`finish_login`]
@@ -1230,10 +1284,6 @@ fn read_setup_token() -> anyhow::Result<String> {
 /// account serves until its (assumed) one-year expiry and then goes dead,
 /// with nothing to renew it, and — unlike the live-add wire route — this
 /// offline path has no other caller that would say so.
-/// Name a setup-token account: the profile's email when the (usually failed)
-/// fetch happened to carry one, else `name` (`--name`), else a prompt —
-/// split out of [`login_with_token`] so the fallback chain is directly
-/// testable without a real stdin prompt.
 /// The name a setup-token account falls back to when the operator declines to
 /// type one: `unnamed`, or the first free `unnamed-N` when that is taken.
 ///
@@ -1259,16 +1309,6 @@ fn unnamed_fallback(accounts: &[Account]) -> String {
         .map(|n| format!("{BASE}-{n}"))
         .find(|candidate| !accounts.iter().any(|a| &a.name == candidate))
         .expect("an unbounded range always yields a free name")
-}
-
-fn resolve_setup_token_name(profile: &Profile, name: Option<&str>, fallback: &str) -> String {
-    match &profile.email {
-        Some(email) => email.clone(),
-        None => match name {
-            Some(explicit) => explicit.to_string(),
-            None => prompt_account_name(fallback),
-        },
-    }
 }
 
 /// What one authenticated call said about a pasted setup token, before it is
@@ -1326,13 +1366,12 @@ pub async fn login_with_token(
     force: bool,
     name: Option<&str>,
     account: Option<&str>,
-    org: Option<&str>,
 ) -> anyhow::Result<String> {
-    if account.is_some() || org.is_some() {
+    if account.is_some() {
         bail!(
-            "--token cannot be combined with --account or --org: a `claude setup-token` \
+            "--token cannot be combined with --account: a `claude setup-token` \
              credential carries only the user:inference scope, so it has no email and no \
-             account id for either flag to confirm against — an identity assertion that \
+             account id for that flag to confirm against — an identity assertion that \
              cannot be evaluated must fail closed rather than pass. Log in with --token alone \
              (use --name to choose the account name), or drop --token and use the browser flow \
              with --account instead. Nothing was written."
@@ -1374,8 +1413,7 @@ pub async fn login_with_token(
     }
 
     let profile = fetch_profile(&tokens.access_token).await;
-    let fallback = unnamed_fallback(&config.accounts);
-    let resolved_name = resolve_setup_token_name(&profile, name, &fallback);
+    let resolved_name = mint_login_name(&config, &profile, None, name)?;
 
     let result = finish_login(
         config_path,
@@ -1422,16 +1460,15 @@ async fn finish_login_checked(
     tokens: &Tokens,
     profile: Profile,
     requested_account: Option<&str>,
-    requested_org: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(query) = requested_account {
-        assert_requested_identity(config, query, requested_org, &profile)?;
+        assert_requested_identity(config, query, &profile)?;
     }
     finish_login(config_path, route, config, name, tokens, profile).await
 }
 
-/// The load-bearing half of `tcr login --account <query> [--org <org>]`:
-/// resolve `query`/`org` against `config` via [`crate::cli::resolve_account`]
+/// The load-bearing half of `tcr login --account <query>`:
+/// resolve `query` against `config` via [`crate::cli::resolve_account`]
 /// — the exact rule `tcr enable`/`tcr disable` and TcrBar's row buttons
 /// already rely on, not a second copy of it — then refuse to proceed unless
 /// the identity that came back from `fetch_profile` resolves, through
@@ -1458,10 +1495,9 @@ async fn finish_login_checked(
 fn assert_requested_identity(
     config: &Config,
     query: &str,
-    org: Option<&str>,
     profile: &Profile,
 ) -> anyhow::Result<()> {
-    let idx = crate::cli::resolve_account(&config.accounts, query, org)?;
+    let idx = crate::cli::resolve_account(&config.accounts, query)?;
     let requested = &config.accounts[idx];
 
     if profile.email.is_none() && profile.account_uuid.is_none() {
@@ -1648,8 +1684,8 @@ fn account_write_result(
             Ok(account.name.clone())
         }
         config::AccountWrite::Ambiguous => bail!(
-            "'{}' matches more than one account already in {} — narrow with --org or use an \
-             exact name. Nothing was changed.",
+            "'{}''s identity matches more than one account already in {} — give each row its own \
+             accountUuid/orgUuid and retry. Nothing was changed.",
             account.name,
             config_path.display()
         ),
@@ -3035,7 +3071,6 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("mallory@example.com"),
             Some("alice@example.com"),
-            None,
         )
         .await
         .unwrap_err();
@@ -3071,7 +3106,6 @@ mod tests {
             &tokens("at-fresh", "rt-fresh", 1_893_456_000_000),
             profile_named("alice@example.com"),
             Some("alice@example.com"),
-            None,
         )
         .await
         .unwrap();
@@ -3118,7 +3152,6 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             all_none,
             Some("alice@example.com"),
-            None,
         )
         .await
         .unwrap_err();
@@ -3137,11 +3170,13 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// An ambiguous `--account` query is an error, not a guess — same
-    /// zero/one/many rule `crate::cli::resolve_account` already enforces for
-    /// every other command.
+    /// An `--account` naming no row is an error, not a guess — the same
+    /// zero/one/many rule `crate::cli::resolve_account` enforces for every other
+    /// command, and the arm that survives now that a name can never match two
+    /// rows. The query used here is the email PORTION of a migrated row's name,
+    /// which is precisely what used to match both of them.
     #[tokio::test]
-    async fn finish_login_checked_ambiguous_query_is_an_error() {
+    async fn finish_login_checked_unmatched_query_is_an_error() {
         let seed = r#"{ "accounts": [
             { "name": "dup@example.com", "type": "oauth", "accessToken": "at-1",
               "refreshToken": "rt-1", "expiresAt": 1893456000000, "priority": 0,
@@ -3156,7 +3191,10 @@ mod tests {
             line!()
         ));
         std::fs::write(&path, seed).unwrap();
+        // Migrates: the two rows become `dup@example.com` and
+        // `dup@example.com/corp-b`. `corp-b` on its own names neither.
         let mut config = load_or_default(&path).unwrap();
+        assert_eq!(config.accounts[1].name, "dup@example.com/corp-b");
         let before = std::fs::read_to_string(&path).unwrap();
 
         let err = finish_login_checked(
@@ -3166,29 +3204,31 @@ mod tests {
             "dup@example.com",
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("dup@example.com"),
-            Some("dup@example.com"),
-            None,
+            Some("corp-b"),
         )
         .await
         .unwrap_err();
         assert!(
-            err.to_string().to_lowercase().contains("more than one")
-                || err.to_string().to_lowercase().contains("ambiguous"),
+            err.to_string().contains("no account matches 'corp-b'"),
             "{}",
             err.to_string()
         );
 
         let after = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(before, after, "an ambiguous query must not guess and write");
+        assert_eq!(before, after, "an unmatched query must not guess and write");
 
         std::fs::remove_file(&path).ok();
     }
 
-    /// The remedy `ambiguous_query_message` advises ("narrow with --org") must
-    /// actually be followable: `--org` plumbed through resolves the same
-    /// otherwise-ambiguous query to exactly one row.
+    /// The migration is what makes a re-login of one org addressable at all:
+    /// the loader gives each row its own name, and `--account <that name>`
+    /// resolves to exactly one row and writes only that row's credential.
+    ///
+    /// This is the same fleet shape that used to be an ambiguous refusal, then
+    /// a refusal plus an org flag. Note the assertion is on which row got
+    /// `rt-new`: a re-login that guessed would still return a plausible name.
     #[tokio::test]
-    async fn finish_login_checked_org_disambiguates_a_duplicate_email() {
+    async fn finish_login_checked_re_logs_in_the_named_row_of_a_migrated_duplicate() {
         let seed = r#"{ "accounts": [
             { "name": "dup@example.com", "type": "oauth", "accessToken": "at-1",
               "refreshToken": "rt-1", "expiresAt": 1893456000000, "priority": 0,
@@ -3203,7 +3243,11 @@ mod tests {
             line!()
         ));
         std::fs::write(&path, seed).unwrap();
+        // Loading migrates the duplicate: Corp A keeps the bare email (lower
+        // priority number), Corp B takes its org's slug.
         let mut config = load_or_default(&path).unwrap();
+        assert_eq!(config.accounts[0].name, "dup@example.com");
+        assert_eq!(config.accounts[1].name, "dup@example.com/corp-b");
 
         let name = finish_login_checked(
             &path,
@@ -3218,7 +3262,6 @@ mod tests {
                 Some("Corp A"),
             ),
             Some("dup@example.com"),
-            Some("org-a"),
         )
         .await
         .unwrap();
@@ -3309,7 +3352,6 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             wrong_org_profile,
             Some("me@example.com (Corp)"),
-            None,
         )
         .await
         .unwrap_err();
@@ -3370,7 +3412,6 @@ mod tests {
             &tokens("at-fresh-corp", "rt-fresh-corp", 1_893_456_000_000),
             right_profile,
             Some("me@example.com (Corp)"),
-            None,
         )
         .await
         .unwrap();
@@ -3429,7 +3470,6 @@ mod tests {
             &tokens("at-new", "rt-new", 1_893_456_000_000),
             profile_named("someone@example.com"),
             Some("work"),
-            None,
         )
         .await
         .unwrap_err();
@@ -3472,7 +3512,6 @@ mod tests {
             "carol@example.com",
             &tokens("at-carol", "rt-carol", 1_893_456_000_000),
             profile_named("carol@example.com"),
-            None,
             None,
         )
         .await
@@ -4218,7 +4257,7 @@ mod tests {
         std::fs::write(&path, two_account_seed()).unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
-        let err = login_with_token(&path, false, None, Some("alice@example.com"), None)
+        let err = login_with_token(&path, false, None, Some("alice@example.com"))
             .await
             .expect_err("--token combined with --account must refuse");
         assert!(err.to_string().contains("--account"), "{}", err.to_string());
@@ -4232,31 +4271,91 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `--token` combined with `--org` (no `--account`) must refuse too — the
-    /// same "no identity to confirm against" reasoning applies to either flag
-    /// alone.
-    #[tokio::test]
-    async fn login_with_token_refuses_with_org_and_writes_nothing() {
-        let path = std::env::temp_dir().join(format!(
-            "tcr-oauth-setup-token-refuse-org-{}-{}.json",
-            std::process::id(),
-            line!()
-        ));
-        std::fs::write(&path, two_account_seed()).unwrap();
-        let before = std::fs::read_to_string(&path).unwrap();
-
-        let err = login_with_token(&path, false, None, None, Some("Corp"))
-            .await
-            .expect_err("--token combined with --org must refuse");
-        assert!(err.to_string().contains("--org"), "{}", err.to_string());
-
-        let after = std::fs::read_to_string(&path).unwrap();
+    /// A login mints its own name, and never prompts on the happy path: the
+    /// bare email when nothing carries it, `email/<org-slug>` when something
+    /// does. This is the whole mechanism that stops a second org of the same
+    /// person from landing on the first one's row.
+    #[test]
+    fn a_login_mints_the_bare_email_when_free_and_qualifies_it_when_not() {
+        let empty: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        let profile = profile_with_identity(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("22222222-2222"),
+            Some("Henry Token"),
+        );
         assert_eq!(
-            before, after,
-            "the file must be byte-identical — --token+--org must write nothing"
+            mint_login_name(&empty, &profile, None, None).unwrap(),
+            "me@example.com"
         );
 
-        std::fs::remove_file(&path).ok();
+        let occupied: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "me@example.com", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mint_login_name(&occupied, &profile, None, None).unwrap(),
+            "me@example.com/henry-token"
+        );
+
+        // No org name on the profile: the org uuid's first eight characters.
+        let no_org_name = profile_with_identity(
+            "me@example.com",
+            Some("uuid-person"),
+            Some("22222222-2222"),
+            None,
+        );
+        assert_eq!(
+            mint_login_name(&occupied, &no_org_name, None, None).unwrap(),
+            "me@example.com/22222222"
+        );
+    }
+
+    /// `--name` wins over the minted name, and is REFUSED when another account
+    /// already holds it. Taking a name off an existing row is how a login
+    /// overwrites the wrong credential, and it is the one collision the loader's
+    /// migration would never see.
+    #[test]
+    fn a_name_override_wins_but_never_takes_a_name_already_in_use() {
+        let occupied: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "alice@example.com", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+        let profile = profile_named("bob@example.com");
+
+        assert_eq!(
+            mint_login_name(&occupied, &profile, None, Some("bob-work")).unwrap(),
+            "bob-work"
+        );
+
+        let err = mint_login_name(&occupied, &profile, None, Some("alice@example.com"))
+            .expect_err("a --name already in use must refuse");
+        assert!(
+            err.to_string()
+                .contains("already the name of another account"),
+            "{err}"
+        );
+    }
+
+    /// A re-login keeps the row's own name rather than re-minting one: that
+    /// name is what every pin, group label and `controlAccount` key points at.
+    #[test]
+    fn a_re_login_keeps_the_rows_existing_name() {
+        let config: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                { "name": "me@example.com/corp", "type": "oauth", "accessToken": "at-1" }
+            ] }"#,
+        )
+        .unwrap();
+        let profile = profile_named("me@example.com");
+        assert_eq!(
+            mint_login_name(&config, &profile, Some("me@example.com/corp"), None).unwrap(),
+            "me@example.com/corp"
+        );
     }
 
     /// A canned upstream that answers every connection with `status_line` and an
@@ -4339,26 +4438,31 @@ mod tests {
     }
 
     /// An all-`None` profile plus `--name` must produce that exact name,
-    /// without ever reaching the stdin prompt — the profile-email branch is
-    /// skipped (no email), the `--name` branch is taken instead of falling
-    /// through to `prompt_account_name`.
+    /// without ever reaching the stdin prompt — the `--name` branch is taken
+    /// instead of falling through to `prompt_account_name`. This is the
+    /// setup-token case: an inference-only credential's profile fetch normally
+    /// comes back empty, so `--name` is the only name there is.
     #[test]
-    fn resolve_setup_token_name_prefers_explicit_name_over_prompt() {
-        let name = resolve_setup_token_name(&all_none_profile(), Some("bob-work"), "account-1");
+    fn a_name_override_skips_the_prompt_on_an_empty_profile() {
+        let empty: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        let name = mint_login_name(&empty, &all_none_profile(), None, Some("bob-work")).unwrap();
         assert_eq!(name, "bob-work");
     }
 
-    /// The profile's email still wins over `--name` when the fetch DID come
-    /// back with one — inference-only scope makes this the unlikely case,
-    /// not the impossible one.
+    /// `--name` wins over the profile's email too. It used to be the other way
+    /// round, which made the flag unusable exactly when a person wanted to name
+    /// their second org's row something they would recognise.
     #[test]
-    fn resolve_setup_token_name_prefers_profile_email_over_name() {
-        let name = resolve_setup_token_name(
+    fn a_name_override_wins_over_the_profile_email() {
+        let empty: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        let name = mint_login_name(
+            &empty,
             &profile_named("carol@example.com"),
-            Some("ignored"),
-            "account-1",
-        );
-        assert_eq!(name, "carol@example.com");
+            None,
+            Some("carol-personal"),
+        )
+        .unwrap();
+        assert_eq!(name, "carol-personal");
     }
 
     // --- the `unnamed` fallback ---------------------------------------------

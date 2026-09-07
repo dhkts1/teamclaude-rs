@@ -116,9 +116,24 @@ fn warn_if_server_running(config: &Config) {
 /// here, before any edit happens, keeps that erasure from ever becoming
 /// reachable; the operator fixes or removes the entry by hand, then the CLI
 /// works on it same as always.
+///
+/// Refuses on [`Config::rename_write_error`] for the analogous reason. `load`
+/// renames duplicated account names in memory and persists the result; when only
+/// the memory half happened, the names this process is about to edit exist
+/// nowhere else, and the next process re-derives its own. An edit verb writing
+/// under those names would attach the change to a row no one else can find.
+/// The server has no such choice — it must boot — so it logs and continues.
 fn load_for_edit(config_path: &Path) -> anyhow::Result<Config> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
+    if let Some(why) = &config.rename_write_error {
+        bail!(
+            "config at {} holds accounts sharing a name, and the rename that would fix it could \
+             not be written back ({why}) — so nothing was changed. Fix the file's permissions, or \
+             give each row its own name by hand, and retry.",
+            config_path.display()
+        );
+    }
     if !config.quarantined_accounts.is_empty() {
         bail!(
             "config at {} has {} account(s) with no usable credential, so the CLI cannot safely \
@@ -142,26 +157,22 @@ fn save_after_edit(config_path: &Path, config: &Config) -> anyhow::Result<()> {
 
 /// Resolve a user-supplied account `query` to exactly one index in `accounts`.
 ///
-/// Delegates to [`identity::match_accounts`]: an exact `name` match wins;
-/// otherwise the email portion is matched, and `--org` (exact org name, or org
-/// uuid exact/prefix) narrows — **even when the name matched**, so a duplicate
-/// email across two orgs is disambiguated by `--org` (finding #8) rather than
-/// silently resolving to the first entry. Zero or more-than-one surviving
-/// candidate is an error — the ambiguous error lists the candidate names so the
-/// caller can disambiguate. (`Account.name` IS the email.)
+/// Delegates to [`identity::match_accounts`]: an EXACT match on the account's
+/// name, and nothing else. Names are unique across a config by construction
+/// (`config::load` renames duplicates; a login mints a free name), so an exact
+/// name is a complete answer and there is nothing left to narrow. What a
+/// duplicated name used to need — matching the email portion, then narrowing by
+/// org — is gone with the duplicates.
+///
+/// A query matching more than one row therefore means the file was hand-edited
+/// behind the loader's back. That is still an error, never a first-match guess.
 pub fn resolve_account<T: identity::Queryable>(
     accounts: &[T],
     query: &str,
-    org: Option<&str>,
 ) -> anyhow::Result<usize> {
-    match identity::match_one(accounts, query, org) {
+    match identity::match_one(accounts, query) {
         identity::Match::One(only) => Ok(only),
-        identity::Match::None => {
-            let org_note = org
-                .map(|o| format!(" (with org matching '{o}')"))
-                .unwrap_or_default();
-            bail!("no account matches '{query}'{org_note}");
-        }
+        identity::Match::None => bail!("no account matches '{query}'"),
         identity::Match::Ambiguous(names) => {
             bail!("{}", ambiguous_query_message(query, &names));
         }
@@ -173,13 +184,14 @@ pub fn resolve_account<T: identity::Queryable>(
 /// same actionable sentence — and the same candidate list — whichever answered.
 pub fn ambiguous_query_message(query: &str, names: &[String]) -> String {
     format!(
-        "'{query}' is ambiguous — matches {} accounts: {}. Narrow with --org or use an exact name.",
+        "'{query}' is ambiguous — {} accounts share that name: {}. Account names are unique by \
+         construction, so this config was edited by hand; fix the duplicate and retry.",
         names.len(),
         names.join(", ")
     )
 }
 
-/// Load → resolve `(query, org)` to one account → hand it to `mutate` → save.
+/// Load → resolve `query` to one account → hand it to `mutate` → save.
 ///
 /// Centralizes the load→resolve→save chain (incl. the nonexistent-account error
 /// path) shared by every mutating verb. Resolution happens BEFORE `mutate`, so a
@@ -190,11 +202,10 @@ pub fn ambiguous_query_message(query: &str, names: &[String]) -> String {
 fn edit_account<T>(
     config_path: &Path,
     query: &str,
-    org: Option<&str>,
     mutate: impl FnOnce(&mut Config, usize) -> T,
 ) -> anyhow::Result<T> {
     let mut config = load_for_edit(config_path)?;
-    let idx = resolve_account(&config.accounts, query, org)?;
+    let idx = resolve_account(&config.accounts, query)?;
     let out = mutate(&mut config, idx);
     save_after_edit(config_path, &config)?;
     Ok(out)
@@ -215,15 +226,11 @@ fn edit_account<T>(
 /// reasons as `set_enabled` — see its doc-comment — sharpened: a removal
 /// applied on top of a live disagreement cannot be undone by re-adding, since
 /// the account's credentials are gone from the file being edited.
-pub async fn remove_account(
-    config_path: &Path,
-    query: &str,
-    org: Option<&str>,
-) -> anyhow::Result<()> {
+pub async fn remove_account(config_path: &Path, query: &str) -> anyhow::Result<()> {
     if let Ok(config) = config::load(config_path) {
-        match post_set_disabled(&config, query, org, true).await {
+        match post_set_disabled(&config, query, true).await {
             Ok(_) => {
-                let removed = edit_account(config_path, query, org, |config, idx| {
+                let removed = edit_account(config_path, query, |config, idx| {
                     config.accounts.remove(idx).name
                 })?;
                 println!("Removed account '{removed}'.");
@@ -256,7 +263,7 @@ pub async fn remove_account(
             // we can do; say loudly that the proxy keeps using the account
             // until it restarts.
             Err(LiveControlError::NoRoute) => {
-                let removed = edit_account(config_path, query, org, |config, idx| {
+                let removed = edit_account(config_path, query, |config, idx| {
                     config.accounts.remove(idx).name
                 })?;
                 eprintln!(
@@ -269,7 +276,7 @@ pub async fn remove_account(
             }
             // It answered something we cannot use, or did not answer at all.
             Err(other) => {
-                let removed = edit_account(config_path, query, org, |config, idx| {
+                let removed = edit_account(config_path, query, |config, idx| {
                     config.accounts.remove(idx).name
                 })?;
                 eprintln!(
@@ -283,7 +290,7 @@ pub async fn remove_account(
         }
     }
 
-    let removed = edit_account(config_path, query, org, |config, idx| {
+    let removed = edit_account(config_path, query, |config, idx| {
         config.accounts.remove(idx).name
     })?;
     println!("Removed account '{removed}'.");
@@ -296,13 +303,8 @@ pub async fn remove_account(
 /// `max(0, existing priorities) + 1`; an explicit `N` is written verbatim. The
 /// `0` seed guarantees a relative move always crosses the default tier even when
 /// every existing priority sits on the same side of it.
-pub fn set_priority(
-    config_path: &Path,
-    query: &str,
-    priority: PriorityArg,
-    org: Option<&str>,
-) -> anyhow::Result<()> {
-    let (name, value) = edit_account(config_path, query, org, |config, idx| {
+pub fn set_priority(config_path: &Path, query: &str, priority: PriorityArg) -> anyhow::Result<()> {
+    let (name, value) = edit_account(config_path, query, |config, idx| {
         let value = match priority {
             PriorityArg::N(n) => n,
             PriorityArg::First => {
@@ -343,14 +345,10 @@ pub fn set_priority(
 /// (`Manager::persist_tokens`); the window where the two differ is the
 /// write itself. Read-only: a non-matching query errors with the file
 /// untouched, and nothing is logged — the token goes to stdout only.
-pub fn print_access_token(
-    config_path: &Path,
-    query: &str,
-    org: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn print_access_token(config_path: &Path, query: &str) -> anyhow::Result<()> {
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
-    let idx = resolve_account(&config.accounts, query, org)?;
+    let idx = resolve_account(&config.accounts, query)?;
     println!("{}", config.accounts[idx].access_token);
     Ok(())
 }
@@ -371,34 +369,21 @@ const GROUP_LIVE_RELOAD_NOTE: &str =
     "note: the running proxy picks this up automatically (next request or status check) — no restart needed";
 
 /// Resolve `name` to exactly one configured account by EXACT match on
-/// `Account.name` (which IS the email — see [`resolve_account`]'s doc-comment).
+/// `Account.name`.
 ///
 /// [`resolve_account`]'s rule, with the group verbs' own not-found message.
-///
-/// The resolution is [`identity::match_one`] — identical to `tcr enable`/
-/// `disable`/`token`/`remove`/`priority` — so `--org` narrows a name two
-/// accounts share and an unbreakable tie is REFUSED. This replaced an exact
-/// `position()` scan that took the first match and reported success, which on
-/// the fleet's duplicated email labelled a row nobody asked for.
 ///
 /// The one thing it does not borrow from `resolve_account` is the not-found
 /// text. The panel shells out blind, so an unknown name has to come back with
 /// the full roster to act on rather than a bare "no account matches".
-fn find_account_by_name(
-    accounts: &[Account],
-    name: &str,
-    org: Option<&str>,
-) -> anyhow::Result<usize> {
-    match identity::match_one(accounts, name, org) {
+fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usize> {
+    match identity::match_one(accounts, name) {
         identity::Match::One(idx) => Ok(idx),
         identity::Match::Ambiguous(names) => bail!("{}", ambiguous_query_message(name, &names)),
         identity::Match::None => {
             let configured: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
-            let org_note = org
-                .map(|o| format!(" (with org matching '{o}')"))
-                .unwrap_or_default();
             bail!(
-                "no account named '{name}'{org_note} in the config. Configured accounts: {}",
+                "no account named '{name}' in the config. Configured accounts: {}",
                 configured.join(", ")
             );
         }
@@ -422,19 +407,14 @@ fn control_account_group_notice(config: &Config, account: &str, group: &str) -> 
     ))
 }
 
-/// `tcr group add <group> <account> [--org <name-or-uuid>]` — label `account`
-/// with `group`.
+/// `tcr group add <group> <account>` — label `account` with `group`.
 ///
 /// Resolves through [`find_account_by_name`], which applies exactly the rule
-/// `tcr enable`/`disable`/`token`/`remove`/`priority` use — not a bare name
-/// lookup. Two
-/// changes come with that, and the second is the one that matters: `--org` can
-/// now narrow a name two accounts share, and an ambiguous name is REFUSED
-/// rather than silently resolved to whichever row happens to come first. The
-/// old `find_account_by_name` was an exact-name `position()` scan, so on the
-/// fleet's duplicated email it labelled the first row and reported success,
-/// which is worse than the failure it looks like: the panel's group menu had no
-/// way to say which row it meant, and no way to tell it had hit the wrong one.
+/// `tcr enable`/`disable`/`token`/`remove`/`priority` use, and refuses an
+/// ambiguous name rather than resolving it to whichever row comes first. That
+/// refusal used to be reachable: on a fleet holding one email twice, this
+/// labelled the first row and reported success, and the panel's group menu had
+/// no way to say which row it meant. Unique names removed the ambiguity itself.
 ///
 /// Idempotent: adding a label an account already carries succeeds and says so,
 /// so the panel can call it without first checking state. The group label
@@ -442,12 +422,7 @@ fn control_account_group_notice(config: &Config, account: &str, group: &str) -> 
 /// validator `tcr run --group` uses — because `add` is the one path that can
 /// put a fresh, attacker- or typo-controlled string into the config; `rm` must
 /// NOT run this check (see [`remove_from_group`]'s doc-comment).
-pub fn add_to_group(
-    config_path: &Path,
-    group: &str,
-    account: &str,
-    org: Option<&str>,
-) -> anyhow::Result<()> {
+pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
@@ -464,7 +439,7 @@ pub fn add_to_group(
     // a false-but-constant warning turn into wallpaper.
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
-    let idx = find_account_by_name(&config.accounts, account, org)?;
+    let idx = find_account_by_name(&config.accounts, account)?;
     let target = &config.accounts[idx];
     // The label itself is real and the write below is correct — but on the
     // CONTROL account it buys nothing, because `Manager::select_with_group`
@@ -506,14 +481,11 @@ pub fn add_to_group(
     Ok(())
 }
 
-/// `tcr group rm <group> <account> [--org <name-or-uuid>]` / `tcr group rm
-/// <group> --all` — remove `account`'s (or every member's, with `--all`)
-/// `group` label.
+/// `tcr group rm <group> <account>` / `tcr group rm <group> --all` — remove
+/// `account`'s (or every member's, with `--all`) `group` label.
 ///
 /// The single-account path resolves through [`find_account_by_name`], same as
-/// [`add_to_group`] and for the same reasons. `--all` deliberately does not
-/// take an org: it walks every member of the group by identity already, so
-/// there is no name to disambiguate.
+/// [`add_to_group`] and for the same reasons.
 ///
 /// `account == None` iff `all` — clap's `ArgGroup` on `GroupRmArgs` refuses
 /// "both" and "neither" at parse time before this ever runs, so the `expect`
@@ -527,7 +499,6 @@ pub fn remove_from_group(
     config_path: &Path,
     group: &str,
     account: Option<&str>,
-    org: Option<&str>,
     all: bool,
 ) -> anyhow::Result<()> {
     // Same reasoning as `add_to_group`: no `load_for_edit` warning here either
@@ -579,7 +550,7 @@ pub fn remove_from_group(
     // clap's ArgGroup on `GroupRmArgs` guarantees exactly one of
     // `account`/`--all` — see this function's doc-comment.
     let account = account.expect("clap guarantees `account` is Some when `all` is false");
-    let idx = find_account_by_name(&config.accounts, account, org)?;
+    let idx = find_account_by_name(&config.accounts, account)?;
     let target = &config.accounts[idx];
     let outcome = config::save_group_membership(config_path, target, group, false)
         .with_context(|| format!("save config at {}", config_path.display()))?;
@@ -995,17 +966,12 @@ fn render_groups_json(config: &Config) -> anyhow::Result<String> {
 /// `skip_serializing_if = Option::is_none` DROPS the key entirely — matching the
 /// JS `delete account.disabled`, not a `false` literal. `Manager::set_disabled`'s
 /// persist does the same, so both paths leave the same document.
-pub async fn set_enabled(
-    config_path: &Path,
-    query: &str,
-    org: Option<&str>,
-    disabled: bool,
-) -> anyhow::Result<()> {
+pub async fn set_enabled(config_path: &Path, query: &str, disabled: bool) -> anyhow::Result<()> {
     // A config we cannot read has no port and no api-key to reach a server with;
     // fall through to the file path, which reports the load failure as it always
     // has. Never a silent skip of the live attempt for any other reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_disabled(&config, query, org, disabled).await {
+        match post_set_disabled(&config, query, disabled).await {
             Ok(applied) => {
                 println!(
                     "{} account '{}'.",
@@ -1034,7 +1000,7 @@ pub async fn set_enabled(
             // we can do, and it is HALF a disable — say so loudly. This arm is the
             // one that used to be the whole function, silently.
             Err(LiveControlError::NoRoute) => {
-                let name = write_disabled_flag(config_path, query, org, disabled)?;
+                let name = write_disabled_flag(config_path, query, disabled)?;
                 eprintln!(
                     "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP {} '{name}' until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
                     config.proxy.port,
@@ -1057,7 +1023,7 @@ pub async fn set_enabled(
             // shape of consequence as the arm above, different cause, and equally
             // never silent.
             Err(other) => {
-                let name = write_disabled_flag(config_path, query, org, disabled)?;
+                let name = write_disabled_flag(config_path, query, disabled)?;
                 eprintln!(
                     "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP {} '{name}' until it restarts.",
                     config.proxy.port,
@@ -1069,7 +1035,7 @@ pub async fn set_enabled(
         }
     }
 
-    let name = write_disabled_flag(config_path, query, org, disabled)?;
+    let name = write_disabled_flag(config_path, query, disabled)?;
     println!(
         "{} account '{name}'.",
         if disabled { "Disabled" } else { "Enabled" }
@@ -1080,13 +1046,8 @@ pub async fn set_enabled(
 /// The file half of enable/disable: resolve, set the flag, save, return the
 /// resolved name. Exactly what `set_enabled` did before it learned to ask the
 /// server.
-fn write_disabled_flag(
-    config_path: &Path,
-    query: &str,
-    org: Option<&str>,
-    disabled: bool,
-) -> anyhow::Result<String> {
-    edit_account(config_path, query, org, |config, idx| {
+fn write_disabled_flag(config_path: &Path, query: &str, disabled: bool) -> anyhow::Result<String> {
+    edit_account(config_path, query, |config, idx| {
         config.accounts[idx].disabled = if disabled { Some(true) } else { None };
         config.accounts[idx].name.clone()
     })
@@ -1145,7 +1106,6 @@ impl LiveControlError {
 async fn post_set_disabled(
     config: &Config,
     query: &str,
-    org: Option<&str>,
     disabled: bool,
 ) -> Result<crate::proxy::SetDisabledResponse, LiveControlError> {
     let client = reqwest::Client::builder()
@@ -1162,7 +1122,6 @@ async fn post_set_disabled(
     );
     let mut request = client.post(&url).json(&serde_json::json!({
         "query": query,
-        "org": org,
         "disabled": disabled,
     }));
     if let Some(key) = config.proxy.api_key.as_deref() {
@@ -1323,7 +1282,6 @@ pub(crate) async fn post_add_account(
 async fn post_set_control(
     config: &Config,
     query: Option<&str>,
-    org: Option<&str>,
 ) -> Result<crate::proxy::SetControlResponse, LiveControlError> {
     let client = reqwest::Client::builder()
         .no_proxy()
@@ -1337,10 +1295,9 @@ async fn post_set_control(
         config.proxy.port,
         crate::proxy::CONTROL_PATH
     );
-    let mut request = client.post(&url).json(&serde_json::json!({
-        "query": query,
-        "org": org,
-    }));
+    let mut request = client
+        .post(&url)
+        .json(&serde_json::json!({ "query": query }));
     if let Some(key) = config.proxy.api_key.as_deref() {
         request = request.header("x-api-key", key);
     }
@@ -1397,19 +1354,19 @@ async fn post_set_control(
 fn write_control_account(
     config_path: &Path,
     query: Option<&str>,
-    org: Option<&str>,
 ) -> anyhow::Result<Option<String>> {
     let config = load_for_edit(config_path)?;
     let target = match query {
         None => None,
-        Some(q) => Some(config.accounts[resolve_account(&config.accounts, q, org)?].clone()),
+        Some(q) => Some(config.accounts[resolve_account(&config.accounts, q)?].clone()),
     };
     let name = target.as_ref().map(|a| a.name.clone());
     let outcome = config::save_control_account(config_path, target.as_ref())
         .with_context(|| format!("save config at {}", config_path.display()))?;
     if let config::ControlWrite::Ambiguous = outcome {
         bail!(
-            "more than one config entry shares this account's identity — give each its own orgUuid, then retry"
+            "more than one config entry shares this account's identity — nothing was changed. \
+             Give each its own accountUuid/orgUuid and retry."
         );
     }
     Ok(name)
@@ -1419,17 +1376,13 @@ fn write_control_account(
 /// first** — same posture as [`set_enabled`], and for the same reason: a
 /// file-only write would leave the running process still resolving identity
 /// traffic to its OLD control account (or none) until it restarts.
-pub async fn set_control(
-    config_path: &Path,
-    query: Option<&str>,
-    org: Option<&str>,
-) -> anyhow::Result<()> {
+pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Result<()> {
     // A config we cannot read has no port and no api-key to reach a server
     // with; fall through to the file path, which reports the load failure as
     // it always has. Never a silent skip of the live attempt for any other
     // reason.
     if let Ok(config) = config::load(config_path) {
-        match post_set_control(&config, query, org).await {
+        match post_set_control(&config, query).await {
             Ok(applied) => {
                 match &applied.name {
                     Some(name) => println!("Set control account to '{name}'."),
@@ -1458,7 +1411,7 @@ pub async fn set_control(
             // is all we can do, and it is HALF a control-account change — say
             // so loudly.
             Err(LiveControlError::NoRoute) => {
-                write_control_account(config_path, query, org)?;
+                write_control_account(config_path, query)?;
                 eprintln!(
                     "[tcr] WARNING: the proxy running on :{} is too old to accept live account control (no {} route), so only the config file was changed. It will KEEP its OLD control account until it restarts. Run `tcr restart` when a cold prompt cache is acceptable.",
                     config.proxy.port,
@@ -1478,7 +1431,7 @@ pub async fn set_control(
             }
             // It answered something we cannot use, or did not answer at all.
             Err(other) => {
-                write_control_account(config_path, query, org)?;
+                write_control_account(config_path, query)?;
                 eprintln!(
                     "[tcr] WARNING: could not apply this to the proxy running on :{} ({}), so only the config file was changed. It may KEEP its OLD control account until it restarts.",
                     config.proxy.port,
@@ -1489,7 +1442,7 @@ pub async fn set_control(
         }
     }
 
-    let name = write_control_account(config_path, query, org)?;
+    let name = write_control_account(config_path, query)?;
     match name {
         Some(name) => println!("Set control account to '{name}'."),
         None => println!("Cleared the control account."),
@@ -2236,10 +2189,9 @@ fn render_accounts_json(
                     a.rate_limit_tier.as_deref(),
                     a.seat_tier.as_deref(),
                 ),
-                // The org, so a client can address this row unambiguously —
-                // `--org` is what every account verb narrows a duplicated email
-                // with, and without this on the wire a client holding only the
-                // name has nothing to pass. Real on both paths, like `groups`.
+                // The org, so a client can SHOW which one this row belongs to.
+                // It is not how the row is addressed — the name is. Real on
+                // both paths, like `groups`.
                 org_uuid: a.org_uuid.clone(),
                 org_name: a.org_name.clone(),
             };
@@ -2735,9 +2687,7 @@ mod tests {
     #[tokio::test]
     async fn remove_deletes_named_account_leaving_siblings() {
         let path = config_on_a_dead_port("remove").await;
-        remove_account(&path, "alice@example.com", None)
-            .await
-            .unwrap();
+        remove_account(&path, "alice@example.com").await.unwrap();
         let config = load(&path);
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].name, "bob@example.com");
@@ -2747,9 +2697,7 @@ mod tests {
     #[tokio::test]
     async fn remove_preserves_unmodelled_extra_fields() {
         let path = config_on_a_dead_port("remove-extra").await;
-        remove_account(&path, "alice@example.com", None)
-            .await
-            .unwrap();
+        remove_account(&path, "alice@example.com").await.unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // The #1 silent-loss risk: unmodelled top-level keys survive the edit.
@@ -2762,7 +2710,7 @@ mod tests {
     async fn remove_nonexistent_errors_and_leaves_file_byte_identical() {
         let path = config_on_a_dead_port("remove-miss").await;
         let before = fs::read_to_string(&path).unwrap();
-        let result = remove_account(&path, "nobody@example.com", None).await;
+        let result = remove_account(&path, "nobody@example.com").await;
         assert!(result.is_err());
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after, "a failed resolve must not write the config");
@@ -2793,9 +2741,7 @@ mod tests {
         doc["proxy"]["port"] = serde_json::json!(port);
         fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
 
-        remove_account(&path, "alice@example.com", None)
-            .await
-            .unwrap();
+        remove_account(&path, "alice@example.com").await.unwrap();
 
         // 1. THE RUNNING ROTATION: parked immediately, not just at next boot.
         let live = manager.snapshot(OffsetDateTime::now_utc());
@@ -2835,7 +2781,7 @@ mod tests {
         fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
         let before = fs::read_to_string(&path).unwrap();
 
-        let err = remove_account(&path, "alice@example.com", None)
+        let err = remove_account(&path, "alice@example.com")
             .await
             .expect_err("a rejected api-key must refuse the removal");
         assert!(
@@ -2861,21 +2807,25 @@ mod tests {
         let raw = fs::read_to_string(&path).unwrap();
         let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
         doc["proxy"]["port"] = serde_json::json!(port);
-        doc["accounts"][1]["name"] = serde_json::json!("alice@example.com");
         fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
-        let before = fs::read_to_string(&path).unwrap();
 
-        let config = load(&path);
+        // The ambiguity is in the LIVE rotation only: the file keeps unique
+        // names (the loader guarantees that), and the running fleet is broken by
+        // hand afterwards. That is the split this test is about — the CLI must
+        // not resolve against the file when the server refused.
+        let mut config = load(&path);
+        config.accounts[1].name = "alice@example.com".to_string();
+        let before = fs::read_to_string(&path).unwrap();
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let err = remove_account(&path, "alice@example.com", None)
+        let err = remove_account(&path, "alice@example.com")
             .await
             .expect_err("an ambiguous query must not be applied");
         let text = err.to_string();
         assert!(
-            text.contains("ambiguous") && text.contains("--org"),
-            "the refusal names the candidates and the fix: {text}"
+            text.contains("ambiguous") && text.matches("alice@example.com").count() >= 2,
+            "the refusal names the candidates: {text}"
         );
         assert_eq!(
             before,
@@ -2890,7 +2840,7 @@ mod tests {
     #[test]
     fn set_priority_explicit_writes_int() {
         let path = write_config("prio-n", TWO_ACCOUNTS);
-        set_priority(&path, "bob@example.com", PriorityArg::N(7), None).unwrap();
+        set_priority(&path, "bob@example.com", PriorityArg::N(7)).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[1].priority, Some(7));
         fs::remove_file(&path).ok();
@@ -2900,7 +2850,7 @@ mod tests {
     fn set_priority_first_is_min0_minus_one() {
         // Existing priorities are 0 and 1 → min(0, {0,1}) - 1 = -1.
         let path = write_config("prio-first", TWO_ACCOUNTS);
-        set_priority(&path, "bob@example.com", PriorityArg::First, None).unwrap();
+        set_priority(&path, "bob@example.com", PriorityArg::First).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[1].priority, Some(-1));
         fs::remove_file(&path).ok();
@@ -2910,7 +2860,7 @@ mod tests {
     fn set_priority_last_is_max0_plus_one() {
         // Existing priorities are 0 and 1 → max(0, {0,1}) + 1 = 2.
         let path = write_config("prio-last", TWO_ACCOUNTS);
-        set_priority(&path, "alice@example.com", PriorityArg::Last, None).unwrap();
+        set_priority(&path, "alice@example.com", PriorityArg::Last).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].priority, Some(2));
         fs::remove_file(&path).ok();
@@ -2920,7 +2870,7 @@ mod tests {
     fn set_priority_nonexistent_errors_and_leaves_file_byte_identical() {
         let path = write_config("prio-miss", TWO_ACCOUNTS);
         let before = fs::read_to_string(&path).unwrap();
-        let result = set_priority(&path, "nobody@example.com", PriorityArg::N(3), None);
+        let result = set_priority(&path, "nobody@example.com", PriorityArg::N(3));
         assert!(result.is_err());
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
@@ -2970,22 +2920,19 @@ mod tests {
       ]
     }"#;
 
-    /// `--org` picks the Team row out of two rows sharing an email — the whole
-    /// reason the flag exists. The assertion is on the OTHER row too: labelling
+    /// The bare email names ONE row after the loader's migration — the Personal
+    /// one, which keeps it — and the Team row is addressed by the name that was
+    /// minted for it. The assertion is on the OTHER row every time: labelling
     /// the right account is only half of it, and a resolver that labelled both
     /// would pass a check that only looked at the one it was asked for.
     #[test]
-    fn group_add_with_an_org_labels_that_org_and_only_that_org() {
-        let path = write_config("group-add-org", DUPLICATED_EMAIL);
-        add_to_group(
-            &path,
-            "codereview",
-            "henry@example.com",
-            Some("22222222-2222-2222-2222-222222222222"),
-        )
-        .unwrap();
+    fn group_add_labels_exactly_the_named_row_of_a_migrated_duplicate() {
+        let path = write_config("group-add-migrated", DUPLICATED_EMAIL);
+        add_to_group(&path, "codereview", "henry@example.com/example-team").unwrap();
 
         let config = load(&path);
+        assert_eq!(config.accounts[0].name, "henry@example.com");
+        assert_eq!(config.accounts[1].name, "henry@example.com/example-team");
         assert_eq!(
             config.accounts[0].groups, None,
             "the Personal row was not asked for and must not be labelled"
@@ -2993,47 +2940,95 @@ mod tests {
         assert_eq!(
             config.accounts[1].groups,
             Some(vec!["codereview".to_string()]),
-            "the Team row is the one --org named"
+            "the Team row is the one the name pointed at"
+        );
+
+        add_to_group(&path, "burst", "henry@example.com").unwrap();
+        let config = load(&path);
+        assert_eq!(
+            config.accounts[0].groups,
+            Some(vec!["burst".to_string()]),
+            "the bare email is the Personal row and nothing else"
+        );
+        assert_eq!(
+            config.accounts[1].groups,
+            Some(vec!["codereview".to_string()]),
+            "the Team row keeps only its own label"
         );
     }
 
-    /// And without `--org` it REFUSES rather than guessing. This is the
-    /// regression: the old exact-name scan silently took `accounts[0]`, so the
-    /// operator saw "Added ... to group" about the wrong account.
+    /// A duplicate put back by hand is MIGRATED AGAIN on the next load, not
+    /// refused and not guessed at. That is what makes uniqueness a property of
+    /// the system rather than of one upgrade: every verb goes through
+    /// `config::load`, so nothing downstream ever sees two rows of one name.
+    ///
+    /// The original regression this replaces: an exact-name scan silently took
+    /// `accounts[0]`, so the operator saw "Added ... to group" about the wrong
+    /// account. Here the label lands on the row the name resolves to, and the
+    /// re-minted name is on disk for the next reader.
     #[test]
-    fn group_add_refuses_a_duplicated_email_with_no_org() {
-        let path = write_config("group-add-ambiguous", DUPLICATED_EMAIL);
-        let err = add_to_group(&path, "codereview", "henry@example.com", None)
-            .expect_err("an unbreakable tie must refuse rather than pick the first row");
-        assert!(err.to_string().contains("ambiguous"), "{err}");
+    fn a_hand_edited_duplicate_is_migrated_again_on_the_next_load() {
+        let path = write_config("group-add-rebroken", DUPLICATED_EMAIL);
+        assert_eq!(
+            load(&path).accounts[1].name,
+            "henry@example.com/example-team"
+        );
+        rename_account_in_file(&path, 1, "henry@example.com");
+
+        add_to_group(&path, "codereview", "henry@example.com").unwrap();
 
         let config = load(&path);
-        assert_eq!(config.accounts[0].groups, None);
+        assert_eq!(config.accounts[0].name, "henry@example.com");
+        assert_eq!(
+            config.accounts[1].name, "henry@example.com/example-team",
+            "the re-broken row is renamed again"
+        );
+        assert_eq!(
+            config.accounts[0].groups,
+            Some(vec!["codereview".to_string()]),
+            "the label landed on the row the bare email names"
+        );
         assert_eq!(config.accounts[1].groups, None);
     }
 
     /// `rm` resolves the same way — the panel's "remove from group" is the same
     /// menu as "add to group" and must not be able to strip the wrong row.
     #[test]
-    fn group_rm_narrows_by_org_and_refuses_without_one() {
-        let path = write_config("group-rm-org", DUPLICATED_EMAIL);
-        let team = Some("22222222-2222-2222-2222-222222222222");
-        add_to_group(&path, "codereview", "henry@example.com", team).unwrap();
+    fn group_rm_strips_exactly_the_named_row_of_a_migrated_duplicate() {
+        let path = write_config("group-rm-migrated", DUPLICATED_EMAIL);
+        let team = "henry@example.com/example-team";
+        add_to_group(&path, "codereview", team).unwrap();
+        add_to_group(&path, "codereview", "henry@example.com").unwrap();
 
-        let err = remove_from_group(&path, "codereview", Some("henry@example.com"), None, false)
-            .expect_err("no org means an unbreakable tie");
-        assert!(err.to_string().contains("ambiguous"), "{err}");
-        assert_eq!(
-            load(&path).accounts[1].groups,
-            Some(vec!["codereview".to_string()]),
-            "a refused removal changes nothing"
-        );
-
-        remove_from_group(&path, "codereview", Some("henry@example.com"), team, false).unwrap();
+        remove_from_group(&path, "codereview", Some("henry@example.com"), false).unwrap();
+        let config = load(&path);
         // Removing the last label DROPS the `groups` key rather than leaving an
         // empty array — `save_group_membership`'s contract, same shape as
         // `disabled == false` removing its key.
+        assert_eq!(config.accounts[0].groups, None);
+        assert_eq!(
+            config.accounts[1].groups,
+            Some(vec!["codereview".to_string()]),
+            "the row nobody named keeps its label"
+        );
+
+        remove_from_group(&path, "codereview", Some(team), false).unwrap();
         assert_eq!(load(&path).accounts[1].groups, None);
+    }
+
+    /// Rewrite one `accounts[]` entry's `name` in the file directly, bypassing
+    /// `config::load`. The only way to reach a duplicate name now, and therefore
+    /// the only way to test the refusals that guard one.
+    fn rename_account_in_file(path: &Path, index: usize, name: &str) {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("readable"))
+                .expect("the fixture is JSON");
+        doc["accounts"][index]["name"] = serde_json::Value::String(name.to_string());
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&doc).expect("serializes"),
+        )
+        .expect("writable");
     }
 
     /// An unknown name still comes back with the whole roster, which is what
@@ -3042,7 +3037,7 @@ mod tests {
     #[test]
     fn group_add_names_every_configured_account_when_the_name_is_unknown() {
         let path = write_config("group-add-unknown", TWO_ACCOUNTS);
-        let err = add_to_group(&path, "codereview", "nobody@example.com", None)
+        let err = add_to_group(&path, "codereview", "nobody@example.com")
             .expect_err("an unknown account is an error");
         let text = err.to_string();
         assert!(text.contains("alice@example.com"), "{text}");
@@ -3052,7 +3047,7 @@ mod tests {
     #[test]
     fn group_add_labels_named_account_and_leaves_siblings_byte_identical() {
         let path = write_config("group-add", TWO_ACCOUNTS);
-        add_to_group(&path, "codereview", "alice@example.com", None).unwrap();
+        add_to_group(&path, "codereview", "alice@example.com").unwrap();
         let config = load(&path);
         assert_eq!(
             config.accounts[0].groups,
@@ -3073,8 +3068,8 @@ mod tests {
     #[test]
     fn group_add_twice_is_idempotent() {
         let path = write_config("group-add-twice", TWO_ACCOUNTS);
-        add_to_group(&path, "codereview", "alice@example.com", None).unwrap();
-        add_to_group(&path, "codereview", "alice@example.com", None).unwrap();
+        add_to_group(&path, "codereview", "alice@example.com").unwrap();
+        add_to_group(&path, "codereview", "alice@example.com").unwrap();
         let config = load(&path);
         assert_eq!(
             config.accounts[0].groups,
@@ -3087,7 +3082,7 @@ mod tests {
     #[test]
     fn group_rm_removes_only_named_label_leaving_others_intact() {
         let path = write_config("group-rm-one", GROUPED_ACCOUNTS);
-        remove_from_group(&path, "codereview", Some("alice@example.com"), None, false).unwrap();
+        remove_from_group(&path, "codereview", Some("alice@example.com"), false).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].groups, Some(vec!["dev".to_string()]));
         // bob still carries codereview — only alice's membership changed.
@@ -3101,7 +3096,7 @@ mod tests {
     #[test]
     fn group_rm_all_clears_label_from_every_member_and_nothing_else() {
         let path = write_config("group-rm-all", GROUPED_ACCOUNTS);
-        remove_from_group(&path, "codereview", None, None, true).unwrap();
+        remove_from_group(&path, "codereview", None, true).unwrap();
         let config = load(&path);
         // alice keeps `dev`, loses `codereview`.
         assert_eq!(config.accounts[0].groups, Some(vec!["dev".to_string()]));
@@ -3120,7 +3115,7 @@ mod tests {
     fn group_rm_all_on_a_group_with_no_members_is_a_success_no_op() {
         let path = write_config("group-rm-all-empty", GROUPED_ACCOUNTS);
         let before = fs::read_to_string(&path).unwrap();
-        remove_from_group(&path, "nonexistent-group", None, None, true).unwrap();
+        remove_from_group(&path, "nonexistent-group", None, true).unwrap();
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(
             before, after,
@@ -3132,7 +3127,7 @@ mod tests {
     #[test]
     fn group_add_unknown_account_errors_and_names_the_configured_accounts() {
         let path = write_config("group-add-unknown", GROUPED_ACCOUNTS);
-        let err = add_to_group(&path, "codereview", "nobody@example.com", None).unwrap_err();
+        let err = add_to_group(&path, "codereview", "nobody@example.com").unwrap_err();
         let message = err.to_string();
         for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
             assert!(
@@ -3146,8 +3141,8 @@ mod tests {
     #[test]
     fn group_rm_unknown_account_errors_and_names_the_configured_accounts() {
         let path = write_config("group-rm-unknown", GROUPED_ACCOUNTS);
-        let err = remove_from_group(&path, "codereview", Some("nobody@example.com"), None, false)
-            .unwrap_err();
+        let err =
+            remove_from_group(&path, "codereview", Some("nobody@example.com"), false).unwrap_err();
         let message = err.to_string();
         for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
             assert!(message.contains(name), "missing {name}: {message}");
@@ -3170,7 +3165,7 @@ mod tests {
         let bad_label = "bad\u{0}label";
 
         let path = write_config("group-add-bad-label", with_bad_label);
-        let err = add_to_group(&path, bad_label, "alice@example.com", None).unwrap_err();
+        let err = add_to_group(&path, bad_label, "alice@example.com").unwrap_err();
         assert!(
             err.to_string().contains("control character"),
             "add must name the character class at fault: {err}"
@@ -3183,7 +3178,7 @@ mod tests {
         );
 
         // `rm` does NOT run the validator — it must still remove the bad label.
-        remove_from_group(&path, bad_label, Some("alice@example.com"), None, false).unwrap();
+        remove_from_group(&path, bad_label, Some("alice@example.com"), false).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].groups, Some(vec!["good".to_string()]));
         fs::remove_file(&path).ok();
@@ -3192,7 +3187,7 @@ mod tests {
     #[test]
     fn group_mutation_preserves_unmodelled_extra_keys() {
         let path = write_config("group-extra", GROUPED_ACCOUNTS);
-        add_to_group(&path, "burst", "carol@example.com", None).unwrap();
+        add_to_group(&path, "burst", "carol@example.com").unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // Top-level unmodelled key.
@@ -3447,7 +3442,7 @@ mod tests {
     #[test]
     fn a_second_member_makes_the_group_route_again() {
         let path = write_config("routes-second-member", CONTROL_ONLY_GROUP);
-        add_to_group(&path, "research", "worker@example.com", None).unwrap();
+        add_to_group(&path, "research", "worker@example.com").unwrap();
         let config = load(&path);
         let research = group_line(&render_groups_text(&config), "research");
         assert!(
@@ -3809,9 +3804,7 @@ mod tests {
     #[tokio::test]
     async fn set_enabled_true_writes_disabled_true() {
         let path = config_on_a_dead_port("disable").await;
-        set_enabled(&path, "alice@example.com", None, true)
-            .await
-            .unwrap();
+        set_enabled(&path, "alice@example.com", true).await.unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(value["accounts"][0]["disabled"], serde_json::json!(true));
@@ -3822,10 +3815,8 @@ mod tests {
     async fn set_enabled_false_drops_the_disabled_key() {
         let path = config_on_a_dead_port("enable").await;
         // First disable, then re-enable — the key must vanish entirely.
-        set_enabled(&path, "alice@example.com", None, true)
-            .await
-            .unwrap();
-        set_enabled(&path, "alice@example.com", None, false)
+        set_enabled(&path, "alice@example.com", true).await.unwrap();
+        set_enabled(&path, "alice@example.com", false)
             .await
             .unwrap();
         let raw = fs::read_to_string(&path).unwrap();
@@ -3866,9 +3857,7 @@ mod tests {
         doc["proxy"]["port"] = serde_json::json!(port);
         fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
 
-        set_enabled(&path, "alice@example.com", None, true)
-            .await
-            .unwrap();
+        set_enabled(&path, "alice@example.com", true).await.unwrap();
 
         // 1. THE RUNNING ROTATION. Not a fresh Manager, not the file — the process
         //    that would serve the next request.
@@ -3894,7 +3883,7 @@ mod tests {
 
         // 3. Re-enable, live, and the key is DROPPED from the document — the same
         //    contract the file-only path has always had.
-        set_enabled(&path, "alice@example.com", None, false)
+        set_enabled(&path, "alice@example.com", false)
             .await
             .unwrap();
         assert!(
@@ -3913,32 +3902,32 @@ mod tests {
     /// An ambiguous query is refused by the SERVER and the CLI does not fall back:
     /// the file's own resolution could land on a different row than the one the
     /// server was talking about, and a disable applied to the wrong account is
-    /// worse than none. Both accounts share an email here, so `--org` is the fix
-    /// the message must name.
+    /// worse than none. The live rotation is broken by hand to hold two rows of
+    /// the same name; the file keeps unique names throughout, which is what
+    /// makes the byte-identical assertion below mean what it says.
     #[tokio::test]
     async fn set_enabled_refuses_an_ambiguous_query_without_writing() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let path = config_on_a_dead_port("live-ambiguous").await;
-        // Same email in two orgs — the shape `--org` exists for.
         let raw = fs::read_to_string(&path).unwrap();
         let mut doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
         doc["proxy"]["port"] = serde_json::json!(port);
-        doc["accounts"][1]["name"] = serde_json::json!("alice@example.com");
         fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
-        let before = fs::read_to_string(&path).unwrap();
 
-        let config = load(&path);
+        let mut config = load(&path);
+        config.accounts[1].name = "alice@example.com".to_string();
+        let before = fs::read_to_string(&path).unwrap();
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
         tokio::spawn(async move { crate::mitm::serve(listener, manager, None).await });
 
-        let err = set_enabled(&path, "alice@example.com", None, true)
+        let err = set_enabled(&path, "alice@example.com", true)
             .await
             .expect_err("an ambiguous query must not be applied");
         let text = err.to_string();
         assert!(
-            text.contains("ambiguous") && text.contains("--org"),
-            "the refusal names the candidates and the fix: {text}"
+            text.contains("ambiguous") && text.matches("alice@example.com").count() >= 2,
+            "the refusal names the candidates: {text}"
         );
         assert_eq!(
             before,
@@ -4149,13 +4138,14 @@ mod tests {
                 { "name": "user-two", "type": "oauth", "accessToken": "at2" }
             ] }"#,
         );
-        let idx = resolve_account(&config.accounts, "user", None).unwrap();
+        let idx = resolve_account(&config.accounts, "user").unwrap();
         assert_eq!(idx, 0, "exact name resolves to that account");
     }
 
-    /// Two accounts sharing the SAME email in different orgs — the finding #8
-    /// scenario. Keying on name alone silently returned the first; `--org` must
-    /// now disambiguate.
+    /// Two accounts sharing the SAME email in different orgs — the shape the
+    /// whole unique-names contract exists for. `load_from` parses without
+    /// migrating (there is no file to write back to), so this is the one place
+    /// the pre-migration fleet can be looked at directly.
     const DUP_EMAIL_TWO_ORGS: &str = r#"{
       "accounts": [
         { "name": "me@example.com", "type": "oauth", "accountUuid": "uuid-person",
@@ -4166,10 +4156,9 @@ mod tests {
     }"#;
 
     #[test]
-    fn resolve_ambiguous_across_two_orgs_errors_listing_candidates() {
-        // The same email in two orgs → ambiguous without --org.
+    fn resolve_a_duplicated_name_errors_listing_candidates() {
         let accounts = load_from(DUP_EMAIL_TWO_ORGS).accounts;
-        let err = resolve_account(&accounts, "me@example.com", None).unwrap_err();
+        let err = resolve_account(&accounts, "me@example.com").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("ambiguous"), "ambiguous error: {msg}");
         assert!(
@@ -4178,15 +4167,22 @@ mod tests {
         );
     }
 
+    /// The migrated names each resolve to their own row, and nothing resolves
+    /// by the email PORTION of a qualified name — that fallback is what let one
+    /// query name two accounts.
     #[test]
-    fn resolve_org_narrows_to_one() {
-        let accounts = load_from(DUP_EMAIL_TWO_ORGS).accounts;
-        // The ambiguous email, narrowed by org name, resolves uniquely.
-        let idx = resolve_account(&accounts, "me@example.com", Some("Org B")).unwrap();
-        assert_eq!(idx, 1);
-        // And --org matching the uuid (exact or prefix) works too.
-        let idx = resolve_account(&accounts, "me@example.com", Some("uuid-a")).unwrap();
-        assert_eq!(idx, 0);
+    fn resolve_after_migration_gives_each_row_its_own_name() {
+        let path = write_config("resolve-migrated", DUP_EMAIL_TWO_ORGS);
+        let accounts = load(&path).accounts;
+        assert_eq!(accounts[0].name, "me@example.com");
+        assert_eq!(accounts[1].name, "me@example.com/org-b");
+
+        assert_eq!(resolve_account(&accounts, "me@example.com").unwrap(), 0);
+        assert_eq!(
+            resolve_account(&accounts, "me@example.com/org-b").unwrap(),
+            1
+        );
+        assert!(resolve_account(&accounts, "org-b").is_err());
     }
 
     // --- render_accounts ---------------------------------------------------
@@ -5422,8 +5418,8 @@ mod tests {
         usage: Option<tcr_status_wire::UsageRow>,
         // `plan` is `(organizationType, rateLimitTier, seatTier)` — the three
         // raw strings, exactly as the profile endpoint spells them. `org` is
-        // `(orgUuid, orgName)`, what a client passes to `--org` to address this
-        // row when a name is ambiguous. Grouped rather than five more
+        // `(orgUuid, orgName)`, the org a client shows beside this row.
+        // Grouped rather than five more
         // positional `Option<&str>` arguments, which at this arity is a call
         // site nobody can read.
         plan: (Option<&str>, Option<&str>, Option<&str>),

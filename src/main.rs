@@ -87,12 +87,9 @@ struct RemoveArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name, or its bare email if the name carries an org suffix. Exact
-    /// and case-sensitive — not a substring.
+    /// Account name — exact and case-sensitive, not a substring. Names are
+    /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -100,12 +97,9 @@ struct TokenArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name, or its bare email if the name carries an org suffix. Exact
-    /// and case-sensitive — not a substring.
+    /// Account name — exact and case-sensitive, not a substring. Names are
+    /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -113,8 +107,8 @@ struct PriorityArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name, or its bare email if the name carries an org suffix. Exact
-    /// and case-sensitive — not a substring.
+    /// Account name — exact and case-sensitive, not a substring. Names are
+    /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
     /// The explicit priority value (lower = preferred). Omit with --first/--last.
     #[arg(conflicts_with_all = ["first", "last"])]
@@ -125,9 +119,6 @@ struct PriorityArgs {
     /// Move the account to the back of rotation (max priority + 1).
     #[arg(long)]
     last: bool,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -135,12 +126,9 @@ struct EnableArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name, or its bare email if the name carries an org suffix. Exact
-    /// and case-sensitive — not a substring.
+    /// Account name — exact and case-sensitive, not a substring. Names are
+    /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -148,12 +136,9 @@ struct DisableArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name, or its bare email if the name carries an org suffix. Exact
-    /// and case-sensitive — not a substring.
+    /// Account name — exact and case-sensitive, not a substring. Names are
+    /// unique, so this always names one row; `tcr accounts` prints them.
     query: String,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -161,13 +146,10 @@ struct ControlArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
     config: Option<PathBuf>,
-    /// Account name, or its bare email if the name carries an org suffix. Exact
-    /// and case-sensitive — not a substring. Omit with `--clear` or `--show`.
+    /// Account name — exact and case-sensitive, not a substring. Omit with
+    /// `--clear` or `--show`.
     #[arg(conflicts_with_all = ["clear", "show"])]
     query: Option<String>,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
     /// Clear the control account (identity traffic resolves to none).
     #[arg(long, conflicts_with = "show")]
     clear: bool,
@@ -226,12 +208,8 @@ struct GroupAddArgs {
     config: Option<PathBuf>,
     /// The group label to add.
     group: String,
-    /// Account name (its bare email — `Account.name` IS the email). Exact,
-    /// case-sensitive.
+    /// Account name — exact and case-sensitive.
     account: String,
-    /// Narrow an ambiguous match to a single org (name or uuid).
-    #[arg(long)]
-    org: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -246,11 +224,6 @@ struct GroupRmArgs {
     /// "both" and "neither".
     #[arg(required_unless_present = "all", conflicts_with = "all")]
     account: Option<String>,
-    /// Narrow an ambiguous match to a single org (name or uuid). Meaningless
-    /// with `--all`, which walks every member by identity and has no name to
-    /// disambiguate.
-    #[arg(long, conflicts_with = "all")]
-    org: Option<String>,
     /// Remove the group from every member instead of one account — deletes
     /// the group, since groups exist only while some account carries the
     /// label.
@@ -350,10 +323,6 @@ struct LoginArgs {
     /// match, or nothing is written.
     #[arg(long)]
     account: Option<String>,
-    /// Narrow an ambiguous `--account` match to a single org (name or uuid) —
-    /// the same flag `tcr enable`/`tcr disable`/`tcr remove`/`tcr priority` take.
-    #[arg(long)]
-    org: Option<String>,
     /// Add an account from a `claude setup-token` credential instead of the
     /// browser flow — no value here. The token is read from stdin (prompted
     /// when stdin is a TTY), never from argv: an argv value is visible in
@@ -362,14 +331,17 @@ struct LoginArgs {
     /// there is no refresh token (the account serves until the token expires,
     /// about a year, then goes dead — see the warning `tcr login --token`
     /// prints) and usually no email (name it with `--name`, or answer the
-    /// prompt). Refuses to combine with `--account`/`--org`: an
-    /// inference-only token carries no identity for either flag to confirm,
-    /// and an assertion that cannot be evaluated must fail closed.
+    /// prompt). Refuses to combine with `--account`: an inference-only token
+    /// carries no identity for that flag to confirm, and an assertion that
+    /// cannot be evaluated must fail closed.
     #[arg(long)]
     token: bool,
-    /// Name the account added by `--token`, since its profile fetch usually
-    /// comes back empty (no email to name it from). Ignored by the browser
-    /// flow, which always has an email or its own prompt.
+    /// Name this account explicitly, overriding the name login would mint for
+    /// it. Refused if some other account already has that name — names are
+    /// unique, and taking one from an existing row is how a login overwrites
+    /// the wrong credential. `--token` needs it most (an inference-only
+    /// credential's profile fetch usually comes back with no email to name it
+    /// from), but the browser flow honours it too.
     #[arg(long)]
     name: Option<String>,
 }
@@ -453,20 +425,20 @@ async fn run_accounts(args: AccountsArgs) -> anyhow::Result<()> {
     cli::list_accounts(&config_path, args.probe).await
 }
 
-/// `tcr remove <query> [--org]` — delete an account from the config, applying
+/// `tcr remove <query>` — delete an account from the config, applying
 /// a live disable through the RUNNING proxy first where there is one.
 async fn run_remove(args: RemoveArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::remove_account(&config_path, &args.query, args.org.as_deref()).await
+    cli::remove_account(&config_path, &args.query).await
 }
 
-/// `tcr token <query> [--org]` — print the account's access token.
+/// `tcr token <query>` — print the account's access token.
 fn run_token(args: TokenArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::print_access_token(&config_path, &args.query, args.org.as_deref())
+    cli::print_access_token(&config_path, &args.query)
 }
 
-/// `tcr priority <query> [N|--first|--last] [--org]` — set rotation priority.
+/// `tcr priority <query> [N|--first|--last]` — set rotation priority.
 fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     let priority = if args.first {
@@ -478,24 +450,24 @@ fn run_priority(args: PriorityArgs) -> anyhow::Result<()> {
     } else {
         anyhow::bail!("provide a priority value, or one of --first / --last");
     };
-    cli::set_priority(&config_path, &args.query, priority, args.org.as_deref())
+    cli::set_priority(&config_path, &args.query, priority)
 }
 
-/// `tcr enable <query> [--org]` — clear an account's `disabled` flag, in the
+/// `tcr enable <query>` — clear an account's `disabled` flag, in the
 /// RUNNING proxy where there is one (async for that reason alone).
 async fn run_enable(args: EnableArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::set_enabled(&config_path, &args.query, args.org.as_deref(), false).await
+    cli::set_enabled(&config_path, &args.query, false).await
 }
 
-/// `tcr disable <query> [--org]` — hold an account out of rotation, in the RUNNING
+/// `tcr disable <query>` — hold an account out of rotation, in the RUNNING
 /// proxy where there is one.
 async fn run_disable(args: DisableArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
-    cli::set_enabled(&config_path, &args.query, args.org.as_deref(), true).await
+    cli::set_enabled(&config_path, &args.query, true).await
 }
 
-/// `tcr control <query> [--org] | --clear | --show` — set, clear, or show the
+/// `tcr control <query> | --clear | --show` — set, clear, or show the
 /// identity-bound control account, in the RUNNING proxy where there is one.
 async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
@@ -503,12 +475,12 @@ async fn run_control(args: ControlArgs) -> anyhow::Result<()> {
         return cli::show_control(&config_path).await;
     }
     if args.clear {
-        return cli::set_control(&config_path, None, args.org.as_deref()).await;
+        return cli::set_control(&config_path, None).await;
     }
     let Some(query) = args.query else {
         anyhow::bail!("provide an account query, or --clear / --show");
     };
-    cli::set_control(&config_path, Some(&query), args.org.as_deref()).await
+    cli::set_control(&config_path, Some(&query)).await
 }
 
 /// `tcr group ls|add|rm|reserve|unreserve|allow-control|disallow-control|color` — manage account group membership. Argument shape is
@@ -521,17 +493,11 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
         }
         GroupAction::Add(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::add_to_group(&config_path, &a.group, &a.account, a.org.as_deref())
+            cli::add_to_group(&config_path, &a.group, &a.account)
         }
         GroupAction::Rm(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
-            cli::remove_from_group(
-                &config_path,
-                &a.group,
-                a.account.as_deref(),
-                a.org.as_deref(),
-                a.all,
-            )
+            cli::remove_from_group(&config_path, &a.group, a.account.as_deref(), a.all)
         }
         GroupAction::Reserve(a) => {
             let config_path = a.config.unwrap_or_else(config::default_path);
@@ -1102,7 +1068,6 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
             args.force,
             args.name.as_deref(),
             args.account.as_deref(),
-            args.org.as_deref(),
         )
         .await
         .context("setup-token login failed")?;
@@ -1113,7 +1078,7 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         &config_path,
         args.force,
         args.account.as_deref(),
-        args.org.as_deref(),
+        args.name.as_deref(),
     )
     .await
     .context("OAuth login failed")?;

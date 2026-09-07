@@ -1236,6 +1236,28 @@ fn stamp_add_endpoint(response: Response) -> Response {
     stamp_endpoint_as(response, ADD_ACCOUNT_ENDPOINT)
 }
 
+/// Deserialize `bytes` into `T`, but ONLY from a JSON object — `None` for
+/// anything else, including a JSON ARRAY.
+///
+/// The array case is why this exists rather than a bare
+/// `serde_json::from_slice`. Serde will happily build a struct out of a
+/// sequence, positionally, when the element count matches the field count. So
+/// `["alice@example.com", true]` deserializes into a two-field
+/// [`SetDisabledRequest`] and parks an account — a body nobody meant as a
+/// request, accepted because of how many fields the struct happens to have
+/// today. Removing one field is all it took to open that: this route had three
+/// fields and the same array was a 400.
+///
+/// Requiring an object is the property the callers actually mean, and it does
+/// not move when a field is added or removed.
+fn parse_object<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    serde_json::from_value(value).ok()
+}
+
 /// The request body of [`DISABLED_PATH`].
 ///
 /// `query` and `disabled` are `Option` rather than required fields so a body that
@@ -1245,8 +1267,6 @@ fn stamp_add_endpoint(response: Response) -> Response {
 #[derive(serde::Deserialize)]
 struct SetDisabledRequest {
     query: Option<String>,
-    #[serde(default)]
-    org: Option<String>,
     disabled: Option<bool>,
 }
 
@@ -1254,12 +1274,10 @@ struct SetDisabledRequest {
 /// read it, and both halves of the wire contract belong to one type.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SetDisabledResponse {
-    /// The RESOLVED account name. The query may have been the account's bare
-    /// EMAIL where its stored name carries an org suffix (`me@example.com (Acme)`),
-    /// so the answer names what was actually parked.
+    /// The RESOLVED account name, so the answer names what was actually parked.
     ///
     /// It is NOT a partial or fuzzy match: [`crate::identity::match_accounts`] is
-    /// exact name, then exact email, byte-for-byte, case-sensitive and untrimmed.
+    /// the account's exact name, byte-for-byte, case-sensitive and untrimmed.
     /// Measured against a fleet holding `alice@example.com`: `alice`, `alice@`,
     /// `example`, `ALICE@EXAMPLE.COM` and a trailing space are each a 404.
     pub name: String,
@@ -1320,11 +1338,11 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
             None,
         ));
     };
-    let Ok(parsed) = serde_json::from_slice::<SetDisabledRequest>(&bytes) else {
+    let Some(parsed) = parse_object::<SetDisabledRequest>(&bytes) else {
         return stamp_endpoint(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\", \"org\": null, \"disabled\": true}.",
+            "Expected a JSON object: {\"query\": \"<account>\", \"disabled\": true}.",
             None,
         ));
     };
@@ -1345,7 +1363,7 @@ async fn set_disabled_handler(State(manager): State<Arc<Manager>>, req: Request)
         ));
     }
 
-    match manager.set_disabled_by_query(&query, parsed.org.as_deref(), disabled) {
+    match manager.set_disabled_by_query(&query, disabled) {
         SetDisabledOutcome::NoMatch => stamp_endpoint(error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -1409,8 +1427,6 @@ fn stamp_control_endpoint(response: Response) -> Response {
 struct SetControlRequest {
     #[serde(default)]
     query: Option<String>,
-    #[serde(default)]
-    org: Option<String>,
 }
 
 /// The 200 body of [`CONTROL_PATH`]. Deserializable too — `tcr control` reads
@@ -1475,11 +1491,11 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
             None,
         ));
     };
-    let Ok(parsed) = serde_json::from_slice::<SetControlRequest>(&bytes) else {
+    let Some(parsed) = parse_object::<SetControlRequest>(&bytes) else {
         return stamp_control_endpoint(error_response(
             StatusCode::BAD_REQUEST,
             "invalid_request_error",
-            "Expected a JSON object: {\"query\": \"<account>\" | null, \"org\": null}.",
+            "Expected a JSON object: {\"query\": \"<account>\" | null}.",
             None,
         ));
     };
@@ -1493,7 +1509,7 @@ async fn set_control_handler(State(manager): State<Arc<Manager>>, req: Request) 
     }
     let cleared = parsed.query.is_none();
 
-    match manager.set_control_by_query(parsed.query.as_deref(), parsed.org.as_deref()) {
+    match manager.set_control_by_query(parsed.query.as_deref()) {
         SetControlOutcome::NoMatch => stamp_control_endpoint(error_response(
             StatusCode::NOT_FOUND,
             "not_found_error",
@@ -4278,6 +4294,8 @@ mod tests {
         Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig {
                 port: 0,
                 api_key: api_key.map(str::to_string),
@@ -6062,14 +6080,16 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// An ambiguous query is a 409 that NAMES the candidates — otherwise `--org` is
-    /// advice the caller cannot act on. Refusing is not pedantry: guessing would
-    /// bench an account the operator did not ask about.
+    /// An ambiguous query is a 409 that NAMES the candidates, so the operator
+    /// knows which rows to go fix. Refusing is not pedantry: guessing would
+    /// bench an account nobody asked about.
+    ///
+    /// Only the LIVE rotation is broken here — `config::load` would have renamed
+    /// the duplicate — which is the only way this arm is still reachable.
     #[tokio::test]
     async fn control_endpoint_409s_an_ambiguous_query_naming_the_candidates() {
         let path = control_config_path("ambiguous");
         let mut config = two_account_config(None);
-        // The same person in two orgs: one email, two rows, `--org` the only fix.
         config.accounts[1].name = "alice@example.com".to_string();
         crate::config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
@@ -6089,8 +6109,8 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&body);
         assert!(
-            text.contains("ambiguous") && text.contains("--org"),
-            "the 409 says what to do about it: {text}"
+            text.contains("ambiguous") && text.matches("alice@example.com").count() >= 2,
+            "the 409 names the candidates: {text}"
         );
         let live = manager.snapshot(OffsetDateTime::now_utc());
         assert!(
@@ -6102,14 +6122,16 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// `--org` narrows the same ambiguous fleet to exactly one row, and it is the
-    /// row named — the resolution rule is the CLI's own
-    /// [`crate::identity::match_one`], run against the LIVE rotation slots.
+    /// The same two-org fleet with the names a migration would have given it:
+    /// the qualified name parks exactly its own row, live AND on disk. The
+    /// resolution rule is the CLI's own [`crate::identity::match_one`], run
+    /// against the LIVE rotation slots.
     #[tokio::test]
-    async fn control_endpoint_org_narrows_to_one_account() {
-        let path = control_config_path("org");
+    async fn control_endpoint_parks_the_row_a_qualified_name_points_at() {
+        let path = control_config_path("qualified-name");
         let mut config = two_account_config(None);
-        config.accounts[1].name = "alice@example.com".to_string();
+        config.accounts[0].name = "alice@example.com".to_string();
+        config.accounts[1].name = "alice@example.com/team".to_string();
         crate::config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
 
@@ -6118,14 +6140,14 @@ mod tests {
             Method::POST,
             Some(loopback_peer()),
             None,
-            r#"{"query":"alice@example.com","org":"Org bbbbbbbbbbbb","disabled":true}"#,
+            r#"{"query":"alice@example.com/team","disabled":true}"#,
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         let live = manager.snapshot(OffsetDateTime::now_utc());
         assert!(
             !live.accounts[0].disabled && live.accounts[1].disabled,
-            "the SECOND row — the one whose org was named — is the one parked"
+            "the SECOND row — the one the name points at — is the one parked"
         );
         assert_eq!(disabled_in_file(&path, 0), None);
         assert_eq!(disabled_in_file(&path, 1), Some(serde_json::json!(true)));
@@ -6355,17 +6377,11 @@ mod tests {
             "the live manager must resolve the new control account"
         );
 
-        // 2. …and the file's top-level key carries it too — as the identity
-        // object [`crate::config::save_control_account`] now writes (never the
-        // legacy bare string), so a duplicated email can survive a restart.
+        // 2. …and the file's top-level key carries it too — the account's NAME,
+        // which is unique across the config and so is the whole key.
         assert_eq!(
             control_account_in_file(&path),
-            Some(serde_json::json!({
-                "name": "alice@example.com",
-                "accountUuid": "22222222-a",
-                "orgUuid": "11111111-1111-1111-1111-aaaaaaaaaaaa",
-                "orgName": "Org aaaaaaaaaaaa",
-            }))
+            Some(serde_json::json!("alice@example.com"))
         );
 
         // Clearing (`query: null`) removes it from both halves.
@@ -6563,7 +6579,7 @@ mod tests {
             Some(CONTROL_ENDPOINT)
         );
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("ambiguous") && text.contains("--org"));
+        assert!(text.contains("ambiguous") && text.matches("alice@example.com").count() >= 2);
         assert_eq!(manager.control(), None, "an unbreakable tie sets nothing");
         std::fs::remove_file(&path).ok();
     }
@@ -7322,13 +7338,13 @@ mod tests {
         }
     }
 
-    /// An ambiguous identity — the same email in two orgs — is a 409 naming the
-    /// candidates, never guessed. `--org` is the only fix.
+    /// An ambiguous identity is a 409 naming the candidates, never guessed. Only
+    /// the LIVE rotation is broken here — `config::load` would have renamed the
+    /// duplicate — which is the only way this arm is still reachable.
     #[tokio::test]
     async fn add_endpoint_409s_an_ambiguous_identity_naming_the_candidates() {
         let path = control_config_path("add-ambiguous");
         let mut config = two_account_config(None);
-        // The same person in two orgs: one email, two rows, `--org` the only fix.
         config.accounts[1].name = "alice@example.com".to_string();
         crate::config::save(&path, &config).expect("write the test config");
         let manager = Manager::with_live_refresher(config, Some(path.clone()));
@@ -7347,8 +7363,8 @@ mod tests {
         );
         let text = String::from_utf8_lossy(&body);
         assert!(
-            text.contains("ambiguous") && text.contains("--org"),
-            "the 409 says what to do about it: {text}"
+            text.contains("ambiguous") && text.matches("alice@example.com").count() >= 2,
+            "the 409 names the candidates: {text}"
         );
         assert_eq!(
             manager.snapshot(OffsetDateTime::now_utc()).accounts.len(),

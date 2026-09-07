@@ -709,6 +709,27 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     }
     let port = config.proxy.port;
 
+    // `config::load` may have just renamed accounts to restore unique names. The
+    // pin file is keyed by name, so carry it across before anything reads it —
+    // otherwise every pin on a renamed account resolves to nothing and those
+    // sessions cold-start their prompt cache, which is the most expensive event
+    // in this system.
+    let renames: Vec<(String, String)> = config
+        .renamed_accounts
+        .iter()
+        .map(|rename| (rename.from.clone(), rename.to.clone()))
+        .collect();
+    if let Some(path) = &affinity_path {
+        let rewritten = affinity::rename_pins(path, &renames);
+        if rewritten > 0 {
+            tracing::info!(
+                path = %path.display(),
+                rewritten,
+                "carried session-affinity pins across the account rename"
+            );
+        }
+    }
+
     // Resolve the port to ONE proxy BEFORE the Manager starts probing/refreshing,
     // so our own startup can never token-war with the incumbent. Only a
     // command-verified teamclaude/tcr server on THIS port is ever signalled — a

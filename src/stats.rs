@@ -121,12 +121,10 @@ pub struct AccountSnapshot {
     pub rate_limit_tier: Option<String>,
     pub seat_tier: Option<String>,
     /// The org this account is scoped to, carried from
-    /// [`crate::manager::AccountRuntime`]. Present so a CLIENT can DISAMBIGUATE
-    /// this row: every account verb (`tcr token`, `remove`, `enable`,
-    /// `disable`, `priority`) takes `--org <name-or-uuid-prefix>`, and without
-    /// an org on the row a caller holding only the name cannot narrow it — which
-    /// is exactly the state the panel was in when "Copy Access Token" failed on
-    /// a duplicated email with "matches 2 accounts".
+    /// [`crate::manager::AccountRuntime`]. A fact a CLIENT can show beside the
+    /// row; it is not how the row is addressed — `name` is unique, and every
+    /// account verb (`tcr token`, `remove`, `enable`, `disable`, `priority`)
+    /// takes that name alone.
     pub org_uuid: Option<String>,
     pub org_name: Option<String>,
     pub priority: i64,

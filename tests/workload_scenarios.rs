@@ -214,6 +214,8 @@ impl Fleet {
         let config = Config {
             quarantined_accounts: Vec::new(),
             migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: SWITCH_THRESHOLD,

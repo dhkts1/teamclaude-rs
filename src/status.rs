@@ -263,9 +263,8 @@ pub struct AccountStatus {
     pub rate_limit_tier: Option<String>,
     #[serde(default)]
     pub seat_tier: Option<String>,
-    /// The org this account is scoped to — see [`AccountSnapshot::org_uuid`]
-    /// for why a client needs it (every account verb takes `--org`, and a row
-    /// with only a name cannot narrow a duplicated email). `#[serde(default)]`
+    /// The org this account is scoped to — see [`AccountSnapshot::org_uuid`]:
+    /// a fact for a client to show, never an address. `#[serde(default)]`
     /// for the same forward-compat reason as the fields above.
     #[serde(default)]
     pub org_uuid: Option<String>,

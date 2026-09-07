@@ -1,22 +1,34 @@
-//! Account identity helpers, ported 1:1 from `teamclaude/src/identity.js`.
+//! Account identity helpers.
 //!
-//! An OAuth account is identified by its Anthropic account UUID (the *person*)
-//! plus the organization it is scoped to. The same email/person can belong to
-//! multiple organizations — e.g. a corporate Pro org and a personal Max org —
-//! each with its own OAuth token and quota. The org must therefore be part of
-//! the identity; otherwise multi-org logins overwrite each other, removals match
-//! the wrong entry, and token rotation persists onto the wrong account.
+//! Two different questions live here, and keeping them apart is the whole point
+//! of the module.
+//!
+//! **Which row did the user mean?** [`match_one`] — an EXACT match on
+//! `Account.name`, and nothing else. `Account.name` is unique across a config by
+//! construction: `config::load` renames duplicates on sight ([`mint_name`] is
+//! the rule), and a login mints a free name rather than colliding. So a name is
+//! a complete answer to that question, and every earlier way of narrowing one —
+//! matching the email portion of a name, then narrowing that by org — is
+//! gone. Those existed only because a name could name two rows, and the bugs
+//! they produced (a group label on the row nobody asked for, a copied token from
+//! the wrong org) were bugs of a lookup that had to guess.
+//!
+//! **Is this the same account re-logging-in?** [`same_identity`] / [`resolve`] —
+//! the Anthropic account UUID (the *person*) plus the organization it is scoped
+//! to. The same person routinely belongs to several organizations, each with its
+//! own OAuth token and quota, so the org has to be part of that comparison or
+//! multi-org logins overwrite each other. This pair is still what `upsert_account`
+//! and `save_account` decide a write's destination with. It is NOT a query key:
+//! nothing takes a user's argument and resolves it this way.
 //!
 //! The org discriminator prefers the org UUID but falls back to the org name
 //! (the profile endpoint has always returned a name), so identity still works on
-//! entries created before org UUIDs were stored.
-//!
-//! Backward compatibility: when the identity fields (`account_uuid`, `org_uuid`,
-//! `org_name`) are all absent — the shape of every config written before this
-//! change — every comparison falls back to name equality, so single-org
-//! behaviour is byte-identical.
+//! entries created before org UUIDs were stored. When the identity fields are all
+//! absent — the shape of every config written before they existed — the
+//! comparison falls back to name equality, which unique names make exact.
 
 use crate::config::Account;
+use std::collections::HashSet;
 
 /// Stable org discriminator for an account record: org UUID, else org name, else
 /// `None` (an empty string is treated as absent).
@@ -140,17 +152,92 @@ where
     }
 }
 
-/// The email portion of a display name, stripping a trailing " (org)" suffix.
+/// The separator between the email and the org slug in a minted account name.
+///
+/// `/` is legal in every argv, can never occur inside an email address, and
+/// reads as "this account, in that org". A name therefore splits back into its
+/// two parts unambiguously — which is what [`email_of`] relies on.
+pub const ORG_SEPARATOR: char = '/';
+
+/// The email portion of an account name: everything before the first
+/// [`ORG_SEPARATOR`], or the whole name when it carries no org suffix.
+///
+/// Only the OAuth `login_hint` uses this. Nothing resolves an account by it —
+/// that was the old email-portion matching, and it is exactly what made
+/// `henry@example.com` name two rows.
 pub fn email_of(name: &str) -> &str {
-    if name.ends_with(')') {
-        if let Some(i) = name.rfind(" (") {
-            return &name[..i];
-        }
-    }
-    name
+    name.split_once(ORG_SEPARATOR)
+        .map_or(name, |(email, _)| email)
 }
 
-/// The three fields a user-supplied account query is matched against.
+/// An org name reduced to the suffix half of an account name: lower-cased, every
+/// run of non-`[a-z0-9]` collapsed to a single `-`, and leading/trailing `-`
+/// trimmed. `Henry Token` → `henry-token`.
+///
+/// Empty when the org name contains nothing usable (`"---"`, `"…"`); callers
+/// treat that exactly as an absent org name and fall back to the org UUID.
+pub fn org_slug(org_name: &str) -> String {
+    let mut slug = String::with_capacity(org_name.len());
+    for ch in org_name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.extend(ch.to_lowercase());
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+/// The suffix half of a name for an account in this org: the slugged org name,
+/// or — when there is no usable org name — the first 8 characters of the org
+/// UUID. `None` when neither is available, which is the only case a minted name
+/// cannot carry an org suffix at all.
+pub fn org_suffix(org_name: Option<&str>, org_uuid: Option<&str>) -> Option<String> {
+    let from_name = org_name.map(org_slug).filter(|s| !s.is_empty());
+    from_name.or_else(|| {
+        org_uuid
+            .map(|uuid| uuid.chars().take(8).collect::<String>())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// Mint a UNIQUE account name for an account with this email, in this org.
+///
+/// The bare `email` when no name in `taken` is that email; otherwise
+/// `email/<org-suffix>` ([`org_suffix`]); and if that is somehow taken too —
+/// the same org twice cannot happen, since identity is `(account_uuid,
+/// org_uuid)`, but a hand-edited config is not bound by that — `-2`, `-3`, and
+/// so on until one is free.
+///
+/// This is ONE rule with two callers by design: a login mints through it, and
+/// `config::load`'s duplicate-name migration renames through it. Two copies is
+/// how a fleet ends up with a row the migration called `a/acme` and a re-login
+/// calls something else, which puts the duplicate straight back.
+pub fn mint_name(
+    email: &str,
+    org_name: Option<&str>,
+    org_uuid: Option<&str>,
+    taken: &HashSet<String>,
+) -> String {
+    if !taken.contains(email) {
+        return email.to_string();
+    }
+    let base = match org_suffix(org_name, org_uuid) {
+        Some(suffix) => format!("{email}{ORG_SEPARATOR}{suffix}"),
+        // No org to name it by. Fall straight through to the numeric suffixes,
+        // which are the only thing left that can make it unique.
+        None => email.to_string(),
+    };
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .expect("an unbounded range always yields a free name")
+}
+
+/// The one field a user-supplied account query is matched against.
 ///
 /// It exists so ONE resolution rule runs over both representations of the fleet:
 /// the config file's [`Account`] records (what the CLI edits) and the running
@@ -161,74 +248,47 @@ pub fn email_of(name: &str) -> &str {
 /// account.
 pub trait Queryable {
     fn query_name(&self) -> &str;
-    fn query_org_name(&self) -> Option<&str>;
-    fn query_org_uuid(&self) -> Option<&str>;
 }
 
 impl Queryable for Account {
     fn query_name(&self) -> &str {
         &self.name
     }
-    fn query_org_name(&self) -> Option<&str> {
-        self.org_name.as_deref()
-    }
-    fn query_org_uuid(&self) -> Option<&str> {
-        self.org_uuid.as_deref()
-    }
 }
 
-/// Indices of accounts matching `query` (exact name, else email), narrowed by
-/// `org_filter` (org name exact, or org uuid exact/prefix). Caller decides on
-/// 0/1/many.
-pub fn match_accounts<T: Queryable>(
-    accounts: &[T],
-    query: &str,
-    org_filter: Option<&str>,
-) -> Vec<usize> {
-    let mut matches: Vec<usize> = accounts
+/// Indices of accounts whose name is EXACTLY `query`. Caller decides on 0/1/many.
+///
+/// Unique names make "many" unreachable through any path that went through
+/// `config::load`; it survives as a return shape because a hand-edited file is
+/// still a file, and refusing beats writing to whichever row came first.
+pub fn match_accounts<T: Queryable>(accounts: &[T], query: &str) -> Vec<usize> {
+    accounts
         .iter()
         .enumerate()
         .filter(|(_, a)| a.query_name() == query)
         .map(|(i, _)| i)
-        .collect();
-    if matches.is_empty() {
-        matches = accounts
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| email_of(a.query_name()) == query)
-            .map(|(i, _)| i)
-            .collect();
-    }
-    if let Some(f) = org_filter {
-        matches.retain(|&i| {
-            let a = &accounts[i];
-            a.query_org_name().is_some_and(|n| n == f)
-                || a.query_org_uuid()
-                    .is_some_and(|u| u == f || u.starts_with(f))
-        });
-    }
-    matches
+        .collect()
 }
 
-/// What a user-supplied `(query, org)` resolved to.
+/// What a user-supplied query resolved to.
 ///
 /// Separate from [`Resolved`], which resolves a stored IDENTITY against records.
 /// This one resolves a human's argument, so its ambiguous arm carries the
-/// candidate NAMES: every caller has to put them in front of the person who
-/// typed the query, or `--org` is unusable advice.
+/// candidate NAMES — the operator has to be told which file to go fix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Match {
     /// Exactly one account matched, at this index.
     One(usize),
     /// Nothing matched.
     None,
-    /// Two or more matched; these are their names, in fleet order.
+    /// Two or more matched; these are their names, in fleet order. Only
+    /// reachable on a config edited by hand behind the loader's back.
     Ambiguous(Vec<String>),
 }
 
 /// [`match_accounts`] collapsed to the 0 / 1 / many decision every caller makes.
-pub fn match_one<T: Queryable>(accounts: &[T], query: &str, org_filter: Option<&str>) -> Match {
-    let candidates = match_accounts(accounts, query, org_filter);
+pub fn match_one<T: Queryable>(accounts: &[T], query: &str) -> Match {
+    let candidates = match_accounts(accounts, query);
     match candidates.as_slice() {
         [] => Match::None,
         [only] => Match::One(*only),
@@ -512,24 +572,114 @@ mod tests {
     }
 
     #[test]
-    fn email_of_strips_org_suffix() {
-        assert_eq!(email_of("me@example.com (Acme)"), "me@example.com");
+    fn email_of_splits_at_the_org_separator() {
+        assert_eq!(email_of("me@example.com/acme"), "me@example.com");
         assert_eq!(email_of("me@example.com"), "me@example.com");
-        // Only a trailing " (…)" is stripped, not a mid-string parenthesis.
-        assert_eq!(email_of("weird (x) name"), "weird (x) name");
+        // A suffix carrying its own separator still yields the email half.
+        assert_eq!(email_of("me@example.com/acme/eu"), "me@example.com");
+        // A name that is not an email at all comes back whole.
+        assert_eq!(email_of("work"), "work");
     }
 
     #[test]
-    fn match_accounts_exact_name_then_email_then_org() {
-        let accounts = vec![
-            acct(
-                "me@example.com (Corp)",
-                Some("u1"),
-                Some("org-corp"),
-                Some("Corp"),
+    fn org_slug_lowercases_and_collapses_punctuation() {
+        assert_eq!(org_slug("Henry Token"), "henry-token");
+        assert_eq!(org_slug("ACME, Inc."), "acme-inc");
+        assert_eq!(org_slug("  spaced  out  "), "spaced-out");
+        assert_eq!(org_slug("already-slugged"), "already-slugged");
+        // Nothing usable survives — the caller must fall back to the org uuid.
+        assert_eq!(org_slug("---"), "");
+        assert_eq!(org_slug(""), "");
+    }
+
+    #[test]
+    fn org_suffix_prefers_the_name_then_eight_uuid_chars() {
+        assert_eq!(
+            org_suffix(Some("Henry Token"), Some("abcdefgh-1111")),
+            Some("henry-token".to_string())
+        );
+        assert_eq!(
+            org_suffix(None, Some("abcdefgh-1111")),
+            Some("abcdefgh".to_string())
+        );
+        // An org name that slugs to nothing is treated as absent.
+        assert_eq!(
+            org_suffix(Some("---"), Some("abcdefgh-1111")),
+            Some("abcdefgh".to_string())
+        );
+        assert_eq!(org_suffix(None, None), None);
+    }
+
+    fn taken(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn mint_name_takes_the_bare_email_when_it_is_free() {
+        assert_eq!(
+            mint_name(
+                "me@example.com",
+                Some("Acme"),
+                Some("org-1"),
+                &taken(&["other@example.com"])
             ),
+            "me@example.com"
+        );
+    }
+
+    #[test]
+    fn mint_name_qualifies_with_the_org_when_the_email_is_taken() {
+        assert_eq!(
+            mint_name(
+                "me@example.com",
+                Some("Henry Token"),
+                Some("org-1"),
+                &taken(&["me@example.com"])
+            ),
+            "me@example.com/henry-token"
+        );
+    }
+
+    #[test]
+    fn mint_name_appends_a_counter_when_the_qualified_name_is_taken_too() {
+        assert_eq!(
+            mint_name(
+                "me@example.com",
+                Some("Acme"),
+                Some("org-1"),
+                &taken(&["me@example.com", "me@example.com/acme"])
+            ),
+            "me@example.com/acme-2"
+        );
+        assert_eq!(
+            mint_name(
+                "me@example.com",
+                Some("Acme"),
+                Some("org-1"),
+                &taken(&[
+                    "me@example.com",
+                    "me@example.com/acme",
+                    "me@example.com/acme-2",
+                ])
+            ),
+            "me@example.com/acme-3"
+        );
+    }
+
+    #[test]
+    fn mint_name_with_no_org_at_all_falls_through_to_the_counter() {
+        assert_eq!(
+            mint_name("me@example.com", None, None, &taken(&["me@example.com"])),
+            "me@example.com-2"
+        );
+    }
+
+    #[test]
+    fn match_accounts_is_exact_on_the_name_and_nothing_else() {
+        let accounts = vec![
+            acct("me@example.com", Some("u1"), Some("org-corp"), Some("Corp")),
             acct(
-                "me@example.com (Personal)",
+                "me@example.com/personal",
                 Some("u1"),
                 Some("org-pers"),
                 Some("Personal"),
@@ -537,35 +687,26 @@ mod tests {
             acct("other@example.com", None, None, None),
         ];
 
-        // Exact display-name wins outright.
+        assert_eq!(match_accounts(&accounts, "me@example.com"), vec![0]);
         assert_eq!(
-            match_accounts(&accounts, "me@example.com (Corp)", None),
-            vec![0]
-        );
-
-        // No exact name → email match finds both org variants.
-        assert_eq!(
-            match_accounts(&accounts, "me@example.com", None),
-            vec![0, 1]
-        );
-
-        // Email + org filter narrows to one (by org name).
-        assert_eq!(
-            match_accounts(&accounts, "me@example.com", Some("Personal")),
+            match_accounts(&accounts, "me@example.com/personal"),
             vec![1]
         );
-        // Org filter by uuid prefix.
-        assert_eq!(
-            match_accounts(&accounts, "me@example.com", Some("org-corp")),
-            vec![0]
-        );
-        assert_eq!(
-            match_accounts(&accounts, "me@example.com", Some("org-")),
-            vec![0, 1],
-            "shared uuid prefix keeps both"
-        );
+        // The email PORTION of a qualified name resolves nothing on its own —
+        // the bare email is a different, and here a real, account.
+        assert_eq!(match_accounts(&accounts, "personal"), Vec::<usize>::new());
+        assert!(match_accounts(&accounts, "nobody@example.com").is_empty());
+    }
 
-        // No match at all.
-        assert!(match_accounts(&accounts, "nobody@example.com", None).is_empty());
+    #[test]
+    fn match_one_still_refuses_a_hand_edited_duplicate() {
+        let accounts = vec![
+            acct("me@example.com", Some("u1"), Some("org-a"), Some("A")),
+            acct("me@example.com", Some("u2"), Some("org-b"), Some("B")),
+        ];
+        assert_eq!(
+            match_one(&accounts, "me@example.com"),
+            Match::Ambiguous(vec!["me@example.com".to_string(); 2])
+        );
     }
 }

@@ -231,15 +231,14 @@ pub struct AccountStatusRow {
     /// telling two rows with the SAME NAME apart.
     #[serde(default)]
     pub plan: Option<String>,
-    /// The org this account is scoped to. On the wire so a CLIENT can address
-    /// this row unambiguously: every `tcr` account verb takes `--org
-    /// <name-or-uuid-prefix>`, and a client holding only `name` cannot narrow a
-    /// duplicated email — the panel's "Copy Access Token" failed with "matches 2
-    /// accounts" for exactly this reason.
+    /// The org this account is scoped to. A FACT about the row, for a client to
+    /// show — not an address: `name` is unique and is the whole address every
+    /// `tcr` verb takes.
     ///
-    /// `orgUuid` is what a client should pass: it is exact, whereas `orgName` is
-    /// a display string that two orgs can share. `orgName` rides along because a
-    /// row that has one and no uuid can still narrow by it.
+    /// It used to be how a client narrowed a duplicated email, back when two
+    /// rows could share a name and the panel's "Copy Access Token" failed with
+    /// "matches 2 accounts". Naming the org is still worth doing on a row whose
+    /// name does not already carry it.
     #[serde(default)]
     pub org_uuid: Option<String>,
     #[serde(default)]
