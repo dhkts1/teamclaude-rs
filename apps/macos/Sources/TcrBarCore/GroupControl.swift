@@ -59,15 +59,27 @@ public enum GroupRouting {
 ///     can apply a change to the file only and warn that a running proxy was
 ///     too old for the control route.
 public enum GroupCommand {
-    /// `tcr group add <group> <account>`. Both arguments positional and
-    /// verbatim — no flags, nothing that could be mistaken for one.
-    public static func addArguments(group: String, account: String) -> [String] {
-        ["group", "add", group, account]
+    /// `tcr group add <group> <account> [--org <uuid>]`. `group` and `account`
+    /// are positional and verbatim.
+    ///
+    /// `org` narrows a name two accounts share, the same way every other
+    /// per-account verb takes it. On this fleet it is what makes the command
+    /// work at all: the same email is logged into two orgs, and `tcr` refuses an
+    /// ambiguous name rather than guessing which row to label. Omitted entirely
+    /// when `nil`, so a single-org row builds the argument vector it always did.
+    public static func addArguments(group: String, account: String, org: String? = nil)
+        -> [String]
+    {
+        guard let org, !org.isEmpty else { return ["group", "add", group, account] }
+        return ["group", "add", group, account, "--org", org]
     }
 
-    /// `tcr group rm <group> <account>`.
-    public static func removeArguments(group: String, account: String) -> [String] {
-        ["group", "rm", group, account]
+    /// `tcr group rm <group> <account> [--org <uuid>]`.
+    public static func removeArguments(group: String, account: String, org: String? = nil)
+        -> [String]
+    {
+        guard let org, !org.isEmpty else { return ["group", "rm", group, account] }
+        return ["group", "rm", group, account, "--org", org]
     }
 
     /// `tcr group rm <group> --all` — removes the whole group.
@@ -281,6 +293,27 @@ public final class GroupController: ObservableObject {
 
     public func isPending(_ key: String) -> Bool { pending.contains(key) }
     public func failure(for key: String) -> GroupCommand.Failure? { failures[key] }
+
+    /// The most recent group failure belonging to one account ROW, whatever
+    /// group it was about, so the row can draw it without knowing which group
+    /// the operator last picked from its menu.
+    ///
+    /// This lookup is why the failure was invisible: `GroupController` recorded
+    /// every one of them and nothing in the panel ever read them back, so a
+    /// refused `tcr group add` — which is what an ambiguous, un-narrowed name
+    /// produces on this fleet — looked exactly like a success. Gil reported it
+    /// as "adding to group doesn't work", with no error anywhere to act on.
+    ///
+    /// Returns the group name alongside the failure: "adding to X failed" is
+    /// actionable where a bare `tcr` error is not, because the menu that
+    /// triggered it has already closed by the time this is drawn.
+    public func failure(forAccount account: AccountRef) -> (group: String, failure: GroupCommand.Failure)? {
+        let suffix = "/\(account.id)"
+        return
+            failures
+            .first { $0.key.hasSuffix(suffix) }
+            .map { (String($0.key.dropLast(suffix.count)), $0.value) }
+    }
     public func needsRestart(_ group: String) -> Bool { appliedPendingRestart.contains(group) }
 
     /// What a call did, as far as the subprocess can say — mirrors
@@ -315,20 +348,32 @@ public final class GroupController: ObservableObject {
         }
     }
 
-    /// `tcr group add <group> <account>`.
-    @discardableResult
-    public func add(account: String, to group: String) async -> Attempt {
-        await run(
-            key: "\(group)/\(account)", group: group,
-            arguments: GroupCommand.addArguments(group: group, account: account))
+    /// The failure key for one member's add/remove: the group and the ROW's
+    /// org-qualified identity, so two same-email rows in different orgs cannot
+    /// share an in-flight spinner or an error line — the same reason every other
+    /// per-account dictionary keys on ``AccountRef/id``.
+    /// `nonisolated` because it is a pure string join with no state to touch —
+    /// callers need it to build a key without hopping to the main actor.
+    public nonisolated static func memberKey(group: String, account: AccountRef) -> String {
+        "\(group)/\(account.id)"
     }
 
-    /// `tcr group rm <group> <account>`.
+    /// `tcr group add <group> <account> [--org <uuid>]`.
     @discardableResult
-    public func remove(account: String, from group: String) async -> Attempt {
+    public func add(account: AccountRef, to group: String) async -> Attempt {
         await run(
-            key: "\(group)/\(account)", group: group,
-            arguments: GroupCommand.removeArguments(group: group, account: account))
+            key: Self.memberKey(group: group, account: account), group: group,
+            arguments: GroupCommand.addArguments(
+                group: group, account: account.name, org: account.orgUuid))
+    }
+
+    /// `tcr group rm <group> <account> [--org <uuid>]`.
+    @discardableResult
+    public func remove(account: AccountRef, from group: String) async -> Attempt {
+        await run(
+            key: Self.memberKey(group: group, account: account), group: group,
+            arguments: GroupCommand.removeArguments(
+                group: group, account: account.name, org: account.orgUuid))
     }
 
     /// `tcr group rm <group> --all`.

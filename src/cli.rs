@@ -373,18 +373,32 @@ const GROUP_LIVE_RELOAD_NOTE: &str =
 /// Resolve `name` to exactly one configured account by EXACT match on
 /// `Account.name` (which IS the email — see [`resolve_account`]'s doc-comment).
 ///
-/// Deliberately not [`resolve_account`]: `tcr group add`/`rm`'s contract with
-/// the TcrBar panel (its argument shape is pinned, not ours to change) has no
-/// `--org` disambiguator, and an unknown name must list every configured
-/// account rather than [`resolve_account`]'s "no account matches" — the panel
-/// shells out blind and needs the full roster in the error to act on it.
-fn find_account_by_name(accounts: &[Account], name: &str) -> anyhow::Result<usize> {
-    match accounts.iter().position(|a| a.name == name) {
-        Some(idx) => Ok(idx),
-        None => {
+/// [`resolve_account`]'s rule, with the group verbs' own not-found message.
+///
+/// The resolution is [`identity::match_one`] — identical to `tcr enable`/
+/// `disable`/`token`/`remove`/`priority` — so `--org` narrows a name two
+/// accounts share and an unbreakable tie is REFUSED. This replaced an exact
+/// `position()` scan that took the first match and reported success, which on
+/// the fleet's duplicated email labelled a row nobody asked for.
+///
+/// The one thing it does not borrow from `resolve_account` is the not-found
+/// text. The panel shells out blind, so an unknown name has to come back with
+/// the full roster to act on rather than a bare "no account matches".
+fn find_account_by_name(
+    accounts: &[Account],
+    name: &str,
+    org: Option<&str>,
+) -> anyhow::Result<usize> {
+    match identity::match_one(accounts, name, org) {
+        identity::Match::One(idx) => Ok(idx),
+        identity::Match::Ambiguous(names) => bail!("{}", ambiguous_query_message(name, &names)),
+        identity::Match::None => {
             let configured: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+            let org_note = org
+                .map(|o| format!(" (with org matching '{o}')"))
+                .unwrap_or_default();
             bail!(
-                "no account named '{name}' in the config. Configured accounts: {}",
+                "no account named '{name}'{org_note} in the config. Configured accounts: {}",
                 configured.join(", ")
             );
         }
@@ -408,7 +422,19 @@ fn control_account_group_notice(config: &Config, account: &str, group: &str) -> 
     ))
 }
 
-/// `tcr group add <group> <account>` — label `account` with `group`.
+/// `tcr group add <group> <account> [--org <name-or-uuid>]` — label `account`
+/// with `group`.
+///
+/// Resolves through [`find_account_by_name`], which applies exactly the rule
+/// `tcr enable`/`disable`/`token`/`remove`/`priority` use — not a bare name
+/// lookup. Two
+/// changes come with that, and the second is the one that matters: `--org` can
+/// now narrow a name two accounts share, and an ambiguous name is REFUSED
+/// rather than silently resolved to whichever row happens to come first. The
+/// old `find_account_by_name` was an exact-name `position()` scan, so on the
+/// fleet's duplicated email it labelled the first row and reported success,
+/// which is worse than the failure it looks like: the panel's group menu had no
+/// way to say which row it meant, and no way to tell it had hit the wrong one.
 ///
 /// Idempotent: adding a label an account already carries succeeds and says so,
 /// so the panel can call it without first checking state. The group label
@@ -416,7 +442,12 @@ fn control_account_group_notice(config: &Config, account: &str, group: &str) -> 
 /// validator `tcr run --group` uses — because `add` is the one path that can
 /// put a fresh, attacker- or typo-controlled string into the config; `rm` must
 /// NOT run this check (see [`remove_from_group`]'s doc-comment).
-pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::Result<()> {
+pub fn add_to_group(
+    config_path: &Path,
+    group: &str,
+    account: &str,
+    org: Option<&str>,
+) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
@@ -433,7 +464,7 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     // a false-but-constant warning turn into wallpaper.
     let config = config::load(config_path)
         .with_context(|| format!("load config at {}", config_path.display()))?;
-    let idx = find_account_by_name(&config.accounts, account)?;
+    let idx = find_account_by_name(&config.accounts, account, org)?;
     let target = &config.accounts[idx];
     // The label itself is real and the write below is correct — but on the
     // CONTROL account it buys nothing, because `Manager::select_with_group`
@@ -475,8 +506,14 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     Ok(())
 }
 
-/// `tcr group rm <group> <account>` / `tcr group rm <group> --all` — remove
-/// `account`'s (or every member's, with `--all`) `group` label.
+/// `tcr group rm <group> <account> [--org <name-or-uuid>]` / `tcr group rm
+/// <group> --all` — remove `account`'s (or every member's, with `--all`)
+/// `group` label.
+///
+/// The single-account path resolves through [`find_account_by_name`], same as
+/// [`add_to_group`] and for the same reasons. `--all` deliberately does not
+/// take an org: it walks every member of the group by identity already, so
+/// there is no name to disambiguate.
 ///
 /// `account == None` iff `all` — clap's `ArgGroup` on `GroupRmArgs` refuses
 /// "both" and "neither" at parse time before this ever runs, so the `expect`
@@ -490,6 +527,7 @@ pub fn remove_from_group(
     config_path: &Path,
     group: &str,
     account: Option<&str>,
+    org: Option<&str>,
     all: bool,
 ) -> anyhow::Result<()> {
     // Same reasoning as `add_to_group`: no `load_for_edit` warning here either
@@ -541,7 +579,7 @@ pub fn remove_from_group(
     // clap's ArgGroup on `GroupRmArgs` guarantees exactly one of
     // `account`/`--all` — see this function's doc-comment.
     let account = account.expect("clap guarantees `account` is Some when `all` is false");
-    let idx = find_account_by_name(&config.accounts, account)?;
+    let idx = find_account_by_name(&config.accounts, account, org)?;
     let target = &config.accounts[idx];
     let outcome = config::save_group_membership(config_path, target, group, false)
         .with_context(|| format!("save config at {}", config_path.display()))?;
@@ -2908,10 +2946,105 @@ mod tests {
       ]
     }"#;
 
+    /// The fleet's real shape: one email logged into two orgs. `tcr group add`
+    /// used to take the FIRST match and report success, so the panel labelled a
+    /// row nobody asked for and had no way to notice.
+    const DUPLICATED_EMAIL: &str = r#"{
+      "accounts": [
+        { "name": "henry@example.com", "type": "oauth", "orgName": "Personal",
+          "orgUuid": "11111111-1111-1111-1111-111111111111",
+          "accountUuid": "uuid-person", "accessToken": "at-p",
+          "refreshToken": "rt-p", "expiresAt": 1893456000000, "priority": 0 },
+        { "name": "henry@example.com", "type": "oauth", "orgName": "Example Team",
+          "orgUuid": "22222222-2222-2222-2222-222222222222",
+          "accountUuid": "uuid-person", "accessToken": "at-t",
+          "refreshToken": "rt-t", "expiresAt": 1893456000000, "priority": 1 }
+      ]
+    }"#;
+
+    /// `--org` picks the Team row out of two rows sharing an email — the whole
+    /// reason the flag exists. The assertion is on the OTHER row too: labelling
+    /// the right account is only half of it, and a resolver that labelled both
+    /// would pass a check that only looked at the one it was asked for.
+    #[test]
+    fn group_add_with_an_org_labels_that_org_and_only_that_org() {
+        let path = write_config("group-add-org", DUPLICATED_EMAIL);
+        add_to_group(
+            &path,
+            "codereview",
+            "henry@example.com",
+            Some("22222222-2222-2222-2222-222222222222"),
+        )
+        .unwrap();
+
+        let config = load(&path);
+        assert_eq!(
+            config.accounts[0].groups, None,
+            "the Personal row was not asked for and must not be labelled"
+        );
+        assert_eq!(
+            config.accounts[1].groups,
+            Some(vec!["codereview".to_string()]),
+            "the Team row is the one --org named"
+        );
+    }
+
+    /// And without `--org` it REFUSES rather than guessing. This is the
+    /// regression: the old exact-name scan silently took `accounts[0]`, so the
+    /// operator saw "Added ... to group" about the wrong account.
+    #[test]
+    fn group_add_refuses_a_duplicated_email_with_no_org() {
+        let path = write_config("group-add-ambiguous", DUPLICATED_EMAIL);
+        let err = add_to_group(&path, "codereview", "henry@example.com", None)
+            .expect_err("an unbreakable tie must refuse rather than pick the first row");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+
+        let config = load(&path);
+        assert_eq!(config.accounts[0].groups, None);
+        assert_eq!(config.accounts[1].groups, None);
+    }
+
+    /// `rm` resolves the same way — the panel's "remove from group" is the same
+    /// menu as "add to group" and must not be able to strip the wrong row.
+    #[test]
+    fn group_rm_narrows_by_org_and_refuses_without_one() {
+        let path = write_config("group-rm-org", DUPLICATED_EMAIL);
+        let team = Some("22222222-2222-2222-2222-222222222222");
+        add_to_group(&path, "codereview", "henry@example.com", team).unwrap();
+
+        let err = remove_from_group(&path, "codereview", Some("henry@example.com"), None, false)
+            .expect_err("no org means an unbreakable tie");
+        assert!(err.to_string().contains("ambiguous"), "{err}");
+        assert_eq!(
+            load(&path).accounts[1].groups,
+            Some(vec!["codereview".to_string()]),
+            "a refused removal changes nothing"
+        );
+
+        remove_from_group(&path, "codereview", Some("henry@example.com"), team, false).unwrap();
+        // Removing the last label DROPS the `groups` key rather than leaving an
+        // empty array — `save_group_membership`'s contract, same shape as
+        // `disabled == false` removing its key.
+        assert_eq!(load(&path).accounts[1].groups, None);
+    }
+
+    /// An unknown name still comes back with the whole roster, which is what
+    /// the panel needs to act on — it shells out blind. A plain "no account
+    /// matches" would be a worse error in exactly the place it is read.
+    #[test]
+    fn group_add_names_every_configured_account_when_the_name_is_unknown() {
+        let path = write_config("group-add-unknown", TWO_ACCOUNTS);
+        let err = add_to_group(&path, "codereview", "nobody@example.com", None)
+            .expect_err("an unknown account is an error");
+        let text = err.to_string();
+        assert!(text.contains("alice@example.com"), "{text}");
+        assert!(text.contains("bob@example.com"), "{text}");
+    }
+
     #[test]
     fn group_add_labels_named_account_and_leaves_siblings_byte_identical() {
         let path = write_config("group-add", TWO_ACCOUNTS);
-        add_to_group(&path, "codereview", "alice@example.com").unwrap();
+        add_to_group(&path, "codereview", "alice@example.com", None).unwrap();
         let config = load(&path);
         assert_eq!(
             config.accounts[0].groups,
@@ -2932,8 +3065,8 @@ mod tests {
     #[test]
     fn group_add_twice_is_idempotent() {
         let path = write_config("group-add-twice", TWO_ACCOUNTS);
-        add_to_group(&path, "codereview", "alice@example.com").unwrap();
-        add_to_group(&path, "codereview", "alice@example.com").unwrap();
+        add_to_group(&path, "codereview", "alice@example.com", None).unwrap();
+        add_to_group(&path, "codereview", "alice@example.com", None).unwrap();
         let config = load(&path);
         assert_eq!(
             config.accounts[0].groups,
@@ -2946,7 +3079,7 @@ mod tests {
     #[test]
     fn group_rm_removes_only_named_label_leaving_others_intact() {
         let path = write_config("group-rm-one", GROUPED_ACCOUNTS);
-        remove_from_group(&path, "codereview", Some("alice@example.com"), false).unwrap();
+        remove_from_group(&path, "codereview", Some("alice@example.com"), None, false).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].groups, Some(vec!["dev".to_string()]));
         // bob still carries codereview — only alice's membership changed.
@@ -2960,7 +3093,7 @@ mod tests {
     #[test]
     fn group_rm_all_clears_label_from_every_member_and_nothing_else() {
         let path = write_config("group-rm-all", GROUPED_ACCOUNTS);
-        remove_from_group(&path, "codereview", None, true).unwrap();
+        remove_from_group(&path, "codereview", None, None, true).unwrap();
         let config = load(&path);
         // alice keeps `dev`, loses `codereview`.
         assert_eq!(config.accounts[0].groups, Some(vec!["dev".to_string()]));
@@ -2979,7 +3112,7 @@ mod tests {
     fn group_rm_all_on_a_group_with_no_members_is_a_success_no_op() {
         let path = write_config("group-rm-all-empty", GROUPED_ACCOUNTS);
         let before = fs::read_to_string(&path).unwrap();
-        remove_from_group(&path, "nonexistent-group", None, true).unwrap();
+        remove_from_group(&path, "nonexistent-group", None, None, true).unwrap();
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(
             before, after,
@@ -2991,7 +3124,7 @@ mod tests {
     #[test]
     fn group_add_unknown_account_errors_and_names_the_configured_accounts() {
         let path = write_config("group-add-unknown", GROUPED_ACCOUNTS);
-        let err = add_to_group(&path, "codereview", "nobody@example.com").unwrap_err();
+        let err = add_to_group(&path, "codereview", "nobody@example.com", None).unwrap_err();
         let message = err.to_string();
         for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
             assert!(
@@ -3005,8 +3138,8 @@ mod tests {
     #[test]
     fn group_rm_unknown_account_errors_and_names_the_configured_accounts() {
         let path = write_config("group-rm-unknown", GROUPED_ACCOUNTS);
-        let err =
-            remove_from_group(&path, "codereview", Some("nobody@example.com"), false).unwrap_err();
+        let err = remove_from_group(&path, "codereview", Some("nobody@example.com"), None, false)
+            .unwrap_err();
         let message = err.to_string();
         for name in ["alice@example.com", "bob@example.com", "carol@example.com"] {
             assert!(message.contains(name), "missing {name}: {message}");
@@ -3029,7 +3162,7 @@ mod tests {
         let bad_label = "bad\u{0}label";
 
         let path = write_config("group-add-bad-label", with_bad_label);
-        let err = add_to_group(&path, bad_label, "alice@example.com").unwrap_err();
+        let err = add_to_group(&path, bad_label, "alice@example.com", None).unwrap_err();
         assert!(
             err.to_string().contains("control character"),
             "add must name the character class at fault: {err}"
@@ -3042,7 +3175,7 @@ mod tests {
         );
 
         // `rm` does NOT run the validator — it must still remove the bad label.
-        remove_from_group(&path, bad_label, Some("alice@example.com"), false).unwrap();
+        remove_from_group(&path, bad_label, Some("alice@example.com"), None, false).unwrap();
         let config = load(&path);
         assert_eq!(config.accounts[0].groups, Some(vec!["good".to_string()]));
         fs::remove_file(&path).ok();
@@ -3051,7 +3184,7 @@ mod tests {
     #[test]
     fn group_mutation_preserves_unmodelled_extra_keys() {
         let path = write_config("group-extra", GROUPED_ACCOUNTS);
-        add_to_group(&path, "burst", "carol@example.com").unwrap();
+        add_to_group(&path, "burst", "carol@example.com", None).unwrap();
         let raw = fs::read_to_string(&path).unwrap();
         let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
         // Top-level unmodelled key.
@@ -3306,7 +3439,7 @@ mod tests {
     #[test]
     fn a_second_member_makes_the_group_route_again() {
         let path = write_config("routes-second-member", CONTROL_ONLY_GROUP);
-        add_to_group(&path, "research", "worker@example.com").unwrap();
+        add_to_group(&path, "research", "worker@example.com", None).unwrap();
         let config = load(&path);
         let research = group_line(&render_groups_text(&config), "research");
         assert!(

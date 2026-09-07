@@ -106,6 +106,55 @@ extension QuotaState: Decodable {
     }
 }
 
+/// Why the server is holding an account out of rotation right now — its own
+/// verdict, not one this app re-derives.
+///
+/// Rust spells these kebab-case (`src/stats.rs`'s `GateReason`, serialized by
+/// `gate_reason_token`): `ok`, `hold`, `five-hour`, `seven-day`,
+/// `fable-weekly`, `standard`, `login`, `rejected`, `disabled`, `reserved`.
+///
+/// [`Self/rejected`] is the one the panel could not see before this existed,
+/// and it is the reason the type does. Anthropic's own
+/// `anthropic-ratelimit-unified-status: rejected` takes an account out of
+/// selection (`src/manager/select.rs`) while `snapshot.rs` rewrites `status`
+/// only for `Throttled` — so a rejected row still reported `status: "active"`
+/// and the panel drew it as eligible for traffic the router will never send it.
+/// An earlier comment in `FleetView` claimed `tcr status --json` emitted no gate
+/// field at all; it has emitted one since the wire crate landed, and this
+/// decodes it.
+///
+/// `unknown` keeps a future variant readable rather than asserting a meaning
+/// this build cannot support, exactly like ``QuotaState/unknown(_:)``.
+public enum GateReason: Equatable, Sendable {
+    case ok
+    case rejected
+    case unknown(String)
+
+    public init(token: String) {
+        switch token {
+        case "ok": self = .ok
+        case "rejected": self = .rejected
+        default: self = .unknown(token)
+        }
+    }
+
+    /// The raw wire token, round-tripped so an unknown variant is displayable.
+    public var token: String {
+        switch self {
+        case .ok: return "ok"
+        case .rejected: return "rejected"
+        case .unknown(let raw): return raw
+        }
+    }
+}
+
+extension GateReason: Decodable {
+    public init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self.init(token: raw)
+    }
+}
+
 /// Where the numbers came from.
 ///
 /// `offline` means no server answered, so every *counter* (requests, tokens,
@@ -1010,6 +1059,21 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let orgUuid: String?
     public let orgName: String?
 
+    /// The SERVER's own reason this account is out of rotation, decoded from
+    /// the wire's `gate` — see ``GateReason``. Optional for the same
+    /// forward-compat reason every field above it is: a server built before the
+    /// key existed omits it, and its rows must keep decoding.
+    ///
+    /// `nil` is not "in rotation" — it is "this server does not report a gate",
+    /// which is why the row falls back to its old behaviour rather than
+    /// claiming anything when this is absent.
+    public let gate: GateReason?
+
+    /// Whether Anthropic itself has rejected this account, so the router will
+    /// never select it however healthy its quota looks. The one gate the panel
+    /// had no way to see, and the reason ``gate`` is decoded at all.
+    public var isRejected: Bool { gate == .rejected }
+
     /// Explicit memberwise init, needed only because adding `fiveHourState`/
     /// `sevenDayState` after the struct already had test fixtures constructing
     /// it directly would otherwise force every one of them to grow two new
@@ -1056,7 +1120,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         rateLimitTier: String? = nil,
         seatTier: String? = nil,
         orgUuid: String? = nil,
-        orgName: String? = nil
+        orgName: String? = nil,
+        gate: GateReason? = nil
     ) {
         self.name = name
         self.priority = priority
@@ -1097,6 +1162,7 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         self.seatTier = seatTier
         self.orgUuid = orgUuid
         self.orgName = orgName
+        self.gate = gate
     }
 
     /// This row's identity, ORG-QUALIFIED — `name` alone is not unique.

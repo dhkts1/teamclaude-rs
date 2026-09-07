@@ -1100,22 +1100,23 @@ struct AccountRow: View {
     ///
     /// This pill answers ONE question — can this account be picked for
     /// traffic — and there are at least THREE independent ways for the
-    /// answer to be no, only two of which this build can currently see:
+    /// answer to be no, and this build can now see all three:
     /// `disabled` (an operator's own choice), `account.health ==
     /// .needsRelogin` (`src/manager/select.rs:931` hard-excludes an
     /// `AccountStatus::Error` account from selection exactly like a disabled
-    /// one, even though `disabled` itself reads false), and a THIRD gate this
-    /// pill cannot yet name: `select.rs:809-822` also excludes an account
-    /// whose `quota.status == Some("rejected")` — Anthropic's own verdict —
-    /// while the snapshot `status` this app decodes stays `"active"`
-    /// (`snapshot.rs:142-153` only ever rewrites `Throttled`). Drawing
-    /// "rotating" on THAT row is the same "misread as its own opposite"
-    /// defect the first two gates were fixed for, and TcrBar currently has no
-    /// way to catch it: `tcr status --json` emits no gate field at all. A
-    /// server-side `GateReason` in the status payload is the fix, tracked
-    /// through the lead rather than added here — decode it as an OPTIONAL
-    /// field when it lands, so an older server (absent field) degrades to
-    /// today's behaviour and never to a false claim in either direction.
+    /// one, even though `disabled` itself reads false), and the third —
+    /// `select.rs:809-822` also excludes an account whose `quota.status ==
+    /// Some("rejected")`, Anthropic's own verdict — while the snapshot
+    /// `status` this app decodes stays `"active"` (`snapshot.rs:142-153` only
+    /// ever rewrites `Throttled`).
+    ///
+    /// That third gate is read from the wire's `gate` field
+    /// (``Account/isRejected``), which the server has emitted since the status
+    /// wire crate landed. An earlier version of this comment said `tcr status
+    /// --json` emitted no gate field at all and deferred the fix; the field was
+    /// already there. It is decoded as an OPTIONAL, so an older server (absent
+    /// field) degrades to the previous behaviour rather than to a false claim
+    /// in either direction.
     ///
     /// A row broken by the SECOND gate draws NEITHER "rotating" nor "parked":
     /// "parked" claims an operator decision that never happened, and
@@ -1166,6 +1167,49 @@ struct AccountRow: View {
     /// the thing that erases the name. Plain text at the same font, with no
     /// chrome and no uppercasing, is narrow enough for the worst row (unmeasured
     /// + rotating + the longest label) and still reads as secondary.
+    /// The row's DESIGNATIONS — what this account IS — on their own line under
+    /// the name: its plan, and the groups it belongs to.
+    ///
+    /// This line exists because the row overflowed the panel. Every pill is
+    /// `fixedSize()`, so a single `HStack` carrying `CONTROL` + `GROUP ONLY` +
+    /// a quota pill + two group tags + the plan has a MINIMUM width past
+    /// `Tok.panelWidth` (380pt) before the name gets a single point — and the
+    /// enclosing `.frame(width:)` centres content it cannot fit rather than
+    /// containing it, so both card edges were clipped and the header truncated.
+    /// No amount of layout priority on the name fixes that: the name can shrink
+    /// to nothing and the pills alone still overflow.
+    ///
+    /// The split is by MEANING, not just to save width, which is why it reads
+    /// as a design rather than a workaround: the first line is identity and
+    /// LIVE STATE (who this is, whether traffic lands here right now), and this
+    /// one is standing facts that change on a plan upgrade or an operator's
+    /// group edit. The group tags moved here with the plan because two long
+    /// group names are the single biggest contributor to the width — the live
+    /// fleet's `HENRY-TEAM-PARKED` alone is wider than three status pills.
+    ///
+    /// Drawn only when there is something to say; an account with no plan and
+    /// no groups reserves no space at all.
+    @ViewBuilder
+    private var designationsLine: some View {
+        if account.plan != nil || !account.groupTags.isEmpty {
+            HStack(spacing: Tok.tightSpacing) {
+                planIndicator
+                // At most two tags, the rest collapsed into a `+N` chip whose
+                // tooltip names them all. The cap stays even with a line to
+                // itself: an account can be in many groups, and this line has a
+                // budget too — it is just a far larger one.
+                ForEach(Array(account.groupTags.prefix(2))) { tag in
+                    GroupChip(tag: tag)
+                }
+                if account.groupTags.count > 2 {
+                    StatusPill("+\(account.groupTags.count - 2)", tint: Tok.inkFaint)
+                        .help(account.groupTags.map(\.name).joined(separator: ", "))
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
     @ViewBuilder
     private var planIndicator: some View {
         if let plan = account.plan, !plan.isEmpty {
@@ -1191,6 +1235,14 @@ struct AccountRow: View {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
         } else if account.health == .needsRelogin {
+            EmptyView()
+        } else if account.isRejected {
+            // Anthropic's own verdict, and the third exclusion named above.
+            // Drawn INSTEAD of "rotating": the router will never select this
+            // account, so claiming it is in rotation is the exact
+            // "misread as its own opposite" defect the other two gates were
+            // fixed for. Nothing else on the row says it — `disabled` is false,
+            // `status` reads "active", and the quota bars can look healthy.
             EmptyView()
         } else if account.servesGroupTrafficOnly {
             // Predicate lives on the model (`Account.servesGroupTrafficOnly`) so
@@ -1256,6 +1308,8 @@ struct AccountRow: View {
             parts.append("parked, out of rotation")
         } else if account.health == .needsRelogin {
             parts.append("not in rotation")
+        } else if account.isRejected {
+            parts.append("rejected by Anthropic, not in rotation")
         } else {
             parts.append("rotating")
         }
@@ -1308,6 +1362,9 @@ struct AccountRow: View {
         }
         if let failure = removeController.failure(for: account.ref) {
             parts.append("last action failed: \(failure.summary)")
+        }
+        if let refused = groupController.failure(forAccount: account.ref) {
+            parts.append("group '\(refused.group)' failed: \(refused.failure.summary)")
         }
         // Spoken for the same reason the pill is: a confirmation only a sighted
         // user gets is half built, and the `✓` in `rowLabel` is punctuation to a
@@ -1498,7 +1555,7 @@ struct AccountRow: View {
                     copyToPasteboard(copyRun.copiedText)
                 }
                 Button("Remove from \(group)") {
-                    Task { await groupController.remove(account: account.name, from: group) }
+                    Task { await groupController.remove(account: account.ref, from: group) }
                 }
                 Button("Delete group “\(group)” for everyone…") {
                     confirmDeleteGroup(group)
@@ -1507,7 +1564,7 @@ struct AccountRow: View {
                 Button("Remove from all groups") {
                     Task {
                         for group in (account.groups ?? []) {
-                            await groupController.remove(account: account.name, from: group)
+                            await groupController.remove(account: account.ref, from: group)
                         }
                     }
                 }
@@ -1539,7 +1596,7 @@ struct AccountRow: View {
                 Divider()
                 ForEach(candidateGroupsToAdd, id: \.self) { group in
                     Button(group) {
-                        Task { await groupController.add(account: account.name, to: group) }
+                        Task { await groupController.add(account: account.ref, to: group) }
                     }
                     let copyAdd = GroupCommand.CopyCommandMenuEntry(
                         arguments: GroupCommand.addArguments(group: group, account: account.name))
@@ -1583,7 +1640,7 @@ struct AccountRow: View {
         let outcome = NewGroupName.evaluate(typed, existingGroups: everyGroupFleetWide)
         switch outcome {
         case .valid(let name):
-            Task { await groupController.add(account: account.name, to: name) }
+            Task { await groupController.add(account: account.ref, to: name) }
         case .rejected, .duplicate:
             let failureAlert = NSAlert()
             failureAlert.alertStyle = .warning
@@ -1785,15 +1842,6 @@ struct AccountRow: View {
                     .truncationMode(.middle)
                     .help(account.name)
                     .textSelection(.enabled)
-                    // The name outranks everything beside it for width. Without
-                    // this the plan tag — `TEAM STANDARD` is the long one —
-                    // took its space from the name, and a row rendered as
-                    // `h…m TEAM STANDARD`: the tag exists to tell two rows
-                    // apart, so a tag that erases the name it is qualifying is
-                    // worse than no tag. Pills are `fixedSize()` and small; the
-                    // name is the row's identity and shrinks last.
-                    .layoutPriority(1)
-                planIndicator
                 controlIndicator
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
@@ -1819,6 +1867,19 @@ struct AccountRow: View {
                             "The refresh token was rejected — this account is out "
                                 + "of rotation and serves no traffic until you re-login."
                         )
+                } else if account.isRejected {
+                    // Ahead of the quota cases deliberately. A rejected account
+                    // can carry a perfectly ordinary reading — the gate is
+                    // Anthropic's, not a quota fact — so `spent`/`ok` would be
+                    // a true number attached to a false conclusion about
+                    // whether traffic can land here. The cause outranks the
+                    // measurement, the same way `needs re-login` above does.
+                    StatusPill("rejected", tint: Tok.spent)
+                        .help(
+                            "Anthropic has rejected this account, so `tcr` sends it no "
+                                + "traffic whatever its quota reads. It returns on their "
+                                + "verdict, not on a reset."
+                        )
                 } else if account.hasQuotaEvidence {
                     StatusPill(account.quotaState.token, tint: quotaTint)
                 } else if account.probeStatus.isFailure {
@@ -1838,22 +1899,8 @@ struct AccountRow: View {
                     StatusPill("unmeasured", tint: quotaTint)
                         .help("Never probed — this account's quota is unknown, not zero.")
                 }
-                // The entire group UI now that the dedicated group views are
-                // gone (bridge: `docs/plans/group-tags-bridge.md`) — one
-                // small colored tag per membership, right on the pills line
-                // beside CONTROL/ROTATING/quota so it reads as one more fact
-                // about the account. At most two, with the rest collapsed to
-                // a `+N` chip: the panel is `Tok.panelWidth` (380pt) wide and
-                // an account can be in many groups. An ungrouped account
-                // draws nothing here — no chip, no reserved space.
-                ForEach(Array(account.groupTags.prefix(2))) { tag in
-                    GroupChip(tag: tag)
-                }
-                if account.groupTags.count > 2 {
-                    StatusPill("+\(account.groupTags.count - 2)", tint: Tok.inkFaint)
-                        .help(account.groupTags.map(\.name).joined(separator: ", "))
-                }
             }
+            designationsLine
             // Two window lines, 5-hour on top and 7-day directly under it —
             // Gil's explicit call (bridge, 2026-08-18) — each tinted by its OWN
             // window's state (`fiveHourTint`/`sevenDayTint`) rather than the
@@ -1994,6 +2041,22 @@ struct AccountRow: View {
                     .font(Tok.detailFont)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+            // A refused group edit, drawn like every other refusal on this row.
+            // It was recorded and never read: `GroupController` has stored these
+            // all along and nothing displayed them, so a `tcr group add` that
+            // exited non-zero — which is what an ambiguous name does on a fleet
+            // holding one email twice — was indistinguishable from one that
+            // worked. The group is named because the menu that started it has
+            // closed by the time this appears.
+            if let refused = groupController.failure(forAccount: account.ref) {
+                Label(
+                    "group '\(refused.group)': \(refused.failure.summary)",
+                    systemImage: Tok.unreadableGlyph
+                )
+                .font(Tok.detailFont)
+                .foregroundStyle(Tok.spent)
+                .fixedSize(horizontal: false, vertical: true)
             }
             verdictLine
             removalNoticeLine
