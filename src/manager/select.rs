@@ -207,6 +207,18 @@ pub(super) fn effective_threshold(threshold: f64, reserve: f64, allow_reserve: b
     }
 }
 
+/// The ONE resolver for the effective Fable-weekly (`7d_oi`) threshold, consumed
+/// by both [`Manager::model_blocked`] and [`Manager::account_gate`]'s FableWeekly
+/// push so they can never independently drift — see
+/// [`crate::config::Config::fable_weekly_threshold`]'s doc for the operator-facing
+/// contract. `today` is whatever threshold the caller would otherwise apply to
+/// this bucket (the account's own `switch_threshold`, or `global_threshold`) —
+/// `config_override.unwrap_or(today)` byte-for-byte reproduces pre-knob
+/// behaviour when the knob is absent. Pure.
+pub(super) fn effective_fable_threshold(config_override: Option<f64>, today: f64) -> f64 {
+    config_override.unwrap_or(today)
+}
+
 impl Manager {
     /// Pick the best eligible account not in `tried`, spreading load across the
     /// fleet, or `None` if all are exhausted/held/disabled.
@@ -459,6 +471,7 @@ impl Manager {
                             Self::eligible(
                                 a,
                                 self.global_threshold,
+                                self.fable_weekly_threshold,
                                 &self.pacing,
                                 true,
                                 now,
@@ -529,7 +542,13 @@ impl Manager {
                                 )
                             });
                             let model_blocked = accounts.get(idx).is_some_and(|a| {
-                                Self::model_blocked(a, self.global_threshold, now, is_fable)
+                                Self::model_blocked(
+                                    a,
+                                    self.global_threshold,
+                                    self.fable_weekly_threshold,
+                                    now,
+                                    is_fable,
+                                )
                             });
                             let paced_out = accounts
                                 .get(idx)
@@ -609,6 +628,7 @@ impl Manager {
                                     if !Self::eligible(
                                         account,
                                         self.global_threshold,
+                                        self.fable_weekly_threshold,
                                         &self.pacing,
                                         true,
                                         now,
@@ -736,6 +756,7 @@ impl Manager {
                                         Self::eligible(
                                             a,
                                             self.global_threshold,
+                                            self.fable_weekly_threshold,
                                             &self.pacing,
                                             true,
                                             now,
@@ -833,6 +854,7 @@ impl Manager {
                         Self::eligible(
                             a,
                             self.global_threshold,
+                            self.fable_weekly_threshold,
                             &self.pacing,
                             true,
                             now,
@@ -977,6 +999,7 @@ impl Manager {
                         tried,
                         control_excluded,
                         self.global_threshold,
+                        self.fable_weekly_threshold,
                         &self.pacing,
                         now,
                         now_ms,
@@ -1009,6 +1032,7 @@ impl Manager {
                                     tried,
                                     control_excluded,
                                     self.global_threshold,
+                                    self.fable_weekly_threshold,
                                     &self.pacing,
                                     now,
                                     now_ms,
@@ -1256,6 +1280,7 @@ impl Manager {
             Self::hard_ok(
                 account,
                 self.global_threshold,
+                self.fable_weekly_threshold,
                 now,
                 now_ms,
                 is_fable,
@@ -1695,10 +1720,12 @@ impl Manager {
     pub(super) fn model_blocked(
         account: &AccountRuntime,
         global_threshold: f64,
+        fable_weekly_threshold: Option<f64>,
         now: OffsetDateTime,
         is_fable: bool,
     ) -> bool {
         let threshold = account.switch_threshold.unwrap_or(global_threshold);
+        let threshold = effective_fable_threshold(fable_weekly_threshold, threshold);
         is_fable && account.quota.model_weekly_exhausted(threshold, now)
     }
 
@@ -1722,6 +1749,7 @@ impl Manager {
     pub(super) fn hard_ok(
         account: &AccountRuntime,
         global_threshold: f64,
+        fable_weekly_threshold: Option<f64>,
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
@@ -1731,7 +1759,13 @@ impl Manager {
     ) -> bool {
         Self::account_hard_ok(account, now_ms, group, reserved, parked)
             && !Self::hold_clears_while_warm(account, now_ms)
-            && !Self::model_blocked(account, global_threshold, now, is_fable)
+            && !Self::model_blocked(
+                account,
+                global_threshold,
+                fable_weekly_threshold,
+                now,
+                is_fable,
+            )
     }
 
     /// Whether the CONTROL account may be preferred for an unpinned
@@ -1798,6 +1832,7 @@ impl Manager {
         tried: &HashSet<usize>,
         control_excluded: Option<usize>,
         global_threshold: f64,
+        fable_weekly_threshold: Option<f64>,
         pacing: &PacingConfig,
         now: OffsetDateTime,
         now_ms: i64,
@@ -1830,6 +1865,7 @@ impl Manager {
                     Self::eligible(
                         account,
                         global_threshold,
+                        fable_weekly_threshold,
                         pacing,
                         false,
                         now,
@@ -1862,6 +1898,7 @@ impl Manager {
     pub(super) fn eligible(
         account: &AccountRuntime,
         global_threshold: f64,
+        fable_weekly_threshold: Option<f64>,
         pacing: &PacingConfig,
         respect_pacing: bool,
         now: OffsetDateTime,
@@ -1898,7 +1935,13 @@ impl Manager {
         // genuinely cannot serve this request, so it must be skipped. What changed
         // is only that it is no longer grounds to MOVE AN EXISTING PIN — that
         // decision reads [`Self::account_hard_ok`], which excludes this gate.
-        if Self::model_blocked(account, global_threshold, now, is_fable) {
+        if Self::model_blocked(
+            account,
+            global_threshold,
+            fable_weekly_threshold,
+            now,
+            is_fable,
+        ) {
             return false;
         }
         // Reservation (not a preference — see this fn's `reserved_group` doc
@@ -1989,6 +2032,7 @@ impl Manager {
     pub(super) fn account_gate(
         account: &AccountRuntime,
         threshold: f64,
+        fable_weekly_threshold: Option<f64>,
         now: OffsetDateTime,
         now_ms: i64,
         is_fable: bool,
@@ -2041,7 +2085,8 @@ impl Manager {
         // The model-scoped weekly gates Fable requests ONLY — mirror `eligible`.
         if is_fable {
             if let Some(window) = account.quota.seven_day_oi {
-                if window.effective(now) >= threshold {
+                let fable_threshold = effective_fable_threshold(fable_weekly_threshold, threshold);
+                if window.effective(now) >= fable_threshold {
                     gates.push((GateReason::FableWeekly, window.live_reset(now)));
                 }
             }
@@ -2188,6 +2233,7 @@ impl Manager {
             if !Self::eligible(
                 account,
                 self.global_threshold,
+                self.fable_weekly_threshold,
                 &self.pacing,
                 respect_pacing,
                 now,
@@ -2205,6 +2251,7 @@ impl Manager {
                     && Self::eligible(
                         account,
                         self.global_threshold,
+                        self.fable_weekly_threshold,
                         &self.pacing,
                         false,
                         now,
@@ -2277,6 +2324,7 @@ impl Manager {
             if !Self::eligible(
                 account,
                 self.global_threshold,
+                self.fable_weekly_threshold,
                 &self.pacing,
                 false,
                 now,
@@ -2667,6 +2715,7 @@ mod revalidation_sticky_tests {
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
+            fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
             account_throttle: ThrottleConfig::default(),
             fleet_throttle: ThrottleConfig::default(),
@@ -2819,6 +2868,7 @@ mod sticky_divert_replay_tests {
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
+            fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
             account_throttle: ThrottleConfig::default(),
             fleet_throttle: ThrottleConfig::default(),
@@ -3005,6 +3055,7 @@ mod reserved_gate_agreement_tests {
                 let elig = Manager::eligible(
                     &account,
                     0.90,
+                    None,
                     &pacing,
                     false,
                     now,
@@ -3024,6 +3075,7 @@ mod reserved_gate_agreement_tests {
                 let (gate, _) = Manager::account_gate(
                     &account,
                     0.90,
+                    None,
                     now,
                     now_ms,
                     false,
@@ -3067,6 +3119,7 @@ mod reserved_gate_agreement_tests {
                 Manager::eligible(
                     &account,
                     0.90,
+                    None,
                     &pacing,
                     false,
                     now,
@@ -3083,6 +3136,7 @@ mod reserved_gate_agreement_tests {
             let (gate, _) = Manager::account_gate(
                 &account,
                 0.90,
+                None,
                 now,
                 now_ms,
                 false,
@@ -3144,6 +3198,7 @@ mod group_miss_tests {
             &HashSet::new(),
             control_excluded,
             0.95,
+            None,
             pacing,
             now,
             odt_to_ms(now),
@@ -3283,6 +3338,7 @@ mod reset_urgency_tests {
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
+            fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
             account_throttle: ThrottleConfig::default(),
             fleet_throttle: ThrottleConfig::default(),
@@ -3534,6 +3590,7 @@ mod fable_last_resort_tests {
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold,
+            fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
             account_throttle: ThrottleConfig::default(),
             fleet_throttle: ThrottleConfig::default(),
@@ -3570,6 +3627,112 @@ mod fable_last_resort_tests {
             utilization,
             reset: Some(now + Duration::hours(2)),
         });
+    }
+
+    /// Absent `fableWeeklyThreshold` must byte-for-byte match today's
+    /// behaviour: `switchThreshold` alone decides the Fable-weekly gate. Guards
+    /// the default so shipping the knob does not silently change an existing
+    /// fleet's routing — see the bridge's evidence (ten of thirteen accounts
+    /// sitting at 0.95-0.98 on `7d_oi`, none of them upstream-rejected).
+    #[test]
+    fn absent_fable_weekly_threshold_matches_todays_switch_threshold_gate() {
+        let manager = build_manager(config_with(vec![account("acct-a")], 0.95));
+        set_seven_day_oi(&manager, 0, 0.96);
+        let now = OffsetDateTime::now_utc();
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert!(
+            Manager::model_blocked(
+                &accounts[0],
+                manager.global_threshold,
+                manager.fable_weekly_threshold,
+                now,
+                true,
+            ),
+            "absent fableWeeklyThreshold must gate a Fable request exactly as \
+             switchThreshold did before this knob existed"
+        );
+    }
+
+    /// `fableWeeklyThreshold: 1.0` frees an account tcr merely PREDICTS is over
+    /// (0.96 against a 0.95 `switchThreshold`) but still gates one upstream has
+    /// GENUINELY rejected (utilization `1.0`, the only value
+    /// `reject_model_weekly` writes) — the whole point of the bridge: let the
+    /// Fable bucket run to a real rejection instead of tcr's own prediction.
+    #[test]
+    fn fable_weekly_threshold_at_one_frees_prediction_but_not_rejection() {
+        let mut config = config_with(vec![account("acct-a"), account("acct-b")], 0.95);
+        config.fable_weekly_threshold = Some(1.0);
+        let manager = build_manager(config);
+        set_seven_day_oi(&manager, 0, 0.96); // predicted-over, never rejected
+        set_seven_day_oi(&manager, 1, 1.0); // genuinely rejected upstream
+        let now = OffsetDateTime::now_utc();
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert!(
+            !Manager::model_blocked(
+                &accounts[0],
+                manager.global_threshold,
+                manager.fable_weekly_threshold,
+                now,
+                true,
+            ),
+            "fableWeeklyThreshold=1.0 must not gate an account tcr merely \
+             predicts is over — only upstream's own rejection may"
+        );
+        assert!(
+            Manager::model_blocked(
+                &accounts[1],
+                manager.global_threshold,
+                manager.fable_weekly_threshold,
+                now,
+                true,
+            ),
+            "fableWeeklyThreshold=1.0 must still gate a genuine upstream rejection"
+        );
+    }
+
+    /// `account_gate`'s FableWeekly push must agree with `model_blocked` on the
+    /// same account under both an absent and a set `fableWeeklyThreshold` — two
+    /// independently-resolved copies is exactly how the panel and routing can
+    /// drift; see [`effective_fable_threshold`], the one resolver both consume.
+    #[test]
+    fn account_gate_and_model_blocked_agree_on_fable_weekly_under_both_settings() {
+        for fable_weekly_threshold in [None, Some(1.0)] {
+            let mut config = config_with(vec![account("acct-a")], 0.95);
+            config.fable_weekly_threshold = fable_weekly_threshold;
+            let manager = build_manager(config);
+            set_seven_day_oi(&manager, 0, 0.96);
+            let now = OffsetDateTime::now_utc();
+            let now_ms = odt_to_ms(now);
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            let blocked = Manager::model_blocked(
+                &accounts[0],
+                manager.global_threshold,
+                manager.fable_weekly_threshold,
+                now,
+                true,
+            );
+            let threshold = accounts[0]
+                .switch_threshold
+                .unwrap_or(manager.global_threshold);
+            let (gate, _) = Manager::account_gate(
+                &accounts[0],
+                threshold,
+                manager.fable_weekly_threshold,
+                now,
+                now_ms,
+                true,
+                None,
+                &HashSet::new(),
+                &HashSet::new(),
+            );
+            assert_eq!(
+                gate == GateReason::FableWeekly,
+                blocked,
+                "fableWeeklyThreshold={fable_weekly_threshold:?}: account_gate \
+                 and model_blocked must agree on whether this account is \
+                 Fable-gated"
+            );
+        }
     }
 
     /// The regression this unit exists to fix: every pooled account sits at

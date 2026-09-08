@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "teamclaude-rs"
-version = "0.2.42"
+version = "0.2.43"
 dependencies = [
  "anyhow",
  "axum",

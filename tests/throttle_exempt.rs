@@ -171,6 +171,7 @@ fn config(
         },
         upstream: upstream.to_string(),
         switch_threshold: 0.98,
+        fable_weekly_threshold: None,
         pacing: PacingConfig::default(),
         account_throttle,
         fleet_throttle,

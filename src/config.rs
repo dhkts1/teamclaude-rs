@@ -767,6 +767,17 @@ pub struct Config {
     pub upstream: String,
     #[serde(default = "default_switch_threshold")]
     pub switch_threshold: f64,
+    /// Override for the Fable weekly bucket (`7d_oi`) alone. `None` (absent from
+    /// the JSON) means "same as `switchThreshold`" — today's behaviour,
+    /// byte-for-byte. `1.0` means "gate Fable only on a genuine upstream
+    /// rejection", never on tcr's own prediction — see
+    /// [`crate::quota::Quota::model_weekly_rejected`]'s doc for why 1.0 is the
+    /// value that collapses the prediction onto the authority. Consumed by
+    /// [`crate::manager::select::Manager::model_blocked`] and
+    /// [`crate::manager::select::Manager::account_gate`]'s FableWeekly push
+    /// through one shared resolver so the two can never disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fable_weekly_threshold: Option<f64>,
     /// Per-account request pacing. Absent in JSON → [`default_pacing`] → all knobs
     /// `None`, i.e. OFF: a per-account concurrency cap trades prompt-cache locality
     /// for load spread, and on a single-user proxy the cache is the scarce resource.
