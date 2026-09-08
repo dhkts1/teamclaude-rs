@@ -219,6 +219,7 @@ impl Fleet {
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: SWITCH_THRESHOLD,
+            fable_weekly_threshold: None,
             pacing,
             // Inert: the global egress throttle is an async sleep on the send
             // path and has no bearing on selection.

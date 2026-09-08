@@ -918,6 +918,14 @@ pub struct Manager {
     upstream: String,
     proxy_api_key: Option<String>,
     global_threshold: f64,
+    /// Override for the Fable weekly bucket alone — see
+    /// [`crate::config::Config::fable_weekly_threshold`]. `None` means "use
+    /// whatever threshold the site would apply anyway", resolved by
+    /// [`crate::manager::select::effective_fable_threshold`] at the two call
+    /// sites ([`Self::model_blocked`], [`Self::account_gate`]'s FableWeekly
+    /// push). Snapshotted at construction, same restart-to-take-effect contract
+    /// as `global_threshold` above.
+    fable_weekly_threshold: Option<f64>,
     /// The set of group labels marked `reserved` (`tcr group reserve`).
     /// Seeded from the config at construction and **hot-reloaded** from the
     /// config file's `groupSettings` thereafter — see
@@ -1262,6 +1270,7 @@ impl Manager {
         let upstream = config.upstream.clone();
         let proxy_api_key = config.proxy.api_key.clone();
         let global_threshold = config.switch_threshold;
+        let fable_weekly_threshold = config.fable_weekly_threshold;
         let reserved_groups = config.reserved_group_names();
         let parked_groups = config.parked_group_names();
         let control_allowed_groups = config.control_allowed_group_names();
@@ -1351,6 +1360,7 @@ impl Manager {
             upstream,
             proxy_api_key,
             global_threshold,
+            fable_weekly_threshold,
             reserved_groups: RwLock::new(reserved_groups),
             parked_groups: RwLock::new(parked_groups),
             control_allowed_groups: RwLock::new(control_allowed_groups),
@@ -1543,6 +1553,7 @@ impl Manager {
             let (reason, free_at) = Self::account_gate(
                 account,
                 threshold,
+                self.fable_weekly_threshold,
                 now,
                 now_ms,
                 is_fable,
@@ -3060,6 +3071,7 @@ mod tests {
             proxy: ProxyConfig::default(),
             upstream: "https://api.anthropic.com".to_string(),
             switch_threshold: 0.90,
+            fable_weekly_threshold: None,
             pacing: PacingConfig::default(),
             account_throttle: ThrottleConfig::default(),
             fleet_throttle: ThrottleConfig::default(),
@@ -5549,6 +5561,7 @@ mod tests {
             !Manager::eligible(
                 &a[0],
                 manager.global_threshold,
+                manager.fable_weekly_threshold,
                 &pacing,
                 true,
                 now,
@@ -5567,6 +5580,7 @@ mod tests {
             Manager::eligible(
                 &a[0],
                 manager.global_threshold,
+                manager.fable_weekly_threshold,
                 &pacing,
                 true,
                 later,
@@ -5749,6 +5763,7 @@ mod tests {
             Manager::eligible(
                 &a[0],
                 manager.global_threshold,
+                manager.fable_weekly_threshold,
                 &manager.pacing,
                 true,
                 now,
@@ -8488,6 +8503,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8511,6 +8527,7 @@ mod tests {
             Manager::account_gate(
                 &disabled,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8528,6 +8545,7 @@ mod tests {
             Manager::account_gate(
                 &errored,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8554,6 +8572,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8578,6 +8597,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8601,6 +8621,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8615,6 +8636,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 true,
@@ -8642,6 +8664,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8674,6 +8697,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 now_ms,
                 false,
@@ -8703,6 +8727,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8729,6 +8754,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 odt_to_ms(now),
                 false,
@@ -8755,6 +8781,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 now_ms,
                 false,
@@ -8777,6 +8804,7 @@ mod tests {
             Manager::account_gate(
                 &a,
                 0.90,
+                None,
                 now,
                 now_ms,
                 false,
@@ -8928,7 +8956,7 @@ mod tests {
                     parked,
                 } = case;
                 let (gate, _) = Manager::account_gate(
-                    &runtime, 0.90, now, now_ms, is_fable, None, &reserved, &parked,
+                    &runtime, 0.90, None, now, now_ms, is_fable, None, &reserved, &parked,
                 );
                 assert_eq!(gate, reason, "fixture `{label}` must exhibit {reason:?}");
 

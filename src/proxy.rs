@@ -4379,6 +4379,7 @@ mod tests {
             },
             upstream: upstream.to_string(),
             switch_threshold: 0.90,
+            fable_weekly_threshold: None,
             pacing: crate::config::PacingConfig::default(),
             account_throttle: crate::config::ThrottleConfig::default(),
             fleet_throttle: crate::config::ThrottleConfig::default(),

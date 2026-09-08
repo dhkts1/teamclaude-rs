@@ -158,8 +158,17 @@ impl Manager {
                 // `group: None` — the fleet view answers "what would UNREQUESTED
                 // traffic see right now", the same question `retry_after_hint`
                 // asks (see `Self::account_gate`'s doc-comment).
-                let (gate, free_at) =
-                    Self::account_gate(a, threshold, now, now_ms, false, None, &reserved, &parked);
+                let (gate, free_at) = Self::account_gate(
+                    a,
+                    threshold,
+                    self.fable_weekly_threshold,
+                    now,
+                    now_ms,
+                    false,
+                    None,
+                    &reserved,
+                    &parked,
+                );
                 let mut reserved_groups: Vec<String> = a
                     .groups
                     .iter()
