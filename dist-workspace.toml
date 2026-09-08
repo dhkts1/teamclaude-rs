@@ -13,3 +13,23 @@ installers = ["shell"]
 # musl (not gnu): static binary runs on alpine AND glibc distros. Deps are musl-clean
 # (rustls/ring, reqwest with rustls-tls; no openssl/native-tls, no system C libs to link).
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
+
+# Ship the Sparkle appcast on EVERY release, including a CLI-only one.
+#
+# Every installed TcrBar.app has `releases/latest/download/appcast.xml` compiled
+# in, and `/releases/latest/` follows whichever release is newest — not the newest
+# app release. A cargo-dist CLI release used to publish tarballs and no appcast,
+# become `latest`, and 404 the update feed for every install (0.2.27, 0.2.28, the
+# fifth failure of its class). The guard workflow cannot catch it: releases made
+# under GITHUB_TOKEN raise no `release:` events.
+#
+# Listing the committed appcast here puts it in `artifacts/*` so it goes up in the
+# same `gh release create` call that makes the release exist — no window at all.
+# For a CLI-only release the feed then serves the last APP entry and Sparkle
+# reports "up to date" instead of failing. An app release's own
+# `release-tcrbar.sh` still uploads its freshly signed appcast with --clobber on
+# top, so the two compose. This is config, not the generated workflow, so
+# `dist generate` keeps it.
+[[dist.extra-artifacts]]
+artifacts = ["appcast.xml"]
+build = ["cp", "apps/macos/appcast.xml", "appcast.xml"]
