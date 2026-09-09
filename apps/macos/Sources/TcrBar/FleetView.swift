@@ -54,8 +54,27 @@ struct FleetView: View {
     /// nothing is worse than one that says why.
     @State private var loginError: String?
 
-    /// Measured height of each account row, keyed by account id (`Account.id`
-    /// is the account name).
+    /// Measured height of every child the list draws — each account row, each
+    /// group heading and each band heading — keyed by that child's identity in
+    /// the list, NOT by account id.
+    ///
+    /// **Keyed by ``FleetSectionRow/id``, and that is load-bearing.** An account
+    /// in two groups is drawn twice (see ``accountList(_:)`` for the override
+    /// that makes that correct), so `Account.id` — the account name — is no
+    /// longer unique among the drawn rows. Under the old keying the two rows of
+    /// one account wrote the same key, one measurement overwrote its twin, and
+    /// `visibleRowsHeight(for:)` then summed n−1 heights for n rows: a viewport
+    /// short of its own content by a whole row for every duplicated account,
+    /// which reads as a list clipped mid-card. The composite id is unique per
+    /// drawn row by construction (`FleetSectionsTests`), so each row owns its
+    /// own slot.
+    ///
+    /// The headings share this dictionary because they share the same problem:
+    /// they are children of the same `VStack` and cost the viewport their own
+    /// height plus a gap, and nothing else measures them. Their keys carry the
+    /// `b:`/`h:` prefixes from ``bandHeightKey(_:)`` and ``groupHeightKey(_:)``,
+    /// which cannot collide with a row key — every row key starts with a
+    /// ``FleetGroupKey/token``, i.e. `g:` or `u:`.
     ///
     /// A `ScrollView` has a flexible ideal height, and the window this panel
     /// lives in sizes itself to its content's *ideal* height — so a scroll view
@@ -68,10 +87,10 @@ struct FleetView: View {
     /// controller is set to `sizingOptions = [.preferredContentSize]`
     /// (`MenuBarShell.swift`) for exactly this reason.
     ///
-    /// Per-row rather than one summed total because rows are not uniform height
-    /// — the needs-relogin state and several conditional detail lines all grow a
-    /// row. `visibleRowsHeight(for:)` sums all of these and clamps the total to
-    /// what `PanelHeight.listBudget` leaves of `Tok.panelMaxHeight`.
+    /// Per-child rather than one summed total because rows are not uniform
+    /// height — the needs-relogin state and several conditional detail lines all
+    /// grow a row. `visibleRowsHeight(for:)` sums all of these and clamps the
+    /// total to what `PanelHeight.listBudget` leaves of `Tok.panelMaxHeight`.
     @State private var rowHeights: [String: CGFloat] = [:]
 
     /// The spend line as drawn, and the height one line of it would be.
@@ -323,32 +342,116 @@ struct FleetView: View {
         }
     }
 
-    /// A flat list of accounts — the only shape this panel draws now. Group
-    /// membership shows as a tag on the row (``AccountRow``'s pills line),
-    /// not as a section, card or separate view; see the bridge for why three
-    /// earlier attempts at the latter were all rejected.
+    /// The account list, cut into sections: a state band heading, then a group
+    /// heading inside it, then the rows.
+    ///
+    /// This comment used to say a flat list was "the only shape this panel draws
+    /// now", and cited `docs/plans/account-groups-plan.md:44-55` (decision \#4)
+    /// for three rejected attempts at sectioning. **Gil has overridden that**,
+    /// this session, knowing the cost. The objection was never that sectioning
+    /// looked wrong — it was that a list cut by group must either duplicate a
+    /// row for a multi-membership account or invent a "primary" group the data
+    /// does not have. The override takes the first: an account in two groups
+    /// gets TWO rows, one under each heading, and nothing here de-duplicates.
+    /// The price is that the row count is no longer the account count and an
+    /// operator will read the same email twice; the alternative was the app
+    /// asserting which group an account "really" belongs to, which is a fact
+    /// nobody has.
+    ///
+    /// Ordering, band membership and the duplication all live in
+    /// ``Fleet/sectionsInDisplayOrder(pinning:)`` and are unit-tested there
+    /// (`FleetSectionsTests`). Nothing is re-derived here: this function draws
+    /// the array it is handed, in array order, and asks
+    /// ``Array/isFirstOfBand(_:)`` when to open a band rather than comparing
+    /// bands itself.
+    ///
+    /// The control account's hairline separator is GONE with the flat list that
+    /// justified it. It marked the boundary under a globally pinned control row,
+    /// and there is no such row any more — `sectionsInDisplayOrder` pins the
+    /// control account to the front of each section it appears in, because
+    /// hoisting it above the first band heading would put it outside every group
+    /// and every state it belongs to. `visibleRowsHeight(for:)` therefore passes
+    /// no `controlHairline` term: it existed to pay for a separator this list no
+    /// longer draws, and charging for it now would make the viewport 8.5pt too
+    /// TALL — the same drift the old comment warned about, in the other
+    /// direction.
     private func accountList(_ fleet: Fleet) -> some View {
-        let rows = fleet.rowsInDisplayOrder(pinning: control.current)
+        let sections = fleet.sectionsInDisplayOrder(pinning: control.current)
         return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            ForEach(Array(rows.enumerated()), id: \.element.id) { index, account in
-                accountRow(account, fleet: fleet)
-                // A thin separator between the pinned control row and the
-                // rotation pool below it — the same `Hairline` this panel
-                // already uses to mark a scope boundary (see `appActions`).
-                // Only drawn when the control row is actually first: index 0
-                // is an ordinary pool row on every fleet without one set.
-                // `hasControlHairline` is the same condition, and
-                // `visibleRowsHeight` sizes the viewport with it — they must
-                // stay one predicate or the list is short by 8.5pt again.
-                if index == 0, hasControlHairline(rows) {
-                    Hairline()
+            // Identified by `FleetSection.id` (band + group), not by group
+            // alone: a group whose accounts differ in state appears in more
+            // than one band, and two sections sharing a SwiftUI identity paint
+            // one section's rows into the other's slot.
+            ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
+                if sections.isFirstOfBand(index) {
+                    bandHeading(section.band)
+                }
+                groupHeading(section)
+                // `FleetSectionRow` is `Identifiable` on the composite
+                // (group, account) id, which is why this can be a plain
+                // `ForEach` over the rows: the duplicated account's two rows
+                // carry different identities.
+                ForEach(section.rows) { row in
+                    accountRow(row, fleet: fleet)
                 }
             }
         }
     }
 
-    private func accountRow(_ account: Account, fleet: Fleet) -> some View {
-        AccountRow(
+    /// The outer heading: what these accounts can do for you right now.
+    /// ``FleetBand/title`` supplies the words — "Live", "Out of tokens",
+    /// "Parked" — so the panel and any future caller cannot name a band two
+    /// different ways.
+    private func bandHeading(_ band: FleetBand) -> some View {
+        measured(bandHeightKey(band)) {
+            Text(band.title.uppercased())
+                .font(Tok.detailFont.weight(.semibold))
+                .tracking(Tok.pillTracking)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The inner heading: one group, or the unlabelled pile. Set apart from the
+    /// band heading by case and weight rather than by an indent, so a row and
+    /// its heading keep the same left edge and the eye reads one column.
+    private func groupHeading(_ section: FleetSection) -> some View {
+        measured(groupHeightKey(section)) {
+            Text(section.title)
+                .font(Tok.secondaryFont.weight(.semibold))
+                .foregroundStyle(.primary)
+        }
+    }
+
+    /// Height key for a band heading. The `b:` prefix cannot collide with a row
+    /// key — those start with a ``FleetGroupKey/token``, `g:` or `u:` — and the
+    /// band's raw value rather than its title keeps it out of the operator's
+    /// typing entirely.
+    private func bandHeightKey(_ band: FleetBand) -> String { "b:\(band.rawValue)" }
+
+    /// Height key for a group heading, built on ``FleetSection/id`` so a group
+    /// split across two bands gets two keys, exactly as it gets two headings.
+    private func groupHeightKey(_ section: FleetSection) -> String { "h:\(section.id)" }
+
+    /// Publish a list child's measured height under `key`.
+    ///
+    /// Raw `proxy.size.height`, deliberately un-rounded: `PanelHeight.settled`
+    /// is the only place the grid is applied, and a dead band that cannot see
+    /// the raw value degenerates into the oscillation it exists to stop. Read
+    /// its doc-comment before changing what is published here.
+    private func measured<Content: View>(
+        _ key: String,
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        content().background(
+            GeometryReader { proxy in
+                Color.clear.preference(key: RowHeightsKey.self, value: [key: proxy.size.height])
+            }
+        )
+    }
+
+    private func accountRow(_ row: FleetSectionRow, fleet: Fleet) -> some View {
+        let account = row.account
+        return AccountRow(
             account: account,
             countersAreStructural: fleet.source.countersAreStructural,
             accounts: accounts,
@@ -362,9 +465,12 @@ struct FleetView: View {
         )
         .background(
             GeometryReader { proxy in
+                // `row.id`, never `account.id`: a duplicated account draws two
+                // of these and `account.id` would make the second overwrite the
+                // first's measurement.
                 Color.clear.preference(
                     key: RowHeightsKey.self,
-                    value: [account.id: proxy.size.height])
+                    value: [row.id: proxy.size.height])
             }
         )
     }
@@ -390,18 +496,15 @@ struct FleetView: View {
     /// empty and this returns the budget itself, so the panel never renders at
     /// zero or one-row height while waiting for a real measurement.
     private func visibleRowsHeight(for fleet: Fleet) -> CGFloat {
-        let rows = fleet.rowsInDisplayOrder(pinning: control.current)
-        let orderedHeights = rows.compactMap { rowHeights[$0.id] }
+        let sections = fleet.sectionsInDisplayOrder(pinning: control.current)
+        let orderedHeights = listChildKeys(sections).compactMap { rowHeights[$0] }
         return PanelHeight.visibleRowsHeight(
             rowHeights: orderedHeights,
             spacing: Tok.rowSpacing,
-            // The separator `accountList` draws under a PINNED control row.
-            // `rowHeights` is filled from `AccountRow`'s own GeometryReader and
-            // the hairline is not an `AccountRow`, so nothing in that array
-            // knows about it — and it costs the list its own thickness plus one
-            // more gap, 8.5pt the viewport was short of its content on every
-            // fleet with a control account set.
-            controlHairline: hasControlHairline(rows) ? Tok.hairlineWidth : nil,
+            // No `controlHairline` term. It paid for the separator the flat
+            // list drew under a globally pinned control row; sectioning removed
+            // both the pin and the separator, so charging for it here would
+            // hand the viewport 8.5pt of empty space under the last card.
             budget: PanelHeight.listBudget(
                 cap: Tok.panelMaxHeight,
                 headerOverflow: PanelHeight.headerOverflow(
@@ -414,10 +517,28 @@ struct FleetView: View {
                 minimum: Tok.panelMinListHeight))
     }
 
-    /// Whether `accountList` will insert its control-row separator — the same
-    /// condition, written once, so the drawing and the measuring cannot drift.
-    private func hasControlHairline(_ rows: [Account]) -> Bool {
-        rows.first?.name == control.current && control.current != nil
+    /// Every child `accountList` draws, in draw order, as its height key.
+    ///
+    /// One function for both jobs, which is the point: the drawing loop and the
+    /// measuring sum have to agree about which children exist, and they used to
+    /// drift over a single hairline (8.5pt of clipped card). Headings are
+    /// children of the same `VStack` as the rows, so each one costs the viewport
+    /// its own height plus one gap — and `PanelHeight.visibleRowsHeight` derives
+    /// the gaps from this array's COUNT, so listing the headings here is what
+    /// makes that arithmetic right rather than an approximation.
+    ///
+    /// A key with no measurement yet is dropped by the caller's `compactMap`,
+    /// which is the same first-frame behaviour the rows have always had.
+    private func listChildKeys(_ sections: [FleetSection]) -> [String] {
+        var keys: [String] = []
+        for (index, section) in sections.enumerated() {
+            if sections.isFirstOfBand(index) {
+                keys.append(bandHeightKey(section.band))
+            }
+            keys.append(groupHeightKey(section))
+            keys.append(contentsOf: section.rows.map(\.id))
+        }
+        return keys
     }
 
     private func offlineNotice(_ source: StatusSource) -> some View {
@@ -841,10 +962,15 @@ struct FleetView: View {
     }
 }
 
-/// Carries the measured height of each account row out of the scroll view,
-/// keyed by `Account.id`. A dictionary rather than one summed scalar because
-/// rows are not uniform height — `visibleRowsHeight(for:)` needs the first N
-/// individually, in display order, not just their total.
+/// Carries the measured height of each list child out of the scroll view,
+/// keyed by that child's list identity — ``FleetSectionRow/id`` for a row, the
+/// `b:`/`h:` heading keys for a band or group heading. **Not `Account.id`**: a
+/// multi-group account draws two rows, and two rows publishing one key means
+/// one measurement lands and the other is silently discarded.
+///
+/// A dictionary rather than one summed scalar because rows are not uniform
+/// height — `visibleRowsHeight(for:)` needs the first N individually, in
+/// display order, not just their total.
 struct RowHeightsKey: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
