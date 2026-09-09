@@ -162,7 +162,16 @@ public enum PanelHeight {
     /// with fresh sub-pixel noise), the published preference stops changing
     /// too, `onPreferenceChange` stops firing, and the layout pass that
     /// triggered it is the last one.
-    public static func quantized(_ measurement: CGFloat) -> CGFloat {
+    /// Internal, not public, and that is load-bearing. After ``settled(_:_:)``
+    /// took over the publish path this had no caller outside this file, and the
+    /// one edit that would silently undo the fix — restoring
+    /// `PanelHeight.quantized(proxy.size.height)` at a `GeometryReader` emitter
+    /// in `FleetView` — is the kind of tidy-up that reads as harmless. `FleetView`
+    /// is in the `TcrBar` target and cannot reach an internal symbol in
+    /// `TcrBarCore`, so that edit is now a compile error rather than a green test
+    /// run with the fix dead. No test could have caught it: `Package.swift:39-43`
+    /// gives the test target `TcrBarCore` only, on purpose.
+    static func quantized(_ measurement: CGFloat) -> CGFloat {
         (measurement / measurementGrain).rounded() * measurementGrain
     }
 
@@ -175,12 +184,21 @@ public enum PanelHeight {
     /// than a damper on them: a raw measurement sitting on a cell BOUNDARY
     /// snaps alternately to the two neighbouring grid points, so a signal that
     /// was merely noisy becomes a clean two-state oscillation that never
-    /// settles. Measured on the shipped code: the same 1e-5 jitter publishes
-    /// one value when centred on 118.0 and two when centred on 118.25, and
-    /// republishes on 199 of 200 passes. Every republish re-fires the
+    /// settles. Measured on a model of this arithmetic, not on a running panel,
+    /// with the shipped fixture as its control: the same 1e-5 jitter publishes
+    /// one value when centred on 118.0 — which is the centring
+    /// `PanelHeightTests` has always used, and why it never caught this — and
+    /// two when centred on 118.25, republishing on 199 of 200 passes. Every republish re-fires the
     /// observer, moves the list's frame by half a point and runs
-    /// `NSHostingView.setFrameSize`, which is the edge the popover's layout
-    /// cycle closes through.
+    /// `NSHostingView.setFrameSize`.
+    ///
+    /// What that costs is a pass budget, and that is the whole claim. Whether
+    /// this is the loop that aborts on the crashing machine is NOT established
+    /// and nothing here should be read as saying it is: the same investigation
+    /// records that the crash cycle reads no preference at all
+    /// (`MenuBarShell.swift`, the #208 comment), and that all three 0.2.43 stacks
+    /// contain no TcrBar frame anywhere. This removes a demonstrated 199-in-200
+    /// republish. It may or may not remove the crash.
     ///
     /// A dead band fixes what the grid cannot: hold the previous value while
     /// the new one is within one grain of it, and only then snap. The band has
@@ -192,7 +210,30 @@ public enum PanelHeight {
     /// place the grid is applied.
     ///
     /// A genuine content change still moves: it is larger than a grain, so it
-    /// falls outside the band on the first pass.
+    /// falls outside the band on the first pass. Continuous drift is not
+    /// swallowed either — the band compares against the last PUBLISHED value, so
+    /// the error never exceeds one grain and the value keeps moving.
+    ///
+    /// Two costs, both found by review rather than by me, both recorded here
+    /// rather than argued away:
+    ///
+    /// A permanent SUB-GRAIN step is held indefinitely — a row that genuinely
+    /// settles at 40.4 goes on publishing 40.0, where quantizing alone would
+    /// have published 40.5. The error is one-sided, and
+    /// ``visibleRowsHeight(rowHeights:spacing:controlHairline:budget:)`` sums it
+    /// across rows, so a fleet under budget can get a viewport up to
+    /// `0.5 × rowCount` shorter than its content — the same symptom class the
+    /// `controlHairline` term above exists to fix. Bounded, and it only bites
+    /// below the cap; above it the list clamps and scrolls regardless.
+    ///
+    /// And the emitters publishing raw gives up a gate that used to sit below
+    /// this code: `onPreferenceChange` requires `Equatable` and skips the
+    /// callback when the published value is unchanged, so on a quantized
+    /// preference SwiftUI itself absorbed sub-grain jitter and the closure never
+    /// ran. It now runs every pass and writes `@State` with a value equal to
+    /// what is already there. That is inert as far as `.frame(height:)` is
+    /// concerned — the same `CGFloat` produces the same frame — but SwiftUI does
+    /// not document it, and it was not measurable without a running panel.
     public static func settled(_ previous: CGFloat, _ measured: CGFloat) -> CGFloat {
         abs(measured - previous) < measurementGrain ? previous : quantized(measured)
     }

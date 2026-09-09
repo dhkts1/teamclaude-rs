@@ -165,10 +165,17 @@ final class MenuBarShell {
         // `NSPopoverFrame` and `NSHostingView`, driven from `stepIdle` with no
         // user event in the stack.
         //
-        // `PanelHeight.quantized` damps the OTHER loop, the one that runs
-        // through `onPreferenceChange`, and shipped in that same 0.2.43 build
-        // — which is the evidence that it is not sufficient alone. Preference
-        // quantization cannot reach a cycle that never reads a preference.
+        // `PanelHeight.settled` damps the OTHER loop, the one that runs
+        // through `onPreferenceChange`. Its predecessor `PanelHeight.quantized`
+        // shipped in that same 0.2.43 build, which is the evidence that damping
+        // that loop is not sufficient alone: preference quantization cannot
+        // reach a cycle that never reads a preference, and none of the three
+        // 0.2.43 stacks contains a TcrBar frame at all.
+        //
+        // `quantized` is no longer called from this target — `settled` owns the
+        // publish path and calls it internally, and it was made internal to
+        // `TcrBarCore` so that re-adding it at a `GeometryReader` emitter fails
+        // to compile rather than silently reverting the fix.
         //
         // A popover has no safe area to inset against: no notch, no title bar,
         // no keyboard. Opting out is correct on its own terms, and it is the
