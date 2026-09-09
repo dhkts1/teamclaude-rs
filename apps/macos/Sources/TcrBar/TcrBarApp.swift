@@ -52,6 +52,26 @@ enum TcrBarEntry {
         for signalNumber in abnormalTerminationSignals {
             signal(signalNumber, tcrbarHandleAbnormalTermination)
         }
+        // Installed alongside them, and it runs FIRST: an uncaught
+        // `NSException` unwinds through this handler before it reaches
+        // `abort()`, which is what raises the `SIGABRT` the loop above
+        // catches. So this logs, and then the signal handler still gets to
+        // stop the child being orphaned — the two do not compete.
+        //
+        // It exists because the crash report does not carry the reason
+        // string. `UncaughtExceptionReport` documents what that cost when the
+        // runaway-layout crash had to be diagnosed from frames alone. The
+        // closure captures nothing, which is required: the parameter is a C
+        // function pointer.
+        NSSetUncaughtExceptionHandler { exception in
+            for line in UncaughtExceptionReport.lines(
+                name: exception.name.rawValue,
+                reason: exception.reason,
+                callStack: exception.callStackSymbols)
+            {
+                NSLog("%@", line)
+            }
+        }
         // First, and the only one of the four that needs no AppKit at all: it
         // draws nothing, it holds a power assertion and prints.
         if let probe = KeepAwakeProbe.request() {

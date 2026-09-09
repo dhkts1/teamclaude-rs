@@ -149,6 +149,39 @@ final class MenuBarShell {
         // rather than a missing line here. `--shell-probe` assertion 5 checks
         // the resulting `contentSize` numerically.
         hosting.sizingOptions = [.preferredContentSize]
+        // The line above sizes the popover; it is also one half of a layout
+        // cycle that aborts the app. The other half is safe-area.
+        // `NSHostingView` observes its own frame through KVO, and every frame
+        // change runs `invalidateSafeAreaInsets()`, which requests another
+        // SwiftUI update, which marks the window as needing another
+        // update-constraints pass. The popover resizes itself from those
+        // constraints, the hosting view's frame changes again, and AppKit
+        // throws from `_postWindowNeedsUpdateConstraints` once the pass count
+        // passes its guard. Nothing catches that `NSException`, so `abort()`.
+        //
+        // Three crash reports from a 0.2.43 build (2026-09-09, macOS 26.6.2,
+        // all three throwing at that same frame) show the cycle with no TcrBar
+        // frame anywhere in it: it runs entirely between `_NSPopoverWindow`,
+        // `NSPopoverFrame` and `NSHostingView`, driven from `stepIdle` with no
+        // user event in the stack.
+        //
+        // `PanelHeight.quantized` damps the OTHER loop, the one that runs
+        // through `onPreferenceChange`, and shipped in that same 0.2.43 build
+        // — which is the evidence that it is not sufficient alone. Preference
+        // quantization cannot reach a cycle that never reads a preference.
+        //
+        // A popover has no safe area to inset against: no notch, no title bar,
+        // no keyboard. Opting out is correct on its own terms, and it is the
+        // edge of the cycle that can be cut without giving up the preferred
+        // size that assertion 5 checks.
+        //
+        // Not reproduced locally: the machine that crashes is one point
+        // release ahead (26.6.2 vs 26.6.1) and the panel is stable here across
+        // days. This cuts a documented edge of the cycle in the crash stack;
+        // it has not been watched to fail and then pass.
+        if #available(macOS 13.3, *) {
+            hosting.safeAreaRegions = []
+        }
         popover.contentViewController = hosting
         // What restores click-outside dismissal, which a menu had by nature.
         popover.behavior = .transient
