@@ -294,6 +294,50 @@ final class FleetSectionsTests: XCTestCase {
         XCTAssertEqual(FleetBand.outOfTokens.title, "Out of tokens")
         XCTAssertEqual(FleetBand.parked.title, "Parked")
     }
+
+    /// A lone "Ungrouped" heading under a band heading says nothing the band
+    /// heading did not, and costs the viewport its own height plus a gap. On a
+    /// fleet with no groups configured that was EVERY band — three dead rows
+    /// saying nothing three times. Caught by rendering the panel and looking at
+    /// the PNG, not by any test, which is why this one exists.
+    func testALoneUngroupedSectionDrawsNoGroupHeading() {
+        let fleet = Fleet(accounts: [
+            sectionAccount("a@example.com", groups: []),
+            sectionAccount("b@example.com", groups: []),
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+        XCTAssertEqual(sections.count, 1, "no groups configured — one ungrouped section")
+        XCTAssertFalse(
+            sections.drawsGroupHeading(at: 0),
+            "the only section in its band, and ungrouped — the heading is dead space")
+    }
+
+    /// A lone NAMED section still draws: "PARKED / henry-team" says WHICH group
+    /// was parked, which the band heading cannot.
+    func testALoneNamedSectionStillDrawsItsHeading() {
+        let fleet = Fleet(accounts: [sectionAccount("a@example.com", groups: ["dev"])])
+        let sections = fleet.sectionsInDisplayOrder()
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertTrue(
+            sections.drawsGroupHeading(at: 0),
+            "a named group is information the band heading does not carry")
+    }
+
+    /// Ungrouped alongside a named section DOES draw — there it is the thing
+    /// separating the two.
+    func testUngroupedDrawsWhenItSharesABandWithANamedSection() {
+        let fleet = Fleet(accounts: [
+            sectionAccount("a@example.com", groups: ["dev"]),
+            sectionAccount("b@example.com", groups: []),
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+        XCTAssertEqual(sections.count, 2)
+        for index in sections.indices {
+            XCTAssertTrue(
+                sections.drawsGroupHeading(at: index),
+                "two sections in one band — both headings separate something")
+        }
+    }
 }
 
 /// A row with everything but the group/state fields fixed — the same shape

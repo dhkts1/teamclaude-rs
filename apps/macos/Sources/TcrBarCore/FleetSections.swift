@@ -232,6 +232,31 @@ extension Array where Element == FleetSection {
         guard index > 0 else { return true }
         return self[index - 1].band != self[index].band
     }
+
+    /// Whether the section at `index` should draw its group heading.
+    ///
+    /// A heading has to earn its line. Every one costs the panel its own height
+    /// PLUS a gap, and `PanelHeight.visibleRowsHeight` charges the viewport for
+    /// both, so a heading that carries no information is not free — it is a row
+    /// of dead space in a panel whose whole design is a fight for height.
+    ///
+    /// The one case where it carries nothing: a band holding a single
+    /// ``FleetGroupKey/ungrouped`` section. "LIVE / Ungrouped" tells a reader
+    /// exactly what "LIVE" already told them. On a fleet with no groups
+    /// configured at all that is every band, so the panel grew three heading
+    /// rows and said nothing three times — caught by rendering the states and
+    /// looking at them, not by any test.
+    ///
+    /// A single NAMED section still draws: "PARKED / henry-team" says which
+    /// group was parked, which the band heading cannot. And an ungrouped
+    /// section alongside a named one still draws, because there it is the thing
+    /// that separates the two.
+    public func drawsGroupHeading(at index: Int) -> Bool {
+        guard indices.contains(index) else { return false }
+        let section = self[index]
+        guard section.group == .ungrouped else { return true }
+        return filter { $0.band == section.band }.count > 1
+    }
 }
 
 extension Fleet {

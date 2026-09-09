@@ -386,7 +386,13 @@ struct FleetView: View {
                 if sections.isFirstOfBand(index) {
                     bandHeading(section.band)
                 }
-                groupHeading(section)
+                // Gated, and `listChildKeys` below gates on the SAME call. The
+                // two must agree exactly: a heading drawn but unkeyed is a row
+                // the viewport never charges for, and a heading keyed but not
+                // drawn charges for a row that is not there. Both clip.
+                if sections.drawsGroupHeading(at: index) {
+                    groupHeading(section)
+                }
                 // `FleetSectionRow` is `Identifiable` on the composite
                 // (group, account) id, which is why this can be a plain
                 // `ForEach` over the rows: the duplicated account's two rows
@@ -535,7 +541,10 @@ struct FleetView: View {
             if sections.isFirstOfBand(index) {
                 keys.append(bandHeightKey(section.band))
             }
-            keys.append(groupHeightKey(section))
+            // Same predicate as the draw loop, deliberately. See there.
+            if sections.drawsGroupHeading(at: index) {
+                keys.append(groupHeightKey(section))
+            }
             keys.append(contentsOf: section.rows.map(\.id))
         }
         return keys
