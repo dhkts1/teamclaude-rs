@@ -149,8 +149,12 @@ struct FleetView: View {
         // subtree disappears, which is the reset — a header that draws no
         // spend line has no overflow, and `listBudget` gives the list the
         // whole cap back.
-        .onPreferenceChange(UsageLineHeightKey.self) { usageLineHeight = $0 }
-        .onPreferenceChange(UsageLineBaselineKey.self) { usageLineBaseline = $0 }
+        .onPreferenceChange(UsageLineHeightKey.self) {
+            usageLineHeight = PanelHeight.settled(usageLineHeight, $0)
+        }
+        .onPreferenceChange(UsageLineBaselineKey.self) {
+            usageLineBaseline = PanelHeight.settled(usageLineBaseline, $0)
+        }
     }
 
     /// The fleet's spend, burn rate, model mix and cache hit rate, on one line:
@@ -181,7 +185,7 @@ struct FleetView: View {
                     GeometryReader { proxy in
                         Color.clear.preference(
                             key: UsageLineHeightKey.self,
-                            value: PanelHeight.quantized(proxy.size.height))
+                            value: proxy.size.height)
                     }
                 )
                 .overlay(alignment: .topLeading) {
@@ -193,7 +197,7 @@ struct FleetView: View {
                             GeometryReader { proxy in
                                 Color.clear.preference(
                                     key: UsageLineBaselineKey.self,
-                                    value: PanelHeight.quantized(proxy.size.height))
+                                    value: proxy.size.height)
                             }
                         )
                 }
@@ -314,7 +318,7 @@ struct FleetView: View {
                     accountList(fleet)
                 }
                 .frame(height: visibleRowsHeight(for: fleet))
-                .onPreferenceChange(RowHeightsKey.self) { rowHeights = $0 }
+                .onPreferenceChange(RowHeightsKey.self) { rowHeights = PanelHeight.settled(rowHeights, $0) }
             }
         }
     }
@@ -360,7 +364,7 @@ struct FleetView: View {
             GeometryReader { proxy in
                 Color.clear.preference(
                     key: RowHeightsKey.self,
-                    value: [account.id: PanelHeight.quantized(proxy.size.height)])
+                    value: [account.id: proxy.size.height])
             }
         )
     }

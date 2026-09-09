@@ -195,4 +195,72 @@ final class PanelHeightTests: XCTestCase {
             quantizedValues, [118.0],
             "every measurement within the grain must publish the identical value")
     }
+
+    /// Why ``PanelHeight/settled(_:_:)`` has to exist, stated as the failure it
+    /// prevents.
+    ///
+    /// The fixture above centres its jitter on 118.0 — a grid POINT — and so it
+    /// passes with quantizing alone and always would. Move the identical jitter
+    /// onto a cell BOUNDARY and the same code publishes two values forever:
+    /// half the samples round down and half round up. That is not damped noise,
+    /// it is a manufactured two-state oscillation, and each alternation re-fires
+    /// the observer and moves the list's frame half a point.
+    ///
+    /// The first assertion is this test's positive control. It is the shipped
+    /// fixture's centring, so if it ever fails the harness is wrong rather than
+    /// the code.
+    func testQuantizingAloneRepublishesWhenJitterStraddlesACellBoundary() {
+        func jitter(around centre: CGFloat) -> [CGFloat] {
+            (0..<20).map { centre + (CGFloat($0) - 10) * 0.00001 }
+        }
+        XCTAssertEqual(
+            Set(jitter(around: 118.0).map(PanelHeight.quantized)).count, 1,
+            "positive control: on a grid point, quantizing alone already publishes one value")
+        XCTAssertEqual(
+            Set(jitter(around: 118.25).map(PanelHeight.quantized)).count, 2,
+            "on a cell boundary the identical jitter publishes two — the limit cycle")
+    }
+
+    /// The dead band holds one value wherever the jitter is centred.
+    ///
+    /// Fails on the change this guards against: make ``PanelHeight/settled(_:_:)``
+    /// return `quantized(measured)` unconditionally — today's shipped behaviour —
+    /// and the two boundary centres publish two values each.
+    func testSubGrainJitterPublishesOneValueWhereverItIsCentred() {
+        for centre in [118.0, 118.25, 42.75] as [CGFloat] {
+            let jitter: [CGFloat] = (0..<20).map { centre + (CGFloat($0) - 10) * 0.00001 }
+            XCTAssertEqual(
+                Set(jitter).count, jitter.count,
+                "the raw values really do all differ, centre \(centre)")
+
+            var previous = PanelHeight.quantized(jitter[0])
+            var published: Set<CGFloat> = [previous]
+            for raw in jitter {
+                previous = PanelHeight.settled(previous, raw)
+                published.insert(previous)
+            }
+            XCTAssertEqual(
+                published.count, 1,
+                "centre \(centre) published \(published.sorted()) — must publish exactly one")
+        }
+    }
+
+    /// A real content change is larger than a grain, so the band never swallows
+    /// it. Without this the fix would trade a crash for a panel that never
+    /// resizes.
+    func testARealChangeStillMoves() {
+        XCTAssertEqual(PanelHeight.settled(118.0, 130.0), 130.0)
+        XCTAssertEqual(PanelHeight.settled(118.0, 118.9), 119.0)
+    }
+
+    /// The per-row form holds each row independently, drops rows that left the
+    /// fleet, and publishes a new row on the grid since it has nothing to hold to.
+    func testPerRowSettlingHoldsDropsAndAdmits() {
+        let previous: [String: CGFloat] = ["a": 40.0, "gone": 12.0]
+        let measured: [String: CGFloat] = ["a": 40.2, "new": 17.26]
+        let out = PanelHeight.settled(previous, measured)
+        XCTAssertEqual(out["a"], 40.0, "within a grain of the last value — held")
+        XCTAssertEqual(out["new"], 17.5, "no previous value — published on the grid")
+        XCTAssertNil(out["gone"], "absent from the measurement — dropped, not held")
+    }
 }

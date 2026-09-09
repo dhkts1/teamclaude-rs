@@ -165,4 +165,49 @@ public enum PanelHeight {
     public static func quantized(_ measurement: CGFloat) -> CGFloat {
         (measurement / measurementGrain).rounded() * measurementGrain
     }
+
+    /// The value to publish for a freshly measured height, given what was
+    /// published last.
+    ///
+    /// ``quantized(_:)`` alone is not enough, and under one centring it is
+    /// actively harmful. Snapping to a grid is a uniform quantizer, and a
+    /// quantizer inside a feedback loop is a source of limit cycles rather
+    /// than a damper on them: a raw measurement sitting on a cell BOUNDARY
+    /// snaps alternately to the two neighbouring grid points, so a signal that
+    /// was merely noisy becomes a clean two-state oscillation that never
+    /// settles. Measured on the shipped code: the same 1e-5 jitter publishes
+    /// one value when centred on 118.0 and two when centred on 118.25, and
+    /// republishes on 199 of 200 passes. Every republish re-fires the
+    /// observer, moves the list's frame by half a point and runs
+    /// `NSHostingView.setFrameSize`, which is the edge the popover's layout
+    /// cycle closes through.
+    ///
+    /// A dead band fixes what the grid cannot: hold the previous value while
+    /// the new one is within one grain of it, and only then snap. The band has
+    /// to see the RAW measurement — applying it after ``quantized(_:)`` cannot
+    /// work, because two adjacent grid points differ by exactly
+    /// ``measurementGrain`` and `0.5 < 0.5` is false, so the alternation would
+    /// pass straight through. That is why the three `GeometryReader` emitters
+    /// publish `proxy.size.height` unrounded now and this function is the only
+    /// place the grid is applied.
+    ///
+    /// A genuine content change still moves: it is larger than a grain, so it
+    /// falls outside the band on the first pass.
+    public static func settled(_ previous: CGFloat, _ measured: CGFloat) -> CGFloat {
+        abs(measured - previous) < measurementGrain ? previous : quantized(measured)
+    }
+
+    /// The per-row form. A row absent from `measured` has gone from the fleet
+    /// and is dropped rather than held; a row with no previous value is
+    /// published on the grid, since there is nothing to hold to.
+    public static func settled(
+        _ previous: [String: CGFloat],
+        _ measured: [String: CGFloat]
+    ) -> [String: CGFloat] {
+        var out = measured
+        for (id, value) in measured {
+            out[id] = previous[id].map { settled($0, value) } ?? quantized(value)
+        }
+        return out
+    }
 }
