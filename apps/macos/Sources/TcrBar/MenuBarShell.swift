@@ -218,6 +218,22 @@ final class MenuBarShell {
                 self?.updateMark(state: state, awake: isOn)
             }
             .store(in: &marks)
+
+        // Phase 3 of `docs/plans/panel-sizing-generalization.md`: predict the
+        // panel's size on every poll tick and log it beside the size SwiftUI
+        // actually produced. Its own sink rather than a line inside the one
+        // above, because that one exists to compose the menu bar mark and
+        // combines a second publisher to do it — a size measurement would then
+        // also fire on every keep-awake toggle, which changes nothing about the
+        // panel's height and would print a duplicate of the previous line.
+        //
+        // Nothing here writes anything. `sizingOptions` is untouched, the
+        // popover still sizes itself, and the only output is one `NSLog`.
+        self.poller.$state
+            .sink { [weak self] state in
+                self?.logPanelSize(state: state)
+            }
+            .store(in: &marks)
     }
 
     // MARK: - The mark
@@ -262,6 +278,47 @@ final class MenuBarShell {
             button.title = "tcr"
         }
         button.toolTip = Self.toolTip(state: state, awake: isOn)
+    }
+
+    // MARK: - The panel's size, predicted against what it really is
+
+    /// One line per poll tick: what ``PanelSize`` says the popover should be,
+    /// beside what the popover actually is.
+    ///
+    /// This is the whole of phase 3 and it changes no behaviour. The question
+    /// the five-phase plan rests on — does a TextKit estimate taken outside the
+    /// view graph track what SwiftUI lays out inside it — could not be answered
+    /// by argument in the design review, and cannot be answered on this machine
+    /// either: it wants a real fleet on a real Mac, and the one that crashes is
+    /// somebody else's. So the app answers it, and the only cost of being wrong
+    /// here is a wrong number in a log.
+    ///
+    /// `state` comes from the publisher and is never re-read off the poller.
+    /// `@Published` fires in `willSet`, so `poller.state` inside this call is
+    /// still the PREVIOUS poll — a line composed from it would pair one tick's
+    /// prediction with the next tick's account count, which is exactly the kind
+    /// of quiet mismatch a reader has no way to see. The same rule the mark's
+    /// own sink follows, and for the same reason.
+    ///
+    /// `popover.contentSize` is read here rather than `hosting.view.frame`:
+    /// `contentSize` is what phase 4 will assign, so this measures the property
+    /// that is about to change owners rather than a proxy for it. With the
+    /// panel closed it is whatever the last open left behind, which is why the
+    /// line says `shown=no` instead of dropping the reading — a reader who
+    /// wants only live layouts can filter, and one debugging a panel that never
+    /// opens still gets lines.
+    private func logPanelSize(state: PollState) {
+        let delta = PanelSizeProbe.delta(
+            state: state,
+            update: updater.updateState,
+            server: server.state,
+            actualContentSize: popover.contentSize,
+            isPanelShown: popover.isShown)
+        // `"%@"` and not the string itself: `NSLog` takes a format string, and
+        // a panel line carries `%` in it the moment a cache-hit percentage
+        // reaches the header — `TcrBarApp.swift:72` logs through the same guard
+        // for the same reason.
+        NSLog("%@", delta.logLine)
     }
 
     // MARK: - The panel
