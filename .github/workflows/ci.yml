@@ -47,6 +47,14 @@ jobs:
       - name: No --org flag
         run: scripts/check-no-org-flag.sh
 
+      # The disclosure gate's own fixtures. The hooks themselves are local and a
+      # fork may not have them wired, so CI runs the suite that proves the scan
+      # still refuses what it exists to refuse — a name, a home path, a real
+      # email — in a diff AND in a commit message. A gate nobody has watched
+      # fail is a gate that reports safety.
+      - name: Disclosure scan fixtures
+        run: .githooks/test-disclosure-scan.sh
+
       # --locked: fail if CI would silently rewrite Cargo.lock. Pins the exact
       # dependency set that was reviewed — important for an auth-handling proxy.
       - name: Clippy
