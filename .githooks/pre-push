@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Pre-push disclosure gate: the last place to stop a private name, an operator's
+# home path or a real email address from becoming world-readable.
+#
+# WHY A PUSH GATE EXISTS AT ALL. The commit-time scan (.githooks/pre-commit) is
+# the right first gate and it cannot be the only one:
+#
+#   - It reads a DIFF, so it has never read a commit MESSAGE. A branch name or a
+#     private product name written in a subject line reaches GitHub unexamined.
+#   - It runs per commit on THIS machine. A commit made with --no-verify, made
+#     before a name was added to .githooks/private-names, or made in a worktree
+#     whose core.hooksPath was never set, is already in history by push time.
+#   - A public repo's history cannot be un-published. Removing a pushed line
+#     needs a force-push to a protected branch, and forks keep their own copies.
+#
+# So this scans what is actually about to leave: every commit in the push range,
+# its added lines AND its message. Pre-existing content never blocks a push —
+# only what these commits introduce.
+#
+# Deliberate exception:  git push --no-verify
+set -euo pipefail
+
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Hard-fail on a missing library rather than degrade to "found nothing": a gate
+# that cannot fail is worse than no gate, because it reports safety.
+if [ ! -f "$HOOK_DIR/lib/disclosure-scan.sh" ]; then
+  echo "pre-push: BLOCKED — .githooks/lib/disclosure-scan.sh is missing, so the" >&2
+  echo "  disclosure scan cannot run. The checkout is damaged; restore the file." >&2
+  exit 1
+fi
+# shellcheck source=lib/disclosure-scan.sh
+. "$HOOK_DIR/lib/disclosure-scan.sh"
+
+tcr_disclosure_require_names_list || exit 1
+
+ZERO='0000000000000000000000000000000000000000'
+findings=""
+scanned=0
+
+# stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  # A deletion pushes nothing.
+  case "$local_sha" in "$ZERO") continue ;; esac
+
+  if [ "$remote_sha" = "$ZERO" ]; then
+    # A new branch. Scanning its whole ancestry would flag years of history that
+    # is already public, so scan only what no other remote ref already carries.
+    range_commits="$(git rev-list "$local_sha" --not --remotes || true)"
+  else
+    range_commits="$(git rev-list "${remote_sha}..${local_sha}" || true)"
+  fi
+
+  [ -n "$range_commits" ] || continue
+
+  while IFS= read -r sha; do
+    [ -n "$sha" ] || continue
+    scanned=$((scanned + 1))
+
+    if out="$(tcr_disclosure_commit_added "$sha" | tcr_disclosure_scan_text "the changes in $(git log -1 --format=%h "$sha")")"; then
+      :
+    else
+      findings="$findings$out"
+    fi
+
+    # The MESSAGE BODY only. The author and committer identity is part of every
+    # commit by design and is already published by GitHub, so scanning it would
+    # flag every push this repo's own maintainer makes — a gate that refuses the
+    # normal case gets turned off, and then it gates nothing.
+    if out="$(git log -1 --format='%B' "$sha" | tcr_disclosure_scan_text "the message of $(git log -1 --format=%h "$sha")")"; then
+      :
+    else
+      findings="$findings$out"
+    fi
+  done <<EOF
+$range_commits
+EOF
+done
+
+if [ -n "$findings" ]; then
+  {
+    echo ""
+    echo "pre-push: BLOCKED — these commits would publish private information."
+    echo "$findings"
+    echo ""
+    echo "  This repository is PUBLIC. Once pushed, removing it requires rewriting"
+    echo "  history on a protected branch, and forks keep their own copies."
+    echo ""
+    echo "  To fix a MESSAGE:  git rebase -i --exec 'git commit --amend' <base>"
+    echo "                     or, for the tip commit, git commit --amend"
+    echo "  To fix a LINE:     edit it, then amend or add a follow-up commit."
+    echo "  If this is genuinely fine:  git push --no-verify"
+    echo ""
+  } >&2
+  exit 1
+fi
+
+[ "$scanned" -gt 0 ] && echo "pre-push: disclosure scan clean ($scanned commit(s))." >&2
+exit 0

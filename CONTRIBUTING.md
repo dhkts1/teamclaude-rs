@@ -112,6 +112,8 @@ repository.
 | Hook | What it does |
 | --- | --- |
 | `pre-commit` | Secret scan (gitleaks, on staged changes only), public-disclosure scan, `cargo fmt --check`, `swift-format lint --strict`, release-version gate, design-token staleness gate. |
+| `pre-merge-commit` | Runs `pre-commit`. Git runs this hook and not `pre-commit` when a merge creates a commit, so without it every gate above was blind to a merge. |
+| `pre-push` | Public-disclosure scan over the commits actually being pushed: their added lines **and their messages**. `git push --no-verify` to override. |
 | `post-merge` | Rebuilds the release binary so the on-disk artifact tracks the checkout. It never restarts a running proxy. |
 
 Two `pre-commit` gates are **hard failures when their tool or input is missing**: the gitleaks secret
@@ -132,6 +134,18 @@ The disclosure scan reads **added lines only**, so pre-existing content can neve
 absolute home paths (`/Users/<someone>/...`), real-looking email addresses, and any name listed in
 `.githooks/private-names`. Synthetic users (`alice`, `bob`, `test`, `example`, `runner`, ...) and
 `@example.com` / `@users.noreply.github.com` addresses are allowed, so fixtures and docs still work.
+
+A `git worktree` of this repository is a separate checkout and does not carry the list either, so the
+first commit in a fresh worktree stops the same way. Copy yours in (`cp .githooks/private-names
+<worktree>/.githooks/`); it is gitignored, so the copy never goes anywhere.
+
+The checks live in `.githooks/lib/disclosure-scan.sh` and all three hooks read them from there. Commit
+time is the right first gate and cannot be the only one: it reads a diff, so it has never read a commit
+**message**, and a commit made with `--no-verify`, made before a name was added to the list, or made in
+a checkout whose `core.hooksPath` was never set is already in history by push time. A public repo's
+history cannot be un-published. `.githooks/test-disclosure-scan.sh` holds the fixtures — a name, a home
+path and a real address, each in a diff and in a message, every one of them watched being refused —
+and CI runs it.
 
 ## Commits
 
