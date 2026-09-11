@@ -693,6 +693,58 @@ fn run_ui() -> anyhow::Result<()> {
     anyhow::bail!("`tcr ui` opens the macOS menu-bar app, and this is not macOS.")
 }
 
+/// `TCR_CLAUDE_BIN` overrides which `claude` binary we launch, taking
+/// priority over the legacy `CLAUDE_BIN` (kept for compatibility with
+/// whatever already sets it outside tcr); neither set falls back to `claude`
+/// on `PATH`. An empty value in either counts as unset — `TCR_CLAUDE_BIN=`
+/// left behind by a shell must not silently win over a real `CLAUDE_BIN`.
+const TCR_CLAUDE_BIN_ENV: &str = "TCR_CLAUDE_BIN";
+/// See [`TCR_CLAUDE_BIN_ENV`].
+const CLAUDE_BIN_ENV: &str = "CLAUDE_BIN";
+
+/// Resolves which `claude` binary to launch, through the ordered pair of env
+/// keys documented at [`TCR_CLAUDE_BIN_ENV`]. Named generally — "harness",
+/// not "claude" — because a second external harness binary will need this
+/// exact resolution order later; that second binary is not built here, but
+/// the helper already takes its own key names and default so adding it is a
+/// new pair of constants and a one-line call, not a rewrite of this function.
+fn resolve_harness_bin(specific_key: &str, legacy_key: &str, default: &str) -> String {
+    resolve_harness_bin_from(
+        std::env::var(specific_key).ok(),
+        std::env::var(legacy_key).ok(),
+        default,
+    )
+}
+
+/// [`resolve_harness_bin`]'s pure half, split out so the precedence order and
+/// the empty-string-counts-as-unset rule are unit-testable without mutating
+/// process-global env vars (which is unsound to do from parallel tests).
+fn resolve_harness_bin_from(
+    specific: Option<String>,
+    legacy: Option<String>,
+    default: &str,
+) -> String {
+    for value in [specific, legacy].into_iter().flatten() {
+        if !value.is_empty() {
+            return value;
+        }
+    }
+    default.to_string()
+}
+
+/// The `claude` binary this process should launch or probe, per
+/// [`resolve_harness_bin`].
+fn claude_bin() -> String {
+    resolve_harness_bin(TCR_CLAUDE_BIN_ENV, CLAUDE_BIN_ENV, "claude")
+}
+
+/// A fresh [`std::process::Command`] for [`claude_bin`] — the one place that
+/// spawns or would spawn the user's harness, so every call site resolves the
+/// same way.
+fn claude_command() -> std::process::Command {
+    std::process::Command::new(claude_bin())
+}
+
 /// `tcr run [-- args…]` — launch Claude Code already pointed at this proxy.
 ///
 /// Mirrors the JS `teamclaude run` passthrough contract: if the proxy is not
@@ -733,7 +785,7 @@ fn run_claude(args: RunArgs) -> anyhow::Result<()> {
         }
     }
 
-    let mut cmd = std::process::Command::new("claude");
+    let mut cmd = claude_command();
     cmd.args(&args.args);
     mark_run_active(&mut cmd);
 
@@ -844,10 +896,7 @@ enum ClaudeVersionCheck {
 }
 
 fn check_claude_version() -> ClaudeVersionCheck {
-    let output = match std::process::Command::new("claude")
-        .arg("--version")
-        .output()
-    {
+    let output = match claude_command().arg("--version").output() {
         Ok(o) if o.status.success() => o,
         _ => return ClaudeVersionCheck::Unknown,
     };
@@ -1693,6 +1742,54 @@ mod tests {
         }
     }
 
+    /// `TCR_CLAUDE_BIN` outranks `CLAUDE_BIN` when both are set.
+    #[test]
+    fn tcr_claude_bin_wins_over_the_legacy_key() {
+        assert_eq!(
+            resolve_harness_bin_from(
+                Some("/opt/beta/claude".to_string()),
+                Some("/opt/legacy/claude".to_string()),
+                "claude",
+            ),
+            "/opt/beta/claude",
+        );
+    }
+
+    /// `CLAUDE_BIN` is used when the tcr-specific key is unset.
+    #[test]
+    fn claude_bin_is_the_fallback_when_tcr_claude_bin_is_unset() {
+        assert_eq!(
+            resolve_harness_bin_from(None, Some("/opt/legacy/claude".to_string()), "claude"),
+            "/opt/legacy/claude",
+        );
+    }
+
+    /// An empty value counts as unset, for either key — a shell that leaves
+    /// `TCR_CLAUDE_BIN=` behind must not silently win over a real `CLAUDE_BIN`.
+    #[test]
+    fn an_empty_value_is_treated_as_missing() {
+        assert_eq!(
+            resolve_harness_bin_from(
+                Some(String::new()),
+                Some("/opt/legacy/claude".to_string()),
+                "claude",
+            ),
+            "/opt/legacy/claude",
+            "an empty TCR_CLAUDE_BIN must fall through to CLAUDE_BIN"
+        );
+        assert_eq!(
+            resolve_harness_bin_from(Some(String::new()), Some(String::new()), "claude"),
+            "claude",
+            "two empty values must fall through to the default"
+        );
+    }
+
+    /// Neither key set falls back to the default (`claude` on `PATH`).
+    #[test]
+    fn neither_key_set_falls_back_to_the_default() {
+        assert_eq!(resolve_harness_bin_from(None, None, "claude"), "claude");
+    }
+
     /// Pins that a configured proxy key is withheld from `claude`, and says why.
     #[test]
     fn the_proxy_key_is_withheld_from_claude_with_the_reason() {
@@ -1733,7 +1830,7 @@ mod tests {
                 &(|cmd: &mut std::process::Command| apply_base_url_env(cmd, 3456)),
             ),
         ] {
-            let mut cmd = std::process::Command::new("claude");
+            let mut cmd = claude_command();
             apply(&mut cmd);
             assert!(
                 !cmd.get_envs()
@@ -1759,7 +1856,7 @@ mod tests {
              launcher that reads it ever runs"
         );
 
-        let mut cmd = std::process::Command::new("claude");
+        let mut cmd = claude_command();
         mark_run_active(&mut cmd);
         assert!(
             cmd.get_envs()
