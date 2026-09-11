@@ -67,6 +67,7 @@ fn base(name: &str, priority: i64) -> AccountRuntime {
         // a permanently un-warmable account.
         quota_known: true,
         consecutive_probe_failures: 0,
+        consecutive_5xx_probes: 0,
         consecutive_warms_without_evidence: 0,
         warm_evidence_retry_after_ms: None,
         input_tokens: 0,
