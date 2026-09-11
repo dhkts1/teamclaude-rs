@@ -64,11 +64,20 @@ pub struct UsageBucket {
 
 /// The normalized buckets a single probe yields. `seven_day_oi` is the
 /// model-scoped (Fable) weekly, pulled from the payload's `limits[]` array.
+/// `extra_usage_usd` is not a bucket at all — see its own doc-comment.
 #[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub five_hour: Option<UsageBucket>,
     pub seven_day: Option<UsageBucket>,
     pub seven_day_oi: Option<UsageBucket>,
+    /// Real, already-billed pay-as-you-go overage in USD, from the payload's
+    /// `extra_usage` field. Unlike the three buckets above this is not a
+    /// percentage of a limit — it is a dollar amount tcr cannot derive from
+    /// response headers, so today's display falls back to `src/pricing.rs`'s
+    /// synthetic token-counted estimate. `None` means "the endpoint did not
+    /// report this field" or "its shape was not one we recognise" — never a
+    /// fabricated `0.0`; see [`parse_extra_usage_usd`].
+    pub extra_usage_usd: Option<f64>,
 }
 
 /// Why a probe failed. `status` carries the HTTP code when there was one — the
@@ -181,6 +190,29 @@ pub fn find_scoped_weekly_limit(data: &Value, needle: &str) -> Option<Value> {
     Some(Value::Object(bucket))
 }
 
+/// Pull the real, already-billed pay-as-you-go overage (in USD) out of the
+/// payload's `extra_usage` field.
+///
+/// The endpoint's exact shape for this field is as undocumented as the
+/// `limits[]` naming [`find_scoped_weekly_limit`] works around, so the same
+/// style applies here: try the plausible key names instead of betting on one,
+/// and let anything that does not match read as absent rather than `0.0`. A
+/// bare numeric `extra_usage` (no wrapping object) is accepted too, since a
+/// scalar dollar figure is at least as plausible as an object carrying one.
+fn parse_extra_usage_usd(data: &Value) -> Option<f64> {
+    let value = data.get("extra_usage")?;
+    if value.is_null() {
+        return None;
+    }
+    if let Some(scalar) = parse_pct(value) {
+        return Some(scalar);
+    }
+    ["amount", "amount_usd", "usd", "total_usd", "cost", "value"]
+        .iter()
+        .find_map(|k| value.get(*k))
+        .and_then(parse_pct)
+}
+
 /// Turn a parsed usage-endpoint payload into normalized buckets.
 pub fn usage_from_payload(data: &Value) -> Usage {
     let fable = find_scoped_weekly_limit(data, "fable");
@@ -188,6 +220,7 @@ pub fn usage_from_payload(data: &Value) -> Usage {
         five_hour: normalize_usage_bucket(data.get("five_hour")),
         seven_day: normalize_usage_bucket(data.get("seven_day")),
         seven_day_oi: normalize_usage_bucket(fable.as_ref()),
+        extra_usage_usd: parse_extra_usage_usd(data),
     }
 }
 
@@ -369,6 +402,15 @@ pub enum ProbeStatus {
     /// (this path never calls `apply_usage`), so it must NOT read as a red error —
     /// a probe 429 painting "error" on every row is exactly the bug this fixes.
     RateLimited,
+    /// A SUSTAINED run of consecutive 5xx reads from the usage endpoint — as
+    /// opposed to one or a few, which still read as the benign `RateLimited`
+    /// above. One or two 5xx is a hiccup the endpoint clears on its own; a run
+    /// that keeps going is first-hand evidence the endpoint itself is down, and
+    /// probe health being first-class means that must surface as its own
+    /// visible state rather than keep hiding behind `RateLimited`'s "benign,
+    /// self-clearing" label forever. See `Manager::probe_account`'s
+    /// `SUSTAINED_5XX_THRESHOLD`.
+    UpstreamDown,
 }
 
 impl ProbeStatus {
@@ -379,6 +421,7 @@ impl ProbeStatus {
             ProbeStatus::Error => "error",
             ProbeStatus::Timeout => "timeout",
             ProbeStatus::RateLimited => "rate-limited",
+            ProbeStatus::UpstreamDown => "upstream-down",
         }
     }
 }
@@ -518,5 +561,70 @@ mod tests {
             serde_json::json!({ "used_percentage": 5, "resets_at": "2030-01-01T00:00:00Z" });
         let out = normalize_usage_bucket(Some(&bucket)).unwrap();
         assert!(out.reset_at_ms.is_some());
+    }
+
+    /// 1a: a payload carrying real billed overage under the object shape
+    /// (`{"amount": ...}`) must reach `Usage.extra_usage_usd`, not get dropped
+    /// on the floor the way it is today.
+    #[test]
+    fn extra_usage_object_shape_is_parsed() {
+        let data = serde_json::json!({
+            "five_hour": { "used_percentage": 10 },
+            "extra_usage": { "amount": "12.34" }
+        });
+        let usage = usage_from_payload(&data);
+        assert_eq!(usage.extra_usage_usd, Some(12.34));
+    }
+
+    /// A bare numeric `extra_usage` (no wrapping object) is at least as
+    /// plausible as an object carrying the figure, so it must parse too.
+    #[test]
+    fn extra_usage_bare_numeric_shape_is_parsed() {
+        let data = serde_json::json!({ "extra_usage": 5.5 });
+        let usage = usage_from_payload(&data);
+        assert_eq!(usage.extra_usage_usd, Some(5.5));
+    }
+
+    /// A payload that never mentions `extra_usage` at all must read as absent,
+    /// never as a fabricated `0.0` — the same rule `find_scoped_weekly_limit`'s
+    /// own tests pin for the weekly bucket.
+    #[test]
+    fn extra_usage_absent_field_is_none() {
+        let data = serde_json::json!({ "five_hour": { "used_percentage": 10 } });
+        let usage = usage_from_payload(&data);
+        assert_eq!(usage.extra_usage_usd, None);
+    }
+
+    /// An `extra_usage` present under a shape this parser does not recognise
+    /// (no numeric candidate key, not a bare number) must ALSO read as absent —
+    /// an unknown shape is "we could not read this", not "there is no overage".
+    #[test]
+    fn extra_usage_unrecognised_shape_is_none_not_zero() {
+        let data = serde_json::json!({ "extra_usage": { "currency": "USD", "note": "n/a" } });
+        let usage = usage_from_payload(&data);
+        assert_eq!(
+            usage.extra_usage_usd, None,
+            "an unrecognised shape must not silently become a real-looking 0.0"
+        );
+    }
+
+    /// End to end: a reported overage survives into the tracked `Quota`, and an
+    /// absent one leaves a prior reading in place rather than erasing it.
+    #[test]
+    fn extra_usage_reaches_quota_and_survives_an_unread_probe() {
+        let with_overage = usage_from_payload(&serde_json::json!({
+            "extra_usage": { "amount": 7.0 }
+        }));
+        let mut quota = crate::quota::Quota::default();
+        quota.apply_usage(&with_overage);
+        assert_eq!(quota.extra_usage_usd, Some(7.0));
+
+        let without_overage = usage_from_payload(&serde_json::json!({ "five_hour": {} }));
+        quota.apply_usage(&without_overage);
+        assert_eq!(
+            quota.extra_usage_usd,
+            Some(7.0),
+            "an unread probe must not erase a previously learned overage"
+        );
     }
 }

@@ -4445,6 +4445,7 @@ mod tests {
                     }),
                     seven_day: None,
                     seven_day_oi: None,
+                    extra_usage_usd: None,
                 })
             })
         }
@@ -5295,6 +5296,7 @@ mod tests {
                         }),
                         seven_day: None,
                         seven_day_oi: None,
+                        extra_usage_usd: None,
                     })
                 } else {
                     Ok(Usage {
@@ -5304,6 +5306,7 @@ mod tests {
                             reset_at_ms: Some(now + 3 * 24 * 60 * 60 * 1000),
                         }),
                         seven_day_oi: None,
+                        extra_usage_usd: None,
                     })
                 }
             })
@@ -5390,12 +5393,14 @@ mod tests {
                         }),
                         seven_day: None,
                         seven_day_oi: None,
+                        extra_usage_usd: None,
                     })
                 } else {
                     Ok(Usage {
                         five_hour: None,
                         seven_day: None,
                         seven_day_oi: None,
+                        extra_usage_usd: None,
                     })
                 }
             })
@@ -5598,6 +5603,7 @@ mod tests {
                     }),
                     seven_day: None,
                     seven_day_oi: None,
+                    extra_usage_usd: None,
                 })
             })
         }

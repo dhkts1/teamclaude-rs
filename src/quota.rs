@@ -89,6 +89,12 @@ pub struct Quota {
     pub requests_remaining: Option<i64>,
     /// Reset for the standard token/request limits.
     pub standard_reset: Option<OffsetDateTime>,
+    /// Real, already-billed pay-as-you-go overage in USD, learned from a probe's
+    /// `extra_usage` field (see [`crate::probe::Usage::extra_usage_usd`]). `None`
+    /// means "never read", not "zero" — this display today falls back to
+    /// [`crate::pricing`]'s synthetic token-counted estimate, and a fabricated
+    /// `0.0` here would read as "no overage" instead of "we don't know yet".
+    pub extra_usage_usd: Option<f64>,
 }
 
 /// A generic view over "case-insensitive header name → value" so the same
@@ -349,6 +355,12 @@ impl Quota {
         apply_bucket(&mut self.five_hour, usage.five_hour, FIVE_HOUR);
         apply_bucket(&mut self.seven_day, usage.seven_day, SEVEN_DAY);
         apply_bucket(&mut self.seven_day_oi, usage.seven_day_oi, SEVEN_DAY);
+        // Same rule as the buckets above: only a reported value overwrites.
+        // `None` (unread this time) leaves whatever was last learned in place,
+        // rather than erasing it back to "unknown".
+        if let Some(extra) = usage.extra_usage_usd {
+            self.extra_usage_usd = Some(extra);
+        }
     }
 }
 

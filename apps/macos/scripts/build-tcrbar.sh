@@ -46,7 +46,17 @@ url_scheme="tcrbar"
 
 # Where the appcast lives. Sparkle reads this out of Info.plist at runtime, so it
 # is written once here rather than compiled into the app.
-feed_url="https://github.com/dhkts1/teamclaude-rs/releases/latest/download/appcast.xml"
+#
+# NOT `releases/latest/download/appcast.xml` any more. `/releases/latest/`
+# follows whichever GitHub Release is newest, including a CLI-only cargo-dist
+# release that carries no appcast — the fifth time that broke every installed
+# copy's updater was 2026-08-27 (v0.2.27). This points at a fixed location on
+# the `gh-pages` branch instead, which only `publish-appcast-feed.sh` ever
+# writes (see that script and docs/RELEASING.md § "The update feed"), so a
+# CLI-only release can no longer become the feed. raw.githubusercontent.com
+# needs no GitHub Pages configuration — it serves any branch's file content
+# directly.
+feed_url="https://raw.githubusercontent.com/dhkts1/teamclaude-rs/gh-pages/appcast.xml"
 
 # Build stamp. A missing or unreadable .git must never fail the build.
 #

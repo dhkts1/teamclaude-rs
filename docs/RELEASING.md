@@ -99,6 +99,63 @@ Flags:
 - `--tag vX.Y.Z` — must equal `v<Cargo.toml version>`. Mismatch aborts.
 - `--verify-only <path/to/TcrBar.app>` — run the signature asserts against an existing bundle.
 
+## The update feed
+
+`SUFeedURL` (in `apps/macos/scripts/build-tcrbar.sh`) is now a FIXED location:
+
+```
+https://raw.githubusercontent.com/dhkts1/teamclaude-rs/gh-pages/appcast.xml
+```
+
+It used to be `.../releases/latest/download/appcast.xml`, and `/releases/latest/`
+follows whichever GitHub Release is newest — including a CLI-only `release.yml`
+(cargo-dist) release that carries no appcast. That class of bug orphaned the
+feed five times, most recently 2026-08-27 (v0.2.27): the app cannot be fixed by
+shipping a new build, because the broken URL is already compiled into the
+installs that are failing. `.github/workflows/appcast-guard.yml`'s header has
+the full incident history.
+
+The fix removes the lookup rather than repairing it. The feed now lives on the
+`gh-pages` branch, a single committed `appcast.xml`, served directly by
+`raw.githubusercontent.com` — no GitHub Pages configuration needed, because
+that host serves any branch's file content whether or not Pages is enabled for
+the repository. Only `apps/macos/scripts/publish-appcast-feed.sh` ever writes
+that branch, and nothing in `.github/workflows/release.yml` (the CLI path)
+touches it, so a CLI-only release can no longer become the feed — the failure
+class is structurally impossible for any build carrying this fix.
+
+**Run it as its own step, after release-tcrbar.sh stage 9, once the appcast
+entry is committed to main:**
+
+```sh
+apps/macos/scripts/publish-appcast-feed.sh            # pushes gh-pages
+apps/macos/scripts/publish-appcast-feed.sh --dry-run   # shows what it would do, pushes nothing
+```
+
+It is deliberately NOT called by `release-tcrbar.sh` itself. That script's own
+header states it performs no git writes, on purpose, because this checkout
+routinely holds sibling sessions' uncommitted work; wiring a push in
+automatically would make that statement false. The script is idempotent (a
+second run against unchanged bytes is a no-op, reported as such) and writes
+through git plumbing only — `hash-object`/`mktree`/`commit-tree` — never a
+checkout, so it cannot touch this worktree's index or HEAD.
+
+**Old installs are not orphaned by this change.** `release-tcrbar.sh` stage 9
+still uploads `appcast.xml` to the GitHub Release asset, exactly as before, so
+`/releases/latest/download/appcast.xml` keeps resolving for every copy built
+before this fix — those copies still read `SUFeedURL` out of the Info.plist
+they were built with, and only stop depending on `/releases/latest/` once
+they've updated at least once to a build carrying the new URL.
+
+**`.github/workflows/appcast-guard.yml` is kept, not deleted**, specifically
+for that transition window — it still protects the old URL for not-yet-updated
+installs. Its automatic `release: published` trigger has been dead since
+before this change (GitHub does not fire that event for a release a workflow
+published with the default `GITHUB_TOKEN`, which is exactly how `release.yml`
+publishes), and that is documented in the workflow's own header now rather
+than left unsaid. `workflow_dispatch` — the manual repair hatch — does not
+depend on that event and still works.
+
 ## The app shows the release notes after an update
 
 On the first launch of a version the operator has not seen, TcrBar fetches the GitHub Release
@@ -127,6 +184,10 @@ only once notes were actually shown. A fresh install records the current version
 7. **Sparkle signature** — `sign_update` produces the EdDSA signature and byte length.
 8. **Appcast** — a new `<item>` is inserted at the marker comment in `apps/macos/appcast.xml`.
 9. **Publish** — `gh release upload` puts the DMG and `appcast.xml` on the release for the tag.
+10. **Publish the feed** — a separate, manual step: once that `<item>` is committed to main,
+    `apps/macos/scripts/publish-appcast-feed.sh` pushes it to `gh-pages`. This is the step
+    `SUFeedURL` actually reads; step 9's upload now exists only to keep pre-migration installs
+    working. See "The update feed" above.
 
 ## Why there are no signing secrets in GitHub
 
@@ -243,11 +304,17 @@ things they catch are not the same things a previous release passing catches.
 
 ## Known gap: a tag publishes the CLI release before the app is built
 
+**This section describes a gap in the retired `/releases/latest/` feed only.** A build carrying the
+fixed `gh-pages` URL (see "The update feed" above) never reads `/releases/latest/` at all, so this
+timing window cannot affect it — `SUFeedURL` simply doesn't move when `release.yml` fires. It still
+applies to every copy built before that fix, until it updates at least once to a build carrying the
+new URL, which is why the mitigation below is still worth running.
+
 `release.yml` (cargo-dist) fires on the tag push and publishes its GitHub Release immediately, with
 the CLI tarballs attached. The DMG and `appcast.xml` only arrive minutes later, when
 `release-local.sh` finishes. In that window the new tag is the **latest** release and carries no
-`appcast.xml`, so `releases/latest/download/appcast.xml` — the `SUFeedURL` every installed copy
-polls — returns **404**, and no install can check for updates.
+`appcast.xml`, so `releases/latest/download/appcast.xml` — the `SUFeedURL` those older copies
+poll — returns **404**, and they cannot check for updates.
 
 Observed on 0.2.26: confirmed 404 against the live URL, cleared by marking the tag prerelease so
 `latest` fell back to 0.2.25.

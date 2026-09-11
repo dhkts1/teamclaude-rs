@@ -79,7 +79,17 @@ fi
 [ -n "$target_dir" ] || target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 bin="$target_dir/release/tcr"
 
-log=$(mktemp -t tcr-post-merge)
+# `mktemp -t <name>` without X's is BSD-only. GNU coreutils refuses it outright
+# ("too few X's in template"), and a Claude Code session on this machine runs
+# with GNU tools first on PATH, so this line failed there while working perfectly
+# in a login zsh. The consequence was worse than a missing temp file: `log` came
+# back empty, `>"$log"` redirected to an empty path, the build never ran, and the
+# hook took its failure branch and reported a build failure for a build that was
+# never attempted. Measured 2026-09-12 on a real merge.
+log=$(mktemp -t tcr-post-merge.XXXXXX) || {
+  echo "post-merge: mktemp failed, so the release rebuild was NOT attempted." >&2
+  exit 0
+}
 if cargo build --release >"$log" 2>&1; then
   rm -f "$log"
   # Replacing the release binary does NOT disturb a running server: on Unix the
