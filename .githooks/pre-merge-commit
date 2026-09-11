@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# git runs pre-merge-commit, NOT pre-commit, when a merge creates a commit.
+#
+# Every gate in pre-commit was therefore blind to a merge: the disclosure scan,
+# the secret scan, the format checks. A branch carrying a private name, an
+# operator's home path or a real email could be merged into main and pushed
+# without a single gate reading it, because nothing about a merge is ever staged
+# in the sense `git diff --cached` means. (henry-plugin hit the same hole on
+# 2026-09-10 and fixed it the same way.)
+#
+# Deliberate exception:  git merge --no-verify
+exec "$(dirname "$0")/pre-commit" "$@"
