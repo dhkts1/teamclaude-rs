@@ -539,6 +539,23 @@ of is how this repo once lost seven hours of prompt-cache to session-affinity be
 off. Check `tcr status` (`http1Only=` on the `source=` line, `http1Only` per row with
 `--json`) or the `"server started"` log line at boot.
 
+## Environment overrides
+
+Two keys are not part of the config file; they are read from the process environment by
+`tcr run` (and by `--group`'s version check, which also launches `claude`) to decide which
+`claude` binary to run. Neither exists in the file above because neither is a setting a
+config edit can change without a rebuild of the session's shell environment anyway.
+
+| env var | default | what it does |
+|---|---|---|
+| `TCR_CLAUDE_BIN` | absent | path or name of the `claude` binary to launch, outranking `CLAUDE_BIN` |
+| `CLAUDE_BIN` | absent | same, as a fallback when `TCR_CLAUDE_BIN` is unset; kept for whatever already sets it outside `tcr` |
+
+Neither set falls back to `claude` resolved from `PATH`, today's only behaviour. **An empty
+value in either counts as unset** — `TCR_CLAUDE_BIN=` left behind by a shell does not
+silently win over a real `CLAUDE_BIN`, and two empty values fall all the way through to the
+`PATH` default.
+
 ## File permissions and secrecy
 
 The config holds live OAuth access and refresh tokens for every account. It is written
