@@ -36,6 +36,36 @@
 # real TcrBar release (which uploads its own, with the new version's entry and a
 # matching enclosure length) is never overwritten by the repository's copy.
 # Order does not matter: whichever of the two runs second is a no-op.
+#
+# KEPT, BUT REDUCED IN SCOPE — read before touching the `on:` block below.
+#
+# SUFeedURL no longer points at `/releases/latest/download/appcast.xml` as of
+# the gh-pages feed (apps/macos/scripts/publish-appcast-feed.sh,
+# docs/RELEASING.md § "The update feed"). For a build carrying that fix, the
+# whole class this guard exists for is structurally impossible: the feed lives
+# on refs/heads/gh-pages, which the CLI release workflow
+# (.github/workflows/release.yml) never touches, so a CLI-only release cannot
+# become the feed regardless of what `/releases/latest/` resolves to. This
+# guard is kept anyway because every copy built BEFORE that fix still carries
+# the old URL and stays exposed to exactly this failure until it updates —
+# which it can only do by successfully reaching the feed at least once, so
+# `/releases/latest/download/appcast.xml` must keep resolving for them in the
+# meantime.
+#
+# THE TRIGGER BELOW HAS BEEN DEAD SINCE THIS FILE WAS WRITTEN, not from any
+# change in this commit. GitHub does not fire `release: published` for a
+# release created by a workflow using the default `GITHUB_TOKEN` (the anti-
+# recursion rule that also keeps a `GITHUB_TOKEN`-authored push from
+# retriggering `push`-triggered workflows) — and `release.yml` (cargo-dist) is
+# exactly that: `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`. So the automatic path
+# has never once run against the release type that orphaned the feed on
+# 2026-08-27; only a release published by a human through the UI, or with a
+# personal token, would fire it. This is not being repaired here — see the
+# task this file's change came from — but it is also not a reason to delete
+# the job: `workflow_dispatch` does not depend on that event at all, so
+# `scripts/guard-appcast-window.sh`-style manual repair
+# (`gh workflow run "Appcast feed guard" -f tag=vX.Y.Z`) still works exactly as
+# documented, on demand, independent of whether the auto-trigger ever fires.
 name: Appcast feed guard
 
 on:
