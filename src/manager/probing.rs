@@ -4,6 +4,15 @@ use super::*;
 
 const PROBE_MAX_RETRY_AFTER_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Consecutive 5xx probe reads, counted separately from every other failure
+/// kind, that escalate an account's probe health from the benign `RateLimited`
+/// to the visible `ProbeStatus::UpstreamDown`. Mirrors
+/// `PROBE_FAILURES_BEFORE_WARMING_UNPROBED` in shape (three is a hiccup, not a
+/// verdict) but must stay its own counter: a 429 self-clears and must never
+/// feed this, or a benign self-throttle would get painted with the same
+/// "endpoint is down" signal a sustained 5xx run is.
+pub(crate) const SUSTAINED_5XX_THRESHOLD: u32 = 3;
+
 impl Manager {
     /// Record the health of account `idx`'s most recent probe. A failing probe
     /// stamps a visible status + message (never a silently-frozen bar), while an
@@ -42,7 +51,10 @@ impl Manager {
                 }
                 // Not a terminal outcome; it says nothing either way.
                 ProbeStatus::Never => false,
-                ProbeStatus::Error | ProbeStatus::Timeout | ProbeStatus::RateLimited => {
+                ProbeStatus::Error
+                | ProbeStatus::Timeout
+                | ProbeStatus::RateLimited
+                | ProbeStatus::UpstreamDown => {
                     account.consecutive_probe_failures =
                         account.consecutive_probe_failures.saturating_add(1);
                     if status == ProbeStatus::RateLimited {
@@ -74,6 +86,26 @@ impl Manager {
             // after becoming eligible.
             self.warm_wake.notify_one();
         }
+    }
+
+    /// Track SUSTAINED (not merely occasional) 5xx reads from the usage
+    /// endpoint, kept separately from `consecutive_probe_failures`: that counter
+    /// is bumped by every failure kind alike, so folding 5xx into it would let a
+    /// 429 and a real outage contribute to the same signal. A 429 self-clears
+    /// and must reset this counter to `0`, same as a success does. Returns the
+    /// count AFTER this update, so the caller compares it to
+    /// [`SUSTAINED_5XX_THRESHOLD`] in the same breath.
+    fn note_5xx_probe(&self, idx: usize, is_5xx: bool) -> u32 {
+        let mut accounts = self.accounts.write().expect("accounts lock poisoned");
+        let Some(account) = accounts.get_mut(idx) else {
+            return 0;
+        };
+        account.consecutive_5xx_probes = if is_5xx {
+            account.consecutive_5xx_probes.saturating_add(1)
+        } else {
+            0
+        };
+        account.consecutive_5xx_probes
     }
 
     /// The OAuth account indices eligible for a usage probe: an OAuth account with a
@@ -191,24 +223,45 @@ impl Manager {
         match result {
             Ok(usage) => {
                 self.apply_usage(idx, &usage);
+                // A successful read is first-hand evidence the endpoint is up —
+                // clear any run of 5xx reads the same way a 429's self-clearing
+                // resets it below.
+                self.note_5xx_probe(idx, false);
                 self.record_probe(idx, ProbeStatus::Ok, None, None);
             }
             Err(err) => {
                 let msg = err.message.to_lowercase();
                 let is_timeout = msg.contains("timed out") || msg.contains("timeout");
+                let is_5xx = matches!(err.status, Some(s) if (500..=599).contains(&s));
                 // A failing probe never blanks the last-learned bar (no apply_usage
                 // on this path), so the only question is how loud to be. Soften only
                 // ENDPOINT-side failures where the credential is provably fine: a 429
-                // (the usage endpoint throttling the probe itself) or a transient 5xx
-                // read as a benign, self-clearing `RateLimited`, never the false
-                // fleet-wide "error" a bursted sweep used to paint. But a TRANSPORT
-                // failure (no HTTP status, not a timeout — connection refused, DNS/TLS,
-                // a proxy-env regression) stays a visible `Error`: a persistent one is
-                // a real connectivity problem and must NOT hide behind a benign label
-                // (probe health is first-class — masking it defeats the point).
+                // (the usage endpoint throttling the probe itself) reads as a benign,
+                // self-clearing `RateLimited`, never the false fleet-wide "error" a
+                // bursted sweep used to paint — and it always stays `RateLimited`
+                // regardless of how many in a row, because a 429 is tcr's own
+                // self-throttle tripping the endpoint's burst limit and clears the
+                // moment the burst ends. A 5xx is different: one or two is still the
+                // same benign, self-clearing `RateLimited` a 429 gets, but a SUSTAINED
+                // run — `SUSTAINED_5XX_THRESHOLD` consecutive reads — is first-hand
+                // evidence the endpoint itself is down, not self-throttling, and must
+                // escalate to its own visible `UpstreamDown` rather than keep hiding
+                // behind the benign label forever. A TRANSPORT failure (no HTTP
+                // status, not a timeout — connection refused, DNS/TLS, a proxy-env
+                // regression) stays a visible `Error` from the first read: a
+                // persistent one is a real connectivity problem and must NOT hide
+                // behind a benign label (probe health is first-class — masking it
+                // defeats the point).
+                let consecutive_5xx = self.note_5xx_probe(idx, is_5xx);
                 let status = match err.status {
                     Some(429) => ProbeStatus::RateLimited,
-                    Some(s) if (500..=599).contains(&s) => ProbeStatus::RateLimited,
+                    Some(s) if (500..=599).contains(&s) => {
+                        if consecutive_5xx >= SUSTAINED_5XX_THRESHOLD {
+                            ProbeStatus::UpstreamDown
+                        } else {
+                            ProbeStatus::RateLimited
+                        }
+                    }
                     Some(_) => ProbeStatus::Error,
                     None if is_timeout => ProbeStatus::Timeout,
                     None => ProbeStatus::Error,
