@@ -175,7 +175,12 @@ only once notes were actually shown. A fresh install records the current version
 3. **Re-sign with `--options runtime --timestamp`.** The hardened runtime is a notarization
    prerequisite; without it `notarytool` rejects the submission with a message that does not say so.
    Nested `Contents/MacOS/tcr` is signed *before* the bundle, because the bundle's seal covers it.
-4. **DMG** via `create-dmg` (`brew install create-dmg`), drag-to-Applications layout, then signed.
+4. **DMG** via `create-dmg` (`brew install create-dmg`), then signed. It carries the app and an
+   `Applications` symlink, so drag-to-install works, but the icons are NOT positioned: the release
+   passes `--skip-jenkins`, which suppresses the Finder-driving AppleScript. That AppleScript mounted
+   the image and opened a real Finder window on the operator mid-release, and it was also the only
+   part of the stage that ever failed (the `-10006` incident documented in the script). Skipping it
+   trades icon positions for a quiet, deterministic build.
 5. **Notarize** — `xcrun notarytool submit --wait` with an App Store Connect **API key**. Not an
    Apple ID plus app-specific password: that pair is tied to one person's account and breaks when
    their 2FA setup changes.

@@ -532,8 +532,16 @@ main() {
   command -v create-dmg >/dev/null 2>&1 \
     || die "create-dmg is not installed. Install it with: brew install create-dmg"
   rm -f "$dmg"
-  # create-dmg exits 2 when it built the image but could not set the window
-  # background; that is cosmetic and not a release failure.
+  # --skip-jenkins suppresses the Finder-prettifying AppleScript. Two reasons,
+  # and the operator's is the first: that AppleScript MOUNTS the image and drives
+  # a real Finder window on whoever is running the release, so a window appears
+  # on screen mid-build. Second, it is the only part of this stage that ever
+  # failed (see the FALLBACK note below). The window-size/icon/app-drop-link
+  # flags are kept because create-dmg still creates the Applications symlink
+  # from --app-drop-link; only the icon POSITIONS need AppleScript, and those are
+  # what we give up. Verified 2026-09-12: with this flag the image contains
+  # TcrBar.app plus `Applications -> /Applications`, create-dmg exits 0, and it
+  # prints "Will skip running AppleScript to configure DMG aesthetics".
   create-dmg \
     --volname "$app_name $version" \
     --window-size 520 340 \
@@ -541,24 +549,26 @@ main() {
     --icon "$app_name.app" 130 170 \
     --app-drop-link 390 170 \
     --hdiutil-quiet \
+    --skip-jenkins \
     "$dmg" "$app_dir" || true
 
   # FALLBACK — because the tolerant `|| [ -f "$dmg" ]` above is not enough.
   #
-  # create-dmg styles the image by driving Finder over AppleScript. That step can
-  # fail OUTRIGHT rather than cosmetically, and when it does it aborts before the
-  # image is finalised — so there is no file left to tolerate and the whole release
-  # dies on presentation. Measured 2026-08-15 on v0.2.12, twice in a row, with
+  # create-dmg used to style the image by driving Finder over AppleScript, and
+  # that step could fail OUTRIGHT rather than cosmetically — aborting before the
+  # image was finalised, so there was no file left to tolerate and the release
+  # died on presentation. Measured 2026-08-15 on v0.2.12, twice in a row, with
   # Finder reachable and the screen unlocked:
   #
   #   execution error: Finder got an error: Can't set statusbar visible of
   #   container window of disk "dmg.bB4bq2" to false. (-10006)
   #
-  # Nothing downstream cares what the window looks like: codesign, notarytool,
-  # stapler and Sparkle all operate on the image, not on its Finder presentation.
-  # Losing a release to a drag-and-drop background is the wrong trade, so fall back
-  # to a plain image — and say so loudly, because the DMG a user opens will look
-  # different from every previous one and that must not be a silent change.
+  # --skip-jenkins above means that AppleScript no longer runs at all, so THAT
+  # failure is now structurally impossible rather than merely tolerated. The
+  # fallback is kept for any other reason create-dmg might produce no image, and
+  # because nothing downstream cares what the window looks like: codesign,
+  # notarytool, stapler and Sparkle all operate on the image, not its Finder
+  # presentation.
   #
   # The staging dir reproduces the one affordance that matters, the Applications
   # symlink, so the fallback image is still usable by hand. `ditto` rather than
@@ -566,8 +576,9 @@ main() {
   # naive copy can strip — and an unsigned app inside a signed image fails
   # notarization for a reason that looks nothing like its cause.
   if [ ! -f "$dmg" ]; then
-    printf 'WARNING: create-dmg produced no image — falling back to an UNSTYLED hdiutil image.\n' >&2
-    printf 'WARNING:   the drag-to-Applications window layout will be missing.\n' >&2
+    printf 'WARNING: create-dmg produced no image — falling back to a plain hdiutil image.\n' >&2
+    printf 'WARNING:   presentation is equivalent (icon positions are already skipped), but the\n' >&2
+    printf 'WARNING:   volume was built by a different tool, so check it opens before shipping.\n' >&2
     printf 'WARNING:   signing, notarization, stapling and the Sparkle feed are unaffected.\n' >&2
     dmg_stage="$(mktemp -d)"
     ditto "$app_dir" "$dmg_stage/$(basename "$app_dir")" \
