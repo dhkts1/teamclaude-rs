@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+  <channel>
+    <title>TcrBar</title>
+    <description>Updates for TcrBar</description>
+    <language>en</language>
+    <!-- release-tcrbar.sh inserts new items directly below this line -->
+    <item>
+      <title>TcrBar 0.2.46</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.46</link>
+      <sparkle:version>513</sparkle:version>
+      <sparkle:shortVersionString>0.2.46</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sat, 12 Sep 2026 11:34:33 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.46/TcrBar-0.2.46.dmg" type="application/octet-stream" sparkle:edSignature="X1ip4hnOYWaQLnuGTvun0VBgpaDEG9EirhTc1Fzur7ogwePl0TI43hmdah36uIHVAPVV93Fv6pFFxUqM0lSGDA==" length="6722859" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.45</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.45</link>
+      <sparkle:version>501</sparkle:version>
+      <sparkle:shortVersionString>0.2.45</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 09 Sep 2026 13:02:40 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.45/TcrBar-0.2.45.dmg" type="application/octet-stream" sparkle:edSignature="HnzJEoJVeCnbEumd3E5glw46fQmly/PkA3+K1whzP5W0ogayn4tdC0/kGlgmTfqg7gejwUw1mowQY5Wb6Ij7CQ==" length="8392049" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.44</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.44</link>
+      <sparkle:version>499</sparkle:version>
+      <sparkle:shortVersionString>0.2.44</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 09 Sep 2026 06:36:58 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.44/TcrBar-0.2.44.dmg" type="application/octet-stream" sparkle:edSignature="ZNhhvBK/9HlIwmzFFsFGb5djHfrNdJ1nZm5f9psxt/QOKMWSIzgM1ixJvjOO3qsrNPC5BVSWO6TyglPJzYXfCA==" length="7304110" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.43</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.43</link>
+      <sparkle:version>496</sparkle:version>
+      <sparkle:shortVersionString>0.2.43</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 08 Sep 2026 07:59:47 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.43/TcrBar-0.2.43.dmg" type="application/octet-stream" sparkle:edSignature="xX5VrIsuJJ+gfm7y/hAAreMADSaTx1Fc4ZG213Arwztwlr98L1laOgxLDn+OTdY1EWK0RYL1V7UTDURyqTkvCQ==" length="7305804" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.40</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.40</link>
+      <sparkle:version>492</sparkle:version>
+      <sparkle:shortVersionString>0.2.40</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 07 Sep 2026 18:21:17 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.40/TcrBar-0.2.40.dmg" type="application/octet-stream" sparkle:edSignature="8PsD79jdIVTpVrLlwvaQo/oMKv+bKelfeb0loEock/IEblQbbBVrz0RMumUG9d77h+fBGpuYRZRutoucBzCeDA==" length="6619862" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.39</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.39</link>
+      <sparkle:version>490</sparkle:version>
+      <sparkle:shortVersionString>0.2.39</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 07 Sep 2026 17:25:45 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.39/TcrBar-0.2.39.dmg" type="application/octet-stream" sparkle:edSignature="TP5JpccTZSkuWRRtQbr6NNmcSc1c27u2QgyFb8r+sl0Nhgz77z9p4KsPnyGlOT/krYRkDNsOLFJ8jn7RuYYaCQ==" length="6599050" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.38</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.38</link>
+      <sparkle:version>488</sparkle:version>
+      <sparkle:shortVersionString>0.2.38</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 07 Sep 2026 15:46:39 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.38/TcrBar-0.2.38.dmg" type="application/octet-stream" sparkle:edSignature="LPQtveo+DUuzfJ6pdVwk64G5ZG95qDzC82uu/UGJHuIrsBcPxPdx8MSpnGk5erGjsBDJ0MpsFZArclHBi68BAA==" length="6584743" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.37</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.37</link>
+      <sparkle:version>484</sparkle:version>
+      <sparkle:shortVersionString>0.2.37</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 07 Sep 2026 13:23:34 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.37/TcrBar-0.2.37.dmg" type="application/octet-stream" sparkle:edSignature="WTdokQqpq4ky2knetL2DfX95NKkalWG1/TvaVCZBhdok/Db1Qq2nXphnWSv91Sq7WVU0vvGF/rmRTBOe5kvxBQ==" length="6572500" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.36</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.36</link>
+      <sparkle:version>481</sparkle:version>
+      <sparkle:shortVersionString>0.2.36</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 06 Sep 2026 14:12:33 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.36/TcrBar-0.2.36.dmg" type="application/octet-stream" sparkle:edSignature="+I+E9h3rIwiePW6p8LzJDTG9dODkEe6O92bGRpOl2Tkfm2GUTnoKhhlAyUVVkbzvaGshcIqv/F7+ElzJhxM6CA==" length="6516299" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.35</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.35</link>
+      <sparkle:version>479</sparkle:version>
+      <sparkle:shortVersionString>0.2.35</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 06 Sep 2026 13:45:10 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.35/TcrBar-0.2.35.dmg" type="application/octet-stream" sparkle:edSignature="WkEauQjdj6xfGC11bUJCXmFfrUkRibJhEuWC4o2ggSslFZXhC4yO4Oypy7meHpPT12Jh94B64GuZGJo1OmEFBQ==" length="7184317" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.34</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.34</link>
+      <sparkle:version>477</sparkle:version>
+      <sparkle:shortVersionString>0.2.34</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 06 Sep 2026 12:43:18 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.34/TcrBar-0.2.34.dmg" type="application/octet-stream" sparkle:edSignature="PHZR4s/bs+83xitFxZT1mRwyDKBWR9041zWdMZBLfgvRI9v1q02VWB9GIQhP0UNdOGYkC6I++z2Jl2u2elyiBg==" length="6456923" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.33</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.33</link>
+      <sparkle:version>475</sparkle:version>
+      <sparkle:shortVersionString>0.2.33</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sat, 05 Sep 2026 20:52:17 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.33/TcrBar-0.2.33.dmg" type="application/octet-stream" sparkle:edSignature="315pFkAp2zq96x+wJUvCW+ANNlM2cpoFDCGGqudn+9nx0T4q3P5AH/rpdya7AuPLRAUbXkZ7IO9sRBW18rX2Bg==" length="6438783" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.32</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.32</link>
+      <sparkle:version>469</sparkle:version>
+      <sparkle:shortVersionString>0.2.32</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 02 Sep 2026 20:59:05 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.32/TcrBar-0.2.32.dmg" type="application/octet-stream" sparkle:edSignature="WOXVn4P0QV3VuPfCwvm26xDNipKAYQJzCgjGra4V4cJe0TPkbaI6wCJzu3QfSgiH80GcNF8oeWLdbVGXrcdUAg==" length="6428852" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.31</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.31</link>
+      <sparkle:version>465</sparkle:version>
+      <sparkle:shortVersionString>0.2.31</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 01 Sep 2026 14:30:46 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.31/TcrBar-0.2.31.dmg" type="application/octet-stream" sparkle:edSignature="mifIgBwFNl5tTikLgt9jtlVCnm/hCyqIiDa6u5C9jHSvdfssA/0FR9elKR0YwbdKiUGM/Jq21/pu1JLtxucrBg==" length="6420609" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.30</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.30</link>
+      <sparkle:version>463</sparkle:version>
+      <sparkle:shortVersionString>0.2.30</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 30 Aug 2026 14:39:38 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.30/TcrBar-0.2.30.dmg" type="application/octet-stream" sparkle:edSignature="YkMRkK8VHPTYiyE0DQiLA1GsbpvQGfZyv3oZfex+eJ1zGNGpyn4W+9LsegbLjXLpiTT2LMy98+DEQelykCYcDA==" length="6410715" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.29</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.29</link>
+      <sparkle:version>458</sparkle:version>
+      <sparkle:shortVersionString>0.2.29</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 27 Aug 2026 15:05:09 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.29/TcrBar-0.2.29.dmg" type="application/octet-stream" sparkle:edSignature="oSOYbPnJ0t9bblk682OzJWUzCSzHTqbOe9zeI/DtwPVX/z9EiA7ITzkO+IHCqTr2qjtAmw7M4kVgqU9tx+QBCg==" length="6401256" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.28</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.28</link>
+      <sparkle:version>456</sparkle:version>
+      <sparkle:shortVersionString>0.2.28</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 27 Aug 2026 12:53:14 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.28/TcrBar-0.2.28.dmg" type="application/octet-stream" sparkle:edSignature="eToI5cuG6JEGYnGrxHMA9GVdTbf77WldwXYyq77sRGS1RZFf22lBsCp6Qgxtn1CtSHjXhp7NOaJeK28sJfHiBA==" length="6396360" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.27</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.27</link>
+      <sparkle:version>453</sparkle:version>
+      <sparkle:shortVersionString>0.2.27</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 27 Aug 2026 10:10:48 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.27/TcrBar-0.2.27.dmg" type="application/octet-stream" sparkle:edSignature="DrIkZT6STgX07a4tlJ5DEvKspZK5mifNcMeghZteZnWxliJseiKBbyk4tSPntAJre6yAYcHG3wg55BppB4WhBg==" length="7052762" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.26</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.26</link>
+      <sparkle:version>451</sparkle:version>
+      <sparkle:shortVersionString>0.2.26</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 26 Aug 2026 11:38:12 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.26/TcrBar-0.2.26.dmg" type="application/octet-stream" sparkle:edSignature="/xFxhkJ9uKcmq7hnrniWkqvdl8+Kc4itWFeNaVNT7HXCUc0YwbvvHenJQ+jE5R4CNlJvP8XKBVYoAIKcxyBLCw==" length="6397073" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.25</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.25</link>
+      <sparkle:version>449</sparkle:version>
+      <sparkle:shortVersionString>0.2.25</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 25 Aug 2026 13:25:10 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.25/TcrBar-0.2.25.dmg" type="application/octet-stream" sparkle:edSignature="EAUnjcbljm5LNuhdoTdU7LEG99+0xc0NdFsxEu9XIDuT620CXDzG4u1kIAarixJt8/8UeGsFqI9hvFN1j8JbCw==" length="6396171" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.24</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.24</link>
+      <sparkle:version>444</sparkle:version>
+      <sparkle:shortVersionString>0.2.24</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 25 Aug 2026 11:56:11 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.24/TcrBar-0.2.24.dmg" type="application/octet-stream" sparkle:edSignature="FJ5eyLjUy9Qtb5lNEVkLQ5FLQg4XrXSGOSauomLBwMW4zpjUW1414nhFJplXnSi9g9+YANbfxneB/ZBRWfxjAA==" length="6228138" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.23</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.23</link>
+      <sparkle:version>442</sparkle:version>
+      <sparkle:shortVersionString>0.2.23</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 23 Aug 2026 19:37:13 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.23/TcrBar-0.2.23.dmg" type="application/octet-stream" sparkle:edSignature="eZyS02kcmNa7LOjvsB2+962qPxi5bVKl/u7wYPScPJdHYI91uGvfJV9pZdOhkFKfFnzi7loUY1yZxmlG8M7BCA==" length="6226088" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.22</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.22</link>
+      <sparkle:version>426</sparkle:version>
+      <sparkle:shortVersionString>0.2.22</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 21 Aug 2026 08:32:33 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.22/TcrBar-0.2.22.dmg" type="application/octet-stream" sparkle:edSignature="CpVDKXuZfd+SFjSDWxQxmTi2ZNiiLOUah7GLzykDtX13LoWRMlaoccjTUkyaaYLtMklmIRbvMMrIYVJ9mlNRBA==" length="6274421" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.19</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.19</link>
+      <sparkle:version>413</sparkle:version>
+      <sparkle:shortVersionString>0.2.19</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 20 Aug 2026 14:50:40 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.19/TcrBar-0.2.19.dmg" type="application/octet-stream" sparkle:edSignature="81wjbDnO7h6QyKMH/HFF7XNEmQpQgURxvAlfzuaZe1Sox9xW7P93+U8Dzi1yaDRoKI83ULNBOEIxYLI+h6NgBg==" length="6628096" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.18</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.18</link>
+      <sparkle:version>411</sparkle:version>
+      <sparkle:shortVersionString>0.2.18</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 18 Aug 2026 14:08:14 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.18/TcrBar-0.2.18.dmg" type="application/octet-stream" sparkle:edSignature="0RwpCFNHUF92jWdCWpvtPVI6uM0T/+mwSftOatnz/apcFpq8onfFAAy09nlVvVsRvSWRIktycf+etHzMKGOiAA==" length="6008032" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.17</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.17</link>
+      <sparkle:version>408</sparkle:version>
+      <sparkle:shortVersionString>0.2.17</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Tue, 18 Aug 2026 08:49:02 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.17/TcrBar-0.2.17.dmg" type="application/octet-stream" sparkle:edSignature="eosddHL74Tf4aLlxsTMyIwUc/234cDjHwVRsbpicpkxQmf+X7WaUddNBwPD4fdEaCqw0xw3Kd7v+OecSmOgbBQ==" length="5997814" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.15</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.15</link>
+      <sparkle:version>401</sparkle:version>
+      <sparkle:shortVersionString>0.2.15</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sat, 15 Aug 2026 11:23:20 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.15/TcrBar-0.2.15.dmg" type="application/octet-stream" sparkle:edSignature="0ESfe7UBoo3llTsvLOUJg17Se6N+dzTlcjRxPNBGKJtyojdNrqxC+45EgKz0i4zKzd2HosJJLecoq+ZC0S5tDw==" length="5986763" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.13</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.13</link>
+      <sparkle:version>393</sparkle:version>
+      <sparkle:shortVersionString>0.2.13</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sat, 15 Aug 2026 07:43:30 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.13/TcrBar-0.2.13.dmg" type="application/octet-stream" sparkle:edSignature="ajKN14f4KKy/d7eYZYZ8czG4CpweYPGmRYTUO6kVP35R9aVN7XVLwRbNNV/JzCg2jjngFf7P4XNFjQ2ody4kBw==" length="5964327" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.11</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.11</link>
+      <sparkle:version>387</sparkle:version>
+      <sparkle:shortVersionString>0.2.11</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 14 Aug 2026 22:46:37 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.11/TcrBar-0.2.11.dmg" type="application/octet-stream" sparkle:edSignature="OyGN/82y7GGuOtK8C2DA1ilsb4/yh/xAOODm1r7l0Dl3qRjjzxnQd8L6F6jF9Dr6lcgR2MOOekmBl06X76TbCw==" length="5963071" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.10</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.10</link>
+      <sparkle:version>370</sparkle:version>
+      <sparkle:shortVersionString>0.2.10</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 14 Aug 2026 21:28:34 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.10/TcrBar-0.2.10.dmg" type="application/octet-stream" sparkle:edSignature="aWe2MVbWmr+jBfpfStxVkTIZDVmjPnPrlSm5vUYuKFvVUwfUdBzZUInPBgdMIfTxDHDrYK7QJW97G5Ln587hCA==" length="5907683" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.8</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.8</link>
+      <sparkle:version>360</sparkle:version>
+      <sparkle:shortVersionString>0.2.8</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 14 Aug 2026 20:05:28 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.8/TcrBar-0.2.8.dmg" type="application/octet-stream" sparkle:edSignature="jQVGiTz11UEEeTwSVJFVJrX3A8uFIuPsXlfkmxn0OYG7/v24vmnK0//l1gsA+P6H7T7MxWhyD76M7WaV/ZXlCw==" length="5902767" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.7</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.7</link>
+      <sparkle:version>348</sparkle:version>
+      <sparkle:shortVersionString>0.2.7</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 14 Aug 2026 15:45:36 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.7/TcrBar-0.2.7.dmg" type="application/octet-stream" sparkle:edSignature="Z5e7pk7fsBz9p6dSf/6zrQGkIGxYjdAEVcxZrwsZHRSlNAoghy6MZk1uqP5cNAUctMVil8mYSBsp2gcA0Va9Dw==" length="5896786" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.5</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.5</link>
+      <sparkle:version>318</sparkle:version>
+      <sparkle:shortVersionString>0.2.5</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Thu, 13 Aug 2026 19:50:18 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.5/TcrBar-0.2.5.dmg" type="application/octet-stream" sparkle:edSignature="rzy03R6ESej3z/NZempsgF8BSYe3an4YM/1DUIxG9yNwtuQy/OHsgvoZdv1XwEIHPXigpF2SlASI6l739+1/Ag==" length="5988151" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.4</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.4</link>
+      <sparkle:version>284</sparkle:version>
+      <sparkle:shortVersionString>0.2.4</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 10 Aug 2026 20:52:15 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.4/TcrBar-0.2.4.dmg" type="application/octet-stream" sparkle:edSignature="2gZ7No20B7afNR4IxwQzfvVbo1zIzVgpw8rIQ2ehVF1Qj3pwbuX3uqKG4FYd4b1ietRmUaDHW2i8pe2unBpMDQ==" length="5933096" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.3</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.3</link>
+      <sparkle:version>263</sparkle:version>
+      <sparkle:shortVersionString>0.2.3</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Mon, 10 Aug 2026 10:25:04 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.3/TcrBar-0.2.3.dmg" type="application/octet-stream" sparkle:edSignature="pvFwI0mGMHSsv4NHVep1FbWdMjRwUiMRHebI8tiCS9ovdwwJHGkHZyh15Q55sBJAR3zpdt/So9QXiNGCd9mqBw==" length="5925962" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.1</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.1</link>
+      <sparkle:version>258</sparkle:version>
+      <sparkle:shortVersionString>0.2.1</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 09 Aug 2026 20:58:11 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.1/TcrBar-0.2.1.dmg" type="application/octet-stream" sparkle:edSignature="ZxtyfH+6uQV4HXojUZzOXGZYTkECioen9lGWl4CEsIxL7h6DAIwBTZA/ljq8SXhUnugr8T+1uwK4Uh1joYBqAw==" length="5874037" />
+    </item>
+    <item>
+      <title>TcrBar 0.2.0</title>
+      <link>https://github.com/dhkts1/teamclaude-rs/releases/tag/v0.2.0</link>
+      <sparkle:version>248</sparkle:version>
+      <sparkle:shortVersionString>0.2.0</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
+      <pubDate>Sun, 09 Aug 2026 19:13:02 +0000</pubDate>
+      <enclosure url="https://github.com/dhkts1/teamclaude-rs/releases/download/v0.2.0/TcrBar-0.2.0.dmg" type="application/octet-stream" sparkle:edSignature="JgBcTRrgdeEp3AhN5W7yabpqhihspg05r1ZLgsSkd2pKxtv4TaknKgtjAySDiAw+A8jgWfvhpTmriWe4xlasBw==" length="5871135" />
+    </item>
+  </channel>
+</rss>
