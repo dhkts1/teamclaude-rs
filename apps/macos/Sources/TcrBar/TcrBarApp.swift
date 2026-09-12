@@ -83,6 +83,10 @@ enum TcrBarEntry {
             _ = NSApplication.shared
             RenderStates.run(into: directory)  // exits
         }
+        if let directory = RenderMark.requestedDirectory() {
+            _ = NSApplication.shared
+            RenderMark.run(into: directory)  // exits
+        }
         if let directory = AppIcon.requestedDirectory() {
             _ = NSApplication.shared
             AppIcon.writeIconSet(to: directory)  // exits

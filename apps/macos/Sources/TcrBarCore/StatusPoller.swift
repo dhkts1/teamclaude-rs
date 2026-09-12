@@ -57,6 +57,37 @@ public enum PollState: Equatable {
             return "tcr answered, and this build could not read the answer"
         }
     }
+
+    /// The `ready/enabled` label drawn beside the gauge glyph, e.g. `"9/13"`.
+    ///
+    /// `nil` for anything but a healthy read of a fleet with at least one
+    /// enabled account: the glyph alone already carries "pending", "tool
+    /// missing" and "poll failed" (``MenuBarShell/gaugeSymbol(for:)``), and an
+    /// all-disabled fleet has no numerator/denominator worth showing — `0/0`
+    /// would read as a fault, not a fact, the same reasoning
+    /// ``Fleet/countsSentence`` gives for returning `nil` in the identical
+    /// case.
+    public var countsLabel: String? {
+        guard case .loaded(let fleet) = self, !fleet.enabledAccounts.isEmpty else { return nil }
+        return "\(fleet.readyCount)/\(fleet.enabledCount)"
+    }
+
+    /// The menu-bar tooltip's own line: ``Fleet/countsSentence`` when there is
+    /// one to give, else ``summary`` unchanged.
+    ///
+    /// `countsSentence` is `nil` for every case but a healthy read with at
+    /// least one enabled account — a pending poll, a missing `tcr`, a failed
+    /// command, an undecodable payload, and a healthy read of an all-disabled
+    /// fleet all fall through to the same `summary` a reader already knows,
+    /// rather than growing a second empty-fleet sentence to keep in sync with
+    /// the first.
+    public var tooltipSentence: String {
+        guard case .loaded(let fleet) = self, let sentence = fleet.countsSentence else {
+            return summary
+        }
+        guard let unreadable = fleet.unreadableNotice else { return sentence }
+        return "\(sentence) · \(unreadable)"
+    }
 }
 
 /// Runs `tcr status --json` on a timer and publishes the result.
