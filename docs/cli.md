@@ -566,6 +566,74 @@ replays the day back in. Fleet-wide totals are not a field — sum the rows.
 
 ---
 
+## `tcr wrap`
+
+`tcr wrap [--days N] [--json]` — a usage report for the last `N` days (default 7, ending
+today UTC), read straight off the usage ledger in `~/.cache/teamclaude/usage/`. Unlike `tcr
+status`, this needs no running proxy: the ledger is a durable, append-only record on disk, and
+`tcr wrap` just reads it.
+
+It reports, in order: totals (requests, input/output/cache-read tokens, cost, cache-hit
+ratio), a per-model breakdown sorted by cost, a per-account breakdown sorted by requests, a
+per-day breakdown with the busiest day marked, the count of distinct sessions plus the three
+longest-running ones by request count, and a comparison against the previous `N`-day period
+(`+12%` / `-3%`). `--config` (default `~/.config/teamclaude.json`) is consulted only for
+pricing overrides — never for accounts, so a removed account's traffic still shows up under
+the name it was recorded under. `--json` emits the same numbers as one object instead of the
+plain-text layout.
+
+"Day" here is the UTC calendar day a ledger line's own file is named after — the same day
+`tcr status`'s `--json` `usage` object writes to and `attach_ledger`'s boot replay reads — not
+the local day `today` on that object uses, and cost is the same API list-price figure `tcr
+status` reports (see the note there: no dollar here is ever billed, every account in this
+fleet is a subscription).
+
+Every number is reproducible straight from the files, without running `tcr` at all — for
+example, total requests and cost for one day:
+
+```
+$ jq -s '{requests: length, inputTokens: (map(.i) | add)}' ~/.cache/teamclaude/usage/2026-09-10.jsonl
+{
+  "requests": 5,
+  "inputTokens": 812000
+}
+```
+
+Example (fake data):
+
+```
+$ tcr wrap --days 7
+tcr wrap: last 7 day(s), 2026-09-06 to 2026-09-12 (UTC)
+
+totals requests=1204 input=812000 output=241500 cacheRead=98000 cost=$42.17 cacheHitRatio=12.1%
+
+by model (sorted by cost):
+  claude-opus-5                requests=610      cost=$31.80
+  claude-sonnet-5              requests=594      cost=$10.37
+
+by account (sorted by requests):
+  alice@example.com            requests=812      cost=$28.44
+  bob@example.com              requests=392      cost=$13.73
+
+by day (busiest marked *):
+  2026-09-06   requests=140      cost=$4.90
+  2026-09-07   requests=210      cost=$7.35
+  2026-09-08 * requests=305      cost=$10.68
+  2026-09-09   requests=180      cost=$6.30
+  2026-09-10   requests=145      cost=$5.08
+  2026-09-11   requests=120      cost=$4.20
+  2026-09-12   requests=104      cost=$3.66
+
+sessions: 38 distinct; top 3 by requests:
+  session 1234567890123456789 requests=210
+  session 9876543210987654321 requests=140
+  session 5566778899001122334 requests=95
+
+compared with the previous 7 day(s): cost=+12% requests=-3%
+```
+
+---
+
 ## `tcr update`
 
 Self-update. One flag, `--force`: rebuild or reinstall even when the source reports it is

@@ -393,13 +393,19 @@ pub fn warn_if_local_offset_unavailable() {
 }
 
 /// The UTC date a record's ledger file is named after.
-fn ledger_date(ts_ms: i64) -> Date {
+///
+/// `pub(crate)` so `tcr wrap` (`src/wrap.rs`) groups a line by the same day its
+/// own file is named after, rather than re-deriving that from the timestamp a
+/// second way.
+pub(crate) fn ledger_date(ts_ms: i64) -> Date {
     OffsetDateTime::from_unix_timestamp_nanos(ts_ms as i128 * 1_000_000)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH)
         .date()
 }
 
-fn date_string(date: Date) -> String {
+/// `pub(crate)` so `tcr wrap` names the same `<date>.jsonl` file this module
+/// writes and replays, instead of formatting the date a second way.
+pub(crate) fn date_string(date: Date) -> String {
     format!(
         "{:04}-{:02}-{:02}",
         date.year(),
@@ -409,16 +415,20 @@ fn date_string(date: Date) -> String {
 }
 
 /// One ledger line. Short keys are deliberate — see the module docs on size.
+///
+/// `pub(crate)`, fields included, so `tcr wrap` (`src/wrap.rs`) reads the exact
+/// shape [`parse_ledger_file`] parses rather than a second struct that could
+/// drift from it field by field.
 #[derive(Debug, Serialize, Deserialize)]
-struct LedgerLine {
+pub(crate) struct LedgerLine {
     /// Unix milliseconds.
-    t: i64,
+    pub(crate) t: i64,
     /// The serving account's `name`. Replay resolves a line by identity and
     /// never by POSITION, so reordering or removing an account in the config
     /// cannot silently reattribute yesterday's traffic. The name is the weakest
     /// of the three keys ([`resolve_account`]) and the only one an account with
     /// no stored identity has.
-    a: String,
+    pub(crate) a: String,
     /// The serving account's `account_uuid` — the STABLE half of its identity,
     /// and the first thing [`resolve_account`] tries.
     ///
@@ -433,7 +443,7 @@ struct LedgerLine {
     /// Absent for an API-key account and for every line written before this
     /// field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    u: Option<String>,
+    pub(crate) u: Option<String>,
     /// The serving account's org discriminator ([`crate::identity::org_key`]),
     /// because a NAME is not an identity here: the same email legitimately
     /// appears twice in one fleet, once per org (`identity.rs`), and replaying
@@ -445,16 +455,42 @@ struct LedgerLine {
     /// written before org identity existed — such a line still resolves by
     /// name, but only while that name is unique.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    g: Option<String>,
+    pub(crate) g: Option<String>,
     #[serde(default)]
-    m: Option<String>,
+    pub(crate) m: Option<String>,
     #[serde(default)]
-    s: Option<u64>,
-    i: u64,
-    c5: u64,
-    c1: u64,
-    r: u64,
-    o: u64,
+    pub(crate) s: Option<u64>,
+    pub(crate) i: u64,
+    pub(crate) c5: u64,
+    pub(crate) c1: u64,
+    pub(crate) r: u64,
+    pub(crate) o: u64,
+}
+
+/// Parse one day's ledger file into its lines, skipping blank lines and
+/// counting (never failing on) malformed ones.
+///
+/// `pub(crate)` and the ONLY place either [`UsageTracker::replay_file`] or
+/// `tcr wrap` reads a ledger file off disk, so "a malformed line is counted,
+/// not fatal" is one piece of behaviour instead of two copies that could drift.
+/// A missing file is the ordinary case (no traffic that day) and returns
+/// nothing, the same as [`UsageTracker::replay_file`] always has.
+pub(crate) fn parse_ledger_file(path: &Path) -> (Vec<LedgerLine>, usize) {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return (Vec::new(), 0);
+    };
+    let mut lines = Vec::new();
+    let mut malformed = 0;
+    for raw in data.lines() {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<LedgerLine>(raw) {
+            Ok(line) => lines.push(line),
+            Err(_) => malformed += 1,
+        }
+    }
+    (lines, malformed)
 }
 
 /// What the writer thread receives. A `Flush` is a rendezvous: the writer
@@ -1165,17 +1201,9 @@ impl UsageTracker {
     }
 
     fn replay_file(&self, path: &Path, accounts: &[LedgerAccount], report: &mut ReplayReport) {
-        let Ok(data) = std::fs::read_to_string(path) else {
-            return; // No file for that day is the ordinary case, not a failure.
-        };
-        for raw in data.lines() {
-            if raw.trim().is_empty() {
-                continue;
-            }
-            let Ok(line) = serde_json::from_str::<LedgerLine>(raw) else {
-                report.malformed += 1;
-                continue;
-            };
+        let (lines, malformed) = parse_ledger_file(path);
+        report.malformed += malformed;
+        for line in lines {
             let Some(idx) = resolve_account(accounts, &line) else {
                 report.unresolved += 1;
                 continue;

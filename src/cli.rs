@@ -2680,6 +2680,14 @@ fn skew_report(server: Option<&BuildInfo>) -> Option<String> {
     build_info::compare(server, &checkout).report_line()
 }
 
+/// `tcr wrap [--days N] [--json]` — a weekly usage report read straight off
+/// the usage ledger, offline and whether or not a proxy is running. All the
+/// actual work — reading the ledger, aggregating, rendering — lives in
+/// [`crate::wrap`]; this is the CLI's entry point into it.
+pub fn wrap(config_path: &Path, days: u32, json: bool) -> anyhow::Result<()> {
+    crate::wrap::print_report(&crate::usage::default_dir(), config_path, days, json)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
