@@ -241,7 +241,7 @@ final class NewGroupNameTests: XCTestCase {
 
     func testRejectionMessageNamesTheDuplicateReason() {
         let outcome = NewGroupName.evaluate("dev", existingGroups: ["dev"])
-        XCTAssertEqual(outcome.rejectionMessage, "A group named that already exists.")
+        XCTAssertEqual(outcome.rejectionMessage, "A group with that name already exists.")
     }
 }
 

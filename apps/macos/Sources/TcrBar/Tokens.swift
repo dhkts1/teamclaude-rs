@@ -309,7 +309,10 @@ public enum Tok {
     public static let rowLineSpacing = space1
 
     public static let radiusSmall: CGFloat = 8
-    public static let radiusMedium: CGFloat = 14
+    /// 16, which is what makes the account card concentric: its inset is
+    /// `space3` (8) and the pills inside it are `pillRadius` (8), so the
+    /// outer curve has to be inner + padding or the corners read pinched.
+    public static let radiusMedium: CGFloat = 16
     public static let radiusLarge: CGFloat = 18
     public static let barHeight: CGFloat = 6
     /// 4, not 3 — matching the bump above. `RoundedRectangle` clamps its

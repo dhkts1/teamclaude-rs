@@ -135,7 +135,7 @@ struct FleetView: View {
                 if let at = poller.lastPollAt {
                     Text(at, style: .time)
                         .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Tok.inkDim)
                 }
             }
             // Only when the read is NOT healthy. On a healthy read this said
@@ -201,7 +201,7 @@ struct FleetView: View {
         if case .loaded(let fleet) = poller.state, let line = fleet.usageSummaryLine {
             Text(line)
                 .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Tok.inkDim)
                 .fixedSize(horizontal: false, vertical: true)
                 .background(
                     GeometryReader { proxy in
@@ -249,6 +249,12 @@ struct FleetView: View {
                 .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                 .foregroundStyle(isFailure ? Tok.spent : Tok.accent)
                 .fixedSize(horizontal: false, vertical: true)
+                // `.plain` draws no chrome, so the clickable region was the
+                // glyph boxes themselves — about 14pt tall, and nothing at all
+                // in the gaps between words. The padding and the explicit
+                // content shape make the whole line one target.
+                .padding(.vertical, Tok.space2)
+                .contentShape(Rectangle())
         }
     }
 
@@ -312,8 +318,7 @@ struct FleetView: View {
             banner(
                 icon: Tok.unreadableGlyph,
                 title: "tcr is not on PATH",
-                detail: "Searched \(searched.count) locations. Set it with "
-                    + "`defaults write io.github.dhkts1.tcrbar \(TcrTool.overrideDefaultsKey) <path>`.",
+                detail: "Searched \(searched.count) locations. \(TcrTool.overrideRemedy)",
                 tint: Tok.spent
             )
         case .commandFailed(let code, let message):
@@ -324,12 +329,21 @@ struct FleetView: View {
                 tint: Tok.spent
             )
         case .undecodable(let message):
+            // The decoder's own text is a Swift `DecodingError` description —
+            // key paths and type names. It is the right thing to keep and the
+            // wrong thing to lead with, so it moves to the tooltip.
+            //
+            // The body is the remedy alone, not a restatement: the header line
+            // directly above already says what happened (`PollState.summary`),
+            // and a banner that repeats the sentence above it is one the reader
+            // has to check twice to find the new information in.
             banner(
                 icon: Tok.unreadableGlyph,
                 title: "Unreadable status output",
-                detail: message,
+                detail: "Usually a version mismatch: update TcrBar, or the server.",
                 tint: Tok.unknown
             )
+            .help(message)
         case .loaded(let fleet):
             if fleet.accounts.isEmpty {
                 banner(
@@ -432,7 +446,7 @@ struct FleetView: View {
             Text(band.title.uppercased())
                 .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
                 .tracking(Tok.pillTracking)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(Tok.inkDim)
         }
     }
 
@@ -588,7 +602,7 @@ struct FleetView: View {
                 Text(title).font(.subheadline.weight(.semibold))
                 Text(detail)
                     .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Tok.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -606,13 +620,13 @@ struct FleetView: View {
             HStack(spacing: Tok.tightSpacing) {
                 Text(server.state.summary)
                     .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Tok.inkDim)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: Tok.tightSpacing)
                 if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
                     Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
                         .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(Tok.inkFaint)
                         .lineLimit(1)
                 }
             }
@@ -831,6 +845,22 @@ struct FleetView: View {
         }
     }
 
+    /// One message for all four `LoginLauncher` hand-offs below.
+    ///
+    /// They carried four identical copies of the same two-case switch, and the
+    /// `toolMissing` copy named the problem with no way out of it — while the
+    /// poll banner five hundred lines up already knew the remedy and gave it.
+    /// `static` because it reads nothing from the view.
+    private static func loginFailureMessage(_ why: LoginLauncher.Failure) -> String {
+        switch why {
+        case .toolMissing(let searched):
+            return "tcr not found (searched \(searched.count) locations). "
+                + TcrTool.overrideRemedy
+        case .couldNotWriteScript(let message):
+            return "Could not open Terminal: \(message)"
+        }
+    }
+
     /// Hand `tcr login` to a Terminal window.
     ///
     /// Deliberately a hand-off, not an in-app flow. `tcr login` refuses while a
@@ -839,12 +869,7 @@ struct FleetView: View {
     /// in the label is doing real work: this opens something.
     private func addAccount() {
         if case .failure(let why) = LoginLauncher.launch() {
-            switch why {
-            case .toolMissing(let searched):
-                loginError = "tcr not found (searched \(searched.count) locations)."
-            case .couldNotWriteScript(let message):
-                loginError = "Could not open Terminal: \(message)"
-            }
+            loginError = Self.loginFailureMessage(why)
         } else {
             loginError = nil
         }
@@ -856,12 +881,7 @@ struct FleetView: View {
     /// why.
     private func reloginAccount(_ account: AccountRef) {
         if case .failure(let why) = LoginLauncher.launch(reloggingIn: account.name) {
-            switch why {
-            case .toolMissing(let searched):
-                loginError = "tcr not found (searched \(searched.count) locations)."
-            case .couldNotWriteScript(let message):
-                loginError = "Could not open Terminal: \(message)"
-            }
+            loginError = Self.loginFailureMessage(why)
         } else {
             loginError = nil
         }
@@ -878,12 +898,7 @@ struct FleetView: View {
     /// why — and never renders or logs a token.
     private func mintAccountToken(_ account: AccountRef) {
         if case .failure(let why) = LoginLauncher.launchMint(target: .account(account.name)) {
-            switch why {
-            case .toolMissing(let searched):
-                loginError = "tcr not found (searched \(searched.count) locations)."
-            case .couldNotWriteScript(let message):
-                loginError = "Could not open Terminal: \(message)"
-            }
+            loginError = Self.loginFailureMessage(why)
         } else {
             loginError = nil
         }
@@ -893,12 +908,7 @@ struct FleetView: View {
     /// `group`'s label at once (`tcr mint --group <name>`).
     private func mintGroupTokens(_ group: String) {
         if case .failure(let why) = LoginLauncher.launchMint(target: .group(group)) {
-            switch why {
-            case .toolMissing(let searched):
-                loginError = "tcr not found (searched \(searched.count) locations)."
-            case .couldNotWriteScript(let message):
-                loginError = "Could not open Terminal: \(message)"
-            }
+            loginError = Self.loginFailureMessage(why)
         } else {
             loginError = nil
         }
@@ -987,7 +997,7 @@ struct FleetView: View {
         if let label = AppBuild.label {
             Text(label)
                 .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(Tok.inkFaint)
                 .lineLimit(1)
                 .textSelection(.enabled)
                 .help(AppBuild.buildDetail(buildNumber: AppBuild.buildNumber) ?? label)
@@ -1247,11 +1257,18 @@ struct AccountRow: View {
     }
 
     /// The 5h line's spend figures, demoted with everything else on the row
-    /// when the reading is historical. `AnyShapeStyle` because the branches are
-    /// different types: `Color` has a `.secondary` but no `.tertiary`, so the
-    /// plain ternary the 7d counters use cannot be written here.
-    private var usageFigureStyle: AnyShapeStyle {
-        hasStaleQuotaReading ? AnyShapeStyle(Tok.disabled) : AnyShapeStyle(.tertiary)
+    /// when the reading is historical.
+    ///
+    /// `Color`, not `AnyShapeStyle`. This reached for SwiftUI's `.tertiary`,
+    /// which has no `Color` spelling and forced the erasure — and which drew
+    /// this figure at 1.86:1 on the light panel, measured off a
+    /// `--render-states` bitmap. A hierarchical style resolves against the
+    /// SYSTEM window background, never against `Tok.raised`, so none of the
+    /// palette's measured ratios ever applied to it. `Tok.inkFaint` is this
+    /// panel's own tertiary ink and `scripts/tcrbar-palette.py` gates it at
+    /// 4.5:1 against both surfaces.
+    private var usageFigureStyle: Color {
+        hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint
     }
 
     /// The Fable weekly figure's tint, from that window's OWN state.
@@ -1275,12 +1292,15 @@ struct AccountRow: View {
     ///
     /// Demoted with the rest of the row on a stale reading, like every other
     /// figure on it.
-    private var fableFigureStyle: AnyShapeStyle {
-        if hasStaleQuotaReading { return AnyShapeStyle(Tok.disabled) }
-        guard let state = account.sevenDayOiState else { return AnyShapeStyle(.tertiary) }
+    ///
+    /// `Color` for the same reason as ``usageFigureStyle``: every branch is a
+    /// token now, so nothing needs erasing.
+    private var fableFigureStyle: Color {
+        if hasStaleQuotaReading { return Tok.disabled }
+        guard let state = account.sevenDayOiState else { return Tok.inkFaint }
         switch state {
-        case .near, .spent: return AnyShapeStyle(Tok.color(for: state))
-        case .ok, .unknown: return AnyShapeStyle(.tertiary)
+        case .near, .spent: return Tok.color(for: state)
+        case .ok, .unknown: return Tok.inkFaint
         }
     }
 
@@ -2127,7 +2147,7 @@ struct AccountRow: View {
     private var accountActionsMenuLabel: some View {
         Image(systemName: "gearshape")
             .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Tok.inkDim)
             // The Menu's own `.accessibilityLabel` below names the
             // control; without hiding the glyph too, VoiceOver reads
             // both the image ("gearshape, image") and the label,
@@ -2342,7 +2362,7 @@ struct AccountRow: View {
                         // `error` account is what the UNMEASURED pill used to
                         // wear too, and the raw word alone drew in the same
                         // grey as a healthy account right above it.
-                        .foregroundStyle(account.health == .needsRelogin ? Tok.spent : .secondary)
+                        .foregroundStyle(account.health == .needsRelogin ? Tok.spent : Tok.inkDim)
                         .lineLimit(1)
                 }
                 // The FABLE weekly window — a third quota window, with its own
@@ -2467,12 +2487,15 @@ struct AccountRow: View {
                 // same distinction `fiveHourTint` draws for the fill. The number
                 // itself is unchanged — it is still true, just no longer
                 // reachable.
-                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : .secondary)
+                .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkDim)
             // Drawn whenever the wire has a reset for this window, beside the
             // number it belongs to. Colour: `captionTint(for:)`.
             if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: Date()) {
                 Text(caption)
-                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
+                    // Tabular, like the percentage it sits beside: this string
+                    // carries digits (`in 4d 12h`) that change under the poll,
+                    // and proportional figures shift the row when they do.
+                    .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                     .foregroundStyle(captionTint)
                     .lineLimit(1)
             }

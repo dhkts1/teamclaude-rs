@@ -238,7 +238,9 @@ public enum GroupNameValidation {
         switch failure {
         case .empty: return "Group name cannot be empty."
         case .controlCharacter: return "Group name cannot contain control characters."
-        case .aboveLatin1: return "Group name cannot contain characters above U+00FF."
+        case .aboveLatin1:
+            return "Group name can use letters, digits and accents, but not emoji "
+                + "or other scripts."
         }
     }
 }
@@ -274,7 +276,7 @@ public enum NewGroupName: Equatable, Sendable {
     public var rejectionMessage: String? {
         switch self {
         case .rejected(let failure): return GroupNameValidation.message(for: failure)
-        case .duplicate: return "A group named that already exists."
+        case .duplicate: return "A group with that name already exists."
         case .valid: return nil
         }
     }

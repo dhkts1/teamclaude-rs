@@ -1442,6 +1442,19 @@ final class StatusPollerClassifyTests: XCTestCase {
         }
     }
 
+    /// The contract on ``PollState/summary`` is "safe to put in front of a
+    /// human", and the `.undecodable` arm used to interpolate a raw
+    /// `DecodingError` description straight into it — which read as
+    /// `DecodingError.valueNotFound: quota` on the panel's own header line.
+    /// This pins the arm that broke it rather than the sentence it now says.
+    func testUndecodableSummaryDoesNotLeakTheDecoderError() {
+        let summary = PollState.undecodable(message: "DecodingError.valueNotFound: quota").summary
+        XCTAssertFalse(
+            summary.contains("DecodingError"),
+            "the raw decoder error must not reach a human-facing line, got: \(summary)")
+        XCTAssertFalse(summary.contains("valueNotFound"), "same, for the case name")
+    }
+
     func testSummariesAreNeverEmpty() {
         let states: [PollState] = [
             .pending,
