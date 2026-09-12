@@ -31,7 +31,7 @@
     --tcr-line-alpha: 0.34;
 
     --tcr-bar-height: 6px;
-    --tcr-bar-radius: 3px;
+    --tcr-bar-radius: 4px;
     --tcr-bar-width: 72px;
     --tcr-body-line-height: 18px;
     --tcr-body-size: 13px;
@@ -45,9 +45,9 @@
     --tcr-pill-padding-h: 6px;
     --tcr-pill-padding-v: 2px;
     --tcr-pill-tracking: 0.3px;
-    --tcr-radius-large: 12px;
-    --tcr-radius-medium: 8px;
-    --tcr-radius-small: 4px;
+    --tcr-radius-large: 18px;
+    --tcr-radius-medium: 14px;
+    --tcr-radius-small: 8px;
     --tcr-secondary-font-size: 11px;
     --tcr-secondary-line-height: 16px;
     --tcr-space1: 2px;

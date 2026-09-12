@@ -308,11 +308,19 @@ public enum Tok {
     /// a row still reads as one block.
     public static let rowLineSpacing = space1
 
-    public static let radiusSmall: CGFloat = 4
-    public static let radiusMedium: CGFloat = 8
-    public static let radiusLarge: CGFloat = 12
+    public static let radiusSmall: CGFloat = 8
+    public static let radiusMedium: CGFloat = 14
+    public static let radiusLarge: CGFloat = 18
     public static let barHeight: CGFloat = 6
-    public static let barRadius: CGFloat = 3
+    /// 4, not 3 — matching the bump above. `RoundedRectangle` clamps its
+    /// corner radius to half the shorter side (`CGPath(roundedRect:...)`'s own
+    /// behaviour), and `barHeight` is 6, so this draws IDENTICALLY to 3: the
+    /// value moved, the pixels did not. Left at the bridge's number anyway —
+    /// it is still correct relative to `radiusSmall`/`radiusMedium` having
+    /// moved — but the bar reading sharp is a `barHeight` fact, not a
+    /// `barRadius` one, and `barHeight` is this panel's measured-row-height
+    /// surface: out of scope for a token bump, flagged rather than changed.
+    public static let barRadius: CGFloat = 4
     /// Width of a quota bar. Fixed, so the percentage after it starts at the
     /// same x on every card; a bar that took the leftover width could not.
     ///

@@ -1624,12 +1624,20 @@ struct AccountRow: View {
             // an outer radius with no matching inset draws a border that bites
             // into its own content at the corners.
             //
+            // Vertical padding moved from `Tok.space2` to `Tok.space3` when
+            // `radiusMedium` went from 8 to 14: the margin this comment
+            // describes is the inset minus roughly 0.29x the radius (where a
+            // `CGPath` corner arc stops intruding on a rectangular content
+            // box), and at the new radius `space2` (4pt) undercuts that by a
+            // fraction of a point. `space3` (8pt) clears it the way `space2`
+            // cleared the old, smaller radius.
+            //
             // It is also the only inner padding now. `rowContent` carried a
             // second one (`Tok.rowPaddingV`) from before this card had a border,
             // when a row needed its own breathing room. Inside a bordered card
             // with `Tok.rowSpacing` between cards it was 4pt of nothing.
             .padding(.horizontal, Tok.space3)
-            .padding(.vertical, Tok.space2)
+            .padding(.vertical, Tok.space3)
             .background(
                 RoundedRectangle(cornerRadius: Tok.radiusMedium)
                     .fill(Tok.raised)
