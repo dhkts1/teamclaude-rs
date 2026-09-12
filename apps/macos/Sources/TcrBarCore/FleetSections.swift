@@ -259,6 +259,37 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// the "draw or not" decision reads as one word and is unit-testable on
     /// its own: see the drawing rule's full reasoning on ``outlineColor``.
     public var isOutlined: Bool { outlineColor != nil }
+
+    /// True for a NAMED group every one of whose rows landed in
+    /// ``FleetBand/parked`` — which, by ``FleetBand/init(_:)``, means every
+    /// row here is either `disabled` or ``Account/isParkedByGroup``. A
+    /// section is per-(band, group), so this needs no per-row check: the
+    /// section's own `band` already speaks for all of them.
+    ///
+    /// `.ungrouped` is never wholly parked, even when every row in it
+    /// happens to be — there is no group name to legend it with and nothing
+    /// for an operator to unpark by name, so the panel draws it exactly like
+    /// any other ungrouped section.
+    public var isWhollyParked: Bool { band == .parked && group != .ungrouped }
+
+    /// "HENRY-TOKEN · PARKED · 5" — the legend `FleetView.groupHeading(_:)`
+    /// draws on an outlined section's own stroke, top-left, in place of the
+    /// old stacked band-heading-over-group-heading pair. The group name,
+    /// uppercased; `· PARKED` exactly when ``isWhollyParked`` — the one place
+    /// that word still survives once the per-row pill is dropped inside such
+    /// a group (`AccountRow.suppressParkedPill`); then always `· <row
+    /// count>`. Lives here, not in the view, for the same reason every other
+    /// formatter in this codebase does: a live section's legend and a
+    /// wholly-parked one's are a fact about the model, testable without
+    /// SwiftUI.
+    public var legendText: String {
+        var text = title.uppercased()
+        if isWhollyParked {
+            text += " · PARKED"
+        }
+        text += " · \(rows.count)"
+        return text
+    }
 }
 
 extension Array where Element == FleetSection {
@@ -295,6 +326,24 @@ extension Array where Element == FleetSection {
         let section = self[index]
         guard section.group == .ungrouped else { return true }
         return filter { $0.band == section.band }.count > 1
+    }
+
+    /// Whether the band containing the section at `index` holds exactly one
+    /// group section — the cue to skip the band heading entirely.
+    ///
+    /// "why parked ontop of it and henry token group name so on the side not
+    /// some header" (Gil, 2026-09-12): a band heading stacked directly over
+    /// a single group's own heading says the same thing twice — "PARKED"
+    /// over "HENRY-TOKEN · PARKED · 5" restates the word the legend already
+    /// carries. This mirrors ``drawsGroupHeading(at:)``'s single-ungrouped-
+    /// section case one level up, and — unlike that one — applies to a
+    /// single NAMED section too: a lone group's own heading (or legend)
+    /// already says which group, which is everything the band heading over
+    /// it would have said.
+    public func soleGroupInBand(at index: Int) -> Bool {
+        guard indices.contains(index) else { return false }
+        let band = self[index].band
+        return filter { $0.band == band }.count == 1
     }
 }
 
