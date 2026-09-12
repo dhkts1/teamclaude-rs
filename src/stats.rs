@@ -314,4 +314,8 @@ pub struct StatsSnapshot {
     /// `tcr status --json`'s `sessions` array (via [`crate::status::StatusPayload`]) is built
     /// from. Reusing the wire type directly here, same as [`AccountSnapshot::usage`] beside it.
     pub wire_sessions: Vec<tcr_status_wire::SessionRow>,
+    /// Fleet-wide tool-call totals summed across [`Self::wire_sessions`] — see
+    /// [`tcr_status_wire::SessionsSummary`]'s doc-comment for why this is computed once
+    /// server-side rather than re-summed by every client.
+    pub wire_sessions_summary: tcr_status_wire::SessionsSummary,
 }
