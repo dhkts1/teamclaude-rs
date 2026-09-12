@@ -35,6 +35,8 @@
     --tcr-bar-width: 72px;
     --tcr-body-line-height: 18px;
     --tcr-body-size: 13px;
+    --tcr-card-gap: 14px;
+    --tcr-card-padding: 2px;
     --tcr-detail-font-size: 10px;
     --tcr-detail-line-height: 14px;
     --tcr-group-outline-inset: 6px;
@@ -50,6 +52,7 @@
     --tcr-radius-large: 18px;
     --tcr-radius-medium: 16px;
     --tcr-radius-small: 8px;
+    --tcr-row-gap: 6px;
     --tcr-secondary-font-size: 11px;
     --tcr-secondary-line-height: 16px;
     --tcr-space1: 2px;
@@ -57,6 +60,7 @@
     --tcr-space3: 8px;
     --tcr-space4: 12px;
     --tcr-space5: 16px;
+    --tcr-status-halo-alpha: 0.18px;
     --tcr-title-line-height: 18px;
     --tcr-title-size: 13px;
     --tcr-window-label-width: 20px;

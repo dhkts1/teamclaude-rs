@@ -189,6 +189,28 @@ public enum Tok {
     public static func wash(_ tint: Color) -> Color { tint.opacity(0.14) }
     public static func line(_ tint: Color) -> Color { tint.opacity(0.34) }
 
+    /// The three status-dot colours the panel lane's fleet summary line
+    /// draws (mockup `docs/design/panel-tabs-mockup.html`'s
+    /// `.dot.busy`/`.dot.wait`/`.dot.idle`). Aliases, not new hues:
+    /// `FleetView.swift:628-630` already maps busy/waiting/idle to these
+    /// same three tokens, so the colours were already there — only the halo
+    /// alpha below was missing.
+    public static let statusBusy = ok
+    public static let statusWaiting = near
+    public static let statusIdle = inkFaint
+
+    /// Alpha of the soft ring the mockup draws around a busy or waiting dot
+    /// (`box-shadow: 0 0 0 3px rgba(_, .18)`). Its own token rather than a
+    /// reuse of `wash`'s 0.14: a status dot's halo and a pill's background
+    /// wash are two different elements that happen to share a rough shape,
+    /// and tying them together would mean a change meant for one silently
+    /// reaches the other.
+    public static let statusHaloAlpha: CGFloat = 0.18
+    /// The halo colour behind a status dot: the dot's own tint at
+    /// `statusHaloAlpha`. Named apart from `wash`/`line` for the same reason
+    /// the alpha above is its own token.
+    public static func halo(_ tint: Color) -> Color { tint.opacity(statusHaloAlpha) }
+
     // MARK: - Type scale
     //
     // Named by ROLE, never by size, so a size change does not require renaming
@@ -252,6 +274,11 @@ public enum Tok {
     public static var detailDigitFont: Font { detailFont.monospacedDigit() }
     public static var bodyDigitFont: Font { bodyFont.monospacedDigit() }
 
+    /// Monospaced-digit variant of any font — for the panel lane to apply to
+    /// every changing number, not only the three roles the named pairs above
+    /// already cover.
+    public static func tabular(_ font: Font) -> Font { font.monospacedDigit() }
+
     /// Positive tracking for the small pill labels. Small text set tight reads as
     /// crowded; a little air is what makes a 10pt label legible.
     public static let pillTracking: CGFloat = 0.3
@@ -303,6 +330,16 @@ public enum Tok {
     public static let panelMinListHeight = PanelHeight.panelMinListHeight
     public static let gutter = space4
     public static let rowSpacing = space3
+    /// Gap between two account cards. 14, not `rowSpacing` (8): the mockup
+    /// (`docs/design/panel-tabs-mockup.html`) measures cards 2.3x farther
+    /// apart than the rows inside one (`cardGap` / `rowGap` = 14 / 6).
+    /// `rowSpacing` stays exactly as it was — a published alias for
+    /// `space3` — so no existing call site has to change; the panel lane
+    /// picks up `cardGap`/`rowGap` where it currently reaches for
+    /// `rowSpacing`.
+    public static let cardGap: CGFloat = 14
+    /// Gap between the lines *inside* one account card. See `cardGap`.
+    public static let rowGap: CGFloat = 6
     public static let tightSpacing = space2
     /// Gap between lines *inside* a row — tighter than the gap between rows, so
     /// a row still reads as one block.
@@ -314,6 +351,21 @@ public enum Tok {
     /// outer curve has to be inner + padding or the corners read pinched.
     public static let radiusMedium: CGFloat = 16
     public static let radiusLarge: CGFloat = 18
+    /// Semantic alias for `radiusMedium`: the account card's own radius,
+    /// named for the outer-equals-inner-plus-padding rule below rather than
+    /// by its place on the point scale. Same value, so nothing already
+    /// drawn moves; the panel lane reaches for this name, not `radiusMedium`.
+    public static let cardRadius: CGFloat = radiusMedium
+    /// The panel's inset beyond the card radius it encloses: `radiusLarge`
+    /// (18) is `cardRadius` (16) plus this — the same
+    /// outer-equals-inner-plus-padding rule `radiusMedium`'s own doc-comment
+    /// above states for the card's pills one level in, and
+    /// `groupOutlineRadius` below states for the group outline one level
+    /// out. Published as its own token rather than folded into `radiusLarge`
+    /// itself: `scripts/tcrbar-palette.py`'s `SWIFT_NUMERIC` regex matches
+    /// only `= <number>`, so turning `radiusLarge` into an expression would
+    /// silently drop `radius-large` out of `design-tokens/`.
+    public static let cardPadding: CGFloat = 2
     public static let barHeight: CGFloat = 6
     /// 4, not 3 — matching the bump above. `RoundedRectangle` clamps its
     /// corner radius to half the shorter side (`CGPath(roundedRect:...)`'s own
@@ -366,6 +418,10 @@ public enum Tok {
     /// shrinks inside its own border, which reads better at a value smaller
     /// than the gap between two sections.
     public static let groupOutlineInset: CGFloat = 6
+    /// Semantic alias for `groupOutlineInset`, named the way the panel lane
+    /// asks for it — the group outline's own padding beyond the card radius
+    /// it encloses. Same value as `groupOutlineInset`; not a second knob.
+    public static let groupPadding: CGFloat = groupOutlineInset
     /// Bigger than `radiusMedium` (the cards' own radius) by roughly
     /// `groupOutlineInset` — the same outer-equals-inner-plus-padding rule
     /// `radiusMedium`'s own doc-comment uses for the cards, applied one
