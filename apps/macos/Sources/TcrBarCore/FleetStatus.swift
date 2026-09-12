@@ -868,6 +868,132 @@ public struct UsageRow: Decodable, Equatable, Sendable {
 }
 
 /// One account row of `tcr status --json`.
+/// One tool call the proxy has observed on the wire — either still
+/// `running` or one of a session's `slowest` (F1, `data/plans/
+/// sessions-wire-bridge.md`). The two arrays carry different halves of the
+/// same fact: a running call has ``startedMs`` and no ``seconds`` yet, a
+/// slowest call has ``seconds``/``endedMs`` and no ``startedMs`` — never
+/// both, but modelled as one `Optional`-heavy type rather than two so the
+/// Tools tab can pool them without a cast.
+public struct ToolCall: Decodable, Equatable, Sendable {
+    public let tool: String
+    /// The first 120 characters of a Bash `input.command`, held in memory
+    /// only (`panel-tabs.md` "Constraints"). `nil` for a non-Bash tool.
+    public let commandHead: String?
+    public let startedMs: Int64?
+    public let endedMs: Int64?
+    public let seconds: Double?
+
+    public init(
+        tool: String,
+        commandHead: String? = nil,
+        startedMs: Int64? = nil,
+        endedMs: Int64? = nil,
+        seconds: Double? = nil
+    ) {
+        self.tool = tool
+        self.commandHead = commandHead
+        self.startedMs = startedMs
+        self.endedMs = endedMs
+        self.seconds = seconds
+    }
+}
+
+/// A session's tool aggregate — the wire's `tools` object.
+public struct SessionTools: Decodable, Equatable, Sendable {
+    public let calls: Int
+    public let errors: Int
+    public let timeouts: Int
+    public let running: [ToolCall]
+    /// The ten slowest calls this session made today, longest first per the
+    /// server (`sessions-wire-bridge.md`); this build does not re-sort a
+    /// single session's own list.
+    public let slowest: [ToolCall]
+
+    public init(
+        calls: Int = 0,
+        errors: Int = 0,
+        timeouts: Int = 0,
+        running: [ToolCall] = [],
+        slowest: [ToolCall] = []
+    ) {
+        self.calls = calls
+        self.errors = errors
+        self.timeouts = timeouts
+        self.running = running
+        self.slowest = slowest
+    }
+}
+
+/// One entry of ``Fleet/sessions`` — a session the proxy has seen in the
+/// last hour, field-for-field the merged F1 wire's `SessionRow`
+/// (`crates/tcr-status-wire/src/lib.rs` on `teamclaude-rs#232`).
+///
+/// Lives on the proxy's `/_tcr/status` HTTP response (`StatusPayload.sessions`),
+/// not on `tcr status --json`'s bare account array — see ``Fleet/sessions``'s
+/// own doc-comment for why nothing here is wired to a live fetch yet.
+/// `Decodable` so a future safe channel (or a test fixture) can build one from
+/// JSON shaped exactly like that endpoint's.
+public struct Session: Decodable, Equatable, Identifiable, Sendable {
+    public let sessionId: String
+    /// The row name this session is pinned to, or `nil` when the proxy has
+    /// not attributed it to an account yet.
+    public let account: String?
+    public let model: String?
+    public let firstSeenMs: Int64
+    public let lastSeenMs: Int64
+    public let requests: Int
+    public let inputTokens: Int
+    public let outputTokens: Int
+    public let cacheReadTokens: Int
+    public let tools: SessionTools
+
+    public var id: String { sessionId }
+
+    public init(
+        sessionId: String,
+        account: String? = nil,
+        model: String? = nil,
+        firstSeenMs: Int64,
+        lastSeenMs: Int64,
+        requests: Int = 0,
+        inputTokens: Int = 0,
+        outputTokens: Int = 0,
+        cacheReadTokens: Int = 0,
+        tools: SessionTools = SessionTools()
+    ) {
+        self.sessionId = sessionId
+        self.account = account
+        self.model = model
+        self.firstSeenMs = firstSeenMs
+        self.lastSeenMs = lastSeenMs
+        self.requests = requests
+        self.inputTokens = inputTokens
+        self.outputTokens = outputTokens
+        self.cacheReadTokens = cacheReadTokens
+        self.tools = tools
+    }
+}
+
+/// One ``ToolCall`` paired with the session that made it, for the Tools tab's
+/// pooled-across-every-session views. Not on ``ToolCall`` itself: a call has
+/// no notion of its own session, and duplicating the id onto every element of
+/// ``SessionTools/running``/``SessionTools/slowest`` would be a second place
+/// for the two to drift.
+public struct SessionToolEntry: Identifiable, Equatable, Sendable {
+    public let sessionId: String
+    public let call: ToolCall
+
+    public var id: String {
+        "\(sessionId)|\(call.tool)|\(call.startedMs ?? 0)|\(call.endedMs ?? 0)|\(call.commandHead ?? "")"
+    }
+
+    public init(sessionId: String, call: ToolCall) {
+        self.sessionId = sessionId
+        self.call = call
+    }
+}
+
 public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public let name: String
     public let priority: Int
@@ -1773,9 +1899,45 @@ public struct Fleet: Equatable, Sendable {
     /// Rows that failed to decode. Never dropped silently — see ``unreadableNotice``.
     public let unreadable: [UnreadableRow]
 
-    public init(accounts: [Account], unreadable: [UnreadableRow] = []) {
+    /// Every session the proxy has seen in the last hour (F2 + F3,
+    /// `data/plans/panel-tabs-bridge.md`). **Never populated by
+    /// ``decode(_:)``** — see this property's own placement, a stored field
+    /// rather than something read off ``accounts``.
+    ///
+    /// The bridge this build was written against said the wire would grow a
+    /// top-level `sessions` array on `tcr status --json`'s existing bare
+    /// array. The merged F1 work (`teamclaude-rs#232`) put it somewhere else
+    /// instead: `SessionRow`/`StatusPayload.sessions` live on the PROXY's own
+    /// `/_tcr/status` HTTP response, which `fetch_live_status` (`src/cli.rs`)
+    /// reads with the proxy's api-key — and `tcr status --json` (`status()`,
+    /// same file) discards `sessions` entirely when it turns that payload
+    /// back into the bare array `Fleet.decode` reads. This app never touches
+    /// `~/.config/teamclaude.json` or the proxy's api-key from Swift — see
+    /// `CLAUDE.md`'s "No credentials, ever" and every `TcrBarCore` file that
+    /// says "this app never writes/reads the tcr config" — so there is
+    /// currently no channel this build may safely use to populate this field
+    /// against a live server. It exists, tested, so the Sessions and Tools
+    /// tabs are ready the moment a safe one exists (a `tcr` CLI subcommand
+    /// that shells out the way every other fact in this app already does),
+    /// and so ``RenderStates``'s fixtures can review the tabs' design today.
+    public let sessions: [Session]
+
+    /// Whether the CURRENT read populated ``sessions`` at all — distinct from
+    /// an empty ``sessions``, which is also true of a server with nothing
+    /// live right now. `false` from every call to ``decode(_:)``, for the
+    /// reason ``sessions`` documents; a future safe channel sets it `true`.
+    public let sessionsSupported: Bool
+
+    public init(
+        accounts: [Account],
+        unreadable: [UnreadableRow] = [],
+        sessions: [Session] = [],
+        sessionsSupported: Bool = false
+    ) {
         self.accounts = accounts
         self.unreadable = unreadable
+        self.sessions = sessions
+        self.sessionsSupported = sessionsSupported
     }
 
     /// Decode the array **one row at a time**.
@@ -1843,6 +2005,29 @@ public struct Fleet: Equatable, Sendable {
 
     public var serverSha: String? { accounts.first?.serverSha }
     public var serverDirty: Bool { accounts.first?.serverDirty ?? false }
+
+    public var toolsTotalCalls: Int { sessions.reduce(0) { $0 + $1.tools.calls } }
+    public var toolsTotalErrors: Int { sessions.reduce(0) { $0 + $1.tools.errors } }
+    public var toolsTotalTimeouts: Int { sessions.reduce(0) { $0 + $1.tools.timeouts } }
+
+    /// Every tool call currently running, pooled across every session.
+    public var toolsRunning: [SessionToolEntry] {
+        sessions.flatMap { session in
+            session.tools.running.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
+        }
+    }
+
+    /// The ten slowest calls across every session, longest first. Each
+    /// session already reports its own ten slowest (`sessions-wire-bridge.md`
+    /// "ten"), so pooling `N` sessions' lists and re-sorting before taking the
+    /// top ten is correct without asking the server for more than ten per
+    /// session.
+    public var toolsSlowest: [SessionToolEntry] {
+        let pooled = sessions.flatMap { session in
+            session.tools.slowest.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
+        }
+        return Array(pooled.sorted { ($0.call.seconds ?? 0) > ($1.call.seconds ?? 0) }.prefix(10))
+    }
 
     /// The account in the worst shape. Reporting only — the menu-bar glyph is
     /// driven by ``capacityGlyphState``, which is a fleet property, not a

@@ -105,7 +105,30 @@ enum RenderStates {
             // own seeding of `FleetView.expandedParkedGroupsKey` for
             // `henry-team`, the wholly-parked group `parkedGroupJSON` builds.
             ("15b-parked-group-expanded", .loaded(fleet(parkedGroupJSON)), false, nil),
+            // F2 — the Sessions tab, grouped by account, one row with a
+            // tool running and one waiting, plus an unassigned session with
+            // no matching Claude Code session file (`sessionsFixture`'s
+            // third entry) to review the id-head fallback.
+            ("16-sessions-tab", .loaded(sessionsTabFleet), false, nil),
+            // F3 — the Tools tab: running now, slowest today (one at the
+            // Bash timeout), and the fleet-wide totals line.
+            ("17-tools-tab", .loaded(sessionsTabFleet), false, nil),
+            // The forward-compat case both tabs must show as one sentence,
+            // never an empty list: `healthyJSON` carries no `sessions` key at
+            // all, the shape every server shipped before F1.
+            ("18-sessions-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
         ]
+    }
+
+    /// Which tab a scene opens on — `.accounts` for every scene above scene
+    /// 16, so this stays a lookup by name rather than a fifth tuple element
+    /// every existing scene would have to grow.
+    private static func initialTab(for sceneName: String) -> PanelTab {
+        switch sceneName {
+        case "16-sessions-tab", "18-sessions-tab-old-server": return .sessions
+        case "17-tools-tab": return .tools
+        default: return .accounts
+        }
     }
 
     @MainActor
@@ -202,7 +225,8 @@ enum RenderStates {
                 groupController: GroupController(),
                 removeController: RemoveAccountController(),
                 startServerAtLaunch: .constant(false),
-                snapshotMode: true
+                snapshotMode: true,
+                initialTab: initialTab(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -569,6 +593,80 @@ enum RenderStates {
     private static var healthyJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498, plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")),"
             + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"], plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
+    }
+
+    /// F1's wire shape (`data/plans/sessions-wire-bridge.md`), attached to
+    /// `alice`'s row the way the server sends it — see ``Account/sessions``'s
+    /// doc-comment for why nothing here is wired to a live fetch yet: this
+    /// build has no safe channel for real session data, so the review
+    /// fixture builds ``Session`` values directly rather than decoding them
+    /// off `tcr status --json`'s bare account array, the same way
+    /// `FleetStatusTests` now does. Scenes 16 and 17 both use this Fleet;
+    /// only ``initialTab(for:)`` decides which tab opens.
+    ///
+    /// Three sessions cover the join's three cases: `alice-c1` has a live
+    /// Bash call running (Sessions tab's "N running · oldest …" line, Tools
+    /// tab's RUNNING NOW ring); `alice-c2` has one already at the Bash
+    /// tool's own 600-second timeout (`panel-tabs.md`: "The ten slowest
+    /// calls today all sit at 600s"); `unassigned-c3` has no `account`,
+    /// exercising the Sessions tab's "Unassigned" group and, having no
+    /// matching session file in this harness, the id-head fallback
+    /// (`panel-tabs-bridge.md`: "no file shows its id's first 8 chars").
+    private static var sessionsFixture: [Session] {
+        // `lastSeenMs`/`firstSeenMs` are epoch milliseconds, and the age
+        // label reads real wall-clock `Date()` (`FleetView.trailingStatus`,
+        // the same "views re-render often enough" idiom
+        // `HeldWindow.countdownLabel` already uses) — not this file's fixed
+        // `referenceDate`, which only pins the POLL timestamp shown in the
+        // header. These are minutes-ago offsets from the real clock so the
+        // rendered age reads like a live fleet's.
+        func msAgo(_ seconds: TimeInterval) -> Int64 {
+            Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
+        }
+        return [
+            Session(
+                sessionId: "aaaaaaaa-1111-2222-3333-444444444444", account: "alice@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
+                requests: 412, inputTokens: 812_000, outputTokens: 41_000, cacheReadTokens: 790_000,
+                tools: SessionTools(
+                    calls: 38, errors: 1, timeouts: 0,
+                    running: [
+                        ToolCall(
+                            tool: "Bash", commandHead: "cargo test --release > /tmp/f1-test.log",
+                            startedMs: msAgo(4 * 60))
+                    ],
+                    slowest: [
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "git -C ~/git/henry-plugin push > /tmp/push.log",
+                            endedMs: msAgo(5 * 60), seconds: 47.5)
+                    ])),
+            Session(
+                sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "alice@example.com",
+                model: "claude-sonnet-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
+                requests: 5756, inputTokens: 940_000, outputTokens: 88_000, cacheReadTokens: 905_000,
+                tools: SessionTools(
+                    calls: 210, errors: 4, timeouts: 1,
+                    slowest: [
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "/opt/homebrew/bin/bash /tmp/disk-scan.sh 2>&1 | tee",
+                            endedMs: msAgo(11 * 60), seconds: 600.0)
+                    ])),
+            Session(
+                sessionId: "cccccccc-1111-2222-3333-444444444444", account: nil,
+                model: "claude-sonnet-5", firstSeenMs: msAgo(45 * 60), lastSeenMs: msAgo(40 * 60),
+                requests: 12, inputTokens: 9000, outputTokens: 800, cacheReadTokens: 6000),
+        ]
+    }
+
+    private static var sessionsTabFleet: Fleet {
+        let base = fleet(
+            "[\(account("alice@example.com", quota: "0.12", state: "ok", plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111"))]"
+        )
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable, sessions: sessionsFixture,
+            sessionsSupported: true)
     }
 
     /// The three plan labels a real fleet produces, side by side — `Max 20x`,
