@@ -221,7 +221,7 @@ is a drop-in that no caller sees, and the file implementation keeps compiling on
 
 Costs, stated plainly: one process spawn per bundle read (once per boot, once per `tcr token`, once
 per credential write), output parsing instead of typed errors, and an open question about whether
-the write can feed the secret on stdin rather than in argv (section 9, phase 2 gate).
+the write feeds the secret on stdin through `security -i`, never in argv (section 9, phase 2 gate; probed 2026-09-12).
 
 ### D. Envelope encryption: one key in the keychain, ciphertext in the file
 
@@ -511,8 +511,8 @@ impl CredentialStore for KeychainStore {
         todo!()
     }
     fn save_bundle(&self, _bundle: &Bundle) -> Result<(), StoreError> {
-        // security add-generic-password -U -A -s <service> -a <item> -w
-        // secret on stdin, never in argv (see phase 2 gate)
+        // printf 'add-generic-password -U -A -s <service> -a <item> -w <secret>\n' | security -i
+        // the command, secret included, on stdin; a bare -w prompts and stores EMPTY (probed 2026-09-12)
         todo!()
     }
     fn probe(&self) -> Result<(), StoreError> { todo!() }
@@ -595,22 +595,26 @@ Every phase ships on its own and leaves the gates green. Line deltas are estimat
 - **Gate, mechanical**: `cargo test --locked --all` with a stub tool binary in place of
   `/usr/bin/security`, covering: absent item, locked keychain, timeout, malformed bundle,
   setup-token round trip.
-- **Gate, on the real machine** (this is the probe the whole decision rests on, and it is the one
-  thing not verified tonight):
+- **Gate, on the real machine.** Probe 1 was run by the lead on 2026-09-12 (`security` on
+  macOS 25.6): `printf '%s' secret | security add-generic-password ... -w` does NOT read stdin.
+  A bare `-w` prompts on the tty, the piped bytes make the two prompts mismatch, and the item
+  is created with an EMPTY password (exit 0, `find-generic-password -w` prints nothing). The
+  working form is the interactive mode, where the whole command arrives on stdin and the secret
+  never enters argv:
   ```
-  # 1. does the write take the secret on stdin rather than argv?
-  printf '%s' '{"v":2,"accounts":{}}' | \
-    security add-generic-password -U -A -s tcr-probe -a credentials -w
-  # 2. does a read come back with no prompt, from a plain shell?
+  # 1. write: the command line, secret included, goes to security's stdin (verified, exit 0)
+  printf 'add-generic-password -U -A -s tcr-probe -a credentials -w %s\n' "$secret" | security -i
+  # 2. read back from a plain shell (verified: prints the value, exit 0)
   security find-generic-password -s tcr-probe -a credentials -w
-  # 3. does it still come back from a process with no GUI session?
+  # 3. still unverified: from a process with no GUI session
   ssh localhost 'security find-generic-password -s tcr-probe -a credentials -w'
-  # 4. and from the supervised server's context, however it is started
-  # 5. clean up
+  # 4. still unverified: from the supervised server's context, however it is started
+  # 5. clean up (verified, exit 0)
   security delete-generic-password -s tcr-probe -a credentials
   ```
-  If (1) puts the secret in argv instead, the fallback is `-X <hex>` with the same exposure, or
-  approach D. If (3) returns `-25308` or hangs, phase 3 does not ship without an unlock story.
+  `-i` reads one command per line, so a secret containing a newline must be rejected before the
+  write (OAuth tokens are base64url and cannot). If (3) returns `-25308` or hangs, phase 3 does
+  not ship without an unlock story.
 - **The failure the gate must catch**: a keychain write that silently succeeds while the read path
   gets a different item, or a prompt appearing in a context with no human. Watch the prompt fire
   once on purpose (create an item WITHOUT `-A` from one binary and read it from another) so the
