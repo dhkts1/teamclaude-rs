@@ -1236,11 +1236,11 @@ struct FleetView: View {
             // than one band, and two sections sharing a SwiftUI identity paint
             // one section's rows into the other's slot.
             ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                if sections.isFirstOfBand(index) {
+                if drawsBandHeading(sections, at: index) {
                     bandHeading(section.band, soleGroupInBand: sections.soleGroupInBand(at: index))
                 }
                 sectionBody(
-                    section, drawsHeading: sections.drawsGroupHeading(at: index), fleet: fleet)
+                    section, drawsHeading: drawsGroupHeading(sections, at: index), fleet: fleet)
             }
         }
     }
@@ -1518,9 +1518,45 @@ struct FleetView: View {
     /// ``groupHeading(_:)`` already follows: an unkeyed, undrawn heading
     /// charges the viewport nothing, and a keyed-but-undrawn one would
     /// charge for a row that is not there.
+    /// Whether the list draws a band heading above the section at `index`.
+    ///
+    /// The draw loop and ``listChildKeys(_:)`` both ask THIS, not
+    /// ``Array/isFirstOfBand(_:)`` directly: a heading drawn but unkeyed is a
+    /// row the viewport never charges for, and a heading keyed but not drawn
+    /// charges for a row that is not there. Both clip. `bandHeading` itself
+    /// then makes the same two refusals (sole group in band, and the LIVE
+    /// band) — kept there too because that is where each one's reason lives.
+    private func drawsBandHeading(_ sections: [FleetSection], at index: Int) -> Bool {
+        guard sections.isFirstOfBand(index), sections.indices.contains(index) else { return false }
+        let section = sections[index]
+        return !sections.soleGroupInBand(at: index) && section.band != .live
+    }
+
+    /// Whether the list draws a plain-text group heading above the section at
+    /// `index` — ``Array/drawsGroupHeading(at:)``, minus the unlabelled pile.
+    ///
+    /// v4 draws no "Ungrouped" heading: the mockup's Accounts panel opens on
+    /// the solo cards with nothing over them, and a heading whose whole
+    /// content is "these have no group" is the row of dead space
+    /// `drawsGroupHeading`'s own doc-comment already argues against for the
+    /// single-section case. The model's rule is left alone — this is a
+    /// drawing decision, and `FleetSectionsTests` pins the model's.
+    private func drawsGroupHeading(_ sections: [FleetSection], at index: Int) -> Bool {
+        guard sections.indices.contains(index) else { return false }
+        return sections.drawsGroupHeading(at: index) && sections[index].group != .ungrouped
+    }
+
     @ViewBuilder
     private func bandHeading(_ band: FleetBand, soleGroupInBand: Bool) -> some View {
-        if !soleGroupInBand {
+        // The LIVE band draws no heading at all in v4 (Gil, reading the panel
+        // beside `docs/design/panel-tabs-mockup.html`: the mockup's Accounts
+        // panel opens straight onto the solo cards, and each group labels
+        // itself with its own legend). `outOfTokens` and `parked` keep theirs:
+        // the mockup never draws either state, so its silence is not evidence
+        // for deleting the only label an ungrouped spent row has — a named
+        // group carries "· PARKED" in its legend, an unlabelled pile carries
+        // nothing.
+        if !soleGroupInBand && band != .live {
             measured(bandHeightKey(band)) {
                 Text(band.title.uppercased())
                     .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
@@ -1561,27 +1597,38 @@ struct FleetView: View {
     private func groupHeading(_ section: FleetSection) -> some View {
         if let rgb = section.outlineColor {
             let color = Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
-            let legend = Text(section.legendText)
-                .font(Tok.detailFont.weight(.bold)).lineSpacing(Tok.detailLineSpacing)
-                .tracking(Tok.pillTracking)
-                .foregroundStyle(color)
-                .padding(.horizontal, Tok.space1)
-                .padding(.vertical, Tok.space1)
-                // Matches the panel body behind it, so the stroke line reads
-                // as broken by the legend rather than running behind it.
-                //
-                // `Tok.panel` is a flat, fully opaque `Color` — this panel is
-                // NOT a real translucent material (no `NSVisualEffectView`
-                // anywhere in this target; `FleetView`'s own root is
-                // `.background(Tok.panel)`, a plain fill). The tabs-mockup
-                // review's finding 11 (an opaque legend patch reads as a
-                // black bar over a backdrop-filter panel) is a defect in that
-                // CSS approximation and does not reproduce here — checked
-                // against both appearances in `--render-states`, scene
-                // `15-parked-group`: the legend's background is pixel-
-                // identical to the panel around it in both. Revisit this
-                // comment the day this panel ever gains real vibrancy.
-                .background(Tok.panel)
+            // The mockup's own legend glyph — a rounded square in the group's
+            // colour, `<rect rx=4>` at 11px, ahead of the name
+            // (`docs/design/panel-tabs-mockup.html:291`). It is the second
+            // channel the group's identity rides on: the outline is the same
+            // hue and a reader who cannot separate two purples still gets a
+            // mark tying legend to box.
+            let legend = HStack(spacing: 4) {
+                Image(systemName: "square.fill")
+                    .font(.system(size: 8))
+                Text(section.legendText)
+                    .tracking(Tok.pillTracking)
+            }
+            .font(Tok.detailFont.weight(.bold))
+            .lineSpacing(Tok.detailLineSpacing)
+            .foregroundStyle(color)
+            .padding(.horizontal, Tok.space1)
+            .padding(.vertical, Tok.space1)
+            // Matches the panel body behind it, so the stroke line reads
+            // as broken by the legend rather than running behind it.
+            //
+            // `Tok.panel` is a flat, fully opaque `Color` — this panel is
+            // NOT a real translucent material (no `NSVisualEffectView`
+            // anywhere in this target; `FleetView`'s own root is
+            // `.background(Tok.panel)`, a plain fill). The tabs-mockup
+            // review's finding 11 (an opaque legend patch reads as a
+            // black bar over a backdrop-filter panel) is a defect in that
+            // CSS approximation and does not reproduce here — checked
+            // against both appearances in `--render-states`, scene
+            // `15-parked-group`: the legend's background is pixel-
+            // identical to the panel around it in both. Revisit this
+            // comment the day this panel ever gains real vibrancy.
+            .background(Tok.panel)
             if section.isWhollyParked || section.collapsesByDefault {
                 Button {
                     toggleGroupExpansion(section.group.token)
@@ -1789,11 +1836,11 @@ struct FleetView: View {
     private func listChildKeys(_ sections: [FleetSection]) -> [String] {
         var keys: [String] = []
         for (index, section) in sections.enumerated() {
-            if sections.isFirstOfBand(index) {
+            if drawsBandHeading(sections, at: index) {
                 keys.append(bandHeightKey(section.band))
             }
             // Same predicate as the draw loop, deliberately. See there.
-            if sections.drawsGroupHeading(at: index) {
+            if drawsGroupHeading(sections, at: index) {
                 keys.append(groupHeightKey(section))
             }
             // Same three branches as `sectionBody`, in the same order and on
