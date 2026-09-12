@@ -38,18 +38,27 @@ findings=""
 scanned=0
 
 # stdin: <local ref> <local sha> <remote ref> <remote sha>, one line per ref.
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
   [ -n "${local_sha:-}" ] || continue
   # A deletion pushes nothing.
   case "$local_sha" in "$ZERO") continue ;; esac
 
-  if [ "$remote_sha" = "$ZERO" ]; then
-    # A new branch. Scanning its whole ancestry would flag years of history that
-    # is already public, so scan only what no other remote ref already carries.
-    range_commits="$(git rev-list "$local_sha" --not --remotes || true)"
-  else
-    range_commits="$(git rev-list "${remote_sha}..${local_sha}" || true)"
-  fi
+  # Only what NO remote ref already carries, for a new branch and an existing one
+  # alike. `--not --remotes` is the whole point and it is not an optimisation:
+  #
+  # Merging `main` into a feature branch makes main's commits new to THIS ref, so
+  # a plain `remote..local` range hands them to the scan even though every one of
+  # them is already public. That is not hypothetical. This hook refused its own
+  # author's push on 2026-09-12, naming two addresses in the message of a
+  # dependabot commit that was already on `main` and already world-readable, at
+  # the exact moment the branch was brought up to date in order to merge it. A
+  # gate that refuses the ordinary act of updating a branch is a gate someone
+  # turns off, and then it gates nothing.
+  #
+  # The range for a brand-new branch is identical under this reading, so the two
+  # cases collapse into one and the remote sha is not needed at all: a deletion is
+  # already told apart above by its all-zero LOCAL sha.
+  range_commits="$(git rev-list "$local_sha" --not --remotes || true)"
 
   [ -n "$range_commits" ] || continue
 
