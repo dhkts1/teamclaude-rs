@@ -49,6 +49,15 @@ public enum LoginLauncher {
         case couldNotWriteScript(String)
     }
 
+    /// Single-quote one shell argument, escaping any embedded single quote the
+    /// POSIX way (`'\''`), so the shell receives it as exactly one argument
+    /// whatever it contains. Shared by ``script(forExecutableAt:reloggingIn:)``
+    /// and ``mintScript(forExecutableAt:target:)`` so the two scripts this file
+    /// composes can never drift onto two different quoting rules.
+    static func posixQuote(_ argument: String) -> String {
+        "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
     /// Compose the shell script that a Terminal window will run.
     ///
     /// Split out and pure so the quoting is testable: an install path containing a
@@ -80,10 +89,7 @@ public enum LoginLauncher {
         forExecutableAt path: String,
         reloggingIn name: String? = nil
     ) -> String {
-        // Single-quote the path and escape any embedded single quote the POSIX
-        // way ('\'') so the shell receives exactly one argument whatever the path
-        // contains.
-        let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let quoted = posixQuote(path)
         let hint: String
         let accountArgument: String
         if let name {
@@ -95,14 +101,13 @@ public enum LoginLauncher {
             let message =
                 "Re-logging in \(name) — tcr requests that account, and refuses "
                 + "to save if the browser hands back a different one."
-            let quotedMessage = "'" + message.replacingOccurrences(of: "'", with: "'\\''") + "'"
+            let quotedMessage = posixQuote(message)
             hint = """
                 echo \(quotedMessage)
                 echo
 
                 """
-            let quotedName = "'" + name.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            accountArgument = " --account \(quotedName)"
+            accountArgument = " --account \(posixQuote(name))"
         } else {
             hint = ""
             accountArgument = ""
@@ -119,21 +124,53 @@ public enum LoginLauncher {
             """
     }
 
-    /// Write the script somewhere Terminal will open, and open it.
+    /// Which rows `tcr mint` should run against — one account, or every
+    /// account carrying a group label. Mirrors the CLI's own two flags
+    /// (`tcr mint --account <name>` / `tcr mint --group <name>`) rather than
+    /// inventing a third shape.
+    public enum MintTarget: Equatable {
+        case account(String)
+        case group(String)
+    }
+
+    /// Compose the shell script for `tcr mint`, the same way
+    /// ``script(forExecutableAt:reloggingIn:)`` composes one for `tcr login`
+    /// and for the same reason: this hands off to a real Terminal rather than
+    /// spawning in the background. `tcr mint` prints an authorize URL and
+    /// waits for a pasted code on stdin, once per account, and puts the
+    /// resulting token(s) on the clipboard itself — nothing here ever reads
+    /// or renders one.
     ///
-    /// A `.command` file opened via LaunchServices starts Terminal directly. The
-    /// alternative — an AppleScript `do script` — needs Automation permission and
-    /// would put a consent dialog between the operator and a login they asked for.
-    ///
-    /// The filename carries a UUID (`uuid`, injectable for tests), not a fixed
-    /// `tcr-login.command`. Before `--account` shipped every invocation wrote
-    /// IDENTICAL bytes, so a fixed path was harmless — two clicks in quick
-    /// succession just overwrote the file with the same script. It is a
-    /// correctness surface now: the content is per-account, so two Re-login
-    /// clicks in quick succession could overwrite the file before the first
-    /// Terminal window reads it, letting window A run window B's
-    /// `--account`. A unique path per invocation makes that race structurally
-    /// impossible rather than merely unlikely.
+    /// `name` — an account or group name — is shell-quoted with the SAME
+    /// ``posixQuote(_:)`` helper the login script uses, for the same reason:
+    /// it is attacker-adjacent input landing on a command line, not just in an
+    /// `echo`.
+    static func mintScript(forExecutableAt path: String, target: MintTarget) -> String {
+        let quoted = posixQuote(path)
+        let flag: String
+        let name: String
+        switch target {
+        case .account(let value):
+            flag = "--account"
+            name = value
+        case .group(let value):
+            flag = "--group"
+            name = value
+        }
+        return """
+            #!/bin/sh
+            # Opened by TcrBar. `tcr mint` needs a terminal: it prints an
+            # authorize URL and waits for a pasted code, once per account, and
+            # puts the resulting token(s) on the clipboard itself.
+            echo "Running tcr mint — follow the prompts below."
+            echo
+            exec \(quoted) mint \(flag) \(posixQuote(name))
+            """
+    }
+
+    /// Write the login script somewhere Terminal will open, and open it. See
+    /// ``writeAndOpen(_:filenamePrefix:uuid:open:)`` for the shared shape and
+    /// why the filename carries a UUID.
     @discardableResult
     public static func launch(
         reloggingIn name: String? = nil,
@@ -148,8 +185,51 @@ public enum LoginLauncher {
         }
 
         let script = script(forExecutableAt: executable.path, reloggingIn: name)
+        return writeAndOpen(
+            script, filenamePrefix: "tcr-login", uuid: uuid(), open: open)
+    }
+
+    /// Same hand-off as ``launch(reloggingIn:uuid:resolve:open:)``, for
+    /// `tcr mint` rather than `tcr login`. Shares its resolve/write/open shape
+    /// exactly — the only difference is which script gets composed — so a
+    /// missing `tcr` or an unwritable temp directory fails the same way here
+    /// as it does there.
+    @discardableResult
+    public static func launchMint(
+        target: MintTarget,
+        uuid: () -> UUID = UUID.init,
+        resolve: () -> Result<URL, TcrTool.NotFound> = { TcrTool.resolve() },
+        open: (URL) -> Void = { NSWorkspace.shared.open($0) }
+    ) -> Result<URL, Failure> {
+        let executable: URL
+        switch resolve() {
+        case .success(let url): executable = url
+        case .failure(let missing): return .failure(.toolMissing(searched: missing.searched))
+        }
+
+        let script = mintScript(forExecutableAt: executable.path, target: target)
+        return writeAndOpen(
+            script, filenamePrefix: "tcr-mint", uuid: uuid(), open: open)
+    }
+
+    /// Write a composed script to a per-invocation temp path and open it, the
+    /// one path both ``launch(reloggingIn:uuid:resolve:open:)`` and
+    /// ``launchMint(target:uuid:resolve:open:)`` share. The filename carries a
+    /// UUID (`uuid`, injectable for tests), not a fixed name: the content is
+    /// per-account/per-group, so two clicks in quick succession could
+    /// overwrite the file before the first Terminal window reads it, letting
+    /// window A run window B's arguments. A unique path per invocation makes
+    /// that race structurally impossible rather than merely unlikely.
+    ///
+    /// A `.command` file opened via LaunchServices starts Terminal directly. The
+    /// alternative — an AppleScript `do script` — needs Automation permission and
+    /// would put a consent dialog between the operator and an action they asked
+    /// for.
+    private static func writeAndOpen(
+        _ script: String, filenamePrefix: String, uuid: UUID, open: (URL) -> Void
+    ) -> Result<URL, Failure> {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("tcr-login-\(uuid().uuidString).command")
+            .appendingPathComponent("\(filenamePrefix)-\(uuid.uuidString).command")
 
         do {
             try script.write(to: url, atomically: true, encoding: .utf8)

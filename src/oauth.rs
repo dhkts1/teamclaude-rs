@@ -107,17 +107,21 @@ pub fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
 }
 
 /// `Accept` header the token endpoint expects from a "recognised" client.
-/// Shared between [`refresh_access_token_at`] and [`exchange_code`] — see
-/// [`OAUTH_USER_AGENT`] for why sending it matters.
-const OAUTH_ACCEPT: &str = "application/json, text/plain, */*";
+/// Shared between [`refresh_access_token_at`], [`exchange_code`] and
+/// `mint::exchange_mint_code` — see [`OAUTH_USER_AGENT`] for why sending it
+/// matters. `pub(crate)` rather than private so `mint.rs` sends the identical
+/// value instead of a second copy that could drift.
+pub(crate) const OAUTH_ACCEPT: &str = "application/json, text/plain, */*";
 
 /// `User-Agent` header the token endpoint expects from a "recognised" client.
 /// Without this header (and [`OAUTH_ACCEPT`]) an otherwise-valid exchange was
 /// refused a bogus `{"type":"rate_limit_error"}` 21 times over 7 minutes; the
 /// identical payload with these headers was evaluated on the first attempt —
 /// measured against the live endpoint, `docs/design/long-lived-tokens.md`
-/// ("The endpoint 429s clients it does not recognise").
-const OAUTH_USER_AGENT: &str = "axios/1.13.6";
+/// ("The endpoint 429s clients it does not recognise"). `pub(crate)` for the
+/// same reason as [`OAUTH_ACCEPT`]: `mint.rs`'s exchange hits the same
+/// endpoint and must never fall behind this value.
+pub(crate) const OAUTH_USER_AGENT: &str = "axios/1.13.6";
 
 /// Refresh an access token against [`TOKEN_ENDPOINT`], retrying `5xx`/network
 /// failures with exponential backoff. Auth rejections are returned immediately.
