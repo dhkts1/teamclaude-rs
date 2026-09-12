@@ -426,8 +426,9 @@ struct FleetView: View {
     }
 
     /// One section's heading and rows, outlined in the group's colour when
-    /// ``FleetSection/isOutlined`` says to (never for `.ungrouped` — its
-    /// bare absence of a box is the signal, per the bridge's decision #1).
+    /// ``FleetSection/outlineColor`` resolves one (never for `.ungrouped`,
+    /// and never for a named group with no resolved colour either — see
+    /// that property's own doc-comment for why the two draw identically).
     ///
     /// `drawsHeading` is threaded through rather than recomputed, and
     /// `listChildKeys` below gates on the SAME call `accountList` made: a
@@ -470,28 +471,35 @@ struct FleetView: View {
     /// itself short of its own content. Growing the background instead
     /// changes nothing SwiftUI's layout pass measures.
     ///
-    /// A named group with no resolved colour (``FleetSection/outlineColor``
-    /// `nil`) still draws — in ``Tok/hairlineStrong``, the same neutral the
-    /// account card's own border already uses — because it IS a real group,
-    /// just one this build cannot colour; only ``FleetGroupKey/ungrouped``
-    /// draws nothing at all.
+    /// Draws NOTHING when ``FleetSection/outlineColor`` is `nil` — an
+    /// earlier version of this drew a neutral ``Tok/hairlineStrong`` box for
+    /// a named group with no resolved colour, mirroring ``GroupChip``'s own
+    /// colourless-but-still-legible fallback. That does not transfer here: a
+    /// chip stays informative without colour because it has text inside it;
+    /// an outline IS the colour, so stripping it leaves a box that groups
+    /// nothing while still competing for the eye — measured at 2.56:1 dark /
+    /// 2.23:1 light against the panel, visible enough to be clutter and not
+    /// visible enough to read as a boundary. An absent box beats an
+    /// invisible one, so an unresolved colour now draws exactly like
+    /// `.ungrouped`.
+    ///
+    /// The resolved colour itself is drawn at full strength, undimmed, even
+    /// where its own measured contrast is low (`henry-team`'s green is
+    /// 1.73:1 on the light panel) — that is reported, not silently
+    /// corrected, because the group heading already names the group in
+    /// text: the outline's colour is redundant decoration here, not
+    /// information the reader has no other way to get, so it does not need
+    /// to clear a text-legibility bar to be worth drawing.
     @ViewBuilder
     private func groupOutline(for section: FleetSection) -> some View {
-        if section.isOutlined {
+        if let rgb = section.outlineColor {
             RoundedRectangle(cornerRadius: Tok.groupOutlineRadius)
-                .strokeBorder(outlineTint(for: section), lineWidth: Tok.groupOutlineWidth)
+                .strokeBorder(
+                    Color(red: rgb.red, green: rgb.green, blue: rgb.blue),
+                    lineWidth: Tok.groupOutlineWidth
+                )
                 .padding(-Tok.groupOutlineInset)
         }
-    }
-
-    /// The colour to stroke a section's outline in: the server-resolved
-    /// group colour at full strength when one exists, else the same neutral
-    /// ``Tok/hairlineStrong`` the account card's own border already draws —
-    /// never a dimmed or invented hue (see ``FleetSection/outlineColor``'s
-    /// doc-comment for why).
-    private func outlineTint(for section: FleetSection) -> Color {
-        guard let rgb = section.outlineColor else { return Tok.hairlineStrong }
-        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
     }
 
     /// The outer heading: what these accounts can do for you right now.

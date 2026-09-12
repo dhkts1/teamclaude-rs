@@ -262,10 +262,10 @@ final class FleetSectionsTests: XCTestCase {
 
     // MARK: - Group outline (docs/plans/group-outline-bridge.md)
 
-    /// A named group's section carries its own server-resolved colour, and
-    /// `isOutlined` says the view should draw it. Decision #1: `.ungrouped`
-    /// carries neither — no colour AND no outline at all, not merely an
-    /// unresolved one, which is the distinction the next test locks down.
+    /// A named group's section carries its own server-resolved colour.
+    /// `.ungrouped` carries none — decision #1, its absent outline IS the
+    /// signal — which is the same `nil` the next test locks down for a
+    /// DIFFERENT reason (a real group whose colour never resolved).
     func testNamedGroupSectionCarriesItsColorAndUngroupedCarriesNone() {
         let fleet = Fleet(accounts: [
             sectionAccount(
@@ -287,15 +287,18 @@ final class FleetSectionsTests: XCTestCase {
     }
 
     /// A named group with no `groupColors` entry — an older server, or the
-    /// field genuinely absent — still answers `isOutlined == true` (it is a
-    /// real group), but `outlineColor` is `nil` rather than an invented hue.
-    /// The view is the one that falls back to a neutral stroke; this layer
-    /// never guesses a colour.
-    func testNamedGroupWithNoResolvedColorIsStillOutlinedButHasNoColor() {
+    /// field genuinely absent — answers `isOutlined == false`, exactly like
+    /// `.ungrouped` does, and the view draws NO outline for either. An
+    /// earlier version of this answered `true` here and had the view fall
+    /// back to a neutral box, mirroring `GroupTag`'s own colourless-chip
+    /// fallback; that was reverted because an outline that is only ever a
+    /// stroke has nothing left to say once its colour is gone — a chip
+    /// still has its text. An absent box beats an invisible one.
+    func testNamedGroupWithNoResolvedColorDrawsNoOutlineEitherJustLikeUngrouped() {
         let fleet = Fleet(accounts: [sectionAccount("a@example.com", groups: ["dev"])])
         let section = try? XCTUnwrap(fleet.sectionsInDisplayOrder().first)
 
-        XCTAssertTrue(section?.isOutlined ?? false)
+        XCTAssertFalse(section?.isOutlined ?? true)
         XCTAssertNil(section?.outlineColor)
     }
 

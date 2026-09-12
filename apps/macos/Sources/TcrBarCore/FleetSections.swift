@@ -221,32 +221,28 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// the heading without walking `rows` itself.
     public var containsControl: Bool { rows.contains(where: \.isControl) }
 
-    /// Whether the view should draw a group outline around this section at
-    /// all — every named group, never ``FleetGroupKey/ungrouped``
-    /// (`docs/plans/group-outline-bridge.md`, decision #1: the absence of an
-    /// outline on an ungrouped section IS the signal, so nothing here
-    /// invents a neutral one for it). A named group still answers `true`
-    /// even when ``outlineColor`` is `nil` — that is a real group with an
-    /// unresolved colour, not the absence of a group, and the view falls
-    /// back to a neutral stroke the same way ``GroupTag/background``'s own
-    /// fallback keeps drawing a (colourless) chip rather than no chip.
-    public var isOutlined: Bool {
-        if case .named = group { return true }
-        return false
-    }
-
     /// The server-resolved colour to stroke this section's outline in, or
-    /// `nil` when no row in it carries a colour for this group (an older
-    /// server, or the field genuinely absent). Never invented client-side —
-    /// the same rule ``Account/groupTags`` already follows for the per-row
-    /// chip — so a `nil` here means the view must fall back to a neutral
-    /// stroke, not guess a hue.
+    /// `nil` when there is nothing to draw: `.ungrouped`
+    /// (`docs/plans/group-outline-bridge.md`, decision #1 — the absence of
+    /// an outline there IS the signal), OR a named group whose colour has
+    /// not resolved (an older server, or the field genuinely absent).
     ///
-    /// Reads from the first row that has an answer rather than requiring
-    /// every row to agree: `groupColors` is fleet-wide (every row of every
-    /// account carries the same map, per its own doc-comment), so in
-    /// practice they always agree, and this only guards against a
-    /// pathological wire payload where they do not.
+    /// Both `nil` cases draw NOTHING, on purpose — this does NOT mirror
+    /// ``GroupTag/background``'s neutral fallback, even though an earlier
+    /// version of this property did. A chip stays informative without
+    /// colour because it has legible text inside it; an outline is only the
+    /// stroke, so a colourless one is a box that groups nothing while still
+    /// competing for the eye. A neutral fallback here measured 2.56:1 dark /
+    /// 2.23:1 light against the panel — visible enough to be clutter, not
+    /// visible enough to read as a boundary — which is why an unresolved
+    /// colour now answers the same as no group at all.
+    ///
+    /// Never invents a colour client-side — the same rule ``Account/groupTags``
+    /// already follows for the per-row chip. Reads from the first row that
+    /// has an answer rather than requiring every row to agree: `groupColors`
+    /// is fleet-wide (every row of every account carries the same map, per
+    /// its own doc-comment), so in practice they always agree, and this only
+    /// guards against a pathological wire payload where they do not.
     public var outlineColor: GroupTagColor.RGB? {
         guard case .named(let name) = group else { return nil }
         for row in rows {
@@ -256,6 +252,13 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
         }
         return nil
     }
+
+    /// Whether the view should draw a group outline around this section at
+    /// all — exactly when ``outlineColor`` resolves to a real colour. Kept
+    /// as its own named property, rather than inlined at every call site, so
+    /// the "draw or not" decision reads as one word and is unit-testable on
+    /// its own: see the drawing rule's full reasoning on ``outlineColor``.
+    public var isOutlined: Bool { outlineColor != nil }
 }
 
 extension Array where Element == FleetSection {
