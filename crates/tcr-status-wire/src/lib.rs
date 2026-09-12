@@ -119,6 +119,78 @@ pub struct HeldWindowRow {
     pub minutes_until_reset: i64,
 }
 
+/// One tool call still awaiting its `tool_result`, on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningToolRow {
+    pub tool: String,
+    pub started_ms: i64,
+    /// First 120 characters of a Bash tool's `input.command` — `None` for any other tool, or
+    /// when the running call carries no command. Held in memory only on the server; never
+    /// written to a log (see `src/session_wire.rs`'s module doc in the main crate).
+    pub command_head: Option<String>,
+}
+
+/// One completed tool call, for a session's "ten slowest" list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlowToolRow {
+    pub tool: String,
+    pub seconds: f64,
+    pub command_head: Option<String>,
+    pub ended_ms: i64,
+}
+
+/// A session's tool-call aggregates.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionToolsRow {
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub errors: u64,
+    #[serde(default)]
+    pub timeouts: u64,
+    /// Tool calls still awaiting a `tool_result`, capped at 64 per session.
+    #[serde(default)]
+    pub running: Vec<RunningToolRow>,
+    /// The ten slowest completed tool calls, descending by `seconds`.
+    #[serde(default)]
+    pub slowest: Vec<SlowToolRow>,
+}
+
+/// One live session on the `tcr status --json` wire's `sessions` array (F1,
+/// `docs/design/panel-tabs.md`). One entry per session the proxy has seen in the last hour —
+/// see `src/session_wire.rs` in the main crate for how it is built and bounded.
+///
+/// `#[serde(default)]` on every field but `sessionId` so a payload from a server built before
+/// this row existed simply omits `sessions` entirely (the array field itself is
+/// `#[serde(default)]` on the enclosing status payload, in `status.rs`) — never a hard parse
+/// failure that drops a client back to a fabricated all-zeros offline snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRow {
+    pub session_id: String,
+    /// The account this session's most recent request served against, or `None` when it has
+    /// never been attributed to one (e.g. the request carried no stable identity).
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    pub first_seen_ms: i64,
+    pub last_seen_ms: i64,
+    #[serde(default)]
+    pub requests: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    #[serde(default)]
+    pub tools: SessionToolsRow,
+}
+
 /// One account's row on the `tcr status --json` wire.
 ///
 /// Field-for-field mirror of what `render_accounts_json` emits today — see that

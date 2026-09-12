@@ -6011,6 +6011,7 @@ mod tests {
                 current: Some(0),
                 recent: Vec::new(),
                 sessions: Vec::new(),
+                wire_sessions: Vec::new(),
             },
             thresholds,
         )
@@ -6585,6 +6586,7 @@ mod tests {
                 current: None,
                 recent: Vec::new(),
                 sessions: Vec::new(),
+                wire_sessions: Vec::new(),
             },
             vec![0.90, 0.90],
         )

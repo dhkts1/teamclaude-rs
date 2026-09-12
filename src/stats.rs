@@ -307,4 +307,11 @@ pub struct StatsSnapshot {
     /// session id) — deliberately NOT recency, so a row holds its place instead of
     /// jumping to the top of the pane on every request.
     pub sessions: Vec<SessionSnapshot>,
+    /// Live sessions keyed on the Claude Code `session_id` embedded in
+    /// `metadata.user_id` (F1, `docs/design/panel-tabs.md`) — a different grain from
+    /// [`Self::sessions`] above, which is keyed on the proxy's own affinity hash and exists
+    /// for the TUI's pin display. This one carries tool-call timing and is what
+    /// `tcr status --json`'s `sessions` array (via [`crate::status::StatusPayload`]) is built
+    /// from. Reusing the wire type directly here, same as [`AccountSnapshot::usage`] beside it.
+    pub wire_sessions: Vec<tcr_status_wire::SessionRow>,
 }

@@ -28,9 +28,13 @@
 //!    test rather than a code review.
 //!
 //! Deliberately NOT on the wire: the recent-request ring buffer (it carries the
-//! request paths a client sent) and the live session table. `tcr status` prints
-//! neither, so neither is exposed — the endpoint ships the smallest thing that
-//! renders the fleet view.
+//! request paths a client sent) and the affinity-hash session table
+//! ([`StatsSnapshot::sessions`], which exists for the TUI's pin display). `tcr status` prints
+//! neither, so neither is exposed.
+//!
+//! [`StatsSnapshot::wire_sessions`] — the Claude Code `session_id`-keyed table with tool-call
+//! timing (F1, `docs/design/panel-tabs.md`) — IS on the wire, as [`StatusPayload::sessions`]:
+//! it carries no credential material either, and it is the whole point of the feature.
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -149,6 +153,18 @@ pub struct StatusPayload {
     /// this must NOT bump [`STATUS_KIND`] — same reasoning as `control`.
     #[serde(default)]
     pub group_colors: std::collections::BTreeMap<String, String>,
+    /// One row per Claude Code session the proxy has seen in the last hour (F1,
+    /// `docs/design/panel-tabs.md`) — see [`crate::stats::StatsSnapshot::wire_sessions`] for
+    /// where this comes from and [`tcr_status_wire::SessionRow`] for the shape.
+    ///
+    /// `#[serde(default)]` for the same forward/back-compat reason as `group_colors` above: an
+    /// OLD server's payload has no such key, and a NEW client reads an empty array — the
+    /// truth, "this server never reported any sessions" — rather than failing the parse and
+    /// dropping to the all-zeros offline snapshot. An OLD client reading a NEW server simply
+    /// never looks at the extra key. Neither direction is MISREAD, so this must NOT bump
+    /// [`STATUS_KIND`], per this struct's `build` doc-comment.
+    #[serde(default)]
+    pub sessions: Vec<tcr_status_wire::SessionRow>,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -379,16 +395,20 @@ impl StatusPayload {
             http1_only,
             control,
             group_colors,
+            sessions: snapshot.wire_sessions.clone(),
         }
     }
 
     /// Rebuild the snapshot the CLI renderers take, plus the server's thresholds.
     ///
-    /// The `recent` log and `sessions` table come back EMPTY and `current` `None`:
-    /// they are not on the wire (see the module docs) and no `tcr status` renderer
-    /// reads them. Every `AccountSnapshot` field, by contrast, is reconstructed —
-    /// the struct literal below names all of them, so a new field forces an
-    /// explicit decision here instead of silently rendering a default.
+    /// The `recent` log and the affinity-hash `sessions` table (`StatsSnapshot::sessions`,
+    /// the TUI pin display) come back EMPTY and `current` `None`: they are not on the wire
+    /// (see the module docs) and no `tcr status` renderer reads them.
+    /// `StatsSnapshot::wire_sessions`, by contrast, IS reconstructed from
+    /// [`Self::sessions`] — it genuinely round-trips.
+    /// Every `AccountSnapshot` field is reconstructed too — the struct literal below names
+    /// all of them, so a new field forces an explicit decision here instead of silently
+    /// rendering a default.
     pub fn into_snapshot(self) -> (StatsSnapshot, Vec<f64>) {
         let mut thresholds = Vec::with_capacity(self.accounts.len());
         let accounts = self
@@ -441,6 +461,7 @@ impl StatusPayload {
                 current: None,
                 recent: Vec::new(),
                 sessions: Vec::new(),
+                wire_sessions: self.sessions,
             },
             thresholds,
         )
@@ -493,6 +514,33 @@ mod tests {
             current: Some(0),
             recent: Vec::new(),
             sessions: Vec::new(),
+            wire_sessions: vec![tcr_status_wire::SessionRow {
+                session_id: "sess-1".to_string(),
+                account: Some("alice@example.com".to_string()),
+                model: Some("claude-fable-5".to_string()),
+                first_seen_ms: crate::now_ms() - 60_000,
+                last_seen_ms: crate::now_ms(),
+                requests: 3,
+                input_tokens: 400,
+                output_tokens: 100,
+                cache_read_tokens: 200,
+                tools: tcr_status_wire::SessionToolsRow {
+                    calls: 2,
+                    errors: 0,
+                    timeouts: 0,
+                    running: vec![tcr_status_wire::RunningToolRow {
+                        tool: "Bash".to_string(),
+                        started_ms: crate::now_ms() - 5_000,
+                        command_head: Some("ls -la".to_string()),
+                    }],
+                    slowest: vec![tcr_status_wire::SlowToolRow {
+                        tool: "Bash".to_string(),
+                        seconds: 3.5,
+                        command_head: Some("sleep 3".to_string()),
+                        ended_ms: crate::now_ms(),
+                    }],
+                },
+            }],
         }
     }
 
@@ -537,6 +585,10 @@ mod tests {
         assert_eq!(after.quota_state, before.quota_state);
         assert_eq!(after.gate, before.gate);
         assert_eq!(after.groups, before.groups, "groups rides the wire intact");
+        assert_eq!(
+            rebuilt.wire_sessions, snapshot.wire_sessions,
+            "the sessions array rides the wire intact"
+        );
         assert_eq!(
             after.reserved_groups, before.reserved_groups,
             "reservedGroups rides the wire intact"
@@ -634,6 +686,33 @@ mod tests {
         assert_eq!(
             back.accounts[0].seven_day_oi_reset_ms, None,
             "missing sevenDayOiResetMs field on the wire defaults to None, not a decode error"
+        );
+    }
+
+    /// A payload from an older server that predates the `sessions` array (F1) still
+    /// deserializes, defaulting to empty — same forward-compat contract as `groupColors`.
+    #[test]
+    fn payload_without_sessions_field_still_deserializes() {
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        value
+            .as_object_mut()
+            .expect("payload object")
+            .remove("sessions");
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let back: StatusPayload =
+            serde_json::from_str(&stripped).expect("deserialize without a sessions field");
+        assert_eq!(
+            back.sessions,
+            Vec::new(),
+            "missing sessions field on the wire defaults to empty, not a decode error"
         );
     }
 

@@ -326,6 +326,7 @@ impl Manager {
             current: *self.current.lock().expect("current lock poisoned"),
             recent,
             sessions,
+            wire_sessions: self.wire_sessions_snapshot(now),
         }
     }
 }

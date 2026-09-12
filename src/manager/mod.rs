@@ -54,6 +54,7 @@ mod state;
 mod throttle;
 mod usage;
 mod warm;
+mod wire_sessions;
 
 // Re-exported so unit F's replay harness (`tests/`) can call the SAME
 // production predicate rather than a reimplementation — see
@@ -1076,6 +1077,12 @@ pub struct Manager {
     /// live per-session visibility in the TUI. Separate from `affinity` so the
     /// routing pin stays byte-for-byte unchanged; bounded in `record_served`.
     sessions: Mutex<HashMap<u64, SessionStat>>,
+    /// The Claude Code `session_id`-keyed table with tool-call timing (F1,
+    /// `docs/design/panel-tabs.md`), on a different grain from [`Self::sessions`] above — see
+    /// [`crate::session_wire`] for the tracker itself and [`crate::stats::StatsSnapshot::wire_sessions`]
+    /// for where it surfaces. A separate lock from every other field here: nothing on the
+    /// routing path reads it, so it is never held together with `accounts` or `affinity`.
+    wire_sessions: Mutex<crate::session_wire::WireSessionTracker>,
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
@@ -1389,6 +1396,7 @@ impl Manager {
             affinity_extended: Mutex::new(HashSet::new()),
             affinity_dirty: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
+            wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             conn_affinity: Mutex::new(HashMap::new()),
