@@ -206,7 +206,7 @@ struct FleetView: View {
                 // 13pt/semibold on macOS, well under the mockup's size.
                 // Literal per the tokens-parity fence; swap for a `Tok` name
                 // once one exists.
-                Text("tcr fleet").font(.system(size: 17, weight: .bold))
+                Text("tcr fleet").font(Tok.panelTitleFont)
                 Spacer()
                 if let at = poller.lastPollAt {
                     // `docs/design/panel-tabs-mockup.html` F14: the header's
@@ -224,7 +224,7 @@ struct FleetView: View {
                     // hints"), so this corrects the colour role along with
                     // the size.
                     Text(freshnessLabel(since: at, now: Date()))
-                        .font(.system(size: 12.5).monospacedDigit())
+                        .font(Tok.tabular(Tok.freshnessFont))
                         .foregroundStyle(Tok.inkFaint)
                 }
                 // Gear opens Settings — in the header, not the footer, and
@@ -394,14 +394,14 @@ struct FleetView: View {
         // were 13pt/11pt.
         var line =
             Text(fleet.capacitySummary)
-            .font(.system(size: 15, weight: .semibold))
+            .font(Tok.nameFont)
             .foregroundColor(Tok.color(for: fleet.capacityState))
         for tally in fleet.breakdown {
             line =
                 line
-                + Text(" · ").font(.system(size: 15)).foregroundColor(Tok.inkFaint)
+                + Text(" · ").font(Tok.summaryFont).foregroundColor(Tok.inkFaint)
                 + Text(tally.label)
-                .font(.system(size: 15, weight: .semibold)).monospacedDigit()
+                .font(Tok.nameFont).monospacedDigit()
                 .foregroundColor(Tok.color(for: tally.kind))
         }
         return
@@ -583,13 +583,13 @@ struct FleetView: View {
                         // v4-spec: tab badge 11pt on rgba(255,255,255,.14),
                         // radius 9, padding 0 6 — literal per the
                         // tokens-parity fence.
-                        .font(.system(size: 11))
+                        .font(.system(size: Tok.tabBadgeFontSize))
                         .padding(.horizontal, 6)
                         .background(Capsule().fill(Color.white.opacity(0.14)))
                 }
             }
             // v4-spec: segmented tab label 12.5pt/600/+0.02em.
-            .font(.system(size: 12.5, weight: .semibold))
+            .font(Tok.tabLabelFont)
             .tracking(0.02 * 12.5)
             .foregroundStyle(isOn ? Tok.ink : Tok.inkDim)
             .frame(maxWidth: .infinity)
@@ -663,12 +663,12 @@ struct FleetView: View {
                         Text(entry.key.isEmpty ? "Unassigned" : entry.key)
                             // v4-spec: an account name is 15pt/600, the same
                             // value the Accounts tab's own name row uses.
-                            .font(.system(size: 15, weight: .semibold))
+                            .font(Tok.nameFont)
                             .foregroundStyle(Tok.ink)
                             .lineLimit(1)
                         Spacer(minLength: Tok.tightSpacing)
                         Text(sessionBlockSummary(entry.rows))
-                            .font(.system(size: 13))
+                            .font(Tok.dimLineFont)
                             .monospacedDigit()
                             .foregroundStyle(Tok.inkDim)
                             .lineLimit(1)
@@ -733,7 +733,7 @@ struct FleetView: View {
                     .frame(width: 8, height: 8)
                 Text(row.displayName).font(.subheadline.weight(.semibold))
                 Text(sessionSubtitle(row))
-                    .font(Tok.secondaryFont)
+                    .font(Tok.dimLineFont)
                     .foregroundStyle(Tok.inkDim)
                     .lineLimit(1)
                 Spacer()
@@ -760,7 +760,7 @@ struct FleetView: View {
                         )
                     Text(row.displayName).font(.subheadline.weight(.semibold))
                     Text(sessionSubtitle(row))
-                        .font(Tok.secondaryFont)
+                        .font(Tok.dimLineFont)
                         .foregroundStyle(Tok.inkDim)
                         .lineLimit(1)
                     Spacer()
@@ -919,7 +919,7 @@ struct FleetView: View {
             }
             if fleet.toolsRunning.isEmpty && fleet.toolsSlowest.isEmpty {
                 Text("No tool calls recorded yet.")
-                    .font(Tok.secondaryFont)
+                    .font(Tok.dimLineFont)
                     .foregroundStyle(Tok.inkDim)
             }
             if let categories = fleet.toolsByCategory {
@@ -945,7 +945,7 @@ struct FleetView: View {
             sectionHeading(title)
             if let subtitle {
                 Text(subtitle)
-                    .font(Tok.detailFont)
+                    .font(Tok.dimLineFont)
                     .foregroundStyle(Tok.inkFaint)
             }
             rows()
@@ -961,7 +961,7 @@ struct FleetView: View {
         let share = total > 0 ? Double(category.calls) / Double(total) : 0
         return HStack(spacing: Tok.tightSpacing) {
             Text(category.name)
-                .font(Tok.detailFont)
+                .font(Tok.dimLineFont)
                 .foregroundStyle(Tok.inkDim)
                 .frame(width: 84, alignment: .leading)
             GeometryReader { proxy in
@@ -974,7 +974,7 @@ struct FleetView: View {
             }
             .frame(height: 7)
             Text(byToolTrailingLabel(category))
-                .font(Tok.detailFont)
+                .font(Tok.dimLineFont)
                 .foregroundStyle(Tok.inkDim)
                 .lineLimit(1)
                 .fixedSize()
@@ -1010,7 +1010,7 @@ struct FleetView: View {
         // already authored uppercase at every call site, so no `.uppercased()`
         // is added here.
         Text(text)
-            .font(.system(size: 11, weight: .bold))
+            .font(Tok.sectionHeadFont)
             .foregroundStyle(Tok.inkFaint)
             .tracking(0.1 * 11)
     }
@@ -1022,11 +1022,11 @@ struct FleetView: View {
     private func toolCallLabel(_ entry: SessionToolEntry) -> some View {
         VStack(alignment: .leading, spacing: Tok.space1) {
             Text(entry.call.commandHead ?? entry.call.tool)
-                .font(.system(size: Tok.detailFontSize, design: .monospaced))
+                .font(Tok.monoFont)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Text("\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
-                .font(Tok.detailFont)
+                .font(Tok.dimLineFont)
                 .foregroundStyle(Tok.inkDim)
         }
     }
@@ -1346,7 +1346,7 @@ struct FleetView: View {
                 // v4-spec: the dim line is 13pt/400. Tabular, like every
                 // other changing number on this panel.
                 Text(section.collapsedSummaryLine)
-                    .font(.system(size: 13))
+                    .font(Tok.dimLineFont)
                     .monospacedDigit()
                     .foregroundStyle(Tok.inkDim)
                     .lineLimit(1)
@@ -1397,17 +1397,17 @@ struct FleetView: View {
                 Image(systemName: "chevron.down")
                 Text(title)
             }
-            .font(.system(size: 13))
+            .font(Tok.buttonFont)
             .foregroundStyle(Tok.ink)
-            .frame(maxWidth: .infinity, minHeight: 28)
+            .frame(maxWidth: .infinity, minHeight: Tok.buttonMinHeight)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .background(
-            RoundedRectangle(cornerRadius: 7).fill(Tok.raised)
+            RoundedRectangle(cornerRadius: Tok.buttonRadius).fill(Tok.raised)
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 7)
+            RoundedRectangle(cornerRadius: Tok.buttonRadius)
                 .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
         )
         .accessibilityHint(hint)
@@ -1424,13 +1424,13 @@ struct FleetView: View {
         let account = row.account
         return HStack(spacing: Tok.tightSpacing) {
             Text(account.name)
-                .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
+                .font(Tok.nameFont).lineSpacing(Tok.bodyLineSpacing)
                 .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                 .lineLimit(1)
                 .help(account.name)
             if let plan = account.plan, !plan.isEmpty {
                 Text(plan)
-                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
+                    .font(Tok.muteLineFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.inkFaint)
                     .lineLimit(1)
             }
@@ -1559,7 +1559,7 @@ struct FleetView: View {
         if !soleGroupInBand && band != .live {
             measured(bandHeightKey(band)) {
                 Text(band.title.uppercased())
-                    .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
+                    .font(Tok.sectionHeadFont).lineSpacing(Tok.detailLineSpacing)
                     .tracking(Tok.pillTracking)
                     .foregroundStyle(Tok.inkDim)
             }
@@ -1609,7 +1609,7 @@ struct FleetView: View {
                 Text(section.legendText)
                     .tracking(Tok.pillTracking)
             }
-            .font(Tok.detailFont.weight(.bold))
+            .font(Tok.sectionHeadFont)
             .lineSpacing(Tok.detailLineSpacing)
             .foregroundStyle(color)
             .padding(.horizontal, Tok.space1)
@@ -1901,13 +1901,13 @@ struct FleetView: View {
                 // 11pt/dim, `Tok.detailDigitFont` 10pt/faint). Literal per
                 // the tokens-parity fence.
                 Text(server.state.summary)
-                    .font(.system(size: 12.5))
+                    .font(Tok.freshnessFont)
                     .foregroundStyle(Tok.inkFaint)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: Tok.tightSpacing)
                 if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
                     Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
-                        .font(.system(size: 12.5).monospacedDigit())
+                        .font(Tok.tabular(Tok.freshnessFont))
                         .foregroundStyle(Tok.inkFaint)
                         .lineLimit(1)
                 }
@@ -3482,7 +3482,7 @@ struct AccountRow: View {
                     // design — `Tok.bodyFont` is 13pt/medium/rounded, a
                     // token owned by `feat/tokens-parity`; literal here per
                     // the coordinator's fence until that lane's name lands.
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(Tok.nameFont)
                     .tracking(-0.005 * 15)
                     .lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
