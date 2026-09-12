@@ -54,6 +54,9 @@ struct FleetView: View {
     /// nothing is worse than one that says why.
     @State private var loginError: String?
 
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     /// Measured height of every child the list draws — each account row, each
     /// group heading and each band heading — keyed by that child's identity in
     /// the list, NOT by account id.
@@ -275,6 +278,13 @@ struct FleetView: View {
             .fixedSize(horizontal: false, vertical: true)
             .accessibilityLabel("\(fleet.capacitySummary), \(fleet.breakdownLabel)")
             .padding(.top, Tok.tightSpacing)
+            // Bound to the two facts that drive this line's colour, not the
+            // summary TEXT: a count ticking should still read instantly, the
+            // same as a digit always has. `capacityState` tints the lead run,
+            // `breakdown` tints the tallies after it, and this line's height
+            // never depends on either.
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: fleet.capacityState)
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: fleet.breakdown)
     }
 
     // MARK: Body
@@ -1065,6 +1075,9 @@ struct AccountRow: View {
     /// land leaves no state at all (the pasteboard is the only evidence).
     @State private var tokenCopyFailure: TokenCommand.Failure?
 
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
     /// whether a quota is known — or, now, about whether it is still LIVE.
@@ -1400,14 +1413,26 @@ struct AccountRow: View {
         if control.isControl(account.name) {
             StatusPill("control", tint: Tok.accent)
                 .help("This account is held out of rotation as the control account.")
+                // Fades in and out rather than snapping. Safe against the
+                // height hazard: this line's quota-state pill (`rotationPill`'s
+                // neighbour below) is unconditional and the same height as
+                // every `StatusPill`, so this line's height never changes
+                // whether this pill is drawn or not.
+                .transition(.opacity)
         }
     }
 
+    /// Every branch below that draws a `StatusPill` carries `.transition(.opacity)`:
+    /// this line's height is pinned regardless, by the quota-state pill further
+    /// along the same `HStack` (`information`, `FleetView.swift`), which is
+    /// never `EmptyView` — so fading this one in and out changes no measured
+    /// height even on the two branches that go empty.
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
+                .transition(.opacity)
         } else if account.isParkedByGroup {
             // The SAME word as the row's own `disabled` above, deliberately:
             // the consequence is identical (no traffic lands here), and giving
@@ -1426,6 +1451,7 @@ struct AccountRow: View {
                         + "`tcr group unpark "
                         + "\(account.parkedGroupNames.first ?? "")` puts them back, live."
                 )
+                .transition(.opacity)
         } else if account.health == .needsRelogin {
             EmptyView()
         } else if account.isRejected {
@@ -1452,6 +1478,7 @@ struct AccountRow: View {
                         + "with no member free waits, or fails, rather than using "
                         + "another account."
                 )
+                .transition(.opacity)
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
                 .help(
@@ -1460,6 +1487,7 @@ struct AccountRow: View {
                         + "Anthropic can also exclude an account without changing "
                         + "its status; TcrBar cannot see that gate yet."
                 )
+                .transition(.opacity)
         }
     }
 
@@ -2149,6 +2177,15 @@ struct AccountRow: View {
                         .help("Never probed — this account's quota is unknown, not zero.")
                 }
             }
+            // Covers `controlIndicator` and `rotationPill` fading in or out on
+            // this line. `account` catches everything `rotationPill` reads;
+            // `controlIndicator` reads `control`, a separate `@ObservedObject`,
+            // so it needs its own binding — `account` changing says nothing
+            // about which account is held out as the control one.
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: account)
+            .animation(
+                reduceMotion ? nil : Tok.standardAnimation,
+                value: control.isControl(account.name))
             designationsLine
             // Two window lines, 5-hour on top and 7-day directly under it —
             // Gil's explicit call (bridge, 2026-08-18) — each tinted by its OWN
@@ -2559,6 +2596,11 @@ struct QuotaBar: View {
         }
         .frame(width: width, height: Tok.barHeight)
         .animation(reduceMotion ? nil : Tok.standardAnimation, value: fraction)
+        // A second binding, not a merged one: `fraction` and `tint` change
+        // independently (a re-poll moves the fill; a band crossing recolours
+        // it) and SwiftUI animates each `.animation(_:value:)` on its own
+        // value, so both ease without either gating the other.
+        .animation(reduceMotion ? nil : Tok.standardAnimation, value: tint)
         .accessibilityElement()
         .accessibilityLabel(label)
         .accessibilityValue(spokenValue)

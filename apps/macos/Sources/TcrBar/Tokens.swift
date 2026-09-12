@@ -314,11 +314,27 @@ public enum Tok {
     // MARK: - Motion
     //
     // One duration and one curve for the whole app. A status panel that animates
-    // in three different ways is noise, not polish.
+    // in three different ways is noise, not polish. 0.15s and an ease-out
+    // (`cubic-bezier(0, 0, .2, 1)`, the same curve `.easeOut` resolves to) are
+    // the values measured off a competitor's compiled stylesheet, applied by
+    // default there; bringing this panel's own single duration/curve pair up to
+    // them is cheaper and more consistent than adding a second, faster pair
+    // beside it.
+    //
+    // Every call site binds this to the SPECIFIC value that changed
+    // (`.animation(_:value:)`), never a broad `withAnimation` at the poll site —
+    // a 3-second poll that changes nothing must animate nothing — and every call
+    // site honours `accessibilityReduceMotion`. Colour, opacity, bar fill and
+    // pill presence only: never a property that changes a row's height, the
+    // list's height or the panel's size — this panel's size is authored
+    // (`panelWidth`) and its list height is the sum of measured row heights
+    // (`FleetView.visibleRowsHeight(for:)`), and an animated height feeds that
+    // measurement into a layout pass mid-animation, which is the layout-cycle
+    // class `ffe8a86` already fixed once.
 
-    public static let duration: TimeInterval = 0.22
+    public static let duration: TimeInterval = 0.15
     public static var standardAnimation: Animation {
-        .timingCurve(0.22, 1, 0.36, 1, duration: duration)
+        .easeOut(duration: duration)
     }
 
     // MARK: - Mapping
@@ -393,6 +409,9 @@ public struct StatusPill: View {
     private let text: String
     private let tint: Color
 
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     public init(_ text: String, tint: Color) {
         self.text = text
         self.tint = tint
@@ -414,6 +433,10 @@ public struct StatusPill: View {
                     )
             )
             .fixedSize()
+            // Bound to `tint` alone: a row's band changing colour (ok -> near ->
+            // spent) eases instead of snapping. The pill's size never depends on
+            // `tint`, so nothing measured moves.
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: tint)
     }
 }
 
@@ -440,6 +463,9 @@ public struct StatusPill: View {
 /// serves its own traffic, a parked one serves none.
 public struct GroupChip: View {
     private let tag: GroupTag
+
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(tag: GroupTag) {
         self.tag = tag
@@ -529,6 +555,10 @@ public struct GroupChip: View {
                 )
         )
         .fixedSize()
+        // Bound to `isParked`, the one state this chip's colour rides: it
+        // dims rather than recolours, and the dim is what should ease in and
+        // out. Size never depends on it, so nothing measured moves.
+        .animation(reduceMotion ? nil : Tok.standardAnimation, value: tag.isParked)
         .help(
             tag.isParked
                 // Said first and on its own: a parked group serves nothing at
