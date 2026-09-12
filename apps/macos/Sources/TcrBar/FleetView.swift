@@ -1124,8 +1124,9 @@ struct AccountRow: View {
     /// computed against — reading the poller's published `state` afterwards could
     /// pick up a different, later poll.
     let onChanged: () async -> PollState
-    /// Hands `tcr login` to a Terminal window for THIS account. Only drawn on a
-    /// `.needsRelogin` row.
+    /// Hands `tcr login` to a Terminal window for THIS account. Drawn on
+    /// every row's context menu, and additionally as the standalone
+    /// ``AccountRow/reloginButton`` on a `.needsRelogin` row.
     let onRelogin: () -> Void
     /// Hands `tcr mint --account <this row's name>` to a Terminal window. See
     /// ``FleetView/mintAccountToken(_:)``.
@@ -1809,9 +1810,14 @@ struct AccountRow: View {
             Task { await performToggle(enabling: enabling) }
         }
         .disabled(accounts.isPending(account.ref))
-        if account.health == .needsRelogin {
-            Button("Re-login…") { onRelogin() }
-        }
+        Button("Re-login…") { onRelogin() }
+            .help(
+                "Opens `tcr login --account` in a Terminal window, requesting "
+                    + "this exact account. `tcr` refuses to save if the browser "
+                    + "hands back a different one. The login it starts now mints "
+                    + "a credential good for a year, so running it on a healthy "
+                    + "row is a safe way to get ahead of the old one expiring."
+            )
         Divider()
         // Hidden entirely while `control` cannot answer the question at all
         // (``ControlAccountController/unavailable``) — an older `tcr` has no
