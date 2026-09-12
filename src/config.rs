@@ -2081,6 +2081,17 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeRe
             continue;
         };
         object.extend(fields);
+        // Stamp the version on every entry this write actually touches, since
+        // nothing else in the live path does — see [`CREDENTIAL_VERSION`]'s
+        // doc-comment. Backfill only: an entry that already carries the key
+        // (whatever it says) is left alone, so this can never paper over the
+        // refusal `load` performs on an unknown future version.
+        if !object.contains_key("credentialVersion") {
+            object.insert(
+                "credentialVersion".to_string(),
+                Value::Number(CREDENTIAL_VERSION.into()),
+            );
+        }
         if let Some(seen) = placed.get_mut(position) {
             *seen = true;
         }
@@ -3214,6 +3225,14 @@ fn merge_account(
                 if let Value::Object(fields) = serde_json::to_value(&credentials)? {
                     entry.extend(fields);
                 }
+                // Same backfill as `merge_tokens`: this entry just received a
+                // real credential, so stamp the version if nothing already did.
+                if !entry.contains_key("credentialVersion") {
+                    entry.insert(
+                        "credentialVersion".to_string(),
+                        Value::Number(CREDENTIAL_VERSION.into()),
+                    );
+                }
                 // `type` always wins — `save_account` is only ever called with a
                 // real credential, so a stale stored type (e.g. an API-key row
                 // re-added as OAuth) is corrected here; leaving it wrong is a
@@ -3310,6 +3329,15 @@ fn merge_account(
                 if let Value::Object(fields) = &mut new_entry {
                     fields.insert("priority".to_string(), Value::from(next_priority));
                 }
+            }
+            // `Account` deliberately carries no `credentialVersion` field (see
+            // [`CREDENTIAL_VERSION`]'s doc-comment), so a freshly serialized
+            // entry never has the key — stamp it here rather than leave a
+            // brand-new account the one entry the read path has to backfill.
+            if let Value::Object(fields) = &mut new_entry {
+                fields
+                    .entry("credentialVersion".to_string())
+                    .or_insert_with(|| Value::Number(CREDENTIAL_VERSION.into()));
             }
             entries.push(new_entry);
             Ok(AccountWrite::Added)
@@ -4901,6 +4929,46 @@ mod tests {
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+        fs::remove_file(&path).ok();
+    }
+
+    /// T1: a steady-state persist must stamp `credentialVersion` on the entry it
+    /// actually writes into, since nothing else in the live path did — see
+    /// [`CREDENTIAL_VERSION`]'s doc-comment. An entry the merge does not touch
+    /// (the account the server never loaded) must be left byte-identical,
+    /// `credentialVersion` included: this is not the version check, which lives
+    /// in `load` and is unaffected.
+    #[test]
+    fn persist_backfills_credential_version_on_the_touched_entry_only() {
+        let path = tmp_path("persist-credential-version");
+        let memory: Config = serde_json::from_str(
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a-new", "refreshToken": "rt-a-new", "expiresAt": 11 } ] }"#,
+        )
+        .unwrap();
+        // acct-a has no credentialVersion and is the one this save touches;
+        // acct-b is never loaded into memory, so the merge must not write it at
+        // all.
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a-old" },
+                   { "name": "acct-b", "accessToken": "at-b", "credentialVersion": 1 } ] }"#,
+        )
+        .unwrap();
+        save_tokens(&path, &memory).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["credentialVersion"],
+            json!(1),
+            "a touched entry with no credentialVersion must be stamped: {value}"
+        );
+        assert_eq!(
+            value["accounts"][1],
+            json!({ "name": "acct-b", "accessToken": "at-b", "credentialVersion": 1 }),
+            "an untouched entry must be left byte-identical: {value}"
         );
         fs::remove_file(&path).ok();
     }

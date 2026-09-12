@@ -1785,6 +1785,133 @@ mod tests {
         let _ = std::fs::remove_file(&blocker);
     }
 
+    /// T4 (bridge unit 2): the write-failure policy — warn once per health
+    /// transition, in each direction — gets a test of its own.
+    ///
+    /// Calls `Ledger::append` directly, on this thread, rather than going
+    /// through `UsageTracker`/the writer thread: the writer runs on a spawned
+    /// `std::thread`, which has no tracing dispatcher of its own unless one is
+    /// set globally, so a `with_default` scoped to this thread (the pattern
+    /// `proxy.rs::a_malformed_non_streamed_body_is_logged_and_a_usage_less_one_is_not`
+    /// already uses) would never see events fired there.
+    ///
+    /// `dropped_lines` is a DIFFERENT counter from this policy and is asserted
+    /// unmoved throughout: it counts lines a FULL QUEUE ejects before `append`
+    /// is ever called (see `LedgerHandle::queue`), never a line that reached
+    /// `append` and failed to write — `a_failing_ledger_stops_claiming_it_is_persisting`
+    /// already pins that fact for one failed line; this generalizes it to N
+    /// failures and to the recovery half.
+    #[test]
+    fn write_failures_warn_once_per_transition_and_never_move_dropped_lines() {
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        struct Msg(Option<String>);
+        impl Visit for Msg {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut m = Msg(None);
+                event.record(&mut m);
+                if let Some(msg) = m.0 {
+                    self.0
+                        .lock()
+                        .expect("capture lock")
+                        .push((*event.metadata().level(), msg));
+                }
+            }
+        }
+        let count = |cap: &Capture, level: tracing::Level, needle: &str| {
+            cap.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .filter(|(l, msg)| *l == level && msg.contains(needle))
+                .count()
+        };
+
+        // A regular FILE where the ledger wants its directory: every
+        // `open_day_file` fails until the blocker is removed — same fixture
+        // shape as `a_failing_ledger_stops_claiming_it_is_persisting`.
+        let blocker = scratch("write-failure-policy");
+        std::fs::write(&blocker, "not a directory").expect("write blocker");
+        let dir = blocker.join("usage");
+        let now = crate::now_ms();
+        let line = || LedgerLine {
+            t: now,
+            a: "alice@example.com".to_string(),
+            u: None,
+            g: None,
+            m: None,
+            s: None,
+            i: 1,
+            c5: 0,
+            c1: 0,
+            r: 0,
+            o: 0,
+        };
+
+        let mut ledger = Ledger {
+            dir,
+            open: None,
+            healthy: Arc::new(AtomicBool::new(true)),
+            dropping: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicU64::new(0)),
+            drops_seen: 0,
+        };
+
+        let cap = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..5 {
+                ledger.append(&line());
+            }
+        });
+        assert_eq!(
+            count(&cap, tracing::Level::WARN, "stopped writing"),
+            1,
+            "5 failed writes in a row must warn exactly ONCE, on the transition"
+        );
+        assert_eq!(
+            ledger.dropped.load(Ordering::Relaxed),
+            0,
+            "a write failure is not a full-queue drop; the counter must not move"
+        );
+
+        // The sink recovers.
+        std::fs::remove_file(&blocker).expect("remove blocker");
+        let cap2 = Capture::default();
+        let subscriber2 = tracing_subscriber::registry().with(cap2.clone());
+        tracing::subscriber::with_default(subscriber2, || {
+            for _ in 0..3 {
+                ledger.append(&line());
+            }
+        });
+        assert_eq!(
+            count(&cap2, tracing::Level::INFO, "writing again"),
+            1,
+            "the recovery must be reported exactly once, not once per successful write"
+        );
+        assert_eq!(
+            ledger.dropped.load(Ordering::Relaxed),
+            0,
+            "recovery must not retroactively count the failed lines as dropped either"
+        );
+
+        let _ = std::fs::remove_dir_all(&blocker);
+    }
+
     /// FINDING 1. The ledger write is not on the request path: with the writer
     /// thread wedged, `record()` still returns — it queues, drops what will not
     /// fit, and keeps the in-memory day complete. Before this, `record()` held
