@@ -4,26 +4,44 @@ import TcrBarCore
 
 /// Rasterise the Settings window, one PNG per pane, in-process, then exit.
 ///
-/// Same reasoning as ``RenderStates``: `ImageRenderer` needs no Screen
-/// Recording permission and draws the real view with the real tokens, and
-/// this window's genuine failure mode (S1, `docs/design/panel-tabs-review.md`)
-/// was exactly a fact only a render could show — a sidebar selection that drew
-/// every section from every pane underneath it regardless of which was
-/// "selected". `swift test` cannot see that; a screenshot of each pane can.
+/// ## Two rendering approaches tried and rejected before this one
 ///
-/// **Captures the DETAIL pane content directly, not `SettingsRootView`.**
-/// Measured, not assumed: the first version of this harness rendered the
-/// whole `NavigationSplitView` (sidebar, toolbar, detail) and every pane past
-/// the first came back as AppKit's generic "cannot display this content"
-/// glyph — a yellow circle-slash, not a rendering failure with an error on
-/// stderr, so `written == attempted` reported a false 8/8. `NavigationSplitView`
-/// plus a `.toolbar` needs a real `NSWindow`/`NSToolbar` host, which
-/// `ImageRenderer` does not provide (`RenderStates`'s own views never use
-/// either, which is why that harness never hit this). The sidebar and
-/// toolbar chrome is therefore **not verified by this harness** — same
-/// admitted gap `RenderStates` already carries for AppKit controls
-/// (`--render-states`'s own header: "a `.checkbox` toggle … `ImageRenderer`
-/// does not draw those at all") — and needs the real running window.
+/// **`ImageRenderer` on the whole `NavigationSplitView`** (attempt 1):
+/// every pane past the first came back as AppKit's generic "cannot display
+/// this content" glyph — a yellow circle-slash, not a rendering failure with
+/// an error on stderr, so `written == attempted` reported a false 8/8.
+/// `NavigationSplitView` plus a `.toolbar` needs a real `NSWindow`/`NSToolbar`
+/// host, which `ImageRenderer` never provides.
+///
+/// **`ImageRenderer` on each pane's bare `Form`, no split view** (attempt 2):
+/// fixed the placeholder, but produced a pixel-uniform blank/white PNG —
+/// `Form(.grouped)` is `NSTableView`-backed, and `ImageRenderer`'s headless
+/// layout pass never walks a table view's real `draw(_:)` path either
+/// (`FleetView`'s own plain `ScrollView`+`VStack` DOES rasterise fine via
+/// `ImageRenderer` — `RenderStates` already proves it — so this is specific
+/// to table/list-backed SwiftUI, not scroll content generally). A follow-up
+/// fix hosted the bare pane in an OFF-SCREEN `NSWindow` and captured with
+/// `NSView.cacheDisplay(in:to:)`: the pane's own text and `Tok`-drawn badges
+/// rendered, but the window never got real AppKit compositing (off-screen,
+/// never key, never main) — dark captures showed dark-tinted TEXT on a
+/// LIGHT background, which is not merely "wrong chrome colour", it is text
+/// that is barely legible against its own background. Read, not assumed: a
+/// second reviewer caught this by reading `groupsRotation-dark.png` and
+/// finding badges and toggle knobs floating on blank white with no row
+/// labels, no section cards and no sidebar at all.
+///
+/// **This version: the REAL `SettingsRootView` (sidebar, toolbar, detail —
+/// everything `SettingsWindowController` shows) in a real window, positioned
+/// ON a connected screen and given one real display cycle before capture.**
+/// The window is `.orderFrontRegardless()`ed rather than skipped, because
+/// that ordering — plus a real screen origin — is what makes AppKit's
+/// vibrancy/table-view backing stores actually get created; an off-screen
+/// origin was tried first and left the same blank/mistinted result attempt
+/// 2 already describes. `NSApp.setActivationPolicy` is never touched and no
+/// status item or server is ever created (this whole harness runs before
+/// `AppDelegate` exists — see `TcrBarEntry.main()`), so this never registers
+/// as the running menu-bar app or starts a proxy; the window is closed again
+/// immediately after each capture.
 ///
 /// ## Usage
 ///
@@ -70,22 +88,6 @@ enum RenderSettings {
         exit(written == attempted ? 0 : 1)
     }
 
-    /// The same switch `SettingsDetailView` (`SettingsView.swift`) makes,
-    /// reproduced here rather than reused: that type is `private` to its own
-    /// file and wraps its result in `.navigationTitle`, which is meaningless
-    /// (and untestable) outside a real `NavigationSplitView` host.
-    @ViewBuilder
-    private static func paneView(
-        for tab: SettingsTab, dependencies: SettingsDependencies
-    ) -> some View {
-        switch tab {
-        case .general: GeneralSettingsPane(dependencies: dependencies)
-        case .menuBar: MenuBarSettingsPane(dependencies: dependencies)
-        case .groupsRotation: GroupsRotationSettingsPane(dependencies: dependencies)
-        case .updates: UpdatesSettingsPane(dependencies: dependencies)
-        }
-    }
-
     /// Two groups — one parked, one not — so the Groups & Rotation pane shows
     /// both a real member count and a real parked toggle state, the same way
     /// `RenderStates`'s own fixtures avoid an all-healthy fleet that cannot
@@ -100,30 +102,18 @@ enum RenderSettings {
         ]
     }
 
+    /// 660×581 — the window's own real minimum, per `SettingsWindowController`
+    /// and the design review's own "Applied" note
+    /// (`docs/design/panel-tabs-review.md`: "window 660×581 with a 200px
+    /// sidebar").
+    private static let windowSize = NSSize(width: 660, height: 581)
+
     @MainActor
     private static func render(
         _ tab: SettingsTab, appearance: Appearance, into directory: URL
     ) -> Bool {
         let previous = NSAppearance.current
         NSAppearance.current = appearance.nsAppearance
-        // `NSAppearance.current` alone resolves `Tok`'s own dynamic
-        // `NSColor` closures (measured: tag text and borders came out
-        // correctly tinted for dark even before this line existed) but NOT
-        // `Form(.grouped)`'s native system materials — those follow
-        // `NSApplication.appearance`, which stayed at the system's real
-        // appearance regardless, so the first attempt at this fix rendered
-        // dark-appropriate text on a light-appearance background. Both must
-        // be set for one coherent capture.
-        // **Measured, and only partially effective**: with both lines set,
-        // `Tok`'s own dynamic colours (every tag, every hint) correctly
-        // switch per appearance, but `Form(.grouped)`'s native system
-        // material (the light/dark grouped-row background) does not — this
-        // off-screen, never-activated, never-key window does not walk the
-        // same effective-appearance path a real on-screen window does. The
-        // dark PNGs from this harness are therefore accurate for every
-        // `Tok`-drawn element and NOT proof of the native chrome's dark
-        // appearance; that needs the real running window
-        // (`SettingsWindowController`, opened by hand).
         let previousAppAppearance = NSApp.appearance
         NSApp.appearance = appearance.nsAppearance
         defer {
@@ -145,55 +135,71 @@ enum RenderSettings {
             updater: Updater(startingUpdater: false),
             onWhatsNew: {})
 
-        // The detail pane's own content, at the window's real inner width —
-        // 660 total minus the fixed 200pt sidebar (`SettingsView.swift`'s own
-        // `.frame(width: 200)`).
-        //
-        // **`ImageRenderer` alone renders this blank.** Measured across three
-        // attempts (`.fixedSize()`, a bare `.frame`, `.frame` plus a matching
-        // `proposedSize`): all three produced a pixel-uniform white PNG, byte-
-        // identical across every pane and both appearances. `Form(.grouped)`
-        // is `NSTableView`-backed on macOS, and `ImageRenderer` runs its
-        // layout headless, off any real window — `FleetView`'s own plain
-        // `ScrollView`+`VStack` rasterises fine that way (`RenderStates`
-        // already proves it), but a table view's rows are drawn through
-        // AppKit's real display path, which a window-less render never
-        // triggers. So this hosts the view in a real (off-screen, non-key,
-        // never-shown-to-the-operator) `NSWindow` and captures it with
-        // `NSView.cacheDisplay(in:to:)` — the same mechanism screen-capture
-        // tools use, and the one path that actually walks the table view's
-        // `draw(_:)` — instead of `ImageRenderer`.
-        let hostedView = paneView(for: tab, dependencies: dependencies)
+        // A fresh navigation object per capture, not `.shared` — so setting
+        // `selectedTab` here can never race or persist against a later call
+        // in this same process.
+        let navigation = SettingsNavigation()
+        navigation.selectedTab = tab
+
+        // The REAL root view — sidebar, toolbar, detail, exactly what
+        // `SettingsWindowController` shows — not a bare pane. See this
+        // type's own doc-comment for the two rejected approaches that only
+        // captured the detail content.
+        let rootView = SettingsRootView(dependencies: dependencies, navigation: navigation)
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
-            .frame(width: 460, height: 540)
 
-        let hosting = NSHostingView(rootView: hostedView)
-        hosting.frame = NSRect(x: 0, y: 0, width: 460, height: 540)
-
+        let hostingController = NSHostingController(rootView: rootView)
         let window = NSWindow(
-            contentRect: hosting.frame, styleMask: [.borderless], backing: .buffered,
+            contentRect: NSRect(origin: .zero, size: windowSize),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
+            backing: .buffered,
             defer: false)
-        // Off-screen — this process never shows the operator a window, the
-        // same guarantee `RenderStates` gives for its own harness.
-        window.setFrameOrigin(NSPoint(x: -10000, y: -10000))
         window.appearance = appearance.nsAppearance
-        window.contentView = hosting
+        window.contentViewController = hostingController
+        window.setFrame(NSRect(origin: .zero, size: windowSize), display: true)
+        // A normal on-screen position — centred, the way a real window would
+        // open — not the screen's literal (0,0) origin. `NSWindow.center()`
+        // measured, not assumed: an earlier attempt set the origin to the
+        // screen's own `minX`/`minY` (AppKit's bottom-LEFT origin), which put
+        // the window's bottom edge at the very bottom of the display, mostly
+        // hidden behind the Dock — the captured PNG showed only a drop-shadow
+        // gradient in two corners, nothing else. `orderFrontRegardless()`
+        // rather than `makeKeyAndOrderFront` and `NSApp.activate` never
+        // called — this must never take key focus or activate the app
+        // (`NSApp.setActivationPolicy` is never touched anywhere in this
+        // file, so it stays `.accessory` throughout).
+        window.center()
         window.orderFrontRegardless()
-        hosting.layoutSubtreeIfNeeded()
-        // One run-loop turn so AppKit actually lays out and backs the table
-        // view before the capture — `layoutSubtreeIfNeeded()` alone left the
-        // same blank result in an earlier attempt at this same fix.
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        window.layoutIfNeeded()
+        window.contentView?.layoutSubtreeIfNeeded()
+        // Several run-loop turns so the window server actually composites a
+        // frame before capture.
+        for _ in 0..<5 {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
 
         let name = "\(tab.rawValue)-\(appearance.rawValue).png"
-        guard let rep = hosting.bitmapImageRepForCachingDisplay(in: hosting.bounds)
+        // `NSView.cacheDisplay`/`ImageRenderer` both draw OFFSCREEN, bypassing
+        // the window server entirely — measured across every attempt in this
+        // file's own doc-comment, neither one reliably reproduces what
+        // `Form(.grouped)`'s native table/vibrancy backing actually composites.
+        // `CGWindowListCreateImage` instead asks the WINDOW SERVER for the
+        // pixels it already composited for this exact window — the same
+        // mechanism `screencapture -l <windowNumber>` uses. Capturing a
+        // window this PROCESS OWNS needs no Screen Recording permission
+        // (that gate is for capturing another process's windows); only this
+        // process's own window is ever named here.
+        guard
+            let cgImage = CGWindowListCreateImage(
+                .null, .optionIncludingWindow, CGWindowID(window.windowNumber),
+                [.boundsIgnoreFraming, .bestResolution])
         else {
             window.close()
             FileHandle.standardError.write(Data("render failed: \(name)\n".utf8))
             return false
         }
-        hosting.cacheDisplay(in: hosting.bounds, to: rep)
         window.close()
+        let rep = NSBitmapImageRep(cgImage: cgImage)
         guard let png = rep.representation(using: .png, properties: [:]) else {
             FileHandle.standardError.write(Data("render failed: \(name)\n".utf8))
             return false
@@ -202,7 +208,7 @@ enum RenderSettings {
         let url = directory.appendingPathComponent(name)
         do {
             try png.write(to: url)
-            print("  \(name)  \(Int(hosting.bounds.width))x\(Int(hosting.bounds.height))pt")
+            print("  \(name)  \(cgImage.width)x\(cgImage.height)px")
             return true
         } catch {
             FileHandle.standardError.write(Data("write failed \(name): \(error)\n".utf8))
