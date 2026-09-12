@@ -222,6 +222,29 @@ public enum Tok {
         .system(size: detailFontSize, weight: .semibold)
     }
 
+    /// Explicit line height per size, one per role, so a 13pt row and an 11pt
+    /// row are no longer spaced by two different, undeclared SwiftUI defaults
+    /// — the inconsistency `wrappedLineSpacing` (below) never actually closed,
+    /// since nothing calls it.
+    ///
+    /// SwiftUI has no line-height property; `.lineSpacing(_:)` adds spacing
+    /// ABOVE a font's own single-line box, so the value applied at each call
+    /// site is this line height minus the role's point size, not this number
+    /// itself. That is an approximation — the font's true line box is a
+    /// TextKit fact this file does not have — but it is one approximation
+    /// applied identically everywhere the role is used, which is the
+    /// consistency being asked for, not a claim of pixel-exact parity with any
+    /// other app's rendering.
+    public static let titleLineHeight: CGFloat = 18
+    public static let bodyLineHeight: CGFloat = 18
+    public static let secondaryLineHeight: CGFloat = 16
+    public static let detailLineHeight: CGFloat = 14
+
+    public static let titleLineSpacing: CGFloat = titleLineHeight - titleSize
+    public static let bodyLineSpacing: CGFloat = bodyLineHeight - bodySize
+    public static let secondaryLineSpacing: CGFloat = secondaryLineHeight - secondaryFontSize
+    public static let detailLineSpacing: CGFloat = detailLineHeight - detailFontSize
+
     /// Tabular variants. Any value that CHANGES uses one of these: the panel
     /// re-polls every 3 seconds, and proportional digits make percentages and
     /// countdowns jitter their own column on every tick.
@@ -285,11 +308,19 @@ public enum Tok {
     /// a row still reads as one block.
     public static let rowLineSpacing = space1
 
-    public static let radiusSmall: CGFloat = 4
-    public static let radiusMedium: CGFloat = 8
-    public static let radiusLarge: CGFloat = 12
+    public static let radiusSmall: CGFloat = 8
+    public static let radiusMedium: CGFloat = 14
+    public static let radiusLarge: CGFloat = 18
     public static let barHeight: CGFloat = 6
-    public static let barRadius: CGFloat = 3
+    /// 4, not 3 — matching the bump above. `RoundedRectangle` clamps its
+    /// corner radius to half the shorter side (`CGPath(roundedRect:...)`'s own
+    /// behaviour), and `barHeight` is 6, so this draws IDENTICALLY to 3: the
+    /// value moved, the pixels did not. Left at the bridge's number anyway —
+    /// it is still correct relative to `radiusSmall`/`radiusMedium` having
+    /// moved — but the bar reading sharp is a `barHeight` fact, not a
+    /// `barRadius` one, and `barHeight` is this panel's measured-row-height
+    /// surface: out of scope for a token bump, flagged rather than changed.
+    public static let barRadius: CGFloat = 4
     /// Width of a quota bar. Fixed, so the percentage after it starts at the
     /// same x on every card; a bar that took the leftover width could not.
     ///
@@ -314,11 +345,27 @@ public enum Tok {
     // MARK: - Motion
     //
     // One duration and one curve for the whole app. A status panel that animates
-    // in three different ways is noise, not polish.
+    // in three different ways is noise, not polish. 0.15s and an ease-out
+    // (`cubic-bezier(0, 0, .2, 1)`, the same curve `.easeOut` resolves to) are
+    // the values measured off a competitor's compiled stylesheet, applied by
+    // default there; bringing this panel's own single duration/curve pair up to
+    // them is cheaper and more consistent than adding a second, faster pair
+    // beside it.
+    //
+    // Every call site binds this to the SPECIFIC value that changed
+    // (`.animation(_:value:)`), never a broad `withAnimation` at the poll site —
+    // a 3-second poll that changes nothing must animate nothing — and every call
+    // site honours `accessibilityReduceMotion`. Colour, opacity, bar fill and
+    // pill presence only: never a property that changes a row's height, the
+    // list's height or the panel's size — this panel's size is authored
+    // (`panelWidth`) and its list height is the sum of measured row heights
+    // (`FleetView.visibleRowsHeight(for:)`), and an animated height feeds that
+    // measurement into a layout pass mid-animation, which is the layout-cycle
+    // class `ffe8a86` already fixed once.
 
-    public static let duration: TimeInterval = 0.22
+    public static let duration: TimeInterval = 0.15
     public static var standardAnimation: Animation {
-        .timingCurve(0.22, 1, 0.36, 1, duration: duration)
+        .easeOut(duration: duration)
     }
 
     // MARK: - Mapping
@@ -393,6 +440,9 @@ public struct StatusPill: View {
     private let text: String
     private let tint: Color
 
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     public init(_ text: String, tint: Color) {
         self.text = text
         self.tint = tint
@@ -400,7 +450,7 @@ public struct StatusPill: View {
 
     public var body: some View {
         Text(text.uppercased())
-            .font(Tok.pillFont)
+            .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
             .tracking(Tok.pillTracking)
             .foregroundStyle(tint)
             .padding(.horizontal, Tok.pillPaddingH)
@@ -414,6 +464,10 @@ public struct StatusPill: View {
                     )
             )
             .fixedSize()
+            // Bound to `tint` alone: a row's band changing colour (ok -> near ->
+            // spent) eases instead of snapping. The pill's size never depends on
+            // `tint`, so nothing measured moves.
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: tint)
     }
 }
 
@@ -440,6 +494,9 @@ public struct StatusPill: View {
 /// serves its own traffic, a parked one serves none.
 public struct GroupChip: View {
     private let tag: GroupTag
+
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     public init(tag: GroupTag) {
         self.tag = tag
@@ -514,7 +571,7 @@ public struct GroupChip: View {
                     .font(.system(size: Tok.detailFontSize - 2, weight: .bold))
             }
             Text(tag.name.uppercased())
-                .font(Tok.pillFont)
+                .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .tracking(Tok.pillTracking)
         }
         .foregroundStyle(foreground)
@@ -529,6 +586,10 @@ public struct GroupChip: View {
                 )
         )
         .fixedSize()
+        // Bound to `isParked`, the one state this chip's colour rides: it
+        // dims rather than recolours, and the dim is what should ease in and
+        // out. Size never depends on it, so nothing measured moves.
+        .animation(reduceMotion ? nil : Tok.standardAnimation, value: tag.isParked)
         .help(
             tag.isParked
                 // Said first and on its own: a parked group serves nothing at

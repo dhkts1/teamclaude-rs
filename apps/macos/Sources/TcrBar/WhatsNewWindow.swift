@@ -100,7 +100,7 @@ struct WhatsNewView: View {
                 Spacer()
                 if let page {
                     Link("Open on GitHub", destination: page)
-                        .font(Tok.secondaryFont)
+                        .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                 }
             }
             .padding(.horizontal, Tok.space5)
@@ -140,12 +140,12 @@ struct WhatsNewView: View {
             HStack(spacing: Tok.space3) {
                 ProgressView().controlSize(.small)
                 Text("Loading release notes…")
-                    .font(Tok.bodyFont)
+                    .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(Tok.inkDim)
             }
         case .failed(_, let message, _):
             Label(message, systemImage: "exclamationmark.triangle")
-                .font(Tok.bodyFont)
+                .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                 .foregroundStyle(Tok.spent)
                 .fixedSize(horizontal: false, vertical: true)
         case .notes(_, let blocks, _):
@@ -160,21 +160,21 @@ struct WhatsNewView: View {
         switch block {
         case .heading(let text):
             Text(WhatsNewMarkdown.inline(text))
-                .font(Tok.titleFont)
+                .font(Tok.titleFont).lineSpacing(Tok.titleLineSpacing)
                 .foregroundStyle(Tok.ink)
                 .padding(.top, Tok.space2)
         case .bullet(let text):
             HStack(alignment: .firstTextBaseline, spacing: Tok.space3) {
                 Text("•").foregroundStyle(Tok.inkDim)
                 Text(WhatsNewMarkdown.inline(text))
-                    .font(Tok.bodyFont)
+                    .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(Tok.ink)
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
             }
         case .paragraph(let text):
             Text(WhatsNewMarkdown.inline(text))
-                .font(Tok.bodyFont)
+                .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                 .foregroundStyle(Tok.ink)
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)

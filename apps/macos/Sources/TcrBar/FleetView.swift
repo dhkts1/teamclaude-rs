@@ -54,6 +54,9 @@ struct FleetView: View {
     /// nothing is worse than one that says why.
     @State private var loginError: String?
 
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     /// Measured height of every child the list draws — each account row, each
     /// group heading and each band heading — keyed by that child's identity in
     /// the list, NOT by account id.
@@ -131,7 +134,7 @@ struct FleetView: View {
                 Spacer()
                 if let at = poller.lastPollAt {
                     Text(at, style: .time)
-                        .font(Tok.secondaryDigitFont)
+                        .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                         .foregroundStyle(.secondary)
                 }
             }
@@ -143,7 +146,7 @@ struct FleetView: View {
             // sentence on screen.
             if !poller.state.isHealthyRead {
                 Text(poller.state.summary)
-                    .font(Tok.secondaryFont)
+                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
@@ -197,7 +200,7 @@ struct FleetView: View {
     private var usageSummary: some View {
         if case .loaded(let fleet) = poller.state, let line = fleet.usageSummaryLine {
             Text(line)
-                .font(Tok.secondaryDigitFont)
+                .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .background(
@@ -209,7 +212,7 @@ struct FleetView: View {
                 )
                 .overlay(alignment: .topLeading) {
                     Text(verbatim: "0")
-                        .font(Tok.secondaryDigitFont)
+                        .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                         .lineLimit(1)
                         .hidden()
                         .background(
@@ -243,7 +246,7 @@ struct FleetView: View {
             }()
             Button(message) { updater.checkForUpdates() }
                 .buttonStyle(.plain)
-                .font(Tok.secondaryFont)
+                .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                 .foregroundStyle(isFailure ? Tok.spent : Tok.accent)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -275,6 +278,22 @@ struct FleetView: View {
             .fixedSize(horizontal: false, vertical: true)
             .accessibilityLabel("\(fleet.capacitySummary), \(fleet.breakdownLabel)")
             .padding(.top, Tok.tightSpacing)
+            // `Text.lineSpacing` returns `Text` on its own but not once two
+            // `Text` runs are concatenated with `+` (that operator is only
+            // defined for `Text + Text`, and `.lineSpacing` here would make
+            // the right side `some View`) — so this line, unlike every other
+            // call site, takes `Tok.secondaryLineSpacing` once at the end
+            // rather than per run. The lead run is drawn at `.subheadline`,
+            // not a `Tok` size, so this is the same approximation the rest of
+            // this token applies, carried one level further.
+            .lineSpacing(Tok.secondaryLineSpacing)
+            // Bound to the two facts that drive this line's colour, not the
+            // summary TEXT: a count ticking should still read instantly, the
+            // same as a digit always has. `capacityState` tints the lead run,
+            // `breakdown` tints the tallies after it, and this line's height
+            // never depends on either.
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: fleet.capacityState)
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: fleet.breakdown)
     }
 
     // MARK: Body
@@ -411,7 +430,7 @@ struct FleetView: View {
     private func bandHeading(_ band: FleetBand) -> some View {
         measured(bandHeightKey(band)) {
             Text(band.title.uppercased())
-                .font(Tok.detailFont.weight(.semibold))
+                .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
                 .tracking(Tok.pillTracking)
                 .foregroundStyle(.secondary)
         }
@@ -423,7 +442,7 @@ struct FleetView: View {
     private func groupHeading(_ section: FleetSection) -> some View {
         measured(groupHeightKey(section)) {
             Text(section.title)
-                .font(Tok.secondaryFont.weight(.semibold))
+                .font(Tok.secondaryFont.weight(.semibold)).lineSpacing(Tok.secondaryLineSpacing)
                 .foregroundStyle(.primary)
         }
     }
@@ -558,7 +577,7 @@ struct FleetView: View {
             Text("source: \(source.token) — quota is real, all serving counters are structurally zero.")
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .font(Tok.secondaryFont)
+        .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
         .foregroundStyle(Tok.offline)
     }
 
@@ -568,7 +587,7 @@ struct FleetView: View {
             VStack(alignment: .leading, spacing: Tok.tightSpacing) {
                 Text(title).font(.subheadline.weight(.semibold))
                 Text(detail)
-                    .font(Tok.secondaryFont)
+                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -586,13 +605,13 @@ struct FleetView: View {
             // read about once a release.
             HStack(spacing: Tok.tightSpacing) {
                 Text(server.state.summary)
-                    .font(Tok.secondaryFont)
+                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: Tok.tightSpacing)
                 if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
                     Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
-                        .font(Tok.detailDigitFont)
+                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
                         .foregroundStyle(.tertiary)
                         .lineLimit(1)
                 }
@@ -612,7 +631,7 @@ struct FleetView: View {
 
             if let loginError {
                 Text(loginError)
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -740,7 +759,7 @@ struct FleetView: View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             Toggle("Start server at launch", isOn: $startServerAtLaunch)
                 .toggleStyle(.checkbox)
-                .font(Tok.secondaryFont)
+                .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                 .help(
                     "Runs `tcr server --headless --no-replace` when TcrBar starts. "
                         + "`--headless` is the load-bearing one: it keeps the "
@@ -752,7 +771,7 @@ struct FleetView: View {
                         + "stops it."
                 )
             Text("TcrBar supervises a server it starts, so quitting TcrBar stops it.")
-                .font(Tok.detailFont)
+                .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -795,7 +814,7 @@ struct FleetView: View {
                 isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
             )
             .toggleStyle(.checkbox)
-            .font(Tok.secondaryFont)
+            .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
             .tint(Tok.awake)
             .help(
                 "Holds the three power assertions `caffeinate -i -m -s` holds, for "
@@ -805,7 +824,7 @@ struct FleetView: View {
             )
             if awake.isOn {
                 Text("The display still sleeps. Sleep itself is only held off on AC power.")
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.awake)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -897,16 +916,16 @@ struct FleetView: View {
                 )
             )
             .toggleStyle(.checkbox)
-            .font(Tok.secondaryFont)
+            .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
             if let detail = loginItem.status.detail {
                 Text(detail)
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.near)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let error = loginItem.lastError {
                 Text(error)
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -967,7 +986,7 @@ struct FleetView: View {
     private var appBuildTag: some View {
         if let label = AppBuild.label {
             Text(label)
-                .font(Tok.detailDigitFont)
+                .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
                 .textSelection(.enabled)
@@ -1111,6 +1130,9 @@ struct AccountRow: View {
     /// than a controller: nothing else needs to know, and a copy that did
     /// land leaves no state at all (the pasteboard is the only evidence).
     @State private var tokenCopyFailure: TokenCommand.Failure?
+
+    /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The single tint for this row's quota evidence. The bar and the
     /// percentage run both read it, so the two can never disagree about
@@ -1420,7 +1442,7 @@ struct AccountRow: View {
     private var orgIndicator: some View {
         if let orgTag = account.ref.displayHalves.orgTag {
             Text(orgTag)
-                .font(Tok.pillFont)
+                .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
                 .textSelection(.enabled)
@@ -1435,7 +1457,7 @@ struct AccountRow: View {
     private var planIndicator: some View {
         if let plan = account.plan, !plan.isEmpty {
             Text(plan)
-                .font(Tok.pillFont)
+                .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
                 .help("This account's plan, as Anthropic reports it for its organization.")
@@ -1447,14 +1469,26 @@ struct AccountRow: View {
         if control.isControl(account.name) {
             StatusPill("control", tint: Tok.accent)
                 .help("This account is held out of rotation as the control account.")
+                // Fades in and out rather than snapping. Safe against the
+                // height hazard: this line's quota-state pill (`rotationPill`'s
+                // neighbour below) is unconditional and the same height as
+                // every `StatusPill`, so this line's height never changes
+                // whether this pill is drawn or not.
+                .transition(.opacity)
         }
     }
 
+    /// Every branch below that draws a `StatusPill` carries `.transition(.opacity)`:
+    /// this line's height is pinned regardless, by the quota-state pill further
+    /// along the same `HStack` (`information`, `FleetView.swift`), which is
+    /// never `EmptyView` — so fading this one in and out changes no measured
+    /// height even on the two branches that go empty.
     @ViewBuilder
     private var rotationPill: some View {
         if account.disabled {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
+                .transition(.opacity)
         } else if account.isParkedByGroup {
             // The SAME word as the row's own `disabled` above, deliberately:
             // the consequence is identical (no traffic lands here), and giving
@@ -1473,6 +1507,7 @@ struct AccountRow: View {
                         + "`tcr group unpark "
                         + "\(account.parkedGroupNames.first ?? "")` puts them back, live."
                 )
+                .transition(.opacity)
         } else if account.health == .needsRelogin {
             EmptyView()
         } else if account.isRejected {
@@ -1499,6 +1534,7 @@ struct AccountRow: View {
                         + "with no member free waits, or fails, rather than using "
                         + "another account."
                 )
+                .transition(.opacity)
         } else {
             StatusPill("rotating", tint: Tok.inkFaint)
                 .help(
@@ -1507,6 +1543,7 @@ struct AccountRow: View {
                         + "Anthropic can also exclude an account without changing "
                         + "its status; TcrBar cannot see that gate yet."
                 )
+                .transition(.opacity)
         }
     }
 
@@ -1634,12 +1671,20 @@ struct AccountRow: View {
             // an outer radius with no matching inset draws a border that bites
             // into its own content at the corners.
             //
+            // Vertical padding moved from `Tok.space2` to `Tok.space3` when
+            // `radiusMedium` went from 8 to 14: the margin this comment
+            // describes is the inset minus roughly 0.29x the radius (where a
+            // `CGPath` corner arc stops intruding on a rectangular content
+            // box), and at the new radius `space2` (4pt) undercuts that by a
+            // fraction of a point. `space3` (8pt) clears it the way `space2`
+            // cleared the old, smaller radius.
+            //
             // It is also the only inner padding now. `rowContent` carried a
             // second one (`Tok.rowPaddingV`) from before this card had a border,
             // when a row needed its own breathing room. Inside a bordered card
             // with `Tok.rowSpacing` between cards it was 4pt of nothing.
             .padding(.horizontal, Tok.space3)
-            .padding(.vertical, Tok.space2)
+            .padding(.vertical, Tok.space3)
             .background(
                 RoundedRectangle(cornerRadius: Tok.radiusMedium)
                     .fill(Tok.raised)
@@ -2081,7 +2126,7 @@ struct AccountRow: View {
     /// stand-in, so the two can never draw two different icons.
     private var accountActionsMenuLabel: some View {
         Image(systemName: "gearshape")
-            .font(Tok.bodyFont)
+            .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
             .foregroundStyle(.secondary)
             // The Menu's own `.accessibilityLabel` below names the
             // control; without hiding the glyph too, VoiceOver reads
@@ -2145,7 +2190,7 @@ struct AccountRow: View {
                 // real: without it the `Text` reports the one-line height it
                 // was offered and clips, rather than growing.
                 Text(account.ref.displayHalves.email)
-                    .font(Tok.bodyFont)
+                    .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2209,6 +2254,15 @@ struct AccountRow: View {
                         .help("Never probed — this account's quota is unknown, not zero.")
                 }
             }
+            // Covers `controlIndicator` and `rotationPill` fading in or out on
+            // this line. `account` catches everything `rotationPill` reads;
+            // `controlIndicator` reads `control`, a separate `@ObservedObject`,
+            // so it needs its own binding — `account` changing says nothing
+            // about which account is held out as the control one.
+            .animation(reduceMotion ? nil : Tok.standardAnimation, value: account)
+            .animation(
+                reduceMotion ? nil : Tok.standardAnimation,
+                value: control.isControl(account.name))
             designationsLine
             // Two window lines, 5-hour on top and 7-day directly under it —
             // Gil's explicit call (bridge, 2026-08-18) — each tinted by its OWN
@@ -2258,7 +2312,7 @@ struct AccountRow: View {
                 // priced, and tokens are `12k out`.
                 if let usageLabel = account.windowUsageLabel {
                     Text(usageLabel)
-                        .font(Tok.detailDigitFont)
+                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
                         .foregroundStyle(usageFigureStyle)
                         .lineLimit(1)
                 }
@@ -2283,7 +2337,7 @@ struct AccountRow: View {
                 // else `tcr` reports.
                 if !account.disabled && account.status != "active" {
                     Text(account.status)
-                        .font(Tok.secondaryFont)
+                        .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                         // `active` and `error` must not be pixel-identical: an
                         // `error` account is what the UNMEASURED pill used to
                         // wear too, and the raw word alone drew in the same
@@ -2304,7 +2358,7 @@ struct AccountRow: View {
                 // rule the 5h line's spend figures follow.
                 if let fable = account.fableWeeklyLabel {
                     Text(fable)
-                        .font(Tok.detailDigitFont)
+                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
                         .foregroundStyle(fableFigureStyle)
                         .lineLimit(1)
                 }
@@ -2327,7 +2381,7 @@ struct AccountRow: View {
                 // following `QuotaFormat.count`'s "n/a" the way the line
                 // above does.
                 Text(QuotaFormat.streamErrorLabel(count: account.streamErrorCount, error: error))
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .lineLimit(2)
             }
@@ -2335,19 +2389,19 @@ struct AccountRow: View {
                 // `tcr`'s own words, verbatim. A toggle that did not happen must
                 // never be indistinguishable from one that did.
                 Label(failure.summary, systemImage: Tok.unreadableGlyph)
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = removeController.failure(for: account.ref) {
                 Label(failure.summary, systemImage: Tok.unreadableGlyph)
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if let failure = tokenCopyFailure {
                 Label(failure.summary, systemImage: Tok.unreadableGlyph)
-                    .font(Tok.detailFont)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -2363,7 +2417,7 @@ struct AccountRow: View {
                     "group '\(refused.group)': \(refused.failure.summary)",
                     systemImage: Tok.unreadableGlyph
                 )
-                .font(Tok.detailFont)
+                .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.spent)
                 .fixedSize(horizontal: false, vertical: true)
             }
@@ -2392,7 +2446,7 @@ struct AccountRow: View {
     ) -> some View {
         HStack(spacing: Tok.tightSpacing) {
             Text(window)
-                .font(Tok.secondaryDigitFont)
+                .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                 .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkFaint)
                 .frame(width: Tok.windowLabelWidth, alignment: .leading)
             QuotaBar(fraction: fraction, tint: tint, label: barLabel)
@@ -2407,7 +2461,7 @@ struct AccountRow: View {
                         : ""
                 )
             Text(QuotaFormat.percent(fraction))
-                .font(Tok.secondaryDigitFont)
+                .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                 // Demoted alongside the bar, not left `.secondary`: the eye
                 // should group these digits as historical rather than live, the
                 // same distinction `fiveHourTint` draws for the fill. The number
@@ -2418,7 +2472,7 @@ struct AccountRow: View {
             // number it belongs to. Colour: `captionTint(for:)`.
             if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: Date()) {
                 Text(caption)
-                    .font(Tok.secondaryFont)
+                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .foregroundStyle(captionTint)
                     .lineLimit(1)
             }
@@ -2451,7 +2505,7 @@ struct AccountRow: View {
                 "Removed from config and stopped. Stays listed as disabled until the proxy restarts.",
                 systemImage: "arrow.triangle.2.circlepath"
             )
-            .font(Tok.detailFont)
+            .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
             .foregroundStyle(Tok.near)
             .fixedSize(horizontal: false, vertical: true)
         }
@@ -2469,7 +2523,7 @@ struct AccountRow: View {
     private var verdictLine: some View {
         if let verdict = accounts.verdict(for: account.ref, reportedDisabled: account.disabled) {
             Label(verdict.rowLabel, systemImage: Self.verdictGlyph(verdict))
-                .font(Tok.detailFont)
+                .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Self.verdictTint(verdict))
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -2516,7 +2570,7 @@ struct AccountRow: View {
         Button("Re-login…") { onRelogin() }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .font(Tok.detailFont)
+            .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
             .accessibilityLabel("Re-login \(account.name)")
             .help(
                 "Opens `tcr login --account` in a Terminal window, requesting "
@@ -2550,7 +2604,7 @@ struct AccountRow: View {
         // which is still the thing being scanned for.
         .buttonStyle(.bordered)
         .controlSize(.small)
-        .font(Tok.detailFont)
+        .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
         .disabled(pending)
         // Thirteen rows otherwise render thirteen controls whose entire
         // accessible name is "Disable", with nothing to say which account is
@@ -2619,6 +2673,11 @@ struct QuotaBar: View {
         }
         .frame(width: width, height: Tok.barHeight)
         .animation(reduceMotion ? nil : Tok.standardAnimation, value: fraction)
+        // A second binding, not a merged one: `fraction` and `tint` change
+        // independently (a re-poll moves the fill; a band crossing recolours
+        // it) and SwiftUI animates each `.animation(_:value:)` on its own
+        // value, so both ease without either gating the other.
+        .animation(reduceMotion ? nil : Tok.standardAnimation, value: tint)
         .accessibilityElement()
         .accessibilityLabel(label)
         .accessibilityValue(spokenValue)
