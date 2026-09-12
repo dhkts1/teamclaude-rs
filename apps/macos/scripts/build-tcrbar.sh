@@ -188,7 +188,7 @@ echo "    Sparkle: embedded from $sparkle_framework"
 #
 # The output path is READ OUT OF CARGO, never assumed to be `$repo_root/target`.
 # `CARGO_TARGET_DIR` redirects it, and assuming otherwise is not a hypothetical:
-# `.githooks/post-merge` announced `built <sha>` for a binary that had landed in
+# the old `.githooks/post-merge` (removed 2026-09-13) announced `built <sha>` for a binary that had landed in
 # `$CARGO_TARGET_DIR` while the `target/release/tcr` a symlink actually resolved
 # to stayed at the old sha. A build that reports success from the wrong path is
 # worse than a failed one.

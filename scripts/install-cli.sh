@@ -41,7 +41,7 @@
 #      six-commits-old artifact and printed "installed" with exit 0 — reporting
 #      success for a build it did not do, which is the one thing this whole
 #      family of scripts exists to stop. apps/macos/scripts/build-tcrbar.sh and
-#      .githooks/post-merge already grep for the same stamp; this now matches.
+#      the old post-merge hook (removed 2026-09-13) grepped for the same stamp; this matches it.
 #
 # KNOWN LIMIT: the symlink refusal in note 3 catches symlinks, not HARDLINKS. A
 # hardlinked destination is detected by its link count where `stat` supports it
@@ -117,7 +117,7 @@ SRC="$TARGET_DIR/release/tcr"
 # one this checkout describes; a binary built six commits ago satisfies it just
 # as well. build.rs stamps the short sha as TCR_BUILD_SHA, so grep the artifact
 # and make it a fact. Same test, same stamp, as apps/macos/scripts/build-tcrbar.sh
-# and .githooks/post-merge.
+# and the old .githooks/post-merge (removed 2026-09-13).
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 expected_sha="$(git -C "$repo_root" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 if [ "$expected_sha" = "unknown" ]; then
