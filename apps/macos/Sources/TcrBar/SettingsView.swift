@@ -152,7 +152,7 @@ private struct SettingsSidebarView: View {
             }
         }
         .font(.footnote)
-        .foregroundStyle(.tertiary)
+        .foregroundStyle(Tok.inkFaint)
         .fontDesign(.monospaced)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 6)

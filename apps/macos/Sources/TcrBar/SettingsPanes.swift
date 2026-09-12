@@ -98,7 +98,7 @@ struct GeneralSettingsPane: View {
                 LabeledContent("Proxy") {
                     HStack(spacing: 8) {
                         Text(server.state.summary)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Tok.inkDim)
                             .lineLimit(2)
                         Spacer(minLength: 8)
                         Button("Restart…") { confirmRestart() }
@@ -115,11 +115,11 @@ struct GeneralSettingsPane: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Start the server at launch")
                         Text("TcrBar supervises a server it starts itself.")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Tok.inkDim)
                     }
                 }
                 LabeledContent("Read the server every") {
-                    Text("\(Int(poller.interval)) s").foregroundStyle(.secondary)
+                    Text("\(Int(poller.interval)) s").foregroundStyle(Tok.inkDim)
                 }
             } header: {
                 SectionHeader(
@@ -141,7 +141,7 @@ struct GeneralSettingsPane: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Keep this Mac awake")
                         Text("While any session is busy.")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Tok.inkDim)
                     }
                 }
                 .toggleStyle(.switch)
@@ -157,7 +157,7 @@ struct GeneralSettingsPane: View {
                         "Quitting stops the proxy this app supervises, so every live "
                             + "session loses its prompt cache."
                     )
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(Tok.inkDim)
                     Spacer()
                     Button("Quit TcrBar…") { confirmQuit() }
                         .controlSize(.small)
@@ -235,7 +235,7 @@ struct MenuBarSettingsPane: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Show the ready count beside the glyph")
                         Text("Reads e.g. \u{201c}9/13\u{201d}, in tabular digits.")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Tok.inkDim)
                     }
                 }
                 .toggleStyle(.switch)
@@ -245,7 +245,7 @@ struct MenuBarSettingsPane: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Show the running-tool count")
                         Text("Adds a second number beside the glyph.")
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(.caption).foregroundStyle(Tok.inkDim)
                     }
                 }
                 .toggleStyle(.switch)
@@ -263,7 +263,7 @@ struct MenuBarSettingsPane: View {
                 }
                 .pickerStyle(.menu)
                 LabeledContent("Text size") {
-                    Text("System").foregroundStyle(.secondary)
+                    Text("System").foregroundStyle(Tok.inkDim)
                 }
             } header: {
                 SectionHeader(
@@ -303,7 +303,7 @@ struct GroupsRotationSettingsPane: View {
         Form {
             Section {
                 if groups.isEmpty {
-                    Text("No groups yet.").foregroundStyle(.secondary)
+                    Text("No groups yet.").foregroundStyle(Tok.inkDim)
                 } else {
                     ForEach(groups) { group in
                         groupRow(group)
@@ -373,7 +373,7 @@ struct GroupsRotationSettingsPane: View {
             HStack {
                 Text(group.name).font(.headline)
                 Spacer()
-                Text("\(group.memberCount) accounts").foregroundStyle(.secondary)
+                Text("\(group.memberCount) accounts").foregroundStyle(Tok.inkDim)
             }
             HStack(spacing: 6) {
                 Toggle(
@@ -408,7 +408,7 @@ struct GroupsRotationSettingsPane: View {
                 RowTag(timing: .readOnly)
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(Tok.inkDim)
         }
         .padding(.vertical, 4)
     }
@@ -417,14 +417,14 @@ struct GroupsRotationSettingsPane: View {
     private func readOnlyRow(_ title: String, _ detail: String?, key: String) -> some View {
         LabeledContent {
             HStack(spacing: 6) {
-                Text(readOnlyHint).foregroundStyle(.secondary).font(.caption)
+                Text(readOnlyHint).foregroundStyle(Tok.inkDim).font(.caption)
                 RowTag(timing: SettingsRowBadge.timing(for: key) ?? .boot)
             }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                 if let detail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary)
+                    Text(detail).font(.caption).foregroundStyle(Tok.inkDim)
                 }
             }
         }
@@ -483,10 +483,10 @@ struct UpdatesSettingsPane: View {
 
             Section {
                 LabeledContent("Server on 127.0.0.1:3456") {
-                    Text(server.state.summary).foregroundStyle(.secondary).lineLimit(2)
+                    Text(server.state.summary).foregroundStyle(Tok.inkDim).lineLimit(2)
                 }
                 LabeledContent("Command-line tcr") {
-                    Text(installedCliPath).font(.caption).foregroundStyle(.secondary)
+                    Text(installedCliPath).font(.caption).foregroundStyle(Tok.inkDim)
                         .lineLimit(2)
                 }
                 Text(
@@ -494,7 +494,7 @@ struct UpdatesSettingsPane: View {
                         + "restarts it and spends the cold prefix. You cannot replace the "
                         + "app bundle while the proxy is running."
                 )
-                .font(.caption).foregroundStyle(.secondary)
+                .font(.caption).foregroundStyle(Tok.inkDim)
             } header: {
                 SectionHeader(
                     title: "The running build",
@@ -513,7 +513,7 @@ struct UpdatesSettingsPane: View {
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).font(.caption).foregroundStyle(Tok.inkDim)
             }
         }
     }
