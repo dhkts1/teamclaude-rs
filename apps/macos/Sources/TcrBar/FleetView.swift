@@ -196,7 +196,11 @@ struct FleetView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack {
-                Text("tcr fleet").font(.headline)
+                // v4-spec: panel title 17pt/700 — `.headline` resolves to
+                // 13pt/semibold on macOS, well under the mockup's size.
+                // Literal per the tokens-parity fence; swap for a `Tok` name
+                // once one exists.
+                Text("tcr fleet").font(.system(size: 17, weight: .bold))
                 Spacer()
                 if let at = poller.lastPollAt {
                     // `docs/design/panel-tabs-mockup.html` F14: the header's
@@ -207,9 +211,15 @@ struct FleetView: View {
                     // elsewhere in this file — there is no live timer driving
                     // a re-render between polls, so this reads as of the last
                     // paint, not truly live-ticking.
+                    //
+                    // v4-spec: freshness is 12.5pt/400, `--mute`, not `--dim`
+                    // — `Tok.inkFaint` is this build's mute-role token
+                    // (`Tokens.swift`'s own naming: "Tertiary text and
+                    // hints"), so this corrects the colour role along with
+                    // the size.
                     Text(freshnessLabel(since: at, now: Date()))
-                        .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
-                        .foregroundStyle(Tok.inkDim)
+                        .font(.system(size: 12.5).monospacedDigit())
+                        .foregroundStyle(Tok.inkFaint)
                 }
             }
             // Only when the read is NOT healthy. On a healthy read this said
@@ -359,16 +369,19 @@ struct FleetView: View {
     /// truncate — while concatenated runs flow onto a second line and keep
     /// their own colours.
     private func capacitySummary(_ fleet: Fleet) -> some View {
+        // v4-spec: summary line is 15pt/400 with numbers at 600 — literal
+        // per the tokens-parity fence; `.subheadline`/`Tok.secondaryDigitFont`
+        // were 13pt/11pt.
         var line =
             Text(fleet.capacitySummary)
-            .font(.subheadline.weight(.semibold))
+            .font(.system(size: 15, weight: .semibold))
             .foregroundColor(Tok.color(for: fleet.capacityState))
         for tally in fleet.breakdown {
             line =
                 line
-                + Text(" · ").font(Tok.secondaryFont).foregroundColor(Tok.inkFaint)
+                + Text(" · ").font(.system(size: 15)).foregroundColor(Tok.inkFaint)
                 + Text(tally.label)
-                .font(Tok.secondaryDigitFont)
+                .font(.system(size: 15, weight: .semibold)).monospacedDigit()
                 .foregroundColor(Tok.color(for: tally.kind))
         }
         return
@@ -547,15 +560,22 @@ struct FleetView: View {
                         .font(.caption2.weight(.semibold))
                         .contentTransition(.numericText())
                         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: badge)
-                        .padding(.horizontal, Tok.space2)
-                        .background(Capsule().fill(Tok.hover))
+                        // v4-spec: tab badge 11pt on rgba(255,255,255,.14),
+                        // radius 9, padding 0 6 — literal per the
+                        // tokens-parity fence.
+                        .font(.system(size: 11))
+                        .padding(.horizontal, 6)
+                        .background(Capsule().fill(Color.white.opacity(0.14)))
                 }
             }
-            .font(.caption.weight(.semibold))
+            // v4-spec: segmented tab label 12.5pt/600/+0.02em.
+            .font(.system(size: 12.5, weight: .semibold))
+            .tracking(0.02 * 12.5)
             .foregroundStyle(isOn ? Tok.ink : Tok.inkDim)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, Tok.space2)
-            .background(RoundedRectangle(cornerRadius: Tok.radiusSmall).fill(isOn ? Tok.hover : Color.clear))
+            // v4-spec: item min-height 32, radius 8.
+            .frame(minHeight: 32)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isOn ? Tok.hover : Color.clear))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(badge.map { "\(tab.title), \($0)" } ?? tab.title)
@@ -870,10 +890,14 @@ struct FleetView: View {
     }
 
     private func sectionHeading(_ text: String) -> some View {
+        // v4-spec: section head is 11pt/700/+0.1em uppercase — `.caption2` is
+        // ~10pt; literal per the tokens-parity fence. The text itself is
+        // already authored uppercase at every call site, so no `.uppercased()`
+        // is added here.
         Text(text)
-            .font(.caption2.weight(.bold))
+            .font(.system(size: 11, weight: .bold))
             .foregroundStyle(Tok.inkFaint)
-            .tracking(Tok.pillTracking)
+            .tracking(0.1 * 11)
     }
 
     /// `commandHead` in monospace, truncated to one line — `panel-tabs-bridge.md`:
@@ -1554,14 +1578,18 @@ struct FleetView: View {
             // the header, pushing the fleet's own numbers down for a string
             // read about once a release.
             HStack(spacing: Tok.tightSpacing) {
+                // v4-spec: footer is 12.5pt/400, `--mute` throughout — both
+                // runs were two different sizes/roles (`Tok.secondaryFont`
+                // 11pt/dim, `Tok.detailDigitFont` 10pt/faint). Literal per
+                // the tokens-parity fence.
                 Text(server.state.summary)
-                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-                    .foregroundStyle(Tok.inkDim)
+                    .font(.system(size: 12.5))
+                    .foregroundStyle(Tok.inkFaint)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: Tok.tightSpacing)
                 if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
                     Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
-                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
+                        .font(.system(size: 12.5).monospacedDigit())
                         .foregroundStyle(Tok.inkFaint)
                         .lineLimit(1)
                 }
@@ -3782,7 +3810,9 @@ struct QuotaBar: View {
                     .strokeBorder(tint, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
             }
         }
-        .frame(width: width, height: Tok.barHeight)
+        // v4-spec: quota bar height is 7pt (`Tok.barHeight` is 6) — literal
+        // per the tokens-parity fence.
+        .frame(width: width, height: 7)
         .animation(reduceMotion ? nil : Tok.standardAnimation, value: fraction)
         // A second binding, not a merged one: `fraction` and `tint` change
         // independently (a re-poll moves the fill; a band crossing recolours
