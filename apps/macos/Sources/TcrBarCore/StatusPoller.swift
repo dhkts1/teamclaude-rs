@@ -48,8 +48,13 @@ public enum PollState: Equatable {
         case .commandFailed(let code, let message):
             let detail = message.isEmpty ? "no output" : message
             return "tcr status failed (exit \(code)): \(detail)"
-        case .undecodable(let message):
-            return "tcr status returned unreadable output: \(message)"
+        case .undecodable:
+            // Deliberately drops `message`. It is a Swift `DecodingError`
+            // description — key paths and type names — and this property's
+            // contract one screen up is "safe to put in front of a human".
+            // The raw text is still reachable: `FleetView` hangs it on the
+            // banner's tooltip, which is where a reader who wants it looks.
+            return "tcr answered, and this build could not read the answer"
         }
     }
 }

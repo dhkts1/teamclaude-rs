@@ -14,6 +14,16 @@ public enum TcrTool {
     /// Environment override, useful when launched from a shell.
     public static let overrideEnvKey = "TCR_BIN"
 
+    /// What to tell someone whose `tcr` could not be found.
+    ///
+    /// Stated once because it is given in two places — the poll banner and
+    /// every login hand-off failure — and a remedy that drifts between them is
+    /// worse than one that is missing. The hand-offs used to say only "tcr not
+    /// found (searched N locations)", which names the problem and no way out
+    /// of it, while the banner three hundred lines away already knew the fix.
+    public static let overrideRemedy =
+        "Set it with `defaults write io.github.dhkts1.tcrbar \(overrideDefaultsKey) <path>`."
+
     /// Why no binary could be found — carries the searched paths so the UI can be
     /// specific instead of silently empty.
     public struct NotFound: Error, Equatable {

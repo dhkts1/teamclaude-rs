@@ -47,6 +47,13 @@ jobs:
       - name: No --org flag
         run: scripts/check-no-org-flag.sh
 
+      # SwiftUI's `.secondary`/`.tertiary` resolve against the system window
+      # background, not this panel's own surfaces, so the contrast that
+      # `tcrbar-palette.py` measures and gates never applied to them. Thirteen
+      # text runs had drifted onto them, the worst at 1.86:1 — see the script.
+      - name: No hierarchical styles used as panel ink
+        run: scripts/check-panel-ink.sh
+
       # The disclosure gate's own fixtures. The hooks themselves are local and a
       # fork may not have them wired, so CI runs the suite that proves the scan
       # still refuses what it exists to refuse — a name, a home path, a real
