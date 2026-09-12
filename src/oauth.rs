@@ -106,6 +106,19 @@ pub fn is_expiring_soon(expires_at_ms: Option<i64>, now_ms: i64) -> bool {
     }
 }
 
+/// `Accept` header the token endpoint expects from a "recognised" client.
+/// Shared between [`refresh_access_token_at`] and [`exchange_code`] — see
+/// [`OAUTH_USER_AGENT`] for why sending it matters.
+const OAUTH_ACCEPT: &str = "application/json, text/plain, */*";
+
+/// `User-Agent` header the token endpoint expects from a "recognised" client.
+/// Without this header (and [`OAUTH_ACCEPT`]) an otherwise-valid exchange was
+/// refused a bogus `{"type":"rate_limit_error"}` 21 times over 7 minutes; the
+/// identical payload with these headers was evaluated on the first attempt —
+/// measured against the live endpoint, `docs/design/long-lived-tokens.md`
+/// ("The endpoint 429s clients it does not recognise").
+const OAUTH_USER_AGENT: &str = "axios/1.13.6";
+
 /// Refresh an access token against [`TOKEN_ENDPOINT`], retrying `5xx`/network
 /// failures with exponential backoff. Auth rejections are returned immediately.
 ///
@@ -143,8 +156,8 @@ pub async fn refresh_access_token_at(
         let send = client
             .post(endpoint)
             .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/plain, */*")
-            .header("User-Agent", "axios/1.13.6")
+            .header("Accept", OAUTH_ACCEPT)
+            .header("User-Agent", OAUTH_USER_AGENT)
             .timeout(REFRESH_TIMEOUT)
             .json(&body)
             .send()
@@ -291,8 +304,16 @@ use crate::singleton;
 pub const AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
 /// Profile endpoint used to name the account (from the JS `PROFILE_URL`).
 pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
-/// OAuth scopes requested at login (from the JS `OAUTH_SCOPES`).
-pub const OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+/// OAuth scopes requested at login. Narrowed from the JS reference's six
+/// scopes to the three the token endpoint will grant a custom `expires_in`
+/// for. `org:create_api_key`, `user:sessions:claude_code` and
+/// `user:mcp_servers` are dropped: requesting any of them alongside a
+/// custom `expires_in` gets HTTP 400 `Custom expires_in not allowed for
+/// scope 'user:mcp_servers'` — measured against the live endpoint,
+/// `docs/design/long-lived-tokens.md` ("The finding" / "A reduced scope set
+/// loses nothing tcr uses"). `user:profile` is kept because `rate_limit_tier`
+/// is not in the token response, so `fetch_profile` still needs it.
+pub const OAUTH_SCOPES: &str = "user:inference user:profile user:file_upload";
 
 /// Overall login timeout matching the JS 2-minute callback-server deadline.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
@@ -522,6 +543,36 @@ async fn wait_for_code(listener: TcpListener, expected_state: &str) -> anyhow::R
     }
 }
 
+/// Lifetime (seconds) requested for the access token minted at login, sent
+/// as a client-supplied `expires_in` in the exchange body. The token endpoint
+/// is CLIENT-DRIVEN here, not server-fixed: measured against the live
+/// endpoint, the same request with no `expires_in` was granted `28800` (8h);
+/// with `expires_in: 31536000` it was granted `31536000` (365d) verbatim —
+/// `docs/design/long-lived-tokens.md` ("The finding"). This only works
+/// because [`OAUTH_SCOPES`] excludes the scopes the endpoint refuses a custom
+/// `expires_in` for; see that constant's doc comment.
+pub const LOGIN_TOKEN_LIFETIME_SECS: u64 = 31_536_000;
+
+/// Build the JSON body for [`exchange_code`]'s `POST {TOKEN_ENDPOINT}`, as a
+/// pure function so the request shape can be asserted without the network —
+/// mirrors `warm_request_spec` in `src/warmer.rs`.
+fn exchange_request_body(
+    code: &str,
+    verifier: &str,
+    state: &str,
+    redirect_uri: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "code": code,
+        "state": state,
+        "grant_type": "authorization_code",
+        "client_id": CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "code_verifier": verifier,
+        "expires_in": LOGIN_TOKEN_LIFETIME_SECS,
+    })
+}
+
 /// Exchange the authorization code for tokens (`POST {TOKEN_ENDPOINT}`).
 ///
 /// This is the ONE step kept as a manual `reqwest` JSON POST rather than
@@ -536,16 +587,6 @@ async fn exchange_code(
     state: &str,
     redirect_uri: &str,
 ) -> anyhow::Result<Tokens> {
-    #[derive(Serialize)]
-    struct ExchangeRequest<'a> {
-        code: &'a str,
-        state: &'a str,
-        grant_type: &'a str,
-        client_id: &'a str,
-        redirect_uri: &'a str,
-        code_verifier: &'a str,
-    }
-
     let client = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -554,14 +595,9 @@ async fn exchange_code(
     let response = client
         .post(TOKEN_ENDPOINT)
         .header("Content-Type", "application/json")
-        .json(&ExchangeRequest {
-            code,
-            state,
-            grant_type: "authorization_code",
-            client_id: CLIENT_ID,
-            redirect_uri,
-            code_verifier: verifier,
-        })
+        .header("Accept", OAUTH_ACCEPT)
+        .header("User-Agent", OAUTH_USER_AGENT)
+        .json(&exchange_request_body(code, verifier, state, redirect_uri))
         .send()
         .await
         .context("token exchange request failed")?;
@@ -2047,6 +2083,57 @@ mod tests {
         assert_eq!(tokens.access_token, "at");
         assert_eq!(tokens.refresh_token.as_deref(), Some("rt"));
         assert_eq!(tokens.expires_at_ms, 1_700_000_000_000);
+    }
+
+    /// A response carrying `expires_in: 31536000` (one year) must land as an
+    /// `expires_at_ms` about 365 days from now — `tokens_from_exchange_body`
+    /// derives it via `expires_at_from`, which just adds `expires_in * 1000`
+    /// to `now_ms()`, so this pins that the year-long value survives the
+    /// round trip rather than being silently capped or defaulted.
+    #[test]
+    fn exchange_body_with_year_long_expires_in_yields_year_out_expiry() {
+        let before = crate::now_ms();
+        let tokens = tokens_from_exchange_body(
+            r#"{"access_token":"at","refresh_token":"rt","expires_in":31536000}"#,
+        )
+        .expect("a present refresh_token must return Ok");
+        let after = crate::now_ms();
+
+        let year_ms: i64 = 31_536_000 * 1000;
+        assert!(
+            tokens.expires_at_ms >= before + year_ms && tokens.expires_at_ms <= after + year_ms,
+            "expected expires_at_ms about one year out, got {} (now was {before}..{after})",
+            tokens.expires_at_ms
+        );
+    }
+
+    /// The serialized exchange body must request the year-long lifetime as a
+    /// client-supplied `expires_in`, mirroring `warm_request_spec`'s
+    /// no-network assertion pattern in `src/warmer.rs`.
+    #[test]
+    fn exchange_request_body_carries_year_long_expires_in() {
+        let body = exchange_request_body("a-code", "a-verifier", "a-state", "https://cb");
+        assert_eq!(body["expires_in"], LOGIN_TOKEN_LIFETIME_SECS);
+        assert_eq!(body["grant_type"], "authorization_code");
+        assert_eq!(body["code"], "a-code");
+    }
+
+    /// The three scopes the token endpoint refuses a custom `expires_in` for
+    /// must never come back: assert their absence explicitly so a future
+    /// re-add (e.g. restoring MCP or Claude Code session scopes) fails this
+    /// test loudly instead of silently reintroducing the HTTP 400.
+    #[test]
+    fn oauth_scopes_excludes_the_custom_expires_in_incompatible_scopes() {
+        for forbidden in [
+            "org:create_api_key",
+            "user:sessions:claude_code",
+            "user:mcp_servers",
+        ] {
+            assert!(
+                !OAUTH_SCOPES.contains(forbidden),
+                "OAUTH_SCOPES must not contain {forbidden:?}, got {OAUTH_SCOPES:?}"
+            );
+        }
     }
 
     /// THE TRAP (bridge §"THE TRAP"): a refresh whose response omits a
