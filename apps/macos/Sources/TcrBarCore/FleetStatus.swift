@@ -552,13 +552,47 @@ public enum QuotaFormat {
     /// formatter. `now` is a required parameter, not a default, so every
     /// test stays deterministic.
     public static func resetCaption(resetAtMs: Int64?, now: Date) -> String? {
+        guard let duration = durationUntilReset(resetAtMs: resetAtMs, now: now) else { return nil }
+        return "in \(duration)"
+    }
+
+    /// `"resets 3h 2m"` — the quota grid's own trailing column
+    /// (`docs/design/panel-tabs-mockup.html`'s `.q .resets`, panel-parity
+    /// finding: "the quota grid's trailing column always `resets …`").
+    ///
+    /// A second formatter rather than a second caller of ``resetCaption``
+    /// re-spelled at the call site: that string is shared with the Fable
+    /// weekly caption (``Account/fableWeeklyLabel``), which sits after an
+    /// unlabelled percentage ("fable 71% · in 4d 12h") where "resets" would
+    /// read as a second, competing verb. The 5h/7d quota rows dropped the
+    /// word entirely when the card went to one line per window (see
+    /// ``resetCaption``'s own doc-comment on the width that cost); now that
+    /// the spend figure that used to compete for the same row moved onto
+    /// the account's plan line (`FleetView.designationsLine`), the row has
+    /// the width back and the column can say what it means again — every
+    /// row in the grid, the same word, so the column is one meaning.
+    public static func resetsCaption(resetAtMs: Int64?, now: Date) -> String? {
+        guard let duration = durationUntilReset(resetAtMs: resetAtMs, now: now) else { return nil }
+        return "resets \(duration)"
+    }
+
+    /// Shared guard: `nil` in → `nil` out, never a placeholder — the same
+    /// house rule ``percent(_:)`` states above. A reset at or before `now`
+    /// also yields `nil`: the Rust side only ever sends future resets, but a
+    /// wire value can age between poll and draw, so this enforces the same
+    /// "future only" rule the server already applies rather than trusting
+    /// the wire. Routes through ``HeldWindow/duration(minutes:)`` — the
+    /// codebase's single answer to "how long" — instead of growing a second
+    /// duration formatter. `now` is a required parameter, not a default, so
+    /// every test stays deterministic.
+    private static func durationUntilReset(resetAtMs: Int64?, now: Date) -> String? {
         guard let resetAtMs else { return nil }
         let resetAt = Date(timeIntervalSince1970: Double(resetAtMs) / 1000)
         let seconds = resetAt.timeIntervalSince(now)
         guard seconds > 0 else { return nil }
         let minutes = Int((seconds / 60).rounded())
         guard minutes > 0 else { return nil }
-        return "in \(HeldWindow.duration(minutes: minutes))"
+        return HeldWindow.duration(minutes: minutes)
     }
 }
 
@@ -899,6 +933,56 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     }
 }
 
+/// One tool's aggregate within a session — `docs/design/panel-tabs-mockup.html`'s
+/// `BY TOOL` bars, `data/plans/wire-2-bridge.md`'s `ToolBucketRow`. `tool` is
+/// the wire's raw `tool_use.name` (`"Bash"`, `"Agent"`, `"Read"`, …) — the
+/// panel merges `Read`/`Grep`/`Glob`/`Edit` into one bucket, this type does
+/// not, so the client-side merge stays visible and testable rather than
+/// baked into the decode.
+public struct ToolBucketRow: Decodable, Equatable, Sendable {
+    public let tool: String
+    public let calls: Int
+    public let errors: Int
+    public let secondsP50: Double?
+    public let overOneMinute: Int
+
+    public init(
+        tool: String, calls: Int = 0, errors: Int = 0, secondsP50: Double? = nil,
+        overOneMinute: Int = 0
+    ) {
+        self.tool = tool
+        self.calls = calls
+        self.errors = errors
+        self.secondsP50 = secondsP50
+        self.overOneMinute = overOneMinute
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tool, calls, errors
+        case secondsP50 = "seconds_p50"
+        case overOneMinute = "over_one_minute"
+    }
+}
+
+/// One `BY TOOL` row, pooled across the fleet — see ``Fleet/toolsByCategory``.
+public struct ToolCategory: Identifiable, Equatable, Sendable {
+    public let name: String
+    public let calls: Int
+    /// The mean of each contributing session's own p50 — see
+    /// ``Fleet/toolsByCategory``'s doc-comment for why this is not a true
+    /// fleet-wide median. `nil` when no session reported one for this
+    /// category.
+    public let medianSeconds: Double?
+
+    public var id: String { name }
+
+    public init(name: String, calls: Int, medianSeconds: Double?) {
+        self.name = name
+        self.calls = calls
+        self.medianSeconds = medianSeconds
+    }
+}
+
 /// A session's tool aggregate — the wire's `tools` object.
 public struct SessionTools: Decodable, Equatable, Sendable {
     public let calls: Int
@@ -909,19 +993,53 @@ public struct SessionTools: Decodable, Equatable, Sendable {
     /// server (`sessions-wire-bridge.md`); this build does not re-sort a
     /// single session's own list.
     public let slowest: [ToolCall]
+    /// How many of this session's calls today ran over one minute —
+    /// `docs/design/panel-tabs-mockup.html`'s "405 ran over 1m". `nil`, not
+    /// `0`, against a server that does not send this key yet: the client
+    /// only ever sees the top-10 `slowest`, so it cannot count this itself,
+    /// and a `0` here would claim "measured none" about a question this
+    /// build cannot answer. `Fleet.toolsOverOneMinute` carries the same
+    /// nil-means-unknown rule through the fleet-wide sum.
+    public let overOneMinute: Int?
+    /// Per-tool aggregates — `data/plans/wire-2-bridge.md`'s `by_tool`. Empty,
+    /// not absent-means-error, against a server that doesn't send it yet:
+    /// ``Fleet/toolsByCategory`` treats an empty array from EVERY session the
+    /// same as "not one session reports this", and hides the `BY TOOL`
+    /// section rather than drawing empty bars.
+    public let byTool: [ToolBucketRow]
 
     public init(
         calls: Int = 0,
         errors: Int = 0,
         timeouts: Int = 0,
         running: [ToolCall] = [],
-        slowest: [ToolCall] = []
+        slowest: [ToolCall] = [],
+        overOneMinute: Int? = nil,
+        byTool: [ToolBucketRow] = []
     ) {
         self.calls = calls
         self.errors = errors
         self.timeouts = timeouts
         self.running = running
         self.slowest = slowest
+        self.overOneMinute = overOneMinute
+        self.byTool = byTool
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case calls, errors, timeouts, running, slowest, overOneMinute
+        case byTool = "by_tool"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        calls = try c.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+        errors = try c.decodeIfPresent(Int.self, forKey: .errors) ?? 0
+        timeouts = try c.decodeIfPresent(Int.self, forKey: .timeouts) ?? 0
+        running = try c.decodeIfPresent([ToolCall].self, forKey: .running) ?? []
+        slowest = try c.decodeIfPresent([ToolCall].self, forKey: .slowest) ?? []
+        overOneMinute = try c.decodeIfPresent(Int.self, forKey: .overOneMinute)
+        byTool = try c.decodeIfPresent([ToolBucketRow].self, forKey: .byTool) ?? []
     }
 }
 
@@ -947,6 +1065,29 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
     public let outputTokens: Int
     public let cacheReadTokens: Int
     public let tools: SessionTools
+    /// Requests seen in each of the last 30 wall-clock minutes, oldest first
+    /// — `SessionRow::req_per_minute`, the Sessions tab's sparkline. `nil`,
+    /// not an all-zero series, when the server doesn't send it yet: a flat
+    /// line at zero would claim a measured idle session, which an unmeasured
+    /// one is not.
+    ///
+    /// **Keyed `reqPerMinute`, not `req_per_minute`.** The wire struct carries
+    /// `#[serde(rename_all = "camelCase")]`
+    /// (`crates/tcr-status-wire/src/lib.rs`, `SessionRow`), so the snake_case
+    /// key this decoder was written against never appears in a real payload:
+    /// it decoded `nil` from every live session while the Swift-constructed
+    /// fixtures — which never go through JSON — drew their sparklines
+    /// perfectly. Verified against that file on `feat/wire-2` (`e13e6f0`),
+    /// and `SessionDecodingTests` now decodes the camelCase key so a rename
+    /// back fails a test rather than a screen.
+    public let reqPerMinute: [UInt16]?
+
+    /// What this session's traffic cost, list-price equivalent —
+    /// `SessionRow::cost_usd`. Optional HERE though the wire field is a plain
+    /// `f64`: a server built before wire 2 sends no such key at all, and its
+    /// sessions must keep decoding rather than throwing the whole tab away.
+    /// `nil` draws no `$` clause; it is never read as zero.
+    public let costUsd: Double?
 
     public var id: String { sessionId }
 
@@ -960,7 +1101,9 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         inputTokens: Int = 0,
         outputTokens: Int = 0,
         cacheReadTokens: Int = 0,
-        tools: SessionTools = SessionTools()
+        tools: SessionTools = SessionTools(),
+        reqPerMinute: [UInt16]? = nil,
+        costUsd: Double? = nil
     ) {
         self.sessionId = sessionId
         self.account = account
@@ -972,6 +1115,29 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         self.outputTokens = outputTokens
         self.cacheReadTokens = cacheReadTokens
         self.tools = tools
+        self.reqPerMinute = reqPerMinute
+        self.costUsd = costUsd
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId, account, model, firstSeenMs, lastSeenMs, requests, inputTokens,
+            outputTokens, cacheReadTokens, tools, reqPerMinute, costUsd
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        account = try c.decodeIfPresent(String.self, forKey: .account)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        firstSeenMs = try c.decode(Int64.self, forKey: .firstSeenMs)
+        lastSeenMs = try c.decode(Int64.self, forKey: .lastSeenMs)
+        requests = try c.decodeIfPresent(Int.self, forKey: .requests) ?? 0
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens) ?? 0
+        cacheReadTokens = try c.decodeIfPresent(Int.self, forKey: .cacheReadTokens) ?? 0
+        tools = try c.decodeIfPresent(SessionTools.self, forKey: .tools) ?? SessionTools()
+        reqPerMinute = try c.decodeIfPresent([UInt16].self, forKey: .reqPerMinute)
+        costUsd = try c.decodeIfPresent(Double.self, forKey: .costUsd)
     }
 }
 
@@ -2009,6 +2175,45 @@ public struct Fleet: Equatable, Sendable {
     public var toolsTotalCalls: Int { sessions.reduce(0) { $0 + $1.tools.calls } }
     public var toolsTotalErrors: Int { sessions.reduce(0) { $0 + $1.tools.errors } }
     public var toolsTotalTimeouts: Int { sessions.reduce(0) { $0 + $1.tools.timeouts } }
+
+    /// `nil`, not `0`, when not one session reports ``SessionTools/overOneMinute``
+    /// — against today's server, that is every session, and the Tools tab
+    /// summary line drops its own clause rather than claim a measured zero.
+    public var toolsOverOneMinute: Int? {
+        let known = sessions.compactMap(\.tools.overOneMinute)
+        guard !known.isEmpty else { return nil }
+        return known.reduce(0, +)
+    }
+
+    /// One row per category — `docs/design/panel-tabs-mockup.html`'s `BY TOOL`
+    /// list: Bash, Agent, and Read/Grep/Glob/Edit pooled as one bucket
+    /// (`data/plans/wire-2-bridge.md`: "the panel groups them"). `nil` when
+    /// not one session reports `byTool`, the same "silence over a fake zero"
+    /// rule as ``toolsOverOneMinute``. The per-category median is the mean of
+    /// each contributing session's own p50 — an approximation stated as one
+    /// in ``ToolCategory/medianSeconds``'s own doc-comment, not a true
+    /// fleet-wide median (this build never sees the raw per-call durations,
+    /// only each session's already-reduced p50).
+    public var toolsByCategory: [ToolCategory]? {
+        let allBuckets = sessions.flatMap(\.tools.byTool)
+        guard !allBuckets.isEmpty else { return nil }
+        func category(for tool: String) -> String {
+            switch tool {
+            case "Bash": return "Bash"
+            case "Agent", "Task": return "Agent"
+            default: return "Read · Grep · Edit"
+            }
+        }
+        let grouped = Dictionary(grouping: allBuckets) { category(for: $0.tool) }
+        let order = ["Bash", "Agent", "Read · Grep · Edit"]
+        return order.compactMap { name in
+            guard let rows = grouped[name], !rows.isEmpty else { return nil }
+            let calls = rows.reduce(0) { $0 + $1.calls }
+            let medians = rows.compactMap(\.secondsP50)
+            let median = medians.isEmpty ? nil : medians.reduce(0, +) / Double(medians.count)
+            return ToolCategory(name: name, calls: calls, medianSeconds: median)
+        }
+    }
 
     /// Every tool call currently running, pooled across every session.
     public var toolsRunning: [SessionToolEntry] {
