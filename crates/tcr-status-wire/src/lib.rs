@@ -125,9 +125,10 @@ pub struct HeldWindowRow {
 pub struct RunningToolRow {
     pub tool: String,
     pub started_ms: i64,
-    /// First 120 characters of a Bash tool's `input.command` — `None` for any other tool, or
-    /// when the running call carries no command. Held in memory only on the server; never
-    /// written to a log (see `src/session_wire.rs`'s module doc in the main crate).
+    /// A Bash tool's `input.command`, or an `Agent`/`Task` tool's `input.subagent_type:
+    /// input.description` — `None` for any other tool, or when the running call carries
+    /// neither. Held in memory only on the server; never written to a log (see
+    /// `src/session_wire.rs`'s module doc in the main crate).
     pub command_head: Option<String>,
 }
 
@@ -154,6 +155,12 @@ pub struct SessionToolsRow {
     /// Tool calls still awaiting a `tool_result`, capped at 64 per session.
     #[serde(default)]
     pub running: Vec<RunningToolRow>,
+    /// The count of [`Self::running`] entries whose `tool` is `Agent` or `Task` — a running
+    /// subagent — so a panel can print "2 subagents" without scanning the list. `#[serde(default)]`
+    /// so a payload from a server built before this field existed decodes as "no subagents known"
+    /// rather than a parse failure.
+    #[serde(default)]
+    pub subagents_running: u64,
     /// The ten slowest completed tool calls, descending by `seconds`.
     #[serde(default)]
     pub slowest: Vec<SlowToolRow>,

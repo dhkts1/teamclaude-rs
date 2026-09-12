@@ -82,6 +82,12 @@ impl Manager {
                     calls: s.tools.calls,
                     errors: s.tools.errors,
                     timeouts: s.tools.timeouts,
+                    subagents_running: s
+                        .tools
+                        .running
+                        .values()
+                        .filter(|r| r.tool == "Agent" || r.tool == "Task")
+                        .count() as u64,
                     running: s
                         .tools
                         .running
@@ -139,6 +145,42 @@ mod tests {
         assert_eq!(row.input_tokens, 10);
         assert_eq!(row.output_tokens, 20);
         assert_eq!(row.cache_read_tokens, 5);
+    }
+
+    /// `subagents_running` counts only `Agent`/`Task` entries among the running tools — a plain
+    /// `Bash` call sitting alongside two subagents must not be counted, and a caller must be
+    /// able to print "2 subagents" without scanning `running` itself.
+    #[test]
+    fn subagents_running_counts_agent_and_task_but_not_bash() {
+        let manager = Manager::from_runtimes(vec![]);
+        let now = OffsetDateTime::now_utc();
+        let uses = vec![
+            ToolUseEvent {
+                id: "tu_bash".to_string(),
+                name: Some("Bash".to_string()),
+                command_head: Some("ls".to_string()),
+            },
+            ToolUseEvent {
+                id: "tu_agent".to_string(),
+                name: Some("Agent".to_string()),
+                command_head: Some("henry:coder: F4 subagents on the wire".to_string()),
+            },
+            ToolUseEvent {
+                id: "tu_task".to_string(),
+                name: Some("Task".to_string()),
+                command_head: Some("review the diff".to_string()),
+            },
+        ];
+        manager.record_wire_session(Some("sess-sub"), None, None, now, &uses, &[]);
+
+        let snap = manager.snapshot(now);
+        assert_eq!(snap.wire_sessions.len(), 1);
+        let row = &snap.wire_sessions[0];
+        assert_eq!(row.tools.running.len(), 3, "all three tools stay pending");
+        assert_eq!(
+            row.tools.subagents_running, 2,
+            "only the Agent and Task entries count, not the Bash call"
+        );
     }
 
     #[test]
