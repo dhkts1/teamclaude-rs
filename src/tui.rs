@@ -986,6 +986,10 @@ fn probe_cell(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style)
         // — benign, not a serving failure. Yellow, never red: the account's own
         // quota bar is still valid; only the probe was deflected.
         ProbeStatus::RateLimited => (format!("busy {age}"), Style::default().fg(Color::Yellow)),
+        // A SUSTAINED run of 5xx, not a benign throttle — the usage endpoint
+        // itself is down. Red, like `Error`: this is the visible state
+        // `RateLimited`'s doc-comment says must not hide behind it forever.
+        ProbeStatus::UpstreamDown => (format!("DOWN {age}"), Style::default().fg(Color::Red)),
         ProbeStatus::Never => ("never".to_string(), Style::default().fg(Color::DarkGray)),
     }
 }

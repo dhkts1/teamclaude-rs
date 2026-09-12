@@ -281,6 +281,14 @@ pub struct AccountRuntime {
     /// probe fails forever, so gating on it unconditionally makes keep-warm
     /// structurally dark. See [`PROBE_FAILURES_BEFORE_WARMING_UNPROBED`].
     pub consecutive_probe_failures: u32,
+    /// Consecutive 5xx probe reads, counted separately from
+    /// `consecutive_probe_failures` above: a 429 self-clears and must reset
+    /// this to `0` the same as a success does, so it is never conflated with a
+    /// real outage. Bumped and read by [`Manager::probe_account`] via its
+    /// private `note_5xx_probe` helper to escalate `ProbeStatus::RateLimited`
+    /// to the visible `ProbeStatus::UpstreamDown` once a run crosses
+    /// `SUSTAINED_5XX_THRESHOLD` (`manager/probing.rs`).
+    pub consecutive_5xx_probes: u32,
     /// Consecutive keep-warm requests ([`Manager::warm_account`]) that succeeded
     /// but carried none of the unified 5h rate-limit headers — a 200 that latched
     /// no evidence. Reset to `0` only by a response (warm or served) whose
@@ -611,6 +619,7 @@ impl AccountRuntime {
             // every account's quota is genuinely unread.
             quota_known: false,
             consecutive_probe_failures: 0,
+            consecutive_5xx_probes: 0,
             consecutive_warms_without_evidence: 0,
             warm_evidence_retry_after_ms: None,
             input_tokens: 0,
@@ -3286,6 +3295,7 @@ mod tests {
                         }),
                         seven_day: None,
                         seven_day_oi: None,
+                        extra_usage_usd: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -3333,6 +3343,7 @@ mod tests {
                         }),
                         seven_day: None,
                         seven_day_oi: None,
+                        extra_usage_usd: None,
                     })
                 } else {
                     Err(ProbeError {
@@ -3362,6 +3373,7 @@ mod tests {
                         reset_at_ms: Some(crate::now_ms() + 86_400_000),
                     }),
                     seven_day_oi: None,
+                    extra_usage_usd: None,
                 })
             })
         }
@@ -6491,6 +6503,160 @@ mod tests {
         assert!(snap.accounts[0].probe_error.is_some());
     }
 
+    /// A prober that always fails with a fixed HTTP status — for pinning exactly
+    /// how many consecutive reads of a given status it takes (or does not take)
+    /// to move `probe_status` past the benign `RateLimited`.
+    struct AlwaysStatusProber {
+        status: u16,
+    }
+    impl UsageProber for AlwaysStatusProber {
+        fn probe(&self, _access_token: String) -> ProbeFuture {
+            let status = self.status;
+            Box::pin(async move {
+                Err(ProbeError {
+                    status: Some(status),
+                    message: "upstream boom".into(),
+                    retry_after_secs: None,
+                })
+            })
+        }
+    }
+
+    /// 1b, the half of the fix `probe_429_is_rate_limited_and_keeps_last_utilization`
+    /// does not cover: ONE 5xx read is still the same benign, self-clearing
+    /// `RateLimited` a 429 gets — it must NOT jump straight to the visible
+    /// escalated state on the first hiccup.
+    #[tokio::test]
+    async fn a_single_5xx_probe_stays_rate_limited() {
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            pacing_refresher(),
+            Arc::new(AlwaysStatusProber { status: 503 }),
+        );
+
+        manager.probe_all().await;
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snap.accounts[0].probe_status,
+            ProbeStatus::RateLimited,
+            "a lone 5xx is a hiccup, same as a 429 — not yet the sustained-outage state"
+        );
+    }
+
+    /// 1b, the other half: a SUSTAINED run of 5xx reads — as opposed to the
+    /// single hiccup above — is first-hand evidence the usage endpoint itself is
+    /// down, and must escalate to the visible `UpstreamDown` rather than keep
+    /// hiding behind `RateLimited` forever.
+    #[tokio::test]
+    async fn sustained_5xx_probes_escalate_to_upstream_down() {
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            pacing_refresher(),
+            Arc::new(AlwaysStatusProber { status: 502 }),
+        );
+
+        for sweep in 1..crate::manager::probing::SUSTAINED_5XX_THRESHOLD {
+            manager.probe_all().await;
+            let snap = manager.snapshot(OffsetDateTime::now_utc());
+            assert_eq!(
+                snap.accounts[0].probe_status,
+                ProbeStatus::RateLimited,
+                "sweep {sweep}: below the threshold, still the benign label"
+            );
+        }
+
+        // The crossing sweep.
+        manager.probe_all().await;
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snap.accounts[0].probe_status,
+            ProbeStatus::UpstreamDown,
+            "a sustained run of 5xx must surface as its own visible status"
+        );
+    }
+
+    /// The counters driving the two statuses above must be genuinely
+    /// independent: a 429 never contributes to the sustained-5xx count, so an
+    /// account that is merely self-throttled — however many times in a row —
+    /// must never be mistaken for a real outage.
+    #[tokio::test]
+    async fn repeated_429s_never_escalate_to_upstream_down() {
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            pacing_refresher(),
+            Arc::new(AlwaysStatusProber { status: 429 }),
+        );
+
+        for _ in 0..(crate::manager::probing::SUSTAINED_5XX_THRESHOLD * 3) {
+            manager.probe_all().await;
+        }
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snap.accounts[0].probe_status,
+            ProbeStatus::RateLimited,
+            "a self-throttle stays benign no matter how many times it repeats"
+        );
+    }
+
+    /// A success between two 5xx runs must reset the sustained-5xx count, the
+    /// same way it resets `consecutive_probe_failures` — a brief recovery in the
+    /// middle is not "the endpoint has been down the whole time".
+    #[tokio::test]
+    async fn a_success_between_5xx_runs_resets_the_sustained_count() {
+        let state = Arc::new(std::sync::Mutex::new(0usize));
+
+        struct FlakyProber {
+            state: Arc<std::sync::Mutex<usize>>,
+        }
+        impl UsageProber for FlakyProber {
+            fn probe(&self, _access_token: String) -> ProbeFuture {
+                let mut n = self.state.lock().expect("lock poisoned");
+                *n += 1;
+                // 5xx, 5xx, OK, 5xx, 5xx — never THREE in a row.
+                let fail = matches!(*n, 1 | 2 | 4 | 5);
+                let call = *n;
+                drop(n);
+                Box::pin(async move {
+                    if fail {
+                        Err(ProbeError {
+                            status: Some(500),
+                            message: format!("upstream boom #{call}"),
+                            retry_after_secs: None,
+                        })
+                    } else {
+                        Ok(Usage {
+                            five_hour: Some(UsageBucket {
+                                utilization: Some(0.1),
+                                reset_at_ms: Some(crate::now_ms() + 3_600_000),
+                            }),
+                            seven_day: None,
+                            seven_day_oi: None,
+                            extra_usage_usd: None,
+                        })
+                    }
+                })
+            }
+        }
+
+        let manager = build_manager_with_prober(
+            config_with(vec![account("a", 0)]),
+            pacing_refresher(),
+            Arc::new(FlakyProber { state }),
+        );
+
+        for _ in 0..5 {
+            manager.probe_all().await;
+        }
+        let snap = manager.snapshot(OffsetDateTime::now_utc());
+        assert_eq!(
+            snap.accounts[0].probe_status,
+            ProbeStatus::RateLimited,
+            "two 5xx, a success, then two more 5xx is never THREE IN A ROW — \
+             the intervening success must have reset the count, or this reads \
+             as UpstreamDown for a run that was never actually sustained"
+        );
+    }
+
     #[tokio::test]
     async fn probe_retry_after_blocks_the_next_probe_until_it_expires() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -8430,6 +8596,7 @@ mod tests {
                     utilization: Some(0.99),
                     reset_at_ms: Some(reset_ms),
                 }),
+                extra_usage_usd: None,
             },
         );
         // A FABLE request (`is_fable = true`) is the only one gated by the 7d_oi
@@ -10483,6 +10650,7 @@ mod tests {
             five_hour: None,
             seven_day: None,
             seven_day_oi: None,
+            extra_usage_usd: None,
         };
         for cycle in 0..5 {
             manager.apply_usage(0, &headerless_probe);

@@ -82,72 +82,23 @@ fi
 # to prevent, one level up.
 #
 # Deliberate exception:  git commit --no-verify
-added="$(git diff --cached -U0 --diff-filter=ACM -- . ':(exclude).githooks/private-names' \
-         | sed -n 's/^+//p' || true)"
-hits=""
-
-if [ -n "$added" ]; then
-  # 1. Private names — an editable list, so adding one needs no hook edit.
-  #
-  #    A MISSING list is a hard failure, for the same reason a missing gitleaks
-  #    is: this is a disclosure gate, and the file is tracked, so its absence
-  #    means the checkout is damaged or somebody deleted it — not that there is
-  #    nothing to check. Skipping silently would leave the other two checks
-  #    (home paths, emails) running and the whole gate looking healthy while the
-  #    one check that knows the actual private names had been switched off.
-  if [ ! -f .githooks/private-names ] && [ "${TCR_ALLOW_MISSING_PRIVATE_NAMES:-0}" != "1" ]; then
-    echo "" >&2
-    echo "pre-commit: BLOCKED — .githooks/private-names is missing, so the private-name" >&2
-    echo "  half of the disclosure scan cannot run." >&2
-    echo "" >&2
-    echo "  The file is local-only and gitignored, so no clone or worktree carries it: a" >&2
-    echo "  committed list of the real names would itself be the disclosure this gate" >&2
-    echo "  exists to stop. Each checkout writes its own." >&2
-    echo "" >&2
-    echo "  Maintaining a list — one name or string per line, '#' comments allowed:" >&2
-    echo "" >&2
-    echo "      \$EDITOR .githooks/private-names" >&2
-    echo "" >&2
-    echo "  Contributing from a fork, with no private names of your own to protect? Then" >&2
-    echo "  this half is not yours to run, and skipping it is the correct answer:" >&2
-    echo "" >&2
-    echo "      TCR_ALLOW_MISSING_PRIVATE_NAMES=1 git commit ..." >&2
-    echo "" >&2
-    exit 1
-  fi
-  if [ -f .githooks/private-names ]; then
-    while IFS= read -r name || [ -n "$name" ]; do
-      case "$name" in ''|\#*) continue ;; esac
-      found="$(printf '%s\n' "$added" | grep -i -m3 -- "$name" || true)"
-      [ -n "$found" ] && hits="$hits
-  private name '$name':
-$(printf '%s\n' "$found" | sed 's/^/      /')"
-    done < .githooks/private-names
-  fi
-
-  # 2. Absolute home paths — they leak the machine layout and the operator's name.
-  #    Obviously-synthetic users are allowed so fixtures and docs still work.
-  found="$(printf '%s\n' "$added" \
-           | grep -E -m3 '/(Users|home)/[A-Za-z0-9._-]+/' \
-           | grep -v -i -E '/(Users|home)/(x|y|alice|bob|carol|test|example|runner|user)/' || true)"
-  [ -n "$found" ] && hits="$hits
-  absolute home path:
-$(printf '%s\n' "$found" | sed 's/^/      /')"
-
-  # 3. Real-looking email addresses (example.com and the GitHub noreply are fine).
-  #    Matched case-insensitively: example.com is RFC 2606 reserved, so ALICE@EXAMPLE.COM
-  #    is no more real than the lowercase form. Docs demonstrating case-sensitive account
-  #    resolution legitimately write the uppercase one, and a case-sensitive allowlist
-  #    blocked exactly that.
-  found="$(printf '%s\n' "$added" \
-           | grep -E -o -m3 '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' \
-           | grep -v -i -E '@(example\.(com|org|net)|users\.noreply\.github\.com)$' || true)"
-  [ -n "$found" ] && hits="$hits
-  real-looking email address:
-$(printf '%s\n' "$found" | sed 's/^/      /')"
+# The checks themselves live in .githooks/lib/disclosure-scan.sh, shared with
+# pre-merge-commit (a merge's content is never staged, so this hook never runs
+# for one) and pre-push (a commit MESSAGE is not part of any diff, so no version
+# of this scan could read one). Three spellings of "would this disclose
+# something?" is how the three answers drift.
+if [ ! -f .githooks/lib/disclosure-scan.sh ]; then
+  echo "" >&2
+  echo "pre-commit: BLOCKED — .githooks/lib/disclosure-scan.sh is missing, so the" >&2
+  echo "  disclosure scan cannot run. The checkout is damaged; restore the file." >&2
+  exit 1
 fi
+# shellcheck source=lib/disclosure-scan.sh
+. .githooks/lib/disclosure-scan.sh
 
-if [ -n "$hits" ]; then
+tcr_disclosure_require_names_list "pre-commit" || exit 1
+
+if ! hits="$(tcr_disclosure_staged_added | tcr_disclosure_scan_text "the staged changes")"; then
   echo "" >&2
   echo "pre-commit: BLOCKED — staged changes would publish private information." >&2
   echo "$hits" >&2

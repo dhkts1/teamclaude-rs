@@ -1112,6 +1112,46 @@ pub fn default_path() -> PathBuf {
 /// An `importFrom`-shaped entry (a bare pointer at another file, resolved by
 /// upstream at startup — not implemented here, see `config-bridge-coder.md`)
 /// has no inline token either, so it falls out through the same check.
+/// The credential-envelope version a later move to the OS keystore will need
+/// to tell an old plaintext shape from a new one. Bumped only when the
+/// on-disk SHAPE of `accessToken`/`refreshToken` changes — never for an
+/// unrelated `Account` field — so a reader can always tell which shape it is
+/// holding before trying to interpret it. `1` is the only shape that has ever
+/// existed: today's plaintext `accessToken`/`refreshToken` strings.
+///
+/// Deliberately NOT an `Account` struct field: `Account` is constructed as a
+/// literal at several dozen call sites across the crate (tests, `oauth.rs`,
+/// `manager/`, …), and giving it a new required field would force every one
+/// of them to name a value that means nothing to them. The version lives
+/// instead as a raw `credentialVersion` key on the JSON object, read and
+/// written directly in [`load`] and [`save`] — the same layer that already
+/// migrates the legacy `throttle` key and renames duplicated accounts by
+/// editing the [`Value`] document rather than the typed struct. A config
+/// written through this path ends up with `credentialVersion` in an
+/// `Account`'s flattened `extra` map, which already exists to carry any key
+/// this crate does not model, and round-trips untouched like any other.
+const CREDENTIAL_VERSION: u64 = 1;
+
+/// `entry`'s `credentialVersion` key, read directly off the raw JSON so
+/// [`load`] can decide before anything is handed to `serde` for typed
+/// deserialization.
+///
+/// - `Ok(None)`: the key is absent — every config written before this lane,
+///   which means version 1 and needs no migration.
+/// - `Ok(Some(v))`: the key is present and reads as a version number.
+/// - `Err(())`: the key is present but is not a shape a version number could
+///   ever take (a string, an object, a negative number, a float) — refused
+///   the same as an unknown future version, because guessing what a
+///   malformed version key meant is exactly the silent reinterpretation this
+///   exists to prevent.
+fn credential_version_of(entry: &Value) -> Result<Option<u64>, ()> {
+    match entry.get("credentialVersion") {
+        None => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().ok_or(()).map(Some),
+        Some(_) => Err(()),
+    }
+}
+
 fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
     let name = entry
         .get("name")
@@ -1139,6 +1179,11 @@ fn unusable_account(entry: &Value) -> Option<(String, &'static str)> {
 }
 
 /// Load and parse the config at `path`.
+///
+/// Checks every account's `credentialVersion` before anything else touches
+/// the entry — see [`CREDENTIAL_VERSION`] — backfilling an absent key to `1`
+/// in the document and refusing the whole file on a version number this
+/// build does not understand.
 ///
 /// Deserializes leniently at the account boundary: an `accounts[]` entry that
 /// cannot yield a usable credential ([`unusable_account`]) is dropped, with a
@@ -1235,6 +1280,51 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
                         error = %err,
                         "legacy `throttle` key does not parse as a throttle config; dropping it"
                     );
+                }
+            }
+        }
+    }
+
+    // Credential-envelope version check, ahead of everything else that reads
+    // an account entry: refuse the whole file rather than silently
+    // reinterpreting a shape a future `tcr` wrote and this build has never
+    // seen. A missing key backfills to version 1 in the document itself, so
+    // the very next `save` writes it explicitly and no migration step is
+    // needed today — see [`CREDENTIAL_VERSION`]'s doc-comment for why this
+    // lives here rather than on `Account`.
+    if let Some(accounts) = doc.get_mut("accounts").and_then(Value::as_array_mut) {
+        for entry in accounts.iter_mut() {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("<unnamed>")
+                .to_string();
+            match credential_version_of(entry) {
+                Ok(None) => {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert(
+                            "credentialVersion".to_string(),
+                            Value::Number(CREDENTIAL_VERSION.into()),
+                        );
+                    }
+                }
+                Ok(Some(v)) if v > CREDENTIAL_VERSION => {
+                    return Err(ConfigError::Parse(
+                        <serde_json::Error as serde::de::Error>::custom(format!(
+                            "account \"{name}\" carries credentialVersion {v}, which this build \
+                             only understands up to {CREDENTIAL_VERSION}; refusing to load rather \
+                             than silently reinterpret its credential shape"
+                        )),
+                    ));
+                }
+                Ok(Some(_)) => {}
+                Err(()) => {
+                    return Err(ConfigError::Parse(
+                        <serde_json::Error as serde::de::Error>::custom(format!(
+                            "account \"{name}\" carries a credentialVersion that is not a \
+                             version number; refusing to load rather than guess what it means"
+                        )),
+                    ));
                 }
             }
         }
@@ -3325,6 +3415,118 @@ mod tests {
         let reloaded: Config = serde_json::from_str(&fs::read_to_string(&tmp).unwrap()).unwrap();
         assert_eq!(reloaded.accounts[0].groups, config.accounts[0].groups);
         fs::remove_file(&tmp).ok();
+    }
+
+    // --- load: the credential envelope declares its version ------------------
+
+    /// A config written before `credentialVersion` existed loads exactly as
+    /// it always has (no version key at all), and the very next `save` now
+    /// writes `credentialVersion: 1` explicitly — nothing migrates by hand,
+    /// and a later build can tell "this file predates the key" from "this
+    /// file explicitly says version 1" apart, by there being no difference
+    /// left to see.
+    #[test]
+    fn missing_credential_version_loads_as_version_1_and_backfills_on_save() {
+        let path = tmp_path("cred-version-missing");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-a", "accessToken": "at-a", "refreshToken": "rt-a" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].access_token, "at-a");
+
+        let saved = tmp_path("cred-version-missing-saved");
+        save(&saved, &config).unwrap();
+        let value = read_json(&saved);
+        assert_eq!(
+            value["accounts"][0]["credentialVersion"],
+            serde_json::json!(1),
+            "a config with no credentialVersion key must re-save with it: {value}"
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&saved).ok();
+    }
+
+    /// An explicit `"credentialVersion": 1` — what every config saved after
+    /// this lane carries — loads and round-trips unchanged.
+    #[test]
+    fn explicit_credential_version_1_round_trips() {
+        let path = tmp_path("cred-version-explicit");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-a", "accessToken": "at-a", "credentialVersion": 1 }
+               ] }"#,
+        )
+        .unwrap();
+
+        let config = load(&path).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+
+        let saved = tmp_path("cred-version-explicit-saved");
+        save(&saved, &config).unwrap();
+        let value = read_json(&saved);
+        assert_eq!(
+            value["accounts"][0]["credentialVersion"],
+            serde_json::json!(1)
+        );
+
+        fs::remove_file(&path).ok();
+        fs::remove_file(&saved).ok();
+    }
+
+    /// A `credentialVersion` this build has never heard of refuses the WHOLE
+    /// file rather than guessing what the newer shape means — the exact
+    /// failure a later move to the OS keystore needs this lane to catch.
+    #[test]
+    fn unknown_future_credential_version_refuses_to_load() {
+        let path = tmp_path("cred-version-future");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-a", "accessToken": "at-a", "credentialVersion": 2 }
+               ] }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("an unknown credentialVersion must refuse to load");
+        let message = err.to_string();
+        assert!(
+            message.contains("acct-a") && message.contains('2'),
+            "error should name the account and the unknown version: {message}"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// A `credentialVersion` that is present but not a number at all (a
+    /// hand-edited file, a half-written migration from some other tool) is
+    /// refused the same way an unknown future number is — never silently
+    /// treated as version 1.
+    #[test]
+    fn malformed_credential_version_refuses_to_load() {
+        let path = tmp_path("cred-version-malformed");
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                 { "name": "acct-a", "accessToken": "at-a", "credentialVersion": "v1" }
+               ] }"#,
+        )
+        .unwrap();
+
+        let err = load(&path).expect_err("a non-numeric credentialVersion must refuse to load");
+        assert!(
+            err.to_string().contains("acct-a"),
+            "error should name the account: {err}"
+        );
+
+        fs::remove_file(&path).ok();
     }
 
     // --- load: skip unusable accounts, keep the rest -------------------------

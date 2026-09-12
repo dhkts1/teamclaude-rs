@@ -3854,11 +3854,27 @@ fn usage_record(
 }
 
 /// Parse the token breakdown from a non-streamed JSON messages body.
+///
+/// A body that is not JSON is logged once, at warn: it means this turn's tokens
+/// are missing from the ledger, which is exactly the kind of silent undercount
+/// the usage ledger's own write-failure policy exists to make visible. Only the
+/// serde error and the body LENGTH are logged, never any body content, because a
+/// request body carries the user's prompt and this repository is public.
 fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
-    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-        return ParsedUsage::default();
+    let value = match serde_json::from_slice::<Value>(bytes) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                body_len = bytes.len(),
+                "a non-streamed 200 body did not parse as JSON, so this turn's tokens are \
+                 NOT in the usage ledger; totals for this window are an undercount"
+            );
+            return ParsedUsage::default();
+        }
     };
     let Some(usage) = value.get("usage") else {
+        // Ordinary, and deliberately silent: plenty of 200 bodies carry no usage.
         return ParsedUsage::default();
     };
     let output = usage
@@ -5203,6 +5219,90 @@ mod tests {
     /// specifically. Exercised directly against the extracted predicate
     /// rather than a network-level reproduction of the race, which the
     /// malformed-frame path alone cannot trigger.
+    /// A malformed non-streamed body must SAY so, and an ordinary body without a
+    /// `usage` key must stay quiet.
+    ///
+    /// Before this test both cases returned a default [`ParsedUsage`], the caller
+    /// skips recording when the totals are zero, and nothing anywhere named the
+    /// difference: a body the proxy could not parse silently cost the ledger a
+    /// turn. Asserting the log rather than the return value is deliberate, because
+    /// the return value is identical in both cases and that is exactly the point.
+    #[test]
+    fn a_malformed_non_streamed_body_is_logged_and_a_usage_less_one_is_not() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        struct Msg(Option<String>);
+        impl Visit for Msg {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut m = Msg(None);
+                event.record(&mut m);
+                if let Some(msg) = m.0 {
+                    // The LEVEL is captured too. Asserting on the message text alone
+                    // let a mutant survive: downgrading this very warning to `trace!`
+                    // kept the word and the test stayed green (measured 2026-09-12,
+                    // before this line existed).
+                    self.0
+                        .lock()
+                        .expect("capture lock")
+                        .push((*event.metadata().level(), msg));
+                }
+            }
+        }
+
+        use tracing_subscriber::layer::SubscriberExt;
+        let cap = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let parsed_bad = tracing::subscriber::with_default(subscriber, || {
+            usage_from_json(b"this is not json at all")
+        });
+        assert_eq!(
+            parsed_bad,
+            ParsedUsage::default(),
+            "a malformed body still yields no usage — the return value is unchanged"
+        );
+        let lines = cap.0.lock().expect("capture lock").clone();
+        let undercounts: Vec<_> = lines
+            .iter()
+            .filter(|(level, msg)| *level == tracing::Level::WARN && msg.contains("undercount"))
+            .collect();
+        assert_eq!(
+            undercounts.len(),
+            1,
+            "exactly one WARN should name the undercount, got {lines:?}"
+        );
+
+        let cap2 = Capture::default();
+        let subscriber2 = tracing_subscriber::registry().with(cap2.clone());
+        let parsed_no_usage = tracing::subscriber::with_default(subscriber2, || {
+            usage_from_json(br#"{"id":"msg_1","type":"message"}"#)
+        });
+        assert_eq!(
+            parsed_no_usage,
+            ParsedUsage::default(),
+            "a body without a usage key also yields no usage"
+        );
+        assert!(
+            cap2.0.lock().expect("capture lock").is_empty(),
+            "an ordinary body with no usage key must not warn: {:?}",
+            cap2.0.lock().expect("capture lock")
+        );
+    }
+
     #[test]
     fn evidence_loss_predicate_distinguishes_full_from_closed() {
         use tokio::sync::mpsc::error::TrySendError;
