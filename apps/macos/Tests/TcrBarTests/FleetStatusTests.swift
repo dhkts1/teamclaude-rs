@@ -278,9 +278,26 @@ final class FleetStatusTests: XCTestCase {
             "overloaded_error"
         )
         XCTAssertFalse(
-            QuotaFormat.streamErrorLabel(count: finn.streamErrorCount, error: "overloaded_error")
+            QuotaFormat.streamErrorLabel(count: finn.streamErrorCount, error: "overloaded_error")!
                 .hasPrefix("n/a"),
             "a nil stream-error count must never render as the broken-English \"n/a×\""
+        )
+    }
+
+    /// `streamErrorCount: 0` is a MEASURED zero — the error has not
+    /// recurred — and `alice` (`liveFixture`) carries exactly that shape:
+    /// `streamErrorCount: 0` beside a `lastStreamError` of `nil`. The panel's
+    /// only gate against rendering the line at all is `lastStreamError`
+    /// being non-nil, so this test pins the label itself: a caller that
+    /// somehow reaches this function with a real error string and a
+    /// measured zero count must get `nil` back, never `"0× …"`, which read
+    /// as the opposite of what a zero count means.
+    func testZeroStreamErrorCountRendersNoLine() throws {
+        let alice = try fleet(liveFixture).accounts[0]
+        XCTAssertEqual(alice.streamErrorCount, 0)
+        XCTAssertNil(
+            QuotaFormat.streamErrorLabel(count: 0, error: "overloaded_error"),
+            "a measured zero stream-error count must render no line at all"
         )
     }
 }

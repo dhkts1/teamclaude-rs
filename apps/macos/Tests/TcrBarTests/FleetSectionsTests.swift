@@ -380,6 +380,83 @@ final class FleetSectionsTests: XCTestCase {
                 "two sections in one band — both headings separate something")
         }
     }
+
+    // MARK: - Group legend (data/plans/panel-groups-bridge.md)
+
+    /// A wholly-parked named group's legend carries both the group name and
+    /// " · PARKED" — the one place that word survives once the per-row pill
+    /// is dropped inside it.
+    func testLegendTextForWhollyParkedGroupCarriesParkedAndCount() {
+        let fleet = Fleet(accounts: [
+            sectionAccount(
+                "p1@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"]),
+            sectionAccount(
+                "p2@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"]),
+        ])
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertTrue(section.isWhollyParked)
+        XCTAssertEqual(section.legendText, "HENRY-TOKEN · PARKED · 2")
+    }
+
+    /// A live (mixed, not wholly parked) named group's legend carries the
+    /// name and the count, but never the word "PARKED" — that word is a
+    /// claim about the group's own state, not decoration every legend wears.
+    func testLegendTextForLiveGroupOmitsParked() {
+        let fleet = Fleet(accounts: [
+            sectionAccount("a@example.com", groups: ["dev"]),
+            sectionAccount("b@example.com", groups: ["dev"]),
+        ])
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertFalse(section.isWhollyParked)
+        XCTAssertEqual(section.legendText, "DEV · 2")
+    }
+
+    /// A group split across bands (some rows parked, some not) is wholly
+    /// parked only in the section that actually landed in the parked band —
+    /// the live half of the same group must not borrow the word.
+    func testLegendTextForSplitGroupDiffersPerBand() {
+        let fleet = Fleet(accounts: [
+            sectionAccount("live@example.com", groups: ["dev"]),
+            sectionAccount("off@example.com", groups: ["dev"], disabled: true),
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+        let live = try! XCTUnwrap(sections.first { $0.band == .live })
+        let parked = try! XCTUnwrap(sections.first { $0.band == .parked })
+
+        XCTAssertEqual(live.legendText, "DEV · 1")
+        XCTAssertEqual(parked.legendText, "DEV · PARKED · 1")
+    }
+
+    // MARK: - Sole group in band (data/plans/panel-groups-bridge.md, item 2)
+
+    /// A band holding exactly one group section — named or ungrouped — draws
+    /// no band heading: the group's own heading (or legend) already says
+    /// everything the band heading over it would have said.
+    func testSoleGroupInBandIsTrueForALoneNamedSection() {
+        let fleet = Fleet(accounts: [
+            sectionAccount(
+                "p1@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"])
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+        XCTAssertEqual(sections.count, 1)
+        XCTAssertTrue(sections.soleGroupInBand(at: 0))
+    }
+
+    /// Two groups sharing one band are each NOT sole — the band heading still
+    /// draws to separate them.
+    func testSoleGroupInBandIsFalseWhenTwoGroupsShareABand() {
+        let fleet = Fleet(accounts: [
+            sectionAccount("a@example.com", groups: ["dev"]),
+            sectionAccount("b@example.com", groups: ["ops"]),
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+        XCTAssertEqual(sections.count, 2)
+        for index in sections.indices {
+            XCTAssertFalse(sections.soleGroupInBand(at: index))
+        }
+    }
 }
 
 /// A row with everything but the group/state fields fixed — the same shape

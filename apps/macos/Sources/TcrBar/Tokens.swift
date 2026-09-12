@@ -349,16 +349,22 @@ public enum Tok {
     /// group's heading and rows (`docs/plans/group-outline-bridge.md`).
     /// Heavier than the card's own ``hairlineWidth`` (0.5) on purpose — a
     /// structural grouping cue drawn at arm's length needs to read at a
-    /// glance, where a hairline disappears — and it is drawn OUTSIDE the
-    /// section's own layout box (`FleetView.groupOutline(for:)`, via
-    /// negative padding) rather than by adding real padding around the
-    /// content, so it never changes any ``rowHeights``-measured row or
-    /// heading height. See that function's own doc-comment for why that
-    /// distinction matters here.
+    /// glance, where a hairline disappears. Drawn at the section's OWN
+    /// bounds (`FleetView.groupOutline(for:)`) with the section's CONTENT
+    /// inset inward by `groupOutlineInset` on all four sides
+    /// (`FleetView.sectionBody`) — an earlier version bled the stroke
+    /// outward via negative padding instead, which only had room to survive
+    /// vertically (inside the gap `rowSpacing` leaves between sections) and
+    /// was clipped on the left and right, where the account list has no
+    /// such gap. See `groupOutline(for:)`'s own doc-comment for the full
+    /// account.
     public static let groupOutlineWidth: CGFloat = 1.0
-    /// How far outside its section's own bounds the outline sits. Kept
-    /// under `rowSpacing` (8) so two adjacent sections' outlines never
-    /// touch in the gap between them.
+    /// How far the section's content is inset from the stroke on every side.
+    /// Kept under `rowSpacing` (8) for the same reason it always was — this
+    /// used to bound how far the OLD outward bleed could travel before
+    /// touching a neighbour; now it bounds how much the section visibly
+    /// shrinks inside its own border, which reads better at a value smaller
+    /// than the gap between two sections.
     public static let groupOutlineInset: CGFloat = 6
     /// Bigger than `radiusMedium` (the cards' own radius) by roughly
     /// `groupOutlineInset` — the same outer-equals-inner-plus-padding rule
@@ -366,6 +372,13 @@ public enum Tok {
     /// level up so the outline reads as a looser box AROUND same-radius
     /// cards rather than a same-size sibling beside them.
     public static let groupOutlineRadius: CGFloat = radiusMedium + groupOutlineInset
+    /// The legend's own height, in points — `detailFontSize` (10) plus its
+    /// line-spacing plus the `space1` vertical breathing room the pill-style
+    /// background around the text effectively adds. `FleetView.sectionBody`
+    /// offsets the legend upward by half of this so it sits centred ON the
+    /// stroke's top edge, the same way `HENRY-TOKEN · PARKED · 5` sits on
+    /// the mockup's border rather than above or below it.
+    public static let groupLegendHeight: CGFloat = detailFontSize + detailLineSpacing + space1
 
     // MARK: - Motion
     //

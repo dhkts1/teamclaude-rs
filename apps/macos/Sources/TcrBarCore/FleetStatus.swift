@@ -483,7 +483,8 @@ public enum QuotaFormat {
     }
 
     /// `(3, "overloaded_error")` → `"3× overloaded_error"`;
-    /// `(nil, "overloaded_error")` → `"overloaded_error"`.
+    /// `(nil, "overloaded_error")` → `"overloaded_error"`;
+    /// `(0, "overloaded_error")` → `nil` — nothing to render.
     ///
     /// Deliberately NOT ``count(_:)`` plus a literal `"×"`: a stream-error
     /// count is a MODIFIER on the error string already being displayed, not
@@ -496,8 +497,16 @@ public enum QuotaFormat {
     /// view, for the same reason every formatter in this enum does: so the
     /// rendered string is a property of the model a test can assert on
     /// directly.
-    public static func streamErrorLabel(count: Int?, error: String) -> String {
+    ///
+    /// `Int?` return, not `String`: a MEASURED zero is not a modifier on
+    /// anything, it is proof the error has not recurred, and a `"0×
+    /// overloaded_error"` line told an operator the opposite of the truth —
+    /// the string reads as "this just happened", not "this stopped
+    /// happening". The caller drops the whole line on `nil`, exactly the way
+    /// it already drops the line when `lastStreamError` itself is absent.
+    public static func streamErrorLabel(count: Int?, error: String) -> String? {
         guard let count else { return error }
+        guard count > 0 else { return nil }
         return "\(count)× \(error)"
     }
 

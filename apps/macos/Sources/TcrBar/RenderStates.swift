@@ -101,6 +101,10 @@ enum RenderStates {
             ("14-usage-stats", .loaded(fleet(usageStatsJSON)), false, nil),
             // A parked group beside a live one — see `parkedGroupJSON`.
             ("15-parked-group", .loaded(fleet(parkedGroupJSON)), false, nil),
+            // The SAME fleet, expanded — see `render(_:appearance:into:)`'s
+            // own seeding of `FleetView.expandedParkedGroupsKey` for
+            // `henry-team`, the wholly-parked group `parkedGroupJSON` builds.
+            ("15b-parked-group-expanded", .loaded(fleet(parkedGroupJSON)), false, nil),
         ]
     }
 
@@ -165,6 +169,23 @@ enum RenderStates {
         // `.harness()` is inert on both halves.
         let awake = AwakeController.harness()
         awake.setOn(scene.awake)
+
+        // `expandedParkedGroups` reads `UserDefaults.standard` at construction
+        // — real for the shipping app, but this harness only ever runs under
+        // `TCRBAR_DEV_BUILD=1`'s OWN bundle id (`build-tcrbar.sh`'s own
+        // comment: "gives a non-shipping build its own identity"), a
+        // `UserDefaults` domain the shipping app never reads or writes.
+        // Seeded here, for exactly one scene, rather than threading a new
+        // constructor parameter through `FleetView` for a harness-only need:
+        // every OTHER scene explicitly clears the key first, so construction
+        // order across scenes cannot leak one render's expansion into the
+        // next.
+        if scene.name == "15b-parked-group-expanded" {
+            UserDefaults.standard.set(
+                ["g:henry-team"], forKey: FleetView.expandedParkedGroupsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: FleetView.expandedParkedGroupsKey)
+        }
 
         let view =
             FleetView(

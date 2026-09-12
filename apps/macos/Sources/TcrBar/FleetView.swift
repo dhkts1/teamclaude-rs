@@ -417,7 +417,7 @@ struct FleetView: View {
             // one section's rows into the other's slot.
             ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
                 if sections.isFirstOfBand(index) {
-                    bandHeading(section.band)
+                    bandHeading(section.band, soleGroupInBand: sections.soleGroupInBand(at: index))
                 }
                 sectionBody(
                     section, drawsHeading: sections.drawsGroupHeading(at: index), fleet: fleet)
@@ -443,34 +443,93 @@ struct FleetView: View {
     private func sectionBody(_ section: FleetSection, drawsHeading: Bool, fleet: Fleet)
         -> some View
     {
-        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            if drawsHeading {
+        // "maybe smoush the group" (Gil, 2026-09-12): a wholly-parked NAMED
+        // group renders one line per account — no quota bars, no cost line —
+        // until its own legend is clicked. Remembered per group name across
+        // launches (`expandedParkedGroups`), never for a live group: there is
+        // nothing here worth hiding from an operator who can act on it right
+        // now.
+        let collapsed = section.isWhollyParked && !expandedParkedGroups.contains(section.group.token)
+        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            // The plain-text heading is for a section with no stroke to carry
+            // a legend on — the unlabelled pile, or a named group whose
+            // colour never resolved. An outlined section draws its name as
+            // the legend in the `.overlay` below instead of here, never both.
+            if drawsHeading && section.outlineColor == nil {
                 groupHeading(section)
             }
-            ForEach(section.rows) { row in
-                accountRow(row, fleet: fleet)
+            if collapsed {
+                ForEach(section.rows) { row in
+                    smooshedAccountRow(row)
+                }
+            } else {
+                ForEach(section.rows) { row in
+                    accountRow(row, fleet: fleet)
+                }
             }
         }
+        // Real padding now, not the old negative one — see `groupOutline`'s
+        // own doc-comment for why. Zero for a section with nothing to
+        // outline, so an unoutlined section's layout is byte-for-byte what
+        // it was before this round.
+        .padding(section.outlineColor == nil ? 0 : Tok.groupOutlineInset)
         .background(groupOutline(for: section))
+        .overlay(alignment: .topLeading) {
+            if section.outlineColor != nil {
+                groupHeading(section)
+                    .padding(.leading, Tok.space3)
+                    .offset(y: -Tok.groupLegendHeight / 2)
+            }
+        }
     }
 
-    /// The section's outline, drawn OUTSIDE its content's own bounds via
-    /// negative padding rather than by padding the content inward.
-    ///
-    /// A `.background` is sized to match the view it is attached to — the
-    /// `VStack` above never grows to accommodate it — so expanding the
-    /// stroked shape past that size with `.padding(-Tok.groupOutlineInset)`
-    /// draws it bleeding outward into the surrounding `rowSpacing` gap
-    /// without asking the `VStack` for one extra point of height. That
-    /// matters here specifically: every row and heading in this list
-    /// publishes its own measured height (`FleetView/rowHeights`,
-    /// `measured(_:content:)`) and `PanelHeight.visibleRowsHeight` sums
-    /// those keyed heights independently of whatever SwiftUI actually lays
-    /// out — a real padding here would grow the rendered list without
-    /// growing any of those published numbers, and the panel would size
-    /// itself short of its own content. Growing the background instead
-    /// changes nothing SwiftUI's layout pass measures.
-    ///
+    /// One line per account inside a collapsed, wholly-parked group: the
+    /// name, its plan in dim text, and the SAME quota-state pill
+    /// `AccountRow.information` draws — never its rotation pill, since every
+    /// row here is parked by construction and the group's own legend already
+    /// says so once for all of them. No quota bars and no cost line, on
+    /// purpose: those are the two things this state exists to hide until the
+    /// legend is clicked.
+    private func smooshedAccountRow(_ row: FleetSectionRow) -> some View {
+        let account = row.account
+        return HStack(spacing: Tok.tightSpacing) {
+            Text(account.name)
+                .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
+                .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
+                .lineLimit(1)
+                .help(account.name)
+            if let plan = account.plan, !plan.isEmpty {
+                Text(plan)
+                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
+                    .foregroundStyle(Tok.inkFaint)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: Tok.tightSpacing)
+            smooshedStatePill(account)
+        }
+        .padding(.vertical, Tok.space1)
+    }
+
+    /// The quota-state pill for a smooshed row — the same five cases
+    /// `AccountRow.information` draws its own quota pill from, mirrored here
+    /// rather than shared because that property also reads `AccountRow`'s
+    /// private `quotaTint` (which demotes a stale reading this collapsed
+    /// view never shows a bar for in the first place).
+    @ViewBuilder
+    private func smooshedStatePill(_ account: Account) -> some View {
+        if account.health == .needsRelogin {
+            StatusPill("needs re-login", tint: Tok.spent)
+        } else if account.isRejected {
+            StatusPill("rejected", tint: Tok.spent)
+        } else if account.hasQuotaEvidence {
+            StatusPill(account.quotaState.token, tint: Tok.color(for: account.quotaState))
+        } else if account.probeStatus.isFailure {
+            StatusPill(account.probeStatus.token, tint: Tok.unmeasured)
+        } else {
+            StatusPill("unmeasured", tint: Tok.unmeasured)
+        }
+    }
+
     /// Draws NOTHING when ``FleetSection/outlineColor`` is `nil` — an
     /// earlier version of this drew a neutral ``Tok/hairlineStrong`` box for
     /// a named group with no resolved colour, mirroring ``GroupChip``'s own
@@ -490,6 +549,22 @@ struct FleetView: View {
     /// text: the outline's colour is redundant decoration here, not
     /// information the reader has no other way to get, so it does not need
     /// to clear a text-legibility bar to be worth drawing.
+    /// **Draws at the section's OWN bounds now, not past them.** The
+    /// negative-padding version of this function bled the stroke outward
+    /// into the surrounding `rowSpacing` gap so no real padding was ever
+    /// added — cheap for `PanelHeight`, since nothing it measures grew, but
+    /// the outward bleed only had room to survive vertically, where the gap
+    /// between sections gave it somewhere to go. Horizontally there is no
+    /// such gap: the account list sits in a fixed-width column, so the same
+    /// bleed ran straight into that column's edge and was clipped —
+    /// Gil, 2026-09-12: "the group doesnt do outline around all the group
+    /// its just on top and under". `sectionBody` now insets its CONTENT by
+    /// `Tok.groupOutlineInset` on all four sides instead, so this stroke —
+    /// drawn unpadded, as a plain background — sits fully inside the padded
+    /// box and is never asked to bleed past anything. The outer-equals-
+    /// inner-plus-inset relationship `Tok.groupOutlineRadius`'s own doc
+    /// comment describes still holds; only which side carries the inset
+    /// changed.
     @ViewBuilder
     private func groupOutline(for section: FleetSection) -> some View {
         if let rgb = section.outlineColor {
@@ -498,7 +573,6 @@ struct FleetView: View {
                     Color(red: rgb.red, green: rgb.green, blue: rgb.blue),
                     lineWidth: Tok.groupOutlineWidth
                 )
-                .padding(-Tok.groupOutlineInset)
         }
     }
 
@@ -506,24 +580,124 @@ struct FleetView: View {
     /// ``FleetBand/title`` supplies the words — "Live", "Out of tokens",
     /// "Parked" — so the panel and any future caller cannot name a band two
     /// different ways.
-    private func bandHeading(_ band: FleetBand) -> some View {
-        measured(bandHeightKey(band)) {
-            Text(band.title.uppercased())
-                .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
-                .tracking(Tok.pillTracking)
-                .foregroundStyle(Tok.inkDim)
+    ///
+    /// Drawn NOTHING when `soleGroupInBand` — see
+    /// ``Array/soleGroupInBand(at:)``'s own doc-comment for why a band
+    /// holding exactly one group section does not also get a band heading
+    /// over it. Skipped rather than drawn-and-hidden, the same discipline
+    /// ``groupHeading(_:)`` already follows: an unkeyed, undrawn heading
+    /// charges the viewport nothing, and a keyed-but-undrawn one would
+    /// charge for a row that is not there.
+    @ViewBuilder
+    private func bandHeading(_ band: FleetBand, soleGroupInBand: Bool) -> some View {
+        if !soleGroupInBand {
+            measured(bandHeightKey(band)) {
+                Text(band.title.uppercased())
+                    .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
+                    .tracking(Tok.pillTracking)
+                    .foregroundStyle(Tok.inkDim)
+            }
         }
     }
 
-    /// The inner heading: one group, or the unlabelled pile. Set apart from the
-    /// band heading by case and weight rather than by an indent, so a row and
-    /// its heading keep the same left edge and the eye reads one column.
+    /// The inner heading: one group, or the unlabelled pile. Two shapes now:
+    ///
+    /// - Plain text, set apart from the band heading by case and weight
+    ///   rather than by an indent (so a row and its heading keep the same
+    ///   left edge), for a section with no outline to carry a legend on —
+    ///   unchanged from before this round.
+    /// - A LEGEND when ``FleetSection/outlineColor`` resolves one: the
+    ///   group's name sitting ON its own stroke, in its own colour, small
+    ///   caps with tracking — "why parked ontop of it and henry token group
+    ///   name so on the side not some header" (Gil, 2026-09-12). This is
+    ///   what replaces the old stacked band-heading-over-group-heading pair;
+    ///   `sectionBody` draws it in an `.overlay`, never alongside the plain
+    ///   text form. Reads " · PARKED" for a wholly-parked group — the one
+    ///   place that word still survives once the per-row pill is dropped
+    ///   (see `AccountRow.suppressParkedPill`) — and always " · N" for the
+    ///   row count.
+    ///
+    ///   A wholly-parked group's legend is a real `Button`, not decorative
+    ///   text with a tap gesture bolted on — `docs/design/panel-tabs-
+    ///   review.md` finding 9 caught exactly that shape ("2 more · click to
+    ///   expand", styled identically to the static text beside it) on the
+    ///   sibling tabs mockup, and a `Text.onTapGesture` here would be the
+    ///   same defect: no keyboard path, no announced role beyond whatever
+    ///   `.accessibilityAddTraits` bolts on by hand. A live group's legend
+    ///   stays plain `Text` — it has nothing to activate, and a control that
+    ///   does nothing on activation is worse than no control (same review,
+    ///   finding 1's whole premise).
+    @ViewBuilder
     private func groupHeading(_ section: FleetSection) -> some View {
-        measured(groupHeightKey(section)) {
-            Text(section.title)
-                .font(Tok.secondaryFont.weight(.semibold)).lineSpacing(Tok.secondaryLineSpacing)
-                .foregroundStyle(.primary)
+        if let rgb = section.outlineColor {
+            let color = Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+            let legend = Text(section.legendText)
+                .font(Tok.detailFont.weight(.bold)).lineSpacing(Tok.detailLineSpacing)
+                .tracking(Tok.pillTracking)
+                .foregroundStyle(color)
+                .padding(.horizontal, Tok.space1)
+                .padding(.vertical, Tok.space1)
+                // Matches the panel body behind it, so the stroke line reads
+                // as broken by the legend rather than running behind it.
+                //
+                // `Tok.panel` is a flat, fully opaque `Color` — this panel is
+                // NOT a real translucent material (no `NSVisualEffectView`
+                // anywhere in this target; `FleetView`'s own root is
+                // `.background(Tok.panel)`, a plain fill). The tabs-mockup
+                // review's finding 11 (an opaque legend patch reads as a
+                // black bar over a backdrop-filter panel) is a defect in that
+                // CSS approximation and does not reproduce here — checked
+                // against both appearances in `--render-states`, scene
+                // `15-parked-group`: the legend's background is pixel-
+                // identical to the panel around it in both. Revisit this
+                // comment the day this panel ever gains real vibrancy.
+                .background(Tok.panel)
+            if section.isWhollyParked {
+                Button {
+                    toggleParkedGroupExpansion(section.group.token)
+                } label: {
+                    legend
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint(
+                    expandedParkedGroups.contains(section.group.token)
+                        ? "Collapses this parked group."
+                        : "Expands this parked group."
+                )
+            } else {
+                legend
+            }
+        } else {
+            measured(groupHeightKey(section)) {
+                Text(section.title)
+                    .font(Tok.secondaryFont.weight(.semibold)).lineSpacing(Tok.secondaryLineSpacing)
+                    .foregroundStyle(.primary)
+            }
         }
+    }
+
+    /// Persisted across launches under ``expandedParkedGroupsKey`` — a
+    /// wholly-parked group an operator has already looked at once should
+    /// stay open, not re-collapse on the next poll or the next time the
+    /// panel opens. Keyed on ``FleetGroupKey/token`` rather than the bare
+    /// name for the same collision reason `FleetSectionRow.id` uses it: a
+    /// group literally named `Ungrouped` cannot borrow the sentinel's key.
+    @State private var expandedParkedGroups: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: FleetView.expandedParkedGroupsKey) ?? [])
+
+    /// Internal, not `private`, so ``RenderStates`` — this file's `--render-
+    /// states` harness, same target — can seed and clear it around one scene
+    /// (`15b-parked-group-expanded`) without a second copy of the literal.
+    static let expandedParkedGroupsKey = "expandedParkedGroupNames"
+
+    private func toggleParkedGroupExpansion(_ groupToken: String) {
+        if expandedParkedGroups.contains(groupToken) {
+            expandedParkedGroups.remove(groupToken)
+        } else {
+            expandedParkedGroups.insert(groupToken)
+        }
+        UserDefaults.standard.set(
+            Array(expandedParkedGroups), forKey: Self.expandedParkedGroupsKey)
     }
 
     /// Height key for a band heading. The `b:` prefix cannot collide with a row
@@ -576,6 +750,13 @@ struct FleetView: View {
             removeController: removeController,
             allAccounts: fleet.accounts,
             enclosingGroupName: enclosingGroupName,
+            // Every row reaching this section is parked BECAUSE this named
+            // group is parked (`FleetSection.isWhollyParked`) — the group's
+            // own legend already says so once, in text that survives without
+            // colour, so restating it on every card under it is the same
+            // fact twice in one glance. `false` (unchanged) for the
+            // ungrouped pile and every live section.
+            suppressParkedPill: row.band == .parked && row.group != .ungrouped,
             snapshotMode: snapshotMode
         )
         .background(
@@ -1218,6 +1399,12 @@ struct AccountRow: View {
     /// ``Account/groupTags`` itself, which still lists every group this
     /// account belongs to.
     var enclosingGroupName: String?
+    /// True when this row sits inside a wholly-parked NAMED group section
+    /// (``FleetSection/isWhollyParked``) — every row there is parked for the
+    /// same reason the group heading now names as a legend, so
+    /// ``rotationPill`` drops the per-row "parked" pill it would otherwise
+    /// draw. Defaults to `false`, unchanged for every other call site.
+    var suppressParkedPill: Bool = false
     /// Mirrors ``FleetView/snapshotMode``. `ImageRenderer` cannot draw a
     /// `Menu` — it rasterises the yellow "unsupported control" placeholder
     /// the README hero used to ship — so a snapshot draws
@@ -1609,7 +1796,9 @@ struct AccountRow: View {
     /// height even on the two branches that go empty.
     @ViewBuilder
     private var rotationPill: some View {
-        if account.disabled {
+        if suppressParkedPill && (account.disabled || account.isParkedByGroup) {
+            EmptyView()
+        } else if account.disabled {
             StatusPill("parked", tint: Tok.disabled)
                 .help("Out of the rotation — `tcr` sends this account no traffic.")
                 .transition(.opacity)
@@ -2531,17 +2720,21 @@ struct AccountRow: View {
             // the slot. Absent — no tooltip at all — on a structurally zero
             // offline read, the same rule the printed line followed.
             .help(account.countersTooltip(countersAreStructural: countersAreStructural) ?? "")
-            if let error = account.lastStreamError, !error.isEmpty {
-                // A nil count here is not a quantity with an unknown value —
-                // unlike `account.requests` above, this number is a MODIFIER
-                // on the error string that is already being displayed, and
-                // the error alone is the actionable fact regardless of how
-                // many times it happened. See
-                // `QuotaFormat.streamErrorLabel(count:error:)`'s doc comment
-                // for why this suppresses the multiplier on `nil` instead of
-                // following `QuotaFormat.count`'s "n/a" the way the line
-                // above does.
-                Text(QuotaFormat.streamErrorLabel(count: account.streamErrorCount, error: error))
+            // A nil count here is not a quantity with an unknown value —
+            // unlike `account.requests` above, this number is a MODIFIER
+            // on the error string that is already being displayed, and
+            // the error alone is the actionable fact regardless of how
+            // many times it happened. See
+            // `QuotaFormat.streamErrorLabel(count:error:)`'s doc comment
+            // for why this suppresses the multiplier on `nil` instead of
+            // following `QuotaFormat.count`'s "n/a" the way the line
+            // above does, and returns `nil` outright on a MEASURED zero —
+            // a count of 0 means the error has not recurred, and the line
+            // must not render at all.
+            if let error = account.lastStreamError, !error.isEmpty,
+                let label = QuotaFormat.streamErrorLabel(count: account.streamErrorCount, error: error)
+            {
+                Text(label)
                     .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.spent)
                     .lineLimit(2)
