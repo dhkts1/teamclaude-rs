@@ -19,7 +19,9 @@ use clap::{Parser, Subcommand};
 use teamclaude_rs::cli::{self, validate_group_label_chars, PriorityArg};
 use teamclaude_rs::config::{self, Config, ConfigError};
 use teamclaude_rs::proxy::GROUP_HEADER_NAME;
-use teamclaude_rs::{affinity, build_info, demo, mitm, oauth, server, singleton, tui, update};
+use teamclaude_rs::{
+    affinity, build_info, demo, mint, mitm, oauth, server, singleton, tui, update,
+};
 
 #[derive(Parser)]
 #[command(
@@ -45,6 +47,10 @@ enum Command {
     Run(RunArgs),
     /// Authenticate a Claude account via the browser and add it to the config.
     Login(LoginArgs),
+    /// Mint a long-lived (365-day) token for an existing account, or every
+    /// account in a group, and put the result on the clipboard. Nothing is
+    /// stored — export only.
+    Mint(MintArgs),
     /// List the configured accounts (offline; `--probe` refreshes live quota).
     Accounts(AccountsArgs),
     /// Remove an account from the config.
@@ -373,6 +379,21 @@ struct LoginArgs {
 }
 
 #[derive(clap::Args)]
+struct MintArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Mint a long-lived token for one existing account — exact name, not a
+    /// substring (see `resolve_account`). Exactly one of `--account` /
+    /// `--group` is required.
+    #[arg(long, required_unless_present = "group", conflicts_with = "group")]
+    account: Option<String>,
+    /// Mint a long-lived token for every account carrying this group label.
+    #[arg(long)]
+    group: Option<String>,
+}
+
+#[derive(clap::Args)]
 struct RunArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json).
     #[arg(long)]
@@ -429,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Server(args)) => run_server(args).await,
         Some(Command::Run(args)) => run_claude(args),
         Some(Command::Login(args)) => run_login(args).await,
+        Some(Command::Mint(args)) => run_mint(args).await,
         Some(Command::Accounts(args)) => run_accounts(args).await,
         Some(Command::Remove(args)) => run_remove(args).await,
         Some(Command::Token(args)) => run_token(args),
@@ -1166,6 +1188,21 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     .await
     .context("OAuth login failed")?;
     println!("Logged in as '{name}'.");
+    Ok(())
+}
+
+/// `tcr mint --account <name> | --group <name>` — mint a long-lived token for
+/// one account or every account in a group and put the result on the
+/// clipboard. Exits non-zero when any targeted account failed or mismatched,
+/// so a UI driving this (the TcrBar menu item) can surface the failure.
+async fn run_mint(args: MintArgs) -> anyhow::Result<()> {
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    let all_ok = mint::run_mint(&config_path, args.account.as_deref(), args.group.as_deref())
+        .await
+        .context("mint failed")?;
+    if !all_ok {
+        std::process::exit(1);
+    }
     Ok(())
 }
 

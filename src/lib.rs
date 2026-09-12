@@ -23,6 +23,7 @@ pub mod config;
 pub mod demo;
 pub mod identity;
 pub mod manager;
+pub mod mint;
 pub mod mitm;
 pub mod model;
 pub mod oauth;
