@@ -1660,6 +1660,7 @@ mod tests {
             current: Some(0),
             recent: vec![],
             sessions: vec![],
+            wire_sessions: vec![],
         }
     }
 
@@ -2001,6 +2002,7 @@ mod tests {
             current: None,
             recent: vec![],
             sessions: vec![diverted("a1f3", "alice", "bob", 24, Some(100))],
+            wire_sessions: vec![],
         };
         let backend = TestBackend::new(48, 8);
         let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");

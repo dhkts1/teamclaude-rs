@@ -2016,6 +2016,41 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // Parse the request's target model ONCE — it is constant across the rotation
     // loop, and drives per-model (Fable-aware) account selection below.
     let request_model = crate::model::parse_request_model(&body_bytes);
+
+    // F1 (`docs/design/panel-tabs.md`, `data/plans/sessions-wire-bridge.md`): the Claude Code
+    // session id embedded in `metadata.user_id`, plus any `tool_use`/`tool_result` blocks in
+    // the LAST TWO messages — parsed ONCE per request, independent of whether session
+    // affinity is on (unlike `stable_session_key`'s peek below, which only runs when the
+    // `SessionKey` extension is present). `RequestSessionPeek` borrows `messages` as a
+    // `RawValue` rather than materializing the whole conversation — see `session_wire.rs`'s
+    // module doc. A body that fails to parse here yields "no session, no tool events" rather
+    // than rejecting the request: this is an observability peek, never a validation gate.
+    let (wire_session_id, wire_tool_uses, wire_tool_results) = {
+        #[derive(serde::Deserialize)]
+        struct RequestSessionPeek<'a> {
+            metadata: Option<RequestSessionMeta>,
+            #[serde(borrow)]
+            messages: Option<&'a serde_json::value::RawValue>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RequestSessionMeta {
+            user_id: Option<String>,
+        }
+        match serde_json::from_slice::<RequestSessionPeek>(&body_bytes) {
+            Ok(peek) => {
+                let session_id = peek
+                    .metadata
+                    .and_then(|m| m.user_id)
+                    .and_then(|blob| crate::session_wire::extract_session_id(&blob));
+                let (uses, results) = peek
+                    .messages
+                    .map(crate::session_wire::extract_tool_events)
+                    .unwrap_or_default();
+                (session_id, uses, results)
+            }
+            Err(_) => (None, Vec::new(), Vec::new()),
+        }
+    };
     // Whether THIS request targets a Fable model — the same classification
     // selection uses (`select.rs`). Threaded into every fleet-exhausted 429 so the
     // `retry-after` hint reflects the Fable-scoped weekly gate for a Fable request
@@ -2885,6 +2920,18 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // request once against the true serving account and log it.
         let served_at = OffsetDateTime::now_utc();
         manager.record_served(idx, served_at, session_key, session_kind);
+        // F1: fold this request's session id, model and tool events into the wire-session
+        // table (`tcr status --json`'s `sessions` array) — a no-op when `wire_session_id` is
+        // `None`. Cloned, not moved: the usage-recording arms below (streamed and
+        // non-streamed) still need `account_name`/`request_model`/`wire_session_id`.
+        manager.record_wire_session(
+            wire_session_id.as_deref(),
+            account_name.clone(),
+            request_model.clone(),
+            served_at,
+            &wire_tool_uses,
+            &wire_tool_results,
+        );
         manager.push_log(RequestLogEntry {
             time: served_at,
             method: method.to_string(),
@@ -2944,6 +2991,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             // task below outlives this iteration. A `String` clone per streamed
             // request, so the ledger can attribute tokens to a model at all.
             let request_model_for_usage = request_model.clone();
+            // Same reasoning, for F1's wire-session token counts: the spawned parser task
+            // outlives this iteration, so it needs its own clone of the session id.
+            let wire_session_id_for_usage = wire_session_id.clone();
             // The ANSWER, not the cell and not the body. Resolving it here costs
             // one structural deserialize per streamed request — the same one the
             // pin's TTL above already pays whenever session affinity is on,
@@ -2989,6 +3039,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         "request usage"
                     );
                     manager_side.record_usage(idx, record);
+                    manager_side.record_wire_session_usage(
+                        wire_session_id_for_usage.as_deref(),
+                        parsed.input_total,
+                        parsed.output,
+                        parsed.cache_read,
+                    );
                 }
                 // Sibling of the usage guard above, not nested in it: an error
                 // event with NO message_start leaves input_total == output == 0,
@@ -3187,6 +3243,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     "request usage"
                 );
                 manager.record_usage(idx, record);
+                manager.record_wire_session_usage(
+                    wire_session_id.as_deref(),
+                    parsed.input_total,
+                    parsed.output,
+                    parsed.cache_read,
+                );
             }
         } else {
             // The "upstream response" line above (:2587) has never carried a
