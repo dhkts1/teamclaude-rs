@@ -220,6 +220,42 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// True when any row here is the control account — so a view can decorate
     /// the heading without walking `rows` itself.
     public var containsControl: Bool { rows.contains(where: \.isControl) }
+
+    /// Whether the view should draw a group outline around this section at
+    /// all — every named group, never ``FleetGroupKey/ungrouped``
+    /// (`docs/plans/group-outline-bridge.md`, decision #1: the absence of an
+    /// outline on an ungrouped section IS the signal, so nothing here
+    /// invents a neutral one for it). A named group still answers `true`
+    /// even when ``outlineColor`` is `nil` — that is a real group with an
+    /// unresolved colour, not the absence of a group, and the view falls
+    /// back to a neutral stroke the same way ``GroupTag/background``'s own
+    /// fallback keeps drawing a (colourless) chip rather than no chip.
+    public var isOutlined: Bool {
+        if case .named = group { return true }
+        return false
+    }
+
+    /// The server-resolved colour to stroke this section's outline in, or
+    /// `nil` when no row in it carries a colour for this group (an older
+    /// server, or the field genuinely absent). Never invented client-side —
+    /// the same rule ``Account/groupTags`` already follows for the per-row
+    /// chip — so a `nil` here means the view must fall back to a neutral
+    /// stroke, not guess a hue.
+    ///
+    /// Reads from the first row that has an answer rather than requiring
+    /// every row to agree: `groupColors` is fleet-wide (every row of every
+    /// account carries the same map, per its own doc-comment), so in
+    /// practice they always agree, and this only guards against a
+    /// pathological wire payload where they do not.
+    public var outlineColor: GroupTagColor.RGB? {
+        guard case .named(let name) = group else { return nil }
+        for row in rows {
+            if let hex = row.account.groupColors?[name], let rgb = GroupTagColor.parse(hex) {
+                return rgb
+            }
+        }
+        return nil
+    }
 }
 
 extension Array where Element == FleetSection {

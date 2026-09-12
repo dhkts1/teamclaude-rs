@@ -419,22 +419,79 @@ struct FleetView: View {
                 if sections.isFirstOfBand(index) {
                     bandHeading(section.band)
                 }
-                // Gated, and `listChildKeys` below gates on the SAME call. The
-                // two must agree exactly: a heading drawn but unkeyed is a row
-                // the viewport never charges for, and a heading keyed but not
-                // drawn charges for a row that is not there. Both clip.
-                if sections.drawsGroupHeading(at: index) {
-                    groupHeading(section)
-                }
-                // `FleetSectionRow` is `Identifiable` on the composite
-                // (group, account) id, which is why this can be a plain
-                // `ForEach` over the rows: the duplicated account's two rows
-                // carry different identities.
-                ForEach(section.rows) { row in
-                    accountRow(row, fleet: fleet)
-                }
+                sectionBody(
+                    section, drawsHeading: sections.drawsGroupHeading(at: index), fleet: fleet)
             }
         }
+    }
+
+    /// One section's heading and rows, outlined in the group's colour when
+    /// ``FleetSection/isOutlined`` says to (never for `.ungrouped` — its
+    /// bare absence of a box is the signal, per the bridge's decision #1).
+    ///
+    /// `drawsHeading` is threaded through rather than recomputed, and
+    /// `listChildKeys` below gates on the SAME call `accountList` made: a
+    /// heading drawn but unkeyed is a row the viewport never charges for,
+    /// and a heading keyed but not drawn charges for a row that is not
+    /// there. Both clip.
+    ///
+    /// `FleetSectionRow` is `Identifiable` on the composite (group, account)
+    /// id, which is why the inner `ForEach` can iterate `section.rows`
+    /// directly: the duplicated account's two rows carry different
+    /// identities.
+    private func sectionBody(_ section: FleetSection, drawsHeading: Bool, fleet: Fleet)
+        -> some View
+    {
+        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            if drawsHeading {
+                groupHeading(section)
+            }
+            ForEach(section.rows) { row in
+                accountRow(row, fleet: fleet)
+            }
+        }
+        .background(groupOutline(for: section))
+    }
+
+    /// The section's outline, drawn OUTSIDE its content's own bounds via
+    /// negative padding rather than by padding the content inward.
+    ///
+    /// A `.background` is sized to match the view it is attached to — the
+    /// `VStack` above never grows to accommodate it — so expanding the
+    /// stroked shape past that size with `.padding(-Tok.groupOutlineInset)`
+    /// draws it bleeding outward into the surrounding `rowSpacing` gap
+    /// without asking the `VStack` for one extra point of height. That
+    /// matters here specifically: every row and heading in this list
+    /// publishes its own measured height (`FleetView/rowHeights`,
+    /// `measured(_:content:)`) and `PanelHeight.visibleRowsHeight` sums
+    /// those keyed heights independently of whatever SwiftUI actually lays
+    /// out — a real padding here would grow the rendered list without
+    /// growing any of those published numbers, and the panel would size
+    /// itself short of its own content. Growing the background instead
+    /// changes nothing SwiftUI's layout pass measures.
+    ///
+    /// A named group with no resolved colour (``FleetSection/outlineColor``
+    /// `nil`) still draws — in ``Tok/hairlineStrong``, the same neutral the
+    /// account card's own border already uses — because it IS a real group,
+    /// just one this build cannot colour; only ``FleetGroupKey/ungrouped``
+    /// draws nothing at all.
+    @ViewBuilder
+    private func groupOutline(for section: FleetSection) -> some View {
+        if section.isOutlined {
+            RoundedRectangle(cornerRadius: Tok.groupOutlineRadius)
+                .strokeBorder(outlineTint(for: section), lineWidth: Tok.groupOutlineWidth)
+                .padding(-Tok.groupOutlineInset)
+        }
+    }
+
+    /// The colour to stroke a section's outline in: the server-resolved
+    /// group colour at full strength when one exists, else the same neutral
+    /// ``Tok/hairlineStrong`` the account card's own border already draws —
+    /// never a dimmed or invented hue (see ``FleetSection/outlineColor``'s
+    /// doc-comment for why).
+    private func outlineTint(for section: FleetSection) -> Color {
+        guard let rgb = section.outlineColor else { return Tok.hairlineStrong }
+        return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
     }
 
     /// The outer heading: what these accounts can do for you right now.

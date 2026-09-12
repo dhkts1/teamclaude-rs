@@ -37,6 +37,8 @@
     --tcr-body-size: 13px;
     --tcr-detail-font-size: 10px;
     --tcr-detail-line-height: 14px;
+    --tcr-group-outline-inset: 6px;
+    --tcr-group-outline-width: 1.0px;
     --tcr-hairline-width: 0.5px;
     --tcr-measurement-grain: 0.5px;
     --tcr-panel-max-height: 520px;

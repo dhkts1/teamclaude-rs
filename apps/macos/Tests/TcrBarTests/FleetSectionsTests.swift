@@ -260,6 +260,45 @@ final class FleetSectionsTests: XCTestCase {
                 .rows.map(\.account.name), ["a@example.com", "z@example.com"])
     }
 
+    // MARK: - Group outline (docs/plans/group-outline-bridge.md)
+
+    /// A named group's section carries its own server-resolved colour, and
+    /// `isOutlined` says the view should draw it. Decision #1: `.ungrouped`
+    /// carries neither — no colour AND no outline at all, not merely an
+    /// unresolved one, which is the distinction the next test locks down.
+    func testNamedGroupSectionCarriesItsColorAndUngroupedCarriesNone() {
+        let fleet = Fleet(accounts: [
+            sectionAccount(
+                "a@example.com", groups: ["dev"], groupColors: ["dev": "#0a84ff"]),
+            sectionAccount("b@example.com", groups: nil),
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+
+        let dev = try? XCTUnwrap(sections.first { $0.group == .named("dev") })
+        XCTAssertTrue(dev?.isOutlined ?? false)
+        let devColor = dev?.outlineColor
+        XCTAssertEqual(devColor?.red ?? -1, 0x0a / 255.0, accuracy: 0.001)
+        XCTAssertEqual(devColor?.green ?? -1, 0x84 / 255.0, accuracy: 0.001)
+        XCTAssertEqual(devColor?.blue ?? -1, 0xff / 255.0, accuracy: 0.001)
+
+        let ungrouped = try? XCTUnwrap(sections.first { $0.group == .ungrouped })
+        XCTAssertFalse(ungrouped?.isOutlined ?? true)
+        XCTAssertNil(ungrouped?.outlineColor)
+    }
+
+    /// A named group with no `groupColors` entry — an older server, or the
+    /// field genuinely absent — still answers `isOutlined == true` (it is a
+    /// real group), but `outlineColor` is `nil` rather than an invented hue.
+    /// The view is the one that falls back to a neutral stroke; this layer
+    /// never guesses a colour.
+    func testNamedGroupWithNoResolvedColorIsStillOutlinedButHasNoColor() {
+        let fleet = Fleet(accounts: [sectionAccount("a@example.com", groups: ["dev"])])
+        let section = try? XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertTrue(section?.isOutlined ?? false)
+        XCTAssertNil(section?.outlineColor)
+    }
+
     // MARK: - What the row and the view need
 
     /// A row's band matches the section it is in — the carried copy cannot
@@ -349,7 +388,8 @@ private func sectionAccount(
     quotaState: QuotaState = .ok,
     quota: Double? = 0,
     status: String = "active",
-    disabled: Bool = false
+    disabled: Bool = false,
+    groupColors: [String: String]? = nil
 ) -> Account {
     Account(
         name: name,
@@ -377,6 +417,6 @@ private func sectionAccount(
         groups: groups,
         reservedGroups: nil,
         parkedGroups: parkedGroups,
-        groupColors: nil
+        groupColors: groupColors
     )
 }
