@@ -611,62 +611,101 @@ struct FleetView: View {
         }
     }
 
+    /// An idle (or unknown-state) session draws ONE line — dot, name,
+    /// subtitle, trailing "idle 40m" — never the second line's request
+    /// count, cache percentage or sparkline. `docs/design/panel-tabs-mockup.html`'s
+    /// `m-075377`/`token-b4` rows are exactly this shape: no metrics line at
+    /// all under an idle session, where a busy or waiting one always has
+    /// one. Splitting on that rather than always drawing both lines and
+    /// hiding parts of the second is what keeps an idle row from claiming a
+    /// sparkline and a cache reading nobody is currently producing.
+    private var isCompactRow: (SessionActivity) -> Bool {
+        { $0 == .idle || $0 == .unknown }
+    }
+
+    @ViewBuilder
     private func sessionRow(_ row: JoinedSession) -> some View {
-        VStack(alignment: .leading, spacing: Tok.space1) {
+        if isCompactRow(row.activity) {
             HStack(spacing: Tok.tightSpacing) {
-                // Busy/waiting get a halo ring — `docs/design/panel-tabs-mockup.html`'s
-                // `.dot.busy`/`.dot.wait` box-shadow — idle stays a bare dot,
-                // the same "the color-alone trigger never fires" the review
-                // already credits this row for (the text beside it always
-                // says the state too).
                 Circle()
                     .fill(activityColor(row.activity))
                     .frame(width: 8, height: 8)
-                    .background(
-                        Circle().fill(activityColor(row.activity).opacity(0.18))
-                            .frame(width: 16, height: 16)
-                            .opacity(row.activity == .idle || row.activity == .unknown ? 0 : 1)
-                    )
                 Text(row.displayName).font(.subheadline.weight(.semibold))
                 Text(sessionSubtitle(row))
                     .font(Tok.secondaryFont)
                     .foregroundStyle(Tok.inkDim)
                     .lineLimit(1)
                 Spacer()
-                if let series = row.session.reqPerMinute, !series.isEmpty {
-                    Sparkline(values: series)
-                        .stroke(Tok.accent, lineWidth: 1.5)
-                        .frame(width: 44, height: 14)
-                }
-            }
-            HStack(spacing: Tok.tightSpacing) {
-                Text("\(row.session.requests) req")
+                Text(trailingStatus(row, now: Date()))
+                    .font(Tok.secondaryDigitFont)
                     .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: row.session.requests)
-                if let cache = cacheHitPercent(row.session) {
-                    Text("· cache \(cache)%").monospacedDigit()
-                }
-                Spacer()
-                // A rolling digit transition here would need this string's
-                // VALUE, not its rendered text, to drive `.animation(value:)`
-                // — it is age-since-oldest-running-tool, recomputed from
-                // `Date()` on every render, so a state-driven transition has
-                // no discrete value to key off. Left as a plain `Text`.
-                Text(trailingStatus(row, now: Date())).monospacedDigit()
+                    .foregroundStyle(Tok.inkDim)
             }
-            .font(Tok.secondaryDigitFont)
-            .foregroundStyle(Tok.inkDim)
+            .padding(.vertical, Tok.space1)
+        } else {
+            VStack(alignment: .leading, spacing: Tok.space1) {
+                HStack(spacing: Tok.tightSpacing) {
+                    // Busy/waiting get a halo ring — `docs/design/panel-tabs-mockup.html`'s
+                    // `.dot.busy`/`.dot.wait` box-shadow — the same "the
+                    // color-alone trigger never fires" the review already
+                    // credits this row for (the text beside it always says
+                    // the state too).
+                    Circle()
+                        .fill(activityColor(row.activity))
+                        .frame(width: 8, height: 8)
+                        .background(
+                            Circle().fill(activityColor(row.activity).opacity(0.18))
+                                .frame(width: 16, height: 16)
+                        )
+                    Text(row.displayName).font(.subheadline.weight(.semibold))
+                    Text(sessionSubtitle(row))
+                        .font(Tok.secondaryFont)
+                        .foregroundStyle(Tok.inkDim)
+                        .lineLimit(1)
+                    Spacer()
+                    if let series = row.session.reqPerMinute, !series.isEmpty {
+                        Sparkline(values: series)
+                            .stroke(Tok.accent, lineWidth: 1.5)
+                            .frame(width: 44, height: 14)
+                    }
+                }
+                HStack(spacing: Tok.tightSpacing) {
+                    Text("\(row.session.requests) req")
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .animation(
+                            reduceMotion ? nil : .easeOut(duration: 0.2),
+                            value: row.session.requests)
+                    if let cache = cacheHitPercent(row.session) {
+                        Text("· cache \(cache)%").monospacedDigit()
+                    }
+                    Spacer()
+                    // A rolling digit transition here would need this string's
+                    // VALUE, not its rendered text, to drive `.animation(value:)`
+                    // — it is age-since-oldest-running-tool, recomputed from
+                    // `Date()` on every render, so a state-driven transition has
+                    // no discrete value to key off. Left as a plain `Text`.
+                    Text(trailingStatus(row, now: Date())).monospacedDigit()
+                }
+                .font(Tok.secondaryDigitFont)
+                .foregroundStyle(Tok.inkDim)
+            }
+            .padding(.vertical, Tok.space1)
         }
-        .padding(.vertical, Tok.space1)
     }
 
     /// "teamclaude-rs · fable-5" — project and model on the session's title
     /// row, `docs/design/panel-tabs-mockup.html`'s `.sub`. Neither, one, or
     /// both may be missing (no session file, no reported model); this joins
-    /// only what's present rather than drawing a bare "·".
+    /// only what's present rather than drawing a bare "·". The model goes
+    /// through ``QuotaFormat/modelLabel(_:)`` — the same `claude-` prefix
+    /// and date-suffix strip the usage-by-model view already applies — so
+    /// this row reads "opus-5", not the wire's "claude-opus-5", matching the
+    /// mockup exactly instead of growing a second, subtly different
+    /// shortener.
     private func sessionSubtitle(_ row: JoinedSession) -> String {
-        [row.project, row.session.model].compactMap { $0 }.joined(separator: " · ")
+        [row.project, row.session.model.map(QuotaFormat.modelLabel)]
+            .compactMap { $0 }.joined(separator: " · ")
     }
 
     /// `cacheReadTokens / (inputTokens + cacheReadTokens)`, the same ratio
@@ -689,7 +728,20 @@ struct FleetView: View {
     private func trailingStatus(_ row: JoinedSession, now: Date) -> String {
         let running = row.session.tools.running
         guard !running.isEmpty, let oldestStartedMs = running.compactMap(\.startedMs).min() else {
-            return row.ageLabel(now: now)
+            // `docs/design/panel-tabs-mockup.html`'s "waiting 12m" / "idle
+            // 40m" — the activity word the dot already carries as colour,
+            // said again in text so the row still reads without it (the
+            // same "the color-alone trigger never fires" property every
+            // other status on this tab already has). `.unknown` prints no
+            // word: it is the join-has-no-file case, not a fourth state
+            // this build has a name for, and inventing one here would claim
+            // a reading nobody made.
+            let age = row.ageLabel(now: now)
+            switch row.activity {
+            case .waiting: return "waiting \(age)"
+            case .idle: return "idle \(age)"
+            case .busy, .unknown: return age
+            }
         }
         let elapsed = max(
             0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(oldestStartedMs) / 1000)))
@@ -834,10 +886,25 @@ struct FleetView: View {
                 .font(.system(size: Tok.detailFontSize, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.tail)
-            Text("\(entry.call.tool) · \(String(entry.sessionId.prefix(8)))")
+            Text("\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
                 .font(Tok.detailFont)
                 .foregroundStyle(Tok.inkDim)
         }
+    }
+
+    /// `docs/design/panel-tabs-mockup.html`'s "Bash · teamclaude-rs-c7" — the
+    /// same ``JoinedSession/displayName`` the Sessions tab already draws for
+    /// this session id, read off ``sessionFiles`` directly: `Fleet.toolsRunning`/
+    /// `toolsSlowest` are pooled at the MODEL layer from the bare wire
+    /// sessions and carry no file join (`SessionToolEntry` is `{sessionId,
+    /// call}` only), so joining here — the one place this tab draws a
+    /// session id — is cheaper than threading `SessionFile` through the
+    /// model just to duplicate a lookup the Sessions tab already owns. Falls
+    /// back to the id's first 8 characters, same as `JoinedSession`'s own
+    /// rule, when no file matches.
+    private func toolCallOwnerName(_ sessionId: String) -> String {
+        if let name = sessionFiles[sessionId]?.name, !name.isEmpty { return name }
+        return String(sessionId.prefix(8))
     }
 
     /// The Bash tool's own timeout — the one denominator this build knows,
@@ -1021,7 +1088,10 @@ struct FleetView: View {
     /// direction.
     private func accountList(_ fleet: Fleet) -> some View {
         let sections = fleet.sectionsInDisplayOrder(pinning: control.current)
-        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+        // v4-spec: gap between cards is 14pt (`Tok.rowSpacing` is 8, shared
+        // with the Sessions/Tools lists this sheet does not name a value
+        // for) — literal here, not a `Tok` edit, per the tokens-lane fence.
+        return VStack(alignment: .leading, spacing: 14) {
             // Identified by `FleetSection.id` (band + group), not by group
             // alone: a group whose accounts differ in state appears in more
             // than one band, and two sections sharing a SwiftUI identity paint
@@ -2375,7 +2445,7 @@ struct AccountRow: View {
     @ViewBuilder
     private var designationsLine: some View {
         if account.ref.displayHalves.orgTag != nil || account.plan != nil
-            || !visibleGroupTags.isEmpty
+            || account.windowUsageLabel != nil || !visibleGroupTags.isEmpty
         {
             HStack(spacing: Tok.tightSpacing) {
                 orgIndicator
@@ -2425,12 +2495,34 @@ struct AccountRow: View {
     @ViewBuilder
     private var planIndicator: some View {
         if let plan = account.plan, !plan.isEmpty {
-            Text(plan)
+            Text(planLineText(plan: plan))
                 .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
                 .help("This account's plan, as Anthropic reports it for its organization.")
+        } else if let usageLabel = account.windowUsageLabel {
+            // No plan on the wire, but there is still a spend figure to show
+            // — draw it alone rather than losing it, the same "an absent
+            // measurement never renders as a fabricated value" rule this
+            // slot already followed when it lived on the quota row.
+            Text(usageLabel)
+                .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
+                .foregroundStyle(usageFigureStyle)
+                .fixedSize()
         }
+    }
+
+    /// "Max 20x · $540 · 1.5M output tokens this week" —
+    /// `docs/design/panel-tabs-mockup.html`'s plan line, F8: spend and
+    /// output tokens moved off the quota grid and onto this line, which
+    /// already carried the plan name. `account.windowUsageLabel` is
+    /// `"$4.20 · 48k out"` (see its own doc-comment for the day-fallback and
+    /// partial-pricing markers it already carries); `nil` when the proxy
+    /// never measured this account, and the plan then draws alone rather
+    /// than growing a placeholder.
+    private func planLineText(plan: String) -> String {
+        guard let usageLabel = account.windowUsageLabel else { return plan }
+        return "\(plan) · \(usageLabel)"
     }
 
     @ViewBuilder
@@ -2654,14 +2746,22 @@ struct AccountRow: View {
             // second one (`Tok.rowPaddingV`) from before this card had a border,
             // when a row needed its own breathing room. Inside a bordered card
             // with `Tok.rowSpacing` between cards it was 4pt of nothing.
-            .padding(.horizontal, Tok.space3)
-            .padding(.vertical, Tok.space3)
+            // v4-spec (`data/plans/v4-spec.md` "Boxes and spacing"): card
+            // padding 10 12, radius 8 — literals here, not a `Tok` edit,
+            // because `Tok.radiusMedium`/`space3` are owned by the
+            // `feat/tokens-parity` lane as of the coordinator's fence; swap
+            // these for its token names once that lane lands. `Tok.space3`
+            // (8) underspaced the spec's 12pt horizontal inset badly enough
+            // that closing the type-scale gap without this would still read
+            // wrong, so it moves now rather than waiting on the token names.
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
             .background(
-                RoundedRectangle(cornerRadius: Tok.radiusMedium)
+                RoundedRectangle(cornerRadius: 8)  // v4-spec: card radius 8
                     .fill(Tok.raised)
             )
             .overlay(
-                RoundedRectangle(cornerRadius: Tok.radiusMedium)
+                RoundedRectangle(cornerRadius: 8)  // v4-spec: card radius 8
                     .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
             )
             .contextMenu { contextMenuItems }
@@ -3199,7 +3299,13 @@ struct AccountRow: View {
                 // would paste verbatim. `.help` below and "Copy Account
                 // Name" are the sanctioned ways to get the real address.
                 Text(emailWithBreakHint)
-                    .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
+                    // v4-spec: account name is 15pt/600/-0.005em, system
+                    // design — `Tok.bodyFont` is 13pt/medium/rounded, a
+                    // token owned by `feat/tokens-parity`; literal here per
+                    // the coordinator's fence until that lane's name lands.
+                    .font(.system(size: 15, weight: .semibold))
+                    .tracking(-0.005 * 15)
+                    .lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -3302,28 +3408,14 @@ struct AccountRow: View {
                 resetAtMs: account.fiveHourResetAtMs,
                 captionTint: captionTint(for: .fiveHour)
             ) {
-                // This 5h window's spend and output tokens — `$4.20 · 48k out`,
-                // the account's own quota window when the server can name its
-                // start, otherwise its day (`Account.windowUsageLabel`).
-                // Absent, not zero, when the proxy did not measure this
-                // account: `windowUsageLabel` is nil there and this slot stays
-                // empty, because `$0.00 · 0` beside a live account is a claim
-                // nobody made. Demoted with `hasStaleQuotaReading` like the
-                // percentage beside it — a row must not read half live and
-                // half historical.
-                //
-                // Every form carries its unit and its span, because this slot
-                // sits in one HStack beside a percentage and a countdown: a
-                // bare `900` there read as 900 requests, 900 dollars or a
-                // second percentage. `$9.41 today` marks the day fallback,
-                // `$5.61+` marks a cost some of whose requests could not be
-                // priced, and tokens are `12k out`.
-                if let usageLabel = account.windowUsageLabel {
-                    Text(usageLabel)
-                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
-                        .foregroundStyle(usageFigureStyle)
-                        .lineLimit(1)
-                }
+                // The spend/output-tokens figure that used to sit here moved
+                // to the plan line (`designationsLine` → `planIndicator`),
+                // per `docs/design/panel-tabs-mockup.html`'s plan line
+                // ("Max 20x · $540 · 1.5M output tokens this week") and the
+                // panel-parity finding that this column should carry one
+                // meaning — the reset countdown — on every row. See
+                // `planIndicator`'s doc-comment for where it draws now.
+                EmptyView()
             }
             .padding(.top, Tok.space1)
             quotaLine(
@@ -3481,8 +3573,12 @@ struct AccountRow: View {
                 // reachable.
                 .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkDim)
             // Drawn whenever the wire has a reset for this window, beside the
-            // number it belongs to. Colour: `captionTint(for:)`.
-            if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: Date()) {
+            // number it belongs to. Colour: `captionTint(for:)`. `resetsCaption`,
+            // not `resetCaption`: this column is the grid's one meaning now
+            // that the spend figure that used to compete with it for the row's
+            // width moved onto the plan line (`designationsLine`) — see that
+            // formatter's own doc-comment.
+            if let caption = QuotaFormat.resetsCaption(resetAtMs: resetAtMs, now: Date()) {
                 Text(caption)
                     // Tabular, like the percentage it sits beside: this string
                     // carries digits (`in 4d 12h`) that change under the poll,

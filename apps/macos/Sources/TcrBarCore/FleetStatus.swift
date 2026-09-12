@@ -552,13 +552,47 @@ public enum QuotaFormat {
     /// formatter. `now` is a required parameter, not a default, so every
     /// test stays deterministic.
     public static func resetCaption(resetAtMs: Int64?, now: Date) -> String? {
+        guard let duration = durationUntilReset(resetAtMs: resetAtMs, now: now) else { return nil }
+        return "in \(duration)"
+    }
+
+    /// `"resets 3h 2m"` — the quota grid's own trailing column
+    /// (`docs/design/panel-tabs-mockup.html`'s `.q .resets`, panel-parity
+    /// finding: "the quota grid's trailing column always `resets …`").
+    ///
+    /// A second formatter rather than a second caller of ``resetCaption``
+    /// re-spelled at the call site: that string is shared with the Fable
+    /// weekly caption (``Account/fableWeeklyLabel``), which sits after an
+    /// unlabelled percentage ("fable 71% · in 4d 12h") where "resets" would
+    /// read as a second, competing verb. The 5h/7d quota rows dropped the
+    /// word entirely when the card went to one line per window (see
+    /// ``resetCaption``'s own doc-comment on the width that cost); now that
+    /// the spend figure that used to compete for the same row moved onto
+    /// the account's plan line (`FleetView.designationsLine`), the row has
+    /// the width back and the column can say what it means again — every
+    /// row in the grid, the same word, so the column is one meaning.
+    public static func resetsCaption(resetAtMs: Int64?, now: Date) -> String? {
+        guard let duration = durationUntilReset(resetAtMs: resetAtMs, now: now) else { return nil }
+        return "resets \(duration)"
+    }
+
+    /// Shared guard: `nil` in → `nil` out, never a placeholder — the same
+    /// house rule ``percent(_:)`` states above. A reset at or before `now`
+    /// also yields `nil`: the Rust side only ever sends future resets, but a
+    /// wire value can age between poll and draw, so this enforces the same
+    /// "future only" rule the server already applies rather than trusting
+    /// the wire. Routes through ``HeldWindow/duration(minutes:)`` — the
+    /// codebase's single answer to "how long" — instead of growing a second
+    /// duration formatter. `now` is a required parameter, not a default, so
+    /// every test stays deterministic.
+    private static func durationUntilReset(resetAtMs: Int64?, now: Date) -> String? {
         guard let resetAtMs else { return nil }
         let resetAt = Date(timeIntervalSince1970: Double(resetAtMs) / 1000)
         let seconds = resetAt.timeIntervalSince(now)
         guard seconds > 0 else { return nil }
         let minutes = Int((seconds / 60).rounded())
         guard minutes > 0 else { return nil }
-        return "in \(HeldWindow.duration(minutes: minutes))"
+        return HeldWindow.duration(minutes: minutes)
     }
 }
 

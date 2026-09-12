@@ -165,7 +165,15 @@ enum RenderStates {
                 status: "waiting"),
             "cccccccc-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "cccccccc-1111-2222-3333-444444444444",
-                cwd: "/Users/alice/git/mycelium", name: "m-075377",
+                cwd: "/Users/alice/git/mycelium coder", name: "m-075377",
+                status: "idle"),
+            "dddddddd-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "dddddddd-1111-2222-3333-444444444444",
+                cwd: "/Users/bob/git/henry-plugin", name: "henry-plugin-c1",
+                status: "busy"),
+            "eeeeeeee-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "eeeeeeee-1111-2222-3333-444444444444",
+                cwd: "/Users/bob/git/token", name: "token-b4",
                 status: "idle"),
         ]
     }
@@ -644,14 +652,28 @@ enum RenderStates {
     /// `FleetStatusTests` now does. Scenes 16 and 17 both use this Fleet;
     /// only ``initialTab(for:)`` decides which tab opens.
     ///
-    /// Three sessions cover the join's three cases: `alice-c1` has a live
-    /// Bash call running (Sessions tab's "N running · oldest …" line, Tools
-    /// tab's RUNNING NOW ring); `alice-c2` has one already at the Bash
-    /// tool's own 600-second timeout (`panel-tabs.md`: "The ten slowest
-    /// calls today all sit at 600s"); `unassigned-c3` has no `account`,
-    /// exercising the Sessions tab's "Unassigned" group and, having no
-    /// matching session file in this harness, the id-head fallback
-    /// (`panel-tabs-bridge.md`: "no file shows its id's first 8 chars").
+    /// The mockup's own five sessions (`docs/design/panel-tabs-mockup.html`'s
+    /// Sessions panel), verbatim: `teamclaude-rs-c7` (busy, two running
+    /// tools — a Bash call and the Agent call that is 20s from the 600s
+    /// timeout) and `mycelium-c2` (waiting 12m) under `henry10@example.com`;
+    /// `m-075377` (idle 40m) rounds out that account's three; `henry-plugin-c1`
+    /// (busy, one running Bash call) and `token-b4` (idle 2h) are
+    /// `henry1@example.com`'s two. Panel-parity round: previously this
+    /// fixture held 3 sessions on 1 account, none matching the mockup's
+    /// names, models or per-row metrics — this round matches all five
+    /// exactly (requests, cache%, the running-tool ages) so the tab compares
+    /// layout and styling, not five wrong numbers.
+    ///
+    /// The mockup's own summary line ("12 sessions · 7 busy · 1 waiting · 4
+    /// idle") and its "Show 7 more sessions" / "3 accounts have no sessions"
+    /// disclosure are NOT reproduced here: this build has no disclosure
+    /// feature (`FleetView.sessionsList` renders every session it is given,
+    /// unclipped — `snapshotMode`'s own doc-comment says so on purpose), so
+    /// seven more fixture sessions would render as seven more full cards the
+    /// mockup does not have, which would widen the diff this round exists to
+    /// close rather than shrink it. Recorded in `product-wave-findings.md`
+    /// as the next round's prerequisite, the same call the previous round
+    /// made about the Accounts tab's own disclosure gap.
     private static var sessionsFixture: [Session] {
         // `lastSeenMs`/`firstSeenMs` are epoch milliseconds, and the age
         // label reads real wall-clock `Date()` (`FleetView.trailingStatus`,
@@ -664,10 +686,15 @@ enum RenderStates {
             Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
         }
         return [
+            // "412 req · cache 97% · 2 running · oldest 9m 40s" — the Agent
+            // call (started 9m40s/580s ago) is older than the Bash one
+            // (4m12s/252s ago), so it is what `oldest` reads; 580s is 20s
+            // short of the 600s Bash timeout, matching the mockup's "20s to
+            // timeout" on the Tools tab's RUNNING NOW row for this same call.
             Session(
-                sessionId: "aaaaaaaa-1111-2222-3333-444444444444", account: "alice@example.com",
-                model: "claude-opus-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
-                requests: 412, inputTokens: 812_000, outputTokens: 41_000, cacheReadTokens: 790_000,
+                sessionId: "aaaaaaaa-1111-2222-3333-444444444444", account: "henry10@example.com",
+                model: "claude-fable-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
+                requests: 412, inputTokens: 30_000, outputTokens: 41_000, cacheReadTokens: 970_000,
                 tools: SessionTools(
                     // `calls` is the sum of `byTool` below (15,000 + 200 +
                     // 2,000) — the two must agree, per `panel-tabs-review.md`
@@ -677,7 +704,11 @@ enum RenderStates {
                     running: [
                         ToolCall(
                             tool: "Bash", commandHead: "cargo test --release > /tmp/f1-test.log",
-                            startedMs: msAgo(4 * 60))
+                            startedMs: msAgo(4 * 60 + 12)),
+                        ToolCall(
+                            tool: "Agent",
+                            commandHead: "Agent · F7 prove time-to-reset value",
+                            startedMs: msAgo(9 * 60 + 40)),
                     ],
                     slowest: [
                         ToolCall(
@@ -700,10 +731,11 @@ enum RenderStates {
                     2, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8,
                     10, 9, 11, 10, 12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17,
                 ]),
+            // "5,756 req · cache 94% · waiting 12m".
             Session(
-                sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "alice@example.com",
-                model: "claude-sonnet-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
-                requests: 5756, inputTokens: 940_000, outputTokens: 88_000, cacheReadTokens: 905_000,
+                sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "henry10@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
+                requests: 5756, inputTokens: 60_000, outputTokens: 88_000, cacheReadTokens: 940_000,
                 tools: SessionTools(
                     calls: 7_477, errors: 4, timeouts: 1,
                     slowest: [
@@ -723,10 +755,44 @@ enum RenderStates {
                     15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 4, 4, 3,
                     3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
                 ]),
+            // "idle 40m" — no metrics line at all in the mockup, and
+            // `FleetView.sessionRow`'s compact idle layout now matches that.
             Session(
-                sessionId: "cccccccc-1111-2222-3333-444444444444", account: nil,
+                sessionId: "cccccccc-1111-2222-3333-444444444444", account: "henry10@example.com",
                 model: "claude-sonnet-5", firstSeenMs: msAgo(45 * 60), lastSeenMs: msAgo(40 * 60),
-                requests: 12, inputTokens: 9000, outputTokens: 800, cacheReadTokens: 6000),
+                requests: 3, inputTokens: 900, outputTokens: 80, cacheReadTokens: 600),
+            // "6,479 req · cache 95% · 1 running · 1m 03s".
+            Session(
+                sessionId: "dddddddd-1111-2222-3333-444444444444", account: "henry1@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(4 * 3600), lastSeenMs: msAgo(63),
+                requests: 6479, inputTokens: 50_000, outputTokens: 63_000, cacheReadTokens: 950_000,
+                // `calls` (and `byTool`) deliberately left at their zero
+                // default: this session's requests (6,479) are a wire fact
+                // independent of tool-call volume, and the Tools tab's
+                // headline is the sum of every session's `tools.calls` —
+                // `panel-tabs-review.md` finding 3's own bug, reproduced
+                // here once already this round by a first draft that set
+                // `calls: 6_479` with no matching `byTool` entries and
+                // pushed the headline to 31,156 against a BY TOOL section
+                // still summing to the mockup's 24,677. Only the running
+                // call below is this session's contribution to the Tools
+                // tab.
+                tools: SessionTools(
+                    running: [
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "swift build -c release --product TcrBar",
+                            startedMs: msAgo(63))
+                    ]),
+                reqPerMinute: [
+                    4, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8, 10, 9, 11, 10,
+                    12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17, 16, 18, 17, 19,
+                ]),
+            // "idle 2h" — compact layout, same as `m-075377` above.
+            Session(
+                sessionId: "eeeeeeee-1111-2222-3333-444444444444", account: "henry1@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(5 * 3600), lastSeenMs: msAgo(2 * 3600),
+                requests: 5, inputTokens: 1500, outputTokens: 120, cacheReadTokens: 900),
         ]
     }
 
@@ -772,7 +838,8 @@ enum RenderStates {
 
     private static var sessionsTabFleet: Fleet {
         let base = fleet(
-            "[\(account("alice@example.com", quota: "0.12", state: "ok", plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111"))]"
+            "[\(account("henry10@example.com", quota: "0.12", state: "ok", plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")),"
+                + "\(account("henry1@example.com", quota: "0.31", state: "ok", plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
         )
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: sessionsFixture,
