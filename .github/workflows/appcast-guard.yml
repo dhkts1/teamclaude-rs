@@ -52,25 +52,33 @@
 # `/releases/latest/download/appcast.xml` must keep resolving for them in the
 # meantime.
 #
-# THE TRIGGER BELOW HAS BEEN DEAD SINCE THIS FILE WAS WRITTEN, not from any
-# change in this commit. GitHub does not fire `release: published` for a
-# release created by a workflow using the default `GITHUB_TOKEN` (the anti-
-# recursion rule that also keeps a `GITHUB_TOKEN`-authored push from
-# retriggering `push`-triggered workflows) — and `release.yml` (cargo-dist) is
-# exactly that: `GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}`. So the automatic path
-# has never once run against the release type that orphaned the feed on
-# 2026-08-27; only a release published by a human through the UI, or with a
-# personal token, would fire it. This is not being repaired here — see the
-# task this file's change came from — but it is also not a reason to delete
-# the job: `workflow_dispatch` does not depend on that event at all, so
-# `scripts/guard-appcast-window.sh`-style manual repair
-# (`gh workflow run "Appcast feed guard" -f tag=vX.Y.Z`) still works exactly as
-# documented, on demand, independent of whether the auto-trigger ever fires.
+# THE `release: published` TRIGGER BELOW IS DEAD, not from any change in this
+# commit. GitHub does not fire `release: published` for a release created by a
+# workflow using the default `GITHUB_TOKEN` (the anti-recursion rule that also
+# keeps a `GITHUB_TOKEN`-authored push from retriggering `push`-triggered
+# workflows) — and `release.yml` (cargo-dist) is exactly that: `GH_TOKEN:
+# ${{ secrets.GITHUB_TOKEN }}`. It has never once fired against the release
+# type that orphaned the feed on 2026-08-27; only a release published by a
+# human through the UI, or with a personal token, reaches it. It is kept here
+# for that path, alongside the manual `workflow_dispatch` repair.
+#
+# The real automatic path is `workflow_run`, watching both `Release`
+# (cargo-dist, .github/workflows/release.yml) and `Release app`
+# (.github/workflows/release-app.yml) for `completed`. GitHub always fires
+# `workflow_run.completed` regardless of which token drove the workflow it
+# watches, because the anti-recursion rule keys on the EVENT a token's own
+# actions would produce (a push, a release) — not on runs of a workflow
+# another job named explicitly. The job below skips when the triggering run
+# did not succeed, and resolves the tag from `git tag --points-at` the
+# completed run's head SHA, since `workflow_run` carries no release-tag field.
 name: Appcast feed guard
 
 on:
   release:
     types: [published]
+  workflow_run:
+    workflows: ["Release", "Release app"]
+    types: [completed]
   # Manual repair hatch: if a release is already orphaning the feed, run this
   # against it rather than uploading by hand.
   workflow_dispatch:
@@ -84,19 +92,51 @@ permissions:
   contents: write
 
 concurrency:
-  group: appcast-guard-${{ github.event.release.tag_name || inputs.tag }}
+  group: appcast-guard-${{ github.event.release.tag_name || inputs.tag || github.event.workflow_run.head_sha }}
   cancel-in-progress: false
 
 jobs:
   ensure-appcast:
     runs-on: ubuntu-24.04
+    # workflow_run fires on every conclusion (failure, cancelled, success); a
+    # release that never finished building has no appcast to protect yet.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve the tag to check
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${RELEASE_TAG}" ]; then
+            tag="${RELEASE_TAG}"
+          elif [ -n "${DISPATCH_TAG}" ]; then
+            tag="${DISPATCH_TAG}"
+          elif [ -n "${RUN_SHA}" ]; then
+            tag="$(git tag --points-at "${RUN_SHA}" | head -1)"
+            if [ -z "${tag}" ]; then
+              echo "::error::no tag points at ${RUN_SHA} (from the completed workflow run)"
+              exit 1
+            fi
+          else
+            echo "::error::no tag resolved from the event or input"
+            exit 1
+          fi
+          echo "tag=${tag}" >>"${GITHUB_OUTPUT}"
 
       - name: Ensure the release carries appcast.xml
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           set -euo pipefail
 
