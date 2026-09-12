@@ -131,6 +131,35 @@ enum RenderStates {
         }
     }
 
+    /// `SessionFile`s for ``sessionsFixture``'s three sessions, on the two
+    /// scenes that render it — coordinator-flagged (2026-09-12): without
+    /// these, `FleetView`'s `snapshotMode` never reads a file for any
+    /// session (its own doc-comment: "the harness's session ids are fixture
+    /// strings that join to nothing real"), so every session read as
+    /// `.unknown` → "idle" regardless of what `sessionsFixture`'s own
+    /// comments say each one is doing. The three statuses here match that
+    /// fixture's own narrative exactly: `aaaaaaaa` has a Bash call running
+    /// now (busy), `bbbbbbbb`'s row comment says "waiting 12m" on the
+    /// mockup this fixture is modelled on, `cccccccc` is the idle,
+    /// unassigned control case.
+    private static func sessionFilesFixture(for sceneName: String) -> [String: SessionFile] {
+        guard sceneName == "16-sessions-tab" || sceneName == "17-tools-tab" else { return [:] }
+        return [
+            "aaaaaaaa-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "aaaaaaaa-1111-2222-3333-444444444444",
+                cwd: "/Users/alice/git/teamclaude-rs", name: "teamclaude-rs-c7",
+                status: "busy"),
+            "bbbbbbbb-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "bbbbbbbb-1111-2222-3333-444444444444",
+                cwd: "/Users/alice/git/mycelium", name: "mycelium-c2",
+                status: "waiting"),
+            "cccccccc-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "cccccccc-1111-2222-3333-444444444444",
+                cwd: "/Users/alice/git/mycelium", name: "m-075377",
+                status: "idle"),
+        ]
+    }
+
     @MainActor
     static func run(into directory: URL) -> Never {
         do {
@@ -226,7 +255,8 @@ enum RenderStates {
                 removeController: RemoveAccountController(),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
-                initialTab: initialTab(for: scene.name)
+                initialTab: initialTab(for: scene.name),
+                initialSessionFiles: sessionFilesFixture(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -640,7 +670,8 @@ enum RenderStates {
                             tool: "Bash",
                             commandHead: "git -C ~/git/henry-plugin push > /tmp/push.log",
                             endedMs: msAgo(5 * 60), seconds: 47.5)
-                    ])),
+                    ],
+                    overOneMinute: 3)),
             Session(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "alice@example.com",
                 model: "claude-sonnet-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
@@ -652,7 +683,8 @@ enum RenderStates {
                             tool: "Bash",
                             commandHead: "/opt/homebrew/bin/bash /tmp/disk-scan.sh 2>&1 | tee",
                             endedMs: msAgo(11 * 60), seconds: 600.0)
-                    ])),
+                    ],
+                    overOneMinute: 5)),
             Session(
                 sessionId: "cccccccc-1111-2222-3333-444444444444", account: nil,
                 model: "claude-sonnet-5", firstSeenMs: msAgo(45 * 60), lastSeenMs: msAgo(40 * 60),

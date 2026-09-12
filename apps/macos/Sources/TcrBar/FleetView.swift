@@ -142,7 +142,17 @@ struct FleetView: View {
         startServerAtLaunch: Binding<Bool>,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
-        initialTab: PanelTab = .accounts
+        initialTab: PanelTab = .accounts,
+        // Coordinator-flagged gap (2026-09-12): `snapshotMode` never reads
+        // real session files (comment above, `body`'s `.onAppear`), so every
+        // render-states Sessions/Tools fixture used to join to NOTHING and
+        // read `.unknown` → the summary line's "idle" bucket for every
+        // session, regardless of what the fixture's own `Session.tools`
+        // narrative says. `RenderStates` seeds this so its fixture sessions
+        // actually carry the busy/waiting/idle status their own doc-comments
+        // describe, instead of the pixelmatch gate comparing a made-up
+        // "0 busy · 0 waiting · 3 idle" against the mockup's real counts.
+        initialSessionFiles: [String: SessionFile] = [:]
     ) {
         self.poller = poller
         self.server = server
@@ -157,6 +167,7 @@ struct FleetView: View {
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
         self._selectedTab = State(initialValue: initialTab)
+        self._sessionFiles = State(initialValue: initialSessionFiles)
     }
 
     var body: some View {
@@ -188,7 +199,15 @@ struct FleetView: View {
                 Text("tcr fleet").font(.headline)
                 Spacer()
                 if let at = poller.lastPollAt {
-                    Text(at, style: .time)
+                    // `docs/design/panel-tabs-mockup.html` F14: the header's
+                    // trailing slot answers "is this current", not "what time
+                    // is it" — the system clock is already a couple of
+                    // centimetres away in the same menu bar. Computed once per
+                    // render, same as `trailingStatus`'s `now:` parameter
+                    // elsewhere in this file — there is no live timer driving
+                    // a re-render between polls, so this reads as of the last
+                    // paint, not truly live-ticking.
+                    Text(freshnessLabel(since: at, now: Date()))
                         .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
                         .foregroundStyle(Tok.inkDim)
                 }
@@ -204,10 +223,28 @@ struct FleetView: View {
                     .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
+            // F1: each tab answers a different question in this slot, so the
+            // summary line switches with `selectedTab` rather than always
+            // showing the Accounts one — `docs/design/panel-tabs-mockup.html`
+            // draws three different sentences here, one per panel.
+            if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty,
+                selectedTab == .accounts
+            {
                 capacitySummary(fleet)
             }
-            usageSummary
+            if selectedTab == .accounts {
+                usageSummary
+            }
+            if case .loaded(let fleet) = poller.state, selectedTab == .sessions,
+                fleet.sessionsSupported, !fleet.sessions.isEmpty
+            {
+                sessionsSummaryLine(fleet)
+            }
+            if case .loaded(let fleet) = poller.state, selectedTab == .tools,
+                fleet.sessionsSupported
+            {
+                toolsSummaryLine(fleet)
+            }
             updateStateLine
         }
         // OUTSIDE `usageSummary`'s own `if`, and outside the subtree that
@@ -667,7 +704,7 @@ struct FleetView: View {
                     sectionHeading("RUNNING NOW")
                     // Finding 5: state the denominator a ring fills toward,
                     // rather than drawing a fraction with no stated whole.
-                    Text("Ring fills toward the 600s Bash timeout")
+                    Text("Ring fills toward the 600s timeout")
                         .font(Tok.detailFont)
                         .foregroundStyle(Tok.inkFaint)
                 }
@@ -781,6 +818,75 @@ struct FleetView: View {
         let minutes = total / 60
         let rest = total % 60
         return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
+    }
+
+    /// "updated 4s ago" — `docs/design/panel-tabs-mockup.html` F14. No day/hour
+    /// tier: a poll older than a few minutes is already covered by the
+    /// non-healthy-read summary line above it in ``header``.
+    private func freshnessLabel(since: Date, now: Date) -> String {
+        let elapsed = max(0, now.timeIntervalSince(since))
+        // Coordinator-flagged (2026-09-12): a fixture pinned to a fixed past
+        // `referenceDate` (`RenderStates.referenceDate`) produced "updated
+        // 54097m ago" against a real `Date()` — a five-digit minute count is
+        // a defect regardless of what produced the gap, so this tiers all
+        // the way up rather than assuming a poll is always recent.
+        if elapsed < 60 { return "updated \(Int(elapsed.rounded()))s ago" }
+        if elapsed < 3600 { return "updated \(Int((elapsed / 60).rounded()))m ago" }
+        if elapsed < 86400 { return "updated \(Int((elapsed / 3600).rounded()))h ago" }
+        return "updated \(Int((elapsed / 86400).rounded()))d ago"
+    }
+
+    /// Sessions tab summary — "12 sessions · 7 busy · 1 waiting · 4 idle",
+    /// `docs/design/panel-tabs-mockup.html`'s Sessions panel. Joined with
+    /// ``sessionFiles`` the same way ``sessionsList(_:)`` does, so the two
+    /// counts on this tab (the summary and the rows below it) can never
+    /// disagree about what "busy" means for a given session.
+    private func sessionsSummaryLine(_ fleet: Fleet) -> some View {
+        let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
+        let busy = joined.filter { $0.activity == .busy }.count
+        let waiting = joined.filter { $0.activity == .waiting }.count
+        let idle = joined.count - busy - waiting
+        var line = Text("\(joined.count) sessions").font(.subheadline.weight(.semibold))
+        line =
+            line + Text(" · ").foregroundColor(Tok.inkFaint)
+            + Text("\(busy) busy").foregroundColor(Tok.ok)
+        line =
+            line + Text(" · ").foregroundColor(Tok.inkFaint)
+            + Text("\(waiting) waiting").foregroundColor(Tok.near)
+        line =
+            line + Text(" · ").foregroundColor(Tok.inkFaint)
+            + Text("\(idle) idle").foregroundColor(Tok.inkDim)
+        return line
+            .font(Tok.secondaryDigitFont)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, Tok.tightSpacing)
+            .lineSpacing(Tok.secondaryLineSpacing)
+    }
+
+    /// Tools tab summary — "24,677 tool calls today · 405 ran over 1m · 31 hit
+    /// the 600s timeout", `docs/design/panel-tabs-mockup.html`'s Tools panel.
+    /// `toolsTotalTimeouts` IS "hit the 600s timeout": the only tool this
+    /// build tracks a timeout for is Bash, and its timeout is 600s
+    /// (``bashTimeoutSeconds``), so a counted timeout and a 600s hit are the
+    /// same event, not two facts that happen to agree.
+    private func toolsSummaryLine(_ fleet: Fleet) -> some View {
+        var line =
+            Text("\(fleet.toolsTotalCalls) tool calls today").fontWeight(.semibold)
+        if let overOneMinute = fleet.toolsOverOneMinute {
+            line =
+                line + Text(" · ").foregroundColor(Tok.inkFaint)
+                + Text("\(overOneMinute) ran over 1m").foregroundColor(Tok.inkDim)
+        }
+        if fleet.toolsTotalTimeouts > 0 {
+            line =
+                line + Text(" · ").foregroundColor(Tok.inkFaint)
+                + Text("\(fleet.toolsTotalTimeouts) hit the 600s timeout").foregroundColor(Tok.spent)
+        }
+        return line
+            .font(Tok.secondaryDigitFont)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, Tok.tightSpacing)
+            .lineSpacing(Tok.secondaryLineSpacing)
     }
 
     /// The account list, cut into sections: a state band heading, then a group

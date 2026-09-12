@@ -909,19 +909,43 @@ public struct SessionTools: Decodable, Equatable, Sendable {
     /// server (`sessions-wire-bridge.md`); this build does not re-sort a
     /// single session's own list.
     public let slowest: [ToolCall]
+    /// How many of this session's calls today ran over one minute —
+    /// `docs/design/panel-tabs-mockup.html`'s "405 ran over 1m". `nil`, not
+    /// `0`, against a server that does not send this key yet: the client
+    /// only ever sees the top-10 `slowest`, so it cannot count this itself,
+    /// and a `0` here would claim "measured none" about a question this
+    /// build cannot answer. `Fleet.toolsOverOneMinute` carries the same
+    /// nil-means-unknown rule through the fleet-wide sum.
+    public let overOneMinute: Int?
 
     public init(
         calls: Int = 0,
         errors: Int = 0,
         timeouts: Int = 0,
         running: [ToolCall] = [],
-        slowest: [ToolCall] = []
+        slowest: [ToolCall] = [],
+        overOneMinute: Int? = nil
     ) {
         self.calls = calls
         self.errors = errors
         self.timeouts = timeouts
         self.running = running
         self.slowest = slowest
+        self.overOneMinute = overOneMinute
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case calls, errors, timeouts, running, slowest, overOneMinute
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        calls = try c.decodeIfPresent(Int.self, forKey: .calls) ?? 0
+        errors = try c.decodeIfPresent(Int.self, forKey: .errors) ?? 0
+        timeouts = try c.decodeIfPresent(Int.self, forKey: .timeouts) ?? 0
+        running = try c.decodeIfPresent([ToolCall].self, forKey: .running) ?? []
+        slowest = try c.decodeIfPresent([ToolCall].self, forKey: .slowest) ?? []
+        overOneMinute = try c.decodeIfPresent(Int.self, forKey: .overOneMinute)
     }
 }
 
@@ -2009,6 +2033,15 @@ public struct Fleet: Equatable, Sendable {
     public var toolsTotalCalls: Int { sessions.reduce(0) { $0 + $1.tools.calls } }
     public var toolsTotalErrors: Int { sessions.reduce(0) { $0 + $1.tools.errors } }
     public var toolsTotalTimeouts: Int { sessions.reduce(0) { $0 + $1.tools.timeouts } }
+
+    /// `nil`, not `0`, when not one session reports ``SessionTools/overOneMinute``
+    /// — against today's server, that is every session, and the Tools tab
+    /// summary line drops its own clause rather than claim a measured zero.
+    public var toolsOverOneMinute: Int? {
+        let known = sessions.compactMap(\.tools.overOneMinute)
+        guard !known.isEmpty else { return nil }
+        return known.reduce(0, +)
+    }
 
     /// Every tool call currently running, pooled across every session.
     public var toolsRunning: [SessionToolEntry] {
