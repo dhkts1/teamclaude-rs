@@ -2020,6 +2020,31 @@ impl Manager {
                     account.groups = new_groups;
                 }
             }
+
+            // Admit an account the file gained since boot (or the last reload)
+            // — APP-35. Never touches or removes an account already in
+            // `accounts`; that is `save_tokens`'s removal semantics
+            // (`config.rs`'s doc-comment on it) and stays out of scope here.
+            // The identity match is the same probe the loop above uses, just
+            // run in the opposite direction: does any LOADED account already
+            // own this fresh entry?
+            let http1_only = self.config.lock().expect("config lock poisoned").http1_only;
+            for candidate in &fresh.accounts {
+                let already_known = accounts.iter().any(|existing| {
+                    let probe = crate::identity::probe(
+                        &existing.name,
+                        existing.account_uuid.clone(),
+                        existing.org_uuid.clone(),
+                        existing.org_name.clone(),
+                    );
+                    crate::identity::same_identity(&probe, candidate)
+                });
+                if already_known {
+                    continue;
+                }
+                changed.push(format!("{}: admitted by reload", candidate.name));
+                accounts.push(AccountRuntime::from_config(candidate, http1_only));
+            }
         }
 
         if !changed.is_empty() {
@@ -4500,6 +4525,64 @@ mod tests {
         manager.reload_groups_if_changed();
         let accounts = manager.accounts.read().expect("accounts lock poisoned");
         assert_eq!(accounts[0].groups, vec!["fixed".to_string()]);
+        drop(accounts);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// APP-35: an account APPENDED to the file after boot must be admitted by
+    /// the same reload path that already picks up a group edit — not just
+    /// counted, but genuinely selectable, which the disabled-control below
+    /// proves. Never touches or removes the two accounts that were already
+    /// there (`reload_never_touches_accounts_credentials_or_tokens` already
+    /// pins that half; this is additive).
+    #[test]
+    fn reload_admits_an_account_added_to_the_file_after_boot() {
+        let path = tmp_config_path("reload-hot-add");
+        let boot = reload_config(&[("acct-a", 0, &[]), ("acct-b", 5, &[])]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+        assert_eq!(
+            manager
+                .accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .len(),
+            2,
+            "control: boots with exactly the two accounts on disk"
+        );
+
+        // The operator appends a third account to the file by hand while the
+        // proxy runs.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let appended = reload_config(&[("acct-a", 0, &[]), ("acct-b", 5, &[]), ("acct-c", 9, &[])]);
+        config::save(&path, &appended).expect("write appended reload config");
+        manager.reload_groups_if_changed();
+
+        {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                accounts.len(),
+                3,
+                "the account added to the file must appear in the running manager"
+            );
+        }
+
+        // Gate the two original accounts out so a successful select can only
+        // mean the new one is genuinely selectable, not merely present in a
+        // list nothing reads.
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].disabled = true;
+            accounts[1].disabled = true;
+        }
+        let now = OffsetDateTime::now_utc();
+        let idx = manager.select(&HashSet::new(), now, None, None, "/v1/messages", None);
+        let accounts = manager.accounts.read().expect("accounts lock poisoned");
+        assert_eq!(
+            idx.and_then(|i| accounts.get(i)).map(|a| a.name.as_str()),
+            Some("acct-c"),
+            "the newly admitted account must be selectable, not just counted: got {idx:?}"
+        );
         drop(accounts);
         std::fs::remove_file(&path).ok();
     }

@@ -115,6 +115,18 @@ public enum Tok {
     /// An emphasised divider or border.
     public static let hairlineStrong = dyn(dark: "#535960", light: "#a1a5aa")
 
+    /// The v4 sheet's card fill (`docs/design/panel-tabs-mockup.html`,
+    /// `data/plans/v4-spec.md`'s `rgba(255,255,255,.045)` over the panel) —
+    /// an alias for `raised`, not a new colour: this ramp's own steps are
+    /// each +0.045 L already (see the file's OKLCH source), which is the
+    /// exact lift a 4.5%-white overlay on this panel produces. Naming it
+    /// `cardFill` is for the v4 vocabulary; the value was already gated.
+    public static let cardFill = raised
+    /// The v4 sheet's card border / divider colour (`rgba(255,255,255,.09)`)
+    /// — an alias for `hairline`, the token this file already uses for
+    /// exactly that role ("0.5pt dividers").
+    public static let cardLine = hairline
+
     /// The system accent stays a system colour: it is the user's choice, and
     /// overriding it would be this app asserting a preference it does not own.
     public static let accent = Color(nsColor: .controlAccentColor)
@@ -133,6 +145,18 @@ public enum Tok {
     /// Tertiary text and hints. Still clears AA at 5.8:1 dark, 4.8:1 light.
     public static let inkFaint = dyn(
         dark: "#94928d", light: "#62605a", darkHC: "#b8b7b3", lightHC: "#494843")
+
+    /// The v4 sheet's `dim` (secondary: `repo · model`, quota grid, metric
+    /// line) — an alias for `inkDim`. The sheet's own hex (`#bfbfc7`) is a
+    /// hair off `inkDim`'s (`#bfbeb9`), not enough to justify a second,
+    /// separately-gated value for a role this ramp already covers at 9.7:1.
+    public static let dim = inkDim
+    /// The v4 sheet's `mute` (tertiary: plan line, section heads, footer,
+    /// freshness) — an alias for `inkFaint`, for the same reason `dim` above
+    /// aliases `inkDim`: the sheet's `#9a9aa3` is close to `inkFaint`'s
+    /// `#94928d`, and `inkFaint` already clears AA (5.8:1) where the
+    /// mockup's own `--mute` review note found the sheet's raw value did not.
+    public static let mute = inkFaint
 
     // MARK: - Status
     //
@@ -187,7 +211,14 @@ public enum Tok {
 
     /// The tint behind a status pill, and the hairline around it.
     public static func wash(_ tint: Color) -> Color { tint.opacity(0.14) }
-    public static func line(_ tint: Color) -> Color { tint.opacity(0.34) }
+    /// 0.40, not 0.34 as of the v4 pill restyle (`data/plans/v4-spec.md`'s
+    /// pill border, ".35 (ok) / .40 (warn, bad)") — this helper has no
+    /// per-role signal to pick between the two (`StatusPill`/`GroupChip`
+    /// take a plain `Color`, not a status enum, and giving them one would
+    /// mean changing every call site in `FleetView.swift`, out of scope
+    /// here), so it is pinned to the sheet's more visible value rather than
+    /// its softer one.
+    public static func line(_ tint: Color) -> Color { tint.opacity(0.40) }
 
     /// The three status-dot colours the panel lane's fleet summary line
     /// draws (mockup `docs/design/panel-tabs-mockup.html`'s
@@ -214,8 +245,13 @@ public enum Tok {
     // MARK: - Type scale
     //
     // Named by ROLE, never by size, so a size change does not require renaming
-    // every call site. Four steps is the whole scale — a status panel that needs
-    // more is being over-designed.
+    // every call site. This used to be a closed four-step scale — a principle
+    // written before the v4 design existed, which does not veto the design: the
+    // panel now follows the v4 sheet's own steps (`data/plans/v4-spec.md`'s
+    // Type table), added below as their own roles rather than folded into the
+    // four that follow, since `FleetView.swift` (a sibling lane's file) still
+    // reaches for those four directly and a value change there needs its own
+    // reviewed, rendered pass — not a redefinition slipped in under an old name.
     //
     // The floor is 10pt and it is used sparingly. An earlier density pass took
     // secondary text to 10pt and detail to 9pt, which is below every Apple
@@ -238,11 +274,66 @@ public enum Tok {
     }
     public static var secondaryFont: Font { .system(size: secondaryFontSize) }
     public static var detailFont: Font { .system(size: detailFontSize) }
-    /// Weight 600 at 10pt. Nothing here goes below 400 — light weights vanish at
-    /// UI sizes.
+    /// 10.5pt, weight 700 — the v4 pill restyle (`data/plans/v4-spec.md`'s
+    /// pill row: "10.5 / 700 / +0.06em, uppercase"). Was 10pt/600; every
+    /// rendered pill changes on purpose here, verified by re-reading
+    /// `--render-states` PNGs, not a regression.
     public static var pillFont: Font {
-        .system(size: detailFontSize, weight: .semibold)
+        .system(size: pillFontSize, weight: .bold)
     }
+    public static let pillFontSize: CGFloat = 10.5
+
+    // MARK: - v4 sheet type roles
+    //
+    // `data/plans/v4-spec.md`'s Type table, added as their own named roles
+    // rather than reusing `titleSize`/`bodySize`/`secondaryFontSize` above:
+    // those four are still what `FleetView.swift` (a sibling lane's file)
+    // reaches for today, and this lane does not touch that file, so a value
+    // change there needs its own reviewed, rendered pass on that lane's own
+    // schedule — these are what it picks up when it does. Tracking values are
+    // the sheet's `em` figures converted to points at each role's own size
+    // (`em * size`), since SwiftUI's `.tracking(_:)` takes points.
+
+    /// Panel title `tcr fleet`. 17pt, 700, tracking -0.17pt (-0.01em).
+    public static let panelTitleSize: CGFloat = 17
+    public static let panelTitleTracking: CGFloat = -0.17
+    public static var panelTitleFont: Font { .system(size: panelTitleSize, weight: .bold) }
+    /// Freshness ("updated 4s ago") and the footer — the sheet gives both
+    /// the same 12.5 / 400 / 0 / `mute`.
+    public static let freshnessSize: CGFloat = 12.5
+    public static var freshnessFont: Font { .system(size: freshnessSize) }
+    public static var footerFont: Font { freshnessFont }
+    /// Fleet summary line. 15pt, 400 (numbers 600), tracking 0.
+    public static let summarySize: CGFloat = 15
+    public static var summaryFont: Font { .system(size: summarySize) }
+    public static var summaryNumberFont: Font { .system(size: summarySize, weight: .semibold) }
+    /// Segmented tab label. 12.5pt, 600, tracking +0.25pt (+0.02em).
+    public static let tabLabelSize: CGFloat = 12.5
+    public static let tabLabelTracking: CGFloat = 0.25
+    public static var tabLabelFont: Font { .system(size: tabLabelSize, weight: .semibold) }
+    /// Account / session name — the thing being scanned for. 15pt, 600,
+    /// tracking -0.075pt (-0.005em).
+    public static let nameSize: CGFloat = 15
+    public static let nameTracking: CGFloat = -0.075
+    public static var nameFont: Font { .system(size: nameSize, weight: .semibold) }
+    /// "Dim" line: `repo · model`, the quota grid. 13pt, 400.
+    public static let dimLineSize: CGFloat = 13
+    public static var dimLineFont: Font { .system(size: dimLineSize) }
+    /// "Mute" line: the plan line. 12pt, 400.
+    public static let muteLineSize: CGFloat = 12
+    public static var muteLineFont: Font { .system(size: muteLineSize) }
+    /// Section head. 11pt, 700, tracking +1.1pt (+0.1em), uppercase (applied
+    /// at the call site the way `StatusPill`/`GroupChip` already uppercase).
+    public static let sectionHeadSize: CGFloat = 11
+    public static let sectionHeadTracking: CGFloat = 1.1
+    public static var sectionHeadFont: Font { .system(size: sectionHeadSize, weight: .bold) }
+    /// Command text. 12pt, SF Mono, 400.
+    public static let monoSize: CGFloat = 12
+    public static var monoFont: Font { .system(size: monoSize, design: .monospaced) }
+    /// Button label. 13pt, 400. Geometry (`buttonRadius` etc.) is below with
+    /// the rest of Space and geometry.
+    public static let buttonFontSize: CGFloat = 13
+    public static var buttonFont: Font { .system(size: buttonFontSize) }
 
     /// Explicit line height per size, one per role, so a 13pt row and an 11pt
     /// row are no longer spaced by two different, undeclared SwiftUI defaults
@@ -279,9 +370,9 @@ public enum Tok {
     /// already cover.
     public static func tabular(_ font: Font) -> Font { font.monospacedDigit() }
 
-    /// Positive tracking for the small pill labels. Small text set tight reads as
-    /// crowded; a little air is what makes a 10pt label legible.
-    public static let pillTracking: CGFloat = 0.3
+    /// Positive tracking for the small pill labels. 0.63pt = the v4 sheet's
+    /// +0.06em at `pillFontSize` (10.5) — was 0.3 at the old 10pt.
+    public static let pillTracking: CGFloat = 0.63
 
     /// Line spacing for text that can wrap to three or more lines. Tight leading
     /// is for one-liners only.
@@ -392,10 +483,34 @@ public enum Tok {
     /// proportional face, so without this the two bars in a card start a hair
     /// apart.
     public static let windowLabelWidth: CGFloat = 20
-    public static let pillRadius = radiusSmall
-    public static let pillPaddingH: CGFloat = 6
+    /// 7, its own literal as of the v4 pill restyle — no longer an alias for
+    /// `radiusSmall` (8), which keeps its own value for its other consumers
+    /// (the toggle backgrounds in `FleetView.swift`).
+    public static let pillRadius: CGFloat = 7
+    public static let pillPaddingH: CGFloat = 7
     public static let pillPaddingV: CGFloat = 2
     public static let hairlineWidth: CGFloat = 0.5
+
+    /// The segmented-tab count badge (`data/plans/v4-spec.md`: "11pt on
+    /// white .14, radius 9, padding 0 x 6"). Geometry only — the badge itself
+    /// is drawn in `FleetView.swift` (a sibling lane's file), which picks
+    /// these up on its own schedule the same way it does `cardGap`/`rowGap`.
+    public static let tabBadgeFontSize: CGFloat = 11
+    public static let tabBadgeRadius: CGFloat = 9
+    public static let tabBadgePaddingH: CGFloat = 6
+    public static let tabBadgePaddingV: CGFloat = 0
+    /// `rgba(255,255,255,.14)` in the sheet — exactly `wash`'s existing 0.14
+    /// alpha over `ink` (an off-white), so this reuses `wash(_:)` rather than
+    /// adding a second alpha token for the same number.
+    public static var tabBadgeBackground: Color { wash(ink) }
+
+    /// Button (`data/plans/v4-spec.md`: "13pt, radius 7, min-height 28,
+    /// padding 5 x 11"). Geometry only, for the same reason as the tab badge
+    /// above — the button itself is drawn in `FleetView.swift`.
+    public static let buttonRadius: CGFloat = 7
+    public static let buttonMinHeight: CGFloat = 28
+    public static let buttonPaddingH: CGFloat = 11
+    public static let buttonPaddingV: CGFloat = 5
 
     /// Group outline: the section-level border wrapped around a named
     /// group's heading and rows (`docs/plans/group-outline-bridge.md`).
