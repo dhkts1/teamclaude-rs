@@ -222,6 +222,29 @@ public enum Tok {
         .system(size: detailFontSize, weight: .semibold)
     }
 
+    /// Explicit line height per size, one per role, so a 13pt row and an 11pt
+    /// row are no longer spaced by two different, undeclared SwiftUI defaults
+    /// — the inconsistency `wrappedLineSpacing` (below) never actually closed,
+    /// since nothing calls it.
+    ///
+    /// SwiftUI has no line-height property; `.lineSpacing(_:)` adds spacing
+    /// ABOVE a font's own single-line box, so the value applied at each call
+    /// site is this line height minus the role's point size, not this number
+    /// itself. That is an approximation — the font's true line box is a
+    /// TextKit fact this file does not have — but it is one approximation
+    /// applied identically everywhere the role is used, which is the
+    /// consistency being asked for, not a claim of pixel-exact parity with any
+    /// other app's rendering.
+    public static let titleLineHeight: CGFloat = 18
+    public static let bodyLineHeight: CGFloat = 18
+    public static let secondaryLineHeight: CGFloat = 16
+    public static let detailLineHeight: CGFloat = 14
+
+    public static let titleLineSpacing: CGFloat = titleLineHeight - titleSize
+    public static let bodyLineSpacing: CGFloat = bodyLineHeight - bodySize
+    public static let secondaryLineSpacing: CGFloat = secondaryLineHeight - secondaryFontSize
+    public static let detailLineSpacing: CGFloat = detailLineHeight - detailFontSize
+
     /// Tabular variants. Any value that CHANGES uses one of these: the panel
     /// re-polls every 3 seconds, and proportional digits make percentages and
     /// countdowns jitter their own column on every tick.
@@ -419,7 +442,7 @@ public struct StatusPill: View {
 
     public var body: some View {
         Text(text.uppercased())
-            .font(Tok.pillFont)
+            .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
             .tracking(Tok.pillTracking)
             .foregroundStyle(tint)
             .padding(.horizontal, Tok.pillPaddingH)
@@ -540,7 +563,7 @@ public struct GroupChip: View {
                     .font(.system(size: Tok.detailFontSize - 2, weight: .bold))
             }
             Text(tag.name.uppercased())
-                .font(Tok.pillFont)
+                .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .tracking(Tok.pillTracking)
         }
         .foregroundStyle(foreground)

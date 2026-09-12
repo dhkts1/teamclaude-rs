@@ -33,8 +33,10 @@
     --tcr-bar-height: 6px;
     --tcr-bar-radius: 3px;
     --tcr-bar-width: 72px;
+    --tcr-body-line-height: 18px;
     --tcr-body-size: 13px;
     --tcr-detail-font-size: 10px;
+    --tcr-detail-line-height: 14px;
     --tcr-hairline-width: 0.5px;
     --tcr-measurement-grain: 0.5px;
     --tcr-panel-max-height: 520px;
@@ -47,11 +49,13 @@
     --tcr-radius-medium: 8px;
     --tcr-radius-small: 4px;
     --tcr-secondary-font-size: 11px;
+    --tcr-secondary-line-height: 16px;
     --tcr-space1: 2px;
     --tcr-space2: 4px;
     --tcr-space3: 8px;
     --tcr-space4: 12px;
     --tcr-space5: 16px;
+    --tcr-title-line-height: 18px;
     --tcr-title-size: 13px;
     --tcr-window-label-width: 20px;
     --tcr-wrapped-line-spacing: 2px;
