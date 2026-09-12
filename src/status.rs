@@ -533,6 +533,7 @@ mod tests {
                         started_ms: crate::now_ms() - 5_000,
                         command_head: Some("ls -la".to_string()),
                     }],
+                    subagents_running: 0,
                     slowest: vec![tcr_status_wire::SlowToolRow {
                         tool: "Bash".to_string(),
                         seconds: 3.5,
@@ -713,6 +714,34 @@ mod tests {
             back.sessions,
             Vec::new(),
             "missing sessions field on the wire defaults to empty, not a decode error"
+        );
+    }
+
+    /// A payload from an older server that predates `subagentsRunning` (F4) still
+    /// deserializes, defaulting to zero — same forward-compat contract as `sessions` itself.
+    #[test]
+    fn payload_without_subagents_running_field_still_deserializes() {
+        let wire = serde_json::to_string(&StatusPayload::from_snapshot(
+            &snapshot_with_counters(),
+            &[0.85],
+            false,
+            None,
+            Default::default(),
+        ))
+        .expect("serialize");
+        let mut value: serde_json::Value = serde_json::from_str(&wire).expect("parse");
+        for session in value["sessions"].as_array_mut().expect("sessions array") {
+            session["tools"]
+                .as_object_mut()
+                .expect("tools object")
+                .remove("subagentsRunning");
+        }
+        let stripped = serde_json::to_string(&value).expect("re-serialize");
+        let back: StatusPayload =
+            serde_json::from_str(&stripped).expect("deserialize without subagentsRunning field");
+        assert_eq!(
+            back.sessions[0].tools.subagents_running, 0,
+            "missing subagentsRunning field on the wire defaults to 0, not a decode error"
         );
     }
 

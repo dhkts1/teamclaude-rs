@@ -13,7 +13,8 @@
 //! - [`WireSessionTracker`]: the bounded, in-memory table one request's parsed events get
 //!   folded into. No I/O, no locking — [`crate::manager::Manager`] wraps one in a `Mutex`.
 //!
-//! `command_head` (a Bash tool's `input.command`, capped to 120 chars) is held ONLY in this
+//! `command_head` (a Bash tool's `input.command`, or an `Agent`/`Task` tool's
+//! `input.subagent_type: input.description`, capped to 120 chars) is held ONLY in this
 //! in-memory table — never written to `~/.cache/teamclaude/logs` or any other file. That is
 //! the same body-content-never-hits-disk rule `src/proxy.rs` states for the request log.
 
@@ -25,8 +26,11 @@ use serde_json::Value;
 pub struct ToolUseEvent {
     pub id: String,
     pub name: Option<String>,
-    /// First 120 characters of `input.command`, only for a `Bash` tool call. Held in memory
-    /// only — see the module doc's no-body-content-on-disk rule.
+    /// For a `Bash` tool call, the first 120 characters of `input.command`. For an `Agent` or
+    /// `Task` tool call (a running subagent), `input.description` (Claude Code's 3-5 word
+    /// summary), prefixed with `input.subagent_type` when present (`"henry:coder: F4 subagents
+    /// on the wire"`), same 120-char cap. `None` for any other tool. Held in memory only — see
+    /// the module doc's no-body-content-on-disk rule.
     pub command_head: Option<String>,
 }
 
@@ -127,14 +131,26 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
             match (msg.role.as_str(), b.kind.as_str()) {
                 ("assistant", "tool_use") => {
                     if let Some(id) = b.id {
-                        let command_head = if b.name.as_deref() == Some("Bash") {
-                            b.input
+                        let command_head = match b.name.as_deref() {
+                            Some("Bash") => b
+                                .input
                                 .as_ref()
                                 .and_then(|v| v.get("command"))
                                 .and_then(Value::as_str)
-                                .map(|s| s.chars().take(COMMAND_HEAD_MAX).collect())
-                        } else {
-                            None
+                                .map(|s| s.chars().take(COMMAND_HEAD_MAX).collect()),
+                            Some("Agent") | Some("Task") => b.input.as_ref().and_then(|input| {
+                                let description =
+                                    input.get("description").and_then(Value::as_str)?;
+                                let head = match input.get("subagent_type").and_then(Value::as_str)
+                                {
+                                    Some(subagent_type) => {
+                                        format!("{subagent_type}: {description}")
+                                    }
+                                    None => description.to_string(),
+                                };
+                                Some(head.chars().take(COMMAND_HEAD_MAX).collect())
+                            }),
+                            _ => None,
                         };
                         tool_uses.push(ToolUseEvent {
                             id,
@@ -379,6 +395,24 @@ mod tests {
         })
     }
 
+    fn agent_tool_use(
+        id: &str,
+        name: &str,
+        description: &str,
+        subagent_type: Option<&str>,
+    ) -> Value {
+        let mut input = serde_json::json!({"description": description});
+        if let Some(st) = subagent_type {
+            input["subagent_type"] = Value::String(st.to_string());
+        }
+        serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+        })
+    }
+
     fn tool_result(id: &str, is_error: bool, text: &str) -> Value {
         serde_json::json!({
             "type": "tool_result",
@@ -421,6 +455,43 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "tu_1");
         assert!(!results[0].is_error);
+    }
+
+    #[test]
+    fn extract_tool_events_fills_command_head_for_an_agent_tool_with_subagent_type() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [agent_tool_use(
+                "tu_agent",
+                "Agent",
+                "F4 subagents on the wire",
+                Some("henry:coder"),
+            )]},
+        ]);
+        let raw = messages_raw(messages);
+        let (uses, _results) = extract_tool_events(&raw);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(
+            uses[0].command_head.as_deref(),
+            Some("henry:coder: F4 subagents on the wire")
+        );
+    }
+
+    #[test]
+    fn extract_tool_events_fills_command_head_for_a_task_tool_without_subagent_type() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [agent_tool_use(
+                "tu_task",
+                "Task",
+                "review the diff",
+                None,
+            )]},
+        ]);
+        let raw = messages_raw(messages);
+        let (uses, _results) = extract_tool_events(&raw);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].command_head.as_deref(), Some("review the diff"));
     }
 
     #[test]
