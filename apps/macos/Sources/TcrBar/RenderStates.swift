@@ -693,7 +693,13 @@ enum RenderStates {
                         ToolBucketRow(tool: "Bash", calls: 15_000, secondsP50: 2.0),
                         ToolBucketRow(tool: "Agent", calls: 200, secondsP50: 380),
                         ToolBucketRow(tool: "Read", calls: 2_000, secondsP50: 0.2),
-                    ])),
+                    ]),
+                // Rising, per the mockup's own aria-label on this session's spark:
+                // "Requests per minute over the last 30 minutes: rising".
+                reqPerMinute: [
+                    2, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8,
+                    10, 9, 11, 10, 12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17,
+                ]),
             Session(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "alice@example.com",
                 model: "claude-sonnet-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
@@ -711,7 +717,12 @@ enum RenderStates {
                         ToolBucketRow(tool: "Bash", calls: 4_913, secondsP50: 2.3),
                         ToolBucketRow(tool: "Agent", calls: 212, secondsP50: 400),
                         ToolBucketRow(tool: "Grep", calls: 2_352, secondsP50: 0.2),
-                    ])),
+                    ]),
+                // Falling, per the mockup's aria-label on this session's spark.
+                reqPerMinute: [
+                    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 4, 4, 3,
+                    3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+                ]),
             Session(
                 sessionId: "cccccccc-1111-2222-3333-444444444444", account: nil,
                 model: "claude-sonnet-5", firstSeenMs: msAgo(45 * 60), lastSeenMs: msAgo(40 * 60),

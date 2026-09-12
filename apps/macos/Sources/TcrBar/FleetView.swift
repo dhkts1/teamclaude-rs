@@ -614,21 +614,39 @@ struct FleetView: View {
     private func sessionRow(_ row: JoinedSession) -> some View {
         VStack(alignment: .leading, spacing: Tok.space1) {
             HStack(spacing: Tok.tightSpacing) {
+                // Busy/waiting get a halo ring — `docs/design/panel-tabs-mockup.html`'s
+                // `.dot.busy`/`.dot.wait` box-shadow — idle stays a bare dot,
+                // the same "the color-alone trigger never fires" the review
+                // already credits this row for (the text beside it always
+                // says the state too).
                 Circle()
                     .fill(activityColor(row.activity))
                     .frame(width: 8, height: 8)
+                    .background(
+                        Circle().fill(activityColor(row.activity).opacity(0.18))
+                            .frame(width: 16, height: 16)
+                            .opacity(row.activity == .idle || row.activity == .unknown ? 0 : 1)
+                    )
                 Text(row.displayName).font(.subheadline.weight(.semibold))
-                if let project = row.project {
-                    Text(project).font(Tok.secondaryFont).foregroundStyle(Tok.inkDim)
-                }
+                Text(sessionSubtitle(row))
+                    .font(Tok.secondaryFont)
+                    .foregroundStyle(Tok.inkDim)
+                    .lineLimit(1)
                 Spacer()
+                if let series = row.session.reqPerMinute, !series.isEmpty {
+                    Sparkline(values: series)
+                        .stroke(Tok.accent, lineWidth: 1.5)
+                        .frame(width: 44, height: 14)
+                }
             }
             HStack(spacing: Tok.tightSpacing) {
                 Text("\(row.session.requests) req")
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: row.session.requests)
-                if let model = row.session.model { Text(model) }
+                if let cache = cacheHitPercent(row.session) {
+                    Text("· cache \(cache)%").monospacedDigit()
+                }
                 Spacer()
                 // A rolling digit transition here would need this string's
                 // VALUE, not its rendered text, to drive `.animation(value:)`
@@ -641,6 +659,24 @@ struct FleetView: View {
             .foregroundStyle(Tok.inkDim)
         }
         .padding(.vertical, Tok.space1)
+    }
+
+    /// "teamclaude-rs · fable-5" — project and model on the session's title
+    /// row, `docs/design/panel-tabs-mockup.html`'s `.sub`. Neither, one, or
+    /// both may be missing (no session file, no reported model); this joins
+    /// only what's present rather than drawing a bare "·".
+    private func sessionSubtitle(_ row: JoinedSession) -> String {
+        [row.project, row.session.model].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    /// `cacheReadTokens / (inputTokens + cacheReadTokens)`, the same ratio
+    /// the account-level cache figure already uses elsewhere in this build.
+    /// `nil` when the session has recorded no tokens at all yet, rather than
+    /// a divide-by-zero "0%" that would claim a measured cold cache.
+    private func cacheHitPercent(_ session: Session) -> Int? {
+        let total = session.inputTokens + session.cacheReadTokens
+        guard total > 0 else { return nil }
+        return Int((Double(session.cacheReadTokens) / Double(total) * 100).rounded())
     }
 
     /// `docs/design/panel-tabs-review.md` finding 2: a session with a tool
@@ -915,7 +951,8 @@ struct FleetView: View {
         line =
             line + Text(" · ").foregroundColor(Tok.inkFaint)
             + Text("\(idle) idle").foregroundColor(Tok.inkDim)
-        return line
+        return
+            line
             .font(Tok.secondaryDigitFont)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.top, Tok.tightSpacing)
@@ -941,7 +978,8 @@ struct FleetView: View {
                 line + Text(" · ").foregroundColor(Tok.inkFaint)
                 + Text("\(fleet.toolsTotalTimeouts) hit the 600s timeout").foregroundColor(Tok.spent)
         }
-        return line
+        return
+            line
             .font(Tok.secondaryDigitFont)
             .fixedSize(horizontal: false, vertical: true)
             .padding(.top, Tok.tightSpacing)
@@ -1905,6 +1943,30 @@ enum PanelTab: Equatable, CaseIterable {
         case .sessions: return "person.2"
         case .tools: return "terminal"
         }
+    }
+}
+
+/// A session row's req/min trend — `docs/design/panel-tabs-mockup.html`'s
+/// `.spark` polyline. Draws `nil`/negative values as zero rather than
+/// crashing the normalisation on an empty range; a flat all-zero series
+/// still draws a flat line at the bottom, which is the honest shape for
+/// "measured, and nothing happened."
+struct Sparkline: Shape {
+    let values: [UInt16]
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard values.count > 1 else { return path }
+        let maxValue = max(1, Double(values.max() ?? 1))
+        let stepX = rect.width / CGFloat(values.count - 1)
+        func point(_ index: Int) -> CGPoint {
+            let x = CGFloat(index) * stepX
+            let y = rect.height * (1 - CGFloat(Double(values[index]) / maxValue))
+            return CGPoint(x: x, y: y)
+        }
+        path.move(to: point(0))
+        for i in 1..<values.count { path.addLine(to: point(i)) }
+        return path
     }
 }
 

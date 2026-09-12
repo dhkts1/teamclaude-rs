@@ -1031,6 +1031,12 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
     public let outputTokens: Int
     public let cacheReadTokens: Int
     public let tools: SessionTools
+    /// Requests seen in each of the last 30 wall-clock minutes, oldest first
+    /// — `data/plans/wire-2-bridge.md`'s `req_per_minute`, the Sessions tab's
+    /// sparkline. `nil`, not an all-zero series, when the server doesn't
+    /// send it yet: a flat line at zero would claim a measured idle session,
+    /// which an unmeasured one is not.
+    public let reqPerMinute: [UInt16]?
 
     public var id: String { sessionId }
 
@@ -1044,7 +1050,8 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         inputTokens: Int = 0,
         outputTokens: Int = 0,
         cacheReadTokens: Int = 0,
-        tools: SessionTools = SessionTools()
+        tools: SessionTools = SessionTools(),
+        reqPerMinute: [UInt16]? = nil
     ) {
         self.sessionId = sessionId
         self.account = account
@@ -1056,6 +1063,28 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         self.outputTokens = outputTokens
         self.cacheReadTokens = cacheReadTokens
         self.tools = tools
+        self.reqPerMinute = reqPerMinute
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionId, account, model, firstSeenMs, lastSeenMs, requests, inputTokens,
+            outputTokens, cacheReadTokens, tools
+        case reqPerMinute = "req_per_minute"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        sessionId = try c.decode(String.self, forKey: .sessionId)
+        account = try c.decodeIfPresent(String.self, forKey: .account)
+        model = try c.decodeIfPresent(String.self, forKey: .model)
+        firstSeenMs = try c.decode(Int64.self, forKey: .firstSeenMs)
+        lastSeenMs = try c.decode(Int64.self, forKey: .lastSeenMs)
+        requests = try c.decodeIfPresent(Int.self, forKey: .requests) ?? 0
+        inputTokens = try c.decodeIfPresent(Int.self, forKey: .inputTokens) ?? 0
+        outputTokens = try c.decodeIfPresent(Int.self, forKey: .outputTokens) ?? 0
+        cacheReadTokens = try c.decodeIfPresent(Int.self, forKey: .cacheReadTokens) ?? 0
+        tools = try c.decodeIfPresent(SessionTools.self, forKey: .tools) ?? SessionTools()
+        reqPerMinute = try c.decodeIfPresent([UInt16].self, forKey: .reqPerMinute)
     }
 }
 
