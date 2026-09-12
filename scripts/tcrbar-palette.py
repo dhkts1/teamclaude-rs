@@ -71,6 +71,16 @@ SURFACES = {
     "track":        (0.320, 0.012, HUE_SURFACE),   # empty quota bar
     "hairline":     (0.360, 0.012, HUE_SURFACE),   # 0.5pt dividers
     "hairlineHigh": (0.460, 0.014, HUE_SURFACE),   # emphasised divider / border
+    # v4 sheet names (`data/plans/v4-spec.md`) for two colours this ramp
+    # already has, not two new hues: the sheet's card fill is
+    # `rgba(255,255,255,.045)` over the panel, and this ramp's own steps are
+    # already +0.045 L apart -- exactly the lift that overlay produces, so
+    # `cardFill` reuses `raised` in full rather than re-deriving a value the
+    # ramp already emits. `cardLine` (`rgba(255,255,255,.09)`, the sheet's
+    # card border / divider) reuses `hairline`, the token this file already
+    # authors for that exact role.
+    "cardFill":     (0.245, 0.012, HUE_SURFACE),   # == raised
+    "cardLine":     (0.360, 0.012, HUE_SURFACE),   # == hairline
 }
 
 # Ink: warm-neutral off-white. Never pure white on a dark panel -- it vibrates.
@@ -78,6 +88,12 @@ INK = {
     "ink":      (0.960, 0.004, 95),   # primary text
     "inkDim":   (0.800, 0.006, 95),   # secondary
     "inkFaint": (0.660, 0.008, 95),   # tertiary / hints
+    # v4 sheet names for the same two roles: `dim` (secondary) and `mute`
+    # (tertiary). The sheet's own hexes (#bfbfc7, #9a9aa3) are a hair off
+    # `inkDim`/`inkFaint`'s, not enough to justify a second, separately-
+    # measured value for a role this ramp already clears AA on.
+    "dim":      (0.800, 0.006, 95),   # == inkDim
+    "mute":     (0.660, 0.008, 95),   # == inkFaint
 }
 
 # Status hues.
@@ -123,12 +139,16 @@ LIGHT_SURFACES = {
     "track":        (0.870, 0.006, HUE_SURFACE),
     "hairline":     (0.830, 0.006, HUE_SURFACE),
     "hairlineHigh": (0.720, 0.008, HUE_SURFACE),
+    "cardFill":     (0.935, 0.004, HUE_SURFACE),   # == raised, see SURFACES
+    "cardLine":     (0.830, 0.006, HUE_SURFACE),   # == hairline, see SURFACES
 }
 
 LIGHT_INK = {
     "ink":      (0.180, 0.006, 95),
     "inkDim":   (0.400, 0.008, 95),
     "inkFaint": (0.490, 0.010, 95),
+    "dim":      (0.400, 0.008, 95),   # == inkDim, see INK
+    "mute":     (0.490, 0.010, 95),   # == inkFaint, see INK
 }
 
 # On a light panel the same hue must go DARKER, not lighter, to keep contrast --
