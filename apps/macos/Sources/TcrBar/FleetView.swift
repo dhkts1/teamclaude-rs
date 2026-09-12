@@ -490,6 +490,14 @@ struct FleetView: View {
 
     private func accountRow(_ row: FleetSectionRow, fleet: Fleet) -> some View {
         let account = row.account
+        // The group name this row is drawn under, if any — so the row can
+        // suppress the one tag that would only restate the heading directly
+        // above it. `nil` for the ungrouped pile, which carries no group name
+        // to restate in the first place.
+        let enclosingGroupName: String? = {
+            if case .named(let name) = row.group { return name }
+            return nil
+        }()
         return AccountRow(
             account: account,
             countersAreStructural: fleet.source.countersAreStructural,
@@ -502,6 +510,7 @@ struct FleetView: View {
             groupController: groupController,
             removeController: removeController,
             allAccounts: fleet.accounts,
+            enclosingGroupName: enclosingGroupName,
             snapshotMode: snapshotMode
         )
         .background(
@@ -640,8 +649,17 @@ struct FleetView: View {
             // original trailing-alignment was reaching for the right thing
             // ("without needing a rule between them"); only its method was
             // wrong. Space groups these two without adding weight.
+            //
+            // The padding used to match `Tok.tightSpacing` — the same value
+            // as the intra-group gap between buttons in `fleetActions` and
+            // `appActions` themselves — so the two six-button rows read as
+            // one undifferentiated block (`--render-states`, `01g-widest-row`).
+            // `Tok.space4`, stacked on this `VStack`'s own `Tok.tightSpacing`
+            // gap between children, puts the inter-group gap at 16pt against
+            // an intra-group gap of 4pt: four times it, comfortably past the
+            // "at least twice" floor.
             appActions
-                .padding(.top, Tok.tightSpacing)
+                .padding(.top, Tok.space4)
 
             if let loginError {
                 Text(loginError)
@@ -1128,6 +1146,12 @@ struct AccountRow: View {
     /// account is not already in, not just the ones visible in whatever
     /// section this row happens to be drawn under.
     let allAccounts: [Account]
+    /// The name of the group section this row is currently drawn under, or
+    /// `nil` for the ungrouped pile. Used only to suppress that ONE tag in
+    /// ``designationsLine`` — see its doc-comment — never to filter or reorder
+    /// ``Account/groupTags`` itself, which still lists every group this
+    /// account belongs to.
+    var enclosingGroupName: String?
     /// Mirrors ``FleetView/snapshotMode``. `ImageRenderer` cannot draw a
     /// `Menu` — it rasterises the yellow "unsupported control" placeholder
     /// the README hero used to ship — so a snapshot draws
@@ -1423,10 +1447,24 @@ struct AccountRow: View {
     /// is part of the row's IDENTITY rather than a fact about it. It is here at
     /// all only because line one has no room for it; putting it first keeps the
     /// two halves as close to each other as two lines allow.
+    ///
+    /// ``Account/groupTags`` with the ONE tag naming the section this row is
+    /// already drawn under removed. An account in two groups renders once per
+    /// group, so inside the `henry-team-parked` heading a `HENRY-TEAM-PARKED`
+    /// pill restated the heading directly above it on every card in that
+    /// section — no reader needed the reminder, and it was the single biggest
+    /// remaining contributor to this line's width. The other groups an account
+    /// belongs to still show: this drops exactly the one tag whose fact is
+    /// already on screen, never the others.
+    private var visibleGroupTags: [GroupTag] {
+        guard let enclosingGroupName else { return account.groupTags }
+        return account.groupTags.filter { $0.name != enclosingGroupName }
+    }
+
     @ViewBuilder
     private var designationsLine: some View {
         if account.ref.displayHalves.orgTag != nil || account.plan != nil
-            || !account.groupTags.isEmpty
+            || !visibleGroupTags.isEmpty
         {
             HStack(spacing: Tok.tightSpacing) {
                 orgIndicator
@@ -1435,12 +1473,12 @@ struct AccountRow: View {
                 // tooltip names them all. The cap stays even with a line to
                 // itself: an account can be in many groups, and this line has a
                 // budget too — it is just a far larger one.
-                ForEach(Array(account.groupTags.prefix(2))) { tag in
+                ForEach(Array(visibleGroupTags.prefix(2))) { tag in
                     GroupChip(tag: tag)
                 }
-                if account.groupTags.count > 2 {
-                    StatusPill("+\(account.groupTags.count - 2)", tint: Tok.inkFaint)
-                        .help(account.groupTags.map(\.name).joined(separator: ", "))
+                if visibleGroupTags.count > 2 {
+                    StatusPill("+\(visibleGroupTags.count - 2)", tint: Tok.inkFaint)
+                        .help(visibleGroupTags.map(\.name).joined(separator: ", "))
                 }
                 Spacer(minLength: 0)
             }
@@ -2182,6 +2220,35 @@ struct AccountRow: View {
         )
     }
 
+    /// ``AccountRef/displayHalves``'s email half, with a break OPPORTUNITY
+    /// inserted right after `@` — never a break forced.
+    ///
+    /// An email has no spaces, so SwiftUI's line breaker sees it as one
+    /// unbreakable word and, when it overflows the row, falls back to
+    /// splitting wherever it runs out of width — `01g-widest-row`'s
+    /// `henry.fitzgerald@example.com` wrapped as `henry.fitzgerald@ex` /
+    /// `ample.com`, a character split mid-domain that defeats scanning. A
+    /// zero-width space (`U+200B`) renders as nothing but IS a legal break
+    /// point, so a wrap now lands where a reader already expects an address
+    /// to fold: right after the `@`.
+    ///
+    /// This string is what the `Text` below DRAWS, not what a user should
+    /// COPY: the inserted `U+200B` is invisible but real, so a drag-select
+    /// copy of this text would paste `henry.fitzgerald@<U+200B>example.com`
+    /// — a credential-adjacent string silently broken by an invisible
+    /// character, with nothing on screen explaining why a login form
+    /// rejected it. That is why `.textSelection` is deliberately OFF this
+    /// `Text` (do not re-enable it without solving that first). The
+    /// sanctioned way to get the real address is `.help(account.name)` on
+    /// hover, or the row's own `Button("Copy Account Name")`, both of which
+    /// read `account.name` directly and never see this hint.
+    private var emailWithBreakHint: String {
+        let email = account.ref.displayHalves.email
+        guard let atIndex = email.firstIndex(of: "@") else { return email }
+        let afterAt = email.index(after: atIndex)
+        return email[..<afterAt] + "\u{200B}" + email[afterAt...]
+    }
+
     private var information: some View {
         VStack(alignment: .leading, spacing: Tok.rowLineSpacing) {
             HStack(spacing: Tok.tightSpacing) {
@@ -2209,13 +2276,16 @@ struct AccountRow: View {
                 // `fixedSize(horizontal:vertical:)` is what makes the wrap
                 // real: without it the `Text` reports the one-line height it
                 // was offered and clips, rather than growing.
-                Text(account.ref.displayHalves.email)
+                // No `.textSelection` here — see ``emailWithBreakHint``: this
+                // string carries an invisible break hint a drag-select copy
+                // would paste verbatim. `.help` below and "Copy Account
+                // Name" are the sanctioned ways to get the real address.
+                Text(emailWithBreakHint)
                     .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                     .help(account.name)
-                    .textSelection(.enabled)
                 controlIndicator
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
