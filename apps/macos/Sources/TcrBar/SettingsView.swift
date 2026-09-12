@@ -33,11 +33,16 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 /// outside the view tree, the same shape `macos-settings-ui`'s own reference
 /// uses. `ObservableObject`, not `@Observable` — this package's platform
 /// floor is macOS 13 (`Package.swift`), and the macro needs 14.
+///
+/// `init()` is plain, not `private`, so a test or a harness can construct an
+/// independent instance instead of mutating `.shared` in place — used by
+/// nothing today (``RenderSettings`` renders each pane's `Form` directly and
+/// never routes through this navigation object at all — see that type's own
+/// doc-comment for why), kept for the next caller that needs one.
 @MainActor
 final class SettingsNavigation: ObservableObject {
     static let shared = SettingsNavigation()
     @Published var selectedTab: SettingsTab? = .general
-    private init() {}
 }
 
 /// `NavigationSplitView` sidebar + detail, back/forward toolbar navigation —
@@ -48,10 +53,18 @@ final class SettingsNavigation: ObservableObject {
 struct SettingsRootView: View {
     let dependencies: SettingsDependencies
 
-    @ObservedObject private var navigation = SettingsNavigation.shared
+    /// Defaults to the shared singleton for real use
+    /// (`SettingsWindowController`); the render harness passes a fresh
+    /// instance per capture — see ``SettingsNavigation``'s own doc-comment.
+    @ObservedObject private var navigation: SettingsNavigation
     @State private var navigationHistory: [SettingsTab] = [.general]
     @State private var historyIndex = 0
     @State private var isHistoryNavigation = false
+
+    init(dependencies: SettingsDependencies, navigation: SettingsNavigation = .shared) {
+        self.dependencies = dependencies
+        self.navigation = navigation
+    }
 
     private var activeTab: SettingsTab {
         navigation.selectedTab ?? .general

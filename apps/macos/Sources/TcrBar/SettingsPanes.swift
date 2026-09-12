@@ -448,6 +448,18 @@ struct UpdatesSettingsPane: View {
         AppBuild.label ?? "TcrBar (development build)"
     }
 
+    /// The resolved `tcr` path this app would shell out to, per the same
+    /// search `TcrTool.resolve()` uses for every poll and command — never a
+    /// guess, and distinct from `TcrTool.overrideRemedy` (that string is the
+    /// FIX for when nothing was found, not a path to display when something
+    /// was).
+    private var installedCliPath: String {
+        switch TcrTool.resolve() {
+        case .success(let url): return url.path
+        case .failure: return "Not found. " + TcrTool.overrideRemedy
+        }
+    }
+
     var body: some View {
         Form {
             Section {
@@ -474,7 +486,7 @@ struct UpdatesSettingsPane: View {
                     Text(server.state.summary).foregroundStyle(.secondary).lineLimit(2)
                 }
                 LabeledContent("Command-line tcr") {
-                    Text(TcrTool.overrideRemedy).font(.caption).foregroundStyle(.secondary)
+                    Text(installedCliPath).font(.caption).foregroundStyle(.secondary)
                         .lineLimit(2)
                 }
                 Text(
