@@ -40,6 +40,16 @@ echo "start" > "$SCRATCH/file.txt"
 git -C "$SCRATCH" add file.txt .githooks
 git -C "$SCRATCH" commit -q --no-verify -m "init"
 
+# A remote from the start, because the gate's range is "what no remote ref already
+# carries". A repo with no remote at all has nothing to subtract, so every case
+# below would scan the whole history and trip over an earlier case's fixtures.
+# Reality always has a remote; the fixture should too.
+SCRATCH_REMOTE="$WORK/remote.git"
+git init -q --bare "$SCRATCH_REMOTE"
+git -C "$SCRATCH" remote add origin "$SCRATCH_REMOTE"
+git -C "$SCRATCH" push -q origin HEAD:refs/heads/main
+git -C "$SCRATCH" fetch -q origin
+
 commit_file() {  # <message>
   git -C "$SCRATCH" commit -q --no-verify -m "$1" file.txt
 }
@@ -99,6 +109,11 @@ else
 fi
 
 # ── The control: a clean commit must PASS ───────────────────────────────────
+# From a base that is actually on the remote. The two refusal fixtures above are
+# still on this branch and are NOT pushed, so a range measured from here would
+# legitimately include them: the gate would be right to refuse, and the control
+# would be testing the wrong thing. Throw them away first.
+git -C "$SCRATCH" reset -q --hard origin/main
 echo "an entirely ordinary line" >> "$SCRATCH/file.txt"
 commit_file "chore: an ordinary change"
 GOOD_SHA="$(git -C "$SCRATCH" rev-parse HEAD)"
@@ -125,6 +140,48 @@ else
   ok "the denylist file is excluded from the scan"
 fi
 git -C "$SCRATCH" reset -q
+
+# ── An already-public commit arriving via a merge must NOT be rescanned ──────
+# The regression that produced this case: merging `main` into a feature branch to
+# bring it up to date makes main's commits new to THAT ref, so a plain
+# `remote..local` range handed them to the scan even though every one of them was
+# already pushed and world-readable. The hook refused its own author's push on
+# 2026-09-12 over two addresses in a dependabot commit message already on `main`.
+# A gate that refuses the ordinary act of updating a branch gets turned off.
+# A commit on "main" whose MESSAGE would trip the scan, pushed and therefore public.
+# The two sides touch DIFFERENT files on purpose: appending to one file from both
+# makes the merge below conflict, and a conflicted merge leaves HEAD where it was,
+# so the range under test is trivially clean and the case passes for the wrong
+# reason. That is not hypothetical either — the first version of this case did
+# exactly that and a mutant survived it.
+echo "upstream work" > "$SCRATCH/upstream.txt"
+git -C "$SCRATCH" add upstream.txt
+git -C "$SCRATCH" commit -q --no-verify -m "chore: a message naming AcmeCorp-Private, already public"
+PUBLIC_SHA="$(git -C "$SCRATCH" rev-parse HEAD)"
+git -C "$SCRATCH" push -q origin HEAD:refs/heads/main
+git -C "$SCRATCH" fetch -q origin
+
+# A feature branch that merges it in, then pushes. Nothing of ITS own discloses.
+git -C "$SCRATCH" checkout -q -b feature "$PUBLIC_SHA~1"
+echo "my own clean work" > "$SCRATCH/mine.txt"
+git -C "$SCRATCH" add mine.txt
+git -C "$SCRATCH" commit -q --no-verify -m "chore: an ordinary change of my own"
+FEATURE_BASE="$(git -C "$SCRATCH" rev-parse HEAD)"
+git -C "$SCRATCH" merge -q --no-ff --no-verify -m "merge: origin/main" "$PUBLIC_SHA"
+if [ "$(git -C "$SCRATCH" rev-parse HEAD)" = "$FEATURE_BASE" ]; then
+  fail "the fixture's merge did not move HEAD, so this case would pass for the wrong reason"
+fi
+if ! git -C "$SCRATCH" merge-base --is-ancestor "$PUBLIC_SHA" HEAD; then
+  fail "the fixture's merge did not bring the public commit in; the case proves nothing"
+fi
+out="$(printf 'refs/heads/feature %s refs/heads/feature %s\n' "$(git -C "$SCRATCH" rev-parse HEAD)" "$FEATURE_BASE" | "$SCRATCH/.githooks/pre-push" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "a commit already on a remote is not rescanned when merged in"
+else
+  fail "merging public history into a branch was refused (rc=$rc): $(printf '%s' "$out" | head -3)"
+fi
+git -C "$SCRATCH" checkout -q -
 
 # ── The gate cannot silently degrade ────────────────────────────────────────
 rm "$SCRATCH/.githooks/lib/disclosure-scan.sh"
