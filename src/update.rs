@@ -1339,6 +1339,41 @@ mod tests {
         assert_eq!(open_handoff_argv(), ["-g", "tcrbar://check-for-updates"]);
     }
 
+    /// The literal assert above pins the constant against itself — it would
+    /// pass even if the app shipped under a different id. Bind it to the
+    /// actual shipped identity instead: the build script's unconditional
+    /// `bundle_id="..."` assignment (`apps/macos/scripts/build-tcrbar.sh`),
+    /// which is what lands in `Info.plist` (the plist itself only ever writes
+    /// `$bundle_id`, a shell variable, so the assignment is the one place the
+    /// real string lives).
+    #[test]
+    fn the_bundle_id_constant_matches_the_shipped_build_script() {
+        let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("apps")
+            .join("macos")
+            .join("scripts")
+            .join("build-tcrbar.sh");
+        let script = fs::read_to_string(&script_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", script_path.display()));
+        let shipped_id = script
+            .lines()
+            .find_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("bundle_id=\"")
+                    .and_then(|rest| rest.strip_suffix('"'))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `bundle_id=\"...\"` assignment found in {}",
+                    script_path.display()
+                )
+            });
+        assert_eq!(
+            shipped_id, TCRBAR_BUNDLE_ID,
+            "the build script's shipped bundle id has drifted from TCRBAR_BUNDLE_ID"
+        );
+    }
+
     /// If we print a command, the binary it names has to be there — the same
     /// rule `the_recommended_app_installer_script_exists` enforces for the
     /// installer path.
