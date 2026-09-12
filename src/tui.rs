@@ -1661,6 +1661,7 @@ mod tests {
             recent: vec![],
             sessions: vec![],
             wire_sessions: vec![],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
         }
     }
 
@@ -2003,6 +2004,7 @@ mod tests {
             recent: vec![],
             sessions: vec![diverted("a1f3", "alice", "bob", 24, Some(100))],
             wire_sessions: vec![],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
         };
         let backend = TestBackend::new(48, 8);
         let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");

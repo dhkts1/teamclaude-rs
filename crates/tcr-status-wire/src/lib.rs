@@ -125,9 +125,10 @@ pub struct HeldWindowRow {
 pub struct RunningToolRow {
     pub tool: String,
     pub started_ms: i64,
-    /// First 120 characters of a Bash tool's `input.command` — `None` for any other tool, or
-    /// when the running call carries no command. Held in memory only on the server; never
-    /// written to a log (see `src/session_wire.rs`'s module doc in the main crate).
+    /// A Bash tool's `input.command`, or an `Agent`/`Task` tool's `input.subagent_type:
+    /// input.description` — `None` for any other tool, or when the running call carries
+    /// neither. Held in memory only on the server; never written to a log (see
+    /// `src/session_wire.rs`'s module doc in the main crate).
     pub command_head: Option<String>,
 }
 
@@ -141,6 +142,27 @@ pub struct SlowToolRow {
     pub ended_ms: i64,
 }
 
+/// One tool's aggregate call stats, for a session's (or the fleet's) "BY TOOL" breakdown
+/// (wire 2, `data/plans/wire-2-bridge.md`). `tool` is the wire's `tool_use.name` verbatim —
+/// `Read`, `Grep`, `Glob` and `Edit` are deliberately NOT merged server-side; a panel groups
+/// them if it wants to.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolBucketRow {
+    pub tool: String,
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub errors: u64,
+    /// Median duration (seconds) over a bounded reservoir of the most recent completed
+    /// calls — see `src/session_wire.rs` in the main crate.
+    #[serde(default)]
+    pub seconds_p50: f64,
+    /// Completed calls of this tool whose duration was 60 seconds or more.
+    #[serde(default)]
+    pub over_one_minute: u64,
+}
+
 /// A session's tool-call aggregates.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,12 +173,49 @@ pub struct SessionToolsRow {
     pub errors: u64,
     #[serde(default)]
     pub timeouts: u64,
+    /// Completed calls (any tool) whose duration was 60 seconds or more — the session-wide
+    /// total; [`ToolBucketRow::over_one_minute`] carries the same count per tool.
+    /// `#[serde(default)]` so a payload from a server built before this field existed decodes
+    /// as "none known" rather than a parse failure.
+    #[serde(default)]
+    pub over_one_minute: u64,
     /// Tool calls still awaiting a `tool_result`, capped at 64 per session.
     #[serde(default)]
     pub running: Vec<RunningToolRow>,
+    /// The count of [`Self::running`] entries whose `tool` is `Agent` or `Task` — a running
+    /// subagent — so a panel can print "2 subagents" without scanning the list. `#[serde(default)]`
+    /// so a payload from a server built before this field existed decodes as "no subagents known"
+    /// rather than a parse failure.
+    #[serde(default)]
+    pub subagents_running: u64,
     /// The ten slowest completed tool calls, descending by `seconds`.
     #[serde(default)]
     pub slowest: Vec<SlowToolRow>,
+    /// Per-tool breakdown for this session's "BY TOOL" section. `#[serde(default)]` so a
+    /// payload from a server built before this field existed decodes as "no breakdown known"
+    /// rather than a parse failure.
+    #[serde(default)]
+    pub by_tool: Vec<ToolBucketRow>,
+}
+
+/// Fleet-wide tool-call totals, summed server-side across every live session — so a panel's
+/// headline and "BY TOOL" bars read from the SAME numbers as the per-session rows and cannot
+/// disagree with them by re-summing client-side (wire 2, `data/plans/wire-2-bridge.md`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionsSummary {
+    #[serde(default)]
+    pub calls: u64,
+    #[serde(default)]
+    pub over_one_minute: u64,
+    #[serde(default)]
+    pub timeouts: u64,
+    #[serde(default)]
+    pub by_tool: Vec<ToolBucketRow>,
+    /// Sum of [`SessionRow::cost_usd`] across every live session — see that field's
+    /// doc-comment for what the number means and does not mean.
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// One live session on the `tcr status --json` wire's `sessions` array (F1,
@@ -189,6 +248,21 @@ pub struct SessionRow {
     pub cache_read_tokens: u64,
     #[serde(default)]
     pub tools: SessionToolsRow,
+    /// Requests seen for this session in each of the last 30 wall-clock minutes, oldest
+    /// first, exactly 30 entries — a ring buffer that decays to zeros as a session goes
+    /// idle. `#[serde(default)]` so a payload from a server built before this field existed
+    /// decodes as an empty sparkline rather than a parse failure.
+    #[serde(default)]
+    pub req_per_minute: Vec<u16>,
+    /// This session's usage priced through `src/pricing.rs`, server-side, from a per-model
+    /// token tally kept on the session — a session that spans two models sums each model's
+    /// own price rather than being priced once against whichever model is current. Same
+    /// list-price-equivalent meaning as [`UsageTotals::cost_usd`], but plain `f64` rather than
+    /// `Option`: a model this proxy cannot price contributes `0.0` here rather than making the
+    /// whole session's figure absent. `#[serde(default)]` so a payload from a server built
+    /// before this field existed decodes as `0.0` rather than a parse failure.
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// One account's row on the `tcr status --json` wire.

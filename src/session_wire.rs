@@ -13,7 +13,8 @@
 //! - [`WireSessionTracker`]: the bounded, in-memory table one request's parsed events get
 //!   folded into. No I/O, no locking — [`crate::manager::Manager`] wraps one in a `Mutex`.
 //!
-//! `command_head` (a Bash tool's `input.command`, capped to 120 chars) is held ONLY in this
+//! `command_head` (a Bash tool's `input.command`, or an `Agent`/`Task` tool's
+//! `input.subagent_type: input.description`, capped to 120 chars) is held ONLY in this
 //! in-memory table — never written to `~/.cache/teamclaude/logs` or any other file. That is
 //! the same body-content-never-hits-disk rule `src/proxy.rs` states for the request log.
 
@@ -25,8 +26,11 @@ use serde_json::Value;
 pub struct ToolUseEvent {
     pub id: String,
     pub name: Option<String>,
-    /// First 120 characters of `input.command`, only for a `Bash` tool call. Held in memory
-    /// only — see the module doc's no-body-content-on-disk rule.
+    /// For a `Bash` tool call, the first 120 characters of `input.command`. For an `Agent` or
+    /// `Task` tool call (a running subagent), `input.description` (Claude Code's 3-5 word
+    /// summary), prefixed with `input.subagent_type` when present (`"henry:coder: F4 subagents
+    /// on the wire"`), same 120-char cap. `None` for any other tool. Held in memory only — see
+    /// the module doc's no-body-content-on-disk rule.
     pub command_head: Option<String>,
 }
 
@@ -127,14 +131,26 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
             match (msg.role.as_str(), b.kind.as_str()) {
                 ("assistant", "tool_use") => {
                     if let Some(id) = b.id {
-                        let command_head = if b.name.as_deref() == Some("Bash") {
-                            b.input
+                        let command_head = match b.name.as_deref() {
+                            Some("Bash") => b
+                                .input
                                 .as_ref()
                                 .and_then(|v| v.get("command"))
                                 .and_then(Value::as_str)
-                                .map(|s| s.chars().take(COMMAND_HEAD_MAX).collect())
-                        } else {
-                            None
+                                .map(|s| s.chars().take(COMMAND_HEAD_MAX).collect()),
+                            Some("Agent") | Some("Task") => b.input.as_ref().and_then(|input| {
+                                let description =
+                                    input.get("description").and_then(Value::as_str)?;
+                                let head = match input.get("subagent_type").and_then(Value::as_str)
+                                {
+                                    Some(subagent_type) => {
+                                        format!("{subagent_type}: {description}")
+                                    }
+                                    None => description.to_string(),
+                                };
+                                Some(head.chars().take(COMMAND_HEAD_MAX).collect())
+                            }),
+                            _ => None,
                         };
                         tool_uses.push(ToolUseEvent {
                             id,
@@ -178,16 +194,149 @@ pub struct SlowTool {
     pub ended_ms: i64,
 }
 
+/// How many of a tool's most recent call durations are kept for [`ToolBucket::seconds_p50`] —
+/// see the bridge ("a bounded reservoir per tool for the median").
+pub const TOOL_DURATION_RESERVOIR_CAP: usize = 256;
+
+/// One tool's aggregate stats within a session — the source for `SessionToolsRow::by_tool`
+/// (`crates/tcr-status-wire`). Keyed on `tool_use.name` verbatim; `Read`, `Grep`, `Glob` and
+/// `Edit` are deliberately NOT merged here (the panel groups them) — see the bridge.
+#[derive(Debug, Clone, Default)]
+pub struct ToolBucket {
+    pub calls: u64,
+    pub errors: u64,
+    /// Completed calls of this tool whose duration was 60 seconds or more.
+    pub over_one_minute: u64,
+    /// Bounded reservoir of the last [`TOOL_DURATION_RESERVOIR_CAP`] completed calls'
+    /// durations (seconds), for a wall-clock-cheap running median.
+    durations: std::collections::VecDeque<f64>,
+}
+
+impl ToolBucket {
+    fn record(&mut self, seconds: f64, is_error: bool) {
+        self.calls += 1;
+        if is_error {
+            self.errors += 1;
+        }
+        if seconds >= 60.0 {
+            self.over_one_minute += 1;
+        }
+        self.durations.push_back(seconds);
+        if self.durations.len() > TOOL_DURATION_RESERVOIR_CAP {
+            self.durations.pop_front();
+        }
+    }
+
+    /// The median over the retained reservoir — not a true all-time median once the
+    /// reservoir has evicted older samples, which is the bounded-memory tradeoff the bridge
+    /// accepts. `0.0` on a bucket with no completed calls yet.
+    pub fn seconds_p50(&self) -> f64 {
+        if self.durations.is_empty() {
+            return 0.0;
+        }
+        let mut sorted: Vec<f64> = self.durations.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mid = sorted.len() / 2;
+        if sorted.len().is_multiple_of(2) {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        } else {
+            sorted[mid]
+        }
+    }
+}
+
 /// Per-session tool aggregates.
 #[derive(Debug, Clone, Default)]
 pub struct ToolStats {
     pub calls: u64,
     pub errors: u64,
     pub timeouts: u64,
+    /// Completed calls (any tool) whose duration was 60 seconds or more — the session-wide
+    /// total; [`ToolBucket::over_one_minute`] carries the same count per tool.
+    pub over_one_minute: u64,
     /// Keyed by `tool_use_id`. Capped at [`PENDING_TOOL_CAP`] per session.
     pub running: std::collections::HashMap<String, RunningTool>,
     /// Sorted by `seconds` descending, capped at [`SLOWEST_CAP`].
     pub slowest: Vec<SlowTool>,
+    /// Per-tool aggregates keyed on `tool_use.name`.
+    pub by_tool: std::collections::HashMap<String, ToolBucket>,
+}
+
+/// How many wall-clock minutes [`ReqPerMinuteRing`] retains.
+pub const REQ_PER_MINUTE_LEN: usize = 30;
+
+/// Requests seen in each of the last [`REQ_PER_MINUTE_LEN`] wall-clock minutes, oldest first,
+/// always exactly that many entries — the source for `SessionRow::req_per_minute`
+/// (`crates/tcr-status-wire`). Advanced on [`Self::record`] (a new request bumps the current
+/// minute's bucket) and again, read-only, by [`Self::projected`] (`snapshot` calls this so an
+/// idle session decays toward zeros instead of freezing on its last-seen minute).
+#[derive(Debug, Clone)]
+pub struct ReqPerMinuteRing {
+    buckets: std::collections::VecDeque<u16>,
+    /// The wall-clock minute number (`ms / 60_000`) the newest (last) bucket represents.
+    head_minute: i64,
+}
+
+impl Default for ReqPerMinuteRing {
+    fn default() -> Self {
+        Self {
+            buckets: std::iter::repeat_n(0, REQ_PER_MINUTE_LEN).collect(),
+            head_minute: 0,
+        }
+    }
+}
+
+impl ReqPerMinuteRing {
+    /// Shift the ring forward to `minute`, pushing a zero bucket per elapsed minute (capped
+    /// at [`REQ_PER_MINUTE_LEN`] shifts, since anything beyond that clears the whole ring
+    /// anyway). A `minute` at or before the current head is a no-op — this ring never runs
+    /// backward.
+    fn advance_to(&mut self, minute: i64) {
+        let diff = minute - self.head_minute;
+        if diff <= 0 {
+            return;
+        }
+        let shift = diff.min(REQ_PER_MINUTE_LEN as i64) as usize;
+        for _ in 0..shift {
+            self.buckets.pop_front();
+            self.buckets.push_back(0);
+        }
+        self.head_minute = minute;
+    }
+
+    fn record(&mut self, now_ms: i64) {
+        self.advance_to(now_ms.div_euclid(60_000));
+        if let Some(last) = self.buckets.back_mut() {
+            *last = last.saturating_add(1);
+        }
+    }
+
+    /// A read-only projection to `now_ms`, oldest first — never mutates stored state, so
+    /// `snapshot` (which takes `&self`) can decay an idle session's ring for display without
+    /// needing a write lock.
+    pub fn projected(&self, now_ms: i64) -> Vec<u16> {
+        let mut copy = self.clone();
+        copy.advance_to(now_ms.div_euclid(60_000));
+        copy.buckets.into_iter().collect()
+    }
+}
+
+/// Model this session has never been attributed a usage record under.
+const UNKNOWN_MODEL: &str = "unknown";
+
+/// One model's raw token tally within a session — the input to pricing, kept apart from
+/// [`WireSession::input_tokens`] and friends (the QUOTA counters, unchanged in meaning) so a
+/// session that spans two models can be priced per-model and summed, rather than priced once
+/// against whichever model happened to be current. `input` here is BASE input only (excludes
+/// both cache dimensions), matching [`crate::usage::UsageRecord::input`] — never re-derive it
+/// from `cache_5m + cache_1h + cache_read` here, since that is what pricing itself does.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelTokenTally {
+    pub input: u64,
+    pub cache_5m: u64,
+    pub cache_1h: u64,
+    pub cache_read: u64,
+    pub output: u64,
 }
 
 /// One session's row.
@@ -202,6 +351,12 @@ pub struct WireSession {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub tools: ToolStats,
+    /// See [`ReqPerMinuteRing`].
+    pub req_per_minute: ReqPerMinuteRing,
+    /// Per-model raw token tallies, keyed on the model id a usage record carried (or
+    /// [`UNKNOWN_MODEL`] when it carried none) — the source `crate::manager::wire_sessions`
+    /// prices into `SessionRow::cost_usd`, one model's price at a time, then sums.
+    pub by_model: std::collections::HashMap<String, ModelTokenTally>,
 }
 
 /// Cap on pending (running) tool-use ids per session — see the bridge.
@@ -257,6 +412,7 @@ impl WireSessionTracker {
 
         entry.requests += 1;
         entry.last_seen_ms = now_ms;
+        entry.req_per_minute.record(now_ms);
         if account.is_some() {
             entry.account = account;
         }
@@ -299,6 +455,15 @@ impl WireSessionTracker {
                 if tr.timed_out {
                     entry.tools.timeouts += 1;
                 }
+                if seconds >= 60.0 {
+                    entry.tools.over_one_minute += 1;
+                }
+                entry
+                    .tools
+                    .by_tool
+                    .entry(running.tool.clone())
+                    .or_default()
+                    .record(seconds, tr.is_error);
                 Self::insert_slowest(
                     &mut entry.tools.slowest,
                     SlowTool {
@@ -319,11 +484,36 @@ impl WireSessionTracker {
     /// stream finishes), on a session that [`Self::record_request`] has already created. A
     /// session not (yet, or no longer) present is silently ignored — there is nothing to
     /// attribute the tokens to.
-    pub fn record_usage(&mut self, session_id: &str, input: u64, output: u64, cache_read: u64) {
+    ///
+    /// `quota_input` is the SAME quota-counter figure this always accumulated
+    /// (`entry.input_tokens`, unchanged meaning) — `model`, `base_input`, `cache_5m` and
+    /// `cache_1h` are new (wire 2): they fold into [`WireSession::by_model`] so a session that
+    /// spans two models can be priced per-model and summed, rather than averaged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_usage(
+        &mut self,
+        session_id: &str,
+        model: Option<&str>,
+        quota_input: u64,
+        base_input: u64,
+        cache_5m: u64,
+        cache_1h: u64,
+        cache_read: u64,
+        output: u64,
+    ) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
-            entry.input_tokens += input;
+            entry.input_tokens += quota_input;
             entry.output_tokens += output;
             entry.cache_read_tokens += cache_read;
+            let tally = entry
+                .by_model
+                .entry(model.unwrap_or(UNKNOWN_MODEL).to_string())
+                .or_default();
+            tally.input += base_input;
+            tally.cache_5m += cache_5m;
+            tally.cache_1h += cache_1h;
+            tally.cache_read += cache_read;
+            tally.output += output;
         }
     }
 
@@ -379,6 +569,24 @@ mod tests {
         })
     }
 
+    fn agent_tool_use(
+        id: &str,
+        name: &str,
+        description: &str,
+        subagent_type: Option<&str>,
+    ) -> Value {
+        let mut input = serde_json::json!({"description": description});
+        if let Some(st) = subagent_type {
+            input["subagent_type"] = Value::String(st.to_string());
+        }
+        serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": name,
+            "input": input,
+        })
+    }
+
     fn tool_result(id: &str, is_error: bool, text: &str) -> Value {
         serde_json::json!({
             "type": "tool_result",
@@ -421,6 +629,43 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "tu_1");
         assert!(!results[0].is_error);
+    }
+
+    #[test]
+    fn extract_tool_events_fills_command_head_for_an_agent_tool_with_subagent_type() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [agent_tool_use(
+                "tu_agent",
+                "Agent",
+                "F4 subagents on the wire",
+                Some("henry:coder"),
+            )]},
+        ]);
+        let raw = messages_raw(messages);
+        let (uses, _results) = extract_tool_events(&raw);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(
+            uses[0].command_head.as_deref(),
+            Some("henry:coder: F4 subagents on the wire")
+        );
+    }
+
+    #[test]
+    fn extract_tool_events_fills_command_head_for_a_task_tool_without_subagent_type() {
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [agent_tool_use(
+                "tu_task",
+                "Task",
+                "review the diff",
+                None,
+            )]},
+        ]);
+        let raw = messages_raw(messages);
+        let (uses, _results) = extract_tool_events(&raw);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].command_head.as_deref(), Some("review the diff"));
     }
 
     #[test]
@@ -622,5 +867,165 @@ mod tests {
         assert_eq!(session.tools.calls, 1);
         assert_eq!(session.tools.errors, 1);
         assert_eq!(session.tools.timeouts, 1);
+    }
+
+    /// `by_tool` keeps separate buckets per tool NAME (three tools, two of which get more
+    /// than one completed call), tracks each bucket's own calls/errors, and reports the
+    /// median of its own reservoir — not a global median across every tool.
+    #[test]
+    fn by_tool_tracks_calls_errors_and_a_per_tool_median() {
+        let mut tracker = WireSessionTracker::new();
+        // Bash: three completed calls back-to-back on a strictly increasing clock, each
+        // one's start pinned to the PREVIOUS call's own end (see `record_request`'s doc on
+        // `previous_response_end_ms`) — durations 1s, 3s, 5s (median 3s), the second an error.
+        let mut clock_ms = 0i64;
+        for (i, (secs, is_error)) in [(1.0, false), (3.0, true), (5.0, false)]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("bash_{i}");
+            tracker.record_request(
+                "sess-tools",
+                None,
+                None,
+                clock_ms,
+                &[ToolUseEvent {
+                    id: id.clone(),
+                    name: Some("Bash".into()),
+                    command_head: None,
+                }],
+                &[],
+            );
+            clock_ms += (secs * 1000.0) as i64;
+            tracker.record_request(
+                "sess-tools",
+                None,
+                None,
+                clock_ms,
+                &[],
+                &[ToolResultEvent {
+                    id,
+                    is_error,
+                    timed_out: false,
+                }],
+            );
+        }
+        // Read: one completed call, 2s, no error — same rule: starts where the clock left off.
+        tracker.record_request(
+            "sess-tools",
+            None,
+            None,
+            clock_ms,
+            &[ToolUseEvent {
+                id: "read_0".into(),
+                name: Some("Read".into()),
+                command_head: None,
+            }],
+            &[],
+        );
+        clock_ms += 2_000;
+        tracker.record_request(
+            "sess-tools",
+            None,
+            None,
+            clock_ms,
+            &[],
+            &[ToolResultEvent {
+                id: "read_0".into(),
+                is_error: false,
+                timed_out: false,
+            }],
+        );
+
+        let snap = tracker.snapshot(clock_ms);
+        let (_, session) = &snap[0];
+        assert_eq!(
+            session.tools.by_tool.len(),
+            2,
+            "Bash and Read stay separate buckets"
+        );
+        let bash = &session.tools.by_tool["Bash"];
+        assert_eq!(bash.calls, 3);
+        assert_eq!(bash.errors, 1);
+        assert_eq!(bash.seconds_p50(), 3.0, "the middle of [1, 3, 5]");
+        let read = &session.tools.by_tool["Read"];
+        assert_eq!(read.calls, 1);
+        assert_eq!(read.errors, 0);
+        assert_eq!(read.seconds_p50(), 2.0);
+    }
+
+    /// A completed call of 60 seconds or more counts toward both the per-tool
+    /// `over_one_minute` and the session-wide total — independent of `errors`/`timeouts`, so a
+    /// slow-but-successful call still counts.
+    #[test]
+    fn over_one_minute_counts_slow_completed_calls_regardless_of_error_status() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_request(
+            "sess-slow",
+            None,
+            None,
+            0,
+            &[ToolUseEvent {
+                id: "tu_slow".into(),
+                name: Some("Bash".into()),
+                command_head: Some("sleep 90".into()),
+            }],
+            &[],
+        );
+        tracker.record_request(
+            "sess-slow",
+            None,
+            None,
+            90_000,
+            &[],
+            &[ToolResultEvent {
+                id: "tu_slow".into(),
+                is_error: false,
+                timed_out: false,
+            }],
+        );
+        let snap = tracker.snapshot(90_000);
+        let (_, session) = &snap[0];
+        assert_eq!(session.tools.over_one_minute, 1);
+        assert_eq!(session.tools.by_tool["Bash"].over_one_minute, 1);
+        assert_eq!(session.tools.errors, 0, "a slow call need not be an error");
+    }
+
+    /// After 31 simulated minutes of one request per minute, the ring has dropped the very
+    /// first minute's count and kept exactly the last 30, oldest first.
+    #[test]
+    fn req_per_minute_ring_drops_the_first_minute_after_31_minutes() {
+        let mut tracker = WireSessionTracker::new();
+        for minute in 0..31 {
+            tracker.record_request("sess-ring", None, None, minute * 60_000, &[], &[]);
+        }
+        let snap = tracker.snapshot(30 * 60_000);
+        let (_, session) = &snap[0];
+        let ring = session.req_per_minute.projected(30 * 60_000);
+        assert_eq!(ring.len(), REQ_PER_MINUTE_LEN);
+        assert_eq!(
+            ring,
+            vec![1u16; REQ_PER_MINUTE_LEN],
+            "minutes 1..=30 each got exactly one request; minute 0 was pushed out"
+        );
+    }
+
+    /// A session with no NEW requests for a while decays toward zeros when projected forward
+    /// — the ring must not freeze on whatever it last recorded.
+    #[test]
+    fn req_per_minute_decays_to_zero_when_projected_past_the_last_request() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_request("sess-idle", None, None, 0, &[], &[]);
+        let snap = tracker.snapshot(0);
+        let (_, session) = &snap[0];
+        // Immediately: minute 0 shows one request.
+        assert_eq!(session.req_per_minute.projected(0).last(), Some(&1));
+        // 35 minutes later, with no new request, minute 0 has scrolled off entirely.
+        let projected = session.req_per_minute.projected(35 * 60_000);
+        assert_eq!(
+            projected,
+            vec![0u16; REQ_PER_MINUTE_LEN],
+            "35 idle minutes is more than the 30-minute window, so every bucket is zero"
+        );
     }
 }

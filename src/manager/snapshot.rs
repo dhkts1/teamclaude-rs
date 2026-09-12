@@ -321,12 +321,16 @@ impl Manager {
             v
         };
 
+        let wire_sessions = self.wire_sessions_snapshot(now);
+        let wire_sessions_summary = Manager::wire_sessions_summary(&wire_sessions);
+
         StatsSnapshot {
             accounts: account_snaps,
             current: *self.current.lock().expect("current lock poisoned"),
             recent,
             sessions,
-            wire_sessions: self.wire_sessions_snapshot(now),
+            wire_sessions,
+            wire_sessions_summary,
         }
     }
 }

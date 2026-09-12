@@ -564,6 +564,21 @@ row says which.
 Totals survive a restart: each served request is appended to `~/.cache/teamclaude/usage/`, and boot
 replays the day back in. Fleet-wide totals are not a field — sum the rows.
 
+### The `sessions` array on `GET /_tcr/status`
+
+Reachable via the raw `/_tcr/status` endpoint, not the CLI's own array output: one entry per Claude
+Code session seen in the last hour, each carrying its tool-call stats (`tools.running`, the pending
+calls; `tools.slowest`, the ten slowest completed ones). `tools.running` entries for an `Agent` or
+`Task` tool call carry the subagent's description in `commandHead` (prefixed with its type when
+Claude Code sent one), and `tools.subagentsRunning` is that count precomputed, so a panel can show
+"2 subagents" without scanning the list itself.
+
+Each session also carries `tools.byTool` (a per-tool-name breakdown: calls, errors, a median
+duration over a bounded reservoir, and `overOneMinute`) and `reqPerMinute` (30 wall-clock minutes
+of request counts, oldest first, decaying to zeros as the session goes idle); the payload's
+top-level `sessionsSummary` is the same `byTool` shape summed across every session server-side, so
+a panel's fleet-wide headline never disagrees with the per-session rows by re-summing them itself.
+
 ---
 
 ## `tcr wrap`

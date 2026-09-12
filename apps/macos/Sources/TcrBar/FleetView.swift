@@ -49,6 +49,10 @@ struct FleetView: View {
     /// Opens the "What's new" window. A closure rather than the controller so
     /// the render harness passes `{}` and can neither fetch nor open anything.
     var onWhatsNew: () -> Void = {}
+    /// Opens the Settings window (gear button, `⌘,`) — `data/plans/
+    /// settings-window-bridge.md`. Same closure shape as ``onWhatsNew``, and
+    /// for the same reason: the render harness passes `{}`.
+    var onSettings: () -> Void = {}
 
     /// Surfaced in place rather than swallowed: a button that silently does
     /// nothing is worse than one that says why.
@@ -142,6 +146,7 @@ struct FleetView: View {
         startServerAtLaunch: Binding<Bool>,
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
+        onSettings: @escaping () -> Void = {},
         initialTab: PanelTab = .accounts,
         // Coordinator-flagged gap (2026-09-12): `snapshotMode` never reads
         // real session files (comment above, `body`'s `.onAppear`), so every
@@ -166,6 +171,7 @@ struct FleetView: View {
         self._startServerAtLaunch = startServerAtLaunch
         self.snapshotMode = snapshotMode
         self.onWhatsNew = onWhatsNew
+        self.onSettings = onSettings
         self._selectedTab = State(initialValue: initialTab)
         self._sessionFiles = State(initialValue: initialSessionFiles)
     }
@@ -221,6 +227,20 @@ struct FleetView: View {
                         .font(.system(size: 12.5).monospacedDigit())
                         .foregroundStyle(Tok.inkFaint)
                 }
+                // Gear opens Settings — in the header, not the footer, and
+                // present regardless of which tab is selected: it is window
+                // chrome, not tab content, the same reasoning the mockup's
+                // own note gives for repeating it on all three tabs
+                // (`docs/design/panel-tabs-mockup.html`). `⌘,` is the
+                // platform's own settings shortcut.
+                Button(action: onSettings) {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Tok.inkDim)
+                .keyboardShortcut(",", modifiers: [.command])
+                .help("Settings… ⌘,")
+                .accessibilityLabel("Settings")
             }
             // Only when the read is NOT healthy. On a healthy read this said
             // "13 accounts — live", which the tallies below say with more
@@ -632,9 +652,8 @@ struct FleetView: View {
             visible.append((key, rows))
         }
         let hidden = sessions.count - visible.reduce(0) { $0 + $1.rows.count }
-        // v4-spec: the gap between cards is 14pt, the same value the Accounts
-        // tab's own list uses.
-        return VStack(alignment: .leading, spacing: 14) {
+        // `Tok.cardGap` — the same gap the Accounts tab's own list uses.
+        return VStack(alignment: .leading, spacing: Tok.cardGap) {
             ForEach(visible, id: \.key) { entry in
                 // v4-spec: each account's session block is a card, with the
                 // account name as its first row and the sessions indented
@@ -736,7 +755,7 @@ struct FleetView: View {
                         .fill(activityColor(row.activity))
                         .frame(width: 8, height: 8)
                         .background(
-                            Circle().fill(activityColor(row.activity).opacity(0.18))
+                            Circle().fill(Tok.halo(activityColor(row.activity)))
                                 .frame(width: 16, height: 16)
                         )
                     Text(row.displayName).font(.subheadline.weight(.semibold))
@@ -868,12 +887,12 @@ struct FleetView: View {
 
     private func toolsList(_ fleet: Fleet) -> some View {
         // v4-spec: each section (RUNNING NOW, SLOWEST TODAY, BY TOOL) is a
-        // card under its own section head, at the same 14pt card gap the other
+        // card under its own section head, at the same `Tok.cardGap` the other
         // two tabs use — Gil, reading round 7's renders: "why sessions and
         // tools missing containers?". The head sits INSIDE its card here
         // rather than above it, so a section reads as one object; the mockup
         // draws it the same way.
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: Tok.cardGap) {
             // `docs/design/panel-tabs-review.md` finding 3: the sum over
             // EVERY tool, never one category standing in for the total —
             // `toolsTotalCalls` already sums across every session's
@@ -1208,10 +1227,10 @@ struct FleetView: View {
     /// direction.
     private func accountList(_ fleet: Fleet) -> some View {
         let sections = fleet.sectionsInDisplayOrder(pinning: control.current)
-        // v4-spec: gap between cards is 14pt (`Tok.rowSpacing` is 8, shared
-        // with the Sessions/Tools lists this sheet does not name a value
-        // for) — literal here, not a `Tok` edit, per the tokens-lane fence.
-        return VStack(alignment: .leading, spacing: 14) {
+        // v4-spec: gap between cards is 14pt — `Tok.cardGap` since #240,
+        // which is that same value under the tokens lane's own name.
+        // `Tok.rowSpacing` (8) is the gap between lines INSIDE a card.
+        return VStack(alignment: .leading, spacing: Tok.cardGap) {
             // Identified by `FleetSection.id` (band + group), not by group
             // alone: a group whose accounts differ in state appears in more
             // than one band, and two sections sharing a SwiftUI identity paint
@@ -1847,26 +1866,6 @@ struct FleetView: View {
                 }
             }
             fleetActions
-            // Scope boundary by PROXIMITY, not by a rule. A `Hairline` shipped
-            // here first and was then rendered with `--render-states`: it put a
-            // THIRD full-width rule into the bottom third of the panel — one
-            // above this block, one here, one above the danger zone — and the
-            // new one sat between two rows that are both just buttons, while
-            // the checkboxes directly below it got no separator at all. The
-            // original trailing-alignment was reaching for the right thing
-            // ("without needing a rule between them"); only its method was
-            // wrong. Space groups these two without adding weight.
-            //
-            // The padding used to match `Tok.tightSpacing` — the same value
-            // as the intra-group gap between buttons in `fleetActions` and
-            // `appActions` themselves — so the two six-button rows read as
-            // one undifferentiated block (`--render-states`, `01g-widest-row`).
-            // `Tok.space4`, stacked on this `VStack`'s own `Tok.tightSpacing`
-            // gap between children, puts the inter-group gap at 16pt against
-            // an intra-group gap of 4pt: four times it, comfortably past the
-            // "at least twice" floor.
-            appActions
-                .padding(.top, Tok.space4)
 
             if let loginError {
                 Text(loginError)
@@ -1875,10 +1874,13 @@ struct FleetView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            launchAtLogin
-            startServerToggle
-            keepAwakeToggle
-
+            // Start server at launch / Launch at login / Keep this Mac awake,
+            // and Check for Updates / What's New / Quit, all moved to the
+            // Settings window the gear opens (`data/plans/
+            // settings-window-bridge.md`): "the panel loses the three
+            // toggles, Check for Updates, What's New and Quit from its
+            // bottom block; Refresh and Add account stay." ``fleetActions``
+            // above is the surviving pair.
             dangerZone
         }
     }
@@ -1940,134 +1942,6 @@ struct FleetView: View {
             Spacer(minLength: 0)
         }
         .buttonStyle(.bordered)
-    }
-
-    /// Actions that act on the APP rather than on the fleet.
-    ///
-    /// These used to be trailing-aligned, on the reasoning that opposite
-    /// alignment would read as a separate group "without needing a rule between
-    /// them". In practice it read as misalignment: two button rows with
-    /// different left edges look broken before they look grouped, and the
-    /// second row's buttons floated away from everything above them. The scope
-    /// split is real, so it is now drawn — a `Hairline`, the same divider this
-    /// panel already uses to separate its sections — and both rows share one
-    /// left edge so the footer has a single vertical rhythm.
-    private var appActions: some View {
-        HStack(spacing: Tok.tightSpacing) {
-            // Disabled rather than silently no-op while Sparkle already has
-            // a check in flight — the same rule "Take over port…" follows.
-            Button("Check for Updates…") { updater.checkForUpdates() }
-                .disabled(!updater.canCheckForUpdates)
-                .help(
-                    "Ask the release feed whether a newer TcrBar exists. "
-                        + "Also reachable as `tcrbar://check-for-updates`."
-                )
-            Button("What's New…") { onWhatsNew() }
-                .help("The release notes for the TcrBar you are running.")
-            Button("Quit") { NSApplication.shared.terminate(nil) }
-            Spacer(minLength: 0)
-        }
-        .buttonStyle(.bordered)
-    }
-
-    /// Bring the proxy up when TcrBar starts. Pairs with "Launch at login" to
-    /// mean "the proxy is always up".
-    ///
-    /// The warning is not decoration. Once TcrBar supervises the server, Quit
-    /// stops it — correct for a supervisor, and a genuinely expensive surprise if
-    /// nobody said so before the box was ticked.
-    ///
-    /// So it is drawn UNCONDITIONALLY, not inside `if startServerAtLaunch`. The
-    /// preference defaults to off (`LaunchPreference.swift`), so a caveat that
-    /// only appears once the box is ticked appears strictly *after* the decision
-    /// it exists to inform — it can tell an operator what they already did, never
-    /// what they are about to do. The hover help cannot carry it either: a
-    /// tooltip is opt-in, and this cost is not.
-    ///
-    /// Always-present also holds the panel's height still as the box toggles,
-    /// which a conditional line does not: the fleet rows above would shift under
-    /// the pointer at the moment of the click.
-    ///
-    /// It carries `Tok.inkFaint`, not `Tok.near`. Every amber line in this footer
-    /// is a live condition of *this* install; this one is a standing fact about
-    /// what the mode means, true before anybody chooses anything, and drawing a
-    /// permanent note in the alarm colour would leave the panel looking alarmed at
-    /// rest. The wording is deliberately state-neutral for the same reason — it
-    /// reads correctly both as a consequence to weigh and as one already taken on.
-    private var startServerToggle: some View {
-        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-            Toggle("Start server at launch", isOn: $startServerAtLaunch)
-                .toggleStyle(.checkbox)
-                .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-                .help(
-                    "Runs `tcr server --headless --no-replace` when TcrBar starts. "
-                        + "`--headless` is the load-bearing one: it keeps the "
-                        + "server alive with no terminal to run its TUI in. "
-                        + "Standing down rather than disturbing a proxy that is "
-                        + "already serving is the default, which `--no-replace` "
-                        + "only restates for an older `tcr`. TcrBar then "
-                        + "supervises the server it started, and quitting TcrBar "
-                        + "stops it."
-                )
-            Text("TcrBar supervises a server it starts, so quitting TcrBar stops it.")
-                .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
-                .foregroundStyle(Tok.inkFaint)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    /// Keep the Mac from idle-sleeping, for as long as the box is ticked.
-    ///
-    /// A checkbox rather than a fifth button: the button row above is already
-    /// four wide inside a 380pt panel, and this belongs with the other two
-    /// toggles anyway — all three are modes, not actions.
-    ///
-    /// The detail line is not decoration. "Keep this Mac awake" over-promises by
-    /// exactly the two cases an operator will hit — a dark screen, and a laptop
-    /// on battery, where the `PreventSystemSleep` half of the hold is inert per
-    /// `man caffeinate` — and hitting either means coming back to a dead run and
-    /// blaming the proxy. It says nothing about a closed lid in either
-    /// direction, because nothing here has measured that.
-    ///
-    /// It carries `Tok.awake`, NOT `Tok.near`. Amber is this palette's "close to
-    /// a gating limit", and it is what the login-item error directly above uses;
-    /// an informational note about a mode the operator just turned on is not
-    /// that, and rendering it in the alarm colour made a footer with one note
-    /// read as a footer with two problems. `Tok.awake` is the mode's own token —
-    /// the same one the menu-bar mark uses — so the line reads as belonging to
-    /// the thing that is on, which is what it is.
-    ///
-    /// `.tint(Tok.awake)` asks for the mark to be the same token the menu bar
-    /// draws, so the two surfaces cannot disagree about what "on" looks like.
-    /// **That one line is unverified**, and it is the only thing here that is: a
-    /// `.checkbox` toggle is an AppKit control, `ImageRenderer` does not draw
-    /// those at all (`--render-states` shows a placeholder for this toggle and
-    /// for the two above it, all three the same), and reading the real control
-    /// back needs a screenshot. On macOS a checkbox may well follow the system
-    /// accent colour and ignore the tint outright. The state is carried by the
-    /// checkbox being *ticked*, which is not a colour, so nothing depends on it.
-    private var keepAwakeToggle: some View {
-        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-            Toggle(
-                "Keep this Mac awake",
-                isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
-            )
-            .toggleStyle(.checkbox)
-            .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-            .tint(Tok.awake)
-            .help(
-                "Holds the three power assertions `caffeinate -i -m -s` holds, for "
-                    + "as long as this is on. Released when you untick it or quit "
-                    + "TcrBar, and taken again the next time TcrBar starts — the "
-                    + "cup in the menu bar is on whenever it is held."
-            )
-            if awake.isOn {
-                Text("The display still sleeps. Sleep itself is only held off on AC power.")
-                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
-                    .foregroundStyle(Tok.awake)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
     }
 
     /// One message for all four `LoginLauncher` hand-offs below.
@@ -2137,36 +2011,6 @@ struct FleetView: View {
         } else {
             loginError = nil
         }
-    }
-
-    /// App-level preference, deliberately beside Quit rather than among the
-    /// account rows: it is about TcrBar, not about the fleet.
-    private var launchAtLogin: some View {
-        VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-            Toggle(
-                "Launch at login",
-                isOn: Binding(
-                    get: { loginItem.status.isOn },
-                    set: { loginItem.set(enabled: $0) }
-                )
-            )
-            .toggleStyle(.checkbox)
-            .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-            if let detail = loginItem.status.detail {
-                Text(detail)
-                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
-                    .foregroundStyle(Tok.near)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let error = loginItem.lastError {
-                Text(error)
-                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
-                    .foregroundStyle(Tok.spent)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .padding(.top, Tok.tightSpacing)
-        .onAppear { loginItem.refresh() }
     }
 
     /// Kept apart from the routine controls on purpose. "Refresh" costs nothing
@@ -2356,11 +2200,13 @@ extension View {
     /// and tools missing containers?"). Writing a second, near-identical box
     /// for them would have been two places to change a radius.
     ///
-    /// The literals are literals, not `Tok` names, for the same reason every
-    /// other v4-spec value on this panel is: `Tok.radiusMedium`/`space3` are
-    /// owned by the `feat/tokens-parity` lane as of the coordinator's fence.
-    /// Swap this ONE body for its token names when that lane lands, and every
-    /// card on the panel follows.
+    /// The radius stays a literal 8 after `feat/tokens-parity` landed (#240),
+    /// and that is deliberate: its `Tok.cardRadius` is an alias for
+    /// `radiusMedium`, 16, while `data/plans/v4-spec.md` measures the mockup's
+    /// card at 8. Swapping the name in would double the curve this bridge
+    /// exists to close. The gap between cards DID move to `Tok.cardGap` (14),
+    /// which agrees with the sheet. Revisit when `feat/tokens-v4` restyles the
+    /// radius family.
     func panelCard() -> some View {
         self
             .padding(.horizontal, 12)
