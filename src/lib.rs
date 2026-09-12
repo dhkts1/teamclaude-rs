@@ -40,6 +40,7 @@ pub mod tui;
 pub mod update;
 pub mod usage;
 pub mod warmer;
+pub mod wrap;
 
 use time::OffsetDateTime;
 
