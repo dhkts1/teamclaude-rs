@@ -480,13 +480,26 @@ struct FleetView: View {
         }
     }
 
+    /// Damping 1.0 (critically damped — settles without overshoot, i.e. "no
+    /// bounce"), response ~0.3s. Local to the tab switch rather than
+    /// `Tok.standardAnimation` (`.easeOut(duration: 0.15)`, tuned for a
+    /// tint/parked-state crossfade elsewhere in this file and not owned by
+    /// this lane) — a tab switch and a colour fade are different motions and
+    /// sharing one token would make the next edit to either fight the other.
+    /// `response`/`dampingFraction` rather than the newer `Spring` type: this
+    /// package's deployment target is macOS 13 (`Package.swift`), and `Spring`
+    /// needs macOS 14.
+    private var tabSwitchAnimation: Animation {
+        .spring(response: 0.3, dampingFraction: 1.0)
+    }
+
     private func tabButton(_ tab: PanelTab, badge: Int?) -> some View {
         let isOn = tab == selectedTab
         return Button {
             if reduceMotion {
                 selectedTab = tab
             } else {
-                withAnimation(Tok.standardAnimation) { selectedTab = tab }
+                withAnimation(tabSwitchAnimation) { selectedTab = tab }
             }
         } label: {
             HStack(spacing: Tok.space2) {
@@ -495,6 +508,8 @@ struct FleetView: View {
                 if let badge {
                     Text("\(badge)")
                         .font(.caption2.weight(.semibold))
+                        .contentTransition(.numericText())
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: badge)
                         .padding(.horizontal, Tok.space2)
                         .background(Capsule().fill(Tok.hover))
                 }
@@ -572,9 +587,17 @@ struct FleetView: View {
                 Spacer()
             }
             HStack(spacing: Tok.tightSpacing) {
-                Text("\(row.session.requests) req").monospacedDigit()
+                Text("\(row.session.requests) req")
+                    .monospacedDigit()
+                    .contentTransition(.numericText())
+                    .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: row.session.requests)
                 if let model = row.session.model { Text(model) }
                 Spacer()
+                // A rolling digit transition here would need this string's
+                // VALUE, not its rendered text, to drive `.animation(value:)`
+                // — it is age-since-oldest-running-tool, recomputed from
+                // `Date()` on every render, so a state-driven transition has
+                // no discrete value to key off. Left as a plain `Text`.
                 Text(trailingStatus(row, now: Date())).monospacedDigit()
             }
             .font(Tok.secondaryDigitFont)
