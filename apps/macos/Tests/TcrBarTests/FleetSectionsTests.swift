@@ -399,10 +399,12 @@ final class FleetSectionsTests: XCTestCase {
         XCTAssertEqual(section.legendText, "HENRY-TOKEN · PARKED · 2")
     }
 
-    /// A live (mixed, not wholly parked) named group's legend carries the
-    /// name and the count, but never the word "PARKED" — that word is a
-    /// claim about the group's own state, not decoration every legend wears.
-    func testLegendTextForLiveGroupOmitsParked() {
+    /// A live named group says ACTIVE where a parked one says PARKED — the
+    /// mockup's own two legends. This assertion used to read `"DEV · 2"`: the
+    /// word was added when a live group became COLLAPSIBLE, because a
+    /// one-line summary otherwise hides the single thing an operator reads a
+    /// group for, which is whether it is serving traffic.
+    func testLegendTextForLiveGroupSaysActive() {
         let fleet = Fleet(accounts: [
             sectionAccount("a@example.com", groups: ["dev"]),
             sectionAccount("b@example.com", groups: ["dev"]),
@@ -410,7 +412,17 @@ final class FleetSectionsTests: XCTestCase {
         let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
 
         XCTAssertFalse(section.isWhollyParked)
-        XCTAssertEqual(section.legendText, "DEV · 2")
+        XCTAssertEqual(section.legendText, "DEV · ACTIVE · 2")
+    }
+
+    /// The ungrouped pile takes neither word. There is no group to be active
+    /// or parked, and "UNGROUPED · ACTIVE" would name a state about a bucket
+    /// rather than about a thing an operator can park.
+    func testLegendTextForUngroupedTakesNoStateWord() {
+        let fleet = Fleet(accounts: [sectionAccount("solo@example.com", groups: nil)])
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertEqual(section.legendText, "UNGROUPED · 1")
     }
 
     /// A group split across bands (some rows parked, some not) is wholly
@@ -425,7 +437,7 @@ final class FleetSectionsTests: XCTestCase {
         let live = try! XCTUnwrap(sections.first { $0.band == .live })
         let parked = try! XCTUnwrap(sections.first { $0.band == .parked })
 
-        XCTAssertEqual(live.legendText, "DEV · 1")
+        XCTAssertEqual(live.legendText, "DEV · ACTIVE · 1")
         XCTAssertEqual(parked.legendText, "DEV · PARKED · 1")
     }
 
@@ -461,6 +473,148 @@ final class FleetSectionsTests: XCTestCase {
 
 /// A row with everything but the group/state fields fixed — the same shape
 /// `GroupTagTests` uses, so the two files' fixtures cannot drift.
+// MARK: - Collapse (data/plans/v4-spec.md; the mockup's MYCELIUM group)
+
+extension FleetSectionsTests {
+
+    /// Six live accounts in one named group, none of them out of tokens:
+    /// the panel draws one summary line instead of six cards.
+    func testLiveGroupOfSixCollapsesByDefault() {
+        let fleet = Fleet(
+            accounts: (1...6).map {
+                sectionAccount("m\($0)@example.com", groups: ["mycelium"])
+            })
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertTrue(section.collapsesByDefault)
+        XCTAssertEqual(section.expandButtonLabel, "Show 6 accounts in this group")
+    }
+
+    /// A NEAR row does not block the collapse, and this is the assertion that
+    /// says so on purpose: the brief that ordered this feature said "no
+    /// near/spent rows", while `docs/design/panel-tabs-mockup.html`'s own
+    /// collapsed group tallies "5 OK · 1 NEAR" on its summary line. A near
+    /// account is NAMED by the tally rather than hidden by it, so collapsing
+    /// costs the operator nothing they could act on.
+    func testNearRowDoesNotBlockCollapseAndIsNamedInTheTally() {
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        accounts.append(
+            sectionAccount("m6@example.com", groups: ["mycelium"], quotaState: .near, quota: 0.6))
+        let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
+
+        XCTAssertTrue(section.collapsesByDefault)
+        XCTAssertEqual(section.breakdown.map(\.label), ["5 ok", "1 near"])
+    }
+
+    /// A dead credential keeps the whole group open. `needsRelogin` is the
+    /// case that matters here: `FleetBand` files it under LIVE on purpose (it
+    /// is not known to be out of tokens and nobody parked it), so unlike a
+    /// spent account it is INSIDE this section, and a summary line would hide
+    /// the one row whose remedy is a click.
+    func testNeedsReloginKeepsTheGroupOpen() {
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        accounts.append(
+            sectionAccount("m6@example.com", groups: ["mycelium"], status: "error"))
+        let section = try! XCTUnwrap(
+            Fleet(accounts: accounts).sectionsInDisplayOrder().first { $0.band == .live })
+
+        XCTAssertEqual(section.rows.count, 6)
+        XCTAssertFalse(section.collapsesByDefault)
+    }
+
+    /// A SPENT account never reaches the live section in the first place —
+    /// `FleetBand` puts it under "Out of tokens", where it keeps its own card,
+    /// its reset countdown and its menu. The five that are left still
+    /// collapse, and that is correct: nothing is hidden by it.
+    ///
+    /// Written after the first draft of this test asserted the opposite and
+    /// failed. `collapsesByDefault`'s own `.spent` clause is therefore
+    /// unreachable through today's banding, and kept as a guard rather than
+    /// deleted: it costs nothing and it is what makes the rule true on its
+    /// own terms rather than by a second file's behaviour.
+    func testSpentRowLeavesTheLiveSectionEntirely() {
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        accounts.append(
+            sectionAccount("m6@example.com", groups: ["mycelium"], quotaState: .spent, quota: 1))
+        let sections = Fleet(accounts: accounts).sectionsInDisplayOrder()
+        let live = try! XCTUnwrap(sections.first { $0.band == .live })
+
+        XCTAssertEqual(live.rows.count, 5)
+        XCTAssertTrue(live.collapsesByDefault)
+        XCTAssertTrue(sections.contains { $0.band == .outOfTokens })
+    }
+
+    /// Three accounts is under the threshold: the cards cost less height than
+    /// the summary line plus its button would save.
+    func testGroupOfThreeStaysOpen() {
+        let fleet = Fleet(
+            accounts: (1...3).map {
+                sectionAccount("m\($0)@example.com", groups: ["mycelium"])
+            })
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertFalse(section.collapsesByDefault)
+    }
+
+    /// The ungrouped pile never collapses however large it is — there is no
+    /// group name to legend it with and no group to expand.
+    func testUngroupedPileNeverCollapses() {
+        let fleet = Fleet(accounts: (1...9).map { sectionAccount("solo\($0)@example.com", groups: nil) })
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertFalse(section.collapsesByDefault)
+    }
+
+    /// A wholly-parked group is not the live collapse's business: it has its
+    /// own smooshed shape, and answering true here would draw both.
+    func testParkedGroupIsNotTheLiveCollapse() {
+        let fleet = Fleet(
+            accounts: (1...6).map {
+                sectionAccount(
+                    "p\($0)@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"])
+            })
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertTrue(section.isWhollyParked)
+        XCTAssertFalse(section.collapsesByDefault)
+    }
+
+    /// "6 accounts · $8.42 today" — the mockup's own line, summed from the
+    /// rows rather than carried as a string.
+    func testCollapsedSummaryLineSumsTodaysSpend() {
+        var accounts = (1...5).map {
+            sectionAccount("m\($0)@example.com", groups: ["mycelium"], todayCost: 1.40)
+        }
+        accounts.append(sectionAccount("m6@example.com", groups: ["mycelium"], todayCost: 1.42))
+        let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
+
+        XCTAssertEqual(section.collapsedSummaryLine, "6 accounts · $8.42 today")
+    }
+
+    /// Not one row priced: the line drops the spend clause entirely rather
+    /// than reporting `$0.00 today` about traffic nobody could price.
+    func testCollapsedSummaryLineOmitsSpendWhenNothingIsPriced() {
+        let fleet = Fleet(
+            accounts: (1...6).map {
+                sectionAccount("m\($0)@example.com", groups: ["mycelium"])
+            })
+        let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertNil(section.todaySpend)
+        XCTAssertEqual(section.collapsedSummaryLine, "6 accounts")
+    }
+
+    /// One priced row among five unpriced ones reports what WAS priced —
+    /// `UsageTotals.addCost`'s own rule, not a second summing convention.
+    func testCollapsedSummaryLineReportsThePricedSubset() {
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        accounts.append(sectionAccount("m6@example.com", groups: ["mycelium"], todayCost: 2.50))
+        let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
+
+        XCTAssertEqual(section.collapsedSummaryLine, "6 accounts · $2.50 today")
+    }
+}
+
 private func sectionAccount(
     _ name: String,
     groups: [String]?,
@@ -469,7 +623,8 @@ private func sectionAccount(
     quota: Double? = 0,
     status: String = "active",
     disabled: Bool = false,
-    groupColors: [String: String]? = nil
+    groupColors: [String: String]? = nil,
+    todayCost: Double? = nil
 ) -> Account {
     Account(
         name: name,
@@ -497,6 +652,17 @@ private func sectionAccount(
         groups: groups,
         reservedGroups: nil,
         parkedGroups: parkedGroups,
-        groupColors: groupColors
+        groupColors: groupColors,
+        usage: todayCost.map { cost in
+            UsageRow(
+                today: usageTotals(cost: cost), window: nil, lastHour: usageTotals(cost: 0),
+                todayByModel: [:])
+        }
     )
+}
+
+private func usageTotals(cost: Double?) -> UsageTotals {
+    UsageTotals(
+        requests: 1, inputTokens: 0, cacheCreationTokens: 0, cacheCreation1hTokens: 0,
+        cacheReadTokens: 0, outputTokens: 0, costUsd: cost, unpricedRequests: 0)
 }

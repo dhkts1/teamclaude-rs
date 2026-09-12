@@ -102,7 +102,7 @@ enum RenderStates {
             // A parked group beside a live one — see `parkedGroupJSON`.
             ("15-parked-group", .loaded(fleet(parkedGroupJSON)), false, nil),
             // The SAME fleet, expanded — see `render(_:appearance:into:)`'s
-            // own seeding of `FleetView.expandedParkedGroupsKey` for
+            // own seeding of `FleetView.expandedGroupsKey` for
             // `henry-team`, the wholly-parked group `parkedGroupJSON` builds.
             ("15b-parked-group-expanded", .loaded(fleet(parkedGroupJSON)), false, nil),
             // F2 — the Sessions tab, grouped by account, one row with a
@@ -117,6 +117,16 @@ enum RenderStates {
             // never an empty list: `healthyJSON` carries no `sessions` key at
             // all, the shape every server shipped before F1.
             ("18-sessions-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
+            // Wave 2, phase 1 (`data/plans/panel-parity-bridge.md`): the
+            // Accounts tab's structure, matching
+            // `docs/design/panel-tabs-mockup.html`'s Accounts panel —
+            // 2 solo cards, a 3-member parked group, a 6-member active
+            // group — so the pixelmatch gate compares two panels with the
+            // same SHAPE, not a 2-card fixture against a 4-section mockup.
+            // `01-healthy` is left alone: other scenes and tests key off its
+            // exact 2-account shape, and this is a dedicated fixture for the
+            // parity gate rather than a rewrite of a scene with other jobs.
+            ("19-accounts-tab-parity", .loaded(fleet(accountsParityJSON)), false, nil),
         ]
     }
 
@@ -129,6 +139,43 @@ enum RenderStates {
         case "17-tools-tab": return .tools
         default: return .accounts
         }
+    }
+
+    /// `SessionFile`s for ``sessionsFixture``'s three sessions, on the two
+    /// scenes that render it — coordinator-flagged (2026-09-12): without
+    /// these, `FleetView`'s `snapshotMode` never reads a file for any
+    /// session (its own doc-comment: "the harness's session ids are fixture
+    /// strings that join to nothing real"), so every session read as
+    /// `.unknown` → "idle" regardless of what `sessionsFixture`'s own
+    /// comments say each one is doing. The three statuses here match that
+    /// fixture's own narrative exactly: `aaaaaaaa` has a Bash call running
+    /// now (busy), `bbbbbbbb`'s row comment says "waiting 12m" on the
+    /// mockup this fixture is modelled on, `cccccccc` is the idle,
+    /// unassigned control case.
+    private static func sessionFilesFixture(for sceneName: String) -> [String: SessionFile] {
+        guard sceneName == "16-sessions-tab" || sceneName == "17-tools-tab" else { return [:] }
+        return [
+            "aaaaaaaa-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "aaaaaaaa-1111-2222-3333-444444444444",
+                cwd: "/Users/alice/git/teamclaude-rs", name: "teamclaude-rs-c7",
+                status: "busy"),
+            "bbbbbbbb-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "bbbbbbbb-1111-2222-3333-444444444444",
+                cwd: "/Users/alice/git/mycelium", name: "mycelium-c2",
+                status: "waiting"),
+            "cccccccc-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "cccccccc-1111-2222-3333-444444444444",
+                cwd: "/Users/alice/git/mycelium coder", name: "m-075377",
+                status: "idle"),
+            "dddddddd-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "dddddddd-1111-2222-3333-444444444444",
+                cwd: "/Users/bob/git/henry-plugin", name: "henry-plugin-c1",
+                status: "busy"),
+            "eeeeeeee-1111-2222-3333-444444444444": SessionFile(
+                sessionId: "eeeeeeee-1111-2222-3333-444444444444",
+                cwd: "/Users/bob/git/token", name: "token-b4",
+                status: "idle"),
+        ]
     }
 
     @MainActor
@@ -193,7 +240,7 @@ enum RenderStates {
         let awake = AwakeController.harness()
         awake.setOn(scene.awake)
 
-        // `expandedParkedGroups` reads `UserDefaults.standard` at construction
+        // `expandedGroups` reads `UserDefaults.standard` at construction
         // — real for the shipping app, but this harness only ever runs under
         // `TCRBAR_DEV_BUILD=1`'s OWN bundle id (`build-tcrbar.sh`'s own
         // comment: "gives a non-shipping build its own identity"), a
@@ -205,9 +252,9 @@ enum RenderStates {
         // next.
         if scene.name == "15b-parked-group-expanded" {
             UserDefaults.standard.set(
-                ["g:henry-team"], forKey: FleetView.expandedParkedGroupsKey)
+                ["g:henry-team"], forKey: FleetView.expandedGroupsKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: FleetView.expandedParkedGroupsKey)
+            UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
         }
 
         let view =
@@ -226,7 +273,8 @@ enum RenderStates {
                 removeController: RemoveAccountController(),
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
-                initialTab: initialTab(for: scene.name)
+                initialTab: initialTab(for: scene.name),
+                initialSessionFiles: sessionFilesFixture(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -474,6 +522,39 @@ enum RenderStates {
             "costUsd":2.0872,"unpricedRequests":0}}}
         """
 
+    /// The same measured shape as ``measuredUsage`` with the three figures the
+    /// panel actually PRINTS dialled to a caller's numbers: today's spend (a
+    /// collapsed group's "· $8.42 today"), and the window's spend and output
+    /// tokens (an account card's "$540 · 1.5M out").
+    ///
+    /// Built as a format, not by rewriting `measuredUsage`'s text: a
+    /// string-replace on a shared JSON literal would hit whichever bucket
+    /// happened to carry the same digits, and the parity fixtures below need
+    /// exactly these three to move and the rest to stay put.
+    private static func measuredUsage(
+        todayCost: Double, windowCost: Double, windowOutputTokens: Int
+    ) -> String {
+        """
+        {"today":{"requests":102,"inputTokens":174512,"cacheCreationTokens":1200000,
+          "cacheCreation1hTokens":400000,"cacheReadTokens":7407414,"outputTokens":31860,
+          "costUsd":\(todayCost),"unpricedRequests":0},
+         "window":{"requests":40,"inputTokens":68000,"cacheCreationTokens":471000,
+          "cacheCreation1hTokens":157000,"cacheReadTokens":2900000,
+          "outputTokens":\(windowOutputTokens),
+          "costUsd":\(windowCost),"unpricedRequests":0,"since":1767207600000},
+         "lastHour":{"requests":12,"inputTokens":20000,"cacheCreationTokens":141000,
+          "cacheCreation1hTokens":47000,"cacheReadTokens":705000,"outputTokens":3756,
+          "costUsd":1.6413,"unpricedRequests":0},
+         "todayByModel":{
+           "claude-opus-5":{"requests":70,"inputTokens":122158,"cacheCreationTokens":840000,
+            "cacheCreation1hTokens":280000,"cacheReadTokens":5185190,"outputTokens":21140,
+            "costUsd":12.0785,"unpricedRequests":0},
+           "claude-sonnet-5":{"requests":32,"inputTokens":52354,"cacheCreationTokens":360000,
+            "cacheCreation1hTokens":120000,"cacheReadTokens":2222224,"outputTokens":10720,
+            "costUsd":2.0872,"unpricedRequests":0}}}
+        """
+    }
+
     /// Nothing this account served could be priced: `costUsd` is null in every
     /// bucket and `unpricedRequests` says how many requests are missing from
     /// the figure. The card must print the token count ALONE — no `$0.00` —
@@ -604,14 +685,28 @@ enum RenderStates {
     /// `FleetStatusTests` now does. Scenes 16 and 17 both use this Fleet;
     /// only ``initialTab(for:)`` decides which tab opens.
     ///
-    /// Three sessions cover the join's three cases: `alice-c1` has a live
-    /// Bash call running (Sessions tab's "N running · oldest …" line, Tools
-    /// tab's RUNNING NOW ring); `alice-c2` has one already at the Bash
-    /// tool's own 600-second timeout (`panel-tabs.md`: "The ten slowest
-    /// calls today all sit at 600s"); `unassigned-c3` has no `account`,
-    /// exercising the Sessions tab's "Unassigned" group and, having no
-    /// matching session file in this harness, the id-head fallback
-    /// (`panel-tabs-bridge.md`: "no file shows its id's first 8 chars").
+    /// The mockup's own five sessions (`docs/design/panel-tabs-mockup.html`'s
+    /// Sessions panel), verbatim: `teamclaude-rs-c7` (busy, two running
+    /// tools — a Bash call and the Agent call that is 20s from the 600s
+    /// timeout) and `mycelium-c2` (waiting 12m) under `henry10@example.com`;
+    /// `m-075377` (idle 40m) rounds out that account's three; `henry-plugin-c1`
+    /// (busy, one running Bash call) and `token-b4` (idle 2h) are
+    /// `henry1@example.com`'s two. Panel-parity round: previously this
+    /// fixture held 3 sessions on 1 account, none matching the mockup's
+    /// names, models or per-row metrics — this round matches all five
+    /// exactly (requests, cache%, the running-tool ages) so the tab compares
+    /// layout and styling, not five wrong numbers.
+    ///
+    /// The mockup's own summary line ("12 sessions · 7 busy · 1 waiting · 4
+    /// idle") and its "Show 7 more sessions" / "3 accounts have no sessions"
+    /// disclosure are NOT reproduced here: this build has no disclosure
+    /// feature (`FleetView.sessionsList` renders every session it is given,
+    /// unclipped — `snapshotMode`'s own doc-comment says so on purpose), so
+    /// seven more fixture sessions would render as seven more full cards the
+    /// mockup does not have, which would widen the diff this round exists to
+    /// close rather than shrink it. Recorded in `product-wave-findings.md`
+    /// as the next round's prerequisite, the same call the previous round
+    /// made about the Accounts tab's own disclosure gap.
     private static var sessionsFixture: [Session] {
         // `lastSeenMs`/`firstSeenMs` are epoch milliseconds, and the age
         // label reads real wall-clock `Date()` (`FleetView.trailingStatus`,
@@ -624,45 +719,192 @@ enum RenderStates {
             Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
         }
         return [
+            // "412 req · cache 97% · 2 running · oldest 9m 40s" — the Agent
+            // call (started 9m40s/580s ago) is older than the Bash one
+            // (4m12s/252s ago), so it is what `oldest` reads; 580s is 20s
+            // short of the 600s Bash timeout, matching the mockup's "20s to
+            // timeout" on the Tools tab's RUNNING NOW row for this same call.
             Session(
-                sessionId: "aaaaaaaa-1111-2222-3333-444444444444", account: "alice@example.com",
-                model: "claude-opus-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
-                requests: 412, inputTokens: 812_000, outputTokens: 41_000, cacheReadTokens: 790_000,
+                sessionId: "aaaaaaaa-1111-2222-3333-444444444444", account: "henry10@example.com",
+                model: "claude-fable-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
+                requests: 412, inputTokens: 30_000, outputTokens: 41_000, cacheReadTokens: 970_000,
                 tools: SessionTools(
-                    calls: 38, errors: 1, timeouts: 0,
+                    // `calls` is the sum of `byTool` below (15,000 + 200 +
+                    // 2,000) — the two must agree, per `panel-tabs-review.md`
+                    // finding 3: the headline IS the total, never one
+                    // category standing in for it.
+                    calls: 17_200, errors: 1, timeouts: 0,
                     running: [
                         ToolCall(
                             tool: "Bash", commandHead: "cargo test --release > /tmp/f1-test.log",
-                            startedMs: msAgo(4 * 60))
+                            startedMs: msAgo(4 * 60 + 12)),
+                        ToolCall(
+                            tool: "Agent",
+                            commandHead: "Agent · F7 prove time-to-reset value",
+                            startedMs: msAgo(9 * 60 + 40)),
                     ],
                     slowest: [
                         ToolCall(
                             tool: "Bash",
                             commandHead: "git -C ~/git/henry-plugin push > /tmp/push.log",
                             endedMs: msAgo(5 * 60), seconds: 47.5)
-                    ])),
+                    ],
+                    overOneMinute: 3,
+                    // Combined with the sibling session's below, sums to the
+                    // mockup's exact BY TOOL numbers: Bash 19,913, Agent 412,
+                    // Read·Grep·Edit 4,352 — 24,677 total.
+                    byTool: [
+                        ToolBucketRow(tool: "Bash", calls: 15_000, secondsP50: 2.0),
+                        ToolBucketRow(tool: "Agent", calls: 200, secondsP50: 380),
+                        ToolBucketRow(tool: "Read", calls: 2_000, secondsP50: 0.2),
+                    ]),
+                // Rising, per the mockup's own aria-label on this session's spark:
+                // "Requests per minute over the last 30 minutes: rising".
+                // "$4.12" — `SessionRow::cost_usd`, wire 2.
+                reqPerMinute: [
+                    2, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8,
+                    10, 9, 11, 10, 12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17,
+                ],
+                costUsd: 4.12),
+            // "5,756 req · cache 94% · waiting 12m".
             Session(
-                sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "alice@example.com",
-                model: "claude-sonnet-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
-                requests: 5756, inputTokens: 940_000, outputTokens: 88_000, cacheReadTokens: 905_000,
+                sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "henry10@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
+                requests: 5756, inputTokens: 60_000, outputTokens: 88_000, cacheReadTokens: 940_000,
                 tools: SessionTools(
-                    calls: 210, errors: 4, timeouts: 1,
+                    calls: 7_477, errors: 4, timeouts: 1,
                     slowest: [
                         ToolCall(
                             tool: "Bash",
                             commandHead: "/opt/homebrew/bin/bash /tmp/disk-scan.sh 2>&1 | tee",
                             endedMs: msAgo(11 * 60), seconds: 600.0)
-                    ])),
+                    ],
+                    overOneMinute: 5,
+                    byTool: [
+                        ToolBucketRow(tool: "Bash", calls: 4_913, secondsP50: 2.3),
+                        ToolBucketRow(tool: "Agent", calls: 212, secondsP50: 400),
+                        ToolBucketRow(tool: "Grep", calls: 2_352, secondsP50: 0.2),
+                    ]),
+                // Falling, per the mockup's aria-label on this session's spark.
+                // "$5.29"; with the sibling above, the account block's header
+                // reads the mockup's "3 sessions · $9.41".
+                reqPerMinute: [
+                    15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 4, 4, 3,
+                    3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
+                ],
+                costUsd: 5.29),
+            // "idle 40m" — no metrics line at all in the mockup, and
+            // `FleetView.sessionRow`'s compact idle layout now matches that.
             Session(
-                sessionId: "cccccccc-1111-2222-3333-444444444444", account: nil,
+                sessionId: "cccccccc-1111-2222-3333-444444444444", account: "henry10@example.com",
                 model: "claude-sonnet-5", firstSeenMs: msAgo(45 * 60), lastSeenMs: msAgo(40 * 60),
-                requests: 12, inputTokens: 9000, outputTokens: 800, cacheReadTokens: 6000),
+                requests: 3, inputTokens: 900, outputTokens: 80, cacheReadTokens: 600),
+            // "6,479 req · cache 95% · 1 running · 1m 03s".
+            Session(
+                sessionId: "dddddddd-1111-2222-3333-444444444444", account: "henry1@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(4 * 3600), lastSeenMs: msAgo(63),
+                requests: 6479, inputTokens: 50_000, outputTokens: 63_000, cacheReadTokens: 950_000,
+                // `calls` (and `byTool`) deliberately left at their zero
+                // default: this session's requests (6,479) are a wire fact
+                // independent of tool-call volume, and the Tools tab's
+                // headline is the sum of every session's `tools.calls` —
+                // `panel-tabs-review.md` finding 3's own bug, reproduced
+                // here once already this round by a first draft that set
+                // `calls: 6_479` with no matching `byTool` entries and
+                // pushed the headline to 31,156 against a BY TOOL section
+                // still summing to the mockup's 24,677. Only the running
+                // call below is this session's contribution to the Tools
+                // tab.
+                tools: SessionTools(
+                    running: [
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "swift build -c release --product TcrBar",
+                            startedMs: msAgo(63))
+                    ]),
+                // "$7.90"; with `token-b4`'s $0.12 below, this account's
+                // block header reads the mockup's "2 sessions · $8.02".
+                reqPerMinute: [
+                    4, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8, 10, 9, 11, 10,
+                    12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17, 16, 18, 17, 19,
+                ],
+                costUsd: 7.90),
+            // "idle 2h" — compact layout, same as `m-075377` above.
+            Session(
+                sessionId: "eeeeeeee-1111-2222-3333-444444444444", account: "henry1@example.com",
+                model: "claude-opus-5", firstSeenMs: msAgo(5 * 3600), lastSeenMs: msAgo(2 * 3600),
+                requests: 5, inputTokens: 1500, outputTokens: 120, cacheReadTokens: 900,
+                // Priced, and deliberately never DRAWN: an idle row is one
+                // line with no metrics, so this figure only ever reaches the
+                // account block's own total. `m-075377` above is left
+                // unpriced (`nil`) so the same block also carries the
+                // server-did-not-send case.
+                costUsd: 0.12),
         ]
+    }
+
+    /// 2 solo cards + a 5-member parked group (`henry-token`) + a 6-member
+    /// active group (`mycelium`) — the mockup's own account count and group
+    /// shape (`docs/design/panel-tabs-mockup.html`'s Accounts panel), built
+    /// entirely from the existing `account()`/group machinery.
+    ///
+    /// The counts are the point, not decoration: five parked accounts is what
+    /// puts two of them behind `FleetView`'s "Show 2 more accounts" button,
+    /// and six live ones is what trips ``FleetSection/collapsesByDefault``, so
+    /// this scene is the render-harness proof that both disclosure shapes
+    /// draw. The spend figures are dialled so the collapsed group's summary
+    /// line reads the mockup's own "6 accounts · $8.42 today".
+    private static var accountsParityJSON: String {
+        // "$540 · 1.5M out" and "$1,190 · 3.1M out" on the two solo cards'
+        // plan lines, the mockup's own figures.
+        let solo1 = account(
+            "henry10@example.com", quota: "0.07", state: "ok", sevenDay: "0.30",
+            sevenDayState: "ok", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            usage: measuredUsage(
+                todayCost: 540.12, windowCost: 540.12, windowOutputTokens: 1_500_000),
+            plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")
+        let solo2 = account(
+            "henry5@example.com", quota: "0.04", state: "ok", sevenDay: "0.98",
+            sevenDayState: "warn", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 5_640,
+            usage: measuredUsage(
+                todayCost: 1_190.4, windowCost: 1_190.4, windowOutputTokens: 3_100_000),
+            plan: "Max 20x", orgUuid: "22222222-2222-2222-2222-222222222222")
+        let tokenColors = ["henry-token": "#92d188", "mycelium": "#c79ae8"]
+        // Five parked members — three drawn, two behind the button.
+        let parkedPlans = ["Team 5x", "Team Standard", "Team 5x", "Team Standard", "Team 5x"]
+        let parkedStates = [
+            ("0.10", "ok"), ("0.0", "unmeasured"), ("0.55", "near"),
+            ("0.22", "ok"), ("0.31", "ok"),
+        ]
+        let parkedNames = [
+            "gil@example.com", "henry1@example.com", "henry2@example.com",
+            "henry3@example.com", "henry4@example.com",
+        ]
+        let tokenRows = (0..<5).map { i in
+            account(
+                parkedNames[i], quota: parkedStates[i].0, state: parkedStates[i].1,
+                groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
+                plan: parkedPlans[i], orgUuid: "33333333-3333-3333-3333-333333333333")
+        }
+        // 5 x $1.40 + $1.42 = $8.42, the mockup's own collapsed-group total.
+        let myceliumRows = (1...6).map { i in
+            account(
+                "mycelium\(i)@example.com", quota: i == 6 ? "0.60" : "0.15",
+                state: i == 6 ? "near" : "ok",
+                usage: measuredUsage(
+                    todayCost: i == 6 ? 1.42 : 1.40, windowCost: 0.9,
+                    windowOutputTokens: 12_476),
+                groups: ["mycelium"], groupColors: tokenColors,
+                plan: "Team Standard", orgUuid: "44444444-4444-4444-4444-444444444444")
+        }
+        let all = [solo1, solo2] + tokenRows + myceliumRows
+        return "[\(all.joined(separator: ","))]"
     }
 
     private static var sessionsTabFleet: Fleet {
         let base = fleet(
-            "[\(account("alice@example.com", quota: "0.12", state: "ok", plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111"))]"
+            "[\(account("henry10@example.com", quota: "0.12", state: "ok", plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")),"
+                + "\(account("henry1@example.com", quota: "0.31", state: "ok", plan: "Team Standard", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
         )
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: sessionsFixture,
