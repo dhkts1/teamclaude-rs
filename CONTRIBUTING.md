@@ -114,7 +114,8 @@ repository.
 | `pre-commit` | Secret scan (gitleaks, on staged changes only), public-disclosure scan, `cargo fmt --check`, `swift-format lint --strict`, release-version gate, design-token staleness gate. |
 | `pre-merge-commit` | Runs `pre-commit`. Git runs this hook and not `pre-commit` when a merge creates a commit, so without it every gate above was blind to a merge. |
 | `pre-push` | Public-disclosure scan over the commits actually being pushed: their added lines **and their messages**. `git push --no-verify` to override. |
-| `post-merge` | Rebuilds the release binary so the on-disk artifact tracks the checkout. It never restarts a running proxy. |
+
+There is no post-merge rebuild any more (removed 2026-09-13): a pull no longer compiles the release binary, so `target/release/tcr` tracks the last explicit `cargo build --release` or `scripts/install-cli.sh`, not the checkout. `tcr status --json` still reports the running build's sha.
 
 Two `pre-commit` gates are **hard failures when their tool or input is missing**: the gitleaks secret
 scan (`TCR_ALLOW_MISSING_GITLEAKS=1` to override) and the private-name list at
@@ -243,7 +244,7 @@ specific bug they exist to prevent. Read the doc-comment before "fixing" what it
 | `tests/` | Integration tests and fixtures |
 | `apps/macos/` | TcrBar, the SwiftUI menu-bar app, and its build/release scripts |
 | `scripts/` | `install-cli.sh`, the palette generator, and assorted analysis tools |
-| `.githooks/` | `pre-commit` and `post-merge`, enabled via `core.hooksPath` |
+| `.githooks/` | `pre-commit`, `pre-merge-commit` and `pre-push`, enabled via `core.hooksPath` |
 | `DESIGN.md`, `MITM-DESIGN.md` | Design rationale for the proxy and the MITM path |
 | `CLAUDE.md` | The same operating rules at more depth, aimed at agents working in-tree |
 
