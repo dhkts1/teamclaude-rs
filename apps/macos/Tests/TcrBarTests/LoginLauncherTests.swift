@@ -196,4 +196,106 @@ final class LoginLauncherTests: XCTestCase {
         let mode = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions]
         XCTAssertEqual(mode as? NSNumber, 0o700, "must be executable, and only by its owner")
     }
+
+    // MARK: - `tcr mint`
+
+    /// `tcr mint --account <name>` on the exec line for the account target.
+    func testMintAccountScriptRunsMintAccountFlag() {
+        let script = LoginLauncher.mintScript(
+            forExecutableAt: "/opt/homebrew/bin/tcr", target: .account("alice"))
+        XCTAssertTrue(
+            script.contains("exec '/opt/homebrew/bin/tcr' mint --account 'alice'"), script)
+    }
+
+    /// `tcr mint --group <name>` on the exec line for the group target.
+    func testMintGroupScriptRunsMintGroupFlag() {
+        let script = LoginLauncher.mintScript(
+            forExecutableAt: "/opt/homebrew/bin/tcr", target: .group("dev"))
+        XCTAssertTrue(
+            script.contains("exec '/opt/homebrew/bin/tcr' mint --group 'dev'"), script)
+    }
+
+    /// The injection case for an account name containing both a space and a
+    /// single quote — the brief's own minimum bar. Mirrors
+    /// ``testSingleQuoteInPathCannotEscapeTheQuoting`` for the login script:
+    /// the whole name must stay one shell argument.
+    func testMintAccountNameWithSpaceAndQuoteIsQuotedAsOneArgument() {
+        let script = LoginLauncher.mintScript(
+            forExecutableAt: "/opt/homebrew/bin/tcr", target: .account("ev'il name"))
+        XCTAssertTrue(
+            script.contains(#"exec '/opt/homebrew/bin/tcr' mint --account 'ev'\''il name'"#),
+            "a quote and a space in the account name must be escaped POSIX-style, got: \(script)"
+        )
+        // Nothing may follow the quoted name except the end of the line.
+        let execLine = script.split(separator: "\n").first { $0.hasPrefix("exec ") }
+        XCTAssertEqual(execLine?.hasSuffix("'"), true, "trailing text after the quoted account name")
+    }
+
+    /// Same injection case for a group name.
+    func testMintGroupNameWithSpaceAndQuoteIsQuotedAsOneArgument() {
+        let script = LoginLauncher.mintScript(
+            forExecutableAt: "/opt/homebrew/bin/tcr", target: .group("ev'il group"))
+        XCTAssertTrue(
+            script.contains(#"exec '/opt/homebrew/bin/tcr' mint --group 'ev'\''il group'"#),
+            "a quote and a space in the group name must be escaped POSIX-style, got: \(script)"
+        )
+        let execLine = script.split(separator: "\n").first { $0.hasPrefix("exec ") }
+        XCTAssertEqual(execLine?.hasSuffix("'"), true, "trailing text after the quoted group name")
+    }
+
+    /// A missing tool is reported the same way ``launch`` reports it, not
+    /// silently swallowed.
+    func testLaunchMintMissingToolIsReportedWithWhatWasSearched() {
+        var opened: URL?
+        let result = LoginLauncher.launchMint(
+            target: .account("alice"),
+            resolve: { .failure(TcrTool.NotFound(searched: ["/a/tcr", "/b/tcr"])) },
+            open: { opened = $0 }
+        )
+
+        guard case .failure(.toolMissing(let searched)) = result else {
+            return XCTFail("expected a toolMissing failure, got \(result)")
+        }
+        XCTAssertEqual(searched, ["/a/tcr", "/b/tcr"])
+        XCTAssertNil(opened, "nothing should be opened when tcr was never found")
+    }
+
+    /// Mirrors ``testSuccessWritesAnExecutableScriptAndOpensIt``: a real
+    /// invocation writes an executable `.command` file and opens it.
+    func testLaunchMintSuccessWritesAnExecutableScriptAndOpensIt() throws {
+        var opened: URL?
+        let result = LoginLauncher.launchMint(
+            target: .group("dev"),
+            resolve: { .success(URL(fileURLWithPath: "/usr/local/bin/tcr")) },
+            open: { opened = $0 }
+        )
+
+        guard case .success(let url) = result else {
+            return XCTFail("expected success, got \(result)")
+        }
+        XCTAssertEqual(opened, url)
+        XCTAssertEqual(url.pathExtension, "command", "Terminal opens .command files")
+
+        let written = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertTrue(written.contains("exec '/usr/local/bin/tcr' mint --group 'dev'"), written)
+
+        let mode = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions]
+        XCTAssertEqual(mode as? NSNumber, 0o700, "must be executable, and only by its owner")
+    }
+
+    /// Two mint launches must not race on one shared path, same reasoning as
+    /// ``testTwoLaunchesGetDifferentPaths`` for login.
+    func testTwoMintLaunchesGetDifferentPaths() throws {
+        var opened: [URL] = []
+        for _ in 0..<2 {
+            let result = LoginLauncher.launchMint(
+                target: .account("alice"),
+                resolve: { .success(URL(fileURLWithPath: "/usr/local/bin/tcr")) },
+                open: { opened.append($0) }
+            )
+            guard case .success = result else { return XCTFail("expected success") }
+        }
+        XCTAssertEqual(opened.count, 2)
+        XCTAssertNotEqual(opened[0], opened[1], "two launches must not race on one shared path")
+    }
 }
