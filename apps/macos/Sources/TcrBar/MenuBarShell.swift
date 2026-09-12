@@ -61,6 +61,24 @@ final class MenuBarShell {
     /// right-click menu can reach it with the panel closed.
     let whatsNew: WhatsNewController
     let whatsNewWindow: WhatsNewWindow
+    /// "Show the running-tool count" and "Open on" — the two Settings-window
+    /// rows with no pre-existing controller (`data/plans/
+    /// settings-window-bridge.md`, Menu Bar pane). Owned here for the same
+    /// reason as `countsPreference`: read by every poll tick, not just while
+    /// the Settings window happens to be open.
+    let runningToolsPreference: ShowRunningToolsPreference
+    let defaultTabPreference: DefaultTabPreference
+    /// The Settings window itself. Lazy and reused, same shape as
+    /// `whatsNewWindow` — a window rebuilt per open loses its sidebar
+    /// selection and its size.
+    private(set) lazy var settingsWindow = SettingsWindowController(
+        dependencies: SettingsDependencies(
+            poller: poller, server: server, loginItem: loginItem, awake: awake,
+            preference: preference, countsPreference: countsPreference,
+            runningToolsPreference: runningToolsPreference,
+            defaultTabPreference: defaultTabPreference,
+            groupController: groupController, updater: updater,
+            onWhatsNew: { [weak self] in self?.openWhatsNew() }))
 
     let statusItem: NSStatusItem
     let popover: NSPopover
@@ -84,7 +102,9 @@ final class MenuBarShell {
         updater: Updater? = nil,
         groupController: GroupController? = nil,
         removeController: RemoveAccountController? = nil,
-        whatsNew: WhatsNewController? = nil
+        whatsNew: WhatsNewController? = nil,
+        runningToolsPreference: ShowRunningToolsPreference? = nil,
+        defaultTabPreference: DefaultTabPreference? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -107,6 +127,8 @@ final class MenuBarShell {
                 location: ReleaseFeedLocation.from(bundle: .main),
                 currentVersion: AppBuild.shortVersion)
         self.whatsNewWindow = WhatsNewWindow(controller: self.whatsNew)
+        self.runningToolsPreference = runningToolsPreference ?? ShowRunningToolsPreference()
+        self.defaultTabPreference = defaultTabPreference ?? DefaultTabPreference()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never
@@ -145,7 +167,9 @@ final class MenuBarShell {
                 preference: self.preference, countsPreference: self.countsPreference,
                 updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
-                onWhatsNew: { [weak self] in self?.openWhatsNew() }))
+                onWhatsNew: { [weak self] in self?.openWhatsNew() },
+                onSettings: { [weak self] in self?.openSettings() },
+                initialTab: Self.initialTab(from: self.defaultTabPreference)))
         // Without this the popover takes a default size and the panel is clipped.
         //
         // This is the specific thing `MenuBarExtra` did for free. `FleetView`
@@ -444,6 +468,27 @@ final class MenuBarShell {
     }
     @objc private func quickQuit() { NSApplication.shared.terminate(nil) }
 
+    /// The gear button's action (`⌘,`, every tab header). Closes the popover
+    /// first — the same reasoning `openWhatsNew()` already follows — since a
+    /// transient popover would otherwise dismiss itself the instant the
+    /// Settings window steals key focus.
+    func openSettings() {
+        closePanel()
+        settingsWindow.show()
+    }
+
+    /// `DefaultTabPreference` stores a plain string (see that type's own
+    /// doc-comment on why it cannot hold `PanelTab` directly); this is the
+    /// one place that turns it back into the real enum, at the one call site
+    /// that constructs the live panel.
+    private static func initialTab(from preference: DefaultTabPreference) -> PanelTab {
+        switch preference.tab {
+        case "sessions": return .sessions
+        case "tools": return .tools
+        default: return .accounts
+        }
+    }
+
     func openPanel() {
         guard let button = statusItem.button else { return }
         // macOS owns the login-item bit and the operator can revoke it in System
@@ -497,6 +542,8 @@ struct FleetPanel: View {
     @ObservedObject var groupController: GroupController
     @ObservedObject var removeController: RemoveAccountController
     var onWhatsNew: () -> Void = {}
+    var onSettings: () -> Void = {}
+    var initialTab: PanelTab = .accounts
 
     var body: some View {
         VStack(spacing: 0) {
@@ -511,7 +558,9 @@ struct FleetPanel: View {
                 groupController: groupController,
                 removeController: removeController,
                 startServerAtLaunch: $preference.startServerAtLaunch,
-                onWhatsNew: onWhatsNew
+                onWhatsNew: onWhatsNew,
+                onSettings: onSettings,
+                initialTab: initialTab
             )
             // Kept OUTSIDE `FleetView` rather than folded into its own
             // preferences footer: this feature's bridge (F5,
