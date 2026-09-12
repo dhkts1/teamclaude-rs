@@ -112,6 +112,53 @@ struct FleetView: View {
     @State private var usageLineHeight: CGFloat = 0
     @State private var usageLineBaseline: CGFloat = 0
 
+    /// Accounts / Sessions / Tools (F2 + F3, `panel-tabs-bridge.md`).
+    /// `.accounts` selected by default, per the bridge.
+    @State private var selectedTab: PanelTab = .accounts
+
+    /// The Claude Code session files joined to the wire's `Session`s for the
+    /// Sessions tab — see ``SessionFiles``. Read once on appear and again
+    /// every poll; never on every render, since ``SessionFiles/read(directory:)``
+    /// touches disk.
+    @State private var sessionFiles: [String: SessionFile] = [:]
+
+    /// Every stored property above still gets its usual default — this exists
+    /// only so ``RenderStates`` can seed ``selectedTab`` deterministically.
+    /// `@State`'s wrapped value can only be seeded through
+    /// `State(initialValue:)` in an initializer; a plain assignment in
+    /// `.onAppear` would work for the live app but leaves the render
+    /// harness's very first (and only) frame racing SwiftUI's own appearance
+    /// timing, which `ImageRenderer` does not document.
+    init(
+        poller: StatusPoller,
+        server: ServerController,
+        loginItem: LoginItem,
+        accounts: AccountController,
+        control: ControlAccountController,
+        awake: AwakeController,
+        updater: Updater,
+        groupController: GroupController,
+        removeController: RemoveAccountController,
+        startServerAtLaunch: Binding<Bool>,
+        snapshotMode: Bool = false,
+        onWhatsNew: @escaping () -> Void = {},
+        initialTab: PanelTab = .accounts
+    ) {
+        self.poller = poller
+        self.server = server
+        self.loginItem = loginItem
+        self.accounts = accounts
+        self.control = control
+        self.awake = awake
+        self.updater = updater
+        self.groupController = groupController
+        self.removeController = removeController
+        self._startServerAtLaunch = startServerAtLaunch
+        self.snapshotMode = snapshotMode
+        self.onWhatsNew = onWhatsNew
+        self._selectedTab = State(initialValue: initialTab)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
             header
@@ -123,6 +170,14 @@ struct FleetView: View {
         .padding(Tok.gutter)
         .frame(width: Tok.panelWidth)
         .background(Tok.panel)
+        // `snapshotMode` never touches disk here: the render harness's session
+        // ids are fixture strings that join to nothing real, so the read
+        // would only ever populate an unused dictionary — see
+        // `RenderStates.swift`'s sessions-tab fixtures.
+        .onAppear { if !snapshotMode { sessionFiles = SessionFiles.read() } }
+        .onChange(of: poller.lastPollAt) { _ in
+            if !snapshotMode { sessionFiles = SessionFiles.read() }
+        }
     }
 
     // MARK: Header
@@ -360,19 +415,349 @@ struct FleetView: View {
 
     private func fleetRows(_ fleet: Fleet) -> some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            if fleet.source.countersAreStructural {
-                offlineNotice(fleet.source)
-            }
-            if snapshotMode {
-                accountList(fleet)
-            } else {
-                ScrollView {
-                    accountList(fleet)
+            panelTabBar(fleet)
+            switch selectedTab {
+            case .accounts:
+                if fleet.source.countersAreStructural {
+                    offlineNotice(fleet.source)
                 }
-                .frame(height: visibleRowsHeight(for: fleet))
-                .onPreferenceChange(RowHeightsKey.self) { rowHeights = PanelHeight.settled(rowHeights, $0) }
+                if snapshotMode {
+                    accountList(fleet)
+                } else {
+                    ScrollView {
+                        accountList(fleet)
+                    }
+                    .frame(height: visibleRowsHeight(for: fleet))
+                    .onPreferenceChange(RowHeightsKey.self) {
+                        rowHeights = PanelHeight.settled(rowHeights, $0)
+                    }
+                }
+            case .sessions:
+                sessionsTab(fleet)
+            case .tools:
+                toolsTab(fleet)
             }
         }
+    }
+
+    // MARK: Tabs (F2 + F3)
+    //
+    // Only the Accounts tab measures its own rows (`RowHeightsKey`, above) —
+    // Sessions and Tools deliberately do not. `visibleRowsHeight(for:)` is
+    // driven entirely by `rowHeights`, which the Accounts tab keeps populated
+    // the instant it is on screen (the default tab), so switching to either
+    // new tab reuses that same number as a FIXED height budget rather than
+    // measuring its own content. That is `panel-tabs-bridge.md`'s rule made
+    // concrete: "Each tab gets a FIXED height budget through the same
+    // functions; no tab's height may depend on content it renders" — the
+    // popover's layout-cycle crash (`ffe8a86`) is exactly what a
+    // content-dependent height on a tab switch would risk reopening.
+
+    /// The segmented control at the top of the panel — SF Symbols
+    /// `gauge`/`person.2`/`terminal`, a count badge on the two new tabs,
+    /// mirroring `docs/design/panel-tabs-mockup.html`.
+    private func panelTabBar(_ fleet: Fleet) -> some View {
+        HStack(spacing: 3) {
+            ForEach(PanelTab.allCases, id: \.self) { tab in
+                tabButton(tab, badge: badge(for: tab, fleet: fleet))
+            }
+        }
+        .padding(3)
+        .background(RoundedRectangle(cornerRadius: Tok.radiusSmall + 2).fill(Tok.raised))
+    }
+
+    /// `nil` on `.accounts` (the mockup carries no badge on it either); a
+    /// live session count on `.sessions`; the RUNNING count on `.tools` — the
+    /// one figure a glance at the closed tab cannot otherwise see. Both zero
+    /// out to `nil` rather than drawing a `0` badge, the same "a zero count
+    /// should never render" rule `panel-tabs-bridge.md` names for the account
+    /// cards.
+    private func badge(for tab: PanelTab, fleet: Fleet) -> Int? {
+        switch tab {
+        case .accounts: return nil
+        case .sessions: return fleet.sessions.isEmpty ? nil : fleet.sessions.count
+        case .tools: return fleet.toolsRunning.isEmpty ? nil : fleet.toolsRunning.count
+        }
+    }
+
+    private func tabButton(_ tab: PanelTab, badge: Int?) -> some View {
+        let isOn = tab == selectedTab
+        return Button {
+            if reduceMotion {
+                selectedTab = tab
+            } else {
+                withAnimation(Tok.standardAnimation) { selectedTab = tab }
+            }
+        } label: {
+            HStack(spacing: Tok.space2) {
+                Image(systemName: tab.systemImage)
+                Text(tab.title)
+                if let badge {
+                    Text("\(badge)")
+                        .font(.caption2.weight(.semibold))
+                        .padding(.horizontal, Tok.space2)
+                        .background(Capsule().fill(Tok.hover))
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(isOn ? Tok.ink : Tok.inkDim)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, Tok.space2)
+            .background(RoundedRectangle(cornerRadius: Tok.radiusSmall).fill(isOn ? Tok.hover : Color.clear))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(badge.map { "\(tab.title), \($0)" } ?? tab.title)
+    }
+
+    /// One row per session, grouped by the account it is pinned to — an
+    /// unpinned session (``Session/account`` `nil`) groups under
+    /// "Unassigned", listed last.
+    @ViewBuilder
+    private func sessionsTab(_ fleet: Fleet) -> some View {
+        if !fleet.sessionsSupported {
+            banner(
+                icon: "person.2",
+                title: "No sessions yet",
+                detail: "This server predates sessions — update tcr.",
+                tint: Tok.unknown)
+        } else if fleet.sessions.isEmpty {
+            banner(
+                icon: "person.2",
+                title: "No live sessions",
+                detail: "Nothing has spoken to the proxy in the last hour.",
+                tint: Tok.inkDim)
+        } else {
+            let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
+            if snapshotMode {
+                sessionsList(joined)
+            } else {
+                ScrollView { sessionsList(joined) }
+                    .frame(height: visibleRowsHeight(for: fleet))
+            }
+        }
+    }
+
+    private func sessionsList(_ sessions: [JoinedSession]) -> some View {
+        let byAccount = Dictionary(grouping: sessions) { $0.session.account ?? "" }
+        // Unassigned (`""`) sorts last; named accounts sort by name so the
+        // list order does not reshuffle between two polls that carry
+        // identical data.
+        let order = byAccount.keys.sorted { lhs, rhs in
+            if lhs.isEmpty != rhs.isEmpty { return rhs.isEmpty }
+            return lhs < rhs
+        }
+        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            ForEach(order, id: \.self) { key in
+                VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+                    Text(key.isEmpty ? "Unassigned" : key)
+                        .font(.subheadline.weight(.semibold))
+                    ForEach(byAccount[key] ?? []) { row in
+                        sessionRow(row)
+                    }
+                }
+            }
+        }
+    }
+
+    private func sessionRow(_ row: JoinedSession) -> some View {
+        VStack(alignment: .leading, spacing: Tok.space1) {
+            HStack(spacing: Tok.tightSpacing) {
+                Circle()
+                    .fill(activityColor(row.activity))
+                    .frame(width: 8, height: 8)
+                Text(row.displayName).font(.subheadline.weight(.semibold))
+                if let project = row.project {
+                    Text(project).font(Tok.secondaryFont).foregroundStyle(Tok.inkDim)
+                }
+                Spacer()
+            }
+            HStack(spacing: Tok.tightSpacing) {
+                Text("\(row.session.requests) req").monospacedDigit()
+                if let model = row.session.model { Text(model) }
+                Spacer()
+                Text(trailingStatus(row, now: Date())).monospacedDigit()
+            }
+            .font(Tok.secondaryDigitFont)
+            .foregroundStyle(Tok.inkDim)
+        }
+        .padding(.vertical, Tok.space1)
+    }
+
+    /// `docs/design/panel-tabs-review.md` finding 2: a session with a tool
+    /// running shows the age of its OLDEST running tool, not its own
+    /// `lastSeenMs` — a session cannot be "busy 3m" while a tool it owns has
+    /// run for 9. This is also the fix for the finding's other half: reading
+    /// `row.session.tools.running` here is the exact array
+    /// ``Fleet/toolsRunning`` pools for the Tools tab, so the two tabs can no
+    /// longer derive two different counts for the same session.
+    private func trailingStatus(_ row: JoinedSession, now: Date) -> String {
+        let running = row.session.tools.running
+        guard !running.isEmpty, let oldestStartedMs = running.compactMap(\.startedMs).min() else {
+            return row.ageLabel(now: now)
+        }
+        let elapsed = max(
+            0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(oldestStartedMs) / 1000)))
+        return "\(running.count) running · oldest \(durationLabel(elapsed))"
+    }
+
+    private func activityColor(_ activity: SessionActivity) -> Color {
+        switch activity {
+        case .busy: return Tok.ok
+        case .waiting: return Tok.near
+        case .idle, .unknown: return Tok.inkFaint
+        }
+    }
+
+    /// The ten slowest calls across every session, then running now, then
+    /// fleet-wide totals — `panel-tabs-bridge.md`'s order for this tab.
+    @ViewBuilder
+    private func toolsTab(_ fleet: Fleet) -> some View {
+        if !fleet.sessionsSupported {
+            banner(
+                icon: "terminal",
+                title: "No tool data yet",
+                detail: "This server predates sessions — update tcr.",
+                tint: Tok.unknown)
+        } else if snapshotMode {
+            toolsList(fleet)
+        } else {
+            ScrollView { toolsList(fleet) }
+                .frame(height: visibleRowsHeight(for: fleet))
+        }
+    }
+
+    private func toolsList(_ fleet: Fleet) -> some View {
+        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            // `docs/design/panel-tabs-review.md` finding 3: the sum over
+            // EVERY tool, never one category standing in for the total —
+            // `toolsTotalCalls` already sums across every session's
+            // `tools.calls`, whatever tool made each call.
+            Text(
+                "\(fleet.toolsTotalCalls) calls · \(fleet.toolsTotalErrors) errors"
+                    + " · \(fleet.toolsTotalTimeouts) timeouts"
+            )
+            .font(Tok.secondaryDigitFont)
+            .foregroundStyle(Tok.inkDim)
+
+            if !fleet.toolsRunning.isEmpty {
+                VStack(alignment: .leading, spacing: Tok.space1) {
+                    sectionHeading("RUNNING NOW")
+                    // Finding 5: state the denominator a ring fills toward,
+                    // rather than drawing a fraction with no stated whole.
+                    Text("Ring fills toward the 600s Bash timeout")
+                        .font(Tok.detailFont)
+                        .foregroundStyle(Tok.inkFaint)
+                }
+                ForEach(fleet.toolsRunning) { entry in runningToolRow(entry) }
+            }
+            if !fleet.toolsSlowest.isEmpty {
+                sectionHeading("SLOWEST TODAY")
+                ForEach(fleet.toolsSlowest) { entry in slowestToolRow(entry) }
+            }
+            if fleet.toolsRunning.isEmpty && fleet.toolsSlowest.isEmpty {
+                Text("No tool calls recorded yet.")
+                    .font(Tok.secondaryFont)
+                    .foregroundStyle(Tok.inkDim)
+            }
+        }
+    }
+
+    private func sectionHeading(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(Tok.inkFaint)
+            .tracking(Tok.pillTracking)
+    }
+
+    /// `commandHead` in monospace, truncated to one line — `panel-tabs-bridge.md`:
+    /// "`command_head` shown in monospace, truncated to one line." Shared by
+    /// ``runningToolRow(_:)`` and ``slowestToolRow(_:)`` so the two rows never
+    /// drift on how a call names itself.
+    private func toolCallLabel(_ entry: SessionToolEntry) -> some View {
+        VStack(alignment: .leading, spacing: Tok.space1) {
+            Text(entry.call.commandHead ?? entry.call.tool)
+                .font(.system(size: Tok.detailFontSize, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Text("\(entry.call.tool) · \(String(entry.sessionId.prefix(8)))")
+                .font(Tok.detailFont)
+                .foregroundStyle(Tok.inkDim)
+        }
+    }
+
+    /// The Bash tool's own timeout — the one denominator this build knows,
+    /// and the reason `docs/design/panel-tabs.md` names 600s specifically:
+    /// "The ten slowest calls today all sit at 600s: the Bash tool's own
+    /// timeout." A non-Bash running call has no known denominator and draws
+    /// no ring, per finding 5's own fix ("state the denominator … set to the
+    /// third ring") — inventing one for a tool this build has no timeout
+    /// figure for would be the same overclaim finding 5 exists to remove.
+    private let bashTimeoutSeconds: Double = 600
+
+    /// A running call: its ring (Bash only, filling toward
+    /// ``bashTimeoutSeconds``) and its elapsed time since `startedMs`, turning
+    /// `--bad`/`Tok.spent` and naming the seconds left inside the last 20s —
+    /// finding 5's fix, verbatim: "20s to timeout" beside the reddened ring.
+    private func runningToolRow(_ entry: SessionToolEntry) -> some View {
+        let now = Date()
+        let elapsed = entry.call.startedMs.map { started in
+            max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
+        }
+        let isBash = entry.call.tool == "Bash"
+        let remaining = elapsed.map { bashTimeoutSeconds - $0 }
+        let isNearTimeout = isBash && (remaining ?? .infinity) <= 20
+        return HStack(spacing: Tok.tightSpacing) {
+            toolCallLabel(entry)
+            Spacer()
+            VStack(alignment: .trailing, spacing: Tok.space1) {
+                if isBash, let elapsed {
+                    ZStack {
+                        Circle().stroke(Tok.hairline, lineWidth: 3)
+                        Circle()
+                            .trim(from: 0, to: min(elapsed / bashTimeoutSeconds, 1))
+                            .stroke(
+                                isNearTimeout ? Tok.spent : Tok.ok,
+                                style: StrokeStyle(lineWidth: 3, lineCap: .round)
+                            )
+                            .rotationEffect(.degrees(-90))
+                    }
+                    .frame(width: 18, height: 18)
+                }
+                if let elapsed {
+                    Text(
+                        isNearTimeout
+                            ? "\(Int(max(0, remaining ?? 0)))s to timeout" : durationLabel(elapsed)
+                    )
+                    .font(Tok.secondaryDigitFont)
+                    .monospacedDigit()
+                    .foregroundStyle(isNearTimeout ? Tok.spent : Tok.inkDim)
+                }
+            }
+        }
+        .padding(.vertical, Tok.space1)
+    }
+
+    private func slowestToolRow(_ entry: SessionToolEntry) -> some View {
+        HStack(spacing: Tok.tightSpacing) {
+            toolCallLabel(entry)
+            Spacer()
+            if let seconds = entry.call.seconds {
+                Text(durationLabel(seconds))
+                    .font(Tok.secondaryDigitFont)
+                    .monospacedDigit()
+                    .foregroundStyle(seconds >= bashTimeoutSeconds ? Tok.spent : Tok.inkDim)
+            }
+        }
+        .padding(.vertical, Tok.space1)
+    }
+
+    /// `"45s"`, `"4m 12s"` — no day tier: the longest call this tab shows is
+    /// the Bash tool's own timeout, six orders of magnitude under a day.
+    private func durationLabel(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded())
+        let minutes = total / 60
+        let rest = total % 60
+        return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
     }
 
     /// The account list, cut into sections: a state band heading, then a group
@@ -1312,6 +1697,29 @@ struct FleetView: View {
 /// A dictionary rather than one summed scalar because rows are not uniform
 /// height — `visibleRowsHeight(for:)` needs the first N individually, in
 /// display order, not just their total.
+/// The panel's three tabs (F2 + F3, `data/plans/panel-tabs-bridge.md`).
+/// `CaseIterable` so `panelTabBar` draws them in one declared order rather
+/// than a second list a reviewer has to keep in sync with this one.
+enum PanelTab: Equatable, CaseIterable {
+    case accounts, sessions, tools
+
+    var title: String {
+        switch self {
+        case .accounts: return "Accounts"
+        case .sessions: return "Sessions"
+        case .tools: return "Tools"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .accounts: return "gauge"
+        case .sessions: return "person.2"
+        case .tools: return "terminal"
+        }
+    }
+}
+
 struct RowHeightsKey: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {

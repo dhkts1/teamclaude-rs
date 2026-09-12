@@ -300,6 +300,105 @@ final class FleetStatusTests: XCTestCase {
             "a measured zero stream-error count must render no line at all"
         )
     }
+
+    // MARK: F2/F3 — sessions (`data/plans/panel-tabs-bridge.md`)
+    //
+    // `Fleet.decode` decodes ONLY the bare account array `tcr status
+    // --json` sends — confirmed against the merged F1 work
+    // (`teamclaude-rs#232`, `crates/tcr-status-wire/src/lib.rs`): the wire's
+    // `SessionRow`/`StatusPayload.sessions` live on the proxy's own
+    // `/_tcr/status` HTTP response, gated by the proxy's api-key
+    // (`fetch_live_status`, `src/cli.rs`), and `tcr status --json` discards
+    // them before printing. This app never touches that endpoint or that key
+    // from Swift (`CLAUDE.md` "No credentials, ever"), so ``Fleet/sessions``
+    // is a plain stored field with no live producer yet — these tests
+    // construct it directly rather than decoding it off the account array,
+    // which is also the proof that `Fleet.decode` never sets it.
+
+    private func session(
+        id: String,
+        account: String? = "alice@example.com",
+        model: String? = "claude-opus-5",
+        requests: Int = 0,
+        tools: SessionTools = SessionTools()
+    ) -> Session {
+        Session(
+            sessionId: id, account: account, model: model, firstSeenMs: 0, lastSeenMs: 1000,
+            requests: requests, tools: tools)
+    }
+
+    /// `Fleet.decode` never populates `sessions`/`sessionsSupported`, on any
+    /// input — including a row that happens to carry a `"sessions"` key,
+    /// which a synthesized `Decodable` simply ignores as an unknown key
+    /// rather than reading it onto ``Account``.
+    func testDecodeNeverPopulatesSessions() throws {
+        let decoded = try fleet(liveFixture)
+        XCTAssertFalse(decoded.sessionsSupported)
+        XCTAssertTrue(decoded.sessions.isEmpty)
+    }
+
+    /// A fleet with zero accounts still reports empty/unsupported rather than
+    /// crashing — there is no `accounts.first` to read at all any more,
+    /// since ``Fleet/sessions`` is now its own stored field.
+    func testEmptyFleetHasNoSessionsAndIsUnsupported() throws {
+        let decoded = try fleet("[]")
+        XCTAssertTrue(decoded.sessions.isEmpty)
+        XCTAssertFalse(decoded.sessionsSupported)
+    }
+
+    /// A `Fleet` built with sessions directly (the shape a future safe
+    /// channel — or a render-states fixture — hands this build) reports them
+    /// and marks itself supported.
+    func testFleetConstructedWithSessionsReportsThemAsSupported() throws {
+        let oneSession = session(
+            id: "11111111-aaaa-bbbb-cccc-111111111111", requests: 40,
+            tools: SessionTools(
+                calls: 12, errors: 1, timeouts: 0,
+                running: [ToolCall(tool: "Bash", commandHead: "cargo test", startedMs: 1500)],
+                slowest: [
+                    ToolCall(tool: "Bash", commandHead: "swift build", endedMs: 1900, seconds: 90.5)
+                ]))
+        let decoded = try fleet(liveFixture)
+        let withSessions = Fleet(
+            accounts: decoded.accounts, sessions: [oneSession], sessionsSupported: true)
+        XCTAssertTrue(withSessions.sessionsSupported)
+        XCTAssertEqual(withSessions.sessions.count, 1)
+        let readBack = withSessions.sessions[0]
+        XCTAssertEqual(readBack.sessionId, "11111111-aaaa-bbbb-cccc-111111111111")
+        XCTAssertEqual(readBack.requests, 40)
+        XCTAssertEqual(readBack.tools.calls, 12)
+        XCTAssertEqual(readBack.tools.running.count, 1)
+        XCTAssertEqual(readBack.tools.running[0].commandHead, "cargo test")
+        XCTAssertEqual(readBack.tools.slowest.count, 1)
+        XCTAssertEqual(readBack.tools.slowest[0].seconds, 90.5)
+    }
+
+    /// `Fleet.toolsRunning`/`toolsSlowest` pool across every session and
+    /// `toolsSlowest` re-sorts rather than trusting per-session order.
+    func testToolsPoolAcrossSessionsAndSlowestSortsDescending() throws {
+        let s1 = session(
+            id: "s1", model: "claude-opus-5",
+            tools: SessionTools(
+                calls: 3, errors: 0, timeouts: 1, slowest: [ToolCall(tool: "Bash", seconds: 12.0)]))
+        let s2 = session(
+            id: "s2", model: "claude-sonnet-5",
+            tools: SessionTools(
+                calls: 5, errors: 2, timeouts: 0,
+                running: [ToolCall(tool: "Read", startedMs: 10)],
+                slowest: [ToolCall(tool: "Bash", seconds: 600.0)]))
+        let decoded = try fleet(liveFixture)
+        let withSessions = Fleet(
+            accounts: decoded.accounts, sessions: [s1, s2], sessionsSupported: true)
+        XCTAssertEqual(withSessions.toolsTotalCalls, 8)
+        XCTAssertEqual(withSessions.toolsTotalErrors, 2)
+        XCTAssertEqual(withSessions.toolsTotalTimeouts, 1)
+        XCTAssertEqual(withSessions.toolsRunning.count, 1)
+        XCTAssertEqual(withSessions.toolsRunning[0].sessionId, "s2")
+        // s2's 600s call sorts ahead of s1's 12s call, even though s1 is
+        // first in the array.
+        XCTAssertEqual(withSessions.toolsSlowest.map(\.sessionId), ["s2", "s1"])
+        XCTAssertEqual(withSessions.toolsSlowest.map { $0.call.seconds }, [600.0, 12.0])
+    }
 }
 
 /// ``Account/effectiveQuotaState(for:)`` is the pure selection
