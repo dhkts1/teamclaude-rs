@@ -1066,11 +1066,28 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
     public let cacheReadTokens: Int
     public let tools: SessionTools
     /// Requests seen in each of the last 30 wall-clock minutes, oldest first
-    /// — `data/plans/wire-2-bridge.md`'s `req_per_minute`, the Sessions tab's
-    /// sparkline. `nil`, not an all-zero series, when the server doesn't
-    /// send it yet: a flat line at zero would claim a measured idle session,
-    /// which an unmeasured one is not.
+    /// — `SessionRow::req_per_minute`, the Sessions tab's sparkline. `nil`,
+    /// not an all-zero series, when the server doesn't send it yet: a flat
+    /// line at zero would claim a measured idle session, which an unmeasured
+    /// one is not.
+    ///
+    /// **Keyed `reqPerMinute`, not `req_per_minute`.** The wire struct carries
+    /// `#[serde(rename_all = "camelCase")]`
+    /// (`crates/tcr-status-wire/src/lib.rs`, `SessionRow`), so the snake_case
+    /// key this decoder was written against never appears in a real payload:
+    /// it decoded `nil` from every live session while the Swift-constructed
+    /// fixtures — which never go through JSON — drew their sparklines
+    /// perfectly. Verified against that file on `feat/wire-2` (`e13e6f0`),
+    /// and `SessionDecodingTests` now decodes the camelCase key so a rename
+    /// back fails a test rather than a screen.
     public let reqPerMinute: [UInt16]?
+
+    /// What this session's traffic cost, list-price equivalent —
+    /// `SessionRow::cost_usd`. Optional HERE though the wire field is a plain
+    /// `f64`: a server built before wire 2 sends no such key at all, and its
+    /// sessions must keep decoding rather than throwing the whole tab away.
+    /// `nil` draws no `$` clause; it is never read as zero.
+    public let costUsd: Double?
 
     public var id: String { sessionId }
 
@@ -1085,7 +1102,8 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         outputTokens: Int = 0,
         cacheReadTokens: Int = 0,
         tools: SessionTools = SessionTools(),
-        reqPerMinute: [UInt16]? = nil
+        reqPerMinute: [UInt16]? = nil,
+        costUsd: Double? = nil
     ) {
         self.sessionId = sessionId
         self.account = account
@@ -1098,12 +1116,12 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         self.cacheReadTokens = cacheReadTokens
         self.tools = tools
         self.reqPerMinute = reqPerMinute
+        self.costUsd = costUsd
     }
 
     private enum CodingKeys: String, CodingKey {
         case sessionId, account, model, firstSeenMs, lastSeenMs, requests, inputTokens,
-            outputTokens, cacheReadTokens, tools
-        case reqPerMinute = "req_per_minute"
+            outputTokens, cacheReadTokens, tools, reqPerMinute, costUsd
     }
 
     public init(from decoder: Decoder) throws {
@@ -1119,6 +1137,7 @@ public struct Session: Decodable, Equatable, Identifiable, Sendable {
         cacheReadTokens = try c.decodeIfPresent(Int.self, forKey: .cacheReadTokens) ?? 0
         tools = try c.decodeIfPresent(SessionTools.self, forKey: .tools) ?? SessionTools()
         reqPerMinute = try c.decodeIfPresent([UInt16].self, forKey: .reqPerMinute)
+        costUsd = try c.decodeIfPresent(Double.self, forKey: .costUsd)
     }
 }
 

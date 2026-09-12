@@ -327,6 +327,40 @@ final class FleetStatusTests: XCTestCase {
             requests: requests, tools: tools)
     }
 
+    /// A `SessionRow` decoded from the payload the proxy actually sends.
+    ///
+    /// The keys here are copied from `crates/tcr-status-wire/src/lib.rs`'s
+    /// `SessionRow`, which carries `#[serde(rename_all = "camelCase")]` —
+    /// verified on `feat/wire-2` (`e13e6f0`). This decoder was written against
+    /// `"req_per_minute"` and therefore read `nil` from every real session
+    /// while the Swift-built render fixtures, which never go through JSON,
+    /// drew their sparklines perfectly. A test that constructs a `Session`
+    /// cannot catch that; only one that decodes the server's own spelling can.
+    func testSessionDecodesTheWiresCamelCaseKeys() throws {
+        let json = """
+            {"sessionId":"aaaa","account":"alice@example.com","model":"claude-opus-5",
+             "firstSeenMs":1000,"lastSeenMs":2000,"requests":412,"inputTokens":10,
+             "outputTokens":20,"cacheReadTokens":30,
+             "reqPerMinute":[1,2,3],"costUsd":4.12}
+            """
+        let decoded = try JSONDecoder().decode(Session.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.reqPerMinute, [1, 2, 3])
+        XCTAssertEqual(decoded.costUsd, 4.12)
+    }
+
+    /// A server built before wire 2 sends neither key. Both must come back
+    /// `nil` — absent, never an all-zero series or a measured `$0.00`.
+    func testSessionDecodesWithoutTheWireTwoKeys() throws {
+        let json = """
+            {"sessionId":"aaaa","firstSeenMs":1000,"lastSeenMs":2000}
+            """
+        let decoded = try JSONDecoder().decode(Session.self, from: Data(json.utf8))
+
+        XCTAssertNil(decoded.reqPerMinute)
+        XCTAssertNil(decoded.costUsd)
+    }
+
     /// `Fleet.decode` never populates `sessions`/`sessionsSupported`, on any
     /// input — including a row that happens to carry a `"sessions"` key,
     /// which a synthesized `Decodable` simply ignores as an unknown key

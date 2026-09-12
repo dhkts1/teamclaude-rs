@@ -102,7 +102,7 @@ enum RenderStates {
             // A parked group beside a live one — see `parkedGroupJSON`.
             ("15-parked-group", .loaded(fleet(parkedGroupJSON)), false, nil),
             // The SAME fleet, expanded — see `render(_:appearance:into:)`'s
-            // own seeding of `FleetView.expandedParkedGroupsKey` for
+            // own seeding of `FleetView.expandedGroupsKey` for
             // `henry-team`, the wholly-parked group `parkedGroupJSON` builds.
             ("15b-parked-group-expanded", .loaded(fleet(parkedGroupJSON)), false, nil),
             // F2 — the Sessions tab, grouped by account, one row with a
@@ -240,7 +240,7 @@ enum RenderStates {
         let awake = AwakeController.harness()
         awake.setOn(scene.awake)
 
-        // `expandedParkedGroups` reads `UserDefaults.standard` at construction
+        // `expandedGroups` reads `UserDefaults.standard` at construction
         // — real for the shipping app, but this harness only ever runs under
         // `TCRBAR_DEV_BUILD=1`'s OWN bundle id (`build-tcrbar.sh`'s own
         // comment: "gives a non-shipping build its own identity"), a
@@ -252,9 +252,9 @@ enum RenderStates {
         // next.
         if scene.name == "15b-parked-group-expanded" {
             UserDefaults.standard.set(
-                ["g:henry-team"], forKey: FleetView.expandedParkedGroupsKey)
+                ["g:henry-team"], forKey: FleetView.expandedGroupsKey)
         } else {
-            UserDefaults.standard.removeObject(forKey: FleetView.expandedParkedGroupsKey)
+            UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
         }
 
         let view =
@@ -522,6 +522,39 @@ enum RenderStates {
             "costUsd":2.0872,"unpricedRequests":0}}}
         """
 
+    /// The same measured shape as ``measuredUsage`` with the three figures the
+    /// panel actually PRINTS dialled to a caller's numbers: today's spend (a
+    /// collapsed group's "· $8.42 today"), and the window's spend and output
+    /// tokens (an account card's "$540 · 1.5M out").
+    ///
+    /// Built as a format, not by rewriting `measuredUsage`'s text: a
+    /// string-replace on a shared JSON literal would hit whichever bucket
+    /// happened to carry the same digits, and the parity fixtures below need
+    /// exactly these three to move and the rest to stay put.
+    private static func measuredUsage(
+        todayCost: Double, windowCost: Double, windowOutputTokens: Int
+    ) -> String {
+        """
+        {"today":{"requests":102,"inputTokens":174512,"cacheCreationTokens":1200000,
+          "cacheCreation1hTokens":400000,"cacheReadTokens":7407414,"outputTokens":31860,
+          "costUsd":\(todayCost),"unpricedRequests":0},
+         "window":{"requests":40,"inputTokens":68000,"cacheCreationTokens":471000,
+          "cacheCreation1hTokens":157000,"cacheReadTokens":2900000,
+          "outputTokens":\(windowOutputTokens),
+          "costUsd":\(windowCost),"unpricedRequests":0,"since":1767207600000},
+         "lastHour":{"requests":12,"inputTokens":20000,"cacheCreationTokens":141000,
+          "cacheCreation1hTokens":47000,"cacheReadTokens":705000,"outputTokens":3756,
+          "costUsd":1.6413,"unpricedRequests":0},
+         "todayByModel":{
+           "claude-opus-5":{"requests":70,"inputTokens":122158,"cacheCreationTokens":840000,
+            "cacheCreation1hTokens":280000,"cacheReadTokens":5185190,"outputTokens":21140,
+            "costUsd":12.0785,"unpricedRequests":0},
+           "claude-sonnet-5":{"requests":32,"inputTokens":52354,"cacheCreationTokens":360000,
+            "cacheCreation1hTokens":120000,"cacheReadTokens":2222224,"outputTokens":10720,
+            "costUsd":2.0872,"unpricedRequests":0}}}
+        """
+    }
+
     /// Nothing this account served could be priced: `costUsd` is null in every
     /// bucket and `unpricedRequests` says how many requests are missing from
     /// the figure. The card must print the token count ALONE — no `$0.00` —
@@ -727,10 +760,12 @@ enum RenderStates {
                     ]),
                 // Rising, per the mockup's own aria-label on this session's spark:
                 // "Requests per minute over the last 30 minutes: rising".
+                // "$4.12" — `SessionRow::cost_usd`, wire 2.
                 reqPerMinute: [
                     2, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8,
                     10, 9, 11, 10, 12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17,
-                ]),
+                ],
+                costUsd: 4.12),
             // "5,756 req · cache 94% · waiting 12m".
             Session(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "henry10@example.com",
@@ -751,10 +786,13 @@ enum RenderStates {
                         ToolBucketRow(tool: "Grep", calls: 2_352, secondsP50: 0.2),
                     ]),
                 // Falling, per the mockup's aria-label on this session's spark.
+                // "$5.29"; with the sibling above, the account block's header
+                // reads the mockup's "3 sessions · $9.41".
                 reqPerMinute: [
                     15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 4, 4, 3,
                     3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
-                ]),
+                ],
+                costUsd: 5.29),
             // "idle 40m" — no metrics line at all in the mockup, and
             // `FleetView.sessionRow`'s compact idle layout now matches that.
             Session(
@@ -784,55 +822,82 @@ enum RenderStates {
                             commandHead: "swift build -c release --product TcrBar",
                             startedMs: msAgo(63))
                     ]),
+                // "$7.90"; with `token-b4`'s $0.12 below, this account's
+                // block header reads the mockup's "2 sessions · $8.02".
                 reqPerMinute: [
                     4, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8, 10, 9, 11, 10,
                     12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17, 16, 18, 17, 19,
-                ]),
+                ],
+                costUsd: 7.90),
             // "idle 2h" — compact layout, same as `m-075377` above.
             Session(
                 sessionId: "eeeeeeee-1111-2222-3333-444444444444", account: "henry1@example.com",
                 model: "claude-opus-5", firstSeenMs: msAgo(5 * 3600), lastSeenMs: msAgo(2 * 3600),
-                requests: 5, inputTokens: 1500, outputTokens: 120, cacheReadTokens: 900),
+                requests: 5, inputTokens: 1500, outputTokens: 120, cacheReadTokens: 900,
+                // Priced, and deliberately never DRAWN: an idle row is one
+                // line with no metrics, so this figure only ever reaches the
+                // account block's own total. `m-075377` above is left
+                // unpriced (`nil`) so the same block also carries the
+                // server-did-not-send case.
+                costUsd: 0.12),
         ]
     }
 
-    /// 2 solo cards + a 3-member parked group (`henry-token`) + a 6-member
+    /// 2 solo cards + a 5-member parked group (`henry-token`) + a 6-member
     /// active group (`mycelium`) — the mockup's own account count and group
     /// shape (`docs/design/panel-tabs-mockup.html`'s Accounts panel), built
-    /// entirely from the existing `account()`/group machinery. No disclosure
-    /// ("Show N more") exists yet, so the parked group renders its 3 real
-    /// members rather than 3-of-5 with a button; that gap is recorded in
-    /// `product-wave-findings.md`, not hidden here.
+    /// entirely from the existing `account()`/group machinery.
+    ///
+    /// The counts are the point, not decoration: five parked accounts is what
+    /// puts two of them behind `FleetView`'s "Show 2 more accounts" button,
+    /// and six live ones is what trips ``FleetSection/collapsesByDefault``, so
+    /// this scene is the render-harness proof that both disclosure shapes
+    /// draw. The spend figures are dialled so the collapsed group's summary
+    /// line reads the mockup's own "6 accounts · $8.42 today".
     private static var accountsParityJSON: String {
+        // "$540 · 1.5M out" and "$1,190 · 3.1M out" on the two solo cards'
+        // plan lines, the mockup's own figures.
         let solo1 = account(
             "henry10@example.com", quota: "0.07", state: "ok", sevenDay: "0.30",
             sevenDayState: "ok", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            usage: measuredUsage(
+                todayCost: 540.12, windowCost: 540.12, windowOutputTokens: 1_500_000),
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")
         let solo2 = account(
             "henry5@example.com", quota: "0.04", state: "ok", sevenDay: "0.98",
             sevenDayState: "warn", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 5_640,
+            usage: measuredUsage(
+                todayCost: 1_190.4, windowCost: 1_190.4, windowOutputTokens: 3_100_000),
             plan: "Max 20x", orgUuid: "22222222-2222-2222-2222-222222222222")
         let tokenColors = ["henry-token": "#92d188", "mycelium": "#c79ae8"]
-        let tokenGroup1 = account(
-            "gil@example.com", quota: "0.10", state: "ok",
-            groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
-            plan: "Team 5x", orgUuid: "33333333-3333-3333-3333-333333333333")
-        let tokenGroup2 = account(
-            "henry1@example.com", quota: "0.0", state: "unmeasured",
-            groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
-            plan: "Team Standard", orgUuid: "33333333-3333-3333-3333-333333333333")
-        let tokenGroup3 = account(
-            "henry2@example.com", quota: "0.55", state: "near",
-            groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
-            plan: "Team 5x", orgUuid: "33333333-3333-3333-3333-333333333333")
+        // Five parked members — three drawn, two behind the button.
+        let parkedPlans = ["Team 5x", "Team Standard", "Team 5x", "Team Standard", "Team 5x"]
+        let parkedStates = [
+            ("0.10", "ok"), ("0.0", "unmeasured"), ("0.55", "near"),
+            ("0.22", "ok"), ("0.31", "ok"),
+        ]
+        let parkedNames = [
+            "gil@example.com", "henry1@example.com", "henry2@example.com",
+            "henry3@example.com", "henry4@example.com",
+        ]
+        let tokenRows = (0..<5).map { i in
+            account(
+                parkedNames[i], quota: parkedStates[i].0, state: parkedStates[i].1,
+                groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
+                plan: parkedPlans[i], orgUuid: "33333333-3333-3333-3333-333333333333")
+        }
+        // 5 x $1.40 + $1.42 = $8.42, the mockup's own collapsed-group total.
         let myceliumRows = (1...6).map { i in
             account(
                 "mycelium\(i)@example.com", quota: i == 6 ? "0.60" : "0.15",
                 state: i == 6 ? "near" : "ok",
+                usage: measuredUsage(
+                    todayCost: i == 6 ? 1.42 : 1.40, windowCost: 0.9,
+                    windowOutputTokens: 12_476),
                 groups: ["mycelium"], groupColors: tokenColors,
                 plan: "Team Standard", orgUuid: "44444444-4444-4444-4444-444444444444")
         }
-        let all = [solo1, solo2, tokenGroup1, tokenGroup2, tokenGroup3] + myceliumRows
+        let all = [solo1, solo2] + tokenRows + myceliumRows
         return "[\(all.joined(separator: ","))]"
     }
 
