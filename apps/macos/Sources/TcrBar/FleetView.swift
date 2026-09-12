@@ -349,7 +349,7 @@ struct FleetView: View {
                 banner(
                     icon: Tok.unreadableGlyph,
                     title: "No accounts configured",
-                    detail: "tcr answered, and the fleet is empty.",
+                    detail: "tcr answered, and the fleet is empty. Run `tcr login` in a terminal to add one.",
                     tint: Tok.unknown
                 )
             } else {
