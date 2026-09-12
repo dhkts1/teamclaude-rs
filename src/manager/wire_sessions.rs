@@ -35,14 +35,26 @@ impl Manager {
 
     /// Add token counts learned from a response's usage to the wire-session table. Called
     /// beside [`Self::record_usage`] (the per-account ledger) at both of its call sites in
-    /// `proxy.rs` — streamed and non-streamed — with the SAME parsed totals, so the two never
-    /// disagree about how much a response cost.
+    /// `proxy.rs` — streamed and non-streamed — with the SAME [`crate::usage::UsageRecord`]
+    /// fields, so the account ledger, the per-model tally and the wire session's quota totals
+    /// never disagree about what a response carried.
+    ///
+    /// `quota_input` is the QUOTA figure (`UsageRecord::input_total()`, verbatim) and folds
+    /// into the session's existing `input_tokens` total, unchanged in meaning. `base_input`,
+    /// `cache_5m` and `cache_1h` (`UsageRecord::input`/`cache_5m`/`cache_1h`) are the pricing
+    /// dimensions, kept in [`crate::session_wire::WireSession::by_model`] — wire 2
+    /// (`data/plans/wire-2-bridge.md`).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_wire_session_usage(
         &self,
         session_id: Option<&str>,
-        input_tokens: u64,
-        output_tokens: u64,
+        model: Option<&str>,
+        quota_input: u64,
+        base_input: u64,
+        cache_5m: u64,
+        cache_1h: u64,
         cache_read_tokens: u64,
+        output_tokens: u64,
     ) {
         let Some(session_id) = session_id else {
             return;
@@ -51,7 +63,16 @@ impl Manager {
             .wire_sessions
             .lock()
             .expect("wire sessions lock poisoned");
-        tracker.record_usage(session_id, input_tokens, output_tokens, cache_read_tokens);
+        tracker.record_usage(
+            session_id,
+            model,
+            quota_input,
+            base_input,
+            cache_5m,
+            cache_1h,
+            cache_read_tokens,
+            output_tokens,
+        );
     }
 
     /// The live wire-session table, projected onto [`tcr_status_wire::SessionRow`] — what
@@ -82,6 +103,7 @@ impl Manager {
                     calls: s.tools.calls,
                     errors: s.tools.errors,
                     timeouts: s.tools.timeouts,
+                    over_one_minute: s.tools.over_one_minute,
                     subagents_running: s
                         .tools
                         .running
@@ -109,9 +131,85 @@ impl Manager {
                             ended_ms: t.ended_ms,
                         })
                         .collect(),
+                    by_tool: s
+                        .tools
+                        .by_tool
+                        .iter()
+                        .map(|(name, bucket)| tcr_status_wire::ToolBucketRow {
+                            tool: name.clone(),
+                            calls: bucket.calls,
+                            errors: bucket.errors,
+                            seconds_p50: bucket.seconds_p50(),
+                            over_one_minute: bucket.over_one_minute,
+                        })
+                        .collect(),
                 },
+                req_per_minute: s.req_per_minute.projected(now_ms),
+                cost_usd: Self::price_session(&self.usage, &s.by_model),
             })
             .collect()
+    }
+
+    /// Price one session's per-model token tallies against the account ledger's OWN pricing
+    /// table (`crate::usage::UsageTracker::price_for`) and sum — one model's price at a time,
+    /// so a session that spans two models is priced correctly rather than averaged. A model
+    /// this table has no entry for contributes `0.0`, the same "unpriced" outcome
+    /// `crate::pricing` documents for the account-level ledger, just not surfaced as a
+    /// separate count here — `SessionRow::cost_usd` is a plain total, not an
+    /// `Option`/`unpriced_requests` pair.
+    fn price_session(
+        usage: &crate::usage::UsageTracker,
+        by_model: &std::collections::HashMap<String, crate::session_wire::ModelTokenTally>,
+    ) -> f64 {
+        let nanos: u64 = by_model
+            .iter()
+            .filter_map(|(model, tally)| {
+                usage.price_for(model).map(|price| {
+                    crate::pricing::cost_nanos(
+                        &price,
+                        tally.input,
+                        tally.cache_5m,
+                        tally.cache_1h,
+                        tally.cache_read,
+                        tally.output,
+                    )
+                })
+            })
+            .sum();
+        nanos as f64 / 1_000_000_000.0
+    }
+
+    /// Fleet-wide tool-call totals, summed across every row `Self::wire_sessions_snapshot`
+    /// just built — the ONE place this sum happens server-side, so a panel's headline and
+    /// "BY TOOL" bars read the same numbers as the per-session rows (see the bridge, F3).
+    pub(super) fn wire_sessions_summary(
+        rows: &[tcr_status_wire::SessionRow],
+    ) -> tcr_status_wire::SessionsSummary {
+        let mut by_tool: std::collections::HashMap<String, tcr_status_wire::ToolBucketRow> =
+            std::collections::HashMap::new();
+        let mut summary = tcr_status_wire::SessionsSummary::default();
+        for row in rows {
+            summary.calls += row.tools.calls;
+            summary.over_one_minute += row.tools.over_one_minute;
+            summary.timeouts += row.tools.timeouts;
+            summary.cost_usd += row.cost_usd;
+            for bucket in &row.tools.by_tool {
+                let entry = by_tool.entry(bucket.tool.clone()).or_insert_with(|| {
+                    tcr_status_wire::ToolBucketRow {
+                        tool: bucket.tool.clone(),
+                        ..Default::default()
+                    }
+                });
+                entry.calls += bucket.calls;
+                entry.errors += bucket.errors;
+                entry.over_one_minute += bucket.over_one_minute;
+            }
+        }
+        // `seconds_p50` cannot be summed across sessions — it is a median, not a total — so
+        // the fleet-wide row leaves it at its default (0.0) rather than fabricating one from
+        // an average of medians.
+        summary.by_tool = by_tool.into_values().collect();
+        summary
     }
 }
 
@@ -135,7 +233,16 @@ mod tests {
             &[],
             &[],
         );
-        manager.record_wire_session_usage(Some("sess-glue"), 10, 20, 5);
+        manager.record_wire_session_usage(
+            Some("sess-glue"),
+            Some("claude-fable-5"),
+            10,
+            10,
+            0,
+            0,
+            5,
+            20,
+        );
 
         let snap = manager.snapshot(now);
         assert_eq!(snap.wire_sessions.len(), 1);
@@ -195,7 +302,51 @@ mod tests {
             &[],
             &[],
         );
-        manager.record_wire_session_usage(None, 10, 20, 5);
+        manager.record_wire_session_usage(None, Some("claude-fable-5"), 10, 10, 0, 0, 5, 20);
         assert!(manager.snapshot(now).wire_sessions.is_empty());
+    }
+
+    /// The scoped ask: two requests on two different models, each with a known price, sum to
+    /// the expected total to the cent — a session that spans models is priced per-model and
+    /// summed, never averaged or priced against whichever model happened to be current.
+    #[test]
+    fn cost_usd_sums_two_models_priced_independently() {
+        let manager = Manager::from_runtimes(vec![]);
+        let now = OffsetDateTime::now_utc();
+        manager.record_wire_session(Some("sess-cost"), None, None, now, &[], &[]);
+
+        // 1,000,000 base input tokens on Opus 5 ($5.00/MTok) = $5.00 exactly.
+        manager.record_wire_session_usage(
+            Some("sess-cost"),
+            Some("claude-opus-5"),
+            1_000_000,
+            1_000_000,
+            0,
+            0,
+            0,
+            0,
+        );
+        // 1,000,000 output tokens on Sonnet 5 ($10.00/MTok output) = $10.00 exactly.
+        manager.record_wire_session_usage(
+            Some("sess-cost"),
+            Some("claude-sonnet-5"),
+            1_000_000,
+            0,
+            0,
+            0,
+            0,
+            1_000_000,
+        );
+
+        let snap = manager.snapshot(now);
+        let row = &snap.wire_sessions[0];
+        assert_eq!(
+            row.cost_usd, 15.0,
+            "$5.00 (opus input) + $10.00 (sonnet output)"
+        );
+        assert_eq!(
+            snap.wire_sessions_summary.cost_usd, 15.0,
+            "the fleet-wide summary sums the same per-session totals"
+        );
     }
 }

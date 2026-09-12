@@ -3038,13 +3038,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         output_tokens = parsed.output,
                         "request usage"
                     );
-                    manager_side.record_usage(idx, record);
                     manager_side.record_wire_session_usage(
                         wire_session_id_for_usage.as_deref(),
-                        parsed.input_total,
-                        parsed.output,
-                        parsed.cache_read,
+                        record.model.as_deref(),
+                        record.input_total(),
+                        record.input,
+                        record.cache_5m,
+                        record.cache_1h,
+                        record.cache_read,
+                        record.output,
                     );
+                    manager_side.record_usage(idx, record);
                 }
                 // Sibling of the usage guard above, not nested in it: an error
                 // event with NO message_start leaves input_total == output == 0,
@@ -3242,13 +3246,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     output_tokens = parsed.output,
                     "request usage"
                 );
-                manager.record_usage(idx, record);
                 manager.record_wire_session_usage(
                     wire_session_id.as_deref(),
-                    parsed.input_total,
-                    parsed.output,
-                    parsed.cache_read,
+                    record.model.as_deref(),
+                    record.input_total(),
+                    record.input,
+                    record.cache_5m,
+                    record.cache_1h,
+                    record.cache_read,
+                    record.output,
                 );
+                manager.record_usage(idx, record);
             }
         } else {
             // The "upstream response" line above (:2587) has never carried a

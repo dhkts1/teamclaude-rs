@@ -573,6 +573,12 @@ calls; `tools.slowest`, the ten slowest completed ones). `tools.running` entries
 Claude Code sent one), and `tools.subagentsRunning` is that count precomputed, so a panel can show
 "2 subagents" without scanning the list itself.
 
+Each session also carries `tools.byTool` (a per-tool-name breakdown: calls, errors, a median
+duration over a bounded reservoir, and `overOneMinute`) and `reqPerMinute` (30 wall-clock minutes
+of request counts, oldest first, decaying to zeros as the session goes idle); the payload's
+top-level `sessionsSummary` is the same `byTool` shape summed across every session server-side, so
+a panel's fleet-wide headline never disagrees with the per-session rows by re-summing them itself.
+
 ---
 
 ## `tcr wrap`

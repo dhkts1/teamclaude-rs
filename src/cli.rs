@@ -6020,6 +6020,7 @@ mod tests {
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
+                wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
             },
             thresholds,
         )
@@ -6595,6 +6596,7 @@ mod tests {
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: Vec::new(),
+                wire_sessions_summary: tcr_status_wire::SessionsSummary::default(),
             },
             vec![0.90, 0.90],
         )

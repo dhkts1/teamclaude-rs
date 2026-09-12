@@ -165,6 +165,14 @@ pub struct StatusPayload {
     /// [`STATUS_KIND`], per this struct's `build` doc-comment.
     #[serde(default)]
     pub sessions: Vec<tcr_status_wire::SessionRow>,
+    /// Fleet-wide tool-call totals summed across [`Self::sessions`] server-side — see
+    /// [`tcr_status_wire::SessionsSummary`]'s doc-comment. `#[serde(default)]` for the same
+    /// forward/back-compat reason as `sessions` itself: an OLD server's payload has no such
+    /// key, and a NEW client reads the all-zero default — the truth, "this server never
+    /// reported one" — rather than failing the parse and dropping to the offline snapshot.
+    /// Neither skew direction is MISREAD, so this must NOT bump [`STATUS_KIND`].
+    #[serde(default)]
+    pub sessions_summary: tcr_status_wire::SessionsSummary,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -396,6 +404,7 @@ impl StatusPayload {
             control,
             group_colors,
             sessions: snapshot.wire_sessions.clone(),
+            sessions_summary: snapshot.wire_sessions_summary.clone(),
         }
     }
 
@@ -462,6 +471,7 @@ impl StatusPayload {
                 recent: Vec::new(),
                 sessions: Vec::new(),
                 wire_sessions: self.sessions,
+                wire_sessions_summary: self.sessions_summary,
             },
             thresholds,
         )
@@ -540,8 +550,31 @@ mod tests {
                         command_head: Some("sleep 3".to_string()),
                         ended_ms: crate::now_ms(),
                     }],
+                    over_one_minute: 0,
+                    by_tool: vec![tcr_status_wire::ToolBucketRow {
+                        tool: "Bash".to_string(),
+                        calls: 2,
+                        errors: 0,
+                        seconds_p50: 3.5,
+                        over_one_minute: 0,
+                    }],
                 },
+                req_per_minute: vec![0; 29].into_iter().chain(std::iter::once(3)).collect(),
+                cost_usd: 0.0125,
             }],
+            wire_sessions_summary: tcr_status_wire::SessionsSummary {
+                calls: 2,
+                over_one_minute: 0,
+                timeouts: 0,
+                by_tool: vec![tcr_status_wire::ToolBucketRow {
+                    tool: "Bash".to_string(),
+                    calls: 2,
+                    errors: 0,
+                    seconds_p50: 0.0,
+                    over_one_minute: 0,
+                }],
+                cost_usd: 0.0125,
+            },
         }
     }
 
