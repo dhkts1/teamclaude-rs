@@ -464,6 +464,8 @@ struct FleetView: View {
             control: control,
             onChanged: { await poller.pollOnce() },
             onRelogin: { reloginAccount(account.ref) },
+            onMint: { mintAccountToken(account.ref) },
+            onMintGroup: { group in mintGroupTokens(group) },
             groupController: groupController,
             removeController: removeController,
             allAccounts: fleet.accounts,
@@ -846,6 +848,43 @@ struct FleetView: View {
         }
     }
 
+    /// Hand `tcr mint --account <name>` to a Terminal window for one row.
+    ///
+    /// Same hand-off reasoning as ``addAccount()``/``reloginAccount(_:)``, not
+    /// ``TokenCommand``: `tcr mint` prompts on stdin once per account and
+    /// puts the resulting token on the clipboard itself, so it needs a real
+    /// terminal exactly like `tcr login` does, and unlike the one-shot `tcr
+    /// token` whose entire stdout is the secret. Surfaces failure the same
+    /// way — a button that silently does nothing is worse than one that says
+    /// why — and never renders or logs a token.
+    private func mintAccountToken(_ account: AccountRef) {
+        if case .failure(let why) = LoginLauncher.launchMint(target: .account(account.name)) {
+            switch why {
+            case .toolMissing(let searched):
+                loginError = "tcr not found (searched \(searched.count) locations)."
+            case .couldNotWriteScript(let message):
+                loginError = "Could not open Terminal: \(message)"
+            }
+        } else {
+            loginError = nil
+        }
+    }
+
+    /// Same hand-off as ``mintAccountToken(_:)``, for every account carrying
+    /// `group`'s label at once (`tcr mint --group <name>`).
+    private func mintGroupTokens(_ group: String) {
+        if case .failure(let why) = LoginLauncher.launchMint(target: .group(group)) {
+            switch why {
+            case .toolMissing(let searched):
+                loginError = "tcr not found (searched \(searched.count) locations)."
+            case .couldNotWriteScript(let message):
+                loginError = "Could not open Terminal: \(message)"
+            }
+        } else {
+            loginError = nil
+        }
+    }
+
     /// App-level preference, deliberately beside Quit rather than among the
     /// account rows: it is about TcrBar, not about the fleet.
     private var launchAtLogin: some View {
@@ -1041,6 +1080,14 @@ struct AccountRow: View {
     /// Hands `tcr login` to a Terminal window for THIS account. Only drawn on a
     /// `.needsRelogin` row.
     let onRelogin: () -> Void
+    /// Hands `tcr mint --account <this row's name>` to a Terminal window. See
+    /// ``FleetView/mintAccountToken(_:)``.
+    let onMint: () -> Void
+    /// Hands `tcr mint --group <name>` to a Terminal window for every account
+    /// carrying that label — the group-level twin of ``onMint``, taking the
+    /// group name since this row's own account is not necessarily the one
+    /// whose tokens end up minted. See ``FleetView/mintGroupTokens(_:)``.
+    let onMintGroup: (String) -> Void
     /// Mutating THIS row's own group membership from its context menu — the
     /// affordance the bridge specifically asked for: before this round,
     /// membership could only be changed from a section-header menu, and the
@@ -1694,6 +1741,13 @@ struct AccountRow: View {
         Button("Copy Access Token") {
             Task { await performCopyToken() }
         }
+        // Distinct wording from the button above on purpose: "Copy" hands over
+        // a string that already exists and dies in hours, "Mint" makes a new
+        // one that does not — the confusion between the two is exactly what
+        // prompted this item to exist.
+        Button("Mint Long-Lived Token…") {
+            onMint()
+        }
         Divider()
         groupMenuItems
         Divider()
@@ -1751,6 +1805,12 @@ struct AccountRow: View {
                     arguments: GroupCommand.runArguments(group: group))
                 Button(copyRun.title) {
                     copyToPasteboard(copyRun.copiedText)
+                }
+                // Same distinction as the row-level item: this mints a NEW
+                // long-lived token for every member of the group, it does not
+                // copy anything that already exists.
+                Button("Mint Long-Lived Tokens for “\(group)”…") {
+                    onMintGroup(group)
                 }
                 // One click, either direction, with the current state on the
                 // item itself — the only administrative entry in this menu that
