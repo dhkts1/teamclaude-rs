@@ -31,6 +31,16 @@ updates:
   # `ignore: dependency-name: actions/checkout` is repo-wide and would also freeze
   # ci.yml, which IS hand-maintained and is correctly on @v7 already.
   #
+  # CLOSING IT IS NOT THE WHOLE ACTION, and this is the part that was missed the
+  # second time round. `groups: patterns: ["*"]` puts every workflow in ONE pull
+  # request, so the unmergeable generated-file bump arrives bundled with bumps to
+  # hand-written files that are perfectly correct. PR #176 (2026-09-12) carried
+  # five dead `release.yml` bumps AND a live one for appcast-guard.yml:94, which
+  # really was still on @v6; closing the PR wholesale would have dropped it
+  # silently, and nothing would have said so. So: before closing, diff the PR per
+  # file, take any bump that is NOT in release.yml into its own commit, and say in
+  # the close comment which files you took and which you dropped.
+  #
   # Deliberately NOT setting `allow-dirty = ["ci"]` in dist-workspace.toml: that
   # would let the bump merge, but only by switching off the check that caught it.
   - package-ecosystem: github-actions
