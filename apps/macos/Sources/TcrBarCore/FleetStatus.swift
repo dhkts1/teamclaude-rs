@@ -899,6 +899,56 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     }
 }
 
+/// One tool's aggregate within a session — `docs/design/panel-tabs-mockup.html`'s
+/// `BY TOOL` bars, `data/plans/wire-2-bridge.md`'s `ToolBucketRow`. `tool` is
+/// the wire's raw `tool_use.name` (`"Bash"`, `"Agent"`, `"Read"`, …) — the
+/// panel merges `Read`/`Grep`/`Glob`/`Edit` into one bucket, this type does
+/// not, so the client-side merge stays visible and testable rather than
+/// baked into the decode.
+public struct ToolBucketRow: Decodable, Equatable, Sendable {
+    public let tool: String
+    public let calls: Int
+    public let errors: Int
+    public let secondsP50: Double?
+    public let overOneMinute: Int
+
+    public init(
+        tool: String, calls: Int = 0, errors: Int = 0, secondsP50: Double? = nil,
+        overOneMinute: Int = 0
+    ) {
+        self.tool = tool
+        self.calls = calls
+        self.errors = errors
+        self.secondsP50 = secondsP50
+        self.overOneMinute = overOneMinute
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tool, calls, errors
+        case secondsP50 = "seconds_p50"
+        case overOneMinute = "over_one_minute"
+    }
+}
+
+/// One `BY TOOL` row, pooled across the fleet — see ``Fleet/toolsByCategory``.
+public struct ToolCategory: Identifiable, Equatable, Sendable {
+    public let name: String
+    public let calls: Int
+    /// The mean of each contributing session's own p50 — see
+    /// ``Fleet/toolsByCategory``'s doc-comment for why this is not a true
+    /// fleet-wide median. `nil` when no session reported one for this
+    /// category.
+    public let medianSeconds: Double?
+
+    public var id: String { name }
+
+    public init(name: String, calls: Int, medianSeconds: Double?) {
+        self.name = name
+        self.calls = calls
+        self.medianSeconds = medianSeconds
+    }
+}
+
 /// A session's tool aggregate — the wire's `tools` object.
 public struct SessionTools: Decodable, Equatable, Sendable {
     public let calls: Int
@@ -917,6 +967,12 @@ public struct SessionTools: Decodable, Equatable, Sendable {
     /// build cannot answer. `Fleet.toolsOverOneMinute` carries the same
     /// nil-means-unknown rule through the fleet-wide sum.
     public let overOneMinute: Int?
+    /// Per-tool aggregates — `data/plans/wire-2-bridge.md`'s `by_tool`. Empty,
+    /// not absent-means-error, against a server that doesn't send it yet:
+    /// ``Fleet/toolsByCategory`` treats an empty array from EVERY session the
+    /// same as "not one session reports this", and hides the `BY TOOL`
+    /// section rather than drawing empty bars.
+    public let byTool: [ToolBucketRow]
 
     public init(
         calls: Int = 0,
@@ -924,7 +980,8 @@ public struct SessionTools: Decodable, Equatable, Sendable {
         timeouts: Int = 0,
         running: [ToolCall] = [],
         slowest: [ToolCall] = [],
-        overOneMinute: Int? = nil
+        overOneMinute: Int? = nil,
+        byTool: [ToolBucketRow] = []
     ) {
         self.calls = calls
         self.errors = errors
@@ -932,10 +989,12 @@ public struct SessionTools: Decodable, Equatable, Sendable {
         self.running = running
         self.slowest = slowest
         self.overOneMinute = overOneMinute
+        self.byTool = byTool
     }
 
     private enum CodingKeys: String, CodingKey {
         case calls, errors, timeouts, running, slowest, overOneMinute
+        case byTool = "by_tool"
     }
 
     public init(from decoder: Decoder) throws {
@@ -946,6 +1005,7 @@ public struct SessionTools: Decodable, Equatable, Sendable {
         running = try c.decodeIfPresent([ToolCall].self, forKey: .running) ?? []
         slowest = try c.decodeIfPresent([ToolCall].self, forKey: .slowest) ?? []
         overOneMinute = try c.decodeIfPresent(Int.self, forKey: .overOneMinute)
+        byTool = try c.decodeIfPresent([ToolBucketRow].self, forKey: .byTool) ?? []
     }
 }
 
@@ -2041,6 +2101,36 @@ public struct Fleet: Equatable, Sendable {
         let known = sessions.compactMap(\.tools.overOneMinute)
         guard !known.isEmpty else { return nil }
         return known.reduce(0, +)
+    }
+
+    /// One row per category — `docs/design/panel-tabs-mockup.html`'s `BY TOOL`
+    /// list: Bash, Agent, and Read/Grep/Glob/Edit pooled as one bucket
+    /// (`data/plans/wire-2-bridge.md`: "the panel groups them"). `nil` when
+    /// not one session reports `byTool`, the same "silence over a fake zero"
+    /// rule as ``toolsOverOneMinute``. The per-category median is the mean of
+    /// each contributing session's own p50 — an approximation stated as one
+    /// in ``ToolCategory/medianSeconds``'s own doc-comment, not a true
+    /// fleet-wide median (this build never sees the raw per-call durations,
+    /// only each session's already-reduced p50).
+    public var toolsByCategory: [ToolCategory]? {
+        let allBuckets = sessions.flatMap(\.tools.byTool)
+        guard !allBuckets.isEmpty else { return nil }
+        func category(for tool: String) -> String {
+            switch tool {
+            case "Bash": return "Bash"
+            case "Agent", "Task": return "Agent"
+            default: return "Read · Grep · Edit"
+            }
+        }
+        let grouped = Dictionary(grouping: allBuckets) { category(for: $0.tool) }
+        let order = ["Bash", "Agent", "Read · Grep · Edit"]
+        return order.compactMap { name in
+            guard let rows = grouped[name], !rows.isEmpty else { return nil }
+            let calls = rows.reduce(0) { $0 + $1.calls }
+            let medians = rows.compactMap(\.secondsP50)
+            let median = medians.isEmpty ? nil : medians.reduce(0, +) / Double(medians.count)
+            return ToolCategory(name: name, calls: calls, medianSeconds: median)
+        }
     }
 
     /// Every tool call currently running, pooled across every session.

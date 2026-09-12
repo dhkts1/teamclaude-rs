@@ -719,7 +719,66 @@ struct FleetView: View {
                     .font(Tok.secondaryFont)
                     .foregroundStyle(Tok.inkDim)
             }
+            if let categories = fleet.toolsByCategory {
+                VStack(alignment: .leading, spacing: Tok.space1) {
+                    sectionHeading("BY TOOL")
+                    Text("share of \(fleet.toolsTotalCalls)")
+                        .font(Tok.detailFont)
+                        .foregroundStyle(Tok.inkFaint)
+                }
+                ForEach(categories) { category in byToolRow(category, total: fleet.toolsTotalCalls) }
+            }
         }
+    }
+
+    /// One `BY TOOL` bar — `docs/design/panel-tabs-mockup.html` F15: every
+    /// bar is a share of the STATED total (never its own category's max), so
+    /// the three widths are directly comparable at a glance.
+    private func byToolRow(_ category: ToolCategory, total: Int) -> some View {
+        let share = total > 0 ? Double(category.calls) / Double(total) : 0
+        return HStack(spacing: Tok.tightSpacing) {
+            Text(category.name)
+                .font(Tok.detailFont)
+                .foregroundStyle(Tok.inkDim)
+                .frame(width: 84, alignment: .leading)
+            GeometryReader { proxy in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Tok.hairline)
+                    Capsule()
+                        .fill(byToolColor(category.name))
+                        .frame(width: max(2, proxy.size.width * share))
+                }
+            }
+            .frame(height: 7)
+            Text(byToolTrailingLabel(category))
+                .font(Tok.detailFont)
+                .foregroundStyle(Tok.inkDim)
+                .lineLimit(1)
+                .fixedSize()
+        }
+        .padding(.vertical, Tok.space1)
+    }
+
+    /// Bash is `--ok` green, Agent is `--info` blue (`.accent`, the closest
+    /// token this palette has to the mockup's dedicated info role — see
+    /// `docs/design/panel-tabs-review.md` finding 12, unresolved here), and
+    /// Read/Grep/Edit is the neutral `--mute` — `docs/design/panel-tabs-mockup.html`'s
+    /// three bar tints.
+    private func byToolColor(_ category: String) -> Color {
+        switch category {
+        case "Bash": return Tok.ok
+        case "Agent": return Tok.accent
+        default: return Tok.inkFaint
+        }
+    }
+
+    /// "19,913 · median 2.1s" — drops the median clause entirely when no
+    /// session reported one, the same silence-over-a-guess rule as the rest
+    /// of this tab.
+    private func byToolTrailingLabel(_ category: ToolCategory) -> String {
+        guard let median = category.medianSeconds else { return "\(category.calls)" }
+        let formatted = median < 60 ? String(format: "%.1fs", median) : durationLabel(median)
+        return "\(category.calls) · median \(formatted)"
     }
 
     private func sectionHeading(_ text: String) -> some View {

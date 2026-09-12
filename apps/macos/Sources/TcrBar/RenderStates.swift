@@ -117,6 +117,16 @@ enum RenderStates {
             // never an empty list: `healthyJSON` carries no `sessions` key at
             // all, the shape every server shipped before F1.
             ("18-sessions-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
+            // Wave 2, phase 1 (`data/plans/panel-parity-bridge.md`): the
+            // Accounts tab's structure, matching
+            // `docs/design/panel-tabs-mockup.html`'s Accounts panel —
+            // 2 solo cards, a 3-member parked group, a 6-member active
+            // group — so the pixelmatch gate compares two panels with the
+            // same SHAPE, not a 2-card fixture against a 4-section mockup.
+            // `01-healthy` is left alone: other scenes and tests key off its
+            // exact 2-account shape, and this is a dedicated fixture for the
+            // parity gate rather than a rewrite of a scene with other jobs.
+            ("19-accounts-tab-parity", .loaded(fleet(accountsParityJSON)), false, nil),
         ]
     }
 
@@ -659,7 +669,11 @@ enum RenderStates {
                 model: "claude-opus-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
                 requests: 412, inputTokens: 812_000, outputTokens: 41_000, cacheReadTokens: 790_000,
                 tools: SessionTools(
-                    calls: 38, errors: 1, timeouts: 0,
+                    // `calls` is the sum of `byTool` below (15,000 + 200 +
+                    // 2,000) — the two must agree, per `panel-tabs-review.md`
+                    // finding 3: the headline IS the total, never one
+                    // category standing in for it.
+                    calls: 17_200, errors: 1, timeouts: 0,
                     running: [
                         ToolCall(
                             tool: "Bash", commandHead: "cargo test --release > /tmp/f1-test.log",
@@ -671,25 +685,78 @@ enum RenderStates {
                             commandHead: "git -C ~/git/henry-plugin push > /tmp/push.log",
                             endedMs: msAgo(5 * 60), seconds: 47.5)
                     ],
-                    overOneMinute: 3)),
+                    overOneMinute: 3,
+                    // Combined with the sibling session's below, sums to the
+                    // mockup's exact BY TOOL numbers: Bash 19,913, Agent 412,
+                    // Read·Grep·Edit 4,352 — 24,677 total.
+                    byTool: [
+                        ToolBucketRow(tool: "Bash", calls: 15_000, secondsP50: 2.0),
+                        ToolBucketRow(tool: "Agent", calls: 200, secondsP50: 380),
+                        ToolBucketRow(tool: "Read", calls: 2_000, secondsP50: 0.2),
+                    ])),
             Session(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "alice@example.com",
                 model: "claude-sonnet-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
                 requests: 5756, inputTokens: 940_000, outputTokens: 88_000, cacheReadTokens: 905_000,
                 tools: SessionTools(
-                    calls: 210, errors: 4, timeouts: 1,
+                    calls: 7_477, errors: 4, timeouts: 1,
                     slowest: [
                         ToolCall(
                             tool: "Bash",
                             commandHead: "/opt/homebrew/bin/bash /tmp/disk-scan.sh 2>&1 | tee",
                             endedMs: msAgo(11 * 60), seconds: 600.0)
                     ],
-                    overOneMinute: 5)),
+                    overOneMinute: 5,
+                    byTool: [
+                        ToolBucketRow(tool: "Bash", calls: 4_913, secondsP50: 2.3),
+                        ToolBucketRow(tool: "Agent", calls: 212, secondsP50: 400),
+                        ToolBucketRow(tool: "Grep", calls: 2_352, secondsP50: 0.2),
+                    ])),
             Session(
                 sessionId: "cccccccc-1111-2222-3333-444444444444", account: nil,
                 model: "claude-sonnet-5", firstSeenMs: msAgo(45 * 60), lastSeenMs: msAgo(40 * 60),
                 requests: 12, inputTokens: 9000, outputTokens: 800, cacheReadTokens: 6000),
         ]
+    }
+
+    /// 2 solo cards + a 3-member parked group (`henry-token`) + a 6-member
+    /// active group (`mycelium`) — the mockup's own account count and group
+    /// shape (`docs/design/panel-tabs-mockup.html`'s Accounts panel), built
+    /// entirely from the existing `account()`/group machinery. No disclosure
+    /// ("Show N more") exists yet, so the parked group renders its 3 real
+    /// members rather than 3-of-5 with a button; that gap is recorded in
+    /// `product-wave-findings.md`, not hidden here.
+    private static var accountsParityJSON: String {
+        let solo1 = account(
+            "henry10@example.com", quota: "0.07", state: "ok", sevenDay: "0.30",
+            sevenDayState: "ok", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")
+        let solo2 = account(
+            "henry5@example.com", quota: "0.04", state: "ok", sevenDay: "0.98",
+            sevenDayState: "warn", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 5_640,
+            plan: "Max 20x", orgUuid: "22222222-2222-2222-2222-222222222222")
+        let tokenColors = ["henry-token": "#92d188", "mycelium": "#c79ae8"]
+        let tokenGroup1 = account(
+            "gil@example.com", quota: "0.10", state: "ok",
+            groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
+            plan: "Team 5x", orgUuid: "33333333-3333-3333-3333-333333333333")
+        let tokenGroup2 = account(
+            "henry1@example.com", quota: "0.0", state: "unmeasured",
+            groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
+            plan: "Team Standard", orgUuid: "33333333-3333-3333-3333-333333333333")
+        let tokenGroup3 = account(
+            "henry2@example.com", quota: "0.55", state: "near",
+            groups: ["henry-token"], parkedGroups: ["henry-token"], groupColors: tokenColors,
+            plan: "Team 5x", orgUuid: "33333333-3333-3333-3333-333333333333")
+        let myceliumRows = (1...6).map { i in
+            account(
+                "mycelium\(i)@example.com", quota: i == 6 ? "0.60" : "0.15",
+                state: i == 6 ? "near" : "ok",
+                groups: ["mycelium"], groupColors: tokenColors,
+                plan: "Team Standard", orgUuid: "44444444-4444-4444-4444-444444444444")
+        }
+        let all = [solo1, solo2, tokenGroup1, tokenGroup2, tokenGroup3] + myceliumRows
+        return "[\(all.joined(separator: ","))]"
     }
 
     private static var sessionsTabFleet: Fleet {
