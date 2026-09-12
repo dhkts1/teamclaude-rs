@@ -38,7 +38,7 @@ from the browser login, and no amount of refreshing moves it.
 
 That is the treadmill: every account needs a browser re-login about monthly, for ever.
 `~/.cache/teamclaude/logs` recorded 59 `refresh token rejected - re-login needed` lines
-over three days (`henrysec` 26, `henry10` 24, `henry1` 9).
+over three days, concentrated on three of the eighteen accounts (26, 24 and 9 rejections).
 
 A one-year access token obtained at login removes the need to refresh at all, which makes
 the 29-day refresh wall irrelevant for a year at a time.
