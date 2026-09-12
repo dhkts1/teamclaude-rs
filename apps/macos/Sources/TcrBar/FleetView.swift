@@ -2220,6 +2220,27 @@ struct AccountRow: View {
         )
     }
 
+    /// ``AccountRef/displayHalves``'s email half, with a break OPPORTUNITY
+    /// inserted right after `@` — never a break forced, and never a
+    /// character removed, so `.textSelection` still copies the real address
+    /// byte-for-byte and `.help` (which reads `account.name` directly, not
+    /// this) is untouched.
+    ///
+    /// An email has no spaces, so SwiftUI's line breaker sees it as one
+    /// unbreakable word and, when it overflows the row, falls back to
+    /// splitting wherever it runs out of width — `01g-widest-row`'s
+    /// `henry.fitzgerald@example.com` wrapped as `henry.fitzgerald@ex` /
+    /// `ample.com`, a character split mid-domain that defeats scanning. A
+    /// zero-width space (`U+200B`) renders as nothing but IS a legal break
+    /// point, so a wrap now lands where a reader already expects an address
+    /// to fold: right after the `@`.
+    private var emailWithBreakHint: String {
+        let email = account.ref.displayHalves.email
+        guard let atIndex = email.firstIndex(of: "@") else { return email }
+        let afterAt = email.index(after: atIndex)
+        return email[..<afterAt] + "\u{200B}" + email[afterAt...]
+    }
+
     private var information: some View {
         VStack(alignment: .leading, spacing: Tok.rowLineSpacing) {
             HStack(spacing: Tok.tightSpacing) {
@@ -2247,7 +2268,7 @@ struct AccountRow: View {
                 // `fixedSize(horizontal:vertical:)` is what makes the wrap
                 // real: without it the `Text` reports the one-line height it
                 // was offered and clips, rather than growing.
-                Text(account.ref.displayHalves.email)
+                Text(emailWithBreakHint)
                     .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(2)
