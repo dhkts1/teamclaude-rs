@@ -585,11 +585,25 @@ enum RenderStates {
     /// clipped and the name is still readable. A second, ordinary row is
     /// included as the control: if the panel is over-wide for a structural
     /// reason, both rows show it, and the bug is not the one this scene names.
+    ///
+    /// Carries `groupColors` (`widestRowSceneColors`), which every earlier
+    /// version of this fixture omitted. This is also the one scene that puts
+    /// ONE account in TWO group sections at once (`docs/plans/
+    /// group-outline-bridge.md`, decision #4) — the case the group-outline
+    /// feature most needs a real render of, and a fixture with no colours
+    /// draws the section-outline feature's neutral FALLBACK stroke in both
+    /// sections, which reads as identical grey regardless of whether the two
+    /// sections are wired to two different colours or none at all. Without
+    /// this, the scene cannot tell "outline colour is broken" apart from
+    /// "outline colour was never given one to draw" — the exact ambiguity
+    /// that made a rendered PNG of this scene, by itself, prove nothing about
+    /// the feature it was chosen to demonstrate.
     private static var widestRowJSON: String {
         let worst = account(
             "henry.fitzgerald@example.com", quota: "0.62", state: "ok",
             groups: ["gil", "henry-team-parked"],
             reservedGroups: ["gil"],
+            groupColors: widestRowSceneColors,
             plan: "Team Standard",
             orgUuid: "22222222-2222-2222-2222-222222222222")
         let ordinary = account(
@@ -642,6 +656,17 @@ enum RenderStates {
     /// `groupColors` the server actually sends.
     private static let parkedSceneColors: [String: String] = [
         "henry-team": "#32d74b", "dev": "#0a84ff",
+    ]
+
+    /// Real colours for the widest-row scene, deliberately DIFFERENT hues
+    /// from `parkedSceneColors` (orange, purple, rather than green, blue) —
+    /// two scenes both carrying blue/green would leave a swapped-colour bug
+    /// invisible if the swap happened to land the same pair back on the same
+    /// two sections. `henry.fitzgerald@example.com` sits in BOTH `gil` and
+    /// `henry-team-parked` at once, so this is the fixture that shows the
+    /// group-outline feature's account-in-two-groups case in colour.
+    private static let widestRowSceneColors: [String: String] = [
+        "gil": "#ff9f0a", "henry-team-parked": "#bf5af2",
     ]
 
     /// ONE PERSON, TWO ORGS — the shape that broke the panel, and the names it
