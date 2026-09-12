@@ -345,6 +345,28 @@ public enum Tok {
     public static let pillPaddingV: CGFloat = 2
     public static let hairlineWidth: CGFloat = 0.5
 
+    /// Group outline: the section-level border wrapped around a named
+    /// group's heading and rows (`docs/plans/group-outline-bridge.md`).
+    /// Heavier than the card's own ``hairlineWidth`` (0.5) on purpose — a
+    /// structural grouping cue drawn at arm's length needs to read at a
+    /// glance, where a hairline disappears — and it is drawn OUTSIDE the
+    /// section's own layout box (`FleetView.groupOutline(for:)`, via
+    /// negative padding) rather than by adding real padding around the
+    /// content, so it never changes any ``rowHeights``-measured row or
+    /// heading height. See that function's own doc-comment for why that
+    /// distinction matters here.
+    public static let groupOutlineWidth: CGFloat = 1.0
+    /// How far outside its section's own bounds the outline sits. Kept
+    /// under `rowSpacing` (8) so two adjacent sections' outlines never
+    /// touch in the gap between them.
+    public static let groupOutlineInset: CGFloat = 6
+    /// Bigger than `radiusMedium` (the cards' own radius) by roughly
+    /// `groupOutlineInset` — the same outer-equals-inner-plus-padding rule
+    /// `radiusMedium`'s own doc-comment uses for the cards, applied one
+    /// level up so the outline reads as a looser box AROUND same-radius
+    /// cards rather than a same-size sibling beside them.
+    public static let groupOutlineRadius: CGFloat = radiusMedium + groupOutlineInset
+
     // MARK: - Motion
     //
     // One duration and one curve for the whole app. A status panel that animates

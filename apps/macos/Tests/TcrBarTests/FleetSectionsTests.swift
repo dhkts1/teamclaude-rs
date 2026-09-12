@@ -260,6 +260,48 @@ final class FleetSectionsTests: XCTestCase {
                 .rows.map(\.account.name), ["a@example.com", "z@example.com"])
     }
 
+    // MARK: - Group outline (docs/plans/group-outline-bridge.md)
+
+    /// A named group's section carries its own server-resolved colour.
+    /// `.ungrouped` carries none — decision #1, its absent outline IS the
+    /// signal — which is the same `nil` the next test locks down for a
+    /// DIFFERENT reason (a real group whose colour never resolved).
+    func testNamedGroupSectionCarriesItsColorAndUngroupedCarriesNone() {
+        let fleet = Fleet(accounts: [
+            sectionAccount(
+                "a@example.com", groups: ["dev"], groupColors: ["dev": "#0a84ff"]),
+            sectionAccount("b@example.com", groups: nil),
+        ])
+        let sections = fleet.sectionsInDisplayOrder()
+
+        let dev = try? XCTUnwrap(sections.first { $0.group == .named("dev") })
+        XCTAssertTrue(dev?.isOutlined ?? false)
+        let devColor = dev?.outlineColor
+        XCTAssertEqual(devColor?.red ?? -1, 0x0a / 255.0, accuracy: 0.001)
+        XCTAssertEqual(devColor?.green ?? -1, 0x84 / 255.0, accuracy: 0.001)
+        XCTAssertEqual(devColor?.blue ?? -1, 0xff / 255.0, accuracy: 0.001)
+
+        let ungrouped = try? XCTUnwrap(sections.first { $0.group == .ungrouped })
+        XCTAssertFalse(ungrouped?.isOutlined ?? true)
+        XCTAssertNil(ungrouped?.outlineColor)
+    }
+
+    /// A named group with no `groupColors` entry — an older server, or the
+    /// field genuinely absent — answers `isOutlined == false`, exactly like
+    /// `.ungrouped` does, and the view draws NO outline for either. An
+    /// earlier version of this answered `true` here and had the view fall
+    /// back to a neutral box, mirroring `GroupTag`'s own colourless-chip
+    /// fallback; that was reverted because an outline that is only ever a
+    /// stroke has nothing left to say once its colour is gone — a chip
+    /// still has its text. An absent box beats an invisible one.
+    func testNamedGroupWithNoResolvedColorDrawsNoOutlineEitherJustLikeUngrouped() {
+        let fleet = Fleet(accounts: [sectionAccount("a@example.com", groups: ["dev"])])
+        let section = try? XCTUnwrap(fleet.sectionsInDisplayOrder().first)
+
+        XCTAssertFalse(section?.isOutlined ?? true)
+        XCTAssertNil(section?.outlineColor)
+    }
+
     // MARK: - What the row and the view need
 
     /// A row's band matches the section it is in — the carried copy cannot
@@ -349,7 +391,8 @@ private func sectionAccount(
     quotaState: QuotaState = .ok,
     quota: Double? = 0,
     status: String = "active",
-    disabled: Bool = false
+    disabled: Bool = false,
+    groupColors: [String: String]? = nil
 ) -> Account {
     Account(
         name: name,
@@ -377,6 +420,6 @@ private func sectionAccount(
         groups: groups,
         reservedGroups: nil,
         parkedGroups: parkedGroups,
-        groupColors: nil
+        groupColors: groupColors
     )
 }
