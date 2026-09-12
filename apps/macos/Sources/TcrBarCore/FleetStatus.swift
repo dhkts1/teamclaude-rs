@@ -2030,6 +2030,56 @@ public struct Fleet: Equatable, Sendable {
         return .spent
     }
 
+    /// One sentence for the menu-bar tooltip: `"9 of 13 accounts ready · 3 near
+    /// their limit · 1 unmeasured · 2 parked"`. Every clause names both a unit
+    /// and its subject — never a bare number — and a clause with a zero count
+    /// is dropped rather than printed as `"0 parked"`, which would read as
+    /// news about a fleet with nothing to report (`docs/design/panel-tabs-
+    /// review.md` finding 7, which flagged exactly this on the sibling tabs
+    /// mockup: a summary that states a population without breaking down who
+    /// is in each part of it).
+    ///
+    /// `nil` when there are no enabled accounts — the same condition that hides
+    /// the menu-bar `ready/enabled` label — so the caller falls back to
+    /// ``PollState/summary`` instead of a sentence with nothing to build on.
+    ///
+    /// "Near their limit" and "unmeasured" reuse this file's own existing
+    /// severity predicates rather than inventing new ones: the near count is
+    /// exactly ``capacityGlyphState``'s own `.near` test (`hasQuotaEvidence &&
+    /// quotaState == .near && health != .needsRelogin` — the `health` clause
+    /// matters here too, for the identical reason its doc-comment gives: a
+    /// credential that died after being probed keeps its last-learned `.near`
+    /// state), and the unmeasured count is ``unmeasuredCount`` unchanged.
+    /// "Parked" is every account — enabled or not — that the panel itself
+    /// already draws a `"parked"` pill for: disabled outright, or held out of
+    /// general rotation by a parked group (``Account/isParkedByGroup``). A
+    /// `sessions`/tools-running clause is deliberately absent: nothing on the
+    /// wire carries that count yet, and a sentence must not print a number
+    /// nobody measured.
+    public var countsSentence: String? {
+        guard !enabledAccounts.isEmpty else { return nil }
+        let readyNoun = enabledCount == 1 ? "account" : "accounts"
+        var clauses = ["\(readyCount) of \(enabledCount) \(readyNoun) ready"]
+
+        let nearLimitCount = enabledAccounts.filter {
+            $0.hasQuotaEvidence && $0.quotaState == .near && $0.health != .needsRelogin
+        }.count
+        if nearLimitCount > 0 {
+            clauses.append("\(nearLimitCount) near their limit")
+        }
+
+        if unmeasuredCount > 0 {
+            clauses.append("\(unmeasuredCount) unmeasured")
+        }
+
+        let parkedCount = accounts.filter { $0.disabled || $0.isParkedByGroup }.count
+        if parkedCount > 0 {
+            clauses.append("\(parkedCount) parked")
+        }
+
+        return clauses.joined(separator: " · ")
+    }
+
     /// Per-bucket counts in fixed severity order, with empty buckets omitted so
     /// a healthy fleet reads just `"12 ok"`.
     ///

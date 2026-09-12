@@ -577,7 +577,9 @@ private func account(
     state: QuotaState,
     disabled: Bool = false,
     held: [HeldWindow] = [],
-    groups: [String]? = nil
+    groups: [String]? = nil,
+    parkedGroups: [String]? = nil,
+    gate: GateReason? = nil
 ) -> Account {
     Account(
         name: name,
@@ -602,7 +604,9 @@ private func account(
         source: .live,
         serverSha: "abc1234",
         serverDirty: false,
-        groups: groups
+        groups: groups,
+        parkedGroups: parkedGroups,
+        gate: gate
     )
 }
 
@@ -1157,6 +1161,94 @@ final class FleetCapacitySummaryTests: XCTestCase {
     }
 }
 
+/// `Fleet.countsSentence` — the menu-bar tooltip's capacity sentence (F5,
+/// `data/plans/menubar-counts-bridge.md`).
+final class FleetCountsSentenceTests: XCTestCase {
+    /// A genuinely never-probed account — `quota: nil`, `probeStatus: .never`,
+    /// `status: "active"` — the same shape `testGlyphIsSpentNotUnknownWhenOnlyBrokenAccountsAreNotReady`
+    /// uses to pin `unmeasuredCount`, not `brokenAccount` (`status: "error"`,
+    /// which is `.needsRelogin` and explicitly excluded from this count).
+    private func unmeasuredAccount(_ name: String) -> Account {
+        Account(
+            name: name, priority: 1, status: "active", disabled: false,
+            quota: nil, quotaState: .ok, fiveHour: nil, sevenDay: nil, sevenDayOi: nil,
+            held: [], requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
+            cacheHitRatio: nil, probeStatus: .never, probeError: nil, lastStreamError: nil,
+            streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil
+        )
+    }
+
+    func testMixedFleetJoinsAllFourClauses() {
+        var accounts = (1...4).map { account("ok\($0)@example.com", state: .ok) }
+        accounts += (1...3).map { account("near\($0)@example.com", state: .near) }
+        accounts.append(unmeasuredAccount("unmeasured1@example.com"))
+        accounts.append(account("parked1@example.com", state: .ok, disabled: true))
+        let fleet = Fleet(accounts: accounts)
+
+        XCTAssertEqual(
+            fleet.countsSentence,
+            "4 of 8 accounts ready · 3 near their limit · 1 unmeasured · 1 parked"
+        )
+    }
+
+    func testEmptyFleetHasNoSentence() {
+        XCTAssertNil(Fleet(accounts: []).countsSentence)
+    }
+
+    func testAllDisabledFleetHasNoSentence() {
+        // No enabled accounts at all — nothing for a ready/enabled fraction to
+        // say, same condition that hides the menu-bar label.
+        let fleet = Fleet(accounts: [account("off1@example.com", state: .ok, disabled: true)])
+        XCTAssertNil(fleet.countsSentence)
+    }
+
+    func testZeroCountClausesAreOmittedNotPrintedAsZero() {
+        let fleet = Fleet(accounts: [account("ok1@example.com", state: .ok)])
+        XCTAssertEqual(fleet.countsSentence, "1 of 1 account ready")
+    }
+
+    func testGroupParkedAccountCountsAsParkedEvenThoughIsReadyDoesNotExcludeIt() {
+        // `isParkedByGroup` is a `disabled: false` account held out of GENERAL
+        // rotation by its own `parkedGroups` — it must count toward "parked"
+        // even though it is not disabled and stays in `enabledCount`.
+        //
+        // It also stays in `readyCount`: ``Account/isReady`` does not check
+        // `isParkedByGroup` (only `disabled`, `health` and `quotaState` gate
+        // it), so a quota-ok group-parked account is BOTH "ready" and
+        // "parked" here — that is this codebase's own existing behaviour
+        // (verified: flip `parkedGroups` to `nil` above and `readyCount`
+        // does not change), not something this sentence invents.
+        let fleet = Fleet(accounts: [
+            account("ok1@example.com", state: .ok),
+            account(
+                "parked1@example.com", state: .ok,
+                groups: ["team-a"], parkedGroups: ["team-a"]
+            ),
+        ])
+        XCTAssertEqual(fleet.countsSentence, "2 of 2 accounts ready · 1 parked")
+    }
+
+    func testNeedsReloginNearAccountIsNotDoubleCountedAsNearItsLimit() {
+        // A credential that died AFTER being probed keeps its last-learned
+        // `.near` quotaState (`Account/isReady`'s own doc-comment). It must
+        // not also read as "near their limit" — it is a broken credential,
+        // not a quota concern, and counting it in both would overstate the
+        // fleet's near-limit population by exactly the accounts this sentence
+        // has no separate clause for.
+        let broken = brokenAccount("broken1@example.com")
+        XCTAssertEqual(broken.health, .needsRelogin)
+        let fleet = Fleet(accounts: [
+            account("ok1@example.com", state: .ok),
+            broken,
+        ])
+        // `brokenAccount` is never-probed, so it also does not count as
+        // "near" — it falls through to neither the near nor the unmeasured
+        // clause (`unmeasuredCount` explicitly excludes `.needsRelogin` too),
+        // leaving a sentence with only the ready clause.
+        XCTAssertEqual(fleet.countsSentence, "1 of 2 accounts ready")
+    }
+}
+
 /// Reset-time rendering. Every assertion injects a fixed reference date, a fixed
 /// calendar and a fixed locale — nothing here reads the wall clock or the
 /// machine's region, so the suite means the same thing on any machine at any
@@ -1440,6 +1532,92 @@ final class AccountCommandTests: XCTestCase {
         else { return XCTFail("a non-zero exit must classify as failed") }
         XCTAssertEqual(failure.summary, "enable failed (exit 2): no output")
         XCTAssertFalse(failure.summary.isEmpty)
+    }
+}
+
+/// `PollState.countsLabel` — the `ready/enabled` label beside the gauge glyph
+/// (F5, `data/plans/menubar-counts-bridge.md`).
+final class PollStateCountsLabelTests: XCTestCase {
+    func testMixedFleetLabel() {
+        let fleet = Fleet(accounts: [
+            account("a1@example.com", state: .ok),
+            account("a2@example.com", state: .ok),
+            account("a3@example.com", state: .spent),
+        ])
+        XCTAssertEqual(PollState.loaded(fleet).countsLabel, "2/3")
+    }
+
+    func testReadyCountZeroStillShowsTheFraction() {
+        let fleet = Fleet(accounts: [account("a1@example.com", state: .spent)])
+        XCTAssertEqual(PollState.loaded(fleet).countsLabel, "0/1")
+    }
+
+    func testEmptyFleetHidesTheLabel() {
+        XCTAssertNil(PollState.loaded(Fleet(accounts: [])).countsLabel)
+    }
+
+    func testAllDisabledFleetHidesTheLabel() {
+        let fleet = Fleet(accounts: [account("off1@example.com", state: .ok, disabled: true)])
+        XCTAssertNil(PollState.loaded(fleet).countsLabel)
+    }
+
+    func testFailedPollHidesTheLabel() {
+        XCTAssertNil(PollState.pending.countsLabel)
+        XCTAssertNil(PollState.toolMissing(searched: []).countsLabel)
+        XCTAssertNil(PollState.commandFailed(exitCode: 1, message: "").countsLabel)
+        XCTAssertNil(PollState.undecodable(message: "boom").countsLabel)
+    }
+}
+
+/// `PollState.tooltipSentence` (F5, `data/plans/menubar-counts-bridge.md`) —
+/// the capacity sentence for a healthy read, `summary` unchanged otherwise.
+final class PollStateTooltipSentenceTests: XCTestCase {
+    func testLoadedFleetUsesTheCountsSentence() {
+        let fleet = Fleet(accounts: [
+            account("a1@example.com", state: .ok),
+            account("a2@example.com", state: .spent, disabled: true),
+        ])
+        XCTAssertEqual(PollState.loaded(fleet).tooltipSentence, fleet.countsSentence)
+        XCTAssertEqual(PollState.loaded(fleet).tooltipSentence, "1 of 1 account ready · 1 parked")
+    }
+
+    func testEmptyFleetFallsBackToSummary() {
+        let state = PollState.loaded(Fleet(accounts: []))
+        XCTAssertEqual(state.tooltipSentence, state.summary)
+        XCTAssertEqual(
+            state.tooltipSentence, "0 accounts — offline read, counters are structurally zero")
+    }
+
+    func testAllDisabledFleetFallsBackToSummary() {
+        // No enabled accounts — `countsSentence` is `nil`, same condition
+        // that hides the menu-bar `ready/enabled` label.
+        let fleet = Fleet(accounts: [account("off1@example.com", state: .ok, disabled: true)])
+        let state = PollState.loaded(fleet)
+        XCTAssertEqual(state.tooltipSentence, state.summary)
+    }
+
+    func testPendingToolMissingCommandFailedAndUndecodableUseSummaryUnchanged() {
+        let states: [PollState] = [
+            .pending,
+            .toolMissing(searched: ["/usr/local/bin/tcr"]),
+            .commandFailed(exitCode: 1, message: "connection refused"),
+            .undecodable(message: "boom"),
+        ]
+        for state in states {
+            XCTAssertEqual(state.tooltipSentence, state.summary, "\(state) must fall through unchanged")
+        }
+    }
+
+    func testUnreadableNoticeIsAppendedAfterTheSentence() {
+        let good = Fleet(accounts: [account("a1@example.com", state: .ok)])
+        let withUnreadable = Fleet(
+            accounts: good.accounts,
+            unreadable: [Fleet.UnreadableRow(index: 1, message: "boom")]
+        )
+        XCTAssertEqual(
+            PollState.loaded(withUnreadable).tooltipSentence,
+            "1 of 1 account ready · 1 account unreadable"
+        )
     }
 }
 

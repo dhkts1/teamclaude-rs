@@ -36,6 +36,11 @@ final class MenuBarShell {
     /// control that keeps nothing awake.
     let awake: AwakeController
     let preference: LaunchPreference
+    /// "Show counts in the menu bar" — whether ``updateMark`` draws the
+    /// `ready/enabled` label. Owned here for the same reason as `preference`:
+    /// the mark it gates is composed on every poll tick, not just while the
+    /// panel is open.
+    let countsPreference: MenuBarCountsPreference
     /// Group-membership mutations for the Groups view, owned here for the
     /// same reason as `accounts`: an in-flight/failure/restart-notice state
     /// that reset every time the panel opened would lose the "restart the
@@ -75,6 +80,7 @@ final class MenuBarShell {
         control: ControlAccountController? = nil,
         awake: AwakeController? = nil,
         preference: LaunchPreference? = nil,
+        countsPreference: MenuBarCountsPreference? = nil,
         updater: Updater? = nil,
         groupController: GroupController? = nil,
         removeController: RemoveAccountController? = nil,
@@ -87,6 +93,7 @@ final class MenuBarShell {
         self.control = control ?? ControlAccountController()
         self.awake = awake ?? AwakeController()
         self.preference = preference ?? LaunchPreference()
+        self.countsPreference = countsPreference ?? MenuBarCountsPreference()
         self.updater = updater ?? Updater()
         self.groupController = groupController ?? GroupController()
         self.removeController = removeController ?? RemoveAccountController()
@@ -135,7 +142,8 @@ final class MenuBarShell {
             rootView: FleetPanel(
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
                 accounts: self.accounts, control: self.control, awake: self.awake,
-                preference: self.preference, updater: self.updater,
+                preference: self.preference, countsPreference: self.countsPreference,
+                updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() }))
         // Without this the popover takes a default size and the panel is clipped.
@@ -203,19 +211,22 @@ final class MenuBarShell {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
-        // Both publishers, combined, so the image is recomposed whenever either
-        // half of it changes.
+        // All three publishers, combined, so the image and label are
+        // recomposed whenever any of them changes.
         //
         // The values come from the publisher, never from re-reading the
         // controllers. `@Published` fires in `willSet`, so `awake.isOn` inside
         // this sink is still the OLD value — a mark composed from it would
         // disagree with `AwakeController.isOn` for one edge in each direction,
         // which is the same "three representations of one fact" failure that
-        // controller's own doc-comment is built to prevent.
+        // controller's own doc-comment is built to prevent. `showCounts`
+        // follows the identical rule for the same reason: toggling it and
+        // reading `countsPreference.showCounts` back inside this sink would
+        // race the very publisher this sink exists to trust.
         self.poller.$state
-            .combineLatest(self.awake.$isOn)
-            .sink { [weak self] state, isOn in
-                self?.updateMark(state: state, awake: isOn)
+            .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
+            .sink { [weak self] state, isOn, showCounts in
+                self?.updateMark(state: state, awake: isOn, showCounts: showCounts)
             }
             .store(in: &marks)
 
@@ -257,19 +268,41 @@ final class MenuBarShell {
 
     /// One line for the tooltip. The menu bar has room for a glyph and nothing
     /// else, so this is where the poll's own summary is reachable by a human who
-    /// has not opened the panel.
+    /// has not opened the panel. ``PollState/tooltipSentence`` is the fuller
+    /// capacity sentence when a healthy read has one to give, and
+    /// ``PollState/summary`` unchanged for every other case.
     static func toolTip(state: PollState, awake: Bool) -> String {
-        awake ? "\(state.summary) · \(KeepAwakeGlyph.accessibilityDescription)" : state.summary
+        awake
+            ? "\(state.tooltipSentence) · \(KeepAwakeGlyph.accessibilityDescription)"
+            : state.tooltipSentence
     }
 
-    private func updateMark(state: PollState, awake isOn: Bool) {
+    /// `PollState.countsLabel`, rendered with tabular figures so the status
+    /// item does not jitter in width as the digits change between polls.
+    private static func countsAttributedTitle(_ label: String) -> NSAttributedString {
+        let font = NSFont.monospacedDigitSystemFont(
+            ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        return NSAttributedString(
+            string: label,
+            attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+    }
+
+    private func updateMark(state: PollState, awake isOn: Bool, showCounts: Bool) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
             gaugeSymbol: Self.gaugeSymbol(for: state), awake: isOn,
             awakeTint: Tok.awakeNSColor)
         {
             button.image = mark
-            button.title = ""
+            // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil`
+            // for the same cases the glyph alone already carries — pending, a
+            // failed read, an all-disabled fleet — so the guard below is
+            // purely `showCounts`; the state check already happened.
+            if showCounts, let label = state.countsLabel {
+                button.attributedTitle = Self.countsAttributedTitle(label)
+            } else {
+                button.title = ""
+            }
         } else if button.image == nil {
             // Only reachable if an SF Symbol this build names has gone missing.
             // A status item with neither image nor title is zero points wide and
@@ -459,24 +492,45 @@ struct FleetPanel: View {
     @ObservedObject var control: ControlAccountController
     @ObservedObject var awake: AwakeController
     @ObservedObject var preference: LaunchPreference
+    @ObservedObject var countsPreference: MenuBarCountsPreference
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
     @ObservedObject var removeController: RemoveAccountController
     var onWhatsNew: () -> Void = {}
 
     var body: some View {
-        FleetView(
-            poller: poller,
-            server: server,
-            loginItem: loginItem,
-            accounts: accounts,
-            control: control,
-            awake: awake,
-            updater: updater,
-            groupController: groupController,
-            removeController: removeController,
-            startServerAtLaunch: $preference.startServerAtLaunch,
-            onWhatsNew: onWhatsNew
-        )
+        VStack(spacing: 0) {
+            FleetView(
+                poller: poller,
+                server: server,
+                loginItem: loginItem,
+                accounts: accounts,
+                control: control,
+                awake: awake,
+                updater: updater,
+                groupController: groupController,
+                removeController: removeController,
+                startServerAtLaunch: $preference.startServerAtLaunch,
+                onWhatsNew: onWhatsNew
+            )
+            // Kept OUTSIDE `FleetView` rather than folded into its own
+            // preferences footer: this feature's bridge (F5,
+            // `data/plans/menubar-counts-bridge.md`) is scoped away from
+            // `FleetView.swift`, which a separate lane owns concurrently — an
+            // edit there risks the exact collision DNA's "you are not alone"
+            // rule exists to prevent. A one-row toggle appended below the
+            // existing panel is the whole cost of keeping this feature inside
+            // its own files.
+            Divider()
+            Toggle("Show counts in the menu bar", isOn: $countsPreference.showCounts)
+                .toggleStyle(.checkbox)
+                .font(Tok.secondaryFont)
+                .help(
+                    "Shows the ready/enabled fraction (e.g. \u{201c}9/13\u{201d}) "
+                        + "beside the gauge glyph in the menu bar."
+                )
+                .padding(.horizontal, Tok.space4)
+                .padding(.vertical, Tok.space3)
+        }
     }
 }
