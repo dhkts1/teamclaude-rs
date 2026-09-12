@@ -2221,10 +2221,7 @@ struct AccountRow: View {
     }
 
     /// ``AccountRef/displayHalves``'s email half, with a break OPPORTUNITY
-    /// inserted right after `@` — never a break forced, and never a
-    /// character removed, so `.textSelection` still copies the real address
-    /// byte-for-byte and `.help` (which reads `account.name` directly, not
-    /// this) is untouched.
+    /// inserted right after `@` — never a break forced.
     ///
     /// An email has no spaces, so SwiftUI's line breaker sees it as one
     /// unbreakable word and, when it overflows the row, falls back to
@@ -2234,6 +2231,17 @@ struct AccountRow: View {
     /// zero-width space (`U+200B`) renders as nothing but IS a legal break
     /// point, so a wrap now lands where a reader already expects an address
     /// to fold: right after the `@`.
+    ///
+    /// This string is what the `Text` below DRAWS, not what a user should
+    /// COPY: the inserted `U+200B` is invisible but real, so a drag-select
+    /// copy of this text would paste `henry.fitzgerald@<U+200B>example.com`
+    /// — a credential-adjacent string silently broken by an invisible
+    /// character, with nothing on screen explaining why a login form
+    /// rejected it. That is why `.textSelection` is deliberately OFF this
+    /// `Text` (do not re-enable it without solving that first). The
+    /// sanctioned way to get the real address is `.help(account.name)` on
+    /// hover, or the row's own `Button("Copy Account Name")`, both of which
+    /// read `account.name` directly and never see this hint.
     private var emailWithBreakHint: String {
         let email = account.ref.displayHalves.email
         guard let atIndex = email.firstIndex(of: "@") else { return email }
@@ -2268,13 +2276,16 @@ struct AccountRow: View {
                 // `fixedSize(horizontal:vertical:)` is what makes the wrap
                 // real: without it the `Text` reports the one-line height it
                 // was offered and clips, rather than growing.
+                // No `.textSelection` here — see ``emailWithBreakHint``: this
+                // string carries an invisible break hint a drag-select copy
+                // would paste verbatim. `.help` below and "Copy Account
+                // Name" are the sanctioned ways to get the real address.
                 Text(emailWithBreakHint)
                     .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                     .help(account.name)
-                    .textSelection(.enabled)
                 controlIndicator
                 Spacer(minLength: Tok.tightSpacing)
                 rotationPill
