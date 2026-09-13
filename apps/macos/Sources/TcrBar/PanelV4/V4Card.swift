@@ -29,6 +29,23 @@ struct V4Card<Content: View>: View {
 /// gap:8`, and NO vertical padding: the sheet gives `padding:4px 0` to
 /// `.sess .row` alone. A card row's height is its line box (`font:15px/1.4` →
 /// 21 pt), which is what ``V4/rowLineHeight`` supplies.
+///
+/// ## Whitespace collapses before a character does
+///
+/// `leading()` takes `layoutPriority(1)` and the `Spacer` takes `minLength: 0`.
+/// Without both, the identifier — the thing the row is FOR — is what gives way:
+/// SwiftUI offers the stack's width around equally, the name truncates, and the
+/// spacer sits at its minimum holding empty points the name needed. Measured on
+/// the shipped panel: 31.5 pt of empty row against a `V4.rowGap` of 8 while the
+/// address read "dave@exam…".
+///
+/// A `Spacer` is a view, so the stack's own `spacing` is charged on BOTH sides
+/// of it — `minLength: V4.rowGap` made the real gap `rowGap * 3`. With
+/// `minLength: 0` the stack spacing is the single source of that gap, which is
+/// what `gap:8` means in the sheet.
+///
+/// Six sites in the Sessions tab already set the priority; no site under
+/// `PanelV4/` did.
 struct V4Row<Leading: View, Trailing: View>: View {
     @ViewBuilder var leading: () -> Leading
     @ViewBuilder var trailing: () -> Trailing
@@ -36,8 +53,10 @@ struct V4Row<Leading: View, Trailing: View>: View {
     var body: some View {
         HStack(alignment: .center, spacing: V4.rowGap) {
             leading()
-            Spacer(minLength: V4.rowGap)
+                .layoutPriority(1)
+            Spacer(minLength: 0)
             trailing()
+                .fixedSize()
         }
         .frame(minHeight: V4.rowLineHeight)
     }

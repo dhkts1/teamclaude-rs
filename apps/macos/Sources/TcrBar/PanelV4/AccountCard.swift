@@ -13,10 +13,19 @@ import TcrBarCore
 ///    What a card inside a group draws, where the group's own legend already
 ///    carries the context the plan line would repeat.
 ///
+/// The trailing slot carries the account's own controls — the actions menu, and
+/// `Re-login…` on a broken card. They used to be reachable by right-click ALONE
+/// (`.contextMenu` was the card's only interaction), so every per-account
+/// action — Re-login, Enable/Disable, Use as Control Account, Copy Access
+/// Token, Mint Long-Lived Token, Delete Account, Remove from group, two of them
+/// destructive — was unreachable from a keyboard, and a card reading NEEDS
+/// RE-LOGIN offered no visible way to repair itself. The context menu stays as
+/// the second route.
+///
 /// The pills are outlined, never filled, and the state pill agrees with the bars
 /// below it: both are computed from the same ``FleetTally/Kind`` classifier, so a
 /// card can no longer read OK over a 98 % bar.
-struct AccountCard: View {
+struct AccountCard<Actions: View>: View {
     enum Shape {
         case full
         case compact
@@ -25,18 +34,36 @@ struct AccountCard: View {
     let account: Account
     var shape: Shape = .full
     let now: Date
+    /// The card's visible per-account controls — the actions menu, and the
+    /// re-login button on a broken account. A closure so ``AccountCard`` stays
+    /// free of the controllers those controls are wired to: they are built from
+    /// the ONE definition in `AccountRow`, and a second copy for the v4 card
+    /// would be a second thing to keep in step with `tcr`'s subcommands.
+    @ViewBuilder var actions: () -> Actions
 
     var body: some View {
         V4Card {
-            V4Row {
-                nameRow
-            } trailing: {
-                HStack(spacing: V4.pillGap) {
-                    if let rotation = rotationPillText {
-                        V4Pill(text: rotation)
+            HStack(spacing: V4.pillGap) {
+                // The informational half of the header is ONE accessibility
+                // element. VoiceOver walked roughly eight stops per card before
+                // this — name, each pill, the plan line, each bar — to reach a
+                // card that, being a `.contain` container with no label of its
+                // own, could not be focused or summarised at any of them.
+                V4Row {
+                    nameRow
+                } trailing: {
+                    HStack(spacing: V4.pillGap) {
+                        if let rotation = rotationPillText {
+                            V4Pill(text: rotation, help: account.rotationHelp)
+                        }
+                        V4Pill(text: statePillText, role: statePillRole, help: account.stateHelp)
                     }
-                    V4Pill(text: statePillText, role: statePillRole)
                 }
+                .accessibilityElement(children: .combine)
+                // The actions sit OUTSIDE that element, so they stay their own
+                // focusable children. Combining them in would have made the
+                // card one stop and taken every per-account action with it.
+                actions()
             }
             if shape == .full {
                 if let plan = planLine {
@@ -49,7 +76,11 @@ struct AccountCard: View {
                 }
             }
         }
+        // `.contain` WITH a label. Without one the container has no accessible
+        // name, so it cannot take focus and a user arriving at the card is told
+        // nothing about which account they have arrived at.
         .accessibilityElement(children: .contain)
+        .accessibilityLabel(account.cardSummaryLabel(now: now))
     }
 
     @ViewBuilder

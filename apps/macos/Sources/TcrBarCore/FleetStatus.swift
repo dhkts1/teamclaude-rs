@@ -2001,6 +2001,100 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
 
     /// What the pool-membership pill says, or `nil` when it draws none.
     public var rotationLabel: String? { rotation?.label }
+
+    /// The sentence behind this account's state pill — what the word means and,
+    /// where there is one, the way out.
+    ///
+    /// A pill has ten characters. `PARKED` names a state without naming WHICH
+    /// group is parked or that `tcr group unpark` puts it back, and the v4 card
+    /// dropped the whole hover layer the pre-v4 row had written these sentences
+    /// for. Lives on the model so the card and the row cannot end up saying two
+    /// different things about one account, and so the remedy is testable
+    /// without SwiftUI.
+    ///
+    /// `nil` where the word is already the whole sentence: `OK` and `NEAR` say
+    /// what they mean and have no action attached.
+    public var stateHelp: String? {
+        if disabled {
+            return "Out of the rotation — `tcr` sends this account no traffic. "
+                + "`tcr enable \(name)` puts it back."
+        }
+        if isParkedByGroup {
+            let groups = parkedGroupNames.joined(separator: ", ")
+            let first = parkedGroupNames.first ?? ""
+            return "Out of the rotation — every member of \(groups) is held back. "
+                + "`tcr group unpark \(first)` puts them back, live."
+        }
+        if health == .needsRelogin {
+            return "This account's refresh token was rejected. Re-login to repair it; "
+                + "no sweep will."
+        }
+        if isRejected {
+            return "Anthropic has rejected this account, so the router will never "
+                + "select it however healthy its quota looks."
+        }
+        if !hasQuotaEvidence {
+            return "Nothing has been measured about this account yet — not a zero "
+                + "reading, no reading at all."
+        }
+        return nil
+    }
+
+    /// The whole card in one sentence — what VoiceOver announces on arriving at
+    /// it: `"alice@example.com, Max 20x, rotating, ok, 5h 12% used, 7d 30% used"`.
+    ///
+    /// The card is an `.accessibilityElement(children: .contain)` container, and
+    /// a container with no label has no accessible name: it cannot take focus,
+    /// and a user stepping through the panel is told nothing about which account
+    /// they have reached. They then had to walk roughly eight stops — name, each
+    /// pill, the plan line, each bar — to learn it.
+    ///
+    /// Built from the same properties the card draws, in the order it draws
+    /// them, so the summary cannot claim something the card does not show.
+    public func cardSummaryLabel(now: Date) -> String {
+        var parts = [name]
+        if let plan, !plan.isEmpty { parts.append(plan) }
+        if let rotation { parts.append(rotation.label.lowercased()) }
+        parts.append(FleetTally.Kind(account: self).phrase)
+        for window in [
+            (label: "5h", value: fiveHour, state: fiveHourState, reset: fiveHourResetAtMs),
+            (label: "7d", value: sevenDay, state: sevenDayState, reset: sevenDayResetAtMs),
+        ] {
+            guard window.value != nil else { continue }
+            parts.append(
+                "\(window.label) "
+                    + QuotaFormat.spokenWindowValue(
+                        value: window.value, state: window.state, resetAtMs: window.reset,
+                        now: now))
+        }
+        if sevenDayOi != nil {
+            parts.append(
+                "fable "
+                    + QuotaFormat.spokenWindowValue(
+                        value: sevenDayOi, state: sevenDayOiState,
+                        resetAtMs: sevenDayOiResetAtMs, now: now))
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// ``cardSummaryLabel(now:)`` against the wall clock.
+    public var cardSummaryLabel: String { cardSummaryLabel(now: Date()) }
+
+    /// The sentence behind the pool-membership pill, for the one state that
+    /// needs explaining: `Group only` is not a word an operator meets anywhere
+    /// else.
+    public var rotationHelp: String? {
+        switch rotation {
+        case .groupOnly:
+            let reserved = groupTags.filter(\.isReserved).map(\.name).joined(separator: ", ")
+            return "Reserved for \(reserved): this account serves requests that ask for "
+                + "that group, and no pool traffic at all."
+        case .rotating:
+            return "The pool is sending this account traffic right now."
+        case .none:
+            return nil
+        }
+    }
 }
 
 /// What ``Account/rotation`` found: the two things a pool-membership pill is

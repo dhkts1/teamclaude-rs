@@ -1,5 +1,23 @@
 import SwiftUI
 
+/// The panel's four text roles.
+///
+/// ## Truncation is allowed; losing the content is not
+///
+/// All four end in `.lineLimit(1)` + `.truncationMode(.tail)`, and until this
+/// none of them offered the full value anywhere: `rg '\.help\(' PanelV4/`
+/// returned three hits, all on Buttons, and `rg textSelection PanelV4/` returned
+/// nothing. The hidden text is the IDENTITY of the thing and no second place on
+/// the panel says it — 8 of 8 mono command rows on the Tools tab end in an
+/// ellipsis, and `dave@example.com` renders as `dave@exam…`. The approved
+/// mockup carries the full command as a `title=` on 7 of 7 mono spans; the
+/// transcription dropped the whole hover layer.
+///
+/// So every role carries `.help(text)` — the pointer route, the mockup's own
+/// `title=` — and `.accessibilityValue(text)`, the spoken one. ``MonoText``
+/// adds `.textSelection(.enabled)`: a command you cannot read is one thing, a
+/// command you cannot copy is another.
+
 /// `.name` — an account or session name. 15 pt / 600 / -0.005em, `ink`.
 struct NameText: View {
     let text: String
@@ -11,6 +29,8 @@ struct NameText: View {
             .lineLimit(1)
             .truncationMode(.tail)
             .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
+            .help(text)
+            .accessibilityValue(text)
     }
 }
 
@@ -25,6 +45,8 @@ struct DimText: View {
             .lineLimit(lineLimit)
             .truncationMode(.tail)
             .frame(minHeight: V4.lineHeight(V4.dimSize), alignment: .leading)
+            .help(text)
+            .accessibilityValue(text)
     }
 }
 
@@ -39,6 +61,8 @@ struct MuteText: View {
             .lineLimit(lineLimit)
             .truncationMode(.tail)
             .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
+            .help(text)
+            .accessibilityValue(text)
     }
 }
 
@@ -52,5 +76,8 @@ struct MonoText: View {
             .foregroundStyle(Tok.ink)
             .lineLimit(1)
             .truncationMode(.tail)
+            .textSelection(.enabled)
+            .help(text)
+            .accessibilityValue(text)
     }
 }
