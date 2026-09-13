@@ -125,4 +125,130 @@ final class RunningToolsMarkTests: XCTestCase {
         XCTAssertFalse(PollState.toolMissing(searched: []).countIsNearCapacity)
         XCTAssertFalse(PollState.undecodable(message: "x").countIsNearCapacity)
     }
+
+    // MARK: - capacityFraction (the cup's fill level, F6 coffee-mark)
+
+    /// The gate's own worked example: `9/13` → `0.69` (`data/plans/coffee-mark-bridge.md`).
+    func testCapacityFractionIsReadyOverEnabled() {
+        let fleet = Fleet(accounts: [
+            account(name: "a1@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a2@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a3@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a4@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a5@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a6@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a7@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a8@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "a9@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "b1@example.com", quotaState: "near", probeStatus: "ok"),
+            account(name: "b2@example.com", quotaState: "near", probeStatus: "ok"),
+            account(name: "b3@example.com", quotaState: "near", probeStatus: "ok"),
+            account(name: "b4@example.com", quotaState: "near", probeStatus: "ok"),
+        ])
+        XCTAssertEqual(
+            PollState.loaded(fleet).capacityFraction ?? -1, 9.0 / 13.0, accuracy: 0.0001)
+    }
+
+    /// The gate's other worked example, verbatim: `0/0` (no enabled accounts at
+    /// all) → `nil`, never a `0` a reader could mistake for "measured, all
+    /// spent" — the same reasoning ``StatusPoller/PollState/countsLabel`` gives
+    /// for the identical case.
+    func testCapacityFractionIsNilWithNoEnabledAccounts() {
+        let fleet = Fleet(accounts: [
+            account(name: "off@example.com", quotaState: "ok", probeStatus: "ok", disabled: true)
+        ])
+        XCTAssertNil(PollState.loaded(fleet).capacityFraction)
+    }
+
+    func testCapacityFractionIsNilForEveryNonLoadedState() {
+        XCTAssertNil(PollState.pending.capacityFraction)
+        XCTAssertNil(PollState.commandFailed(exitCode: 1, message: "x").capacityFraction)
+        XCTAssertNil(PollState.toolMissing(searched: []).capacityFraction)
+        XCTAssertNil(PollState.undecodable(message: "x").capacityFraction)
+    }
+
+    /// `0` and `1` are real, drawable fractions — distinct from `nil`, which
+    /// means "there is no ratio, draw an empty cup for a different reason".
+    func testCapacityFractionCanBeZeroOrOneWithoutBeingNil() {
+        let allSpent = Fleet(accounts: [
+            account(name: "spent@example.com", quotaState: "spent", probeStatus: "ok")
+        ])
+        XCTAssertEqual(PollState.loaded(allSpent).capacityFraction, 0)
+
+        let allReady = Fleet(accounts: [
+            account(name: "ready1@example.com", quotaState: "ok", probeStatus: "ok"),
+            account(name: "ready2@example.com", quotaState: "ok", probeStatus: "ok"),
+        ])
+        XCTAssertEqual(PollState.loaded(allReady).capacityFraction, 1)
+    }
+
+    // MARK: - capacityTintKind (the one glyph's colour regime, F6 coffee-mark)
+    //
+    // `MenuBarShell.cupTint(for:awake:)` attaches `Tok`'s real colours to this
+    // and lives in `TcrBar`, which this test target does not link (see this
+    // file's own doc-comment); `PollState.capacityTintKind(awake:)` is the pure
+    // decision underneath it, and it is what these tests exercise directly.
+
+    /// The precedence's top rule: a read failure outranks everything, keep-awake
+    /// included — there is no fleet to ask about capacity or the Mac's sleep
+    /// state at all.
+    func testCapacityTintKindIsFailedForEveryReadFailureRegardlessOfAwake() {
+        for state in [
+            PollState.toolMissing(searched: []),
+            .commandFailed(exitCode: 1, message: "x"),
+            .undecodable(message: "x"),
+        ] {
+            for awake in [false, true] {
+                XCTAssertEqual(
+                    state.capacityTintKind(awake: awake), .failed,
+                    "\(state) awake=\(awake) did not resolve to .failed")
+            }
+        }
+    }
+
+    /// Near outranks awake: an operator who is keeping the Mac up still needs
+    /// to see "nothing is ready and something is close" rather than have it
+    /// hidden behind the keep-awake colour.
+    func testCapacityTintKindIsNearWhenCapacityGlyphStateIsNearEvenWhileAwake() {
+        let fleet = Fleet(accounts: [
+            account(name: "spent@example.com", quotaState: "spent", probeStatus: "ok"),
+            account(name: "near@example.com", quotaState: "near", probeStatus: "ok"),
+        ])
+        XCTAssertEqual(PollState.loaded(fleet).capacityTintKind(awake: true), .near)
+    }
+
+    /// The plain floor: nothing failed, nothing near, keep-awake off.
+    func testCapacityTintKindIsTemplateForAHealthyReadWithKeepAwakeOff() {
+        let fleet = Fleet(accounts: [
+            account(name: "ready@example.com", quotaState: "ok", probeStatus: "ok")
+        ])
+        XCTAssertEqual(PollState.loaded(fleet).capacityTintKind(awake: false), .template)
+    }
+
+    /// Keep-awake on, nothing failed, nothing near: `.awake`, not `.template`.
+    func testCapacityTintKindIsAwakeForAHealthyReadWithKeepAwakeOn() {
+        let fleet = Fleet(accounts: [
+            account(name: "ready@example.com", quotaState: "ok", probeStatus: "ok")
+        ])
+        XCTAssertEqual(PollState.loaded(fleet).capacityTintKind(awake: true), .awake)
+    }
+
+    /// `.pending` is not a failure — it is "nothing decoded yet", so it falls
+    /// through to the same template/awake floor a healthy, non-near read does,
+    /// never the red failure colour.
+    func testCapacityTintKindForPendingFollowsAwakeRatherThanFailing() {
+        XCTAssertEqual(PollState.pending.capacityTintKind(awake: false), .template)
+        XCTAssertEqual(PollState.pending.capacityTintKind(awake: true), .awake)
+    }
+
+    /// An all-disabled fleet is an operator decision, not a fault
+    /// (``Fleet/capacityGlyphState``'s own doc-comment) — it must not resolve
+    /// to `.near` or `.failed`, only the same template/awake floor, with the
+    /// empty cup coming from `capacityFraction` being `nil`, not from the tint.
+    func testCapacityTintKindForAnAllDisabledFleetFollowsAwakeRatherThanNearOrFailed() {
+        let fleet = Fleet(accounts: [
+            account(name: "off@example.com", quotaState: "ok", probeStatus: "ok", disabled: true)
+        ])
+        XCTAssertEqual(PollState.loaded(fleet).capacityTintKind(awake: false), .template)
+    }
 }

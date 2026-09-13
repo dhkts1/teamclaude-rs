@@ -191,6 +191,13 @@ public enum Tok {
     public static let nearNSColor = dynNS(dark: "#ffd16b", light: "#925d0b")
     /// Spent on a gating window until it resets.
     public static let spent = dyn(dark: "#ea5a56", light: "#940015")
+    /// `spent`, as an `NSColor` — same reason ``nearNSColor`` exists beside
+    /// ``near``: the menu-bar mark's coffee cup outline draws red when the
+    /// last poll failed to answer at all, into an `NSImage` symbol
+    /// configuration rather than a SwiftUI view, so it needs the identical
+    /// hex this token already carries rather than a second value the palette
+    /// script's gate would have to track.
+    public static let spentNSColor = dynNS(dark: "#ea5a56", light: "#940015")
     /// Enabled, but nothing has ever been measured about it.
     ///
     /// Its own hue for the same reason `FleetTally.Kind.unmeasured` is its own

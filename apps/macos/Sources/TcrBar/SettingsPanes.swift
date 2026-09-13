@@ -274,9 +274,12 @@ struct MenuBarSettingsPane: View {
                     isOn: $countsPreference.showCounts
                 ) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Show the ready count beside the glyph")
-                        Text("Reads e.g. \u{201c}9/13\u{201d}, in tabular digits.")
-                            .font(.caption).foregroundStyle(Tok.inkDim)
+                        Text("Show the ready count beside the cup")
+                        Text(
+                            "The cup's fill level already shows capacity; this spells it out "
+                                + "as \u{201c}9/13\u{201d}, in tabular digits."
+                        )
+                        .font(.caption).foregroundStyle(Tok.inkDim)
                     }
                 }
                 .toggleStyle(.switch)
