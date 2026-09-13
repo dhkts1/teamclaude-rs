@@ -14,6 +14,7 @@ private struct SettingsTag: View {
         case .live: return Tok.ok
         case .boot: return Tok.near
         case .readOnly: return Tok.inkFaint
+        case .nextLaunch: return Tok.near
         }
     }
 
