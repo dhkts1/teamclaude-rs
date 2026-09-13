@@ -242,6 +242,20 @@ enum V4 {
     /// `· 20s to timeout` within 60 s of the 600 s limit").
     static let toolTimeoutWarnSeconds: Double = 60
 
+    // MARK: - Kill (`✕`)
+
+    /// The ✕'s hit target. 24, not the 22 pt `docs/design/tools-tab.md` calls
+    /// the minimum: that document's own rule takes the ✕ to 24 because macOS'
+    /// pointer minimum is 24 and this is the one DESTRUCTIVE control on the
+    /// tab. A hit target smaller than the glyph's own confidence is how a
+    /// mis-click kills the wrong command.
+    static let killHitTarget: CGFloat = 24
+    /// The glyph inside that target. Smaller than the box on purpose: the box
+    /// is what the pointer must hit, the glyph is what the eye must not be
+    /// dominated by — a running row is about its command, not about the way
+    /// to end it.
+    static let killGlyph: CGFloat = 10
+
     /// The fixed column every row's trailing content occupies — the ring and
     /// its duration on Tools, the sparkline or the status on Sessions.
     ///

@@ -474,6 +474,8 @@ enum RenderStates {
                 initialTab: initialTab(for: scene.name),
                 initialSessionFiles: sessionFilesFixture(for: scene.name),
                 initialMachineStats: machineFixture,
+                initialRunningProcesses: runningProcessesFixture(
+                    for: scene.name, state: scene.state),
                 initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
@@ -613,6 +615,40 @@ enum RenderStates {
     /// both of its tool-carrying sessions.
     private static func expandedTimeoutClassesFixture(for sceneName: String) -> Set<String> {
         sceneName == "17b-tools-tab-timeout-class-open" ? ["wait"] : []
+    }
+
+    /// One running Bash row's process reading, fixed — the mockup's own
+    /// `640% cpu · 2.1 GB`. Never ``ProcessTable/read()``: the harness must
+    /// draw the same pixels on a quiet laptop and on a box mid-build, the
+    /// same rule ``machineFixture`` states for the machine line.
+    ///
+    /// The key can only be derived from THIS scene's own fleet, not written
+    /// down: ``SessionToolEntry/id`` contains the call's `startedMs`, and
+    /// `sessionsFixture` stamps those off the real clock so its ages read
+    /// like a live fleet's.
+    ///
+    /// Exactly ONE of the two running Bash calls is seeded, on purpose. The
+    /// other renders the case that is just as common live and twice as easy
+    /// to get wrong: a call this build matched no process to, which draws no
+    /// cpu/memory clause and NO ✕ at all. A fixture that seeded both would
+    /// leave the refusal unreviewed.
+    private static func runningProcessesFixture(for sceneName: String, state: PollState)
+        -> [String: RunningCallStats]
+    {
+        guard
+            sceneName == "17-tools-tab" || sceneName == "17b-tools-tab-timeout-class-open",
+            case .loaded(let fleet) = state,
+            let entry = fleet.toolsRunning.first(where: { $0.call.tool == "Bash" })
+        else { return [:] }
+        return [
+            entry.id: RunningCallStats(
+                pid: 48765,
+                processGroup: 48765,
+                cpuSeconds: 1_294.7,
+                residentBytes: 2_254_857_830,
+                cpuPercent: 640,
+                readAt: referenceDate)
+        ]
     }
 
     /// The machine line's numbers, fixed — `docs/design/tools-tab.md`'s own

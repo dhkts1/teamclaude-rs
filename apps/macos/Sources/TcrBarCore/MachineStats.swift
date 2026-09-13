@@ -1,8 +1,18 @@
 import Darwin
 import Foundation
 
-/// What the box itself is doing — the Tools tab's machine line, "load 7.1 of
-/// 14 · 48 GB of 64 used · 5 compiles · disk 210 GB free".
+/// What the box itself is doing — the Tools tab's machine line, "load 7.1/14
+/// · 48/64 GB · 5 compiles · 210 GB free".
+///
+/// The words `of`, `used` and `disk` came out of that sentence on 2026-09-13:
+/// the long form is 59 characters and wrapped to two lines inside the 372 pt
+/// panel, which put the machine reading on the same footing as the summary
+/// above it. The slash is the form each pair is already read in elsewhere
+/// (`uptime`'s load against cores, a disk's used-against-capacity), so
+/// nothing is lost but the connective tissue. This deliberately diverges from
+/// `docs/design/panel-tabs-mockup.html`'s own long line, the same way the
+/// ring's 28 pt diverges from the mockup's 34: the mockup sets this line in a
+/// wider column than the panel has.
 ///
 /// `docs/design/tools-tab.md` question 2: "is the box overloaded?", which an
 /// operator answers today by typing `uptime` and counting `rustc` processes by
@@ -72,20 +82,20 @@ public struct MachineStats: Equatable, Sendable {
         return .overloaded
     }
 
-    /// "load 7.1 of 14 · 48 GB of 64 used · 5 compiles · disk 210 GB free".
+    /// "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free".
     public var line: String { "\(loadClause) · \(restClause)" }
 
     /// The load clause alone — the one part a view TINTS, split out here so
     /// the tint and the words it colours can never drift apart.
-    public var loadClause: String { "load \(String(format: "%.1f", loadAverage)) of \(cores)" }
+    public var loadClause: String { "load \(String(format: "%.1f", loadAverage))/\(cores)" }
 
     /// Everything after the load — memory, compiles, disk. Never tinted: one
     /// coloured clause on a line is a signal, three are decoration.
     public var restClause: String {
         let compileNoun = compiles == 1 ? "compile" : "compiles"
         return
-            "\(Self.gibibytes(memoryUsedBytes)) GB of \(Self.gibibytes(memoryTotalBytes)) used"
-            + " · \(compiles) \(compileNoun) · disk \(Self.gigabytes(diskFreeBytes)) GB free"
+            "\(Self.gibibytes(memoryUsedBytes))/\(Self.gibibytes(memoryTotalBytes)) GB"
+            + " · \(compiles) \(compileNoun) · \(Self.gigabytes(diskFreeBytes)) GB free"
     }
 
     /// Memory in binary GB, which is the unit a Mac's own "64 GB" memory
