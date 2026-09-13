@@ -379,6 +379,48 @@ struct FleetView: View {
                 }
             }
         }
+        v4UpdateRow
+    }
+
+    /// The v4 panel's version of ``updateStateLine``, drawn under
+    /// ``v4Summary`` on EVERY tab — outside the `switch` above, which is why
+    /// it survives a tab change the summary itself does not. Restored after
+    /// the v4 migration (#248) left an available update announced only by
+    /// Sparkle's own dialog, Settings, and the right-click menu: `rg -n
+    /// updateStateLine FleetView.swift` before this change found it wired
+    /// only from the legacy `header`, which `v4Body` never draws.
+    ///
+    /// Shares ``UpdateState/headerMessage`` with the legacy line rather than
+    /// reconstructing the wording: one sentence, one place that decides what
+    /// each state says. `.unknown`/`.upToDate` draw nothing, matching
+    /// ``updateStateLine``'s own reasoning — a permanent "you're up to date"
+    /// row has no place here either.
+    @ViewBuilder
+    private var v4UpdateRow: some View {
+        if let message = updater.updateState.headerMessage {
+            let isFailure: Bool = {
+                if case .failed = updater.updateState { return true }
+                return false
+            }()
+            HStack(alignment: .top, spacing: V4.buttonGap) {
+                Text(message)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(isFailure ? Tok.spent : Tok.accent)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .contentShape(Rectangle())
+                    // The failure line is the retry: no button next to a
+                    // sentence that already reads as an error, matching
+                    // ``updateStateLine``'s own tappable-text treatment.
+                    .onTapGesture { if isFailure { updater.checkForUpdates() } }
+                if !isFailure {
+                    Spacer(minLength: 0)
+                    V4Button(title: "Update…", role: .normal) { updater.checkForUpdates() }
+                }
+            }
+            .padding(.horizontal, V4.summaryPaddingSide)
+            .padding(.bottom, V4.summaryPaddingBottom)
+        }
     }
 
     @ViewBuilder

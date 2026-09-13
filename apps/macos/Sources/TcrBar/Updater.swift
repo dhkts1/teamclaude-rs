@@ -56,6 +56,16 @@ final class Updater: NSObject, ObservableObject {
             }
     }
 
+    /// A render-harness/test seam: sets ``updateState`` directly, the way
+    /// Sparkle's real delegate callbacks below do, without ever constructing
+    /// an `SUAppcastItem` or `Error` — neither is buildable outside a real
+    /// check. `startingUpdater: false` only stops Sparkle from scheduling a
+    /// background check; it says nothing about what the harness wants ON
+    /// screen, which is why this exists rather than waiting on one.
+    func setUpdateStateForPreview(_ state: UpdateState) {
+        updateState = state
+    }
+
     /// The user-initiated check. Sparkle drives every subsequent step, including
     /// telling the user when there is nothing to install — which a background
     /// check deliberately stays silent about.

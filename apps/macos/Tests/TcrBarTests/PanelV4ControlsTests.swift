@@ -258,6 +258,49 @@ final class PanelV4ControlsTests: XCTestCase {
             "the alert text is duplicated in the footer instead of shared")
     }
 
+    // MARK: - The update line, restored under the v4 summary
+
+    /// `rg -n updateStateLine FleetView.swift` before this change found it
+    /// referenced only from the legacy `header`, which `v4Body` never draws —
+    /// so an available update went unannounced on the shipped panel since the
+    /// v4 migration (#248). This asserts the v4 tree now draws its own row,
+    /// with a button named "Update…" and no button when there is nothing to
+    /// report — the tap-through the render fixtures (`21-update-available`,
+    /// `21b-update-failed`) cannot check, since `--render-states` proves
+    /// pixels, not button titles.
+    ///
+    /// Source-reading, not ViewInspector, for the same reason every other
+    /// test in this file is: `FleetView` is built from live controllers with
+    /// no test doubles in this target.
+    func testTheUpdateRowDrawsAButtonWhenAvailableAndNothingWhenUpToDate() throws {
+        let source = try panelSource("FleetView.swift")
+        XCTAssertTrue(
+            source.contains("V4Button(title: \"Update…\", role: .normal)"),
+            "the v4 update row lost its Update… button")
+        XCTAssertTrue(
+            source.contains("updater.updateState.headerMessage"),
+            "the v4 update row no longer shares UpdateState.headerMessage with "
+                + "the legacy line")
+        XCTAssertTrue(
+            source.contains("private var v4UpdateRow"),
+            "the v4 update row was renamed or removed")
+    }
+
+    /// `UpdateState.headerMessage` is `nil` for `.unknown`/`.upToDate`
+    /// (`UpdateStateTests.testUnknownRendersNothing`,
+    /// `testUpToDateRendersNothing`) and the v4 row gates its entire body on
+    /// that message — so proving the gate here, without re-deriving
+    /// `headerMessage`'s own semantics, is what keeps this test from failing
+    /// silently if a future edit puts an unconditional row under the
+    /// `if let message =` instead.
+    func testTheUpdateRowIsGatedOnHeaderMessage() throws {
+        let source = try panelSource("FleetView.swift")
+        XCTAssertTrue(
+            source.contains("if let message = updater.updateState.headerMessage {"),
+            "the update row no longer gates on headerMessage being non-nil, so "
+                + "it would draw something for .unknown/.upToDate too")
+    }
+
     private func panelSource(_ relative: String) throws -> String {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // -> TcrBarTests
