@@ -53,38 +53,37 @@ final class ToolCallLabelTests: XCTestCase {
             ToolCallLabel.spoken(seconds: 583, timeout: 600))
     }
 
-    /// A row whose command head the wire could not carry names its session.
-    ///
-    /// Command heads never reach `session-wire.json` (the privacy call in
-    /// `src/session_wire.rs`), so every restored row arrives with none — 72 of
-    /// 95 `slowest` entries on the live proxy, 2026-09-13 — and each of those
-    /// rows printed the single word `Bash`. Whose call it was is the least this
-    /// row can say and still be worth reading.
-    func testARowWithNoCommandHeadNamesItsSession() {
+    /// A running call prints its elapsed time, and inside the warning band
+    /// how long is left as well — never colour alone.
+    func testARunningCallNamesTheSecondsLeftInsideTheWarningBand() {
         XCTAssertEqual(
-            ToolCallLabel.headline(commandHead: nil, tool: "Bash", owner: "teamclaude-rs-bc"),
-            "Bash · teamclaude-rs-bc")
-        // An empty string is the same absence as nil — the wire's `Option` and a
-        // head truncated to nothing must not print two different rows.
+            ToolCallLabel.running(elapsed: 580, remaining: 20, warnWithin: 60),
+            "9m 40s · 20s left")
         XCTAssertEqual(
-            ToolCallLabel.headline(commandHead: "", tool: "Agent", owner: "example-c2"),
-            "Agent · example-c2")
+            ToolCallLabel.running(elapsed: 252, remaining: 348, warnWithin: 60),
+            "4m 12s")
     }
 
-    /// A real command head is the row, untouched — the owner is said on the sub
-    /// line and must not be appended here.
-    func testACommandHeadIsTheHeadlineOnItsOwn() {
+    /// A tool with no cap — an Agent, a Read — can never be "20s from"
+    /// anything, so it prints its age and stops. The first render of the
+    /// redesigned tab printed "9m 43s · 17s left" beside an Agent call that
+    /// drew no ring, which is the panel claiming a deadline it does not have.
+    func testAnUncappedCallNeverPrintsSecondsLeft() {
         XCTAssertEqual(
-            ToolCallLabel.headline(
-                commandHead: "cargo test --release", tool: "Bash", owner: "teamclaude-rs-bc"),
-            "cargo test --release")
+            ToolCallLabel.running(elapsed: 583, remaining: nil, warnWithin: 60), "9m 43s")
     }
 
-    /// No owner to name (no session file, and an id that resolved to nothing):
-    /// the bare tool, never a dangling separator.
-    func testAnUnknownOwnerLeavesTheToolAlone() {
+    /// A call the wire gave no start time draws an empty label rather than a
+    /// made-up zero.
+    func testACallWithNoStartTimePrintsNothing() {
+        XCTAssertEqual(ToolCallLabel.running(elapsed: nil, remaining: nil, warnWithin: 60), "")
+    }
+
+    /// Past the deadline the clause floors at zero: a kill lands a hair after
+    /// the deadline it was measured against, and "-2s left" is not a reading.
+    func testSecondsLeftFloorsAtZero() {
         XCTAssertEqual(
-            ToolCallLabel.headline(commandHead: nil, tool: "Bash", owner: ""),
-            "Bash")
+            ToolCallLabel.running(elapsed: 602, remaining: -2, warnWithin: 60),
+            "10m 2s · 0s left")
     }
 }

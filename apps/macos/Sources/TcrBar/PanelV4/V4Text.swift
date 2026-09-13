@@ -66,15 +66,20 @@ struct MuteText: View {
     }
 }
 
-/// `.mono` — a tool call's command head. One line, ellipsised at the tail, and
-/// never allowed to push the thing beside it off the row.
+/// `.mono` — a tool call's command head. Ellipsised at the tail, and never
+/// allowed to push the thing beside it off the row.
+///
+/// `lineLimit` is 1 where the command shares a row with something else, and
+/// ``V4/commandLineLimit`` where it has a full-width line of its own on the
+/// Tools tab.
 struct MonoText: View {
     let text: String
+    var lineLimit: Int = 1
     var body: some View {
         Text(text)
             .font(V4.mono(V4.monoSize))
             .foregroundStyle(Tok.ink)
-            .lineLimit(1)
+            .lineLimit(lineLimit)
             .truncationMode(.tail)
             .textSelection(.enabled)
             .help(text)

@@ -56,25 +56,23 @@ public enum ToolCallLabel {
         return "ran \(duration(seconds)), killed at the \(Int(timeout)) second timeout"
     }
 
-    /// The one line a RUNNING NOW or SLOWEST TODAY row leads with: the command
-    /// when the wire carried one, and `"Bash · teamclaude-rs-bc"` when it did
-    /// not.
+    /// What a RUNNING NOW row prints beside its ring: `"4m 12s"`, or
+    /// `"9m 40s · 20s left"` once the call is inside the warning band.
     ///
-    /// Command heads are memory-only — `RunningTool::command_head` and
-    /// `SlowTool::command_head` carry `#[serde(skip_serializing)]`, the privacy
-    /// call `src/session_wire.rs`'s module doc states — so every row restored
-    /// from `~/.cache/teamclaude/session-wire.json`, and every row closed out of
-    /// a restored one, arrives with `commandHead` nil. Measured 2026-09-13 on
-    /// the live proxy: 72 of 95 `slowest` entries. Those rows used to print the
-    /// bare word `Bash`, five of them in a column, telling a reader nothing.
-    /// Naming the session at least says WHOSE call it was, which is the fact
-    /// that makes the row worth reading at all.
+    /// `remaining` is `nil` for a call with no known cap — an Agent, a Read —
+    /// and such a call can never print a "left" clause, because there is
+    /// nothing this build knows it is running out of. That is the same refusal
+    /// the ring makes by not being drawn at all for those tools; stating it
+    /// once, here, is what stops the two from disagreeing (they did: the first
+    /// render of this layout printed "9m 43s · 17s left" beside an Agent call
+    /// with no ring).
     ///
-    /// `owner` is the caller's already-resolved session label (the Sessions
-    /// tab's own `displayName`, falling back to the id's first 8 characters),
-    /// never a raw session id built here.
-    public static func headline(commandHead: String?, tool: String, owner: String) -> String {
-        if let commandHead, !commandHead.isEmpty { return commandHead }
-        return owner.isEmpty ? tool : "\(tool) · \(owner)"
+    /// The clause says "left" rather than "to timeout" because the row is
+    /// already under a section head that states the 600s timeout out loud, and
+    /// the shorter word fits beside the elapsed time in the trailing column.
+    public static func running(elapsed: Double?, remaining: Double?, warnWithin: Double) -> String {
+        let age = elapsed.map(duration) ?? ""
+        guard let remaining, remaining <= warnWithin else { return age }
+        return "\(age) · \(Int(max(0, remaining.rounded())))s left"
     }
 }

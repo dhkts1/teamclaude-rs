@@ -146,6 +146,14 @@ struct FleetView: View {
     /// touches disk.
     @State private var sessionFiles: [String: SessionFile] = [:]
 
+    /// What the box itself is doing, for the Tools tab's machine line. `nil`
+    /// until the first reading lands, which is the state the line draws
+    /// nothing in: the alternative is "load 0.0 of 0" for one frame, and a
+    /// zero nobody measured is the one thing this tab refuses everywhere
+    /// else. Read on appear and on every poll — never per render, since
+    /// ``MachineStats/read()`` walks the process table.
+    @State private var machine: MachineStats?
+
     /// Every stored property above still gets its usual default — this exists
     /// only so ``RenderStates`` can seed ``selectedTab`` deterministically.
     /// `@State`'s wrapped value can only be seeded through
@@ -177,7 +185,18 @@ struct FleetView: View {
         // actually carry the busy/waiting/idle status their own doc-comments
         // describe, instead of the pixelmatch gate comparing a made-up
         // "0 busy · 0 waiting · 3 idle" against the mockup's real counts.
-        initialSessionFiles: [String: SessionFile] = [:]
+        initialSessionFiles: [String: SessionFile] = [:],
+        // Seeded for the same reason `initialSessionFiles` is: `snapshotMode`
+        // never reads the real machine (the render harness must draw the same
+        // pixels on any box, at any load), so a fixture hands the machine line
+        // its numbers and the live app leaves this `nil` and reads them.
+        initialMachineStats: MachineStats? = nil,
+        // Which TIMED OUT TODAY classes start open. Seeded for one render
+        // scene: the disclosure is the whole point of that card — a count
+        // that opens to the commands behind it — and a harness that can only
+        // ever draw it closed leaves the half that answers the question
+        // unreviewed.
+        initialExpandedTimeoutClasses: Set<String> = []
     ) {
         self.poller = poller
         self.server = server
@@ -194,6 +213,8 @@ struct FleetView: View {
         self.onSettings = onSettings
         self._selectedTab = State(initialValue: initialTab)
         self._sessionFiles = State(initialValue: initialSessionFiles)
+        self._machine = State(initialValue: initialMachineStats)
+        self._expandedTimeoutClasses = State(initialValue: initialExpandedTimeoutClasses)
     }
 
     /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
@@ -216,9 +237,17 @@ struct FleetView: View {
         // ids are fixture strings that join to nothing real, so the read
         // would only ever populate an unused dictionary — see
         // `RenderStates.swift`'s sessions-tab fixtures.
-        .onAppear { if !snapshotMode { sessionFiles = SessionFiles.read() } }
+        .onAppear {
+            if !snapshotMode {
+                sessionFiles = SessionFiles.read()
+                machine = MachineStats.read()
+            }
+        }
         .onChange(of: poller.lastPollAt) { _ in
-            if !snapshotMode { sessionFiles = SessionFiles.read() }
+            if !snapshotMode {
+                sessionFiles = SessionFiles.read()
+                machine = MachineStats.read()
+            }
         }
         // The sheet IS `loginSession != nil` — dismissing by any route (Esc,
         // click-away) runs the same cancel the button does, because a login
@@ -1395,51 +1424,128 @@ struct FleetView: View {
         }
     }
 
+    /// The tab, top to bottom, in the order `docs/design/tools-tab.md` puts
+    /// the operator's own questions: what is running (and about to time out),
+    /// what keeps timing out, what was slowest, and — last, as one line — how
+    /// many calls each tool made.
     private func toolsList(_ fleet: Fleet) -> some View {
-        // v4-spec: each section (RUNNING NOW, SLOWEST TODAY, BY TOOL) is a
-        // card under its own section head, at the same `Tok.cardGap` the other
-        // two tabs use — Gil, reading round 7's renders: "why sessions and
-        // tools missing containers?". The head sits INSIDE its card here
-        // rather than above it, so a section reads as one object; the mockup
-        // draws it the same way.
         VStack(alignment: .leading, spacing: Tok.cardGap) {
-            // `docs/design/panel-tabs-review.md` finding 3: the sum over
-            // EVERY tool, never one category standing in for the total —
-            // `toolsTotalCalls` already sums across every session's
-            // `tools.calls`, whatever tool made each call.
-            if !fleet.toolsRunning.isEmpty {
-                toolsSection("RUNNING NOW", subtitle: "Ring fills toward the 600s timeout") {
-                    // Finding 5: state the denominator a ring fills toward,
-                    // rather than drawing a fraction with no stated whole —
-                    // that is the `subtitle` above.
-                    ForEach(fleet.toolsRunning) { entry in runningToolRow(entry) }
-                }
-            }
-            if !fleet.toolsSlowest.isEmpty {
-                // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
-                // across every session, and a panel this tall shows half of
-                // them before the fold.
-                let slowest = Array(fleet.toolsSlowest.prefix(Self.slowestVisibleRows))
-                let width = slowestColumnWidth(slowest)
-                toolsSection("SLOWEST TODAY", subtitle: nil) {
-                    ForEach(slowest) { entry in
-                        slowestToolRow(entry, width: width)
-                    }
-                }
-            }
-            if fleet.toolsRunning.isEmpty && fleet.toolsSlowest.isEmpty {
+            runningNowSection(fleet)
+            timedOutSection(fleet)
+            slowestSection(fleet)
+            if fleet.toolsRunning.isEmpty && fleet.toolsSlowest.isEmpty
+                && fleet.toolsTimeoutClasses == nil
+            {
                 Text("No tool calls recorded yet.")
                     .font(Tok.dimLineFont)
                     .foregroundStyle(Tok.inkDim)
             }
-            if let categories = fleet.toolsByCategory {
-                toolsSection("BY TOOL", subtitle: "share of \(QuotaFormat.count(fleet.toolsTotalCalls))") {
-                    ForEach(categories) { category in
-                        byToolRow(category, total: fleet.toolsTotalCalls)
+            byToolLine(fleet)
+        }
+    }
+
+    /// RUNNING NOW — one two-line item per call, longest-running first
+    /// (``Fleet/toolsRunning`` sorts them), five before the fold.
+    @ViewBuilder
+    private func runningNowSection(_ fleet: Fleet) -> some View {
+        let entries = fleet.toolsRunning
+        if !entries.isEmpty {
+            let visible =
+                toolsRunningExpanded ? entries : Array(entries.prefix(Self.runningVisibleItems))
+            let hidden = entries.count - visible.count
+            // Finding 5: state the denominator the ring fills toward, rather
+            // than drawing a fraction with no stated whole.
+            toolsSection(
+                "RUNNING NOW",
+                subtitle: "\(entries.count) · ring fills toward the 600s timeout"
+            ) {
+                ForEach(Array(visible.enumerated()), id: \.offset) { index, entry in
+                    if index > 0 { itemRule }
+                    runningToolItem(entry)
+                }
+                if hidden > 0 {
+                    disclosureButton(
+                        "Show \(hidden) more",
+                        hint: "Shows every tool call the proxy currently has running."
+                    ) { toggleToolsRunningExpansion() }
+                }
+            }
+        }
+    }
+
+    /// TIMED OUT TODAY — the count in the headline said 31 and named nothing.
+    /// This says WHICH KIND of command, which is the thing an operator can
+    /// change. Hidden entirely against a server that does not report the
+    /// field: ``Fleet/toolsTimeoutClasses`` returns `nil` there rather than a
+    /// card of zeroes.
+    @ViewBuilder
+    private func timedOutSection(_ fleet: Fleet) -> some View {
+        if let classes = fleet.toolsTimeoutClasses, !classes.isEmpty {
+            let total = classes.reduce(0) { $0 + $1.count }
+            toolsSection("TIMED OUT TODAY", subtitle: "\(total) · by command class") {
+                ForEach(classes) { timeoutClass in
+                    timeoutClassRow(timeoutClass, total: total)
+                    if expandedTimeoutClasses.contains(timeoutClass.name) {
+                        ForEach(Array(timeoutClass.calls.enumerated()), id: \.offset) { _, entry in
+                            timedOutItem(entry)
+                                .padding(.leading, V4.sessPaddingLeft)
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// SLOWEST TODAY — three items in the same two-line shape as RUNNING NOW,
+    /// with a pill where the ring goes.
+    @ViewBuilder
+    private func slowestSection(_ fleet: Fleet) -> some View {
+        let entries = fleet.toolsSlowest
+        if !entries.isEmpty {
+            let visible =
+                toolsSlowestExpanded ? entries : Array(entries.prefix(Self.slowestVisibleItems))
+            let hidden = entries.count - visible.count
+            toolsSection("SLOWEST TODAY", subtitle: nil) {
+                ForEach(Array(visible.enumerated()), id: \.offset) { index, entry in
+                    if index > 0 { itemRule }
+                    slowestToolItem(entry)
+                }
+                if hidden > 0 {
+                    disclosureButton(
+                        "Show \(hidden) more",
+                        hint: "Shows the rest of today's ten slowest tool calls."
+                    ) { toggleToolsSlowestExpansion() }
+                }
+            }
+        }
+    }
+
+    /// BY TOOL, as ONE muted line rather than a card of three bars:
+    /// "Bash 19,913 · Agent 412 · Read/Grep/Edit 4,352 · median 2.1s".
+    ///
+    /// `docs/design/tools-tab.md`: "'BY TOOL' answers a question nobody
+    /// asked." The counts are still worth a glance — they are not worth the
+    /// vertical space of the section that answers "is something stuck".
+    @ViewBuilder
+    private func byToolLine(_ fleet: Fleet) -> some View {
+        if let categories = fleet.toolsByCategory, !categories.isEmpty {
+            Text(ToolCategory.summaryLine(categories, medianSeconds: fleet.toolsMedianSeconds))
+                .font(V4.font(V4.byToolLineSize))
+                .foregroundStyle(Tok.mute)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, V4.sectionHeadMarginSide)
+        }
+    }
+
+    /// The 1 pt rule between two items in a card. Items here are two lines
+    /// each, so without it the command line of one reads as a third line of
+    /// the one above.
+    private var itemRule: some View {
+        Rectangle()
+            .fill(Tok.cardLine)
+            .frame(height: V4.panelBorderWidth)
+            .padding(.vertical, V4.rowGap / 2)
+            .accessibilityHidden(true)
     }
 
     /// One Tools-tab section: its head, an optional subtitle, and its rows,
@@ -1470,63 +1576,192 @@ struct FleetView: View {
         }
     }
 
-    /// One `BY TOOL` bar — `docs/design/panel-tabs-mockup.html` F15: every
-    /// bar is a share of the STATED total (never its own category's max), so
-    /// the three widths are directly comparable at a glance.
-    private func byToolRow(_ category: ToolCategory, total: Int) -> some View {
-        let share = total > 0 ? Double(category.calls) / Double(total) : 0
-        return V4Row {
-            HStack(spacing: V4.quotaGap) {
-                Text(category.name)
-                    .font(V4.font(V4.dimSize))
-                    .foregroundStyle(Tok.dim)
-                    .lineLimit(1)
-                    .fixedSize()
-                GeometryReader { proxy in
-                    ZStack(alignment: .leading) {
-                        RoundedRectangle(cornerRadius: V4.barRadius)
-                            .fill(Tok.ink.opacity(V4.barTrackAlpha))
-                        RoundedRectangle(cornerRadius: V4.barRadius)
-                            // One neutral tint for all three categories, not
-                            // the mockup's own `--ok` green for Bash and
-                            // `--info` blue (`.accent`) for Agent
-                            // (`docs/design/panel-tabs-review.md` finding 12,
-                            // left unresolved there; a later review raised it
-                            // again). This bar's whole job is a
-                            // share-of-total width comparison — the category
-                            // is already named beside it in text — so a
-                            // borrowed status colour told the reader
-                            // something untrue: green reads as "healthy
-                            // quota" and the accent reads as "selected", and
-                            // neither is what a tool-call count is.
-                            .fill(Tok.inkFaint)
-                            .frame(width: max(V4.barMinWidth, proxy.size.width * share))
-                    }
-                }
-                .frame(height: V4.barHeight)
-                .frame(maxWidth: V4.barCappedWidth)
+    /// One `TIMED OUT TODAY` row: the class, what it means, a bar for its
+    /// share of today's timeouts, and the count. Clicking opens the commands
+    /// behind it.
+    ///
+    /// The bar is a share of the STATED total, never of the biggest class
+    /// (`docs/design/panel-tabs-mockup.html` F15), so the widths are
+    /// comparable to each other and to the headline's own number.
+    @ViewBuilder
+    private func timeoutClassRow(_ timeoutClass: ToolTimeoutClass, total: Int) -> some View {
+        // A class the server sent a count but no commands for is drawn as a
+        // ROW, not as a disabled button: `.disabled` greys the whole line, so
+        // the class with nothing to open read as the least important one on
+        // the card rather than as one that simply does not open.
+        if timeoutClass.calls.isEmpty {
+            timeoutClassBody(timeoutClass, total: total)
+        } else {
+            Button {
+                toggleTimeoutClass(timeoutClass.name)
+            } label: {
+                timeoutClassBody(timeoutClass, total: total)
+                    .contentShape(Rectangle())
             }
-        } trailing: {
-            // Not in the ring column: this row has no ring, its value is the
-            // row's whole point, and the bar beside it is capped at 110 pt and
-            // can give up the space. Right edge at the card's content edge, the
-            // same as every other trailing item on the tab.
-            Text(byToolTrailingLabel(category))
-                .font(V4.font(V4.dimSize))
-                .foregroundStyle(Tok.dim)
-                .lineLimit(1)
-                .fixedSize()
+            .buttonStyle(.plain)
+            .accessibilityLabel(
+                "\(timeoutClass.name), \(timeoutClass.count) of \(total) timeouts today"
+            )
+            .accessibilityHint("Shows the commands in this class.")
         }
     }
 
-    /// "19,913 · median 2.1s" — drops the median clause entirely when no
-    /// session reported one, the same silence-over-a-guess rule as the rest
-    /// of this tab.
-    private func byToolTrailingLabel(_ category: ToolCategory) -> String {
-        let calls = QuotaFormat.count(category.calls)
-        guard let median = category.medianSeconds else { return calls }
-        let formatted = median < 60 ? String(format: "%.1fs", median) : durationLabel(median)
-        return "\(calls) · median \(formatted)"
+    private func timeoutClassBody(_ timeoutClass: ToolTimeoutClass, total: Int) -> some View {
+        let expanded = expandedTimeoutClasses.contains(timeoutClass.name)
+        let share = total > 0 ? Double(timeoutClass.count) / Double(total) : 0
+        let hasCalls = !timeoutClass.calls.isEmpty
+        return Group {
+            V4Row {
+                HStack(spacing: V4.rowGap) {
+                    // No chevron on a class the server sent a count but no
+                    // commands for: an affordance that opens nothing is worse
+                    // than none.
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: V4.discGlyph))
+                        .foregroundStyle(Tok.mute)
+                        .opacity(hasCalls ? 1 : 0)
+                        .accessibilityHidden(true)
+                    Text(timeoutClass.name)
+                        .font(V4.font(V4.dimSize, .semibold))
+                        .foregroundStyle(Tok.ink)
+                        .lineLimit(1)
+                    if let caption = timeoutClass.caption {
+                        MuteText(text: caption)
+                    }
+                }
+            } trailing: {
+                HStack(spacing: V4.quotaGap) {
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            .fill(Tok.ink.opacity(V4.barTrackAlpha))
+                            .frame(width: V4.barCappedWidth)
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            // Amber, not the neutral ink the BY TOOL bars
+                            // used: a timeout IS a warning, so the colour
+                            // says the same thing the section head does.
+                            .fill(Tok.near)
+                            .frame(width: max(V4.barMinWidth, V4.barCappedWidth * share))
+                    }
+                    .frame(height: V4.barHeight)
+                    Text("\(timeoutClass.count)")
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(Tok.dim)
+                        .lineLimit(1)
+                        .frame(width: V4.timeoutCountWidth, alignment: .trailing)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(timeoutClass.name), \(timeoutClass.count) of \(total) timeouts today")
+    }
+
+    /// A running call, as the mockup's two-line item: who and how long on the
+    /// first line, the command on its own full-width second one.
+    ///
+    /// The command gets its own line because it is the DISTINGUISHING text —
+    /// `docs/design/tools-tab.md`'s own layout rule, from the "essential text
+    /// truncation" guideline: two full-width lines beat 36 characters
+    /// squeezed beside a ring.
+    private func runningToolItem(_ entry: SessionToolEntry) -> some View {
+        let now = Date()
+        let elapsed = entry.call.startedMs.map { started in
+            max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
+        }
+        // Only a Bash call HAS a timeout to be near: an Agent or a Read has no
+        // cap this build knows, so it draws no ring and can never be "20s
+        // from" anything. ONE expression decides that, and the ring, the tint
+        // and the label all read it — the first draft decided it per site and
+        // printed "17s left" beside a call with no ring.
+        let capped = entry.call.tool == "Bash"
+        let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
+        let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
+        return toolItem(
+            entry: entry,
+            trailing: {
+                HStack(spacing: V4.rowGap) {
+                    if capped {
+                        ProgressRing(
+                            fraction: (elapsed ?? 0) / bashTimeoutSeconds,
+                            tint: isNearTimeout ? Tok.spent : Tok.ok,
+                            accessibilityText: elapsed.map {
+                                "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
+                            })
+                    }
+                    // Elapsed and "20s left" are ONE reading, so they are one
+                    // Text: a call in the warning band is red AND says how
+                    // long is left, never colour alone.
+                    Text(
+                        ToolCallLabel.running(
+                            elapsed: elapsed, remaining: remaining,
+                            warnWithin: V4.toolTimeoutWarnSeconds)
+                    )
+                    .font(V4.font(V4.dimSize))
+                    .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
+                    .lineLimit(1)
+                }
+            })
+    }
+
+    /// One of today's slowest calls — the same item, with a pill where the
+    /// running item's ring is.
+    private func slowestToolItem(_ entry: SessionToolEntry) -> some View {
+        toolItem(
+            entry: entry,
+            trailing: {
+                if let seconds = entry.call.seconds {
+                    // A killed call says so in WORDS, never red against grey
+                    // alone, and the spoken value says it too.
+                    let spoken = ToolCallLabel.spoken(
+                        seconds: seconds, timeout: bashTimeoutSeconds)
+                    V4Pill(
+                        text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
+                        role: ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
+                            ? .bad : .neutral
+                    )
+                    .accessibilityValue(spoken ?? "")
+                    .help(spoken ?? "")
+                }
+            })
+    }
+
+    /// One of the commands behind a timeout class — the same item again, with
+    /// the pill the class already implies left off: every call in this list
+    /// timed out, and saying so once per row is thirteen pills saying the
+    /// heading.
+    private func timedOutItem(_ entry: SessionToolEntry) -> some View {
+        toolItem(entry: entry, trailing: { EmptyView() })
+    }
+
+    /// The shape every item on this tab shares: `session · tool` and a
+    /// trailing column on line one, the command head full width on line two.
+    ///
+    /// One function rather than three near-copies, because the three lists
+    /// must never drift on how a call names itself — the same reason
+    /// ``MonoText`` is shared.
+    private func toolItem<Trailing: View>(
+        entry: SessionToolEntry, @ViewBuilder trailing: @escaping () -> Trailing
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            V4Row {
+                HStack(spacing: 0) {
+                    NameText(text: toolCallOwnerName(entry.sessionId))
+                        .layoutPriority(1)
+                    // ` · Bash`, and for a Bash row the slot where B1's
+                    // "· 640% cpu · 2.1 GB" lands. Nothing is drawn there
+                    // now: this build reads no process, and inventing a
+                    // figure to fill a slot is the one thing a panel about
+                    // trust cannot do.
+                    MuteText(text: " · \(entry.call.tool)")
+                }
+            } trailing: {
+                trailing()
+            }
+            if let head = entry.call.commandHead, !head.isEmpty {
+                MonoText(text: head, lineLimit: V4.commandLineLimit)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
     }
 
     private func sectionHeading(_ text: String) -> some View {
@@ -1540,10 +1775,8 @@ struct FleetView: View {
             .tracking(0.1 * 11)
     }
 
-    /// `commandHead` in monospace, truncated to one line: `command_head`
-    /// shown in monospace, truncated to one line. Shared by
-    /// ``runningToolRow(_:)`` and ``slowestToolRow(_:)`` so the two rows never
-    /// drift on how a call names itself.
+    /// Whose session a pooled tool call belongs to — the name every item on
+    /// this tab leads with, through ``toolItem(entry:trailing:)``.
     /// `docs/design/panel-tabs-mockup.html`'s "Bash · teamclaude-rs-c7" — the
     /// same ``JoinedSession/displayName`` the Sessions tab already draws for
     /// this session id, read off ``sessionFiles`` directly: `Fleet.toolsRunning`/
@@ -1559,18 +1792,6 @@ struct FleetView: View {
         return String(sessionId.prefix(8))
     }
 
-    /// The line a tool row leads with — ``ToolCallLabel/headline(commandHead:tool:owner:)``
-    /// with this tab's own session label, so a row whose command head the wire
-    /// could not carry says `Bash · teamclaude-rs-bc` rather than the bare word
-    /// `Bash`. Shared by both rows for the same reason ``MonoText`` is: the two
-    /// must never drift on how a call names itself.
-    private func toolCallHeadline(_ entry: SessionToolEntry) -> String {
-        ToolCallLabel.headline(
-            commandHead: entry.call.commandHead,
-            tool: entry.call.tool,
-            owner: toolCallOwnerName(entry.sessionId))
-    }
-
     /// The Bash tool's own timeout — the one denominator this build knows,
     /// and the reason `docs/design/panel-tabs.md` names 600s specifically:
     /// "The ten slowest calls today all sit at 600s: the Bash tool's own
@@ -1580,134 +1801,15 @@ struct FleetView: View {
     /// figure for would be the same overclaim finding 5 exists to remove.
     private var bashTimeoutSeconds: Double { V4.toolTimeoutSeconds }
 
-    /// How many of the ten slowest calls the tab draws.
-    static let slowestVisibleRows = 5
+    /// How many running calls the tab draws before its disclosure button —
+    /// `docs/design/tools-tab.md`'s "five visible, show N more". Five is
+    /// what fits above the fold beside the two sections under it.
+    static let runningVisibleItems = 5
 
-    /// A running call: its ring (Bash only, filling toward
-    /// ``bashTimeoutSeconds``) and its elapsed time since `startedMs`, turning
-    /// `--bad`/`Tok.spent` and naming the seconds left inside the last 20s —
-    /// finding 5's fix, verbatim: "20s to timeout" beside the reddened ring.
-    private func runningToolRow(_ entry: SessionToolEntry) -> some View {
-        let now = Date()
-        let elapsed = entry.call.startedMs.map { started in
-            max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
-        }
-        let remaining = elapsed.map { bashTimeoutSeconds - $0 }
-        let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
-        return V4Row {
-            // The two text lines are the row; the ring sits beside BOTH of them,
-            // vertically centred, rather than pairing with the first and letting
-            // the row grow to the ring's height (Gil, 2026-09-13: three rows took
-            // 200 pt where the mockup takes 150). The sub line now has the whole
-            // leading column — 224 pt against the 200 pt it needs — so
-            // "· 20s to timeout" survives without a `fixedSize` fight.
-            VStack(alignment: .leading, spacing: 0) {
-                MonoText(text: toolCallHeadline(entry))
-                // When the wire carried no command head the headline IS
-                // "Bash · teamclaude-rs-bc", so the sub line must not say it a
-                // second time — it keeps only the clause the headline cannot
-                // carry, the seconds left.
-                toolCallSubLine(
-                    entry,
-                    remaining: isNearTimeout ? remaining : nil,
-                    namesOwner: entry.call.commandHead?.isEmpty == false)
-            }
-        } trailing: {
-            // Ring and duration on ONE line, inside the shared column: the
-            // two are one reading ("how far through its timeout is this
-            // call"), and stacking them made the pair read as two items.
-            TrailingColumn {
-                HStack(spacing: V4.rowGap) {
-                    Spacer(minLength: 0)
-                    ProgressRing(
-                        fraction: (elapsed ?? 0) / bashTimeoutSeconds,
-                        tint: isNearTimeout ? Tok.spent : Tok.ok,
-                        accessibilityText: elapsed.map {
-                            "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
-                        })
-                    Text(elapsed.map(durationLabel) ?? "")
-                        .font(V4.font(V4.dimSize))
-                        .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
-                        .lineLimit(1)
-                        .frame(width: V4.durationColumnWidth, alignment: .trailing)
-                }
-            }
-        }
-        .frame(minHeight: V4.ringRowMinHeight)
-    }
-
-    /// "Agent · teamclaude-rs-c7 · 20s to timeout" — the tool, whose session it
-    /// belongs to, and what is left of its timeout.
-    ///
-    /// `namesOwner` is false when the row's HEADLINE is already
-    /// "\<tool\> · \<owner\>" (the no-command-head fallback), leaving this line
-    /// with the timeout clause alone rather than the same words twice.
-    private func toolCallSubLine(
-        _ entry: SessionToolEntry, remaining: Double?, namesOwner: Bool = true
-    ) -> some View {
-        HStack(spacing: 0) {
-            if namesOwner {
-                MuteText(text: "\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
-            }
-            if let remaining {
-                Text(" · \(Int(max(0, remaining.rounded())))s to timeout")
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.spent)
-                    .lineLimit(1)
-                    // Never the clause that gives way: the tool and its owner
-                    // are said again elsewhere on the panel, and this is the
-                    // only place the row says how long is left.
-                    .fixedSize()
-            }
-            Spacer(minLength: 0)
-        }
-    }
-
-    /// `width` is the SLOWEST TODAY list's shared duration column — one width
-    /// for every row in the list, never per row, or the durations zig-zag down
-    /// the tab (``TrailingColumn``'s own reason for existing). It widens for
-    /// the whole list when any call in it was killed, because "timed out" is a
-    /// longer string than "9m 43s" and the column has to hold the widest thing
-    /// the list says.
-    private func slowestToolRow(_ entry: SessionToolEntry, width: CGFloat) -> some View {
-        // ONE line, as the mockup draws it: the command, ellipsised at the pill
-        // column. The second line the pre-v4 row added ("Bash · mycelium-c2")
-        // cost 55 pt a row and pushed three of the five slowest below the fold.
-        V4Row {
-            MonoText(text: toolCallHeadline(entry))
-        } trailing: {
-            TrailingColumn(width: width) {
-                if let seconds = entry.call.seconds {
-                    // A killed call says so in WORDS. Red against grey was the
-                    // whole difference before (review finding 4), and the pill
-                    // spoke the duration alone, so a listener heard "10m 0s"
-                    // for a call the proxy had killed.
-                    let spoken = ToolCallLabel.spoken(
-                        seconds: seconds, timeout: bashTimeoutSeconds)
-                    V4Pill(
-                        text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
-                        role: ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
-                            ? .bad : .neutral
-                    )
-                    .accessibilityValue(spoken ?? "")
-                    .help(spoken ?? "")
-                }
-            }
-        }
-    }
-
-    /// Whether the SLOWEST TODAY list has to hold a "timed out" pill, and
-    /// therefore which width its duration column takes. `V4.trailingColumnWidth`
-    /// is the Tools tab's own full trailing column (ring + gap + duration), so
-    /// the wider case is still a declared token rather than a number invented
-    /// for the word.
-    private func slowestColumnWidth(_ entries: [SessionToolEntry]) -> CGFloat {
-        let anyTimedOut = entries.contains {
-            guard let seconds = $0.call.seconds else { return false }
-            return ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
-        }
-        return anyTimedOut ? V4.trailingColumnWidth : V4.durationColumnWidth
-    }
+    /// How many of today's ten slowest the tab draws. Three, not the five
+    /// the pre-redesign list drew: each item is now two lines, and the
+    /// section above it answers a question asked more often.
+    static let slowestVisibleItems = 3
 
     /// `"45s"`, `"4m 12s"`. The rule itself is ``ToolCallLabel/duration(_:)``,
     /// in `TcrBarCore` where a test can read it.
@@ -1778,12 +1880,45 @@ struct FleetView: View {
                 line + Text(" · ").foregroundColor(Tok.inkFaint)
                 + Text("\(fleet.toolsTotalTimeouts) hit the 600s timeout").foregroundColor(Tok.spent)
         }
-        return
+        return VStack(alignment: .leading, spacing: 0) {
             line
-            .font(Tok.secondaryDigitFont)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.top, Tok.tightSpacing)
-            .lineSpacing(Tok.secondaryLineSpacing)
+                .font(Tok.secondaryDigitFont)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, Tok.tightSpacing)
+                .lineSpacing(Tok.secondaryLineSpacing)
+            machineLine
+        }
+    }
+
+    /// "load 7.1 of 14 · 48 GB of 64 used · 5 compiles · disk 210 GB free" —
+    /// the second question `docs/design/tools-tab.md` records the operator
+    /// arriving with ("is the box overloaded?"), which this panel answered
+    /// nowhere at all. Drawn under the tools headline, above the tabs, where
+    /// the mockup puts it.
+    ///
+    /// Only the LOAD is tinted, and it is tinted by Gil's own dispatch rule:
+    /// amber from one load unit per core, red past two, at which point the
+    /// answer to "can I start another coder" is no. Nothing is drawn until
+    /// the first reading lands — a line of zeroes would be a measurement
+    /// nobody made.
+    @ViewBuilder
+    private var machineLine: some View {
+        if let machine {
+            (Text(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint))
+                + Text(" · ").foregroundColor(Tok.inkFaint)
+                + Text(machine.restClause).foregroundColor(Tok.mute))
+                .font(V4.font(V4.muteSize))
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityLabel(machine.line)
+        }
+    }
+
+    private func machineLoadTint(_ tint: MachineStats.LoadTint) -> Color {
+        switch tint {
+        case .calm: return Tok.mute
+        case .busy: return Tok.near
+        case .overloaded: return Tok.spent
+        }
     }
 
     /// The account list, cut into sections: a state band heading, then a group
@@ -2300,6 +2435,30 @@ struct FleetView: View {
     private func toggleSessionsExpansion() {
         sessionsExpanded.toggle()
         UserDefaults.standard.set(sessionsExpanded, forKey: Self.sessionsExpandedKey)
+    }
+
+    /// Whether RUNNING NOW and SLOWEST TODAY are showing every item or the
+    /// first few. Not persisted, unlike the Sessions tab's own flag: those
+    /// two lists change with every poll, so a choice made about yesterday's
+    /// fourteen running calls says nothing about today's three.
+    @State private var toolsRunningExpanded = false
+    @State private var toolsSlowestExpanded = false
+
+    /// Which TIMED OUT TODAY classes are open. By class NAME, not index: the
+    /// rows re-sort by count on every poll, and an index would silently
+    /// reassign an open row to a different class.
+    @State private var expandedTimeoutClasses: Set<String> = []
+
+    private func toggleToolsRunningExpansion() { toolsRunningExpanded.toggle() }
+
+    private func toggleToolsSlowestExpansion() { toolsSlowestExpanded.toggle() }
+
+    private func toggleTimeoutClass(_ name: String) {
+        if expandedTimeoutClasses.contains(name) {
+            expandedTimeoutClasses.remove(name)
+        } else {
+            expandedTimeoutClasses.insert(name)
+        }
     }
 
     /// Height key for a collapsed group's summary block. Same `<letter>:`
