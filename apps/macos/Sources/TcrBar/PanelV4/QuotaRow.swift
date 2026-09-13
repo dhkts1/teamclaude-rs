@@ -75,6 +75,17 @@ struct QuotaRow: View {
     let tint: QuotaBarTintSource
     let resetAtMs: Int64?
     let now: Date
+    /// An optional figure parked at the END of this row, where the pre-v4 card
+    /// drew the account's cost and output tokens. Carrying it here rather than
+    /// on a line of its own is worth ~20 pt a card, which is most of the 28 pt
+    /// the v4 card grew (measured 2026-09-13: 63 pt -> 91 pt for the same two
+    /// windows). Only the FIRST window gets one; a figure repeated per row
+    /// would say three different things about one account.
+    var trailing: String? = nil
+    /// What a hover says about ``trailing``. The inline figure is abbreviated
+    /// to fit beside a bar; the full phrase it abbreviates stays one hover
+    /// away rather than being lost with the row it used to occupy.
+    var trailingHelp: String? = nil
 
     private var fraction: Double {
         switch QuotaFormat.barFill(value) {
@@ -143,6 +154,15 @@ struct QuotaRow: View {
                     .font(V4.font(V4.muteSize))
                     .foregroundStyle(captionTint)
                     .fixedSize()
+            }
+            if let trailing {
+                Spacer(minLength: V4.quotaGap)
+                Text(trailing)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .help(trailingHelp ?? trailing)
             }
         }
         .frame(minHeight: V4.lineHeight(V4.dimSize))
