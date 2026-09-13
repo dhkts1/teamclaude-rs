@@ -36,11 +36,22 @@ private struct SettingsTag: View {
 private struct SectionHeader: View {
     let title: String
     let timing: SettingsRowTiming
+    /// Stated ONCE for a section where every row shares it — "Edit in
+    /// ~/.config/teamclaude.json" no longer repeats under each of a
+    /// section's read-only values (review #30,
+    /// `data/plans/interface-review-2026-09-13.md`): four copies of one
+    /// sentence out-inked the four numbers they annotated.
+    var hint: String? = nil
 
     var body: some View {
         HStack(spacing: 8) {
             Text(title)
             SettingsTag(timing: timing)
+            if let hint {
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(Tok.inkFaint)
+            }
         }
     }
 }
@@ -145,7 +156,9 @@ struct GeneralSettingsPane: View {
                     }
                 }
                 LabeledContent("Read the server every") {
-                    Text("\(Int(poller.interval)) s").foregroundStyle(Tok.inkDim)
+                    Text("\(Int(poller.interval)) s")
+                        .foregroundStyle(Tok.inkDim)
+                        .monospacedDigit()
                 }
             } header: {
                 SectionHeader(
@@ -396,7 +409,7 @@ struct GroupsRotationSettingsPane: View {
                     value: "Off",
                     key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming)
             } header: {
-                SectionHeader(title: "Rotation", timing: rotationSectionTiming)
+                SectionHeader(title: "Rotation", timing: rotationSectionTiming, hint: readOnlyHint)
             }
 
             Section {
@@ -421,7 +434,7 @@ struct GroupsRotationSettingsPane: View {
                     value: "Off",
                     key: SettingsRowBadge.http1Only, sectionTiming: limitsSectionTiming)
             } header: {
-                SectionHeader(title: "Limits", timing: limitsSectionTiming)
+                SectionHeader(title: "Limits", timing: limitsSectionTiming, hint: readOnlyHint)
             }
         }
         .formStyle(.grouped)
@@ -441,7 +454,9 @@ struct GroupsRotationSettingsPane: View {
             HStack {
                 Text(group.name).font(.headline)
                 Spacer()
-                Text(pluralizedAccounts(group.memberCount)).foregroundStyle(Tok.inkDim)
+                Text(pluralizedAccounts(group.memberCount))
+                    .foregroundStyle(Tok.inkDim)
+                    .monospacedDigit()
             }
             // No tag: `.live`, same as the section's own badge — a toggle
             // whose change is real and immediate needs no repeated word.
@@ -469,7 +484,7 @@ struct GroupsRotationSettingsPane: View {
             .help("Only sessions tagged with this group route here. \(readOnlyHint)")
 
             HStack(spacing: 6) {
-                Text("Members: \(group.memberCount)")
+                Text("Members: \(group.memberCount)").monospacedDigit()
                 Spacer()
                 if let hex = group.colorHex {
                     Circle().fill(Color(hex: hex) ?? Tok.inkFaint).frame(width: 14, height: 14)
@@ -497,12 +512,9 @@ struct GroupsRotationSettingsPane: View {
         sectionTiming: SettingsRowTiming
     ) -> some View {
         LabeledContent {
-            VStack(alignment: .trailing, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(value)
-                    rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
-                }
-                Text(readOnlyHint).foregroundStyle(Tok.inkFaint).font(.caption2)
+            HStack(spacing: 6) {
+                Text(value).monospacedDigit()
+                rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
             }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
@@ -512,6 +524,14 @@ struct GroupsRotationSettingsPane: View {
                 }
             }
         }
+        // Was a repeated `Text(readOnlyHint)` under every value (review #53,
+        // `data/plans/interface-review-2026-09-13.md`): four copies of one
+        // sentence out-inked the four numbers they annotated and doubled
+        // each row's height on the value side. The section header now
+        // states it once (`SectionHeader(hint:)`); `.help` keeps it
+        // reachable per row, the same way the hand-written "Reserved" row
+        // beside this one already carries it.
+        .help(readOnlyHint)
     }
 }
 
