@@ -210,7 +210,13 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
 }
 
 /// One tool call still awaiting its `tool_result`.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` (and on every struct below it, down to
+/// [`WireSession`]) exist for exactly one reader: [`crate::session_wire_persist`],
+/// which round-trips a session's live state to disk verbatim so a restored row
+/// is the SAME struct the tracker already knows how to project, not a second
+/// parallel shape that could drift from it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RunningTool {
     pub tool: String,
     pub started_ms: i64,
@@ -218,7 +224,7 @@ pub struct RunningTool {
 }
 
 /// One completed tool call, for the "ten slowest" list.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SlowTool {
     pub tool: String,
     pub seconds: f64,
@@ -233,7 +239,7 @@ pub const TOOL_DURATION_RESERVOIR_CAP: usize = 256;
 /// One tool's aggregate stats within a session — the source for `SessionToolsRow::by_tool`
 /// (`crates/tcr-status-wire`). Keyed on `tool_use.name` verbatim; `Read`, `Grep`, `Glob` and
 /// `Edit` are deliberately NOT merged here (the panel groups them) — see the bridge.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ToolBucket {
     pub calls: u64,
     pub errors: u64,
@@ -278,7 +284,7 @@ impl ToolBucket {
 }
 
 /// Per-session tool aggregates.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ToolStats {
     pub calls: u64,
     pub errors: u64,
@@ -302,7 +308,7 @@ pub const REQ_PER_MINUTE_LEN: usize = 30;
 /// (`crates/tcr-status-wire`). Advanced on [`Self::record`] (a new request bumps the current
 /// minute's bucket) and again, read-only, by [`Self::projected`] (`snapshot` calls this so an
 /// idle session decays toward zeros instead of freezing on its last-seen minute).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReqPerMinuteRing {
     buckets: std::collections::VecDeque<u16>,
     /// The wall-clock minute number (`ms / 60_000`) the newest (last) bucket represents.
@@ -362,7 +368,7 @@ const UNKNOWN_MODEL: &str = "unknown";
 /// against whichever model happened to be current. `input` here is BASE input only (excludes
 /// both cache dimensions), matching [`crate::usage::UsageRecord::input`] — never re-derive it
 /// from `cache_5m + cache_1h + cache_read` here, since that is what pricing itself does.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelTokenTally {
     pub input: u64,
     pub cache_5m: u64,
@@ -372,7 +378,7 @@ pub struct ModelTokenTally {
 }
 
 /// One session's row.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct WireSession {
     pub account: Option<String>,
     pub model: Option<String>,
@@ -585,6 +591,17 @@ impl WireSessionTracker {
             .filter(|(_, s)| now_ms.saturating_sub(s.last_seen_ms) <= SESSION_TTL_MS)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Fold restored sessions (`crate::session_wire_persist::load`'s output) into this
+    /// table. Existing entries win — a session already tracked by a request served
+    /// between boot and this call is fresher than anything on disk, same rule
+    /// `Manager::restore_affinity` follows for pins — so this is meant to run once, at
+    /// boot, before the listener binds.
+    pub fn restore(&mut self, sessions: std::collections::HashMap<String, WireSession>) {
+        for (session_id, session) in sessions {
+            self.sessions.entry(session_id).or_insert(session);
+        }
     }
 }
 

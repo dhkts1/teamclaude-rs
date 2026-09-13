@@ -21,7 +21,9 @@ use std::time::Duration;
 
 use teamclaude_rs::config::Config;
 use teamclaude_rs::proxy::STATUS_PATH;
-use teamclaude_rs::server::{serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup};
+use teamclaude_rs::server::{
+    serve, AffinityFlush, IncumbentPolicy, ServeOptions, TlsSetup, WireSessionsFlush,
+};
 use teamclaude_rs::singleton::{ProxyHost, ProxyOwner};
 use teamclaude_rs::usage::LedgerShutdown;
 
@@ -63,6 +65,18 @@ fn scratch_affinity_path(tag: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(unique).join("affinity.json")
 }
 
+fn scratch_wire_sessions_path(tag: &str) -> std::path::PathBuf {
+    let unique = format!(
+        "tcr-serve-test-wire-{}-{tag}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    std::env::temp_dir().join(unique).join("session-wire.json")
+}
+
 /// A disposable DIRECTORY for the port claim, for the same reason as the pin
 /// cache above: the real claim lives beside the live proxy's pin cache, is named
 /// after its port, and `tcr login` reads it. The file name inside is `serve`'s to
@@ -88,6 +102,10 @@ fn options(tag: &str) -> ServeOptions {
         // could reach `takeover_port` could SIGKILL the developer's live proxy.
         incumbent: IncumbentPolicy::never_signal(),
         affinity_path: Some(scratch_affinity_path(tag)),
+        // Scratch-scoped for the same reason as `affinity_path`: the binary's
+        // default path is one shared file, and a test serving briefly must
+        // never overwrite the live proxy's Sessions/Tools cache.
+        wire_sessions_path: Some(scratch_wire_sessions_path(tag)),
         // In-memory usage only. The binary's ledger directory is shared, and a
         // test serving briefly must never append into the live proxy's day file
         // — the same hazard `affinity_path` is scratch-scoped for.
@@ -144,12 +162,14 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
     );
     assert!(addr.ip().is_loopback(), "the proxy binds loopback only");
 
-    // The two loops this config enables: affinity flush + quota probe. The
-    // keep-warm loop is off, so it must NOT have been spawned.
+    // The three loops this config enables: affinity flush + wire-sessions flush
+    // + quota probe. The keep-warm loop is off, so it must NOT have been
+    // spawned.
     assert_eq!(
         handle.background_task_count(),
-        2,
-        "expected the affinity flusher and the quota prober, and no keep-warm loop"
+        3,
+        "expected the affinity flusher, the wire-sessions flusher and the quota \
+         prober, and no keep-warm loop"
     );
 
     // One real request, over a real socket, through the real listener.
@@ -185,8 +205,8 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
         .await
         .expect("shutdown did not finish: a background task ignored the shutdown signal");
     assert_eq!(
-        report.tasks_joined, 3,
-        "the accept loop plus both background loops must be joined"
+        report.tasks_joined, 4,
+        "the accept loop plus all three background loops must be joined"
     );
     assert_eq!(
         report.tasks_aborted, 0,
@@ -196,6 +216,11 @@ async fn the_library_can_start_serve_and_stop_the_proxy_with_no_binary() {
         report.affinity,
         AffinityFlush::Written(0),
         "a clean shutdown owes the next boot its final pin write, even when empty"
+    );
+    assert_eq!(
+        report.wire_sessions,
+        WireSessionsFlush::Written(0),
+        "a clean shutdown owes the next boot its final Sessions/Tools cache write, even when empty"
     );
 
     // Independent of our own bookkeeping: the accept loop really is gone, so the
@@ -237,14 +262,15 @@ async fn dropping_the_handle_stops_the_accept_loop_and_every_background_loop() {
         .expect_started();
     let port = handle.addr().port();
     assert_ne!(port, LIVE_PROXY_PORT);
-    assert_eq!(handle.background_task_count(), 2);
+    // Affinity flusher + wire-sessions flusher + quota prober.
+    assert_eq!(handle.background_task_count(), 3);
 
     // Every task `serve` spawned captured one of these.
     let manager = handle.manager().clone();
     let live_tasks = || std::sync::Arc::strong_count(&manager) - 1;
     assert!(
-        live_tasks() >= 3,
-        "expected the accept loop and both background loops to hold a manager clone, saw {}",
+        live_tasks() >= 4,
+        "expected the accept loop and all three background loops to hold a manager clone, saw {}",
         live_tasks()
     );
 

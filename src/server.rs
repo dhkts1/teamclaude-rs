@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::manager::Manager;
-use crate::{affinity, build_info, cli, mitm, singleton};
+use crate::{affinity, build_info, cli, mitm, session_wire_persist, singleton};
 
 /// How long [`ServerHandle::shutdown`] waits for a task to stop before aborting
 /// it. Long enough for a loop to finish an iteration and an in-progress atomic
@@ -166,6 +166,17 @@ pub struct ServeOptions {
     /// never repairs it. The next boot then cold-starts every session's prompt
     /// cache. Point this somewhere disposable, or leave it `None`.
     pub affinity_path: Option<PathBuf>,
+    /// The Sessions/Tools panel cache (`tcr status --json`'s `sessions` array —
+    /// `docs/design/panel-tabs.md`), or `None` to keep it **in memory only** —
+    /// nothing is read at boot and nothing is written at shutdown, so a restart
+    /// empties the panel exactly as it always has.
+    ///
+    /// `None` is the default for the same reason as [`Self::affinity_path`]: the
+    /// binary's path ([`crate::session_wire_persist::default_path`]) is one
+    /// shared file, and a second process that serves briefly would overwrite
+    /// the live proxy's Sessions/Tools cache with its own (usually empty) one.
+    /// Point this somewhere disposable, or leave it `None`.
+    pub wire_sessions_path: Option<PathBuf>,
     /// The usage-ledger DIRECTORY, or `None` to keep usage **in memory only** —
     /// nothing is replayed at boot and nothing is written, so a restart starts
     /// the day at zero.
@@ -248,6 +259,7 @@ impl ServeOptions {
             port: None,
             incumbent: IncumbentPolicy::never_signal(),
             affinity_path: None,
+            wire_sessions_path: None,
             usage_dir: None,
             tls: TlsSetup::Load,
             // Inert, like every other field here: with no owner dir, `host` is
@@ -345,6 +357,38 @@ impl AffinityFlush {
     }
 }
 
+/// What the final Sessions/Tools cache write did on shutdown — mirrors
+/// [`AffinityFlush`] exactly, for exactly the same reason: a caller that only
+/// ever sees this on a clean quit has no other way to know the panel's data
+/// will or will not be there at the next boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireSessionsFlush {
+    /// Nothing to write: no cache path was configured
+    /// ([`ServeOptions::wire_sessions_path`] was `None`).
+    Disabled,
+    /// The sessions were written for the next boot. Zero is a normal count.
+    Written(usize),
+    /// The write failed and the sessions are **lost**. Carries the rendered
+    /// error because the caller may have no tracing subscriber to read the
+    /// warning in.
+    Failed(String),
+}
+
+impl WireSessionsFlush {
+    /// The session count when one was actually written, else `None`.
+    pub fn sessions_written(&self) -> Option<usize> {
+        match self {
+            WireSessionsFlush::Written(count) => Some(*count),
+            _ => None,
+        }
+    }
+
+    /// Did a write that was supposed to happen fail?
+    pub fn failed(&self) -> bool {
+        matches!(self, WireSessionsFlush::Failed(_))
+    }
+}
+
 /// What a clean [`ServerHandle::shutdown`] did, so a caller can assert on it
 /// instead of trusting that the function returned.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +402,8 @@ pub struct ShutdownReport {
     pub tasks_aborted: usize,
     /// What the final pin write did.
     pub affinity: AffinityFlush,
+    /// What the final Sessions/Tools cache write did.
+    pub wire_sessions: WireSessionsFlush,
     /// What the usage ledger's drain-and-join did: `Flushed` means every line
     /// this process queued is on disk, `Abandoned` means the writer outlasted
     /// the grace and its tail is gone.
@@ -375,6 +421,7 @@ pub struct ServerHandle {
     shutdown: watch::Sender<bool>,
     manager: Arc<Manager>,
     affinity_path: Option<PathBuf>,
+    wire_sessions_path: Option<PathBuf>,
     /// The port claim written after the bind, to be removed on shutdown. `None`
     /// when the caller asked for no claim (or the write failed — a claim that was
     /// never written is nothing to remove).
@@ -534,6 +581,10 @@ impl ServerHandle {
         // makes the pins survive a SIGKILL, which is the case that matters.
         let affinity = self.flush_affinity_finally();
 
+        // Same belt-and-braces reasoning as the pin flush just above, for the
+        // Sessions/Tools cache.
+        let wire_sessions = self.flush_wire_sessions_finally();
+
         // Then the usage ledger, LAST, because it is the one flush whose input
         // is still arriving: an in-flight request that finishes during the joins
         // above records its usage, and that line is in the writer's queue rather
@@ -563,6 +614,7 @@ impl ServerHandle {
             tasks_joined: self.tasks_joined,
             tasks_aborted: self.tasks_aborted,
             affinity,
+            wire_sessions,
             ledger,
         }
     }
@@ -633,6 +685,34 @@ impl ServerHandle {
                     "final session-affinity pin write failed; pins will not survive this restart"
                 );
                 AffinityFlush::Failed(err.to_string())
+            }
+        }
+    }
+
+    /// The shutdown Sessions/Tools cache write, as a value — mirrors
+    /// [`Self::flush_affinity_finally`] exactly, including why it exists: the
+    /// 5-second debounced flusher is what survives a SIGKILL, this is belt-
+    /// and-braces for a clean quit that landed inside the last interval.
+    fn flush_wire_sessions_finally(&self) -> WireSessionsFlush {
+        let Some(path) = self.wire_sessions_path.as_ref() else {
+            return WireSessionsFlush::Disabled;
+        };
+        match self.manager.flush_wire_sessions(path) {
+            Ok(count) => {
+                tracing::info!(
+                    path = %path.display(),
+                    sessions = count,
+                    "Sessions/Tools cache written for the next boot"
+                );
+                WireSessionsFlush::Written(count)
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "final Sessions/Tools cache write failed; the panel will start empty next boot"
+                );
+                WireSessionsFlush::Failed(err.to_string())
             }
         }
     }
@@ -711,6 +791,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         port: port_override,
         incumbent,
         affinity_path,
+        wire_sessions_path,
         usage_dir,
         tls,
         host,
@@ -901,6 +982,69 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             };
             // The write itself is synchronous, so cancelling here can never tear
             // a half-written pin file; the loss is at most one interval, which
+            // `ServerHandle::shutdown`'s final flush then recovers.
+            tokio::select! {
+                _ = flush => {}
+                _ = stop.changed() => {}
+            }
+        })));
+    }
+
+    // The Sessions/Tools panel cache (F1, `docs/design/panel-tabs.md`) survives a
+    // restart the same way pins do — see `session_wire_persist` — restored before
+    // the listener binds so the panel is populated from the first `tcr status`
+    // after a bounce instead of starting empty.
+    //
+    // Only when a cache path was given: with `wire_sessions_path: None` the table
+    // is an in-memory record for this process alone, so there is nothing to
+    // restore from and nothing to spawn a flusher for.
+    if let Some(wire_sessions_path) = &wire_sessions_path {
+        let report =
+            manager.restore_wire_sessions(wire_sessions_path, session_wire_persist::RESTORE_TTL_MS);
+        if let Some(reason) = &report.degraded {
+            // Never fatal: this is a cache, so an unusable one costs the panel's
+            // pre-restart history and nothing else.
+            tracing::warn!(
+                path = %wire_sessions_path.display(),
+                reason = %reason,
+                "Sessions/Tools cache ignored; starting with an empty table"
+            );
+        } else {
+            tracing::info!(
+                path = %wire_sessions_path.display(),
+                restored = report.sessions.len(),
+                expired = report.expired,
+                ttl_hours = session_wire_persist::RESTORE_TTL_MS / 3_600_000,
+                "Sessions/Tools cache restored"
+            );
+        }
+
+        // Debounced incremental flush — same 5-second, dirty-flag-gated contract
+        // as the affinity flusher just above, for the same reason: a SIGKILL runs
+        // no shutdown path at all, so only a periodic write can survive one.
+        let flusher = manager.clone();
+        let flush_path = wire_sessions_path.clone();
+        let mut stop = shutdown_tx.subscribe();
+        background.push(tokio::spawn(supervise("wire-sessions-flusher", async move {
+            let flush = async {
+                let mut ticker = tokio::time::interval(Duration::from_secs(5));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    if !flusher.take_wire_sessions_dirty() {
+                        continue;
+                    }
+                    if let Err(err) = flusher.flush_wire_sessions(&flush_path) {
+                        tracing::warn!(
+                            path = %flush_path.display(),
+                            error = %err,
+                            "could not write the Sessions/Tools cache; the panel will start empty next restart"
+                        );
+                    }
+                }
+            };
+            // The write itself is synchronous, so cancelling here can never tear
+            // a half-written file; the loss is at most one interval, which
             // `ServerHandle::shutdown`'s final flush then recovers.
             tokio::select! {
                 _ = flush => {}
@@ -1149,6 +1293,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         shutdown: shutdown_tx,
         manager,
         affinity_path,
+        wire_sessions_path,
         owner_path,
         tasks_joined: 0,
         tasks_aborted: 0,
@@ -1225,6 +1370,9 @@ mod tests {
             shutdown,
             manager,
             affinity_path,
+            // Same reasoning as `affinity_path` above: a hand-built handle in a
+            // unit test writes nothing outside this process.
+            wire_sessions_path: None,
             // No claim: a hand-built handle in a unit test may not delete a file
             // on shutdown, least of all one named after the live proxy's port.
             owner_path: None,
