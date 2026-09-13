@@ -5,10 +5,21 @@
 //! Two halves, deliberately separate:
 //!
 //! - Pure parsing (this module): given a request body already read into memory, pull out the
-//!   `metadata.user_id`-embedded `session_id` and, from the LAST TWO entries of `messages`
-//!   only, any `tool_use` (assistant) and `tool_result` (user) blocks. Never deserializes the
-//!   whole conversation history into owned [`serde_json::Value`]s — `messages` is read
-//!   borrowed as [`RawValue`] and only its tail two elements are turned into owned values.
+//!   `metadata.user_id`-embedded `session_id` and, from the TAIL of `messages`, any
+//!   `tool_use` (assistant) and `tool_result` (user) blocks. The tail is not a fixed "last
+//!   two" — Claude Code does not always end a request's history with exactly
+//!   `[assistant(tool_use), user(tool_result)]`. Measured against this machine's own
+//!   transcripts (`~/.claude/projects/*.jsonl`, walked via each entry's real `parentUuid`
+//!   chain, so cross-thread/subagent interleaving in the same file cannot be mistaken for
+//!   one thread's own history): a `tool_use` and its `tool_result` are always adjacent
+//!   logical messages, but Claude Code can append further trailing `user` messages after
+//!   the `tool_result` — a system-reminder is sent as its OWN message, not folded into the
+//!   `tool_result`'s content array — before the next request actually goes out. So the tail
+//!   walks backward from the newest message, gathering it into the scan window, until it
+//!   reaches an `assistant` message (which is where the newest `tool_use` block, if any,
+//!   lives) or [`TAIL_SCAN_CAP`] is hit. Never deserializes the whole conversation history
+//!   into owned [`serde_json::Value`]s — `messages` is read borrowed as [`RawValue`] and
+//!   only this bounded tail window is turned into owned values.
 //! - [`WireSessionTracker`]: the bounded, in-memory table one request's parsed events get
 //!   folded into. No I/O, no locking — [`crate::manager::Manager`] wraps one in a `Mutex`.
 //!
@@ -46,6 +57,14 @@ pub struct ToolResultEvent {
 /// Max characters kept from a Bash tool's `input.command` — see [`ToolUseEvent::command_head`].
 const COMMAND_HEAD_MAX: usize = 120;
 
+/// Upper bound on how many of `messages`' trailing entries [`extract_tool_events`] will ever
+/// parse while walking backward for the assistant turn that owns the newest `tool_use` — see
+/// the module doc. Comfortably covers the observed shape (one or two trailing non-assistant
+/// messages, e.g a system-reminder sent as its own message) while keeping the parse cost
+/// small and fixed even for a turn with no tool_use at all, where the walk never finds an
+/// `assistant` message and runs all the way to the cap.
+const TAIL_SCAN_CAP: usize = 20;
+
 /// Parse `metadata.user_id`'s stringified JSON blob for its `session_id` — see
 /// `src/proxy.rs`'s `stable_session_key` doc-comment for the blob's shape and lineage
 /// guarantees. `None` on absence or a parse failure; never a panic on a hand-shaped or
@@ -61,9 +80,9 @@ pub fn extract_session_id(user_id_json: &str) -> Option<String> {
         .and_then(|p| p.session_id)
 }
 
-/// The minimal shape read from `messages`: only `role` and `content`, and only for the last
-/// two elements of the array — see the module doc for why the rest of the history is never
-/// materialized.
+/// The minimal shape read from `messages`: only `role` and `content`, and only for the
+/// bounded tail window [`extract_tool_events`] walks — see the module doc for why the rest
+/// of the history is never materialized.
 #[derive(serde::Deserialize)]
 struct MessagePeek {
     #[serde(default)]
@@ -115,11 +134,25 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
     let Ok(all) = serde_json::from_str::<Vec<&RawValue>>(messages.get()) else {
         return (tool_uses, tool_results);
     };
-    let tail_start = all.len().saturating_sub(2);
-    for raw in &all[tail_start..] {
+
+    // Walk backward from the newest message, parsing each into the tail window, until an
+    // `assistant` message is reached (where the newest `tool_use` block, if any, lives) or
+    // `TAIL_SCAN_CAP` is hit — see the module doc for why a fixed "last two" undercounts.
+    // `tail` ends up oldest-first, matching `all`'s own order, once reversed below.
+    let mut tail: Vec<MessagePeek> = Vec::new();
+    for raw in all.iter().rev().take(TAIL_SCAN_CAP) {
         let Ok(msg) = serde_json::from_str::<MessagePeek>(raw.get()) else {
             continue;
         };
+        let is_assistant = msg.role == "assistant";
+        tail.push(msg);
+        if is_assistant {
+            break;
+        }
+    }
+    tail.reverse();
+
+    for msg in tail {
         let Some(Value::Array(blocks)) = msg.content else {
             continue;
         };
@@ -682,6 +715,44 @@ mod tests {
             "the stale tool_use is outside the last two messages"
         );
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn a_trailing_reminder_message_after_the_tool_result_must_not_hide_the_pair() {
+        // Real shape, confirmed against this machine's own Claude Code transcripts
+        // (~/.claude/projects/*.jsonl, parentUuid-chained — NOT a cross-thread artifact):
+        // Claude Code appends a system-reminder as its OWN trailing `user` message,
+        // separate from the `tool_result` message that precedes it, rather than folding
+        // the reminder text into the tool_result's own content array. So by the time the
+        // client actually fires the next request, the array's last THREE elements are
+        // [assistant(tool_use), user(tool_result), user(reminder-only text)] — the
+        // matching pair sits at [-3, -2], one step outside "the last two messages".
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": [tool_use("tu_reminded", "Bash", Some("ls -la"))]},
+            {"role": "user", "content": [tool_result("tu_reminded", false, "ok")]},
+            {"role": "user", "content": [{"type": "text", "text": "<system-reminder>...</system-reminder>"}]},
+        ]);
+        let raw = messages_raw(messages);
+        let (uses, results) = extract_tool_events(&raw);
+
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_request(
+            "sess-reminded",
+            Some("alice@example.com".into()),
+            Some("claude-x".into()),
+            1_000,
+            &uses,
+            &results,
+        );
+
+        let snap = tracker.snapshot(1_000);
+        let (_, session) = &snap[0];
+        assert_eq!(
+            session.tools.calls, 1,
+            "the tool call must still be counted even though a trailing reminder message \
+             pushed the real pair one slot outside the last two messages"
+        );
     }
 
     #[test]
