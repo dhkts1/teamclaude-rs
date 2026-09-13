@@ -35,6 +35,9 @@
 //! lives here, in a crate small enough to read in one sitting. The proxy keeps
 //! its guarantee intact and the audit surface is this file.
 
+#[cfg(target_os = "macos")]
+pub mod peer;
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
