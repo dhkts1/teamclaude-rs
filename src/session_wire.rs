@@ -23,10 +23,20 @@
 //! - [`WireSessionTracker`]: the bounded, in-memory table one request's parsed events get
 //!   folded into. No I/O, no locking — [`crate::manager::Manager`] wraps one in a `Mutex`.
 //!
-//! `command_head` (a Bash tool's `input.command`, or an `Agent`/`Task` tool's
-//! `input.subagent_type: input.description`, capped to 120 chars) is held ONLY in this
-//! in-memory table — never written to `~/.cache/teamclaude/logs` or any other file. That is
-//! the same body-content-never-hits-disk rule `src/proxy.rs` states for the request log.
+//! A `tool_use` block reaches this table from two directions — a request's assistant message
+//! ([`extract_tool_events`]) and the response the proxy just streamed (`proxy.rs`, which
+//! builds its events through the shared [`tool_use_event_from_block`]) — because a Claude Code
+//! request carries a `tool_use` and its `tool_result` together, so the request side alone can
+//! never show a tool still running.
+//!
+//! `command_head` (capped to 120 chars; the per-tool shape is on
+//! [`ToolUseEvent::command_head`]) is held in this in-memory table — never written to
+//! `~/.cache/teamclaude/logs` or any other log file. That is the same
+//! body-content-never-hits-disk rule `src/proxy.rs` states for the request log. NOTE, measured
+//! 2026-09-13: the affinity-style snapshot in [`crate::session_wire_persist`] round-trips
+//! `WireSession` verbatim, heads included, so `~/.cache/teamclaude/session-wire.json` does
+//! hold them today (23 `command_head` strings in the live file) — that predates the wider
+//! heads above and is a policy call, not something this parser decides.
 
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -36,12 +46,25 @@ use serde_json::Value;
 pub struct ToolUseEvent {
     pub id: String,
     pub name: Option<String>,
-    /// For a `Bash` tool call, the NORMALIZED first 120 characters of `input.command` — see
-    /// [`normalize_bash_command`]. For an `Agent` or `Task` tool call (a running subagent),
-    /// `input.description` (Claude Code's 3-5 word summary), prefixed with
-    /// `input.subagent_type` when present (`"reviewer: check the wire fixtures"`), same
-    /// 120-char cap. `None` for any other tool. Held in memory only — see the module doc's
-    /// no-body-content-on-disk rule.
+    /// What this call is DOING, for the panel row that would otherwise print the bare tool
+    /// name. Built by [`tool_use_event_from_block`], always capped at [`COMMAND_HEAD_MAX`]
+    /// characters:
+    ///
+    /// - `Bash` — the NORMALIZED first 120 characters of `input.command`, see
+    ///   [`normalize_bash_command`].
+    /// - `Agent` / `Task` (a running subagent) — `input.description` (Claude Code's 3-5 word
+    ///   summary), prefixed with `input.subagent_type` when present
+    ///   (`"reviewer: check the wire fixtures"`).
+    /// - `TaskOutput` — `TaskOutput · waiting on task <input.task_id>`.
+    /// - `Read` / `Edit` / `Write` / `NotebookEdit` — the tool name and `input.file_path`
+    ///   (`input.notebook_path` for a notebook).
+    /// - `Grep` / `Glob` — the tool name and `input.pattern`.
+    /// - `WebFetch` — the HOST of `input.url`, never its path or query.
+    /// - `WebSearch` — `input.query`.
+    /// - `None` for any other tool, and for any of the above whose field is absent; the panel
+    ///   falls back to the tool name.
+    ///
+    /// Held in memory only — see the module doc's no-body-content-on-disk rule.
     pub command_head: Option<String>,
     /// A `Bash` tool call's coarse category — see [`CommandClass`]. `None` for any other
     /// tool, or when `command_head` is `None`.
@@ -378,38 +401,7 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
             match (msg.role.as_str(), b.kind.as_str()) {
                 ("assistant", "tool_use") => {
                     if let Some(id) = b.id {
-                        let mut command_class = None;
-                        let command_head = match b.name.as_deref() {
-                            Some("Bash") => b
-                                .input
-                                .as_ref()
-                                .and_then(|v| v.get("command"))
-                                .and_then(Value::as_str)
-                                .map(|s| {
-                                    let (head, class) = normalize_bash_command(s);
-                                    command_class = Some(class);
-                                    head
-                                }),
-                            Some("Agent") | Some("Task") => b.input.as_ref().and_then(|input| {
-                                let description =
-                                    input.get("description").and_then(Value::as_str)?;
-                                let head = match input.get("subagent_type").and_then(Value::as_str)
-                                {
-                                    Some(subagent_type) => {
-                                        format!("{subagent_type}: {description}")
-                                    }
-                                    None => description.to_string(),
-                                };
-                                Some(head.chars().take(COMMAND_HEAD_MAX).collect())
-                            }),
-                            _ => None,
-                        };
-                        tool_uses.push(ToolUseEvent {
-                            id,
-                            name: b.name,
-                            command_head,
-                            command_class,
-                        });
+                        tool_uses.push(tool_use_event_from_block(id, b.name, b.input.as_ref()));
                     }
                 }
                 ("user", "tool_result") => {
@@ -428,6 +420,81 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
         }
     }
     (tool_uses, tool_results)
+}
+
+/// Build one [`ToolUseEvent`] from a `tool_use` block's `id`, `name` and `input`.
+///
+/// Factored out of [`extract_tool_events`] because a `tool_use` block now reaches this table
+/// from TWO directions and both must produce the identical event: a REQUEST body's assistant
+/// message (here) and the RESPONSE the proxy has just finished streaming (`proxy.rs`'s SSE and
+/// non-streamed parse paths). The response side is what makes `running` non-empty at all — a
+/// Claude Code request carries a `tool_use` and its matching `tool_result` in the SAME body, so
+/// a request-only table opens and closes every call within one call and shows nothing in
+/// flight (measured 2026-09-13 against the live proxy: 11 sessions, `running: 0` in every one,
+/// while at least three were mid-tool).
+///
+/// Every head produced here is display context for a panel row, capped at
+/// [`COMMAND_HEAD_MAX`] characters — see [`ToolUseEvent::command_head`] for the per-tool shape
+/// and the module doc for where it may and may not be held.
+pub fn tool_use_event_from_block(
+    id: String,
+    name: Option<String>,
+    input: Option<&Value>,
+) -> ToolUseEvent {
+    let mut command_class = None;
+    let field = |key: &str| input.and_then(|v| v.get(key)).and_then(Value::as_str);
+    let capped = |s: String| -> String { s.chars().take(COMMAND_HEAD_MAX).collect() };
+    let command_head = match name.as_deref() {
+        Some("Bash") => field("command").map(|s| {
+            let (head, class) = normalize_bash_command(s);
+            command_class = Some(class);
+            head
+        }),
+        Some("Agent") | Some("Task") => field("description").map(|description| {
+            let head = match field("subagent_type") {
+                Some(subagent_type) => format!("{subagent_type}: {description}"),
+                None => description.to_string(),
+            };
+            capped(head)
+        }),
+        // A running `TaskOutput` is a session WAITING on a subagent, not working — without
+        // this it renders as the bare word `TaskOutput`, which is what four of the live
+        // slowest-six rows said on 2026-09-13.
+        Some("TaskOutput") => field("task_id")
+            .map(|task_id| capped(format!("TaskOutput · waiting on task {task_id}"))),
+        Some(tool @ ("Read" | "Edit" | "Write" | "NotebookEdit")) => field("file_path")
+            .or_else(|| field("notebook_path"))
+            .map(|path| capped(format!("{tool} {path}"))),
+        Some(tool @ ("Grep" | "Glob")) => {
+            field("pattern").map(|pattern| capped(format!("{tool} {pattern}")))
+        }
+        // The HOST only: a fetch URL's path and query carry the search term or record id,
+        // and the row only needs to say where the call went.
+        Some("WebFetch") => field("url").map(|url| capped(format!("WebFetch {}", url_host(url)))),
+        Some("WebSearch") => field("query").map(|query| capped(format!("WebSearch {query}"))),
+        _ => None,
+    };
+    ToolUseEvent {
+        id,
+        name,
+        command_head,
+        command_class,
+    }
+}
+
+/// The host part of a URL. Hand-rolled rather than adding a URL crate for one display field:
+/// drop the scheme, cut at the first `/`, `?` or `#`, then drop any `user@` credentials prefix
+/// (which is exactly the part that must never reach a panel row). A string carrying none of
+/// those separators is its own host.
+fn url_host(raw: &str) -> &str {
+    let after_scheme = raw.split_once("://").map_or(raw, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host)
 }
 
 /// One tool call still awaiting its `tool_result`.
@@ -682,29 +749,7 @@ impl WireSessionTracker {
         }
 
         for tu in tool_uses {
-            if entry.tools.running.contains_key(&tu.id) {
-                continue;
-            }
-            if entry.tools.running.len() >= PENDING_TOOL_CAP {
-                if let Some(oldest) = entry
-                    .tools
-                    .running
-                    .iter()
-                    .min_by_key(|(_, r)| r.started_ms)
-                    .map(|(k, _)| k.clone())
-                {
-                    entry.tools.running.remove(&oldest);
-                }
-            }
-            entry.tools.running.insert(
-                tu.id.clone(),
-                RunningTool {
-                    tool: tu.name.clone().unwrap_or_default(),
-                    started_ms: previous_response_end_ms,
-                    command_head: tu.command_head.clone(),
-                    command_class: tu.command_class,
-                },
-            );
+            Self::insert_running(&mut entry.tools, tu, previous_response_end_ms);
         }
 
         for tr in tool_results {
@@ -778,6 +823,63 @@ impl WireSessionTracker {
             tally.cache_read += cache_read;
             tally.output += output;
         }
+    }
+
+    /// Insert tool calls parsed from the RESPONSE this session's last request produced, as
+    /// running from `now_ms` — the instant the stream ended, which is when the client actually
+    /// started the tool. This is the half that makes `running` non-empty: see
+    /// [`tool_use_event_from_block`] for why the request side alone never can.
+    ///
+    /// Deliberately NOT [`Self::record_request`]: this is the second half of a request already
+    /// recorded, so it must not count another request, move `last_seen_ms`, or feed the
+    /// per-minute ring. A session that is absent is ignored rather than created — the request
+    /// half runs first and creates it, and a response alone names nothing to attribute to.
+    ///
+    /// The matching `tool_result` arrives in the NEXT request and closes the entry through
+    /// [`Self::record_request`]'s result loop, which measures the duration from the
+    /// `started_ms` set here; that same request also replays the `tool_use`, and the
+    /// already-running skip in [`Self::insert_running`] is what keeps this earlier, truer
+    /// start instant instead of overwriting it.
+    pub fn record_response_tool_uses(
+        &mut self,
+        session_id: &str,
+        now_ms: i64,
+        tool_uses: &[ToolUseEvent],
+    ) {
+        if let Some(entry) = self.sessions.get_mut(session_id) {
+            for tu in tool_uses {
+                Self::insert_running(&mut entry.tools, tu, now_ms);
+            }
+        }
+    }
+
+    /// Put one `tool_use` into `running`, evicting the oldest entry when [`PENDING_TOOL_CAP`]
+    /// is reached. An id already running is left ALONE — its recorded start is the earlier and
+    /// therefore truer one (the response-side insert), and a later request replaying the same
+    /// block must not reset the clock.
+    fn insert_running(tools: &mut ToolStats, tu: &ToolUseEvent, started_ms: i64) {
+        if tools.running.contains_key(&tu.id) {
+            return;
+        }
+        if tools.running.len() >= PENDING_TOOL_CAP {
+            if let Some(oldest) = tools
+                .running
+                .iter()
+                .min_by_key(|(_, r)| r.started_ms)
+                .map(|(k, _)| k.clone())
+            {
+                tools.running.remove(&oldest);
+            }
+        }
+        tools.running.insert(
+            tu.id.clone(),
+            RunningTool {
+                tool: tu.name.clone().unwrap_or_default(),
+                started_ms,
+                command_head: tu.command_head.clone(),
+                command_class: tu.command_class,
+            },
+        );
     }
 
     fn insert_slowest(slowest: &mut Vec<SlowTool>, tool: SlowTool) {
@@ -1121,6 +1223,178 @@ mod tests {
         // so "previous response end" is that request's own arrival), resolved at 6_500.
         assert_eq!(session.tools.slowest[0].seconds, 5.5);
         assert_eq!(session.tools.slowest[0].tool, "Bash");
+    }
+
+    /// The RUNNING NOW half: a `tool_use` parsed out of the RESPONSE is running from stream
+    /// end until the NEXT request's `tool_result` closes it — and that next request replays
+    /// the same block without resetting its clock.
+    #[test]
+    fn a_response_side_tool_use_runs_until_the_next_requests_tool_result() {
+        let mut tracker = WireSessionTracker::new();
+        // The request that produced the turn — its own body carried no tool events.
+        tracker.record_request("sess-r", None, None, 1_000, &[], &[]);
+
+        // The response finished streaming at 2_000 carrying one tool_use.
+        let uses = vec![ToolUseEvent {
+            id: "tu_1".into(),
+            name: Some("Bash".into()),
+            command_head: Some("cargo test --release".into()),
+            command_class: None,
+        }];
+        tracker.record_response_tool_uses("sess-r", 2_000, &uses);
+
+        let mid = tracker.snapshot(2_500);
+        let (_, session) = &mid[0];
+        assert_eq!(
+            session.tools.running.len(),
+            1,
+            "RUNNING NOW is non-empty between the response and the next request"
+        );
+        assert_eq!(session.tools.running["tu_1"].started_ms, 2_000);
+        assert_eq!(
+            session.requests, 1,
+            "a response-side insert is the same request's second half, not another request"
+        );
+
+        // The next request, 7 seconds after the stream ended, replays the same tool_use AND
+        // carries its tool_result.
+        tracker.record_request(
+            "sess-r",
+            None,
+            None,
+            9_000,
+            &uses,
+            &[ToolResultEvent {
+                id: "tu_1".into(),
+                is_error: false,
+                timed_out: false,
+            }],
+        );
+
+        let snap = tracker.snapshot(9_000);
+        let (_, session) = &snap[0];
+        assert!(session.tools.running.is_empty(), "the result closed it");
+        assert_eq!(session.tools.calls, 1);
+        assert_eq!(
+            session.tools.slowest[0].seconds, 7.0,
+            "measured from the response-side start (2_000) — the replayed tool_use must not \
+             reset it to this request's previous-response instant (1_000, which would read 8.0)"
+        );
+    }
+
+    /// A response can only add to a session the request half already created: the request is
+    /// recorded first, at the same call site, and nothing else may conjure a session.
+    #[test]
+    fn a_response_side_tool_use_for_an_unknown_session_is_ignored() {
+        let mut tracker = WireSessionTracker::new();
+        tracker.record_response_tool_uses(
+            "sess-never-seen",
+            2_000,
+            &[ToolUseEvent {
+                id: "tu_1".into(),
+                name: Some("Bash".into()),
+                command_head: None,
+                command_class: None,
+            }],
+        );
+        assert!(tracker.snapshot(2_000).is_empty());
+    }
+
+    /// Cause 2: every row said `TaskOutput` and nothing else because `command_head` was `None`
+    /// for all but Bash/Agent/Task.
+    #[test]
+    fn command_head_says_what_a_non_bash_tool_is_doing() {
+        let cases: [(&str, Value, Option<&str>); 8] = [
+            (
+                "TaskOutput",
+                serde_json::json!({"task_id": "task_9"}),
+                Some("TaskOutput · waiting on task task_9"),
+            ),
+            (
+                "Read",
+                serde_json::json!({"file_path": "/tmp/example.rs"}),
+                Some("Read /tmp/example.rs"),
+            ),
+            (
+                "NotebookEdit",
+                serde_json::json!({"notebook_path": "/tmp/example.ipynb"}),
+                Some("NotebookEdit /tmp/example.ipynb"),
+            ),
+            (
+                "Grep",
+                serde_json::json!({"pattern": "fn main"}),
+                Some("Grep fn main"),
+            ),
+            (
+                "Glob",
+                serde_json::json!({"pattern": "**/*.rs"}),
+                Some("Glob **/*.rs"),
+            ),
+            (
+                // The host only — a path and query carry the search term or record id.
+                "WebFetch",
+                serde_json::json!({"url": "https://example.com/orders/42?token=abc"}),
+                Some("WebFetch example.com"),
+            ),
+            (
+                "WebSearch",
+                serde_json::json!({"query": "rust sse parser"}),
+                Some("WebSearch rust sse parser"),
+            ),
+            // Unchanged: a tool with no rule keeps `None` and the panel falls back to its name.
+            ("SomeFutureTool", serde_json::json!({"whatever": 1}), None),
+        ];
+
+        for (name, input, expected) in cases {
+            let messages = messages_raw(serde_json::json!([
+                {
+                    "role": "assistant",
+                    "content": [{"type": "tool_use", "id": "tu_1", "name": name, "input": input}],
+                }
+            ]));
+            let (uses, _) = extract_tool_events(&messages);
+            assert_eq!(uses.len(), 1, "for {name}");
+            assert_eq!(uses[0].command_head.as_deref(), expected, "head for {name}");
+            assert!(
+                uses[0].command_class.is_none(),
+                "class is Bash-only ({name})"
+            );
+        }
+    }
+
+    /// The field the head reads can be absent (a malformed or future input shape): that is a
+    /// missing head, never a fabricated one.
+    #[test]
+    fn a_missing_head_field_leaves_the_head_none() {
+        let messages = messages_raw(serde_json::json!([
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "tu_1", "name": "Read", "input": {}}],
+            }
+        ]));
+        let (uses, _) = extract_tool_events(&messages);
+        assert_eq!(uses[0].command_head, None);
+    }
+
+    /// A head is capped like a Bash command's — a long path cannot widen a panel row.
+    #[test]
+    fn a_long_head_is_capped_like_a_bash_command() {
+        let long_path = format!("/tmp/{}", "a".repeat(400));
+        let messages = messages_raw(serde_json::json!([
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "tu_1",
+                    "name": "Read",
+                    "input": {"file_path": long_path},
+                }],
+            }
+        ]));
+        let (uses, _) = extract_tool_events(&messages);
+        let head = uses[0].command_head.as_deref().expect("a head");
+        assert_eq!(head.chars().count(), COMMAND_HEAD_MAX);
+        assert!(head.starts_with("Read /tmp/aaa"));
     }
 
     #[test]
