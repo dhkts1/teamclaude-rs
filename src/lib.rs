@@ -36,6 +36,7 @@ pub mod quota;
 pub mod schedule;
 pub mod server;
 pub mod session_wire;
+pub mod session_wire_persist;
 pub mod singleton;
 pub mod stats;
 pub mod status;

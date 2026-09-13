@@ -1106,6 +1106,14 @@ pub struct Manager {
     /// for where it surfaces. A separate lock from every other field here: nothing on the
     /// routing path reads it, so it is never held together with `accounts` or `affinity`.
     wire_sessions: Mutex<crate::session_wire::WireSessionTracker>,
+    /// Set whenever [`Self::wire_sessions`] is mutated, cleared by the flusher
+    /// task that snapshots it to disk — same debounce contract as
+    /// [`Self::affinity_dirty`]/[`crate::affinity`], mirrored for
+    /// [`crate::session_wire_persist`]. A relaxed atomic for the same reason:
+    /// the setter is every request that carries a `wire_session_id`, the
+    /// reader is a slow timer, and the only ordering that matters is "a change
+    /// eventually causes a write".
+    wire_sessions_dirty: AtomicBool,
     /// Monotonic session-key source handed out by [`Manager::next_session_key`],
     /// one per connection. Starts at 1 so the first key is a nonzero, unique u64.
     session_seq: AtomicU64,
@@ -1421,6 +1429,7 @@ impl Manager {
             affinity_dirty: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             wire_sessions: Mutex::new(crate::session_wire::WireSessionTracker::new()),
+            wire_sessions_dirty: AtomicBool::new(false),
             session_seq: AtomicU64::new(1),
             next_revalidation_at_ms: std::sync::atomic::AtomicI64::new(0),
             conn_affinity: Mutex::new(HashMap::new()),

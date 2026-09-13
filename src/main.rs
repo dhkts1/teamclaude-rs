@@ -1393,6 +1393,9 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             server::IncumbentPolicy::replace_legacy_js_only()
         },
         affinity_path: Some(affinity::default_path()),
+        // The Sessions/Tools panel cache, a binary-only side effect exactly like the
+        // pin cache above and for the same reason: one shared file, one writer.
+        wire_sessions_path: Some(teamclaude_rs::session_wire_persist::default_path()),
         // The shared usage ledger, a binary-only side effect exactly like the
         // pin cache above and for the same reason: one directory, one writer.
         usage_dir: Some(teamclaude_rs::usage::default_dir()),

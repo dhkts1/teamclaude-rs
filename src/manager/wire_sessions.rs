@@ -1,8 +1,12 @@
 //! `Manager` glue for [`crate::session_wire::WireSessionTracker`] — split verbatim from
 //! `mod.rs`, mirroring `usage.rs`/`snapshot.rs`'s split.
 
+use std::path::Path;
+use std::sync::atomic::Ordering;
+
 use super::*;
 use crate::session_wire::{ToolResultEvent, ToolUseEvent};
+use crate::session_wire_persist::{self, LoadReport};
 
 impl Manager {
     /// Fold one request's session identity, model and parsed tool events into the wire-session
@@ -31,6 +35,8 @@ impl Manager {
             .lock()
             .expect("wire sessions lock poisoned");
         tracker.record_request(session_id, account, model, now_ms, tool_uses, tool_results);
+        drop(tracker);
+        self.mark_wire_sessions_dirty();
     }
 
     /// Add token counts learned from a response's usage to the wire-session table. Called
@@ -72,6 +78,8 @@ impl Manager {
             cache_read_tokens,
             output_tokens,
         );
+        drop(tracker);
+        self.mark_wire_sessions_dirty();
     }
 
     /// The live wire-session table, projected onto [`tcr_status_wire::SessionRow`] — what
@@ -210,6 +218,56 @@ impl Manager {
         summary.by_tool = by_tool.into_values().collect();
         summary
     }
+
+    /// Flag the wire-session table as changed since the last flush. Mirrors
+    /// [`Self::mark_affinity_dirty`]: a single relaxed store on the request path, with the
+    /// actual write done off it by a debounced flusher.
+    pub fn mark_wire_sessions_dirty(&self) {
+        self.wire_sessions_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Consume the dirty flag: `true` when something changed since the last call.
+    pub fn take_wire_sessions_dirty(&self) -> bool {
+        self.wire_sessions_dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// Write the wire-session table to `path`, atomically. Returns how many sessions
+    /// landed. Never called on the request hot path — see `server.rs`'s debounced
+    /// flusher, spawned only when a path was configured — and the caller logs the
+    /// failure and carries on, same as [`Self::flush_affinity`]: a proxy that cannot
+    /// write this cache still serves traffic exactly as it did before this file existed.
+    pub fn flush_wire_sessions(&self, path: &Path) -> Result<usize, crate::config::ConfigError> {
+        let now_ms = crate::now_ms();
+        let sessions: std::collections::HashMap<String, crate::session_wire::WireSession> = {
+            let tracker = self
+                .wire_sessions
+                .lock()
+                .expect("wire sessions lock poisoned");
+            tracker.snapshot(now_ms).into_iter().collect()
+        };
+        session_wire_persist::save(path, &sessions, now_ms)
+    }
+
+    /// Restore wire sessions from `path` into the live table, dropping anything stale
+    /// (older than `ttl_ms`) or past [`session_wire_persist::PERSIST_CAP`].
+    ///
+    /// Existing in-memory sessions win — a session already tracked by a request served
+    /// between boot and this call is fresher than anything on disk, same rule
+    /// [`Self::restore_affinity`] follows for pins. In practice the table is empty here:
+    /// this runs before the listener binds. Returns the store's report so the caller can
+    /// state what was dropped.
+    pub fn restore_wire_sessions(&self, path: &Path, ttl_ms: i64) -> LoadReport {
+        let now_ms = crate::now_ms();
+        let report = session_wire_persist::load(path, now_ms, ttl_ms);
+        if !report.sessions.is_empty() {
+            let mut tracker = self
+                .wire_sessions
+                .lock()
+                .expect("wire sessions lock poisoned");
+            tracker.restore(report.sessions.clone());
+        }
+        report
+    }
 }
 
 #[cfg(test)]
@@ -346,6 +404,128 @@ mod tests {
         assert_eq!(
             snap.wire_sessions_summary.cost_usd, 15.0,
             "the fleet-wide summary sums the same per-session totals"
+        );
+    }
+
+    fn tmp_wire_sessions_path(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-wire-sessions-manager-test-{}-{label}-{}",
+            std::process::id(),
+            crate::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("session-wire.json")
+    }
+
+    /// The Manager-level round trip: a call tracked by one manager, flushed to disk,
+    /// restored by a second (fresh) manager — the restart-survival contract, proven
+    /// through the same `flush_wire_sessions`/`restore_wire_sessions` pair `server.rs`
+    /// wires into boot and the debounced flusher, not by calling
+    /// `session_wire_persist::save`/`load` directly.
+    #[test]
+    fn flush_and_restore_round_trip_through_two_managers() {
+        let path = tmp_wire_sessions_path("round-trip");
+        let now = OffsetDateTime::now_utc();
+
+        let first = Manager::from_runtimes(vec![]);
+        first.record_wire_session(
+            Some("sess-restart"),
+            Some("alice@example.com".to_string()),
+            Some("claude-sonnet-5".to_string()),
+            now,
+            &[ToolUseEvent {
+                id: "tu_1".to_string(),
+                name: Some("Bash".to_string()),
+                command_head: Some("ls".to_string()),
+            }],
+            &[ToolResultEvent {
+                id: "tu_1".to_string(),
+                is_error: false,
+                timed_out: false,
+            }],
+        );
+        let written = first
+            .flush_wire_sessions(&path)
+            .expect("flush to a writable temp path");
+        assert_eq!(written, 1);
+
+        let second = Manager::from_runtimes(vec![]);
+        let report =
+            second.restore_wire_sessions(&path, crate::session_wire_persist::RESTORE_TTL_MS);
+        assert_eq!(report.degraded, None);
+        assert_eq!(report.sessions.len(), 1);
+
+        let snap = second.snapshot(now);
+        assert_eq!(snap.wire_sessions.len(), 1);
+        let row = &snap.wire_sessions[0];
+        assert_eq!(row.session_id, "sess-restart");
+        assert_eq!(row.account.as_deref(), Some("alice@example.com"));
+        assert_eq!(
+            row.tools.calls, 1,
+            "the restored row is indistinguishable from a live one, tool counts included"
+        );
+    }
+
+    /// Restoring must never clobber a session the SECOND manager already tracked
+    /// between its own boot and this call — same "existing wins" rule
+    /// `restore_affinity` follows for pins.
+    #[test]
+    fn restore_does_not_overwrite_an_existing_in_memory_session() {
+        let path = tmp_wire_sessions_path("no-clobber");
+        let now = OffsetDateTime::now_utc();
+
+        let first = Manager::from_runtimes(vec![]);
+        first.record_wire_session(
+            Some("sess-shared"),
+            Some("alice@example.com".to_string()),
+            None,
+            now,
+            &[],
+            &[],
+        );
+        first.flush_wire_sessions(&path).expect("flush");
+
+        let second = Manager::from_runtimes(vec![]);
+        // A request already served on the SECOND manager before restore runs.
+        second.record_wire_session(
+            Some("sess-shared"),
+            Some("bob@example.com".to_string()),
+            None,
+            now,
+            &[],
+            &[],
+        );
+        second.restore_wire_sessions(&path, crate::session_wire_persist::RESTORE_TTL_MS);
+
+        let snap = second.snapshot(now);
+        assert_eq!(snap.wire_sessions.len(), 1);
+        assert_eq!(
+            snap.wire_sessions[0].account.as_deref(),
+            Some("bob@example.com"),
+            "the in-memory value, fresher than the file, must survive the restore"
+        );
+    }
+
+    /// The dirty flag: unset on a fresh manager, set by a call that mutates the wire
+    /// session table, and cleared by consuming it — the same debounce contract the
+    /// flusher task in `server.rs` runs on.
+    #[test]
+    fn wire_sessions_dirty_flag_tracks_mutation_and_clears_on_take() {
+        let manager = Manager::from_runtimes(vec![]);
+        assert!(!manager.take_wire_sessions_dirty());
+
+        manager.record_wire_session(
+            Some("sess-dirty"),
+            None,
+            None,
+            OffsetDateTime::now_utc(),
+            &[],
+            &[],
+        );
+        assert!(manager.take_wire_sessions_dirty());
+        assert!(
+            !manager.take_wire_sessions_dirty(),
+            "a second read without an intervening write finds nothing new"
         );
     }
 }
