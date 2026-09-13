@@ -57,22 +57,45 @@ kernel backlog instead of being refused.
    `proxy-owner-<port>.json`, and connects.
 2. Predecessor stops accepting, and stops every background loop (the existing
    shutdown watch channel already does both).
-3. **Predecessor releases mutation ownership** and from here refuses to refresh
-   a token or persist config, whatever any in-flight request asks of it.
-4. Predecessor flushes affinity pins and persists config, so the successor reads
-   a current file rather than one up to 5 s stale.
+3. Predecessor flushes affinity pins and persists config. This is its **final**
+   write, made while it is still the owner, so the successor reads a current
+   file rather than one up to 5 s stale.
+4. **Predecessor releases mutation ownership.** From here it refuses to refresh
+   a token and refuses to persist config, whatever an in-flight request or its
+   own shutdown path asks of it.
 5. Predecessor sends the listening fd over `SCM_RIGHTS`.
 6. Successor restores pins from the just-flushed file and begins accepting on
    the received fd. It never binds.
 7. Predecessor drains in-flight connections and exits.
 
-Ownership transfers at step 3, before the successor is serving anything. There
-is no instant at which both processes believe they may mutate.
+Ownership transfers at step 4, before the successor is serving anything, so
+there is no instant at which both processes believe they may mutate.
 
-## What enforces step 3
+### Why the order is flush-then-release, and not the reverse
 
-A flag on `Manager`, checked in `ensure_fresh_inner` and on the persist paths.
-Released state is terminal: nothing sets it back.
+Both neighbouring orderings are broken, in opposite directions, which is why
+this is spelled out rather than left to the implementer:
+
+- **Release before the flush** and the final pin and token write never happens.
+  The successor then starts from a stale file, which is the cold-cache cost this
+  whole design exists to avoid.
+- **Never release at all** and the predecessor clobbers the successor.
+  `ServerHandle::shutdown_within` ends by calling `Manager::persist_now`, so the
+  predecessor's ordinary shutdown path fires a config write *during the drain*,
+  after the successor is already serving and rotating its own tokens. That write
+  carries the predecessor's now-stale in-memory copy. It is exactly the
+  "boot-time tokens written back over the fresh ones" failure that
+  `singleton.rs` documents, arriving through a new door.
+
+So the release has to sit strictly between the last write the predecessor is
+entitled to make and the first one the successor will make.
+
+## What enforces step 4
+
+A flag on `Manager`, checked at the single point where each mutation is
+decided: `refresh_plan` (which `ensure_fresh_inner` already returns early on),
+`persist_now`, and `persist_tokens`. Released state is terminal; nothing sets it
+back.
 
 It has to be a flag rather than an assumption, because step 7 is a drain, and a
 draining request can still reach `ensure_fresh` and rotate a single-use token.
@@ -81,7 +104,7 @@ design and it is this check.
 
 ## What the test must catch
 
-Not "the handoff works". The test that matters is the one that fails if step 3
+Not "the handoff works". The test that matters is the one that fails if step 4
 is missing: drive a request through a predecessor that has already handed off,
 and assert no refresh was attempted. Watch it fail against a build with the flag
 removed before trusting it.
