@@ -1,0 +1,10 @@
+[package]
+name = "tcr-fdpass"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+description = "SCM_RIGHTS listening-socket passing, isolated so the main crate keeps #![forbid(unsafe_code)]"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["socket", "uio"] }
