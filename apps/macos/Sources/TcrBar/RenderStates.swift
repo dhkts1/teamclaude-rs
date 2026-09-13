@@ -24,7 +24,7 @@ import TcrBarCore
 ///
 /// ## Usage
 ///
-///     TcrBar.app/Contents/MacOS/TcrBar --render-states /tmp/tcrbar-states
+///     TcrBar.app/Contents/MacOS/TcrBar --render-states <output-directory>
 ///
 /// Writes one PNG per state and exits without ever showing a menu-bar item,
 /// polling `tcr`, or touching a server.
@@ -755,7 +755,7 @@ enum RenderStates {
                     calls: 17_200, errors: 1, timeouts: 0,
                     running: [
                         ToolCall(
-                            tool: "Bash", commandHead: "cargo test --release > /tmp/f1-test.log",
+                            tool: "Bash", commandHead: "cargo test --release > test.log",
                             startedMs: msAgo(4 * 60 + 12)),
                         ToolCall(
                             tool: "Agent",
@@ -765,7 +765,7 @@ enum RenderStates {
                     slowest: [
                         ToolCall(
                             tool: "Bash",
-                            commandHead: "git -C ~/git/henry-plugin push > /tmp/push.log",
+                            commandHead: "git -C ~/src/example push > push.log",
                             endedMs: msAgo(5 * 60), seconds: 47.5)
                     ],
                     overOneMinute: 3,
@@ -801,15 +801,15 @@ enum RenderStates {
                     slowest: [
                         ToolCall(
                             tool: "Bash",
-                            commandHead: "/opt/homebrew/bin/bash /tmp/disk-scan.sh 2>&1 | tee",
+                            commandHead: "/opt/homebrew/bin/bash disk-scan.sh 2>&1 | tee",
                             endedMs: msAgo(11 * 60), seconds: 600.0),
                         ToolCall(
                             tool: "Bash",
-                            commandHead: "bash /tmp/retro-review-wait.sh --until green",
+                            commandHead: "bash retro-review-wait.sh --until green",
                             endedMs: msAgo(23 * 60), seconds: 583.0),
                         ToolCall(
                             tool: "Bash",
-                            commandHead: "until grep -qE \"^(error|warning)\" /tmp/build.log",
+                            commandHead: "until grep -qE \"^(error|warning)\" build.log",
                             endedMs: msAgo(36 * 60), seconds: 556.0),
                         ToolCall(
                             tool: "Bash",
@@ -906,7 +906,7 @@ enum RenderStates {
         // 7d window sits at 98 % reports `near` on BOTH. The fixture used to
         // send `warn`, a token no `tcr` emits: it decoded to `.unknown`, which
         // painted the 98 % bar the unmeasured violet and left the card's pill
-        // reading OK — the very defect `/tmp/parity/delta-list.md` #19 records,
+        // reading OK — the very defect the parity pass was opened to fix,
         // reproduced by the fixture rather than by the panel.
         let solo2 = account(
             "henry5@example.com", quota: "0.98", state: "near",
@@ -958,8 +958,7 @@ enum RenderStates {
     /// session list, because the strip's badges are shared chrome and the
     /// mockup's Accounts panel draws both of them (`Sessions 12`, `Tools 3`).
     /// Rendered from a fleet with no sessions, the two badges vanish and the
-    /// parity comparison silently loses the delta it was meant to prove
-    /// (`/tmp/parity/delta-list.md` #7).
+    /// parity comparison silently loses the delta it was meant to prove.
     ///
     /// ``sessionsFixture``'s five sessions carry all three running tool calls,
     /// so `Tools` reads 3 with no help. `Sessions` needs the mockup's twelve:

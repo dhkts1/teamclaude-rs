@@ -8,25 +8,21 @@ import TcrBarCore
 /// truncate the tail of the sentence instead of flowing it onto a second line,
 /// and the tail is where the money is.
 struct SummaryLine: View {
-    /// One clause of the sentence: a FIGURE and the words around it.
+    /// One clause of the sentence, with its own colour and weight.
     ///
-    /// The sheet weights the number, not the clause (`.sum b{font-weight:600}`
-    /// wraps the digits alone). Bolding "9 ready" whole makes the line read as
-    /// five headings; bolding "9" makes it read as a sentence with five numbers
-    /// in it, which is what it is. Colour belongs to the clause, weight to the
-    /// figure — so ``label`` is drawn at 400 in the SAME tint.
+    /// The clause is the unit, not the number inside it: the mockup's markup is
+    /// `<span class="ok">9 ready</span>`, and `.sum .ok` is the ONLY class in
+    /// the sheet that sets a weight. Measured off the mockup's own render, per
+    /// word: `9` and `ready` both draw a 5 px stem at 2x, while `3`, `near`,
+    /// `limit`, `1` and `unmeasured` all draw 3–4. So `ok` is 600 whole and
+    /// every other clause is 400 in its own colour — the sheet colours what the
+    /// operator can act on and weights only the headline.
     struct Run {
-        /// The digits, at 600.
-        let figure: String
-        /// The words, at 400. Before the figure when ``labelLeads`` (`cache 95%`),
-        /// after it otherwise (`9 ready`, `$41.80 today`).
-        var label: String = ""
-        var labelLeads: Bool = false
+        let text: String
         var tint: Color = Tok.dim
+        var emphasised: Bool = false
 
-        var spoken: String {
-            labelLeads ? "\(label) \(figure)" : "\(figure) \(label)"
-        }
+        var spoken: String { text }
     }
 
     /// One or two lines. The Accounts tab draws two — the capacity breakdown,
@@ -57,24 +53,10 @@ struct SummaryLine: View {
     private func text(for runs: [Run]) -> Text {
         var out = Text("")
         for (index, run) in runs.enumerated() {
-            if index > 0 {
-                out = out + separator
-            }
-            let figure = fragment(run.figure, run.tint, .semibold)
-            guard !run.label.isEmpty else {
-                out = out + figure
-                continue
-            }
-            let label = fragment(run.label, run.tint, .regular)
-            let space = fragment(" ", run.tint, .regular)
-            out =
-                out + (run.labelLeads ? label + space + figure : figure + space + label)
+            if index > 0 { out = out + fragment(" · ", Tok.mute, .regular) }
+            out = out + fragment(run.text, run.tint, run.emphasised ? .semibold : .regular)
         }
         return out
-    }
-
-    private var separator: Text {
-        fragment(" · ", Tok.mute, .regular)
     }
 
     private func fragment(_ text: String, _ tint: Color, _ weight: Font.Weight) -> Text {
@@ -109,31 +91,27 @@ extension SummaryLine {
 
     static func accounts(_ fleet: Fleet) -> SummaryLine {
         var first: [Run] = fleet.sentenceBreakdown.map { tally in
-            Run(figure: "\(tally.count)", label: tally.kind.phrase, tint: tint(tally.kind))
+            Run(
+                text: tally.sentenceLabel, tint: tint(tally.kind),
+                emphasised: tally.kind == .ok)
         }
         if first.isEmpty {
-            first = [
-                Run(figure: fleet.capacitySummary, tint: Tok.color(for: fleet.capacityState))
-            ]
+            first = [Run(text: fleet.capacitySummary, tint: Tok.color(for: fleet.capacityState))]
         }
         var second: [Run] = []
         if fleet.hasUsage {
-            // `dim`, not white: the mockup's money clause is `.nw`, which sets
-            // wrapping and nothing else — `.sum b{color:#fff}` is a rule for the
-            // OTHER two tabs' summaries, where the figure is the subject of the
-            // sentence. Here it is one clause of five.
+            // `dim` at 400: the mockup's money clause is `.nw`, which sets
+            // wrapping and nothing else — `.sum b{color:#fff;font-weight:600}`
+            // is a rule for the OTHER two tabs' summaries, where the figure is
+            // the subject of the sentence. Here it is one clause of five.
+            second.append(Run(text: "\(QuotaFormat.usd(fleet.todayCost)) today"))
             second.append(
-                Run(figure: QuotaFormat.usd(fleet.todayCost), label: "today"))
-            second.append(
-                Run(
-                    figure: QuotaFormat.percent(fleet.todayCacheHitRatio), label: "cache",
-                    labelLeads: true))
+                Run(text: "cache \(QuotaFormat.percent(fleet.todayCacheHitRatio))"))
             if let unpriced = fleet.todayUnpricedRequests, unpriced > 0 {
                 // Kept even though the mockup has no such case: it says the
                 // figure beside it is a FLOOR, and dropping it would make a
                 // partially-priced day read as a measured one.
-                second.append(
-                    Run(figure: "\(unpriced)", label: "unpriced today", tint: Tok.mute))
+                second.append(Run(text: "\(unpriced) unpriced today", tint: Tok.mute))
             }
         }
         return SummaryLine(

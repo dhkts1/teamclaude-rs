@@ -2,12 +2,13 @@ import SwiftUI
 
 /// `.seg` / `.tab` / `.badge` — a real tablist of real buttons.
 ///
-/// Three measured fixes over the pre-v4 strip (`/tmp/parity/delta-list.md` #5,
-/// #6, #7, #8): the selected item carries `rgba(255,255,255,.12)` and a shadow
-/// rather than a .045 wash that read as unselected; the icons draw in a 14 pt box
-/// instead of 23–34 pt of glyph; and the badges are rendered from the same counts
-/// on EVERY tab, including the one you are looking at, so a count never vanishes
-/// because its own tab is open.
+/// Three measured fixes over the pre-v4 strip. The selected item carries
+/// `rgba(255,255,255,.12)` and a shadow, where the old one washed .045 over its
+/// container — +10 per channel against the mockup's +26, faint enough to read as
+/// unselected. The icons draw in a 14 pt box instead of the 23–34 pt of glyph
+/// they had grown to. And the badges render from the same counts on EVERY tab,
+/// including the one being looked at: the old strip drew zero badge pixels on
+/// Accounts while showing both counts on the other two.
 struct SegmentedTabs: View {
     let tabs: [PanelTab]
     let selected: PanelTab

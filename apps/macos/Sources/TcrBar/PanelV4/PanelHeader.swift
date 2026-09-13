@@ -3,9 +3,10 @@ import SwiftUI
 /// `.hdr` — the title and, on the same baseline, how fresh the reading is and
 /// the gear that opens Settings.
 ///
-/// The gear is a real 26 pt button with a fill and a radius, not a bare glyph
-/// (`/tmp/parity/delta-list.md` #3): at 14 pt of unfilled icon it read as
-/// decoration and gave a pointer nothing to aim at.
+/// The gear is a real 26 pt button with a fill and a radius, not a bare glyph.
+/// Measured: the mockup draws a 26×26 pt box, radius 7, fill white .08, with a
+/// 15 pt icon; the pre-v4 header drew 14×14 pt of glyph and no box at all, which
+/// read as decoration and gave a pointer nothing to aim at.
 struct PanelHeader: View {
     let title: String
     /// "updated 4s ago". `nil` before the first poll returns, when there is no

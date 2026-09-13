@@ -3,8 +3,10 @@ import TcrBarCore
 
 /// One account, as the mockup's Accounts panel draws it.
 ///
-/// Two shapes, both cards — the group members are NOT bare rows
-/// (`/tmp/parity/delta-list.md` #22):
+/// Two shapes, both cards — the group members are NOT bare rows. Measured, the
+/// mockup gives each member a card: `rgba(255,255,255,.045)`, radius 8, ~42 pt
+/// tall, 6 pt apart, inset inside the group's 8 pt padding. The pre-v4 panel drew
+/// them as unfilled 29 pt rows whose text started flush against the group stroke.
 ///
 ///  - `.full`: name and pills, the plan line, then one `.q` row per quota window.
 ///  - `.compact`: one row — name, its plan inline in `mute`, and the state pill.

@@ -379,19 +379,17 @@ public enum QuotaFormat {
     }
 
     /// `24677` → `"24,677"` — a plain count, grouped. The Tools tab wrote
-    /// `24677 calls` one line under its own header's `24,677`
-    /// (`/tmp/parity/delta-list.md` #54): the same number, twice, in two
-    /// formats.
+    /// `24677 calls` one line under its own header's `24,677`: the same number,
+    /// twice, in two formats, on one screen.
     public static func count(_ value: Int) -> String {
         grouped(String(value))
     }
 
     /// `1190.4` → `"1,190.4"`: thousands separators on the integer part.
     ///
-    /// The panel wrote `$1190` beside a mockup that writes `$1,190`
-    /// (`/tmp/parity/delta-list.md` #32) — four digits is exactly where an
-    /// amount stops being readable at a glance, and a fleet's weekly spend lives
-    /// there. Grouped here, in the one formatter every currency figure on the
+    /// The panel wrote `$1190` beside a mockup that writes `$1,190` — four
+    /// digits is exactly where an amount stops being readable at a glance, and a
+    /// fleet's weekly spend lives there. Grouped here, in the one formatter every currency figure on the
     /// panel goes through, rather than at the call sites that noticed.
     ///
     /// A literal `,`, not the locale's separator: every other figure this type

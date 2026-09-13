@@ -8,7 +8,8 @@ import SwiftUI
 /// draws, and it draws it in the action row like any other button: the pre-v4
 /// panel gave it a hairline and a strip of its own BELOW the footer text, which
 /// put the most expensive control on the panel in the position a reader scans
-/// last (`/tmp/parity/delta-list.md` #14, #17).
+/// last. The mockup's order is buttons, then the rule, then the footer line; the
+/// old panel had it exactly inverted.
 struct V4Button: View {
     enum Role {
         case normal

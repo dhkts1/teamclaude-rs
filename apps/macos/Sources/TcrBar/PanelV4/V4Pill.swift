@@ -4,8 +4,10 @@ import SwiftUI
 /// the role colour. 10.5 pt / 700 / +0.06em, uppercase, radius 7, padding 2 7.
 ///
 /// The pre-v4 panel filled its pills and drew no border, which is the opposite
-/// construction (`/tmp/parity/delta-list.md` #20) and reads as a chip rather than
-/// a state. The role colours come from the gated palette, never from a group's
+/// construction and reads as a chip rather than a state: measured, the mockup's
+/// pill interiors are exactly the card fill (37,37,40) for ROTATING, OK, NEAR and
+/// UNMEASURED alike, while the old panel painted each a different opaque colour.
+/// The role colours come from the gated palette, never from a group's
 /// identity colour — the sheet is explicit that group colour is "outline and
 /// legend only, never status".
 struct V4Pill: View {

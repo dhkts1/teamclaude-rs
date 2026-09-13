@@ -4,9 +4,9 @@ import TcrBarCore
 /// The Accounts tab, in the mockup's own DOM order: the loose cards first, then
 /// one `.grp` box per named group, then the tab's action row.
 ///
-/// The order is the one delta the sheet and the shipping panel disagreed about
-/// (`/tmp/parity/delta-list.md` #26): the panel drew its groups first and the
-/// ungrouped pile between them. Loose cards lead here — they are the accounts
+/// The order is the one delta the sheet and the shipping panel disagreed about:
+/// the mockup runs loose cards, then the parked group, then the collapsed one,
+/// while the panel drew its groups first and the ungrouped pile between them. Loose cards lead here — they are the accounts
 /// that answer "what can serve right now" with no label to read first.
 ///
 /// Then the groups, in ``Fleet/sectionsInDisplayOrder(pinning:)``'s order

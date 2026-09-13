@@ -89,8 +89,8 @@ enum V4 {
     /// padding, and it is the session block's. A card's rows have none: their
     /// height is their line box and nothing else, which is what
     /// ``lineHeight(_:)`` supplies. Measured: padding the card's rows as well
-    /// made every account card 3 pt tall per row — a parked card 47 pt against
-    /// the mockup's 43 (`/tmp/parity/rows.py`).
+    /// made every account card 3 pt tall per row — a parked card measured 47 pt
+    /// against the mockup's 43.
     static let sessRowPaddingV: CGFloat = 4
 
     // MARK: - Quota grid (`.q`)

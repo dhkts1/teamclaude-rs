@@ -222,9 +222,10 @@ struct FleetView: View {
     }
 
     /// A badge per tab, from the same counts on EVERY tab — including the one
-    /// being looked at, which the pre-v4 strip dropped (`/tmp/parity/
-    /// delta-list.md` #7). Accounts carries none: the mockup gives it none
-    /// either, and the summary line directly above already counts the fleet.
+    /// being looked at, which the pre-v4 strip dropped: it drew zero badge
+    /// pixels on Accounts while showing both counts on Sessions and Tools.
+    /// Accounts itself carries no count of its own; the summary line directly
+    /// above it already counts the fleet.
     private var v4Badges: [PanelTab: Int] {
         guard case .loaded(let fleet) = poller.state else { return [:] }
         var out: [PanelTab: Int] = [:]
@@ -343,8 +344,7 @@ struct FleetView: View {
     }
 
     /// Where this tab's numbers come from — the mockup gives each tab its own
-    /// provenance line rather than repeating one global block
-    /// (`/tmp/parity/delta-list.md` #16).
+    /// provenance line rather than repeating one global block on all three.
     private var v4FooterLeading: String {
         switch selectedTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
@@ -970,7 +970,7 @@ struct FleetView: View {
                     }
                 }
                 // `repo · model` drops to its own line when a sparkline occupies
-                // the right of the row (`/tmp/parity/delta-list.md` #40). Kept
+                // the right of the row, as the mockup wraps it. Kept
                 // inline, it competes with a 64 pt sparkline for the same width
                 // and the SESSION NAME is what loses — "teamclau…".
                 DimText(text: sessionSubtitle(row))

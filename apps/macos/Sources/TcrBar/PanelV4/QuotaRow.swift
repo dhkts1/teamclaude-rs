@@ -5,7 +5,7 @@ import TcrBarCore
 /// a 40 pt right-aligned percentage, then the reset caption.
 ///
 /// Three things here are the fix for a measured defect rather than a
-/// transcription (`/tmp/parity/delta-list.md` #18, #19, #28, #29):
+/// transcription:
 ///
 ///  - The bar is the grid's `1fr` column, so it FILLS the row (170 pt on this
 ///    panel). The pre-v4 bar was a fixed 72 pt, which made a 98 % window and a

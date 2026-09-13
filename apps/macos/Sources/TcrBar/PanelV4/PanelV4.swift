@@ -12,10 +12,12 @@ import TcrBarCore
 /// the views they already had (Gil, 2026-09-13: "i think just accounts need
 /// fixing … the others i think ours look better").
 ///
-/// The corner, the border and the top edge are the shared-chrome fix
-/// (`/tmp/parity/delta-list.md` #1): every earlier round drew a square panel with
-/// no border at all, which is the single largest block of wrong pixels on all
-/// three tabs and is drawn once, here, for all of them.
+/// The corner, the border and the top edge are the shared-chrome fix. Measured
+/// against the approved mockup: its corner rounds over 18 pt, row y=0 is the
+/// `rgba(255,255,255,.18)` top edge and a 1 pt `line` border runs the perimeter,
+/// while every earlier round of this panel had pixel (0,0) already at panel fill
+/// — radius 0, no border, no top edge. It is the single largest block of wrong
+/// pixels on all three tabs, and it is drawn once, here, for all of them.
 struct PanelV4<Summary: View, Content: View, Footer: View>: View {
     var title: String = "tcr fleet"
     /// "updated 4s ago", or `nil` before the first poll lands.

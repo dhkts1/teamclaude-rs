@@ -3,10 +3,10 @@ import SwiftUI
 /// `.card` — the panel's one box: `rgba(255,255,255,.045)` fill, a 1 pt
 /// `line` border, radius 8, padding 10 12.
 ///
-/// The border is a full 1 pt, not the half-point hairline the pre-v4 panel drew:
-/// measured against the mockup, the old one was half the width at nearly three
-/// times the alpha (`/tmp/parity/delta-list.md` #11), which reads as a drawn
-/// outline rather than the seam the sheet asks for.
+/// The border is a full 1 pt, not the half-point hairline the pre-v4 panel drew.
+/// Measured against the mockup: card border 1 pt at alpha .09 there, 0.5 pt at
+/// alpha .24 here — half the width at nearly three times the alpha, which reads
+/// as a drawn outline rather than the seam the sheet asks for.
 struct V4Card<Content: View>: View {
     @ViewBuilder var content: () -> Content
 

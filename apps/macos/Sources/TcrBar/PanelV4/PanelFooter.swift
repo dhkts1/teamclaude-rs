@@ -3,10 +3,11 @@ import SwiftUI
 /// `.foot` — the provenance line: a 1 pt top rule, 10 pt above it, 8 pt below,
 /// and 12.5 pt `mute` text with one fact on each end.
 ///
-/// Per TAB, not global (`/tmp/parity/delta-list.md` #16): the mockup gives the
-/// Sessions panel "proxy + ~/.claude/sessions" and the Tools panel "from request
-/// bodies only · nothing logged", because where a number came from is the one
-/// thing a footer can say that the rows above it cannot.
+/// Per TAB, not global: the mockup gives the Sessions panel "proxy +
+/// ~/.claude/sessions" and the Tools panel "from request bodies only · nothing
+/// logged", because where a number came from is the one thing a footer can say
+/// that the rows above it cannot. The pre-v4 panel repeated one identical block
+/// — the action row, the server line and the danger button — on all three tabs.
 struct PanelFooter<Extras: View>: View {
     let leading: String
     var leadingSystemImage: String?
