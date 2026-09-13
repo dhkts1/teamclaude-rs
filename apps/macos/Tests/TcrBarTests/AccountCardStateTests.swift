@@ -66,6 +66,19 @@ final class AccountCardStateTests: XCTestCase {
         XCTAssertNil(stateAccount("frank@example.com", disabled: true).rotationLabel)
     }
 
+    /// The card drops `.rotating` on a compact row — the group box's legend
+    /// carries that context once for every member — and keeps `.groupOnly`,
+    /// which the legend never says. Suppressing both left `01-healthy`'s
+    /// reserved `research` member with no word for the state at all.
+    func testTheTwoRotationStatesAreDistinguishableWithoutReadingTheirWords() {
+        let reserved = stateAccount(
+            "gwen@example.com", groups: ["research"], reservedGroups: ["research"])
+        XCTAssertEqual(reserved.rotation, .groupOnly)
+        XCTAssertEqual(stateAccount("hal@example.com").rotation, .rotating)
+        XCTAssertEqual(RotationState.rotating.label, "Rotating")
+        XCTAssertEqual(RotationState.groupOnly.label, "Group only")
+    }
+
     // MARK: - The state pill (review #7, #8)
 
     func testAParkedGroupMemberIsParkedNotOK() {

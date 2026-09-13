@@ -32,7 +32,7 @@ struct AccountCard: View {
                 nameRow
             } trailing: {
                 HStack(spacing: V4.pillGap) {
-                    if shape == .full, let rotation = account.rotationLabel {
+                    if let rotation = rotationPillText {
                         V4Pill(text: rotation)
                     }
                     V4Pill(text: statePillText, role: statePillRole)
@@ -80,12 +80,25 @@ struct AccountCard: View {
     }
 
     /// `Rotating` / `Group only` — ``Account/rotationLabel``, and nothing
-    /// re-derived here. Suppressed on a compact card: every row inside a parked
-    /// group is out of rotation and the legend says so once for all of them.
+    /// re-derived here.
     ///
     /// It used to be `!disabled && !isParkedByGroup && !isRejected`, which
     /// missed the dead-credential case entirely — a card read ROTATING beside
     /// NEEDS RE-LOGIN — and had no word for a reserved account at all.
+    ///
+    /// `"Rotating"` alone is dropped on a compact card, and `"Group only"` is
+    /// not. A compact card is a card inside a group box, and what that box's
+    /// legend says once for all of its members is whether the GROUP is parked —
+    /// so repeating "rotating" per row is noise. It says nothing about the
+    /// group being RESERVED, which is what "Group only" reports, and suppressing
+    /// both left the one account the word describes with no word at all: the
+    /// `research` group in `01-healthy` is reserved, and its member's card drew
+    /// an unqualified OK.
+    private var rotationPillText: String? {
+        guard let rotation = account.rotation else { return nil }
+        if shape == .compact, rotation == .rotating { return nil }
+        return rotation.label
+    }
     private var kind: FleetTally.Kind {
         FleetTally.Kind(account: account)
     }

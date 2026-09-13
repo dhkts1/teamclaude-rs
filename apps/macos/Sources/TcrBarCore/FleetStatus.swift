@@ -1918,11 +1918,35 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     /// Lives on the model rather than in the card so the two panels cannot
     /// drift into two different ladders, and so the rule is testable without
     /// standing up SwiftUI.
-    public var rotationLabel: String? {
+    ///
+    /// A case, not the word: the card suppresses one of the two on a compact
+    /// row, and deciding that by comparing against the string it is about to
+    /// draw would break the moment the word changed.
+    public var rotation: RotationState? {
         if disabled || isParkedByGroup { return nil }
         if health == .needsRelogin || isRejected { return nil }
-        if servesGroupTrafficOnly { return "Group only" }
-        return "Rotating"
+        if servesGroupTrafficOnly { return .groupOnly }
+        return .rotating
+    }
+
+    /// What the pool-membership pill says, or `nil` when it draws none.
+    public var rotationLabel: String? { rotation?.label }
+}
+
+/// What ``Account/rotation`` found: the two things a pool-membership pill is
+/// ever allowed to claim.
+public enum RotationState: Equatable, Sendable {
+    /// The pool is sending this account traffic right now.
+    case rotating
+    /// Reserved: it serves requests that ask for its group, and no pool
+    /// traffic at all. ``Account/servesGroupTrafficOnly``.
+    case groupOnly
+
+    public var label: String {
+        switch self {
+        case .rotating: return "Rotating"
+        case .groupOnly: return "Group only"
+        }
     }
 }
 
