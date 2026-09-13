@@ -243,8 +243,16 @@ public enum ProcessStats {
 /// a test reads them without a live process, the same split
 /// ``ToolCallLabel`` makes for the duration pill.
 public enum ProcessStatsLabel {
-    /// `" · 640% cpu · 2.1 GB"`, or `" · 2.1 GB"` on the first poll, or `""`
-    /// for a call with no matched process at all.
+    /// `" · 640% · 2.1 GB"`, or `" · 2.1 GB"` on the first poll, or `""` for a
+    /// call with no matched process at all.
+    ///
+    /// The word `cpu` is NOT here (Gil, 2026-09-14, ruling on the first
+    /// render of this row): it cost about 24 pt of a 372 pt line, and the line
+    /// paid for it by truncating the session name to `teamcla…`. The session
+    /// name is the row's distinguishing text and must not give ground to a
+    /// unit word. `640%` is unambiguous beside a memory figure in gigabytes,
+    /// and the unit is spelled out in full on hover
+    /// (``hover(_:tool:)``) for anyone who wants it.
     ///
     /// Leading separator included: this lands directly after the row's
     /// `· Bash`, and a caller assembling the `·` itself is a second place for
@@ -253,15 +261,23 @@ public enum ProcessStatsLabel {
         guard let stats else { return "" }
         let memory = " · \(gigabytes(stats.residentBytes)) GB"
         guard let percent = stats.cpuPercent else { return memory }
-        return " · \(Int(percent.rounded()))% cpu\(memory)"
+        return " · \(Int(percent.rounded()))%\(memory)"
     }
 
-    /// `"pid 48765 · Bash"` — the row's hover text, and its spoken value.
-    /// `nil` when nothing matched: an empty tooltip is a tooltip that opens
-    /// on an empty box.
+    /// `"pid 48765 · Bash · 640% cpu"` — the row's hover text, and its spoken
+    /// value. `nil` when nothing matched: an empty tooltip is a tooltip that
+    /// opens on an empty box.
+    ///
+    /// This is where the unit the printed line drops (see ``clause(_:)``) is
+    /// said in full, along with the tool word the clause replaces. Hover and
+    /// VoiceOver have no width budget, so the two facts a scanning reader does
+    /// not need — which pid, and what the percentage counts — live here rather
+    /// than in the line.
     public static func hover(_ stats: RunningCallStats?, tool: String) -> String? {
         guard let stats else { return nil }
-        return "pid \(stats.pid) · \(tool)"
+        let identity = "pid \(stats.pid) · \(tool)"
+        guard let percent = stats.cpuPercent else { return identity }
+        return "\(identity) · \(Int(percent.rounded()))% cpu"
     }
 
     /// The ✕'s accessibility label: `"Kill cargo test --release"`.

@@ -155,7 +155,7 @@ struct FleetView: View {
     @State private var machine: MachineStats?
 
     /// What each RUNNING Bash call's process tree is costing, keyed by
-    /// ``SessionToolEntry/id`` — the row's `640% cpu · 2.1 GB`, and the pid
+    /// ``SessionToolEntry/id`` — the row's `640% · 2.1 GB`, and the pid
     /// its ✕ would signal. Empty for every call this build could not match a
     /// process to, which is the state that draws neither figure nor button.
     ///
@@ -1945,34 +1945,29 @@ struct FleetView: View {
         VStack(alignment: .leading, spacing: 0) {
             V4Row {
                 HStack(spacing: 0) {
-                    // The PRIORITY swaps when there is a measurement to draw.
-                    //
-                    // Line 1 is `session · Bash` everywhere else, and the name
-                    // wins the width. On a matched running row it is
-                    // `session · 640% cpu · 2.1 GB` against a ring, an elapsed
-                    // time and a ✕, and 372 pt does not hold both in full: the
-                    // first render of this row drew `teamclaude-rs-c7 · Bash ·
-                    // 6…` and lost the whole figure. So the MEASUREMENT keeps
-                    // its width and the session name ellipsises — the name is
-                    // repeated on every other row of the tab and spoken in
-                    // full by VoiceOver, while the figure is stated nowhere
-                    // else and is the reason the row is being read.
+                    // The NAME keeps the width, on every row, measurement or
+                    // not (Gil, 2026-09-14, ruling on the first render of this
+                    // row): it is the row's distinguishing text and the one
+                    // string a reader scans for. The first attempt let it
+                    // ellipsise to `teamcla…` so that ` · 640% cpu · 2.1 GB`
+                    // could be drawn whole; the fix was to spend the ~24 pt
+                    // the word `cpu` cost instead — see
+                    // ``ProcessStatsLabel/clause(_:)``.
                     NameText(text: toolCallOwnerName(entry.sessionId))
-                        .layoutPriority(meta.isEmpty ? 1 : 0)
-                    // ` · Bash`, REPLACED by ` · 640% cpu · 2.1 GB` once a
-                    // process is matched. The tool word goes rather than the
-                    // figure because this row's tool is already said by the
-                    // ring (only a Bash call has one), by the ✕ (only a Bash
-                    // call can be killed) and by the hover text, which is
-                    // `pid 48765 · Bash` — the pid being what you check after
-                    // deciding, not while scanning.
+                        .layoutPriority(1)
+                    // ` · Bash`, REPLACED by ` · 640% · 2.1 GB` once a process
+                    // is matched. The tool word goes rather than the figure
+                    // because this row's tool is already said by the ring
+                    // (only a Bash call has one), by the ✕ (only a Bash call
+                    // can be killed) and by the hover text, which is
+                    // `pid 48765 · Bash · 640% cpu` — the pid and the unit
+                    // being what you check after deciding, not while scanning.
                     //
                     // `meta` is empty for every other row and for a call no
                     // process matched: this panel draws a figure it measured
                     // or it draws nothing, and inventing one to fill a slot is
                     // the one thing a panel about trust cannot do.
                     MuteText(text: meta.isEmpty ? " · \(entry.call.tool)" : meta)
-                        .layoutPriority(meta.isEmpty ? 0 : 1)
                         .help(metaHover ?? "")
                         .accessibilityValue(metaHover ?? "")
                 }

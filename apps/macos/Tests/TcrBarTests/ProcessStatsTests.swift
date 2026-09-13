@@ -165,8 +165,12 @@ final class ProcessStatsTests: XCTestCase {
         let stats = RunningCallStats(
             pid: 48765, processGroup: 48765, cpuSeconds: 16.4,
             residentBytes: 2_254_857_830, cpuPercent: 640, readAt: callStart)
-        XCTAssertEqual(ProcessStatsLabel.clause(stats), " · 640% cpu · 2.1 GB")
-        XCTAssertEqual(ProcessStatsLabel.hover(stats, tool: "Bash"), "pid 48765 · Bash")
+        // No `cpu` in the LINE (Gil, 2026-09-14: the session name must not
+        // truncate to pay for a unit word) and the unit in full on HOVER,
+        // which has no width budget.
+        XCTAssertEqual(ProcessStatsLabel.clause(stats), " · 640% · 2.1 GB")
+        XCTAssertEqual(
+            ProcessStatsLabel.hover(stats, tool: "Bash"), "pid 48765 · Bash · 640% cpu")
     }
 
     /// The first poll shows memory only — there is no rate yet — and a call
@@ -177,6 +181,9 @@ final class ProcessStatsTests: XCTestCase {
             pid: 48765, processGroup: 48765, cpuSeconds: 16.4,
             residentBytes: 2_254_857_830, cpuPercent: nil, readAt: callStart)
         XCTAssertEqual(ProcessStatsLabel.clause(firstPoll), " · 2.1 GB")
+        // Hover drops the rate it has not measured too, rather than saying
+        // "0% cpu" about a process nobody has watched yet.
+        XCTAssertEqual(ProcessStatsLabel.hover(firstPoll, tool: "Bash"), "pid 48765 · Bash")
         XCTAssertEqual(ProcessStatsLabel.clause(nil), "")
         XCTAssertNil(ProcessStatsLabel.hover(nil, tool: "Bash"))
     }
