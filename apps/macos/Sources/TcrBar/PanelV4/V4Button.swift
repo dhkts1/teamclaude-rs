@@ -2,8 +2,35 @@ import SwiftUI
 
 /// `.btn` — a real control: 13 pt label on `rgba(255,255,255,.10)`, a `line`
 /// border, radius 7, min-height 28, padding 5 11.
+///
+/// `.btn.danger` is the sheet's own second variant — `color:var(--bad)` with a
+/// `rgba(239,107,107,.38)` border. "Take over port…" is the only one the panel
+/// draws, and it draws it in the action row like any other button: the pre-v4
+/// panel gave it a hairline and a strip of its own BELOW the footer text, which
+/// put the most expensive control on the panel in the position a reader scans
+/// last (`/tmp/parity/delta-list.md` #14, #17).
 struct V4Button: View {
+    enum Role {
+        case normal
+        case danger
+
+        var tint: Color {
+            switch self {
+            case .normal: return Tok.ink
+            case .danger: return Tok.spent
+            }
+        }
+
+        var border: Color {
+            switch self {
+            case .normal: return Tok.cardLine
+            case .danger: return Tok.spent.opacity(V4.dangerBorderAlpha)
+            }
+        }
+    }
+
     let title: String
+    var role: Role = .normal
     var help: String?
     let action: () -> Void
 
@@ -11,10 +38,11 @@ struct V4Button: View {
         Button(action: action) {
             Text(title)
                 .font(V4.font(V4.buttonFontSize))
-                .foregroundStyle(Tok.ink)
+                .foregroundStyle(role.tint)
                 .lineLimit(1)
-                .padding(.vertical, V4.buttonPaddingV)
-                .padding(.horizontal, V4.buttonPaddingH)
+                .frame(minHeight: V4.lineHeight(V4.buttonFontSize))
+                .padding(.vertical, V4.buttonInsetV)
+                .padding(.horizontal, V4.buttonInsetH)
                 .frame(minHeight: V4.buttonMinHeight)
                 .background(
                     RoundedRectangle(cornerRadius: V4.buttonRadius)
@@ -22,7 +50,7 @@ struct V4Button: View {
                 )
                 .overlay(
                     RoundedRectangle(cornerRadius: V4.buttonRadius)
-                        .strokeBorder(Tok.cardLine, lineWidth: V4.panelBorderWidth)
+                        .strokeBorder(role.border, lineWidth: V4.panelBorderWidth)
                 )
         }
         .buttonStyle(V4PressStyle())
@@ -49,9 +77,9 @@ struct V4Disclosure: View {
                     .lineLimit(1)
             }
             .foregroundStyle(Tok.dim)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, V4.discPaddingV)
-            .padding(.horizontal, V4.discPaddingH)
+            .frame(maxWidth: .infinity, minHeight: V4.lineHeight(V4.discFontSize))
+            .padding(.vertical, V4.discInsetV)
+            .padding(.horizontal, V4.discInsetH)
             .frame(minHeight: V4.buttonMinHeight)
             .overlay(
                 RoundedRectangle(cornerRadius: V4.discRadius)

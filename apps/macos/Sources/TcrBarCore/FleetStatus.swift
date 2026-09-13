@@ -375,7 +375,34 @@ public enum QuotaFormat {
             printedMagnitude: { decimals, magnitude in
                 Double(String(format: "%.\(decimals)f", magnitude)) ?? magnitude
             })
-        return "$" + String(format: "%.\(decimals)f", value)
+        return "$" + grouped(String(format: "%.\(decimals)f", value))
+    }
+
+    /// `1190.4` → `"1,190.4"`: thousands separators on the integer part.
+    ///
+    /// The panel wrote `$1190` beside a mockup that writes `$1,190`
+    /// (`/tmp/parity/delta-list.md` #32) — four digits is exactly where an
+    /// amount stops being readable at a glance, and a fleet's weekly spend lives
+    /// there. Grouped here, in the one formatter every currency figure on the
+    /// panel goes through, rather than at the call sites that noticed.
+    ///
+    /// A literal `,`, not the locale's separator: every other figure this type
+    /// prints is built with `String(format:)` and a `.` decimal point, so a
+    /// locale-aware separator here would produce `1.190,4` in one half of the
+    /// same line and `2.1s` in the other.
+    static func grouped(_ formatted: String) -> String {
+        let negative = formatted.hasPrefix("-")
+        let body = negative ? String(formatted.dropFirst()) : formatted
+        let parts = body.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let integer = parts.first, integer.count > 3 else { return formatted }
+        var digits: [Character] = []
+        for (offset, character) in integer.reversed().enumerated() {
+            if offset > 0, offset % 3 == 0 { digits.append(",") }
+            digits.append(character)
+        }
+        let head = String(digits.reversed())
+        let tail = parts.count > 1 ? "." + parts[1] : ""
+        return (negative ? "-" : "") + head + tail
     }
 
     private static func usdDecimals(for magnitude: Double) -> Int {
@@ -2006,6 +2033,27 @@ public struct FleetTally: Equatable, Sendable {
             }
         }
 
+        /// The same bucket as a WORD, for the summary sentence: `9 ready`,
+        /// `3 near limit`, `1 unmeasured`.
+        ///
+        /// Not ``token``, and not a rename of it: the panel says both, in two
+        /// registers the mockup uses side by side. A pill inside a group is
+        /// `5 OK` — three characters beside five other pills — while the
+        /// sentence under the title is prose and has to survive being read out
+        /// loud, where "ok" and "near" say less than "ready" and "near limit".
+        /// `token` is also what a test and the pre-v4 panel assert on.
+        public var phrase: String {
+            switch self {
+            case .ok: return "ready"
+            case .near: return "near limit"
+            case .spent: return "spent"
+            case .unknown: return "unknown"
+            case .needsRelogin: return "need re-login"
+            case .unmeasured: return "unmeasured"
+            case .disabled: return "parked"
+            }
+        }
+
         /// The bucket an *enabled* account's quota state falls into.
         init(quotaState: QuotaState) {
             switch quotaState {
@@ -2044,8 +2092,11 @@ public struct FleetTally: Equatable, Sendable {
         self.count = count
     }
 
-    /// `"7 spent"`.
+    /// `"7 spent"` — the pill form, inside a group's tally row.
     public var label: String { "\(count) \(kind.token)" }
+
+    /// `"9 ready"` — the sentence form, for the summary line under the title.
+    public var sentenceLabel: String { "\(count) \(kind.phrase)" }
 }
 
 /// The decoded fleet, plus the facts that are properties of the *fetch* rather
@@ -2494,6 +2545,32 @@ public struct Fleet: Equatable, Sendable {
         counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
             .ok, .near, .spent, .unknown, .disabled,
+        ]
+        return order.compactMap { kind in
+            guard let count = counts[kind], count > 0 else { return nil }
+            return FleetTally(kind: kind, count: count)
+        }
+    }
+
+    /// Every bucket, in the same severity order and with NOTHING omitted — the
+    /// list the v4 summary line draws.
+    ///
+    /// ``breakdown`` drops `.unmeasured` and `.needsRelogin` because the pre-v4
+    /// header prints ``capacitySummary`` immediately before it and that sentence
+    /// already names them; printing them twice was a real defect. The v4 panel
+    /// has no such second clause — its summary line IS the breakdown — so the
+    /// same omission silently deletes an account from the count: a fleet of
+    /// thirteen read "9 ready · 3 near limit" and the reader was left to notice
+    /// the missing one. Two surfaces, two lists, one place each.
+    public var sentenceBreakdown: [FleetTally] {
+        let disabledCount = accounts.count - enabledCount
+        var counts: [FleetTally.Kind: Int] = [:]
+        for account in enabledAccounts {
+            counts[FleetTally.Kind(account: account), default: 0] += 1
+        }
+        counts[.disabled] = disabledCount
+        let order: [FleetTally.Kind] = [
+            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }

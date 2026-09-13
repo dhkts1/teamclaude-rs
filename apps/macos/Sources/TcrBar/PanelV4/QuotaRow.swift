@@ -12,15 +12,21 @@ import TcrBarCore
 ///    30 % one look like similar amounts of ink.
 ///  - The percentage sits in its own fixed 40 pt column, right-aligned, so two
 ///    windows' digits line up and every `resets …` starts at one x.
-///  - The fill is a STATUS colour chosen from the reading (`ok` / `warn` at the
-///    near threshold / `bad` over it) and never the enclosing group's identity
-///    colour. A 98 % window used to draw in its group's violet beside an OK pill.
+///  - The fill is a STATUS colour, taken from the window's own state
+///    (`ok` / `warn` at the server's near threshold / `bad` over it) and never
+///    from the enclosing group's identity colour. A 98 % window used to draw in
+///    its group's violet beside an OK pill.
 struct QuotaRow: View {
     let label: String
     /// `nil` is an unmeasured window: an explicit empty track, never a zero-width
     /// fill, because a zero reading and an absent one mean opposite things.
     let value: Double?
-    let state: QuotaState?
+    /// What the bar's colour is allowed to be read from —
+    /// ``Account/quotaBarTintSource(for:)`` and nothing else. That function is
+    /// the one place that knows "no reading" and "old server, borrow the
+    /// composite state" are different facts; re-deriving it here from
+    /// `fiveHourState ?? quotaState` is the exact bug its doc-comment records.
+    let tint: QuotaBarTintSource
     let resetAtMs: Int64?
     let now: Date
 
@@ -31,15 +37,19 @@ struct QuotaRow: View {
         }
     }
 
-    /// The window's own state when the server sent one, else the reading's own
-    /// band. Never the account's overall `quotaState`: a healthy account can hold
-    /// one spent window, which is the row this bar exists to show.
+    /// The window's own state, or `nil` when there is nothing to state.
+    ///
+    /// `.unknown` is a token THIS build cannot name, not a missing reading: the
+    /// panel has no copy of the server's near-limit threshold, so it may not
+    /// invent a band for it. It draws the sheet's own `.bar i.neutral` grey.
+    /// What it must never do is what the first v4 render did — fall through to
+    /// the `unmeasured` violet and paint a 98 % window the same colour as an
+    /// account nothing has ever measured.
     private var role: QuotaState? {
-        if let state { return state }
-        guard let value else { return nil }
-        if value >= 0.95 { return .spent }
-        if value >= 0.80 { return .near }
-        return .ok
+        switch tint {
+        case .unmeasured: return nil
+        case .state(let state): return state
+        }
     }
 
     private var fillTint: Color {
@@ -47,7 +57,8 @@ struct QuotaRow: View {
         case .some(.near): return Tok.near
         case .some(.spent): return Tok.spent
         case .some(.ok): return Tok.ok
-        case .some(.unknown), .none: return Tok.unmeasured
+        case .some(.unknown): return Tok.mute
+        case .none: return Tok.unmeasured
         }
     }
 
@@ -56,7 +67,8 @@ struct QuotaRow: View {
     /// in the other.
     private var captionTint: Color {
         switch role {
-        case .some(.near), .some(.spent): return Tok.near
+        case .some(.near): return Tok.near
+        case .some(.spent): return Tok.spent
         default: return Tok.mute
         }
     }
@@ -88,6 +100,7 @@ struct QuotaRow: View {
                     .fixedSize()
             }
         }
+        .frame(minHeight: V4.lineHeight(V4.dimSize))
         .padding(.top, V4.quotaMarginTop)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(label) window, \(QuotaFormat.percent(value)) used")

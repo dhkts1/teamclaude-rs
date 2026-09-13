@@ -75,10 +75,22 @@ enum V4 {
     static let cardPaddingH: CGFloat = 12
     /// `.card{margin:14px 0}` — adjacent cards collapse to one 14 pt gap.
     static let cardGap: CGFloat = 14
-    /// `.row{padding:4px 0}` — so two adjacent rows sit 8 pt apart.
-    static let rowPaddingV: CGFloat = 4
+    /// Padding PLUS the border, which is what `box-sizing:border-box` charges a
+    /// CSS box for and what a SwiftUI `strokeBorder` overlay does not: the
+    /// overlay takes no layout at all, so a card padded by the CSS figure alone
+    /// draws 2 pt shorter and 2 pt narrower than the same card in the browser.
+    /// Measured on the first v4 render: 41 pt against the mockup's 43.
+    static var cardInsetV: CGFloat { cardPaddingV + panelBorderWidth }
+    static var cardInsetH: CGFloat { cardPaddingH + panelBorderWidth }
     /// The flex gap inside a `.row`.
     static let rowGap: CGFloat = 8
+    /// `.sess .row{padding:4px 0}` — the ONLY `.row` in the sheet with vertical
+    /// padding, and it is the session block's. A card's rows have none: their
+    /// height is their line box and nothing else, which is what
+    /// ``lineHeight(_:)`` supplies. Measured: padding the card's rows as well
+    /// made every account card 3 pt tall per row — a parked card 47 pt against
+    /// the mockup's 43 (`/tmp/parity/rows.py`).
+    static let sessRowPaddingV: CGFloat = 4
 
     // MARK: - Quota grid (`.q`)
 
@@ -152,6 +164,8 @@ enum V4 {
     static let groupPaddingTop: CGFloat = 12
     static let groupPaddingSide: CGFloat = 8
     static let groupPaddingBottom: CGFloat = 4
+    /// `.grp.collapsed{padding-bottom:8px}`.
+    static let groupPaddingBottomCollapsed: CGFloat = 8
     static let groupMarginTop: CGFloat = 20
     static let groupMarginBottom: CGFloat = 8
     static let groupRadius: CGFloat = 16
@@ -160,7 +174,14 @@ enum V4 {
     static let groupCardGap: CGFloat = 6
     /// The legend sits at `top:-7px; left:calc(var(--n0) + 4px)` with `--n0:10px`,
     /// and the stroke is masked out for a 9 px band behind it.
-    static let legendOffsetY: CGFloat = -7
+    ///
+    /// The legend is NOT offset by a constant: `top:-7px` is the CSS's way of
+    /// writing "centre an 11 pt line box on the 1.5 pt stroke" (a 15.4 pt line
+    /// box lifted 7 pt sits 0.7 pt below the edge, i.e. centred), and a SwiftUI
+    /// label whose height is its own text metrics is a different number.
+    /// ``GroupBox`` lifts it by half its MEASURED height instead, which is the
+    /// same intent and survives a font change; the constant put the legend
+    /// 1.75 pt high on the first render.
     static let legendNotchStart: CGFloat = 10
     static let legendNotchPadding: CGFloat = 4
     static let legendMaskBand: CGFloat = 9
@@ -175,9 +196,14 @@ enum V4 {
     static let buttonMinHeight: CGFloat = 28
     static let buttonPaddingV: CGFloat = 5
     static let buttonPaddingH: CGFloat = 11
+    /// The border again (see ``cardInsetV``).
+    static var buttonInsetV: CGFloat { buttonPaddingV + panelBorderWidth }
+    static var buttonInsetH: CGFloat { buttonPaddingH + panelBorderWidth }
     static let buttonFillAlpha: Double = 0.10
     static let buttonFontSize: CGFloat = 13
     static let buttonGap: CGFloat = 8
+    /// `.btn.danger{border-color:rgba(239,107,107,.38)}`.
+    static let dangerBorderAlpha: Double = 0.38
     /// `.more` — the disclosure control: full width, 12.5 pt/600, its own 6 pt
     /// top margin and a 12 pt chevron.
     static let discFontSize: CGFloat = 12.5
@@ -186,6 +212,8 @@ enum V4 {
     static let discRadius: CGFloat = 8
     static let discPaddingV: CGFloat = 5
     static let discPaddingH: CGFloat = 10
+    static var discInsetV: CGFloat { discPaddingV + panelBorderWidth }
+    static var discInsetH: CGFloat { discPaddingH + panelBorderWidth }
     /// `.aside` — "3 accounts have no sessions".
     static let asideFontSize: CGFloat = 12
     static let asidePaddingTop: CGFloat = 6
@@ -232,6 +260,41 @@ enum V4 {
     /// value is kept beside `trend` only so the sheet's own two extra roles are
     /// both named in one place.
     static let info = Color(red: 0x6a / 255, green: 0xa9 / 255, blue: 0xff / 255)
+
+    // MARK: - Line boxes
+
+    /// `body{font:15px/1.4}` — the mockup's ONE line-height, inherited by every
+    /// line on the panel.
+    ///
+    /// This is the number eleven adaptation rounds did not have. A browser gives
+    /// a 15 pt line a 21 pt box; SwiftUI gives it ~18 pt, so a transcription that
+    /// gets every padding right still draws every card 3 pt per row short — and
+    /// the previous round compensated by padding `.row` by 4, which the sheet
+    /// only does for `.sess .row` and which then overshot in the other
+    /// direction. One factor, applied to each text role's own size.
+    static let lineHeightFactor: CGFloat = 1.4
+
+    /// The line box a run of `size` pt text occupies, rounded the way a layout
+    /// engine rounds it.
+    static func lineHeight(_ size: CGFloat) -> CGFloat {
+        (size * lineHeightFactor).rounded()
+    }
+
+    /// A `.card`'s `.row`: its tallest child is the 15 pt name, so the row is
+    /// that name's line box. Every line INSIDE that row gets the same box —
+    /// a CSS line box is set by its block's strut, not by the smallest span on
+    /// it, so a 12 pt plan wrapping under a 15 pt name still occupies 21 pt.
+    static var rowLineHeight: CGFloat { lineHeight(nameSize) }
+
+    /// What a block's top margin becomes when it follows the segmented strip.
+    ///
+    /// Adjacent CSS margins COLLAPSE to the larger of the two: the strip's
+    /// `margin-bottom:12` and the first card's `margin-top:14` make one 14 pt
+    /// gap, not 26. SwiftUI adds paddings, which is how the first v4 render put
+    /// 29 pt of nothing under the tabs against the mockup's 15.
+    static func marginAfterStrip(_ own: CGFloat) -> CGFloat {
+        max(own, segMarginBottom) - segMarginBottom
+    }
 
     // MARK: - Derived helpers
 

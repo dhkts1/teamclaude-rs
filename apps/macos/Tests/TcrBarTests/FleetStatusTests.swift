@@ -703,6 +703,40 @@ final class QuotaFormatTests: XCTestCase {
     }
 }
 
+extension FleetStatusTests {
+    /// ``Fleet/breakdown`` deliberately omits the unmeasured and
+    /// need-re-login buckets, because the pre-v4 header names them in the
+    /// clause beside it. ``Fleet/sentenceBreakdown`` is the list for a surface
+    /// with no such clause — the v4 summary line — and it must account for
+    /// EVERY row, or the sentence quietly loses an account.
+    func testSentenceBreakdownNamesEveryBucketBreakdownOmits() {
+        let fleet = Fleet(accounts: [
+            account("ready@example.com", state: .ok),
+            account("near@example.com", state: .near),
+            // Never probed: `quota: nil`, `probeStatus: .never` — the
+            // `.unmeasured` bucket, not a zero reading.
+            Account(
+                name: "never-probed@example.com", priority: 1, status: "active",
+                disabled: false, quota: nil, quotaState: .ok, fiveHour: nil,
+                sevenDay: nil, sevenDayOi: nil, held: [], requests: 0, inputTokens: 0,
+                outputTokens: 0, cacheReadTokens: 0, cacheHitRatio: nil,
+                probeStatus: .never, probeError: nil, lastStreamError: nil,
+                streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil),
+            brokenAccount("dead@example.com"),
+        ])
+
+        XCTAssertEqual(
+            fleet.breakdown.map(\.label), ["1 ok", "1 near"],
+            "the pre-v4 list is unchanged")
+        XCTAssertEqual(
+            fleet.sentenceBreakdown.map(\.sentenceLabel),
+            ["1 ready", "1 near limit", "1 unmeasured", "1 need re-login"])
+        XCTAssertEqual(
+            fleet.sentenceBreakdown.map(\.count).reduce(0, +), fleet.accounts.count,
+            "every account lands in exactly one bucket of the sentence")
+    }
+}
+
 /// Hand-built accounts for the capacity aggregates. Only the fields the
 /// aggregates read carry meaning; the rest are inert. Names stay obviously fake.
 private func account(

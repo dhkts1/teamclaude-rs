@@ -7,9 +7,15 @@ import TcrBarCore
 /// The order is the one delta the sheet and the shipping panel disagreed about
 /// (`/tmp/parity/delta-list.md` #26): the panel drew its groups first and the
 /// ungrouped pile between them. Loose cards lead here — they are the accounts
-/// that answer "what can serve right now" with no label to read first — and the
-/// named groups follow in ``Fleet/sectionsInDisplayOrder(pinning:)``'s order,
-/// which is unchanged and still unit-tested there.
+/// that answer "what can serve right now" with no label to read first.
+///
+/// Then the groups, in ``Fleet/sectionsInDisplayOrder(pinning:)``'s order
+/// (unchanged, still unit-tested there) but with the ones that are drawn as a
+/// single summary line LAST. That is the mockup's own order —
+/// `HENRY-TOKEN · PARKED` with its member cards, then the collapsed
+/// `MYCELIUM · ACTIVE` — and it is a rule, not a transcription: a box holding
+/// one line is a lid, and a lid between two open boxes reads as the end of the
+/// list.
 struct AccountsTabV4<Menu: View>: View {
     let fleet: Fleet
     let controlName: String?
@@ -30,19 +36,30 @@ struct AccountsTabV4<Menu: View>: View {
 
     private var sections: [FleetSection] {
         let all = fleet.sectionsInDisplayOrder(pinning: controlName)
-        return all.filter { $0.group == .ungrouped } + all.filter { $0.group != .ungrouped }
+        let loose = all.filter { $0.group == .ungrouped }
+        let named = all.filter { $0.group != .ungrouped }
+        return loose + named.filter { !isSummarised($0) } + named.filter { isSummarised($0) }
+    }
+
+    /// A group the operator has not opened and that the fleet says collapses by
+    /// default: one line, its tally, and a button.
+    private func isSummarised(_ section: FleetSection) -> Bool {
+        section.collapsesByDefault && !expandedGroups.contains(section.group.token)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            ForEach(sections, id: \.id) { section in
+            ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
                 if section.group == .ungrouped {
-                    ForEach(section.rows) { row in
-                        card(row, shape: .full)
-                            .padding(.top, V4.cardGap)
+                    ForEach(Array(section.rows.enumerated()), id: \.element.id) { row, account in
+                        card(account, shape: .full)
+                            .padding(
+                                .top,
+                                index == 0 && row == 0
+                                    ? V4.marginAfterStrip(V4.cardGap) : V4.cardGap)
                     }
                 } else {
-                    group(section)
+                    group(section, first: index == 0)
                 }
             }
         }
@@ -54,9 +71,9 @@ struct AccountsTabV4<Menu: View>: View {
     }
 
     @ViewBuilder
-    private func group(_ section: FleetSection) -> some View {
+    private func group(_ section: FleetSection, first: Bool) -> some View {
         let expanded = expandedGroups.contains(section.group.token)
-        let summarised = section.collapsesByDefault && !expanded
+        let summarised = isSummarised(section)
         let capped = section.isWhollyParked && !expanded
         let visible =
             capped ? Array(section.rows.prefix(Self.parkedVisibleRows)) : Array(section.rows)
@@ -64,7 +81,8 @@ struct AccountsTabV4<Menu: View>: View {
 
         GroupBox(
             legend: section.legendText,
-            color: section.outlineColor.map(V4.groupColor) ?? Tok.cardLine
+            color: section.outlineColor.map(V4.groupColor) ?? Tok.cardLine,
+            collapsed: summarised
         ) {
             if summarised {
                 // The whole of a collapsed live group: one line, its tally, and
@@ -85,9 +103,13 @@ struct AccountsTabV4<Menu: View>: View {
                     help: "Shows every account in this group."
                 ) { onToggleGroup(section.group.token) }
             } else {
-                ForEach(Array(visible.enumerated()), id: \.element.id) { index, row in
+                // `.grp .card{margin:6px 0}` — EVERY card, the first included.
+                // Its top margin does not collapse into the group's own 12 pt
+                // padding, so the first card sits 18 pt under the stroke; giving
+                // the first card nothing put it at 11 pt.
+                ForEach(visible) { row in
                     card(row, shape: .compact)
-                        .padding(.top, index == 0 ? 0 : V4.groupCardGap)
+                        .padding(.top, V4.groupCardGap)
                 }
                 if hidden > 0 {
                     V4Disclosure(
@@ -97,6 +119,12 @@ struct AccountsTabV4<Menu: View>: View {
                 }
             }
         }
+        // A group that leads the tab collapses its own 20 pt top margin with the
+        // strip's 12 the same way a card does. ``GroupBox`` has already applied
+        // the full margin, so the collapse is the difference — negative, and it
+        // is a subtraction rather than a parameter because the margin belongs to
+        // the group, not to whoever happens to draw it first.
+        .padding(.top, first ? V4.marginAfterStrip(V4.groupMarginTop) - V4.groupMarginTop : 0)
     }
 
     private func pillRole(_ kind: FleetTally.Kind) -> V4Pill.Role {

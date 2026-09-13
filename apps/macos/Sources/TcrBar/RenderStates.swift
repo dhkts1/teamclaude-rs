@@ -126,7 +126,7 @@ enum RenderStates {
             // `01-healthy` is left alone: other scenes and tests key off its
             // exact 2-account shape, and this is a dedicated fixture for the
             // parity gate rather than a rewrite of a scene with other jobs.
-            ("19-accounts-tab-parity", .loaded(fleet(accountsParityJSON)), false, nil),
+            ("19-accounts-tab-parity", .loaded(accountsParityFleet), false, nil),
         ]
     }
 
@@ -260,7 +260,17 @@ enum RenderStates {
         let view =
             FleetView(
                 poller: StatusPoller(pinnedState: scene.state, lastPollAt: referenceDate),
-                server: ServerController(),
+                // The parity scene compares against a mockup whose proxy was
+                // running, so its server is pinned to the supervised state:
+                // otherwise the app draws "Start server", "Take over port…" and
+                // "Not supervised by TcrBar" — three real controls for a state
+                // the mockup never had — and the two panels differ by a fact
+                // about this machine rather than by a layout decision. Pinned,
+                // never spawned: `ServerController.harness(pinned:)` signals
+                // nothing.
+                server: scene.name == "19-accounts-tab-parity"
+                    ? ServerController.harness(pinned: .supervising(pid: 4242))
+                    : ServerController(),
                 loginItem: LoginItem(),
                 accounts: AccountController(),
                 control: ControlAccountController(pinned: scene.control),
@@ -863,17 +873,33 @@ enum RenderStates {
             usage: measuredUsage(
                 todayCost: 540.12, windowCost: 540.12, windowOutputTokens: 1_500_000),
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")
+        // `near`, not `warn`: the wire's only three quota-state tokens are
+        // `ok`/`near`/`spent` (`src/cli.rs`'s `quota_state_token`), and the
+        // composite is the most-spent of the two windows — so an account whose
+        // 7d window sits at 98 % reports `near` on BOTH. The fixture used to
+        // send `warn`, a token no `tcr` emits: it decoded to `.unknown`, which
+        // painted the 98 % bar the unmeasured violet and left the card's pill
+        // reading OK — the very defect `/tmp/parity/delta-list.md` #19 records,
+        // reproduced by the fixture rather than by the panel.
         let solo2 = account(
-            "henry5@example.com", quota: "0.04", state: "ok", sevenDay: "0.98",
-            sevenDayState: "warn", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 5_640,
+            "henry5@example.com", quota: "0.98", state: "near",
+            fiveHour: "0.04", fiveHourState: "ok",
+            sevenDay: "0.98", sevenDayState: "near",
+            fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 5_640,
             usage: measuredUsage(
                 todayCost: 1_190.4, windowCost: 1_190.4, windowOutputTokens: 3_100_000),
             plan: "Max 20x", orgUuid: "22222222-2222-2222-2222-222222222222")
         let tokenColors = ["henry-token": "#92d188", "mycelium": "#c79ae8"]
         // Five parked members — three drawn, two behind the button.
         let parkedPlans = ["Team 5x", "Team Standard", "Team 5x", "Team Standard", "Team 5x"]
+        // Row two is the UNMEASURED case, and unmeasured means NO READING —
+        // `quota: "null"`, the shape `tcr` sends for an account nothing has
+        // been learned about. It used to say `("0.0", "unmeasured")`: a real
+        // zero reading with an invented state word, which rendered as the
+        // `UNKNOWN` pill (a state this build cannot name) where the mockup
+        // draws `UNMEASURED` (no state to name yet). Opposite meanings.
         let parkedStates = [
-            ("0.10", "ok"), ("0.0", "unmeasured"), ("0.55", "near"),
+            ("0.10", "ok"), ("null", "ok"), ("0.55", "near"),
             ("0.22", "ok"), ("0.31", "ok"),
         ]
         let parkedNames = [
@@ -899,6 +925,34 @@ enum RenderStates {
         }
         let all = [solo1, solo2] + tokenRows + myceliumRows
         return "[\(all.joined(separator: ","))]"
+    }
+
+    /// The parity scene's fleet: ``accountsParityJSON``'s accounts PLUS a
+    /// session list, because the strip's badges are shared chrome and the
+    /// mockup's Accounts panel draws both of them (`Sessions 12`, `Tools 3`).
+    /// Rendered from a fleet with no sessions, the two badges vanish and the
+    /// parity comparison silently loses the delta it was meant to prove
+    /// (`/tmp/parity/delta-list.md` #7).
+    ///
+    /// ``sessionsFixture``'s five sessions carry all three running tool calls,
+    /// so `Tools` reads 3 with no help. `Sessions` needs the mockup's twelve:
+    /// the seven added here are quiet rows — no tools, no sparkline — which is
+    /// the only thing a COUNT needs them to be, and they are never drawn on
+    /// this tab.
+    private static var accountsParityFleet: Fleet {
+        let base = fleet(accountsParityJSON)
+        let quiet = (1...7).map { index in
+            Session(
+                sessionId: "f000000\(index)-1111-2222-3333-444444444444",
+                account: "henry10@example.com", model: "claude-sonnet-5",
+                firstSeenMs: Int64(Date().addingTimeInterval(-3600).timeIntervalSince1970 * 1000),
+                lastSeenMs: Int64(
+                    Date().addingTimeInterval(-Double(index) * 300).timeIntervalSince1970 * 1000),
+                requests: 4, inputTokens: 900, outputTokens: 80, cacheReadTokens: 600)
+        }
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable,
+            sessions: sessionsFixture + quiet, sessionsSupported: true)
     }
 
     private static var sessionsTabFleet: Fleet {

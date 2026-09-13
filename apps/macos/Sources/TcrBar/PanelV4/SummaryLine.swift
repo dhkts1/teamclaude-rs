@@ -65,9 +65,13 @@ extension SummaryLine {
     /// re-counted here. Line one is the population breakdown (`9 ready · 3 near
     /// limit · 1 unmeasured`), line two is what it cost (`$41.80 today · cache
     /// 95%`).
+    ///
+    /// ``Fleet/sentenceBreakdown``, not ``Fleet/breakdown``: the latter leaves
+    /// out the unmeasured and need-re-login buckets for a header that names them
+    /// in a clause this line does not have.
     static func accounts(_ fleet: Fleet) -> SummaryLine {
-        var first: [Run] = fleet.breakdown.map { tally in
-            Run(text: tally.label, tint: Tok.color(for: tally.kind), emphasised: true)
+        var first: [Run] = fleet.sentenceBreakdown.map { tally in
+            Run(text: tally.sentenceLabel, tint: Tok.color(for: tally.kind), emphasised: true)
         }
         if first.isEmpty {
             first = [Run(text: fleet.capacitySummary, tint: Tok.color(for: fleet.capacityState))]

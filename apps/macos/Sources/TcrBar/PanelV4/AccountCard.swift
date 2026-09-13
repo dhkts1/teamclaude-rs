@@ -42,7 +42,7 @@ struct AccountCard: View {
                 }
                 ForEach(quotaWindows, id: \.label) { window in
                     QuotaRow(
-                        label: window.label, value: window.value, state: window.state,
+                        label: window.label, value: window.value, tint: window.tint,
                         resetAtMs: window.resetAtMs, now: now)
                 }
             }
@@ -53,11 +53,24 @@ struct AccountCard: View {
     @ViewBuilder
     private var nameRow: some View {
         if shape == .compact, let plan = account.plan, !plan.isEmpty {
-            // `.name .mute` — the plan sits INSIDE the name span in the mockup,
-            // on one line, so the row reads as one subject with a qualifier.
-            HStack(spacing: V4.tabGap) {
-                NameText(text: account.name)
-                MuteText(text: plan)
+            // `.name .mute` — the plan sits INSIDE the name span, so the row
+            // reads as one subject with a qualifier. It is an inline span, not a
+            // column: when the pair does not fit, the browser WRAPS it and the
+            // card grows a line (the mockup's own `henry1@example.com` /
+            // `Team Standard`). `ViewThatFits` is that wrap. The first v4 render
+            // had no second candidate and truncated the ADDRESS instead —
+            // "henry1@exam…" — which is the one string on the row that has to
+            // stay readable.
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: V4.tabGap) {
+                    NameText(text: account.name)
+                    MuteText(text: plan)
+                }
+                VStack(alignment: .leading, spacing: 0) {
+                    NameText(text: account.name)
+                    MuteText(text: plan)
+                        .frame(minHeight: V4.rowLineHeight, alignment: .leading)
+                }
             }
         } else {
             NameText(text: account.name)
@@ -122,7 +135,7 @@ struct AccountCard: View {
     private struct Window {
         let label: String
         let value: Double?
-        let state: QuotaState?
+        let tint: QuotaBarTintSource
         let resetAtMs: Int64?
     }
 
@@ -133,10 +146,12 @@ struct AccountCard: View {
     private var quotaWindows: [Window] {
         [
             Window(
-                label: "5h", value: account.fiveHour, state: account.fiveHourState,
+                label: "5h", value: account.fiveHour,
+                tint: account.quotaBarTintSource(for: .fiveHour),
                 resetAtMs: account.fiveHourResetAtMs),
             Window(
-                label: "7d", value: account.sevenDay, state: account.sevenDayState,
+                label: "7d", value: account.sevenDay,
+                tint: account.quotaBarTintSource(for: .sevenDay),
                 resetAtMs: account.sevenDayResetAtMs),
         ]
     }

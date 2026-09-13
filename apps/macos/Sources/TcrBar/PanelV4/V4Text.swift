@@ -10,6 +10,7 @@ struct NameText: View {
             .foregroundStyle(Tok.ink)
             .lineLimit(1)
             .truncationMode(.tail)
+            .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
     }
 }
 
@@ -23,6 +24,7 @@ struct DimText: View {
             .foregroundStyle(Tok.dim)
             .lineLimit(lineLimit)
             .truncationMode(.tail)
+            .frame(minHeight: V4.lineHeight(V4.dimSize), alignment: .leading)
     }
 }
 
@@ -36,6 +38,7 @@ struct MuteText: View {
             .foregroundStyle(Tok.mute)
             .lineLimit(lineLimit)
             .truncationMode(.tail)
+            .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
     }
 }
 

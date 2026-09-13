@@ -353,6 +353,21 @@ final class UsageStatsTests: XCTestCase {
         XCTAssertEqual(QuotaFormat.usd(nil), "n/a", "an unpriced bucket is not a free one")
     }
 
+    /// `/tmp/parity/delta-list.md` #32 — the panel wrote `$1190` beside a
+    /// mockup that writes `$1,190`, and a four-digit weekly spend is exactly
+    /// where an amount stops being readable at a glance.
+    func testUsdGroupsThousands() {
+        XCTAssertEqual(QuotaFormat.usd(1_190.4), "$1,190")
+        XCTAssertEqual(QuotaFormat.usd(24_677), "$24,677")
+        XCTAssertEqual(QuotaFormat.usd(1_234_567), "$1,234,567")
+        XCTAssertEqual(QuotaFormat.usd(999), "$999", "three digits are not grouped")
+        XCTAssertEqual(
+            QuotaFormat.usd(-1_190.4), "$-1,190", "a credit groups the same way")
+        XCTAssertEqual(
+            QuotaFormat.usd(41.8), "$41.8",
+            "the decimal point is never mistaken for a separator")
+    }
+
     func testTokensAreScaledAndNeverFabricated() {
         XCTAssertEqual(QuotaFormat.tokens(812), "812")
         XCTAssertEqual(QuotaFormat.tokens(48_000), "48k")

@@ -317,7 +317,7 @@ struct FleetView: View {
             leadingSystemImage: selectedTab == .sessions ? "shippingbox" : nil,
             trailing: v4FooterTrailing
         ) {
-            VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            VStack(alignment: .leading, spacing: V4.buttonGap) {
                 if selectedTab == .accounts {
                     v4Actions
                 }
@@ -327,13 +327,17 @@ struct FleetView: View {
                         .foregroundStyle(Tok.spent)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                if !server.state.isOurChild || server.state.summary != "" {
+                // Only when something is off. `.supervising` says "Supervised
+                // by TcrBar (pid N)", which the row of controls right above it
+                // already says by offering "Stop server" — a footer line that
+                // repeats the state of the button beside it is a line the
+                // mockup's footer does not have and does not need.
+                if !server.state.isOurChild {
                     Text(server.state.summary)
                         .font(V4.font(V4.footerSize))
                         .foregroundStyle(Tok.mute)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                dangerZone
             }
         }
     }
@@ -355,22 +359,47 @@ struct FleetView: View {
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }
 
-    /// `.btn` — the two fleet actions the mockup keeps, plus the server control
+    /// `.btn` — the two fleet actions the mockup keeps, plus the server controls
     /// the app cannot do without. Above the footer rule, which is where the
     /// sheet puts them and the opposite of where the pre-v4 panel did.
+    ///
+    /// Two rows, not one: four buttons do not fit across 352 pt, and the second
+    /// row is where the destructive one goes. That separation is the whole point
+    /// of the pre-v4 `dangerZone` and it survives the migration — "Refresh"
+    /// costs nothing and "Take over port…" costs every live session a cold
+    /// prompt-cache prefix, so a misclick between neighbours must not be able to
+    /// spend that. What does NOT survive is its layout: a hairline of its own
+    /// under the footer text, which put the panel's most expensive control below
+    /// the line that ends the panel.
     private var v4Actions: some View {
-        HStack(spacing: V4.buttonGap) {
-            if server.state.isOurChild {
-                V4Button(title: "Stop server") { server.stop() }
-            } else {
-                V4Button(title: "Start server") { server.start() }
+        VStack(alignment: .leading, spacing: V4.buttonGap) {
+            HStack(spacing: V4.buttonGap) {
+                if server.state.isOurChild {
+                    V4Button(title: "Stop server") { server.stop() }
+                } else {
+                    V4Button(title: "Start server") { server.start() }
+                }
+                V4Button(title: "Refresh") { Task { await poller.pollOnce() } }
+                V4Button(
+                    title: "Add account…",
+                    help: "Opens `tcr login` in a Terminal window."
+                ) { addAccount() }
+                Spacer(minLength: 0)
             }
-            V4Button(title: "Refresh") { Task { await poller.pollOnce() } }
-            V4Button(
-                title: "Add account…",
-                help: "Opens `tcr login` in a Terminal window."
-            ) { addAccount() }
-            Spacer(minLength: 0)
+            // Disabled rather than silently no-op: the spawn path refuses a
+            // second child, so with one already supervised the click would do
+            // nothing and look like a failure.
+            if !server.state.isOurChild {
+                HStack(spacing: V4.buttonGap) {
+                    Spacer(minLength: 0)
+                    V4Button(
+                        title: "Take over port…",
+                        role: .danger,
+                        help:
+                            "Replace the proxy currently holding the port. Expensive — asks first."
+                    ) { confirmTakeover() }
+                }
+            }
         }
     }
 

@@ -15,8 +15,8 @@ struct V4Card<Content: View>: View {
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, V4.cardPaddingV)
-        .padding(.horizontal, V4.cardPaddingH)
+        .padding(.vertical, V4.cardInsetV)
+        .padding(.horizontal, V4.cardInsetH)
         .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.cardFill))
         .overlay(
             RoundedRectangle(cornerRadius: V4.cardRadius)
@@ -26,8 +26,9 @@ struct V4Card<Content: View>: View {
 }
 
 /// `.row` — `display:flex; justify-content:space-between; align-items:center;
-/// gap:8` with `padding:4px 0`, so two adjacent rows sit 8 pt apart and the card's
-/// own 10 pt padding is not doubled by the first and last row's.
+/// gap:8`, and NO vertical padding: the sheet gives `padding:4px 0` to
+/// `.sess .row` alone. A card row's height is its line box (`font:15px/1.4` →
+/// 21 pt), which is what ``V4/rowLineHeight`` supplies.
 struct V4Row<Leading: View, Trailing: View>: View {
     @ViewBuilder var leading: () -> Leading
     @ViewBuilder var trailing: () -> Trailing
@@ -38,7 +39,7 @@ struct V4Row<Leading: View, Trailing: View>: View {
             Spacer(minLength: V4.rowGap)
             trailing()
         }
-        .padding(.vertical, V4.rowPaddingV)
+        .frame(minHeight: V4.rowLineHeight)
     }
 }
 

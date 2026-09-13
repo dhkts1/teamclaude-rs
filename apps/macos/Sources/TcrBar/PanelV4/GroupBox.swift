@@ -12,11 +12,17 @@ import TcrBarCore
 struct GroupBox<Content: View>: View {
     let legend: String
     let color: Color
+    /// `.grp.collapsed{padding-bottom:8px}` — a box holding one line and a
+    /// button closes a little further under it than one holding cards.
+    var collapsed: Bool = false
     @ViewBuilder var content: () -> Content
 
-    /// The legend's measured width, which is where the notch ends. Starts at the
-    /// sheet's own `--n1` default so the first frame is close, then corrects.
-    @State private var legendWidth: CGFloat = 0
+    /// The legend's measured size. The width is where the notch ends; the
+    /// height is what the legend is lifted by half of, so it sits CENTRED on the
+    /// stroke rather than at a constant offset that only suits one font.
+    @State private var legendSize: CGSize = .zero
+
+    private var legendWidth: CGFloat { legendSize.width }
 
     private var notchEnd: CGFloat {
         V4.legendNotchStart + V4.legendNotchPadding * 2 + legendWidth
@@ -29,7 +35,7 @@ struct GroupBox<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, V4.groupPaddingTop)
         .padding(.horizontal, V4.groupPaddingSide)
-        .padding(.bottom, V4.groupPaddingBottom)
+        .padding(.bottom, collapsed ? V4.groupPaddingBottomCollapsed : V4.groupPaddingBottom)
         .overlay(outline)
         .overlay(alignment: .topLeading) { legendLabel }
         .padding(.top, V4.groupMarginTop)
@@ -72,21 +78,23 @@ struct GroupBox<Content: View>: View {
         }
         .background(
             GeometryReader { proxy in
-                Color.clear.preference(key: LegendWidthKey.self, value: proxy.size.width)
+                Color.clear.preference(key: LegendSizeKey.self, value: proxy.size)
             }
         )
-        .onPreferenceChange(LegendWidthKey.self) { legendWidth = $0 }
+        .onPreferenceChange(LegendSizeKey.self) { legendSize = $0 }
         .padding(.leading, V4.legendNotchStart + V4.legendNotchPadding)
-        .offset(y: V4.legendOffsetY)
+        .offset(y: -legendSize.height / 2)
         .accessibilityHidden(true)
     }
 }
 
-/// How wide the legend actually drew, so the stroke's notch matches it rather
-/// than a guessed constant.
-struct LegendWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
+/// How big the legend actually drew: the notch matches its width and the lift
+/// is half its height, so neither is a guessed constant.
+struct LegendSizeKey: PreferenceKey {
+    static var defaultValue: CGSize = .zero
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        value = CGSize(
+            width: max(value.width, next.width), height: max(value.height, next.height))
     }
 }
