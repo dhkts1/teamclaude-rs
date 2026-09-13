@@ -1,12 +1,21 @@
 import AppKit
 import Foundation
 
-/// Hands `tcr login` to a real Terminal window.
+/// Hands `tcr mint` — and, on an old `tcr`, `tcr login` — to a real Terminal
+/// window.
 ///
-/// ## Why not just spawn it
+/// ## What still comes through here
 ///
-/// `tcr login` cannot run as a background subprocess of a GUI app, for two
-/// independent reasons, and both are in `tcr`'s own source rather than guesswork:
+/// `tcr mint` is unchanged: it prints an authorize URL, waits for a pasted code
+/// on stdin once per account, and needs a terminal exactly as described below.
+///
+/// `tcr login` no longer does. `--non-interactive` (`src/oauth.rs`'s `LoginUi`)
+/// removed both prompts, and ``LoginSession`` runs the login as a child of this
+/// app with a sheet on the panel. This file is the LOGIN fallback for one case:
+/// a `tcr` on this machine that predates that flag, which
+/// ``LoginCapability/probe(executable:)`` detects by reading `tcr login --help`.
+/// The two reasons below are why that fallback has to exist at all, and both
+/// are in `tcr`'s own source rather than guesswork:
 ///
 ///  1. **An older `tcr` refuses while a server holds the port.** That used to be
 ///     universal — refusing outright whenever a proxy held the port, no

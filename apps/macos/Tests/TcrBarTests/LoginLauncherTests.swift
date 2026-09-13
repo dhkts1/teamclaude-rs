@@ -298,4 +298,163 @@ final class LoginLauncherTests: XCTestCase {
         XCTAssertEqual(opened.count, 2)
         XCTAssertNotEqual(opened[0], opened[1], "two launches must not race on one shared path")
     }
+
+    // MARK: - The in-app login (`LoginSession`, `tcr login --non-interactive`)
+
+    /// The argv, which is the whole contract with the CLI. `--force` is absent
+    /// here for the same reason it is absent from the Terminal script.
+    func testInAppLoginArgumentsAndNeverForce() {
+        XCTAssertEqual(
+            LoginSession.arguments(account: nil), ["login", "--non-interactive"])
+        XCTAssertEqual(
+            LoginSession.arguments(account: "alice@example.com"),
+            ["login", "--non-interactive", "--account", "alice@example.com"])
+        XCTAssertFalse(LoginSession.arguments(account: "alice@example.com").contains("--force"))
+    }
+
+    /// Every line `src/oauth.rs`'s `LoginEvent::line` can print, parsed back.
+    func testEveryEventLineParses() {
+        XCTAssertEqual(
+            LoginProgressEvent.parse(#"{"event":"browser","url":"https://claude.ai/oauth/authorize?x=1"}"#),
+            .browser(url: "https://claude.ai/oauth/authorize?x=1"))
+        XCTAssertEqual(LoginProgressEvent.parse(#"{"event":"waiting"}"#), .waiting)
+        XCTAssertEqual(
+            LoginProgressEvent.parse(#"{"event":"saved","account":"alice@example.com"}"#),
+            .saved(account: "alice@example.com"))
+        XCTAssertEqual(
+            LoginProgressEvent.parse(#"{"event":"error","reason":"Login timed out after 2 minutes"}"#),
+            .failed(reason: "Login timed out after 2 minutes"))
+    }
+
+    /// A line that is not one of the four events must be ignored, never
+    /// mistaken for one. Prose on stdout is what a CLI one version ahead or
+    /// behind this app looks like, and reading it as a state change is how a
+    /// working login reports itself broken.
+    func testNonEventLinesAreIgnored() {
+        for line in [
+            "",
+            "   ",
+            "Saved account 'alice@example.com' to /tmp/config.json",
+            #"{"event":"browser"}"#,  // no url
+            #"{"event":"saved","account":""}"#,  // empty name
+            #"{"event":"something-new","detail":"from a newer tcr"}"#,
+            #"{"not":"an event"}"#,
+            "{ this is not json",
+        ] {
+            XCTAssertNil(LoginProgressEvent.parse(line), "must ignore: \(line)")
+        }
+    }
+
+    /// The happy sequence, folded through the state machine: the `browser`
+    /// event hands back a URL to open and changes nothing, `waiting` names who
+    /// is signing in, `saved` ends it.
+    func testHappySequenceReachesSaved() {
+        var flow = LoginFlow(requesting: "alice@example.com")
+        XCTAssertEqual(flow.phase, .opening)
+
+        let url = flow.apply(.browser(url: "https://claude.ai/oauth/authorize?state=abc"))
+        XCTAssertEqual(url?.absoluteString, "https://claude.ai/oauth/authorize?state=abc")
+        XCTAssertEqual(flow.phase, .opening, "the URL is out, but nothing is waiting on it yet")
+
+        XCTAssertNil(flow.apply(.waiting))
+        XCTAssertEqual(flow.phase, .waitingForBrowser(email: "alice@example.com"))
+
+        XCTAssertNil(flow.apply(.saved(account: "alice@example.com")))
+        XCTAssertEqual(flow.phase, .saved(account: "alice@example.com"))
+        XCTAssertTrue(flow.phase.isTerminal)
+    }
+
+    /// A fresh add has no identity to name yet — the sheet must not invent one.
+    func testAFreshAddWaitsWithNoEmail() {
+        var flow = LoginFlow(requesting: nil)
+        flow.apply(.waiting)
+        XCTAssertEqual(flow.phase, .waitingForBrowser(email: nil))
+    }
+
+    /// The error event carries `tcr`'s own words through unparaphrased.
+    func testErrorEventBecomesTheFailureReason() {
+        var flow = LoginFlow(requesting: nil)
+        flow.apply(.waiting)
+        flow.apply(.failed(reason: "the proxy on :3456 rejected the api-key"))
+        XCTAssertEqual(flow.phase, .failed(reason: "the proxy on :3456 rejected the api-key"))
+    }
+
+    /// A child that dies saying nothing must still end the sheet. Without this
+    /// the spinner runs forever on a process that is gone — which is exactly
+    /// what an OLD `tcr` does, exiting immediately on an unknown argument.
+    func testAChildThatExitsSilentlyStillFails() {
+        var flow = LoginFlow(requesting: nil)
+        flow.apply(.waiting)
+        flow.finish(exitCode: 2, stderr: "")
+        XCTAssertEqual(
+            flow.phase, .failed(reason: "tcr login exited (code 2) without saving an account"))
+    }
+
+    /// When it did speak, its last stderr line IS the reason: `--non-interactive`
+    /// puts the whole failure on one line there.
+    func testAChildThatSpokeOnStderrReportsThatReason() {
+        var flow = LoginFlow(requesting: nil)
+        flow.apply(.waiting)
+        flow.finish(exitCode: 1, stderr: "OAuth login failed: Login timed out after 2 minutes\n")
+        XCTAssertEqual(
+            flow.phase, .failed(reason: "OAuth login failed: Login timed out after 2 minutes"))
+    }
+
+    /// A finished login cannot be un-finished by anything that arrives after
+    /// it — including the child's own exit.
+    func testNothingOverwritesATerminalPhase() {
+        var flow = LoginFlow(requesting: nil)
+        flow.apply(.saved(account: "alice@example.com"))
+        flow.apply(.failed(reason: "a late error"))
+        flow.finish(exitCode: 1, stderr: "and a late stderr line")
+        XCTAssertEqual(flow.phase, .saved(account: "alice@example.com"))
+    }
+
+    /// A URL this app cannot open is a visible failure, not a skipped step:
+    /// the browser is the only human part of the flow.
+    func testAnUnopenableAuthorizeURLFails() {
+        var flow = LoginFlow(requesting: nil)
+        XCTAssertNil(flow.apply(.browser(url: "file:///etc/passwd")))
+        guard case .failed(let reason) = flow.phase else {
+            return XCTFail("expected a failure, got \(flow.phase)")
+        }
+        XCTAssertTrue(reason.contains("file:///etc/passwd"), reason)
+    }
+
+    /// The authorize URL is the longest line this stream carries and the one a
+    /// pipe read is likeliest to cut in half. Split mid-URL, it must still
+    /// arrive as ONE line.
+    func testALineSplitAcrossTwoReadsIsStillOneLine() {
+        let line = #"{"event":"browser","url":"https://claude.ai/oauth/authorize?state=abcdef"}"#
+        var buffer = LineBuffer()
+        let whole = Array((line + "\n").utf8)
+        let cut = whole.count / 2
+
+        XCTAssertEqual(buffer.append(Data(whole[..<cut])), [], "no complete line yet")
+        XCTAssertEqual(buffer.append(Data(whole[cut...])), [line])
+        XCTAssertEqual(
+            LoginProgressEvent.parse(line),
+            .browser(url: "https://claude.ai/oauth/authorize?state=abcdef"))
+    }
+
+    /// Two events in one read are two lines, and a trailing partial is held.
+    func testTwoLinesInOneReadAndATrailingPartial() {
+        var buffer = LineBuffer()
+        let lines = buffer.append(Data((#"{"event":"waiting"}"# + "\n" + #"{"event":"sav"#).utf8))
+        XCTAssertEqual(lines, [#"{"event":"waiting"}"#])
+        XCTAssertEqual(
+            buffer.append(Data((#"ed","account":"alice@example.com"}"# + "\n").utf8)),
+            [#"{"event":"saved","account":"alice@example.com"}"#])
+    }
+
+    /// The capability probe reads `tcr login --help`. An older `tcr` — the one
+    /// this app must hand to a Terminal window instead — does not name the flag.
+    func testCapabilityProbeReadsTheHelpText() {
+        XCTAssertTrue(
+            LoginCapability.supportsNonInteractive(
+                help: "Usage: tcr login [OPTIONS]\n      --non-interactive  Drive the login\n"))
+        XCTAssertFalse(
+            LoginCapability.supportsNonInteractive(
+                help: "Usage: tcr login [OPTIONS]\n      --force  Skip the refusal\n"))
+    }
 }

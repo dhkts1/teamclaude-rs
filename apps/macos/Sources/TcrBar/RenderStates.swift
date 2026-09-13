@@ -137,6 +137,52 @@ enum RenderStates {
         ]
     }
 
+    /// The sign-in sheet (``LoginSheet``), one PNG per state, drawn WHERE IT
+    /// APPEARS: over the Accounts tab, on the dimming scrim a real sheet puts
+    /// there.
+    ///
+    /// A separate list because a sheet is not a `PollState`: it is presented
+    /// over the panel, and `ImageRenderer` draws a view, never a presentation —
+    /// a `.sheet` modifier on the panel rasterises as the panel alone. So the
+    /// harness composes the two by hand, which is exactly why ``LoginSheet``
+    /// takes a phase rather than a live ``LoginSession``. The composition is
+    /// an approximation of AppKit's presentation (which insets and shadows the
+    /// sheet itself), and it answers the question a bare sheet could not: how
+    /// much of the panel is still legible behind it, and where the eye lands.
+    ///
+    /// **The spinner is drawn as a still `clock`** (`LoginSheet.snapshotMode`).
+    /// `ImageRenderer` rasterises a `ProgressView` as the macOS "prohibited"
+    /// placeholder — a red crossed-out circle, the same class of limitation
+    /// this file already records for a `.checkbox` toggle — so the fixture
+    /// showed a state the app never draws. The still glyph is a stand-in for
+    /// motion, and is not evidence about the spinner either way.
+    ///
+    /// `.failed` is the state this list exists for. It is the one nobody sees
+    /// until it happens to them, it carries the longest string on the sheet
+    /// (`tcr`'s own refusal, unparaphrased), and a wrapping failure line is the
+    /// kind of thing a green build says nothing about.
+    private static var sheetScenes: [(name: String, phase: LoginPhase, url: URL?)] {
+        let authorize = URL(
+            string: "https://claude.ai/oauth/authorize?code=true&state=RENDER-FIXTURE")
+        return [
+            ("20-login-opening", .opening, nil),
+            (
+                "20b-login-waiting", .waitingForBrowser(email: "alice@example.com"),
+                authorize
+            ),
+            ("20c-login-saved", .saved(account: "alice@example.com"), nil),
+            (
+                "20d-login-failed",
+                .failed(
+                    reason:
+                        "the proxy on :3456 rejected the api-key in "
+                        + "~/.config/teamclaude.json while checking whether it could take a "
+                        + "live login — no browser was opened and nothing was changed."),
+                nil
+            ),
+        ]
+    }
+
     /// Which tab a scene opens on — `.accounts` for every scene above scene
     /// 16, so this stays a lookup by name rather than a fifth tuple element
     /// every existing scene would have to grow.
@@ -224,6 +270,12 @@ enum RenderStates {
                         written += 1
                     }
                 }
+            }
+        }
+        for scene in sheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
 
@@ -347,19 +399,96 @@ enum RenderStates {
             // shown at full height instead of clipped.
             .fixedSize()
 
+        // The shipped default stays unsuffixed — every existing filename this
+        // harness produces is unchanged — and only the forced `.comfortable`
+        // variant gets `-comfortable`, per `densityVariantScenes`. Computed
+        // here rather than in `rasterise`, which is shared with the sheet
+        // scenes and has no density of its own.
+        let name =
+            density == .compact
+            ? "\(scene.name)-\(appearance.rawValue).png"
+            : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
+        return rasterise(view, named: name, into: directory)
+    }
+
+    /// One state of the sign-in sheet, rendered on its own.
+    ///
+    /// Same appearance dance as ``render(_:appearance:into:)`` and the same
+    /// writer, and deliberately NO controller of any kind: a ``LoginSession``
+    /// would spawn `tcr login`. The harness draws a phase, never a login.
+    @MainActor
+    private static func renderSheet(
+        _ scene: (name: String, phase: LoginPhase, url: URL?),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        let previous = NSAppearance.current
+        NSAppearance.current = appearance.nsAppearance
+        defer { NSAppearance.current = previous }
+
+        // The panel underneath is the ordinary healthy Accounts tab, built the
+        // same way every other scene builds one — pinned state, harness
+        // controllers, nothing that can spawn or signal anything.
+        UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
+        let panel =
+            FleetView(
+                poller: StatusPoller(
+                    pinnedState: .loaded(fleet(healthyJSON)), lastPollAt: referenceDate),
+                server: ServerController.harness(pinned: .supervising(pid: 4242)),
+                loginItem: LoginItem(),
+                accounts: AccountController(),
+                control: ControlAccountController(pinned: nil),
+                awake: AwakeController.harness(),
+                updater: Updater(startingUpdater: false),
+                groupController: GroupController(),
+                removeController: RemoveAccountController(),
+                startServerAtLaunch: .constant(false),
+                snapshotMode: true,
+                initialTab: .accounts,
+                initialSessionFiles: [:]
+            )
+            .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            .fixedSize()
+
+        let view = panel
+            .overlay {
+                ZStack {
+                    Color.black.opacity(sheetScrimAlpha)
+                    // The rounded fill goes UNDER the sheet rather than
+                    // clipping it: `.clipShape` + `.shadow` rasterises through
+                    // an offscreen layer whose backing showed as white corners
+                    // around the light-mode sheet, which is not a surface this
+                    // app has.
+                    LoginSheet(phase: scene.phase, authorizeURL: scene.url, snapshotMode: true)
+                        .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
+                        .shadow(radius: sheetShadowRadius)
+                }
+            }
+            .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+        return rasterise(view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+    }
+
+    /// Harness-only geometry for the sheet composition above: how far the
+    /// panel behind a sheet is dimmed, and the sheet's drop shadow. Not design
+    /// tokens and not in `V4.swift` — AppKit owns both for a real
+    /// presentation, and `V4.swift` holds transcribed mockup values only.
+    /// These exist so the fixture reads like the thing it is picturing.
+    private static let sheetScrimAlpha: Double = 0.45
+    private static let sheetShadowRadius: CGFloat = 12
+
+    /// Rasterise one view to a PNG under `directory`. The single writer for
+    /// every scene in this file, so a panel render and a sheet render cannot
+    /// drift onto two different scales.
+    @MainActor
+    private static func rasterise<V: View>(_ view: V, named name: String, into directory: URL)
+        -> Bool
+    {
         let renderer = ImageRenderer(content: view)
         // 2x so the PNG shows what a Retina panel draws — hairlines and 10pt text
         // are exactly where a 1x render would flatter the design.
         renderer.scale = 2
         renderer.proposedSize = .unspecified
 
-        // The shipped default stays unsuffixed — every existing filename this
-        // harness produces is unchanged — and only the forced `.comfortable`
-        // variant gets `-comfortable`, per `densityVariantScenes`.
-        let name =
-            density == .compact
-            ? "\(scene.name)-\(appearance.rawValue).png"
-            : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
         guard let image = renderer.nsImage,
             let tiff = image.tiffRepresentation,
             let rep = NSBitmapImageRep(data: tiff),
