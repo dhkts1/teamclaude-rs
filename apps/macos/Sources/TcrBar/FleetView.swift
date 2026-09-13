@@ -221,6 +221,64 @@ struct FleetView: View {
         )
     }
 
+    /// The two facts about WHERE the Accounts tab's numbers come from, on one
+    /// line under the summary: a row `tcr` sent that this build could not read,
+    /// and which account every quota measurement was taken through.
+    ///
+    /// Review finding 15. Both existed in the model and reached no view:
+    /// `Fleet.unreadableNotice` had four references, all inside
+    /// `StatusPoller`, and `control.current` was read only for ordering. So
+    /// thirteen accounts rendered as twelve with no sentence saying one was
+    /// lost — which `Fleet`'s own doc-comment (`FleetStatus.swift:2111-2114`)
+    /// says must never happen — and the only visible consequence of "Use as
+    /// Control Account" was a row moving. Measured before the fix: the
+    /// `05-unreadable-row`, `12-keeping-awake` and `13-control-account` renders
+    /// were byte-identical, three of 27 named states drawing nothing of their
+    /// own.
+    ///
+    /// The notice is `Tok.spent`, as the review's After asks. The control
+    /// clause is `Tok.accent` rather than the neutral pill it suggests: this
+    /// panel already has a recorded decision for that exact fact — the row's
+    /// own control marker uses `accent` "not one of the quota/rotation status
+    /// hues … a designation, not a measured state" — and a second colour for
+    /// one fact is how two places start disagreeing.
+    @ViewBuilder
+    private func accountsProvenanceLine(_ fleet: Fleet) -> some View {
+        let notice = fleet.unreadableNotice
+        let controlName = control.current
+        if notice != nil || controlName != nil {
+            HStack(spacing: V4.rowGap) {
+                if let notice {
+                    Text(notice)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.spent)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                Spacer(minLength: 0)
+                if let controlName {
+                    Text("control account · \(controlName)")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.accent)
+                        .lineLimit(1)
+                        // The NAME is what gives way, never the designation:
+                        // middle truncation keeps both ends of an address.
+                        .truncationMode(.middle)
+                        .help("Every quota figure on this panel is measured through \(controlName).")
+                }
+            }
+            .padding(.horizontal, V4.summaryPaddingSide)
+            .padding(.bottom, V4.summaryPaddingBottom)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                [
+                    notice.map { "\($0). tcr sent a row this build could not decode." },
+                    controlName.map { "Quotas measured through the control account \($0)." },
+                ]
+                .compactMap { $0 }.joined(separator: " "))
+        }
+    }
+
     /// Is there a fleet to draw tabs over? `.loaded` with at least one account
     /// — the exact case ``v4Content`` gives a tab body to. Every other state
     /// (pending, tool missing, command failed, undecodable, empty fleet) falls
@@ -271,6 +329,7 @@ struct FleetView: View {
             switch visibleTab {
             case .accounts:
                 SummaryLine.accounts(fleet)
+                accountsProvenanceLine(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
             // header at ``header`` has always carried and the v4 summary block
             // dropped: a server that predates the sessions wire reports no
