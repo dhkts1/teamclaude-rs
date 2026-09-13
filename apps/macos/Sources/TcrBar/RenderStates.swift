@@ -117,6 +117,13 @@ enum RenderStates {
             // never an empty list: `healthyJSON` carries no `sessions` key at
             // all, the shape every server shipped before F1.
             ("18-sessions-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
+            // The same server, on the Tools tab. Its own scene because the two
+            // tabs draw two different summary lines above that one sentence,
+            // and the Tools half is the one the 2026-09-13 interface review
+            // caught printing "0 tool calls today" directly over "This server
+            // predates sessions — update tcr." (finding 9). A scene nobody
+            // renders is a claim nobody can check.
+            ("18b-tools-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
             // Wave 2, phase 1 (`data/plans/panel-parity-bridge.md`): the
             // Accounts tab's structure, matching
             // `docs/design/panel-tabs-mockup.html`'s Accounts panel —
@@ -136,7 +143,7 @@ enum RenderStates {
     private static func initialTab(for sceneName: String) -> PanelTab {
         switch sceneName {
         case "16-sessions-tab", "18-sessions-tab-old-server": return .sessions
-        case "17-tools-tab": return .tools
+        case "17-tools-tab", "18b-tools-tab-old-server": return .tools
         default: return .accounts
         }
     }

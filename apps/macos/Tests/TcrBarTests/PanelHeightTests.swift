@@ -253,6 +253,35 @@ final class PanelHeightTests: XCTestCase {
         XCTAssertEqual(PanelHeight.settled(118.0, 118.9), 119.0)
     }
 
+    /// The v4 viewport: a short fleet gets its own height back, a long one is
+    /// clamped, and an unmeasured first frame gets the budget.
+    ///
+    /// The defect (interface review finding 11) is the MIDDLE case being
+    /// impossible: nothing under `PanelV4/` emits `RowHeightsKey`, so the v4
+    /// tab's row dictionary was permanently empty, `visibleRowsHeight` took its
+    /// first-frame branch forever, and every fleet — two accounts or thirteen —
+    /// was drawn in a viewport the full height of the cap.
+    func testTheViewportFitsShortContentAndClampsLongContent() {
+        let budget = PanelHeight.panelMaxHeight
+        XCTAssertEqual(
+            PanelHeight.viewportHeight(contentHeight: 184, budget: budget), 184,
+            "a two-account fleet draws at its own height, not at the cap")
+        XCTAssertEqual(
+            PanelHeight.viewportHeight(contentHeight: 980, budget: budget), budget,
+            "a thirteen-account fleet fills the cap and scrolls")
+        XCTAssertEqual(
+            PanelHeight.viewportHeight(contentHeight: 0, budget: budget), budget,
+            "nothing measured yet — the budget, never a zero-height panel")
+    }
+
+    /// The budget, not the cap: a wrapped header spends part of it, and the
+    /// viewport is clamped to what is left rather than to 520.
+    func testTheViewportIsClampedToTheBudgetTheHeaderLeft() {
+        let budget = PanelHeight.listBudget(headerOverflow: 28, minimum: 120)
+        XCTAssertEqual(budget, PanelHeight.panelMaxHeight - 28)
+        XCTAssertEqual(PanelHeight.viewportHeight(contentHeight: 900, budget: budget), budget)
+    }
+
     /// The per-row form holds each row independently, drops rows that left the
     /// fleet, and publishes a new row on the grid since it has nothing to hold to.
     func testPerRowSettlingHoldsDropsAndAdmits() {
