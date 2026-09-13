@@ -125,6 +125,7 @@ impl Manager {
                             tool: r.tool,
                             started_ms: r.started_ms,
                             command_head: r.command_head,
+                            command_class: r.command_class.map(|c| c.as_str().to_string()),
                         })
                         .collect(),
                     slowest: s
@@ -135,6 +136,7 @@ impl Manager {
                             tool: t.tool,
                             seconds: t.seconds,
                             command_head: t.command_head,
+                            command_class: t.command_class.map(|c| c.as_str().to_string()),
                             ended_ms: t.ended_ms,
                         })
                         .collect(),
@@ -323,16 +325,19 @@ mod tests {
                 id: "tu_bash".to_string(),
                 name: Some("Bash".to_string()),
                 command_head: Some("ls".to_string()),
+                command_class: None,
             },
             ToolUseEvent {
                 id: "tu_agent".to_string(),
                 name: Some("Agent".to_string()),
-                command_head: Some("henry:coder: F4 subagents on the wire".to_string()),
+                command_head: Some("reviewer: check the wire fixtures".to_string()),
+                command_class: None,
             },
             ToolUseEvent {
                 id: "tu_task".to_string(),
                 name: Some("Task".to_string()),
                 command_head: Some("review the diff".to_string()),
+                command_class: None,
             },
         ];
         manager.record_wire_session(Some("sess-sub"), None, None, now, &uses, &[]);
@@ -437,6 +442,7 @@ mod tests {
                 id: "tu_1".to_string(),
                 name: Some("Bash".to_string()),
                 command_head: Some("ls".to_string()),
+                command_class: None,
             }],
             &[ToolResultEvent {
                 id: "tu_1".to_string(),

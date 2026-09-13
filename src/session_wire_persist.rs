@@ -411,6 +411,7 @@ mod tests {
                     id: id.clone(),
                     name: Some("Bash".into()),
                     command_head: None,
+                    command_class: None,
                 }],
                 &[],
             );

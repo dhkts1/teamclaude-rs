@@ -130,6 +130,13 @@ pub struct RunningToolRow {
     /// neither. Held in memory only on the server; never written to a log (see
     /// `src/session_wire.rs`'s module doc in the main crate).
     pub command_head: Option<String>,
+    /// A Bash tool's coarse category (`"wait"`, `"compound"`, `"search"`, `"git-net"`,
+    /// `"git-local"`, `"build"`, `"other"`) — `None` for any other tool, or when
+    /// `command_head` is `None`. `#[serde(default)]` so a server that has not shipped this
+    /// field yet still decodes against a newer panel. See `src/session_wire.rs`'s
+    /// `CommandClass` in the main crate for the classifier itself.
+    #[serde(default)]
+    pub command_class: Option<String>,
 }
 
 /// One completed tool call, for a session's "ten slowest" list.
@@ -139,6 +146,9 @@ pub struct SlowToolRow {
     pub tool: String,
     pub seconds: f64,
     pub command_head: Option<String>,
+    /// Same meaning and same `#[serde(default)]` reasoning as [`RunningToolRow::command_class`].
+    #[serde(default)]
+    pub command_class: Option<String>,
     pub ended_ms: i64,
 }
 
