@@ -714,9 +714,19 @@ pub struct WireSession {
     pub first_seen_ms: i64,
     pub last_seen_ms: i64,
     pub requests: u64,
+    /// BASE input only — never cache reads or cache creation, both counted separately below.
+    /// The 2026-09-14 incident: this field used to hold `UsageRecord::input_total()`, which
+    /// already folds `cache_read_tokens` in, so the panel's hit-ratio (`cache_read /
+    /// (input_tokens + cache_creation_tokens + cache_read_tokens)`) double-counted cache reads
+    /// and every session rendered ~50% no matter its real hit rate.
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Cache-write tokens (5-minute plus 1-hour TTL creation), kept apart from
+    /// `input_tokens` for the same reason as `cache_read_tokens` — see its doc-comment.
+    /// `#[serde(default)]` so a cache file written before this field existed still loads.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     pub tools: ToolStats,
     /// See [`ReqPerMinuteRing`].
     pub req_per_minute: ReqPerMinuteRing,
@@ -879,16 +889,17 @@ impl WireSessionTracker {
     /// session not (yet, or no longer) present is silently ignored — there is nothing to
     /// attribute the tokens to.
     ///
-    /// `quota_input` is the SAME quota-counter figure this always accumulated
-    /// (`entry.input_tokens`, unchanged meaning) — `model`, `base_input`, `cache_5m` and
-    /// `cache_1h` are new (wire 2): they fold into [`WireSession::by_model`] so a session that
-    /// spans two models can be priced per-model and summed, rather than averaged.
+    /// `base_input` accumulates into `entry.input_tokens` — BASE input only, never the quota
+    /// figure (`UsageRecord::input_total()`), which already folds cache reads and cache
+    /// creation in; folding the quota figure in here is the 2026-09-14 double-count incident
+    /// (see [`WireSession::input_tokens`]). `model`, `cache_5m` and `cache_1h` fold into
+    /// [`WireSession::by_model`] so a session that spans two models can be priced per-model
+    /// and summed, rather than averaged.
     #[allow(clippy::too_many_arguments)]
     pub fn record_usage(
         &mut self,
         session_id: &str,
         model: Option<&str>,
-        quota_input: u64,
         base_input: u64,
         cache_5m: u64,
         cache_1h: u64,
@@ -896,7 +907,8 @@ impl WireSessionTracker {
         output: u64,
     ) {
         if let Some(entry) = self.sessions.get_mut(session_id) {
-            entry.input_tokens += quota_input;
+            entry.input_tokens += base_input;
+            entry.cache_creation_tokens += cache_5m + cache_1h;
             entry.output_tokens += output;
             entry.cache_read_tokens += cache_read;
             let tally = entry

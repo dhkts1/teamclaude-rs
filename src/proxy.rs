@@ -3050,7 +3050,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     manager_side.record_wire_session_usage(
                         wire_session_id_for_usage.as_deref(),
                         record.model.as_deref(),
-                        record.input_total(),
                         record.input,
                         record.cache_5m,
                         record.cache_1h,
@@ -3265,7 +3264,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 manager.record_wire_session_usage(
                     wire_session_id.as_deref(),
                     record.model.as_deref(),
-                    record.input_total(),
                     record.input,
                     record.cache_5m,
                     record.cache_1h,

@@ -76,16 +76,17 @@ impl Manager {
     /// fields, so the account ledger, the per-model tally and the wire session's quota totals
     /// never disagree about what a response carried.
     ///
-    /// `quota_input` is the QUOTA figure (`UsageRecord::input_total()`, verbatim) and folds
-    /// into the session's existing `input_tokens` total, unchanged in meaning. `base_input`,
-    /// `cache_5m` and `cache_1h` (`UsageRecord::input`/`cache_5m`/`cache_1h`) are the pricing
-    /// dimensions, kept in [`crate::session_wire::WireSession::by_model`] — wire 2.
+    /// `base_input`, `cache_5m` and `cache_1h` (`UsageRecord::input`/`cache_5m`/`cache_1h`) fold
+    /// into the session's `input_tokens`/`cache_creation_tokens` totals and into the per-model
+    /// pricing tally kept in [`crate::session_wire::WireSession::by_model`] — wire 2. The QUOTA
+    /// figure (`UsageRecord::input_total()`) is deliberately NOT passed here: it already folds
+    /// cache reads in, and folding it into `input_tokens` too was the 2026-09-14 double-count
+    /// incident (see [`crate::session_wire::WireSession::input_tokens`]).
     #[allow(clippy::too_many_arguments)]
     pub fn record_wire_session_usage(
         &self,
         session_id: Option<&str>,
         model: Option<&str>,
-        quota_input: u64,
         base_input: u64,
         cache_5m: u64,
         cache_1h: u64,
@@ -102,7 +103,6 @@ impl Manager {
         tracker.record_usage(
             session_id,
             model,
-            quota_input,
             base_input,
             cache_5m,
             cache_1h,
@@ -137,6 +137,7 @@ impl Manager {
                 input_tokens: s.input_tokens,
                 output_tokens: s.output_tokens,
                 cache_read_tokens: s.cache_read_tokens,
+                cache_creation_tokens: s.cache_creation_tokens,
                 tools: tcr_status_wire::SessionToolsRow {
                     calls: s.tools.calls,
                     errors: s.tools.errors,
@@ -362,7 +363,6 @@ mod tests {
             Some("sess-glue"),
             Some("claude-fable-5"),
             10,
-            10,
             0,
             0,
             5,
@@ -377,6 +377,37 @@ mod tests {
         assert_eq!(row.input_tokens, 10);
         assert_eq!(row.output_tokens, 20);
         assert_eq!(row.cache_read_tokens, 5);
+    }
+
+    /// The 2026-09-14 incident, pinned: `input_tokens` must hold BASE input only, never the
+    /// quota figure (base + cache creation + cache read), or the panel's hit-ratio
+    /// double-counts cache reads and every session renders ~50% regardless of its real hit
+    /// rate. Cache creation gets its own counter rather than being dropped on the floor.
+    #[test]
+    fn session_input_tokens_excludes_cache_reads_and_creation() {
+        let manager = Manager::from_runtimes(vec![]);
+        let now = OffsetDateTime::now_utc();
+        manager.record_wire_session(Some("sess-ratio"), None, None, now, &[], &[]);
+        // base 100, cache_5m 20, cache_1h 30, cache_read 850 — the quota figure these fold
+        // into (`UsageRecord::input_total()`) would be 1000, the number that used to land
+        // wrongly in `input_tokens`.
+        manager.record_wire_session_usage(
+            Some("sess-ratio"),
+            Some("claude-sonnet-5"),
+            100,
+            20,
+            30,
+            850,
+            0,
+        );
+
+        let row = &manager.snapshot(now).wire_sessions[0];
+        assert_eq!(
+            row.input_tokens, 100,
+            "base input only, not the quota total"
+        );
+        assert_eq!(row.cache_creation_tokens, 50, "cache_5m + cache_1h");
+        assert_eq!(row.cache_read_tokens, 850);
     }
 
     /// `subagents_running` counts only `Agent`/`Task` entries among the running tools — a plain
@@ -476,7 +507,7 @@ mod tests {
             &[],
             &[],
         );
-        manager.record_wire_session_usage(None, Some("claude-fable-5"), 10, 10, 0, 0, 5, 20);
+        manager.record_wire_session_usage(None, Some("claude-fable-5"), 10, 0, 0, 5, 20);
         assert!(manager.snapshot(now).wire_sessions.is_empty());
     }
 
@@ -494,7 +525,6 @@ mod tests {
             Some("sess-cost"),
             Some("claude-opus-5"),
             1_000_000,
-            1_000_000,
             0,
             0,
             0,
@@ -504,7 +534,6 @@ mod tests {
         manager.record_wire_session_usage(
             Some("sess-cost"),
             Some("claude-sonnet-5"),
-            1_000_000,
             0,
             0,
             0,

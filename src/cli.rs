@@ -5159,6 +5159,7 @@ mod tests {
             input_tokens: 400,
             output_tokens: 50,
             cache_read_tokens: 900,
+            cache_creation_tokens: 25,
             tools: tcr_status_wire::SessionToolsRow::default(),
             req_per_minute: vec![0, 1, 2],
             cost_usd: 0.5,
