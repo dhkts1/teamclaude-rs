@@ -12,6 +12,11 @@ import TcrBarCore
 ///    30 % one look like similar amounts of ink.
 ///  - The percentage sits in its own fixed 40 pt column, right-aligned, so two
 ///    windows' digits line up and every `resets …` starts at one x.
+///  - The window's verdict is SPOKEN, not only tinted. The label names the
+///    window and the value carries the percentage, the state word and the
+///    reset countdown — an `accessibilityLabel` carrying the percentage
+///    overrode the combined children, so the `resets 3d 22h` caption and the
+///    near/spent state reached a listener through nothing at all.
 ///  - The fill is a STATUS colour, taken from the window's own state
 ///    (`ok` / `warn` at the server's near threshold / `bad` over it) and never
 ///    from the enclosing group's identity colour. A 98 % window used to draw in
@@ -37,7 +42,7 @@ struct QuotaRow: View {
         }
     }
 
-    /// The window's own state, or `nil` when there is nothing to state.
+    /// The window's own state, or `nil` when the server stated none.
     ///
     /// `.unknown` is a token THIS build cannot name, not a missing reading: the
     /// panel has no copy of the server's near-limit threshold, so it may not
@@ -45,20 +50,39 @@ struct QuotaRow: View {
     /// What it must never do is what the first v4 render did — fall through to
     /// the `unmeasured` violet and paint a 98 % window the same colour as an
     /// account nothing has ever measured.
+    ///
+    /// `nil` for BOTH absences — nothing measured, and measured with no band —
+    /// because a state word is what neither of them has. What separates them
+    /// is whether the bar draws at all, and that is ``fillTint``'s question,
+    /// not this one's.
     private var role: QuotaState? {
         switch tint {
-        case .unmeasured: return nil
+        case .unmeasured, .measuredWithoutState: return nil
         case .state(let state): return state
         }
     }
 
-    private var fillTint: Color {
-        switch role {
-        case .some(.near): return Tok.near
-        case .some(.spent): return Tok.spent
-        case .some(.ok): return Tok.ok
-        case .some(.unknown): return Tok.mute
-        case .none: return Tok.unmeasured
+    /// The fill's colour, or `nil` for a window with no reading — which draws
+    /// NO fill at all, not a coloured sliver.
+    ///
+    /// `V4.barMinWidth` exists so a 0.4 % window is still visible as a mark
+    /// rather than nothing. Applied to an UNMEASURED window it painted 2 pt of
+    /// `Tok.unmeasured` at the left of an empty track, which says "a little
+    /// has been spent" about an account nothing has ever probed — the one
+    /// reading this row exists to distinguish from a real zero, drawn as a
+    /// real zero. The empty track and the `n/a` percentage beside it are the
+    /// whole statement.
+    private var fillTint: Color? {
+        switch tint {
+        case .unmeasured: return nil
+        // A reading with no band: the sheet's `.bar i.neutral` grey, the same
+        // ink an `.unknown` token draws. Something WAS measured, so the bar
+        // draws; nobody said how close to a limit it is, so it draws neutral.
+        case .measuredWithoutState: return Tok.mute
+        case .state(.near): return Tok.near
+        case .state(.spent): return Tok.spent
+        case .state(.ok): return Tok.ok
+        case .state(.unknown): return Tok.mute
         }
     }
 
@@ -83,9 +107,11 @@ struct QuotaRow: View {
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: V4.barRadius)
                         .fill(Tok.ink.opacity(V4.barTrackAlpha))
-                    RoundedRectangle(cornerRadius: V4.barRadius)
-                        .fill(fillTint)
-                        .frame(width: max(V4.barMinWidth, proxy.size.width * fraction))
+                    if let fillTint {
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            .fill(fillTint)
+                            .frame(width: max(V4.barMinWidth, proxy.size.width * fraction))
+                    }
                 }
             }
             .frame(height: V4.barHeight)
@@ -103,6 +129,9 @@ struct QuotaRow: View {
         .frame(minHeight: V4.lineHeight(V4.dimSize))
         .padding(.top, V4.quotaMarginTop)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(label) window, \(QuotaFormat.percent(value)) used")
+        .accessibilityLabel("\(label) window")
+        .accessibilityValue(
+            QuotaFormat.spokenWindowValue(
+                value: value, state: role, resetAtMs: resetAtMs, now: now))
     }
 }

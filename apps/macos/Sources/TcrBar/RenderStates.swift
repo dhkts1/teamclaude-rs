@@ -201,7 +201,7 @@ enum RenderStates {
         for scene in scenes {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(scene, appearance: appearance, density: .compact, into: directory) {
+                if render(scene, appearance: appearance, density: .auto, into: directory) {
                     written += 1
                 }
             }
@@ -209,6 +209,12 @@ enum RenderStates {
             // see `densityVariantScenes` — so the mockup comparison stays
             // possible at both densities `PanelDensityPreference` offers,
             // not only the shipped default.
+            //
+            // The main pass above is `.auto`, the shipped default since Gil's
+            // "make compact the default please above 4 accounts": forcing
+            // `.compact` there would have made every PNG in this set a
+            // picture of a setting nobody has, which is the one thing a
+            // review harness may not be.
             if densityVariantScenes.contains(scene.name) {
                 for appearance in Appearance.allCases {
                     attempted += 1
@@ -236,8 +242,8 @@ enum RenderStates {
         }
     }
 
-    /// Scenes rendered twice — once at `V4`'s shipped `.compact` default,
-    /// once forced to `.comfortable` — so the one fixture compared against
+    /// Scenes rendered twice — once at `V4`'s shipped `.auto` default, once
+    /// forced to `.comfortable` — so the one fixture compared against
     /// the mockup crop (`data/plans/panel-density-bridge.md`) stays
     /// comparable at both densities, not only the one now shipping. Every
     /// other scene renders `.compact` alone: this harness is a review
@@ -944,9 +950,17 @@ enum RenderStates {
     private static var accountsParityJSON: String {
         // "$540 · 1.5M out" and "$1,190 · 3.1M out" on the two solo cards'
         // plan lines, the mockup's own figures.
+        // `henry10` carries a Fable weekly window and `henry5` below does not,
+        // so this one scene shows both halves of the rule the card follows: a
+        // third `fable` row when ``Account/sevenDayOi`` is present, and NO row
+        // at all when it is absent. An empty `fable` track on an account with
+        // no such window would claim a window that does not exist, and a
+        // fixture where every row has one could not tell the two apart.
         let solo1 = account(
             "henry10@example.com", quota: "0.07", state: "ok", sevenDay: "0.30",
-            sevenDayState: "ok", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            sevenDayState: "ok",
+            fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            sevenDayOi: "0.71", sevenDayOiState: "near", sevenDayOiResetInMinutes: 6_498,
             usage: measuredUsage(
                 todayCost: 540.12, windowCost: 540.12, windowOutputTokens: 1_500_000),
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")

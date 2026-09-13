@@ -19,14 +19,19 @@ import TcrBarCore
 /// two exceptions below (`trend`, `info`) are roles the palette has no token for
 /// and are named as such.
 enum V4 {
-    /// Which of the two ``PanelDensity`` values the type and box tokens below
-    /// shrink for (Gil, 2026-09-13: "yes the right compact is better" —
-    /// `data/plans/panel-density-bridge.md`). A plain `UserDefaults` read
-    /// through `PanelDensityPreference.current()`, not a stored value: every
-    /// token below is a computed `static var` re-evaluated on each draw, so
-    /// the Settings-window picker takes effect on the panel's next redraw
-    /// with nothing to wire, restart or invalidate.
-    static var compact: Bool { PanelDensityPreference.current() == .compact }
+    /// Whether the type and box tokens below shrink (Gil, 2026-09-13: "yes the
+    /// right compact is better" — `data/plans/panel-density-bridge.md`).
+    ///
+    /// ``PanelDensityPreference/resolved(defaults:accounts:)``, not
+    /// `current() == .compact`: the shipped default is `.auto`, and against
+    /// `.auto` that comparison is false — which would have quietly made
+    /// Comfortable the default for every fleet, whatever its size. The
+    /// resolver is the one place that decides, and it is read rather than
+    /// stored: every token below is a computed `static var` re-evaluated on
+    /// each draw, so the Settings picker AND a fleet that grew past the
+    /// ceiling both take effect on the panel's next redraw with nothing to
+    /// wire, restart or invalidate.
+    static var compact: Bool { PanelDensityPreference.resolved() == .compact }
 
     // MARK: - Panel (`.panel`)
 
@@ -103,8 +108,17 @@ enum V4 {
 
     // MARK: - Quota grid (`.q`)
 
-    /// `grid-template-columns:24px 1fr 40px auto`.
-    static let quotaLabelWidth: CGFloat = 24
+    /// `grid-template-columns:24px 1fr 40px auto` — with the first track
+    /// widened from the sheet's 24.
+    ///
+    /// 24 pt fits `5h` and `7d`, which is every label the mockup's card has.
+    /// The Fable weekly window's label is a WORD, and at 24 pt `fable` wrapped
+    /// to `fabl` / `e` and grew the row by a line — measured in
+    /// `01-healthy-auto-dark.png` before this changed. One track, not two:
+    /// three bars starting at three different x is the misalignment this grid
+    /// exists to prevent, so the column is sized for the longest label the card
+    /// can draw and every row keeps it.
+    static var quotaLabelWidth: CGFloat { compact ? 32 : 34 }
     static let quotaPercentWidth: CGFloat = 40
     static let quotaGap: CGFloat = 8
     static var quotaMarginTop: CGFloat { compact ? 4 : 6 }
@@ -307,6 +321,15 @@ enum V4 {
     /// `scale .96 over 120 ms` on press; `spring, damping 1.0, response 0.3` for a
     /// tab switch or an expand.
     static let pressScale: CGFloat = 0.96
+    /// `.more:hover{background:rgba(255,255,255,.07)}` — and the same +.07 the
+    /// sheet's other hovers are: `.btn` goes `.10` to `.17`, `.more` `0` to
+    /// `.07`. Added OVER whatever fill a control already has, so one rule
+    /// reproduces both rather than a hover value per control.
+    static let hoverFillAlpha: Double = 0.07
+    /// `transition:background-color .15s cubic-bezier(.2,0,0,1)`. Inside the
+    /// sheet's `@media (prefers-reduced-motion:no-preference)` block, which is
+    /// why Reduce Motion drops the transition and keeps the hover.
+    static let hoverDuration: Double = 0.15
     static let springResponse: Double = 0.3
     static let springDamping: Double = 1.0
 

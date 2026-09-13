@@ -29,12 +29,14 @@ struct PanelHeader: View {
                     .font(V4.font(V4.titleSize, .bold))
                     .tracking(V4.titleTracking)
                     .foregroundStyle(Tok.ink)
-                Spacer(minLength: V4.headerGap)
+                    .layoutPriority(1)
+                Spacer(minLength: 0)
                 if let freshness {
                     Text(freshness)
                         .font(V4.font(V4.freshnessSize))
                         .foregroundStyle(Tok.mute)
                         .lineLimit(1)
+                        .fixedSize()
                 }
             }
             .frame(minHeight: V4.lineHeight(V4.titleSize))
@@ -56,7 +58,7 @@ struct PanelHeader: View {
                         .fill(Tok.ink.opacity(V4.gearFillAlpha))
                 )
         }
-        .buttonStyle(V4PressStyle())
+        .buttonStyle(V4PressStyle(cornerRadius: V4.gearRadius))
         .accessibilityLabel("Settings")
         .keyboardShortcut(",", modifiers: .command)
         .help("Settings… ⌘,")

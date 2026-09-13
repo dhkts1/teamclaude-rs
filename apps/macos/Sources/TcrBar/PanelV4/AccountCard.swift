@@ -13,10 +13,19 @@ import TcrBarCore
 ///    What a card inside a group draws, where the group's own legend already
 ///    carries the context the plan line would repeat.
 ///
+/// The trailing slot carries the account's own controls — the actions menu, and
+/// `Re-login…` on a broken card. They used to be reachable by right-click ALONE
+/// (`.contextMenu` was the card's only interaction), so every per-account
+/// action — Re-login, Enable/Disable, Use as Control Account, Copy Access
+/// Token, Mint Long-Lived Token, Delete Account, Remove from group, two of them
+/// destructive — was unreachable from a keyboard, and a card reading NEEDS
+/// RE-LOGIN offered no visible way to repair itself. The context menu stays as
+/// the second route.
+///
 /// The pills are outlined, never filled, and the state pill agrees with the bars
 /// below it: both are computed from the same ``FleetTally/Kind`` classifier, so a
 /// card can no longer read OK over a 98 % bar.
-struct AccountCard: View {
+struct AccountCard<Actions: View>: View {
     enum Shape {
         case full
         case compact
@@ -25,18 +34,36 @@ struct AccountCard: View {
     let account: Account
     var shape: Shape = .full
     let now: Date
+    /// The card's visible per-account controls — the actions menu, and the
+    /// re-login button on a broken account. A closure so ``AccountCard`` stays
+    /// free of the controllers those controls are wired to: they are built from
+    /// the ONE definition in `AccountRow`, and a second copy for the v4 card
+    /// would be a second thing to keep in step with `tcr`'s subcommands.
+    @ViewBuilder var actions: () -> Actions
 
     var body: some View {
         V4Card {
-            V4Row {
-                nameRow
-            } trailing: {
-                HStack(spacing: V4.pillGap) {
-                    if shape == .full, isRotating {
-                        V4Pill(text: "Rotating")
+            HStack(spacing: V4.pillGap) {
+                // The informational half of the header is ONE accessibility
+                // element. VoiceOver walked roughly eight stops per card before
+                // this — name, each pill, the plan line, each bar — to reach a
+                // card that, being a `.contain` container with no label of its
+                // own, could not be focused or summarised at any of them.
+                V4Row {
+                    nameRow
+                } trailing: {
+                    HStack(spacing: V4.pillGap) {
+                        if let rotation = rotationPillText {
+                            V4Pill(text: rotation, help: account.rotationHelp)
+                        }
+                        V4Pill(text: statePillText, role: statePillRole, help: account.stateHelp)
                     }
-                    V4Pill(text: statePillText, role: statePillRole)
                 }
+                .accessibilityElement(children: .combine)
+                // The actions sit OUTSIDE that element, so they stay their own
+                // focusable children. Combining them in would have made the
+                // card one stop and taken every per-account action with it.
+                actions()
             }
             if shape == .full {
                 if let plan = planLine {
@@ -49,7 +76,11 @@ struct AccountCard: View {
                 }
             }
         }
+        // `.contain` WITH a label. Without one the container has no accessible
+        // name, so it cannot take focus and a user arriving at the card is told
+        // nothing about which account they have arrived at.
         .accessibilityElement(children: .contain)
+        .accessibilityLabel(account.cardSummaryLabel(now: now))
     }
 
     @ViewBuilder
@@ -79,15 +110,28 @@ struct AccountCard: View {
         }
     }
 
-    /// `Rotating` — the account is in the pool right now. Suppressed on a
-    /// compact card: every row inside a parked group is out of rotation and the
-    /// legend says so once for all of them.
-    private var isRotating: Bool {
-        !account.disabled && !account.isParkedByGroup && !account.isRejected
+    /// `Rotating` / `Group only` — ``Account/rotationLabel``, and nothing
+    /// re-derived here.
+    ///
+    /// It used to be `!disabled && !isParkedByGroup && !isRejected`, which
+    /// missed the dead-credential case entirely — a card read ROTATING beside
+    /// NEEDS RE-LOGIN — and had no word for a reserved account at all.
+    ///
+    /// `"Rotating"` alone is dropped on a compact card, and `"Group only"` is
+    /// not. A compact card is a card inside a group box, and what that box's
+    /// legend says once for all of its members is whether the GROUP is parked —
+    /// so repeating "rotating" per row is noise. It says nothing about the
+    /// group being RESERVED, which is what "Group only" reports, and suppressing
+    /// both left the one account the word describes with no word at all: the
+    /// `research` group in `01-healthy` is reserved, and its member's card drew
+    /// an unqualified OK.
+    private var rotationPillText: String? {
+        guard let rotation = account.rotation else { return nil }
+        if shape == .compact, rotation == .rotating { return nil }
+        return rotation.label
     }
-
     private var kind: FleetTally.Kind {
-        account.disabled ? .disabled : FleetTally.Kind(account: account)
+        FleetTally.Kind(account: account)
     }
 
     private var statePillText: String {
@@ -97,6 +141,7 @@ struct AccountCard: View {
         case .spent: return "Spent"
         case .unknown: return "Unknown"
         case .needsRelogin: return "Needs re-login"
+        case .rejected: return "Rejected"
         case .unmeasured: return "Unmeasured"
         case .disabled: return "Parked"
         }
@@ -106,7 +151,7 @@ struct AccountCard: View {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin: return .bad
+        case .spent, .needsRelogin, .rejected: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }
@@ -141,12 +186,31 @@ struct AccountCard: View {
         let resetAtMs: Int64?
     }
 
-    /// The two windows the mockup's card draws. A window with no reading at all
-    /// is still drawn — an empty track is a fact ("never measured"), and dropping
-    /// the row would make a card that has never been probed look like one with
-    /// nothing to report.
+    /// The windows the card draws: the mockup's two, plus `fable` under them
+    /// when this account has one.
+    ///
+    /// `5h` and `7d` are drawn even with no reading at all — an empty track is
+    /// a fact ("never measured"), and dropping the row would make a card that
+    /// has never been probed look like one with nothing to report.
+    ///
+    /// `fable` is the opposite case and is drawn only when ``Account/sevenDayOi``
+    /// is non-nil. It is a SEPARATE window with a separate reset, gating Fable
+    /// requests alone (`docs/cli.md`, "The weekly quota pair on `--json`"): a
+    /// non-Fable request never checks it, and `held[]`/`quotaState` never
+    /// reflect it — so it cannot be read off the `7d` bar above it, and an
+    /// empty `fable` track on an account that simply has no such window would
+    /// be a claim about a window that does not exist. The pre-v4 card drew it
+    /// as a label on the 7d line (`Account.fableWeeklyLabel`, "fable 71% · in
+    /// 4d 12h"); the v4 transcription referenced it nowhere at all, so the
+    /// panel drew no Fable figure while the router was gating on one (Gil,
+    /// 2026-09-13: "why i dont see fable like we had before?").
+    ///
+    /// Its tint comes from ``Account/fableBarTintSource`` and never from
+    /// `quotaBarTintSource(for:)`: that function's old-server fallback borrows
+    /// the composite `quotaState`, which for this window would be a reading of
+    /// something else entirely.
     private var quotaWindows: [Window] {
-        [
+        var windows = [
             Window(
                 label: "5h", value: account.fiveHour,
                 tint: account.quotaBarTintSource(for: .fiveHour),
@@ -156,5 +220,13 @@ struct AccountCard: View {
                 tint: account.quotaBarTintSource(for: .sevenDay),
                 resetAtMs: account.sevenDayResetAtMs),
         ]
+        if account.sevenDayOi != nil {
+            windows.append(
+                Window(
+                    label: "fable", value: account.sevenDayOi,
+                    tint: account.fableBarTintSource,
+                    resetAtMs: account.sevenDayOiResetAtMs))
+        }
+        return windows
     }
 }

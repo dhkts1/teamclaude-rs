@@ -232,12 +232,21 @@ struct FleetView: View {
             badges: v4Badges,
             onSelect: { selectedTab = $0 },
             onSettings: onSettings,
+            accountCount: v4AccountCount,
             summary: { v4Summary },
             content: { v4Content },
             footer: { v4Footer }
         )
     }
 
+    /// Every account row the Accounts tab would draw, or `nil` when there is no
+    /// fleet to draw — what `PanelDensity.auto` decides against. Parked and
+    /// disabled rows count: they cost the panel exactly as much height as a
+    /// serving one, and the rule is about how much is in the panel.
+    private var v4AccountCount: Int? {
+        guard case .loaded(let fleet) = poller.state else { return nil }
+        return fleet.accounts.count
+    }
     /// The two facts about WHERE the Accounts tab's numbers come from, on one
     /// line under the summary: a row `tcr` sent that this build could not read,
     /// and which account every quota measurement was taken through.
@@ -430,22 +439,39 @@ struct FleetView: View {
             // `AccountRow`'s menu, rendered with no row around it. A second
             // copy of that menu for the v4 card is a second thing to keep in
             // step with `tcr`'s subcommands.
-            AccountRow(
-                account: account,
-                countersAreStructural: fleet.source.countersAreStructural,
-                accounts: accounts,
-                control: control,
-                onChanged: { await poller.pollOnce() },
-                onRelogin: { reloginAccount(account.ref) },
-                onMint: { mintAccountToken(account.ref) },
-                onMintGroup: { group in mintGroupTokens(group) },
-                groupController: groupController,
-                removeController: removeController,
-                allAccounts: fleet.accounts,
-                snapshotMode: snapshotMode,
-                menuOnly: true
-            )
+            v4AccountRow(account, in: fleet, menuOnly: true)
+        } actions: { account in
+            // The SAME definition again, drawn this time as the visible
+            // controls in the card's trailing slot. `.contextMenu` was the
+            // card's only interaction until now: seven per-account actions,
+            // two destructive, reachable by pointer alone.
+            v4AccountRow(account, in: fleet, actionsOnly: true)
         }
+    }
+
+    /// One `AccountRow`, built exactly as the legacy panel builds it, rendering
+    /// either its menu items alone or its visible controls alone. Both slots of
+    /// the v4 card come through here so the two can never be wired to different
+    /// controllers.
+    private func v4AccountRow(
+        _ account: Account, in fleet: Fleet, menuOnly: Bool = false, actionsOnly: Bool = false
+    ) -> AccountRow {
+        AccountRow(
+            account: account,
+            countersAreStructural: fleet.source.countersAreStructural,
+            accounts: accounts,
+            control: control,
+            onChanged: { await poller.pollOnce() },
+            onRelogin: { reloginAccount(account.ref) },
+            onMint: { mintAccountToken(account.ref) },
+            onMintGroup: { group in mintGroupTokens(group) },
+            groupController: groupController,
+            removeController: removeController,
+            allAccounts: fleet.accounts,
+            snapshotMode: snapshotMode,
+            menuOnly: menuOnly,
+            actionsOnly: actionsOnly
+        )
     }
 
     /// `.foot` plus everything that has to sit above its rule: the action row,
@@ -1831,7 +1857,7 @@ struct FleetView: View {
         switch kind {
         case .ok: return Tok.color(for: QuotaState.ok)
         case .near: return Tok.color(for: QuotaState.near)
-        case .spent, .needsRelogin: return Tok.spent
+        case .spent, .needsRelogin, .rejected: return Tok.spent
         case .unknown: return Tok.unknown
         case .unmeasured: return Tok.unmeasured
         case .disabled: return Tok.disabled
@@ -2861,6 +2887,19 @@ struct AccountRow: View {
     /// constructed exactly as the legacy panel constructs it; only its `body`
     /// differs.
     var menuOnly: Bool = false
+    /// Render ONLY this row's visible controls, with no row around them — what
+    /// the v4 account card draws in its trailing slot (``AccountsTabV4``).
+    ///
+    /// The sibling of ``menuOnly`` and for the same reason: `contextMenuItems`,
+    /// ``accountActionsMenu`` and ``reloginButton`` are all wired to THIS row's
+    /// controllers and its own `perform…` methods, so lifting either set into a
+    /// standalone view would make the gear menu and the card's controls two
+    /// definitions of what an account can do. The row is constructed exactly as
+    /// the legacy panel constructs it; only its `body` differs.
+    ///
+    /// Takes precedence over ``menuOnly`` when both are set, which no call site
+    /// does — the card passes one or the other.
+    var actionsOnly: Bool = false
     /// The last "Copy Access Token" that did not land — `tcr`'s own words,
     /// drawn under the row like the other failure lines. Row-local rather
     /// than a controller: nothing else needs to know, and a copy that did
@@ -2934,6 +2973,9 @@ struct AccountRow: View {
         if hasStaleQuotaReading { return Tok.disabled }
         switch account.quotaBarTintSource(for: .fiveHour) {
         case .unmeasured: return Tok.unmeasured
+        // `quotaBarTintSource(for:)` never returns this — it belongs to the
+        // Fable window, which this legacy row draws as a label, not a bar.
+        case .measuredWithoutState: return Tok.mute
         case .state(let state): return Tok.color(for: state)
         }
     }
@@ -2944,6 +2986,7 @@ struct AccountRow: View {
         if hasStaleQuotaReading { return Tok.disabled }
         switch account.quotaBarTintSource(for: .sevenDay) {
         case .unmeasured: return Tok.unmeasured
+        case .measuredWithoutState: return Tok.mute
         case .state(let state): return Tok.color(for: state)
         }
     }
@@ -3448,10 +3491,30 @@ struct AccountRow: View {
     }
 
     var body: some View {
-        if menuOnly {
+        if actionsOnly {
+            v4CardActions
+        } else if menuOnly {
             contextMenuItems
         } else {
             rowBody
+        }
+    }
+
+    /// The v4 card's trailing controls: the actions menu, and `Re-login…` ahead
+    /// of it on a broken account.
+    ///
+    /// `Re-login…` is drawn rather than left in the menu because a card reading
+    /// NEEDS RE-LOGIN offering no visible way to repair itself is the state the
+    /// panel exists to get an operator out of. It leads the pair for the same
+    /// reason the pre-v4 row puts it beside ``toggleButton``: it is the action
+    /// the card's own pill is asking for.
+    @ViewBuilder
+    private var v4CardActions: some View {
+        HStack(spacing: V4.pillGap) {
+            if account.health == .needsRelogin {
+                reloginButton
+            }
+            accountActionsMenu
         }
     }
 

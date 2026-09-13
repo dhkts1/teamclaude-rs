@@ -39,6 +39,12 @@ struct V4Pill: View {
 
     let text: String
     var role: Role = .neutral
+    /// The sentence behind the word — what this state means and, where there is
+    /// one, the remedy. A pill names a state in ten characters; a PARKED pill
+    /// that does not say WHICH group is parked or that `tcr group unpark` is
+    /// the way out names the state without naming anything the operator can do
+    /// about it. The pre-v4 row already wrote these sentences.
+    var help: String?
 
     var body: some View {
         Text(text.uppercased())
@@ -54,5 +60,7 @@ struct V4Pill: View {
                     .strokeBorder(role.border, lineWidth: V4.pillBorderWidth)
             )
             .accessibilityLabel(text)
+            .accessibilityValue(help ?? "")
+            .help(help ?? text)
     }
 }
