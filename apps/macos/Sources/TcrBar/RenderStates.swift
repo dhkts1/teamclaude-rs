@@ -154,7 +154,29 @@ enum RenderStates {
                 "19-accounts-tab-parity", .loaded(accountsParityFleet), false,
                 "henry10@example.com"
             ),
+            // The row `v4UpdateRow` restored (FleetView.swift): an available
+            // update, drawn under the summary with the "Update…" button —
+            // see ``updateState(for:)`` for how the `Updater` gets there.
+            ("21-update-available", .loaded(fleet(healthyJSON)), false, nil),
+            // Same row, the failure branch — the reason in place of the
+            // button, and no button at all.
+            ("21b-update-failed", .loaded(fleet(healthyJSON)), false, nil),
         ]
+    }
+
+    /// The ``UpdateState`` a scene's `Updater` should report, or `nil` for
+    /// every scene not about the update row — the same by-name lookup
+    /// ``initialTab(for:)`` already uses rather than a tuple element every
+    /// other scene would carry for nothing.
+    private static func updateState(for sceneName: String) -> UpdateState? {
+        switch sceneName {
+        case "21-update-available": return .available(version: "0.2.50")
+        case "21b-update-failed":
+            return .failed(
+                "the proxy on :3456 rejected the api-key in "
+                    + "~/.config/teamclaude.json while checking the feed")
+        default: return nil
+        }
     }
 
     /// The sign-in sheet (``LoginSheet``), one PNG per state, drawn WHERE IT
@@ -388,6 +410,11 @@ enum RenderStates {
         let awake = AwakeController.harness()
         awake.setOn(scene.awake)
 
+        let updater = Updater(startingUpdater: false)
+        if let state = updateState(for: scene.name) {
+            updater.setUpdateStateForPreview(state)
+        }
+
         // `expandedGroups` reads `UserDefaults.standard` at construction
         // — real for the shipping app, but this harness only ever runs under
         // `TCRBAR_DEV_BUILD=1`'s OWN bundle id (`build-tcrbar.sh`'s own
@@ -426,7 +453,9 @@ enum RenderStates {
                 // `startingUpdater: false`: this process was asked for PNGs. A
                 // started updater schedules background checks and can put a
                 // window on screen, neither of which belongs in a render run.
-                updater: Updater(startingUpdater: false),
+                // `updateState(for:)` above sets ``Updater/updateState``
+                // directly for the two scenes that need it.
+                updater: updater,
                 groupController: GroupController(),
                 removeController: RemoveAccountController(),
                 startServerAtLaunch: .constant(false),
