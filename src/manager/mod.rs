@@ -1849,9 +1849,24 @@ impl Manager {
                 "more than one loaded config account carries this identity; refusing to guess which one just rotated, so the rotated token will not reach disk and this account may need `tcr login`"
             ),
         }
-        // Tokens only: the in-memory config is a boot-time snapshot, so writing
-        // it whole would stamp stale settings over the user's live file.
-        if let Err(err) = config::save_tokens(path, &snapshot) {
+        // Tokens only, and only THIS account's: the in-memory config is a
+        // boot-time snapshot, so writing it whole would stamp stale settings over
+        // the user's live file. Its CREDENTIALS for the other accounts are stale
+        // in the same way and cost more to lose, because another process that
+        // refreshed or re-authed one of them in the meantime gets its single-use
+        // refresh token reverted and that account dies until `tcr login`. See
+        // `config::CredentialScope`.
+        //
+        // A placement that is not `One` means the rotated credential never
+        // reached the snapshot at all (both branches above say exactly that), so
+        // there is nothing of ours to persist and the only thing a write could do
+        // is stamp stale copies over whatever is on disk. Write nothing.
+        let crate::identity::Resolved::One(position) = placement else {
+            return;
+        };
+        if let Err(err) =
+            config::save_tokens_for(path, &snapshot, config::CredentialScope::Only(position))
+        {
             tracing::error!(error = %err, "failed to persist refreshed token to config");
         }
     }
@@ -3664,6 +3679,70 @@ mod tests {
             b"{\"successor\":true}",
             "a released manager overwrote the successor's config file"
         );
+    }
+
+    /// `persist_tokens` must write ONLY the account it rotated.
+    ///
+    /// `config::CredentialScope` makes that expressible; this is the test that
+    /// it is USED. Every config-level test passes with `persist_tokens` handing
+    /// over `CredentialScope::All`, so without this the fix could be reverted
+    /// and nothing would go red.
+    ///
+    /// The story: the manager holds a boot-time snapshot. Another `tcr` process
+    /// re-auths `acct-b`, putting a fresh single-use refresh token on disk. The
+    /// manager then rotates `acct-a` and persists. Its snapshot still carries
+    /// b's OLD credential, and writing it would leave b dead until re-authed by
+    /// hand. Strictly ordered, no concurrency, which is why a file lock is not
+    /// the fix here.
+    #[test]
+    fn a_rotation_persists_only_the_rotated_account() {
+        let path = tmp_config_path("scoped-persist");
+        let config = config_with(vec![account("a", 0), account("b", 1)]);
+        let manager = build_manager_with_path(config, path.clone());
+
+        // Establish the file from the manager's own snapshot, so an unchanged
+        // value below cannot just mean nothing ever writes here.
+        manager.persist_now();
+        let before = std::fs::read_to_string(&path).expect("the persist must write the file");
+        assert!(
+            before.contains("rt-b"),
+            "precondition: acct-b's original credential is on disk: {before}"
+        );
+
+        // Another process re-auths acct-b. Completes before the rotation below.
+        let mut relogin = crate::config::load(&path).expect("the file we just wrote loads");
+        relogin.accounts[1].refresh_token = Some("rt-b-relogin".to_string());
+        crate::config::save_tokens(&path, &relogin).expect("the re-auth write");
+
+        // The manager rotates acct-a only.
+        manager.persist_tokens(
+            "a",
+            None,
+            None,
+            None,
+            &Tokens {
+                access_token: "at-a-rotated".to_string(),
+                refresh_token: Some("rt-a-rotated".to_string()),
+                expires_at_ms: crate::now_ms() + 3_600_000,
+            },
+        );
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read back"))
+                .expect("the config stays valid JSON");
+        assert_eq!(
+            value["accounts"][0]["refreshToken"],
+            serde_json::json!("rt-a-rotated"),
+            "the rotation this persist exists for must land"
+        );
+        assert_eq!(
+            value["accounts"][1]["refreshToken"],
+            serde_json::json!("rt-b-relogin"),
+            "rotating acct-a reverted acct-b's re-auth; that token is single-use \
+             and acct-b is now dead until `tcr login`"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     /// Released is terminal. Nothing clears it, and releasing twice is safe --

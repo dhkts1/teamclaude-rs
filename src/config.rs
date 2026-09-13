@@ -1794,7 +1794,57 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
 /// key the user just DELETED would reappear as its default (`"pacing": {}`) and a
 /// key they never wrote would appear for the first time. Editing the parsed
 /// document leaves the file byte-identical apart from the credential fields.
+/// Which accounts' credentials a token write is allowed to touch.
+///
+/// The in-memory config is a boot-time snapshot. [`Manager::persist_tokens`]
+/// already knew not to write SETTINGS from it ("writing it whole would stamp
+/// stale settings over the user's live file") and then wrote every account's
+/// CREDENTIALS from that same snapshot, which are stale in exactly the same way
+/// and far more expensive to lose. Another process that refreshed or re-authed
+/// an account in the meantime gets its single-use refresh token stamped back to
+/// the snapshot's copy; that account then 400s `invalid_grant` on its next
+/// refresh and is dead until re-authed by hand.
+///
+/// No lock fixes this. The staleness is in the writer's memory, not in its file
+/// access, so two writes that are already strictly ordered still lose the token
+/// (see `a_stale_snapshot_reverts_another_processs_rotated_token`). What fixes
+/// it is that a rotation knows which account it rotated, and says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CredentialScope {
+    /// Every account in the snapshot. Correct only for a writer that genuinely
+    /// speaks for the whole fleet, which is the shutdown flush and nothing else.
+    All,
+    /// Only the account at this index in `memory.accounts`. Every rotation:
+    /// [`crate::identity::Resolved::One`] already carries this index.
+    Only(usize),
+}
+
+impl CredentialScope {
+    /// Whether a loaded account at `position` is this write's business.
+    fn covers(self, position: usize) -> bool {
+        match self {
+            Self::All => true,
+            Self::Only(only) => only == position,
+        }
+    }
+}
+
 pub fn save_tokens(path: &Path, memory: &Config) -> Result<(), ConfigError> {
+    save_tokens_for(path, memory, CredentialScope::All)
+}
+
+/// [`save_tokens`], restricted to the accounts `scope` names.
+///
+/// The fallback paths below are deliberately NOT scoped. They fire only when the
+/// file is unreadable, malformed, or has no usable accounts list, and the
+/// existing policy there is to write the snapshot whole rather than lose a
+/// rotated token into a broken file. That is unchanged; a scope narrows the
+/// normal merge, not the salvage.
+pub fn save_tokens_for(
+    path: &Path,
+    memory: &Config,
+    scope: CredentialScope,
+) -> Result<(), ConfigError> {
     let mut doc = match read_document(path) {
         Ok(doc) => doc,
         Err(ConfigError::Io(err)) => {
@@ -1814,7 +1864,7 @@ pub fn save_tokens(path: &Path, memory: &Config) -> Result<(), ConfigError> {
             return save(path, memory);
         }
     };
-    let report = match merge_tokens(&mut doc, memory) {
+    let report = match merge_tokens(&mut doc, memory, scope) {
         Ok(report) => report,
         Err(reason) => {
             tracing::warn!(
@@ -1964,6 +2014,11 @@ struct MergeReport {
     /// Names of loaded accounts with no on-disk entry to write into. Benign when
     /// the user deleted the account; a token loss when they renamed it.
     absent_from_disk: Vec<String>,
+    /// Entries left alone because [`CredentialScope`] did not name them. Counted
+    /// rather than listed: this is the normal, expected outcome for every
+    /// account a rotation did not rotate, and naming them would warn on every
+    /// refresh for the life of the process.
+    out_of_scope: usize,
 }
 
 impl MergeReport {
@@ -2024,7 +2079,11 @@ impl MergeReport {
 /// back to writing the config whole rather than lose every rotated token in the
 /// one write. A skipped entry is not an error for the others — the merge runs to
 /// the end of the list either way.
-fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeReport, Unmergeable> {
+fn merge_tokens(
+    doc: &mut Map<String, Value>,
+    memory: &Config,
+    scope: CredentialScope,
+) -> Result<MergeReport, Unmergeable> {
     // Plan against an IMMUTABLE view first. Deciding one entry at a time under a
     // mutable borrow is what made the old first-match resolution unfixable: the
     // assignment for entry N depends on which accounts the other entries claim,
@@ -2061,6 +2120,14 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeRe
             }
             EntryPlan::Write(position) => position,
         };
+        // Not this write's account. NOT a `skipped` entry: that list means "a
+        // credential we meant to write and could not", and every one of those is
+        // warned about as a consumed single-use token. Declining to write an
+        // account we never rotated is the opposite of a loss.
+        if !scope.covers(position) {
+            report.out_of_scope += 1;
+            continue;
+        }
         // A `Write` plan only comes from an entry the planner parsed, so both of
         // these hold by construction.
         let (Some(object), Some(fresh)) = (entry.as_object_mut(), memory.accounts.get(position))
@@ -2097,12 +2164,15 @@ fn merge_tokens(doc: &mut Map<String, Value>, memory: &Config) -> Result<MergeRe
         }
     }
 
+    // In-scope only: an account this write was never going to touch is not
+    // "absent from disk", it is none of this write's business.
     report.absent_from_disk = memory
         .accounts
         .iter()
+        .enumerate()
         .zip(&placed)
-        .filter(|(_, seen)| !**seen)
-        .map(|(account, _)| account.name.clone())
+        .filter(|((position, _), seen)| scope.covers(*position) && !**seen)
+        .map(|((_, account), _)| account.name.clone())
         .collect();
     Ok(report)
 }
@@ -4575,7 +4645,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = merge_tokens(&mut doc, &memory).unwrap();
+        let report = merge_tokens(&mut doc, &memory, CredentialScope::All).unwrap();
 
         assert_eq!(
             report.skipped,
@@ -4720,7 +4790,7 @@ mod tests {
 
         let mut doc: Map<String, Value> = serde_json::from_str(malformed).unwrap();
         assert_eq!(
-            merge_tokens(&mut doc, &memory),
+            merge_tokens(&mut doc, &memory, CredentialScope::All),
             Err(Unmergeable::Missing),
             "the caller must be told, not handed a silently untouched document"
         );
@@ -4754,7 +4824,7 @@ mod tests {
 
         let mut doc: Map<String, Value> = serde_json::from_str(malformed).unwrap();
         assert_eq!(
-            merge_tokens(&mut doc, &memory),
+            merge_tokens(&mut doc, &memory, CredentialScope::All),
             Err(Unmergeable::NotAnArray)
         );
 
@@ -4788,7 +4858,8 @@ mod tests {
         .unwrap();
 
         let mut doc = read_document(&path).unwrap();
-        let report = merge_tokens(&mut doc, &memory).expect("the document has an accounts array");
+        let report = merge_tokens(&mut doc, &memory, CredentialScope::All)
+            .expect("the document has an accounts array");
         assert_eq!(
             report.skipped,
             vec![SkippedEntry {
@@ -4840,7 +4911,8 @@ mod tests {
         .unwrap();
 
         let mut doc = read_document(&path).unwrap();
-        let report = merge_tokens(&mut doc, &memory).expect("the document has an accounts array");
+        let report = merge_tokens(&mut doc, &memory, CredentialScope::All)
+            .expect("the document has an accounts array");
         assert_eq!(
             report.skipped,
             vec![
@@ -4901,7 +4973,8 @@ mod tests {
         .unwrap();
 
         let mut doc = read_document(&path).unwrap();
-        let report = merge_tokens(&mut doc, &memory).expect("the document has an accounts array");
+        let report = merge_tokens(&mut doc, &memory, CredentialScope::All)
+            .expect("the document has an accounts array");
         assert!(
             report.skipped.is_empty(),
             "a deletion leaves no unmatched on-disk entry: {report:?}"
@@ -6386,5 +6459,126 @@ mod tests {
         assert_eq!(before, fs::read_to_string(&path).unwrap());
 
         fs::remove_file(&path).ok();
+    }
+
+    /// Two accounts, both credentials at their original value.
+    fn two_account_file() -> &'static str {
+        r#"{ "accounts": [
+               { "name": "acct-a", "accessToken": "at-a", "refreshToken": "rt-a", "expiresAt": 1 },
+               { "name": "acct-b", "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1 } ] }"#
+    }
+
+    /// THE regression guard for the scoped write.
+    ///
+    /// The story, all of it real: the server boots and snapshots the config.
+    /// The user then re-auths `acct-b` in a separate `tcr` process, which puts
+    /// a fresh single-use refresh token on disk. The server's snapshot still
+    /// holds b's OLD credential. The server then rotates `acct-a` and persists.
+    ///
+    /// Before `CredentialScope`, that persist wrote the snapshot's credentials
+    /// for EVERY matched account, so it stamped b's stale token back over the
+    /// re-auth. b then 400s `invalid_grant` on its next refresh and is dead
+    /// until re-authed by hand, again.
+    ///
+    /// There is no concurrency here. The two writes are strictly ordered, one
+    /// finishing before the other starts, which is exactly why a file lock
+    /// cannot fix this and `CredentialScope` can.
+    #[test]
+    fn a_rotation_does_not_revert_another_processs_credential() {
+        let path = tmp_path("scoped-rotation");
+        fs::write(&path, two_account_file()).unwrap();
+
+        // The server's boot-time snapshot.
+        let mut server = load(&path).unwrap();
+
+        // Another process re-auths acct-b. Completes entirely.
+        let mut relogin = load(&path).unwrap();
+        relogin.accounts[1].access_token = "at-b-relogin".to_string();
+        relogin.accounts[1].refresh_token = Some("rt-b-relogin".to_string());
+        save_tokens(&path, &relogin).unwrap();
+        assert_eq!(
+            read_json(&path)["accounts"][1]["refreshToken"],
+            json!("rt-b-relogin"),
+            "precondition: the re-auth must land, or the assertion below proves nothing"
+        );
+
+        // The server rotates acct-a and persists, scoped as `persist_tokens` does.
+        server.accounts[0].access_token = "at-a-rotated".to_string();
+        server.accounts[0].refresh_token = Some("rt-a-rotated".to_string());
+        save_tokens_for(&path, &server, CredentialScope::Only(0)).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["refreshToken"],
+            json!("rt-a-rotated"),
+            "the rotation this write exists for must land"
+        );
+        assert_eq!(
+            value["accounts"][1]["refreshToken"],
+            json!("rt-b-relogin"),
+            "a rotation of acct-a must not revert acct-b's credential"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `CredentialScope::All` is still destructive from a stale snapshot, and
+    /// that is pinned here on purpose rather than left to be rediscovered.
+    ///
+    /// The fix is not that `All` became safe. It is that the rotation path no
+    /// longer uses it. The one remaining `All` caller is `Manager::persist_now`,
+    /// the shutdown flush, which is also the case `cli.rs`'s
+    /// `warn_if_server_running` already warns users about. If a third caller
+    /// ever wants `All`, this test is what it has to justify.
+    #[test]
+    fn the_all_scope_still_reverts_another_processs_credential() {
+        let path = tmp_path("all-scope-reverts");
+        fs::write(&path, two_account_file()).unwrap();
+
+        let mut stale = load(&path).unwrap();
+
+        let mut other = load(&path).unwrap();
+        other.accounts[1].refresh_token = Some("rt-b-relogin".to_string());
+        save_tokens(&path, &other).unwrap();
+
+        stale.accounts[0].access_token = "at-a-new".to_string();
+        save_tokens_for(&path, &stale, CredentialScope::All).unwrap();
+
+        assert_eq!(
+            read_json(&path)["accounts"][1]["refreshToken"],
+            json!("rt-b"),
+            "documenting the hazard `All` still carries: it reverted the re-auth"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// The accounts a scoped write left alone are COUNTED, never reported as
+    /// unpersisted credentials. Every entry in `skipped` is warned about as a
+    /// consumed single-use token, and an account we never rotated is the
+    /// opposite of a loss: listing it there would warn about every other account
+    /// on every single refresh.
+    #[test]
+    fn a_scoped_write_counts_the_untouched_rather_than_calling_them_skipped() {
+        let mut doc: Map<String, Value> =
+            serde_json::from_str(two_account_file()).expect("fixture parses");
+        let memory: Config = serde_json::from_str(two_account_file()).expect("fixture loads");
+
+        let report = merge_tokens(&mut doc, &memory, CredentialScope::Only(0))
+            .expect("the document has an accounts array");
+
+        assert_eq!(
+            report.out_of_scope, 1,
+            "acct-b was not this write's business"
+        );
+        assert!(
+            report.skipped.is_empty(),
+            "an out-of-scope account must not be reported as an unpersisted credential: {:?}",
+            report.skipped.iter().map(|s| s.index).collect::<Vec<_>>()
+        );
+        assert!(
+            report.absent_from_disk.is_empty(),
+            "acct-b is on disk; it was simply out of scope"
+        );
     }
 }
