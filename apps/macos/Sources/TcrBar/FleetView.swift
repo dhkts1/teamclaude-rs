@@ -590,6 +590,7 @@ struct FleetView: View {
                 }
             }
         }
+        .padding(.top, V4.actsMarginTop)
     }
 
     private var legacyBody: some View {

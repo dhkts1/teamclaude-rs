@@ -2,11 +2,9 @@ import SwiftUI
 import TcrBarCore
 
 /// One quota window, as a card draws it — the label, the value and the reset
-/// every quota window carries, whichever shape the card puts it in
-/// (``QuotaRow``'s three-column grid, or ``DenseQuotaLine``'s one line).
-///
-/// Named once here rather than nested in ``AccountCard`` so both shapes build
-/// their windows from the one type, instead of one of them re-deriving it.
+/// every quota window carries. Named once here rather than nested in
+/// ``AccountCard`` so both Compact and Comfortable build their rows from the
+/// one type, instead of one of them re-deriving it.
 struct QuotaWindowSpec {
     let label: String
     let value: Double?
@@ -14,9 +12,8 @@ struct QuotaWindowSpec {
     let resetAtMs: Int64?
 }
 
-/// What ``QuotaBarTintSource`` means for a bar, wherever one is drawn — shared
-/// by ``QuotaRow`` and ``DenseQuotaLine`` so the near/spent rule can only be
-/// written once. See ``QuotaRow/role`` and ``QuotaRow/fillTint`` (retired in
+/// What ``QuotaBarTintSource`` means for a bar — so the near/spent rule can
+/// only be written once. See ``QuotaRow/role`` and ``QuotaRow/fillTint`` (retired in
 /// favour of this) for the reasoning: `.unmeasured` draws no fill at all,
 /// `.measuredWithoutState` draws the sheet's neutral grey, and the Fable
 /// window's own tint never borrows the composite `quotaState`.
@@ -155,92 +152,5 @@ struct QuotaRow: View {
         .accessibilityValue(
             QuotaFormat.spokenWindowValue(
                 value: value, state: role, resetAtMs: resetAtMs, now: now))
-    }
-}
-
-/// Compact's quota block: every window ``AccountCard`` would otherwise draw as
-/// one ``QuotaRow`` each, folded onto one line — `5h ▮▮▮▯▯ 19% · 7d ▮▯▯▯▯ 3% ·
-/// fable ▯▯▯▯▯ 0%` (Gil, 2026-09-13: "its way more than what was before,
-/// recheck").
-///
-/// The restored `fable` row plus three full ``QuotaRow`` lines cost Compact
-/// +42 pt over its own prior two-row card (222 pt against 180) — a shorter
-/// card fixes that, not a smaller font, so this draws the SAME bar tints and
-/// near/spent rules as ``QuotaRow`` (via ``QuotaBarTintSource``) at a fixed
-/// 40 pt bar width instead of one that fills the row.
-///
-/// What the multi-row shape carried that one line has no room for — the reset
-/// caption per window — moves to this line's `.help` tooltip and to its
-/// combined accessibility value, both built from
-/// ``QuotaFormat/denseLineSpokenValue(windows:now:)`` so nothing spoken is
-/// lost, only re-homed. A window the server does not report is absent from
-/// the line entirely, never a placeholder `n/a` chip.
-struct DenseQuotaLine: View {
-    let windows: [QuotaWindowSpec]
-    let now: Date
-
-    private var spokenValue: String {
-        QuotaFormat.denseLineSpokenValue(
-            windows: windows.map {
-                (label: $0.label, value: $0.value, state: $0.tint.role, resetAtMs: $0.resetAtMs)
-            }, now: now)
-    }
-
-    var body: some View {
-        // Two candidates, not a shrink-to-fit: `ViewThatFits` picks the first
-        // that measures within 372 pt, so three windows' labels shrink to
-        // `mute` size together, before any label truncates — never the last
-        // window alone going small while the first two stay `dim`.
-        ViewThatFits(in: .horizontal) {
-            line(labelSize: V4.dimSize)
-            line(labelSize: V4.muteSize)
-        }
-        .frame(minHeight: V4.lineHeight(V4.dimSize))
-        .padding(.top, V4.quotaMarginTop)
-        .help(spokenValue)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Quota")
-        .accessibilityValue(spokenValue)
-    }
-
-    private func line(labelSize: CGFloat) -> some View {
-        HStack(spacing: V4.quotaGap) {
-            ForEach(Array(windows.enumerated()), id: \.offset) { index, window in
-                if index > 0 {
-                    Text("·")
-                        .font(V4.font(labelSize))
-                        .foregroundStyle(Tok.mute)
-                }
-                chip(window, labelSize: labelSize)
-            }
-        }
-    }
-
-    private func chip(_ window: QuotaWindowSpec, labelSize: CGFloat) -> some View {
-        HStack(spacing: V4.quotaGap) {
-            Text(window.label)
-                .font(V4.font(labelSize))
-                .foregroundStyle(Tok.dim)
-            ZStack(alignment: .leading) {
-                RoundedRectangle(cornerRadius: V4.barRadius)
-                    .fill(Tok.ink.opacity(V4.barTrackAlpha))
-                if let fillColor = window.tint.fillColor {
-                    RoundedRectangle(cornerRadius: V4.barRadius)
-                        .fill(fillColor)
-                        .frame(width: max(V4.barMinWidth, V4.denseBarWidth * fraction(window.value)))
-                }
-            }
-            .frame(width: V4.denseBarWidth, height: V4.barHeight)
-            Text(QuotaFormat.percent(window.value))
-                .font(V4.font(labelSize))
-                .foregroundStyle(Tok.dim)
-        }
-    }
-
-    private func fraction(_ value: Double?) -> Double {
-        switch QuotaFormat.barFill(value) {
-        case .measured(let v): return v
-        case .unmeasured: return 0
-        }
     }
 }

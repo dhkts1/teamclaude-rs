@@ -127,11 +127,6 @@ enum V4 {
     static let barMinWidth: CGFloat = 2
     /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
     static let barCappedWidth: CGFloat = 110
-    /// `DenseQuotaLine`'s own bar: a FIXED 40 pt, not the grid's `1fr` column
-    /// ``QuotaRow`` fills. Three of these plus their labels and percentages
-    /// are what Compact's one-line quota block has to fit in 372 pt; a bar
-    /// that grows with the card would fight the other two windows for it.
-    static let denseBarWidth: CGFloat = 40
 
     // MARK: - Pill (`.pill`)
 
@@ -280,6 +275,11 @@ enum V4 {
     static let buttonFillAlpha: Double = 0.10
     static let buttonFontSize: CGFloat = 13
     static let buttonGap: CGFloat = 8
+    /// `.acts{margin-top:12px}` — the action row's own top margin, so it sits
+    /// as far under the last card as the tabs sit above the list (the
+    /// mockup's `.card{margin:14px 0}` already gives the card its half of
+    /// that gap; this is the other half).
+    static let actsMarginTop: CGFloat = 12
     /// `.btn.danger{border-color:rgba(239,107,107,.38)}`.
     static let dangerBorderAlpha: Double = 0.38
     /// `.more` — the disclosure control: full width, 12.5 pt/600, its own 6 pt
