@@ -3,9 +3,8 @@ import XCTest
 @testable import TcrBarCore
 
 /// `Account.groupTags` and `GroupTagColor` — the small colored tag on an
-/// account row that is now the entire group-membership UI (bridge:
-/// `docs/plans/group-tags-bridge.md`). Account names are obviously fake —
-/// this repository is public.
+/// account row that is now the entire group-membership UI. Account names
+/// are obviously fake — this repository is public.
 final class GroupTagTests: XCTestCase {
 
     // MARK: - Account.groupTags

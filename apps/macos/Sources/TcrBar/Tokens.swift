@@ -115,8 +115,8 @@ public enum Tok {
     /// An emphasised divider or border.
     public static let hairlineStrong = dyn(dark: "#535960", light: "#a1a5aa")
 
-    /// The v4 sheet's card fill (`docs/design/panel-tabs-mockup.html`,
-    /// `data/plans/v4-spec.md`'s `rgba(255,255,255,.045)` over the panel) —
+    /// The v4 sheet's card fill (the mockup's
+    /// `rgba(255,255,255,.045)` over the panel) —
     /// an alias for `raised`, not a new colour: this ramp's own steps are
     /// each +0.045 L already (see the file's OKLCH source), which is the
     /// exact lift a 4.5%-white overlay on this panel produces. Naming it
@@ -139,8 +139,7 @@ public enum Tok {
     /// clearly and a near-white one shows it faintly, but "faint" is not
     /// "inverted".
     ///
-    /// `Tok.ink` drew this before review #6's cap list
-    /// (`data/plans/interface-review-2026-09-13.md`): ink is a TEXT token
+    /// `Tok.ink` drew this before review #6's cap list: ink is a TEXT token
     /// that answers to appearance for legibility (near-white on the dark
     /// panel, near-black on the light one), and reusing it for the bevel
     /// meant the edge went near-black in light appearance too — a dark line
@@ -240,7 +239,7 @@ public enum Tok {
 
     /// The tint behind a status pill, and the hairline around it.
     public static func wash(_ tint: Color) -> Color { tint.opacity(0.14) }
-    /// 0.40, not 0.34 as of the v4 pill restyle (`data/plans/v4-spec.md`'s
+    /// 0.40, not 0.34 as of the v4 pill restyle (the sheet's
     /// pill border, ".35 (ok) / .40 (warn, bad)") — this helper has no
     /// per-role signal to pick between the two (`StatusPill`/`GroupChip`
     /// take a plain `Color`, not a status enum, and giving them one would
@@ -276,7 +275,7 @@ public enum Tok {
     // Named by ROLE, never by size, so a size change does not require renaming
     // every call site. This used to be a closed four-step scale — a principle
     // written before the v4 design existed, which does not veto the design: the
-    // panel now follows the v4 sheet's own steps (`data/plans/v4-spec.md`'s
+    // panel now follows the v4 sheet's own steps (the sheet's
     // Type table), added below as their own roles rather than folded into the
     // four that follow, since `FleetView.swift` (a sibling lane's file) still
     // reaches for those four directly and a value change there needs its own
@@ -303,7 +302,7 @@ public enum Tok {
     }
     public static var secondaryFont: Font { .system(size: secondaryFontSize) }
     public static var detailFont: Font { .system(size: detailFontSize) }
-    /// 10.5pt, weight 700 — the v4 pill restyle (`data/plans/v4-spec.md`'s
+    /// 10.5pt, weight 700 — the v4 pill restyle (the sheet's
     /// pill row: "10.5 / 700 / +0.06em, uppercase"). Was 10pt/600; every
     /// rendered pill changes on purpose here, verified by re-reading
     /// `--render-states` PNGs, not a regression.
@@ -314,7 +313,7 @@ public enum Tok {
 
     // MARK: - v4 sheet type roles
     //
-    // `data/plans/v4-spec.md`'s Type table, added as their own named roles
+    // The v4 sheet's Type table, added as their own named roles
     // rather than reusing `titleSize`/`bodySize`/`secondaryFontSize` above:
     // those four are still what `FleetView.swift` (a sibling lane's file)
     // reaches for today, and this lane does not touch that file, so a value
@@ -526,7 +525,7 @@ public enum Tok {
     public static let pillPaddingV: CGFloat = 2
     public static let hairlineWidth: CGFloat = 0.5
 
-    /// The segmented-tab count badge (`data/plans/v4-spec.md`: "11pt on
+    /// The segmented-tab count badge (the v4 sheet: "11pt on
     /// white .14, radius 9, padding 0 x 6"). Geometry only — the badge itself
     /// is drawn in `FleetView.swift` (a sibling lane's file), which picks
     /// these up on its own schedule the same way it does `cardGap`/`rowGap`.
@@ -539,7 +538,7 @@ public enum Tok {
     /// adding a second alpha token for the same number.
     public static var tabBadgeBackground: Color { wash(ink) }
 
-    /// Button (`data/plans/v4-spec.md`: "13pt, radius 7, min-height 28,
+    /// Button (the v4 sheet: "13pt, radius 7, min-height 28,
     /// padding 5 x 11"). Geometry only, for the same reason as the tab badge
     /// above — the button itself is drawn in `FleetView.swift`.
     public static let buttonRadius: CGFloat = 7
@@ -548,7 +547,7 @@ public enum Tok {
     public static let buttonPaddingV: CGFloat = 5
 
     /// Group outline: the section-level border wrapped around a named
-    /// group's heading and rows (`docs/plans/group-outline-bridge.md`).
+    /// group's heading and rows.
     /// Heavier than the card's own ``hairlineWidth`` (0.5) on purpose — a
     /// structural grouping cue drawn at arm's length needs to read at a
     /// glance, where a hairline disappears. Drawn at the section's OWN
@@ -720,7 +719,7 @@ public struct StatusPill: View {
 
 /// One group tag on an account row (``Account/groupTags``) — the whole
 /// group-membership UI now that the dedicated Groups tab, deck cards and
-/// section headers are gone (bridge: `docs/plans/group-tags-bridge.md`).
+/// section headers are gone.
 ///
 /// Tinted by the SERVER-resolved colour (``GroupTag/background``), never a
 /// colour this app derives itself, so every client agrees on what a group

@@ -1,7 +1,7 @@
 import SwiftUI
 import TcrBarCore
 
-/// The four panes (`data/plans/settings-window-bridge.md` § Panes).
+/// The four panes.
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general
     case menuBar

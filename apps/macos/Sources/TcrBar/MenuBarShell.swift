@@ -62,8 +62,7 @@ final class MenuBarShell {
     let whatsNew: WhatsNewController
     let whatsNewWindow: WhatsNewWindow
     /// "Show the running-tool count" and "Open on" — the two Settings-window
-    /// rows with no pre-existing controller (`data/plans/
-    /// settings-window-bridge.md`, Menu Bar pane). Owned here for the same
+    /// rows with no pre-existing controller (Menu Bar pane). Owned here for the same
     /// reason as `countsPreference`: read by every poll tick, not just while
     /// the Settings window happens to be open.
     let runningToolsPreference: ShowRunningToolsPreference
@@ -629,11 +628,9 @@ struct FleetPanel: View {
                 initialTab: initialTab
             )
             // Kept OUTSIDE `FleetView` rather than folded into its own
-            // preferences footer: this feature's bridge (F5,
-            // `data/plans/menubar-counts-bridge.md`) is scoped away from
-            // `FleetView.swift`, which a separate lane owns concurrently — an
-            // edit there risks the exact collision DNA's "you are not alone"
-            // rule exists to prevent. A one-row toggle appended below the
+            // preferences footer: this feature (F5) is scoped away from
+            // `FleetView.swift`, which is owned concurrently by other work —
+            // an edit there risks a collision. A one-row toggle appended below the
             // existing panel is the whole cost of keeping this feature inside
             // its own files.
             Divider()

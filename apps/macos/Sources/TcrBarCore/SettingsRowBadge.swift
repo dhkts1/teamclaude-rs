@@ -1,7 +1,7 @@
 import Foundation
 
 /// When a Settings-window row's value takes effect, and the one table every
-/// row is checked against (`data/plans/settings-window-bridge.md`, gate 1).
+/// row is checked against (gate 1).
 ///
 /// This exists because of a finding against the earlier mockup
 /// (`docs/design/panel-tabs-review.md` § Settings window, S3): 16 of 31 rows

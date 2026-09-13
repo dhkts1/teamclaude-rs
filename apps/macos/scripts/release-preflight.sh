@@ -11,7 +11,7 @@
 # and then either exits 0 or names what is wrong.
 #
 # WHY THIS EXISTS. Four consecutive releases of this project broke the Sparkle
-# update feed, and `docs/plans/swarm-retrospectives.md` prescribed this script
+# update feed, and the retrospective on each one prescribed this script
 # three times before anyone wrote it. The specific incidents, in the order the
 # checks below are numbered:
 #

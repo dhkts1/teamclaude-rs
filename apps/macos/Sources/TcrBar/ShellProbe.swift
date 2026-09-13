@@ -345,7 +345,7 @@ enum ShellProbe {
     // MARK: - Assertion 7
 
     /// Retired the "the gauge differs between appearances" half of this check:
-    /// the coffee-mark rework (`data/plans/coffee-mark-bridge.md`) removed the
+    /// the coffee-mark rework removed the
     /// separate gauge glyph this assertion used to split against by colour —
     /// there is now one cup, and its own colour IS the awake tint end to end.
     /// What is still real and still worth a shell-level check, since a unit

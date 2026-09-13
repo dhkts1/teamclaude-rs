@@ -667,7 +667,7 @@ public enum QuotaFormat {
     /// individually.
     ///
     /// The line drops every window's reset caption from what it draws — that is
-    /// the whole point of going to one line per card (`data/plans/dense-quota-bridge.md`)
+    /// the whole point of going to one line per card
     /// — so this is where the caption comes back for a listener. Built here
     /// rather than assembled at the SwiftUI call site so the sentence is a
     /// property of the model a test can assert on directly, the same reason
@@ -1010,8 +1010,7 @@ public struct UsageRow: Decodable, Equatable, Sendable {
 
 /// One account row of `tcr status --json`.
 /// One tool call the proxy has observed on the wire — either still
-/// `running` or one of a session's `slowest` (F1, `data/plans/
-/// sessions-wire-bridge.md`). The two arrays carry different halves of the
+/// `running` or one of a session's `slowest` (F1). The two arrays carry different halves of the
 /// same fact: a running call has ``startedMs`` and no ``seconds`` yet, a
 /// slowest call has ``seconds``/``endedMs`` and no ``startedMs`` — never
 /// both, but modelled as one `Optional`-heavy type rather than two so the
@@ -1040,8 +1039,8 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     }
 }
 
-/// One tool's aggregate within a session — `docs/design/panel-tabs-mockup.html`'s
-/// `BY TOOL` bars, `data/plans/wire-2-bridge.md`'s `ToolBucketRow`. `tool` is
+/// One tool's aggregate within a session — the mockup's
+/// `BY TOOL` bars, the wire's `ToolBucketRow`. `tool` is
 /// the wire's raw `tool_use.name` (`"Bash"`, `"Agent"`, `"Read"`, …) — the
 /// panel merges `Read`/`Grep`/`Glob`/`Edit` into one bucket, this type does
 /// not, so the client-side merge stays visible and testable rather than
@@ -1097,7 +1096,7 @@ public struct SessionTools: Decodable, Equatable, Sendable {
     public let timeouts: Int
     public let running: [ToolCall]
     /// The ten slowest calls this session made today, longest first per the
-    /// server (`sessions-wire-bridge.md`); this build does not re-sort a
+    /// server; this build does not re-sort a
     /// single session's own list.
     public let slowest: [ToolCall]
     /// How many of this session's calls today ran over one minute —
@@ -1108,7 +1107,7 @@ public struct SessionTools: Decodable, Equatable, Sendable {
     /// build cannot answer. `Fleet.toolsOverOneMinute` carries the same
     /// nil-means-unknown rule through the fleet-wide sum.
     public let overOneMinute: Int?
-    /// Per-tool aggregates — `data/plans/wire-2-bridge.md`'s `by_tool`. Empty,
+    /// Per-tool aggregates — the wire's `by_tool`. Empty,
     /// not absent-means-error, against a server that doesn't send it yet:
     /// ``Fleet/toolsByCategory`` treats an empty array from EVERY session the
     /// same as "not one session reports this", and hides the `BY TOOL`
@@ -1901,8 +1900,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
 
     /// The row-level "change this account's groups" menu — derived purely
     /// from ``groups``, so a test can assert its shape without touching
-    /// SwiftUI (bridge: `docs/plans/stacked-cards-bridge.md`, "put rendered
-    /// values and state rules on the model, not in the view"). One
+    /// SwiftUI (rendered values and state rules live on the model, not in
+    /// the view). One
     /// ``AccountGroupMenuAction/remove(group:)`` per membership,
     /// ``AccountGroupMenuAction/removeAll`` only once there is more than one
     /// membership to collapse — a single membership already has its own
@@ -1922,9 +1921,8 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     }
 
     /// The row's own tag list — the entire group-membership UI now that the
-    /// dedicated group views are gone (bridge:
-    /// `docs/plans/group-tags-bridge.md`, "there is no group view. A group is
-    /// metadata on an account, shown as a small colored tag."). Sorted
+    /// dedicated group views are gone: there is no group view, a group is
+    /// metadata on an account, shown as a small colored tag. Sorted
     /// alphabetically, same as ``groupMenuActions``, so an account in several
     /// groups renders the same tags in the same order on every poll — a
     /// stable order is the whole point of deriving this here rather than
@@ -2415,8 +2413,8 @@ public struct Fleet: Equatable, Sendable {
     /// Rows that failed to decode. Never dropped silently — see ``unreadableNotice``.
     public let unreadable: [UnreadableRow]
 
-    /// Every session the proxy has seen in the last hour (F2 + F3,
-    /// `data/plans/panel-tabs-bridge.md`). **Never populated by
+    /// Every session the proxy has seen in the last hour (F2 + F3).
+    /// **Never populated by
     /// ``decode(_:)``** — see this property's own placement, a stored field
     /// rather than something read off ``accounts``.
     ///
@@ -2535,9 +2533,9 @@ public struct Fleet: Equatable, Sendable {
         return known.reduce(0, +)
     }
 
-    /// One row per category — `docs/design/panel-tabs-mockup.html`'s `BY TOOL`
+    /// One row per category — the mockup's `BY TOOL`
     /// list: Bash, Agent, and Read/Grep/Glob/Edit pooled as one bucket
-    /// (`data/plans/wire-2-bridge.md`: "the panel groups them"). `nil` when
+    /// (the panel groups them). `nil` when
     /// not one session reports `byTool`, the same "silence over a fake zero"
     /// rule as ``toolsOverOneMinute``. The per-category median is the mean of
     /// each contributing session's own p50 — an approximation stated as one
@@ -2573,8 +2571,7 @@ public struct Fleet: Equatable, Sendable {
     }
 
     /// The ten slowest calls across every session, longest first. Each
-    /// session already reports its own ten slowest (`sessions-wire-bridge.md`
-    /// "ten"), so pooling `N` sessions' lists and re-sorting before taking the
+    /// session already reports its own ten slowest, so pooling `N` sessions' lists and re-sorting before taking the
     /// top ten is correct without asking the server for more than ten per
     /// session.
     public var toolsSlowest: [SessionToolEntry] {

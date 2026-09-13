@@ -27,8 +27,7 @@ struct SummaryLine: View {
 
     /// One or two lines. The Accounts tab draws two — the capacity breakdown,
     /// then spend and cache — because a single wrapped sentence of five clauses
-    /// reads as one long number (`data/plans/panel-v4-migration-bridge.md`'s own
-    /// `.sum` row).
+    /// reads as one long number (the design's own `.sum` row).
     let lines: [[Run]]
     var accessibilityText: String?
 

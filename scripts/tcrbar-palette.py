@@ -71,7 +71,7 @@ SURFACES = {
     "track":        (0.320, 0.012, HUE_SURFACE),   # empty quota bar
     "hairline":     (0.360, 0.012, HUE_SURFACE),   # 0.5pt dividers
     "hairlineHigh": (0.460, 0.014, HUE_SURFACE),   # emphasised divider / border
-    # v4 sheet names (`data/plans/v4-spec.md`) for two colours this ramp
+    # v4 sheet names for two colours this ramp
     # already has, not two new hues: the sheet's card fill is
     # `rgba(255,255,255,.045)` over the panel, and this ramp's own steps are
     # already +0.045 L apart -- exactly the lift that overlay produces, so
@@ -158,7 +158,7 @@ LIGHT_INK = {
 #
 # These are judged at 4.5:1, the same body-text floor the ink scale above
 # carries -- not 3:1. The 3:1 WCAG 1.4.11 non-text floor was the rule until
-# review #6 (`data/plans/interface-review-2026-09-13.md`): it assumed a status
+# review #6: it assumed a status
 # hue is decorative, but since v4 it IS the pill label's own text colour, the
 # summary clause's tint and the reset caption's colour -- body text wearing a
 # hue, not a bar or a dot beside it. The dark pass already judged these same

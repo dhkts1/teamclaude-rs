@@ -5,8 +5,7 @@ import XCTest
 /// `UpdateState` — the enum ``Updater`` (in the `TcrBar` executable target)
 /// populates from Sparkle's real delegate callbacks. This file tests the
 /// state's own semantics: what each case means and what the header shows
-/// for it (bridge: `docs/plans/menu-and-update-bridge.md`, "Nothing shows
-/// whether an update is available").
+/// for it ("Nothing shows whether an update is available").
 ///
 /// It cannot exercise `Updater`'s Sparkle wiring itself: `Package.swift`
 /// deliberately keeps `TcrBarCore` (and therefore this test target, which
