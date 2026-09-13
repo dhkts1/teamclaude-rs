@@ -26,6 +26,31 @@
 //! `SecCodeCopyGuestWithAttributes` as `kSecGuestAttributeAudit`, and the
 //! resulting code object is checked with `SecCodeCheckValidity`.
 //!
+//! # Who owns which half
+//!
+//! Every Security-framework call below is
+//! [`security_framework::os::macos::code_signing`]. That module has existed
+//! since 2021 and exposes exactly this API: the audit-token guest attribute,
+//! the requirement parser, and the validity check, with the CF ownership rules
+//! already encoded in the types. This file briefly carried a second,
+//! hand-written copy of those bindings because a search of the crate's
+//! top-level modules did not reach `os::macos`; the copy is gone and the trade
+//! is recorded below.
+//!
+//! What stays here is the part no crate does: reading the peer's audit token
+//! off the socket with `getsockopt`. That is a socket call, not a
+//! Security-framework call, and it is the only `unsafe` block left in this
+//! module.
+//!
+//! One guard was lost in the move. The hand-written version refused a Security
+//! call that returned `errSecSuccess` *and* a null out-parameter; upstream
+//! checks the status only and then `assume_init()`s the out-parameter
+//! (`security-framework-3.7.0/src/lib.rs:51`). Every failure these calls
+//! actually produce carries a non-zero status, so upstream catches them all,
+//! and a zero status with nothing written would be Apple violating its own
+//! Create-rule contract. It is upstream's invariant to hold rather than ours to
+//! re-derive, and holding a private copy of it was the more expensive mistake.
+//!
 //! # Failure is refusal
 //!
 //! Every error path here returns `Err`. There is deliberately no branch that
@@ -36,23 +61,19 @@
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::str::FromStr;
 
-use core_foundation::base::{CFTypeID, TCFType};
+use core_foundation::base::TCFType;
 use core_foundation::data::CFData;
-use core_foundation::dictionary::CFDictionary;
-use core_foundation::string::CFString;
-use core_foundation::{declare_TCFType, impl_TCFType};
-use core_foundation_sys::base::OSStatus;
-use core_foundation_sys::dictionary::CFDictionaryRef;
-use core_foundation_sys::string::CFStringRef;
+use security_framework::os::macos::code_signing::{
+    Flags, GuestAttributes, SecCode, SecRequirement,
+};
 
 /// `sys/un.h`: retrieve the peer's audit token. Deliberately NOT `LOCAL_PEERPID`
-/// (`0x002`) — see the module docs.
+/// (`0x002`). See the module docs.
 const LOCAL_PEERTOKEN: libc::c_int = 0x006;
 /// `sys/un.h`: the option level for `LOCAL_*` socket options.
 const SOL_LOCAL: libc::c_int = 0;
-/// `kSecCSDefaultFlags`.
-const SEC_CS_DEFAULT_FLAGS: u32 = 0;
 
 /// `audit_token_t` from `bsm/audit.h`: eight opaque words. Its contents are
 /// never interpreted here; it is passed to the Security framework verbatim,
@@ -63,75 +84,13 @@ struct AuditToken {
     val: [u32; 8],
 }
 
-/// The two Security-framework types this module touches, as proper CF types.
-///
-/// `declare_TCFType!`/`impl_TCFType!` are what `core-foundation` provides for
-/// exactly this, and they replace a hand-rolled ownership wrapper that had to
-/// be trusted by eye. They generate `Drop` (release), `Clone` (retain) and the
-/// `TCFType` conversions, so ownership stops being something this file asserts
-/// and becomes something the type system carries. It is also the shape
-/// `security-framework` uses, which is what these bindings should eventually
-/// become part of.
-#[repr(C)]
-pub struct __SecCode(std::ffi::c_void);
-/// Opaque handle to a running program, as the Security framework sees it.
-pub type SecCodeRef = *const __SecCode;
-declare_TCFType!(SecCode, SecCodeRef);
-impl_TCFType!(SecCode, SecCodeRef, SecCodeGetTypeID);
-
-#[repr(C)]
-pub struct __SecRequirement(std::ffi::c_void);
-/// Opaque handle to a parsed code-signing requirement.
-pub type SecRequirementRef = *const __SecRequirement;
-declare_TCFType!(SecRequirement, SecRequirementRef);
-impl_TCFType!(SecRequirement, SecRequirementRef, SecRequirementGetTypeID);
-
-#[link(name = "Security", kind = "framework")]
-extern "C" {
-    static kSecGuestAttributeAudit: CFStringRef;
-
-    fn SecCodeGetTypeID() -> CFTypeID;
-    fn SecRequirementGetTypeID() -> CFTypeID;
-
-    fn SecCodeCopyGuestWithAttributes(
-        host: SecCodeRef,
-        attributes: CFDictionaryRef,
-        flags: u32,
-        guest: *mut SecCodeRef,
-    ) -> OSStatus;
-
-    fn SecRequirementCreateWithString(
-        text: CFStringRef,
-        flags: u32,
-        requirement: *mut SecRequirementRef,
-    ) -> OSStatus;
-
-    fn SecCodeCheckValidity(
-        code: SecCodeRef,
-        flags: u32,
-        requirement: SecRequirementRef,
-    ) -> OSStatus;
-}
-
-/// Reject a Security call that reported failure OR handed back nothing.
-///
-/// Both halves matter. A non-zero `OSStatus` is the documented failure, and a
-/// zero status with a null out-parameter is the undocumented one; treating
-/// either as success means wrapping a null in a CF type and releasing it later.
-fn created<T>(status: OSStatus, out: *const T, call: &str, kind: io::ErrorKind) -> io::Result<()> {
-    if status != 0 || out.is_null() {
-        return Err(io::Error::new(
-            kind,
-            format!("{call} failed (OSStatus {status})"),
-        ));
-    }
-    Ok(())
-}
+/// Size of an `audit_token_t`: eight 32-bit words.
+const AUDIT_TOKEN_BYTES: usize = std::mem::size_of::<AuditToken>();
 
 /// Read the audit token of the process on the other end of `stream`.
 fn peer_audit_token(stream: &UnixStream) -> io::Result<AuditToken> {
     let mut token = AuditToken { val: [0; 8] };
-    let mut len = std::mem::size_of::<AuditToken>() as libc::socklen_t;
+    let mut len = AUDIT_TOKEN_BYTES as libc::socklen_t;
     // SAFETY: `token` is a live, correctly sized `audit_token_t`, and `len`
     // describes it. `getsockopt` writes at most `len` bytes into it.
     let rc = unsafe {
@@ -146,13 +105,10 @@ fn peer_audit_token(stream: &UnixStream) -> io::Result<AuditToken> {
     if rc != 0 {
         return Err(io::Error::last_os_error());
     }
-    if len as usize != std::mem::size_of::<AuditToken>() {
+    if len as usize != AUDIT_TOKEN_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "LOCAL_PEERTOKEN returned {len} bytes, expected {}",
-                std::mem::size_of::<AuditToken>()
-            ),
+            format!("LOCAL_PEERTOKEN returned {len} bytes, expected {AUDIT_TOKEN_BYTES}"),
         ));
     }
     Ok(token)
@@ -160,42 +116,38 @@ fn peer_audit_token(stream: &UnixStream) -> io::Result<AuditToken> {
 
 /// Resolve an audit token to a code object for that running process.
 fn code_for_token(token: &AuditToken) -> io::Result<SecCode> {
-    // SAFETY: reading the 32 bytes of a live `audit_token_t` as bytes. The
-    // Security framework expects exactly these bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            std::ptr::from_ref(token).cast::<u8>(),
-            std::mem::size_of::<AuditToken>(),
-        )
-    };
-    let data = CFData::from_buffer(bytes);
-    // SAFETY: reading an immutable CFStringRef constant exported by the
-    // Security framework; it is valid for the process lifetime.
-    let key = unsafe { CFString::wrap_under_get_rule(kSecGuestAttributeAudit) };
-    let attrs = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), data.as_CFType())]);
+    // The token's 32 bytes are what the Security framework wants, uninterpreted.
+    let bytes = token_bytes(token);
+    let data = CFData::from_buffer(&bytes);
 
-    let mut code: SecCodeRef = std::ptr::null();
-    // SAFETY: `attrs` outlives the call; `code` is a valid out-parameter.
-    let status = unsafe {
-        SecCodeCopyGuestWithAttributes(
-            std::ptr::null(),
-            attrs.as_concrete_TypeRef(),
-            SEC_CS_DEFAULT_FLAGS,
-            &mut code,
-        )
-    };
-    // 100001 is kPOSIXErrorEPERM and is a documented outcome here, not an
-    // impossible one. It still means "cannot establish what the peer is",
-    // which is a refusal like any other.
-    created(
-        status,
-        code,
-        "SecCodeCopyGuestWithAttributes for the peer audit token",
-        io::ErrorKind::Other,
-    )?;
-    // SAFETY: a Copy-rule call returns +1, which is exactly what
-    // `wrap_under_create_rule` takes ownership of.
-    Ok(unsafe { SecCode::wrap_under_create_rule(code) })
+    // `set_audit_token` takes a raw `CFDataRef` and does not extend its
+    // lifetime for us, so `data` must outlive the call below. It does: both
+    // locals live to the end of this function, and the call is the tail
+    // expression. Do not hoist `attrs` out of this scope without carrying
+    // `data` with it.
+    let mut attrs = GuestAttributes::new();
+    attrs.set_audit_token(data.as_concrete_TypeRef());
+
+    // A failure here is "cannot establish what the peer is", which is a refusal
+    // like any other. `100001` (kPOSIXErrorEPERM) and `100003` (no such
+    // process) are both documented outcomes, not impossible ones.
+    SecCode::copy_guest_with_attribues(None, &attrs, Flags::NONE).map_err(|e| {
+        io::Error::other(format!(
+            "resolving the peer audit token to a code object failed: {e}"
+        ))
+    })
+}
+
+/// Reinterpret an audit token as the bytes the Security framework expects.
+///
+/// Split out so it can be asserted on directly: `code_for_token` passes these
+/// bytes straight through, so a wrong reinterpretation is invisible to every
+/// caller above it.
+fn token_bytes(token: &AuditToken) -> [u8; AUDIT_TOKEN_BYTES] {
+    // SAFETY: `AuditToken` is `#[repr(C)]` over eight `u32`, so it has no
+    // padding and no niches; every bit pattern of the source is a valid byte
+    // array of the same size, which `AUDIT_TOKEN_BYTES` pins.
+    unsafe { std::mem::transmute::<AuditToken, [u8; AUDIT_TOKEN_BYTES]>(*token) }
 }
 
 /// Check that the process on the other end of `stream` satisfies `requirement`,
@@ -203,10 +155,14 @@ fn code_for_token(token: &AuditToken) -> io::Result<SecCode> {
 ///
 /// The requirement this project uses is team-scoped rather than bundle-scoped,
 /// because a CLI `tcr` handing over to a TcrBar (or the reverse) is ordinary and
-/// those carry different identifiers:
+/// those carry different identifiers. It also pins the two Developer ID marker
+/// OIDs, so an Apple Development certificate for the same team does not pass:
 ///
 /// ```text
-/// anchor apple generic and certificate leaf[subject.OU] = "UJQ3GQF56Y"
+/// anchor apple generic
+///   and certificate 1[field.1.2.840.113635.100.6.2.6]
+///   and certificate leaf[field.1.2.840.113635.100.6.1.13]
+///   and certificate leaf[subject.OU] = "UJQ3GQF56Y"
 /// ```
 ///
 /// Returns `Ok(())` only when the peer is resolved AND satisfies it. Every
@@ -215,36 +171,21 @@ pub fn verify_peer(stream: &UnixStream, requirement: &str) -> io::Result<()> {
     let token = peer_audit_token(stream)?;
     let code = code_for_token(&token)?;
 
-    let text = CFString::new(requirement);
-    let mut req: SecRequirementRef = std::ptr::null();
-    // SAFETY: `text` outlives the call; `req` is a valid out-parameter.
-    let status = unsafe {
-        SecRequirementCreateWithString(text.as_concrete_TypeRef(), SEC_CS_DEFAULT_FLAGS, &mut req)
-    };
-    created(
-        status,
-        req,
-        &format!("parsing the code requirement {requirement:?}"),
-        io::ErrorKind::InvalidInput,
-    )?;
-    // SAFETY: a Create-rule call returns +1.
-    let req = unsafe { SecRequirement::wrap_under_create_rule(req) };
-
-    // SAFETY: both handles are live CF references owned by this frame.
-    let status = unsafe {
-        SecCodeCheckValidity(
-            code.as_concrete_TypeRef(),
-            SEC_CS_DEFAULT_FLAGS,
-            req.as_concrete_TypeRef(),
+    // A requirement that does not parse is the caller's bug, and must stay
+    // distinguishable from a peer that parsed fine and was refused.
+    let req = SecRequirement::from_str(requirement).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("parsing the code requirement {requirement:?} failed: {e}"),
         )
-    };
-    if status != 0 {
-        return Err(io::Error::new(
+    })?;
+
+    code.check_validity(Flags::NONE, &req).map_err(|e| {
+        io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("peer does not satisfy the code requirement (OSStatus {status})"),
-        ));
-    }
-    Ok(())
+            format!("peer does not satisfy the code requirement: {e}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -267,32 +208,6 @@ mod tests {
             .find_map(|l| l.strip_prefix("Identifier=").map(str::to_string))
     }
 
-    /// `created` has two independent rejection reasons and the integration
-    /// tests only exercise one of them.
-    ///
-    /// In practice the Security calls return null *and* a non-zero status when
-    /// they fail, so the null check alone makes every higher-level test pass
-    /// even with the status check deleted (verified: removing `status != 0`
-    /// leaves all four peer tests green). A call that returned a partial result
-    /// with a failing status would then be wrapped and trusted. Tested directly
-    /// because nothing above it can see the difference.
-    #[test]
-    fn created_rejects_a_failing_status_even_with_a_non_null_result() {
-        let non_null: *const u8 = &1u8;
-
-        created(0, non_null, "ok", io::ErrorKind::Other).expect("success must pass");
-
-        let err = created(-1, non_null, "failing", io::ErrorKind::Other)
-            .expect_err("a non-zero OSStatus must be rejected even when a pointer came back");
-        assert!(
-            err.to_string().contains("-1"),
-            "the status belongs in the message: {err}"
-        );
-
-        created(0, std::ptr::null::<u8>(), "null", io::ErrorKind::Other)
-            .expect_err("a null result must be rejected even when the status says success");
-    }
-
     /// POSITIVE CONTROL for the audit-token plumbing.
     ///
     /// Both ends of a socketpair belong to this process, so the peer resolves to
@@ -304,6 +219,30 @@ mod tests {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         let token = peer_audit_token(&a).expect("LOCAL_PEERTOKEN must work on a unix socketpair");
         code_for_token(&token).expect("the audit token must resolve to a code object");
+    }
+
+    /// The bytes handed to the Security framework must be the token's own, in
+    /// its own order.
+    ///
+    /// `code_for_token` is a pure pass-through, so nothing above this can tell a
+    /// correct reinterpretation from a byte-swapped or truncated one: a wrong
+    /// token resolves to no process, which reads exactly like a peer that
+    /// failed the check. Asserted directly against the little-endian layout of
+    /// a known value.
+    #[test]
+    fn the_token_bytes_are_the_token_in_order() {
+        let token = AuditToken {
+            val: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let bytes = token_bytes(&token);
+        assert_eq!(bytes.len(), 32, "an audit token is eight 32-bit words");
+        for (word, chunk) in token.val.iter().zip(bytes.chunks_exact(4)) {
+            assert_eq!(
+                chunk,
+                word.to_ne_bytes(),
+                "each word must survive in native order"
+            );
+        }
     }
 
     /// THE test. This binary is ad-hoc signed, so it must NOT satisfy a

@@ -10,11 +10,22 @@ description = "SCM_RIGHTS listening-socket passing, isolated so the main crate k
 nix = { version = "0.29", features = ["socket", "uio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Peer code-signature verification (`peer.rs`). `core-foundation` is the safe
-# RAII wrapper over the CF types the Security framework speaks; hand-managing
-# CFRelease across every error path is exactly the thing that leaks or
-# double-frees under review pressure.
+# Peer code-signature verification (`peer.rs`).
+#
+# `security-framework` owns every Security-framework call that module makes:
+# the SecCode and SecRequirement CF types, the guest-attribute dictionary, the
+# requirement parser, and the ownership rules on what those calls hand back. It
+# has exposed all of it from `os::macos::code_signing` since 2021. This crate
+# briefly carried a hand-written second copy, which is a private fork of
+# someone else's reviewed unsafe code.
+#
+# `default-features = false` turns off the TLS-side features (alpn,
+# session-tickets); `code_signing` is not behind any feature gate.
+security-framework = { version = "3.7", default-features = false }
+# Still needed directly: the audit token has to become a CFData before it can
+# be handed over as a guest attribute.
 core-foundation = "0.10"
-core-foundation-sys = "0.8"
+# Still needed directly: the one getsockopt that reads the token off the
+# socket. That is not a Security-framework call and no crate does it for us.
 libc = "0.2"
 

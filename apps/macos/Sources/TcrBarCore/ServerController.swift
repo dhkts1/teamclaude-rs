@@ -287,6 +287,13 @@ public final class ServerController: ObservableObject {
     /// this function did exactly that and took 30 seconds to honour a 0.2-second
     /// deadline. The probe therefore runs on a Dispatch queue, off the cooperative
     /// pool entirely, and is waited on by a semaphore that has its own deadline.
+    ///
+    /// The WAIT runs on a Dispatch queue too, rather than inside a
+    /// `Task.detached`: a detached task is still scheduled on the cooperative
+    /// pool, and parking one of its threads on a semaphore is the exact hazard
+    /// `DispatchSemaphore.wait` is marked unavailable-from-async to prevent.
+    /// `withCheckedContinuation` suspends the caller instead, and the blocking
+    /// wait happens on a thread Dispatch is free to replace.
     static func support(
         within seconds: Double,
         probe: @escaping @Sendable () -> ReplaceFlagSupport
@@ -297,10 +304,12 @@ public final class ServerController: ObservableObject {
             answer.value = probe()
             finished.signal()
         }
-        return await Task.detached(priority: .userInitiated) {
-            _ = finished.wait(timeout: .now() + seconds)
-            return answer.value ?? .supported
-        }.value
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = finished.wait(timeout: .now() + seconds)
+                continuation.resume(returning: answer.value ?? .supported)
+            }
+        }
     }
 
     /// The default argument set. Kept as a distinct name so existing call sites

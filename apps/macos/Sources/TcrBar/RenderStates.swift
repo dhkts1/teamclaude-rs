@@ -343,10 +343,26 @@ enum RenderStates {
         // The appearance has to be current for the duration of the rasterisation:
         // every token resolves through NSColor's dynamic provider, which reads the
         // CURRENT appearance, not one baked into the view.
-        let previous = NSAppearance.current
-        NSAppearance.current = appearance.nsAppearance
-        defer { NSAppearance.current = previous }
+        return withDrawingAppearance(appearance.nsAppearance) {
+            renderUnderCurrentAppearance(
+                scene, appearance: appearance, density: density, into: directory)
+        }
+    }
 
+    /// The body of ``render(_:appearance:density:into:)``, run with the drawing
+    /// appearance already installed.
+    ///
+    /// A separate function only because the macOS 12 replacement for assigning
+    /// `NSAppearance.current` takes a block (``withDrawingAppearance(_:perform:)``):
+    /// wrapping ninety lines in a closure would have re-indented the whole
+    /// function to change nothing.
+    @MainActor
+    private static func renderUnderCurrentAppearance(
+        _ scene: (name: String, state: PollState, awake: Bool, control: String?),
+        appearance: Appearance,
+        density: PanelDensity,
+        into directory: URL
+    ) -> Bool {
         // `V4.compact` reads this key straight out of `UserDefaults`
         // (`PanelDensityPreference.current()`), so forcing a density for one
         // render is a write-then-restore around this call, the same pattern
@@ -452,10 +468,20 @@ enum RenderStates {
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
-        let previous = NSAppearance.current
-        NSAppearance.current = appearance.nsAppearance
-        defer { NSAppearance.current = previous }
+        return withDrawingAppearance(appearance.nsAppearance) {
+            renderSheetUnderCurrentAppearance(scene, appearance: appearance, into: directory)
+        }
+    }
 
+    /// The body of ``renderSheet(_:appearance:into:)``, run with the drawing
+    /// appearance already installed — the same split, for the same reason, as
+    /// ``renderUnderCurrentAppearance(_:appearance:density:into:)``.
+    @MainActor
+    private static func renderSheetUnderCurrentAppearance(
+        _ scene: (name: String, phase: LoginPhase, url: URL?),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
         // The panel underneath is the ordinary healthy Accounts tab, built the
         // same way every other scene builds one — pinned state, harness
         // controllers, nothing that can spawn or signal anything.
