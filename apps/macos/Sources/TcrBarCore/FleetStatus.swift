@@ -998,6 +998,14 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     /// The first 120 characters of a Bash `input.command`, held in memory
     /// only (`panel-tabs.md` "Constraints"). `nil` for a non-Bash tool.
     public let commandHead: String?
+    /// The wire's coarse Bash category — `wait`, `build`, `search`,
+    /// `git-net`, `git-local`, `compound`, `other`
+    /// (`crates/tcr-status-wire/src/lib.rs` `RunningToolRow::command_class`).
+    /// `nil` for any non-Bash tool, and for a Bash call the classifier had no
+    /// head to read. The TIMED OUT TODAY section groups on it, which is the
+    /// only place this build reads it: a list of five commands is not a
+    /// pattern, and the class is the pattern.
+    public let commandClass: String?
     public let startedMs: Int64?
     public let endedMs: Int64?
     public let seconds: Double?
@@ -1005,15 +1013,34 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     public init(
         tool: String,
         commandHead: String? = nil,
+        commandClass: String? = nil,
         startedMs: Int64? = nil,
         endedMs: Int64? = nil,
         seconds: Double? = nil
     ) {
         self.tool = tool
         self.commandHead = commandHead
+        self.commandClass = commandClass
         self.startedMs = startedMs
         self.endedMs = endedMs
         self.seconds = seconds
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case tool, commandHead, commandClass, startedMs, endedMs, seconds
+    }
+
+    /// Hand-written so a payload from a server built before `commandClass`
+    /// existed decodes as "no class known" rather than as a parse failure that
+    /// costs the whole session its row.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        tool = try c.decode(String.self, forKey: .tool)
+        commandHead = try c.decodeIfPresent(String.self, forKey: .commandHead)
+        commandClass = try c.decodeIfPresent(String.self, forKey: .commandClass)
+        startedMs = try c.decodeIfPresent(Int64.self, forKey: .startedMs)
+        endedMs = try c.decodeIfPresent(Int64.self, forKey: .endedMs)
+        seconds = try c.decodeIfPresent(Double.self, forKey: .seconds)
     }
 }
 
@@ -1041,10 +1068,17 @@ public struct ToolBucketRow: Decodable, Equatable, Sendable {
         self.overOneMinute = overOneMinute
     }
 
+    /// camelCase, because that is what the wire sends: every struct in
+    /// `crates/tcr-status-wire/src/lib.rs` carries
+    /// `#[serde(rename_all = "camelCase")]`, so the key is `secondsP50`.
+    /// These two used to name `seconds_p50`/`over_one_minute` — keys no
+    /// server has ever sent — which is why the panel's whole BY TOOL section
+    /// was `nil` against a live proxy while every test passed: no test
+    /// decoded this type from JSON at all. Positive control, 2026-09-13:
+    /// `tcr sessions --json | python3 -c 'print(list(...["tools"]))'` prints
+    /// `byTool`, `secondsP50`, `overOneMinute`.
     private enum CodingKeys: String, CodingKey {
-        case tool, calls, errors
-        case secondsP50 = "seconds_p50"
-        case overOneMinute = "over_one_minute"
+        case tool, calls, errors, secondsP50, overOneMinute
     }
 }
 
@@ -1064,6 +1098,70 @@ public struct ToolCategory: Identifiable, Equatable, Sendable {
         self.name = name
         self.calls = calls
         self.medianSeconds = medianSeconds
+    }
+
+    /// The whole `BY TOOL` section, as ONE line: "Bash 19,913 · Agent 412 ·
+    /// Read/Grep/Edit 4,352 · median 2.1s".
+    ///
+    /// Three bars answered "which tool made the most calls", a question
+    /// `docs/design/tools-tab.md` records nobody asking — and spent a card on
+    /// it above the sections that answer the three questions an operator
+    /// arrives with. The counts stay, in the space a footer takes.
+    ///
+    /// `median` is the p50 of the bucket the MEDIAN CALL falls in: sort every
+    /// reported p50, walk the call counts, and take the bucket that crosses
+    /// half of them. This build never sees a raw per-call duration, so a true
+    /// fleet-wide median is not available — this is the closest statement the
+    /// data supports, and it cannot be dragged by a 400-second Agent bucket
+    /// of 200 calls the way a weighted mean can. Dropped entirely when no
+    /// bucket reported a p50.
+    public static func summaryLine(_ categories: [ToolCategory], medianSeconds: Double?)
+        -> String
+    {
+        let counts = categories.map { "\($0.name) \(QuotaFormat.count($0.calls))" }
+        guard let medianSeconds else { return counts.joined(separator: " · ") }
+        let formatted =
+            medianSeconds < 60
+            ? String(format: "%.1fs", medianSeconds) : ToolCallLabel.duration(medianSeconds)
+        return (counts + ["median \(formatted)"]).joined(separator: " · ")
+    }
+}
+
+/// One row of `TIMED OUT TODAY` — a command class, how many of today's
+/// timeouts it accounts for, and the calls behind the count.
+///
+/// `docs/design/tools-tab.md` question 3: "what keeps timing out, so the
+/// CLASS of command gets fixed?" A count in the headline said 31 and named
+/// nothing; a list of five commands is five anecdotes. The class is the unit
+/// an operator can act on.
+public struct ToolTimeoutClass: Identifiable, Equatable, Sendable {
+    /// `wait`, `build`, `git-net`, `git-local`, `search`, `compound`,
+    /// `other` — or a non-Bash tool's own name, which is how a timed-out
+    /// `WebFetch` reaches this list.
+    public let name: String
+    public let count: Int
+    /// The timed-out calls this row opens to show, each still carrying the
+    /// session that made it. Empty when the server sent counts but no calls,
+    /// which is a shorter row, never a wrong one.
+    public let calls: [SessionToolEntry]
+
+    public var id: String { name }
+
+    public init(name: String, count: Int, calls: [SessionToolEntry] = []) {
+        self.name = name
+        self.count = count
+        self.calls = calls
+    }
+
+    /// What the class means, for the three whose names do not say it. The
+    /// rest go bare rather than take a gloss that repeats the word.
+    public var caption: String? {
+        switch name {
+        case "wait": return "until / sleep loops"
+        case "build": return "cargo · swift"
+        case "git-net": return "push · fetch"
+        default: return nil
+        }
     }
 }
 
@@ -1091,6 +1189,14 @@ public struct SessionTools: Decodable, Equatable, Sendable {
     /// same as "not one session reports this", and hides the `BY TOOL`
     /// section rather than drawing empty bars.
     public let byTool: [ToolBucketRow]
+    /// How many of this session's calls timed out today, per command class —
+    /// `{"wait": 12, "build": 9}`, and a non-Bash tool under its own name.
+    /// Empty against a server that does not send it yet, and
+    /// ``Fleet/toolsTimeoutClasses`` turns "empty from every session" into a
+    /// hidden section rather than a card of zeroes.
+    public let timeoutsByClass: [String: Int]
+    /// The calls behind those counts — what a class row opens to show.
+    public let timedOut: [ToolCall]
 
     public init(
         calls: Int = 0,
@@ -1099,7 +1205,9 @@ public struct SessionTools: Decodable, Equatable, Sendable {
         running: [ToolCall] = [],
         slowest: [ToolCall] = [],
         overOneMinute: Int? = nil,
-        byTool: [ToolBucketRow] = []
+        byTool: [ToolBucketRow] = [],
+        timeoutsByClass: [String: Int] = [:],
+        timedOut: [ToolCall] = []
     ) {
         self.calls = calls
         self.errors = errors
@@ -1108,11 +1216,15 @@ public struct SessionTools: Decodable, Equatable, Sendable {
         self.slowest = slowest
         self.overOneMinute = overOneMinute
         self.byTool = byTool
+        self.timeoutsByClass = timeoutsByClass
+        self.timedOut = timedOut
     }
 
+    /// Every key camelCase, matching the wire's own `rename_all` — see
+    /// ``ToolBucketRow``'s `CodingKeys` for what a snake_case key here cost.
     private enum CodingKeys: String, CodingKey {
-        case calls, errors, timeouts, running, slowest, overOneMinute
-        case byTool = "by_tool"
+        case calls, errors, timeouts, running, slowest, overOneMinute, byTool
+        case timeoutsByClass, timedOut
     }
 
     public init(from decoder: Decoder) throws {
@@ -1124,6 +1236,8 @@ public struct SessionTools: Decodable, Equatable, Sendable {
         slowest = try c.decodeIfPresent([ToolCall].self, forKey: .slowest) ?? []
         overOneMinute = try c.decodeIfPresent(Int.self, forKey: .overOneMinute)
         byTool = try c.decodeIfPresent([ToolBucketRow].self, forKey: .byTool) ?? []
+        timeoutsByClass = try c.decodeIfPresent([String: Int].self, forKey: .timeoutsByClass) ?? [:]
+        timedOut = try c.decodeIfPresent([ToolCall].self, forKey: .timedOut) ?? []
     }
 }
 
@@ -2716,11 +2830,11 @@ public struct Fleet: Equatable, Sendable {
             switch tool {
             case "Bash": return "Bash"
             case "Agent", "Task": return "Agent"
-            default: return "Read · Grep · Edit"
+            default: return "Read/Grep/Edit"
             }
         }
         let grouped = Dictionary(grouping: allBuckets) { category(for: $0.tool) }
-        let order = ["Bash", "Agent", "Read · Grep · Edit"]
+        let order = ["Bash", "Agent", "Read/Grep/Edit"]
         return order.compactMap { name in
             guard let rows = grouped[name], !rows.isEmpty else { return nil }
             let calls = rows.reduce(0) { $0 + $1.calls }
@@ -2730,11 +2844,68 @@ public struct Fleet: Equatable, Sendable {
         }
     }
 
-    /// Every tool call currently running, pooled across every session.
+    /// The p50 of the bucket the median call falls in — the one figure the
+    /// `BY TOOL` line ends with. See ``ToolCategory/summaryLine(_:medianSeconds:)``
+    /// for why this and not a mean. `nil` when no bucket reported a p50.
+    public var toolsMedianSeconds: Double? {
+        let buckets = sessions.flatMap(\.tools.byTool)
+            .compactMap { row -> (calls: Int, p50: Double)? in
+                guard let p50 = row.secondsP50, row.calls > 0 else { return nil }
+                return (row.calls, p50)
+            }
+            .sorted { $0.p50 < $1.p50 }
+        let total = buckets.reduce(0) { $0 + $1.calls }
+        guard total > 0 else { return nil }
+        var seen = 0
+        for bucket in buckets {
+            seen += bucket.calls
+            if Double(seen) >= Double(total) / 2 { return bucket.p50 }
+        }
+        return buckets.last?.p50
+    }
+
+    /// Today's timeouts by command class, biggest first — the
+    /// `TIMED OUT TODAY` card. `nil`, never an empty array, when not one
+    /// session reports ``SessionTools/timeoutsByClass``: against a server
+    /// built before that field the section is HIDDEN, because a card reading
+    /// "wait 0 · build 0" claims a measurement nobody made.
+    ///
+    /// Ties break on the class name so two polls carrying identical data draw
+    /// the rows in identical order.
+    public var toolsTimeoutClasses: [ToolTimeoutClass]? {
+        var counts: [String: Int] = [:]
+        for session in sessions {
+            for (name, count) in session.tools.timeoutsByClass {
+                counts[name, default: 0] += count
+            }
+        }
+        guard !counts.isEmpty else { return nil }
+        // A Bash call is filed under its class; anything else under its own
+        // tool name, which is how a timed-out `WebFetch` reaches the card.
+        let entries = sessions.flatMap { session in
+            session.tools.timedOut.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
+        }
+        let calls = Dictionary(grouping: entries) { $0.call.commandClass ?? $0.call.tool }
+        return
+            counts
+            .map { ToolTimeoutClass(name: $0.key, count: $0.value, calls: calls[$0.key] ?? []) }
+            .sorted { lhs, rhs in
+                if lhs.count != rhs.count { return lhs.count > rhs.count }
+                return lhs.name < rhs.name
+            }
+    }
+
+    /// Every tool call currently running, pooled across every session,
+    /// LONGEST FIRST — `docs/design/tools-tab.md`'s first question is "is
+    /// something stuck or about to time out", so the call nearest its timeout
+    /// is the one that must be on top rather than the one whose session
+    /// happened to sort first. A call with no `startedMs` has no elapsed time
+    /// to rank and sorts last.
     public var toolsRunning: [SessionToolEntry] {
         sessions.flatMap { session in
             session.tools.running.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
         }
+        .sorted { ($0.call.startedMs ?? .max) < ($1.call.startedMs ?? .max) }
     }
 
     /// The ten slowest calls across every session, longest first. Each

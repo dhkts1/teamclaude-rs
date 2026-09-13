@@ -270,6 +270,20 @@ enum V4 {
     /// 67 pt between rows the mockup sets 56 pt apart.
     static var ringRowMinHeight: CGFloat { lineHeight(monoSize) + lineHeight(muteSize) }
 
+    /// A command head gets TWO lines of its own, full width, before it
+    /// ellipsises — `docs/design/tools-tab.md`'s own layout rule, from the
+    /// "essential text truncation" guideline: the command is the
+    /// distinguishing text, and cutting it at 36 characters to fit beside a
+    /// ring hides the one thing that tells two calls apart.
+    static let commandLineLimit = 2
+    /// The count column on a TIMED OUT TODAY row. Wide enough for three
+    /// digits: a day past 999 timeouts in one class is a different
+    /// conversation.
+    static let timeoutCountWidth: CGFloat = 26
+    /// The BY TOOL footer line — 11 pt, the section-head size, because that
+    /// is what it now is: a caption under the tab rather than a card in it.
+    static let byToolLineSize: CGFloat = 11
+
     // MARK: - Group (`.grp`)
 
     static let groupPaddingTop: CGFloat = 12

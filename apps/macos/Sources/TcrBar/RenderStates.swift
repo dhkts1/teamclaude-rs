@@ -117,6 +117,12 @@ enum RenderStates {
             // F3 — the Tools tab: running now, slowest today (one at the
             // Bash timeout), and the fleet-wide totals line.
             ("17-tools-tab", .loaded(sessionsTabFleet), false, nil),
+            // The same fleet with one TIMED OUT TODAY class OPEN — see
+            // `expandedTimeoutClassesFixture`. Its own scene because the
+            // disclosure is that card's whole point (a count that opens to
+            // the commands behind it) and a harness that can only draw it
+            // closed reviews half the section.
+            ("17b-tools-tab-timeout-class-open", .loaded(sessionsTabFleet), false, nil),
             // The forward-compat case both tabs must show as one sentence,
             // never an empty list: `healthyJSON` carries no `sessions` key at
             // all, the shape every server shipped before F1.
@@ -233,7 +239,9 @@ enum RenderStates {
         case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
             "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed":
             return .sessions
-        case "17-tools-tab", "18b-tools-tab-old-server", "18d-tools-tab-old-tcr": return .tools
+        case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
+            "18d-tools-tab-old-tcr":
+            return .tools
         default: return .accounts
         }
     }
@@ -250,7 +258,10 @@ enum RenderStates {
     /// mockup this fixture is modelled on, `cccccccc` is the idle,
     /// unassigned control case.
     private static func sessionFilesFixture(for sceneName: String) -> [String: SessionFile] {
-        guard sceneName == "16-sessions-tab" || sceneName == "17-tools-tab" else { return [:] }
+        guard
+            sceneName == "16-sessions-tab" || sceneName == "17-tools-tab"
+                || sceneName == "17b-tools-tab-timeout-class-open"
+        else { return [:] }
         return [
             "aaaaaaaa-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "aaaaaaaa-1111-2222-3333-444444444444",
@@ -461,7 +472,9 @@ enum RenderStates {
                 startServerAtLaunch: .constant(false),
                 snapshotMode: true,
                 initialTab: initialTab(for: scene.name),
-                initialSessionFiles: sessionFilesFixture(for: scene.name)
+                initialSessionFiles: sessionFilesFixture(for: scene.name),
+                initialMachineStats: machineFixture,
+                initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name)
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -594,6 +607,37 @@ enum RenderStates {
             return false
         }
     }
+
+    /// `wait` open on the one scene that reviews the disclosure — the
+    /// biggest class, and the one `sessionsFixture` gives commands to from
+    /// both of its tool-carrying sessions.
+    private static func expandedTimeoutClassesFixture(for sceneName: String) -> Set<String> {
+        sceneName == "17b-tools-tab-timeout-class-open" ? ["wait"] : []
+    }
+
+    /// The machine line's numbers, fixed — `docs/design/tools-tab.md`'s own
+    /// line, verbatim. Never ``MachineStats/read()``: a render must produce
+    /// the same pixels on a quiet laptop and on a box running five compiles,
+    /// or the harness is comparing this machine's load rather than the
+    /// panel's layout.
+    ///
+    /// The tint here is `calm`, not amber: 7.1 on 14 cores is half a load
+    /// unit per core, and this build tints by Gil's dispatch rule (amber from
+    /// 1x, red past 2x) rather than by the mockup's own `warn` class on this
+    /// same line, which the rule contradicts. Measured on the render, not
+    /// read off the code — a pixel scan for `#ffd16b` finds amber in the four
+    /// TIMED OUT bars and nowhere on the machine line. The bands themselves
+    /// are pinned by `MachineStatsTests.testLoadTintBands`, which is where a
+    /// threshold belongs; a fixture chosen to picture one band would have
+    /// cost this scene the mockup's own numbers, and scene 17 is compared
+    /// against the mockup crop.
+    private static let machineFixture = MachineStats(
+        loadAverage: 7.1,
+        cores: 14,
+        memoryUsedBytes: 48 * 1_073_741_824,
+        memoryTotalBytes: 64 * 1_073_741_824,
+        compiles: 5,
+        diskFreeBytes: 210_000_000_000)
 
     /// Tall enough that thirteen rows are all visible rather than scrolled. This
     /// is a review artifact, so seeing everything beats fidelity to the clip.
@@ -1023,7 +1067,13 @@ enum RenderStates {
                     // 2,000) — the two must agree, per `panel-tabs-review.md`
                     // finding 3: the headline IS the total, never one
                     // category standing in for it.
-                    calls: 17_200, errors: 1, timeouts: 0,
+                    // 23 = this session's own `timeoutsByClass` below
+                    // (8 + 9 + 6), and with the sibling's 8 the summary line's
+                    // "31 hit the 600s timeout" IS the TIMED OUT TODAY card's
+                    // own total. The two numbers are the same fact; a fixture
+                    // that let them disagree would render a panel contradicting
+                    // itself two lines apart.
+                    calls: 17_200, errors: 1, timeouts: 23,
                     running: [
                         ToolCall(
                             tool: "Bash", commandHead: "cargo test --release > test.log",
@@ -1047,6 +1097,25 @@ enum RenderStates {
                         ToolBucketRow(tool: "Bash", calls: 15_000, secondsP50: 2.0),
                         ToolBucketRow(tool: "Agent", calls: 200, secondsP50: 380),
                         ToolBucketRow(tool: "Read", calls: 2_000, secondsP50: 0.2),
+                    ],
+                    // The mockup's own TIMED OUT TODAY card: wait 12, build 9,
+                    // git-net 4, other 6 — 31, which is the number this tab's
+                    // summary line already says hit the 600s timeout. Split
+                    // across the two sessions that carry tool data, so the
+                    // render also proves the fleet-wide sum rather than one
+                    // session's dictionary drawn straight through.
+                    timeoutsByClass: ["wait": 8, "build": 9, "other": 6],
+                    timedOut: [
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "until grep -q \"Ready in\" /tmp/dev.log; do sleep 1; done",
+                            commandClass: "wait",
+                            endedMs: msAgo(18 * 60), seconds: 600),
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "cargo build --release --all-features",
+                            commandClass: "build",
+                            endedMs: msAgo(52 * 60), seconds: 600),
                     ]),
                 // Rising, per the mockup's own aria-label on this session's spark:
                 // "Requests per minute over the last 30 minutes: rising".
@@ -1062,7 +1131,8 @@ enum RenderStates {
                 model: "claude-opus-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
                 requests: 5756, inputTokens: 60_000, outputTokens: 88_000, cacheReadTokens: 940_000,
                 tools: SessionTools(
-                    calls: 7_477, errors: 4, timeouts: 1,
+                    // 8 = `wait` 4 + `git-net` 4 below.
+                    calls: 7_477, errors: 4, timeouts: 8,
                     // Five, the mockup's own count for SLOWEST TODAY — and the
                     // reason there are five: `Fleet.toolsSlowest` pools ten
                     // across every session and the tab draws the top five, so a
@@ -1098,6 +1168,18 @@ enum RenderStates {
                         ToolBucketRow(tool: "Bash", calls: 4_913, secondsP50: 2.3),
                         ToolBucketRow(tool: "Agent", calls: 212, secondsP50: 400),
                         ToolBucketRow(tool: "Grep", calls: 2_352, secondsP50: 0.2),
+                    ],
+                    // The other four of the mockup's `wait` twelve, and its
+                    // `git-net` four. A class with a count and no commands is
+                    // deliberate here too: `git-net` opens to nothing, which
+                    // is the row shape a server sending counts alone draws.
+                    timeoutsByClass: ["wait": 4, "git-net": 4],
+                    timedOut: [
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "until [ -f /tmp/merge-gate.done ]; do sleep 5; done",
+                            commandClass: "wait",
+                            endedMs: msAgo(31 * 60), seconds: 600)
                     ]),
                 // Falling, per the mockup's aria-label on this session's spark.
                 // "$5.29"; with the sibling above, the account block's header
