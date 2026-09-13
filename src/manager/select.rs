@@ -380,6 +380,9 @@ impl Manager {
         // `Self::parked_groups`'s and `Self::control_allowed_groups`'s docs.
         let parked_groups = self.parked_groups();
         let control_allowed_groups = self.control_allowed_groups();
+        // Same point-in-time-snapshot reasoning as `reserved_groups` above —
+        // see `Self::spill_groups`'s doc.
+        let spill_groups = self.spill_groups();
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
@@ -1042,32 +1045,43 @@ impl Manager {
             let mut best =
                 self.pick_eligible(&accounts, pool_tried, now, now_ms, is_fable, true, group);
 
-            // A RESERVED group is STRICT, and strictness is checked BEFORE the soft
-            // fallback below can widen the pick. `reserved` means the group is
-            // private in BOTH directions: `Self::reserved_blocks` already keeps
-            // unrequested traffic OUT of its members, and this keeps the group's own
-            // traffic IN. An UNRESERVED group is unaffected and still spills.
+            // An explicit `--group` ask is STRICT BY DEFAULT (2026-09-13), and
+            // strictness is checked BEFORE the soft fallback below can widen the
+            // pick: when the asked-for group has no free member, the request
+            // refuses rather than spilling into the whole pool. This used to be
+            // conditional on `reserved`; it no longer is. A group ask an
+            // operator typed is being served by that group or not at all,
+            // independent of whether the group is also `reserved` (which today
+            // governs only the INBOUND direction — keeping other traffic OUT —
+            // see `GroupSettings::reserved`'s doc).
             //
-            // Deliberately not a second config flag. One concept — "this group is
-            // mine" — is what an operator reads off the panel's lock glyph, and two
-            // half-set booleans produce a group that looks private while still
-            // leaking. Every existing prefer-and-fall-back test uses an unreserved
-            // group and is untouched by this.
+            // Two carve-outs from "strict by default":
+            //   - `groupSettings.<g>.spillToPool` is the escape hatch back to the
+            //     pre-2026-09-13 spill behaviour, for an operator who wants it.
+            //     Every existing prefer-and-fall-back test now sets this so it
+            //     keeps exercising the OLD rule under its new name.
+            //   - A RESERVED group ignores `spillToPool` and is always strict:
+            //     spilling a reserved group's own traffic into the pool would
+            //     hand it to an account other traffic cannot reach any other
+            //     way, which contradicts what `reserved` promises inbound.
             //
             // Measured on the live fleet 2026-09-01: pool traffic diverted onto a
             // reserved-group member 127 times in a day (116 requests, 43 of them
             // Opus), rate-limiting it (`hold_seconds=17`); three seconds later that
             // group's OWN `--group` ask found its only member gated and spilled to
             // the pool — 33 times, every one `reason="all-members-unavailable"`.
-            // The inbound leak caused the outbound one, so closing only the first
-            // still leaves an operator's private account serving traffic it was
-            // walled off from.
+            // That measurement was the inbound leak causing an outbound one on a
+            // RESERVED group specifically; it is also the reasoning for making
+            // strict-by-default apply to every group, not only reserved ones — an
+            // operator who explicitly asks for a group has the same expectation
+            // whether or not that group also happens to be reserved.
             //
             // Returning `None` is not dropping the request: it hands the caller's
             // exhaustion ladder (`proxy.rs`) the same `None` a truly exhausted fleet
             // produces, which soft-waits once for a transient park (the 17s hold
             // above) and answers an honest 429 only for real exhaustion.
-            let strict_group = group.filter(|g| reserved_groups.contains(*g));
+            let strict_group =
+                group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
 
             // Soft fallback (CRITICAL — pacing must never DROP a servable request,
             // and a group with no current capacity must never either): if the first
@@ -1097,7 +1111,7 @@ impl Manager {
                     tracing::info!(
                         group = g,
                         reason = miss.as_str(),
-                        "group: strict (reserved) — refusing to fall back to the whole pool, returning no account — {}",
+                        "group: strict — refusing to fall back to the whole pool, returning no account — {}",
                         miss.explain(),
                     );
                 } else if let Some(idx) =
@@ -1149,9 +1163,9 @@ impl Manager {
 
             // Fable last resort (three-tier gate, replacing the old hard two-tier
             // one): reached only when BOTH passes above already came up empty AND
-            // a reserved strict group did not just intentionally return `None`
-            // (`strict_group` is a per-group PRIVACY decision, never a candidate
-            // pool to widen). The threshold applied by `model_blocked` above is a
+            // a strict group did not just intentionally return `None`
+            // (`strict_group` is a per-group PRIVACY/EXCLUSIVITY decision, never a
+            // candidate pool to widen). The threshold applied by `model_blocked` above is a
             // PREDICTION (`switchThreshold` against `7d_oi`, observed sitting at
             // 0.95-0.98 on a real fleet); upstream — `Quota::reject_model_weekly`,
             // the only writer of a genuine `1.0` — is the AUTHORITY. A prediction
