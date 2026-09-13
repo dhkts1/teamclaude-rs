@@ -1171,12 +1171,14 @@ struct FleetView: View {
                 }
             }
             if !fleet.toolsSlowest.isEmpty {
+                // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
+                // across every session, and a panel this tall shows half of
+                // them before the fold.
+                let slowest = Array(fleet.toolsSlowest.prefix(Self.slowestVisibleRows))
+                let width = slowestColumnWidth(slowest)
                 toolsSection("SLOWEST TODAY", subtitle: nil) {
-                    // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
-                    // across every session, and a panel this tall shows half of
-                    // them before the fold.
-                    ForEach(fleet.toolsSlowest.prefix(Self.slowestVisibleRows)) { entry in
-                        slowestToolRow(entry)
+                    ForEach(slowest) { entry in
+                        slowestToolRow(entry, width: width)
                     }
                 }
             }
@@ -1390,30 +1392,56 @@ struct FleetView: View {
         }
     }
 
-    private func slowestToolRow(_ entry: SessionToolEntry) -> some View {
+    /// `width` is the SLOWEST TODAY list's shared duration column — one width
+    /// for every row in the list, never per row, or the durations zig-zag down
+    /// the tab (``TrailingColumn``'s own reason for existing). It widens for
+    /// the whole list when any call in it was killed, because "timed out" is a
+    /// longer string than "9m 43s" and the column has to hold the widest thing
+    /// the list says.
+    private func slowestToolRow(_ entry: SessionToolEntry, width: CGFloat) -> some View {
         // ONE line, as the mockup draws it: the command, ellipsised at the pill
         // column. The second line the pre-v4 row added ("Bash · mycelium-c2")
         // cost 55 pt a row and pushed three of the five slowest below the fold.
         V4Row {
             MonoText(text: entry.call.commandHead ?? entry.call.tool)
         } trailing: {
-            TrailingColumn(width: V4.durationColumnWidth) {
+            TrailingColumn(width: width) {
                 if let seconds = entry.call.seconds {
+                    // A killed call says so in WORDS. Red against grey was the
+                    // whole difference before (review finding 4), and the pill
+                    // spoke the duration alone, so a listener heard "10m 0s"
+                    // for a call the proxy had killed.
+                    let spoken = ToolCallLabel.spoken(
+                        seconds: seconds, timeout: bashTimeoutSeconds)
                     V4Pill(
-                        text: durationLabel(seconds),
-                        role: seconds >= bashTimeoutSeconds ? .bad : .neutral)
+                        text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
+                        role: ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
+                            ? .bad : .neutral
+                    )
+                    .accessibilityValue(spoken ?? "")
+                    .help(spoken ?? "")
                 }
             }
         }
     }
 
-    /// `"45s"`, `"4m 12s"` — no day tier: the longest call this tab shows is
-    /// the Bash tool's own timeout, six orders of magnitude under a day.
+    /// Whether the SLOWEST TODAY list has to hold a "timed out" pill, and
+    /// therefore which width its duration column takes. `V4.trailingColumnWidth`
+    /// is the Tools tab's own full trailing column (ring + gap + duration), so
+    /// the wider case is still a declared token rather than a number invented
+    /// for the word.
+    private func slowestColumnWidth(_ entries: [SessionToolEntry]) -> CGFloat {
+        let anyTimedOut = entries.contains {
+            guard let seconds = $0.call.seconds else { return false }
+            return ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
+        }
+        return anyTimedOut ? V4.trailingColumnWidth : V4.durationColumnWidth
+    }
+
+    /// `"45s"`, `"4m 12s"`. The rule itself is ``ToolCallLabel/duration(_:)``,
+    /// in `TcrBarCore` where a test can read it.
     private func durationLabel(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let minutes = total / 60
-        let rest = total % 60
-        return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
+        ToolCallLabel.duration(seconds)
     }
 
     /// "updated 4s ago" — `docs/design/panel-tabs-mockup.html` F14. No day/hour
