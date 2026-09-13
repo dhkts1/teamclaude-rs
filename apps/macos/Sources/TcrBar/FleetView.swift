@@ -116,6 +116,23 @@ struct FleetView: View {
     @State private var usageLineHeight: CGFloat = 0
     @State private var usageLineBaseline: CGFloat = 0
 
+    /// The v4 Accounts tab's content height, as ONE measurement.
+    ///
+    /// The pre-v4 list publishes a height per child and `visibleRowsHeight(for:)`
+    /// sums them; `AccountsTabV4` is a single subtree that owns its own sections,
+    /// boxes, cards and gaps, so its height arrives whole. Nothing under
+    /// `PanelV4/` emits `RowHeightsKey` — which is exactly why the v4 panel was
+    /// pinned at the cap on every fleet (interface review finding 11) — and
+    /// adding an emitter to `AccountCard` would only have the view re-derive
+    /// gaps this subtree already knows.
+    ///
+    /// Published raw and folded through `PanelHeight.settled`, the same dead
+    /// band the row measurements use, for the reason that function's own
+    /// doc-comment gives: this number sizes the frame around the very content
+    /// being measured, and sub-pixel drift there is an `onPreferenceChange`
+    /// loop with a pass budget rather than a convergence test.
+    @State private var v4ContentHeight: CGFloat = 0
+
     /// Accounts / Sessions / Tools (F2 + F3, `panel-tabs-bridge.md`).
     /// `.accounts` selected by default, per the bridge.
     @State private var selectedTab: PanelTab = .accounts
@@ -210,8 +227,8 @@ struct FleetView: View {
     private var v4Body: some View {
         PanelV4(
             freshness: poller.lastPollAt.map { freshnessLabel(since: $0, now: Date()) },
-            tabs: PanelTab.allCases,
-            selected: selectedTab,
+            tabs: v4Tabs,
+            selected: visibleTab,
             badges: v4Badges,
             onSelect: { selectedTab = $0 },
             onSettings: onSettings,
@@ -230,6 +247,94 @@ struct FleetView: View {
         guard case .loaded(let fleet) = poller.state else { return nil }
         return fleet.accounts.count
     }
+    /// The two facts about WHERE the Accounts tab's numbers come from, on one
+    /// line under the summary: a row `tcr` sent that this build could not read,
+    /// and which account every quota measurement was taken through.
+    ///
+    /// Review finding 15. Both existed in the model and reached no view:
+    /// `Fleet.unreadableNotice` had four references, all inside
+    /// `StatusPoller`, and `control.current` was read only for ordering. So
+    /// thirteen accounts rendered as twelve with no sentence saying one was
+    /// lost — which `Fleet`'s own doc-comment (`FleetStatus.swift:2111-2114`)
+    /// says must never happen — and the only visible consequence of "Use as
+    /// Control Account" was a row moving. Measured before the fix: the
+    /// `05-unreadable-row`, `12-keeping-awake` and `13-control-account` renders
+    /// were byte-identical, three of 27 named states drawing nothing of their
+    /// own.
+    ///
+    /// The notice is `Tok.spent`, as the review's After asks. The control
+    /// clause is `Tok.accent` rather than the neutral pill it suggests: this
+    /// panel already has a recorded decision for that exact fact — the row's
+    /// own control marker uses `accent` "not one of the quota/rotation status
+    /// hues … a designation, not a measured state" — and a second colour for
+    /// one fact is how two places start disagreeing.
+    @ViewBuilder
+    private func accountsProvenanceLine(_ fleet: Fleet) -> some View {
+        let notice = fleet.unreadableNotice
+        let controlName = control.current
+        if notice != nil || controlName != nil {
+            HStack(spacing: V4.rowGap) {
+                if let notice {
+                    Text(notice)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.spent)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                Spacer(minLength: 0)
+                if let controlName {
+                    Text("control account · \(controlName)")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.accent)
+                        .lineLimit(1)
+                        // The NAME is what gives way, never the designation:
+                        // middle truncation keeps both ends of an address.
+                        .truncationMode(.middle)
+                        .help("Every quota figure on this panel is measured through \(controlName).")
+                }
+            }
+            .padding(.horizontal, V4.summaryPaddingSide)
+            .padding(.bottom, V4.summaryPaddingBottom)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                [
+                    notice.map { "\($0). tcr sent a row this build could not decode." },
+                    controlName.map { "Quotas measured through the control account \($0)." },
+                ]
+                .compactMap { $0 }.joined(separator: " "))
+        }
+    }
+
+    /// Is there a fleet to draw tabs over? `.loaded` with at least one account
+    /// — the exact case ``v4Content`` gives a tab body to. Every other state
+    /// (pending, tool missing, command failed, undecodable, empty fleet) falls
+    /// to one banner that is the same on all three tabs.
+    private var hasFleet: Bool {
+        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty { return true }
+        return false
+    }
+
+    /// The tabs the strip may offer, and the one that is really on screen.
+    ///
+    /// Review finding 14: with no fleet, two of the three tabs led nowhere.
+    /// Tapping Sessions moved the selected pill and changed nothing else — a
+    /// control reporting a state change that did not happen — and, worse, it
+    /// took Start server, Refresh, Add account and Take over port off the one
+    /// screen whose entire purpose is recovery, because ``v4Footer`` gates
+    /// those on the Accounts tab. Hidden controls, on the state that needs
+    /// them most.
+    ///
+    /// So a panel with no fleet offers the one tab it can actually draw.
+    /// ``selectedTab`` is left untouched rather than reset: it is the
+    /// operator's standing choice (and a persisted preference), and a fleet
+    /// coming back should return them to the tab they were on, not to
+    /// whatever an outage picked for them.
+    private var v4Tabs: [PanelTab] { hasFleet ? PanelTab.allCases : [.accounts] }
+
+    /// The tab whose body, summary, footer text and actions are actually
+    /// drawn. Reading ``selectedTab`` directly is the bug: it can name a tab
+    /// the strip is not offering.
+    private var visibleTab: PanelTab { hasFleet ? selectedTab : .accounts }
 
     /// A badge per tab, from the same counts on EVERY tab — including the one
     /// being looked at, which the pre-v4 strip dropped: it drew zero badge
@@ -247,17 +352,33 @@ struct FleetView: View {
     @ViewBuilder
     private var v4Summary: some View {
         if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
-            switch selectedTab {
+            switch visibleTab {
             case .accounts:
                 SummaryLine.accounts(fleet)
+                accountsProvenanceLine(fleet)
+            // Both gated on `sessionsSupported`, which is the guard the pre-v4
+            // header at ``header`` has always carried and the v4 summary block
+            // dropped: a server that predates the sessions wire reports no
+            // sessions and no tool calls, and "0 sessions · 0 busy · 0 waiting
+            // · 0 idle" over the banner that says so is four fabricated
+            // measurements. `FleetStatus.swift:2241-2244` refuses the same
+            // false zero one clause over (`toolsOverOneMinute` returns `nil`
+            // rather than 0) and `StatusPoller.swift:102-106` refuses it for
+            // the menu bar. The tab body's own banner — "This server predates
+            // sessions — update tcr." — is then the only sentence on screen
+            // about either count, which is the whole truth and all of it.
             case .sessions:
-                sessionsSummaryLine(fleet)
-                    .padding(.horizontal, V4.summaryPaddingSide)
-                    .padding(.bottom, V4.summaryPaddingBottom)
+                if fleet.sessionsSupported {
+                    sessionsSummaryLine(fleet)
+                        .padding(.horizontal, V4.summaryPaddingSide)
+                        .padding(.bottom, V4.summaryPaddingBottom)
+                }
             case .tools:
-                toolsSummaryLine(fleet)
-                    .padding(.horizontal, V4.summaryPaddingSide)
-                    .padding(.bottom, V4.summaryPaddingBottom)
+                if fleet.sessionsSupported {
+                    toolsSummaryLine(fleet)
+                        .padding(.horizontal, V4.summaryPaddingSide)
+                        .padding(.bottom, V4.summaryPaddingBottom)
+                }
             }
         }
     }
@@ -266,7 +387,7 @@ struct FleetView: View {
     private var v4Content: some View {
         switch poller.state {
         case .loaded(let fleet) where !fleet.accounts.isEmpty:
-            switch selectedTab {
+            switch visibleTab {
             case .accounts:
                 if fleet.source.countersAreStructural {
                     offlineNotice(fleet.source)
@@ -274,8 +395,24 @@ struct FleetView: View {
                 if snapshotMode {
                     accountsTabV4(fleet)
                 } else {
-                    ScrollView { accountsTabV4(fleet) }
-                        .frame(height: visibleRowsHeight(for: fleet))
+                    ScrollView {
+                        accountsTabV4(fleet)
+                            // On the CONTENT, never on the `ScrollView`: a
+                            // reader attached outside the frame reports the
+                            // frame back to itself, which is a measurement of
+                            // this line rather than of the fleet.
+                            .background(
+                                GeometryReader { proxy in
+                                    Color.clear.preference(
+                                        key: V4ContentHeightKey.self,
+                                        value: proxy.size.height)
+                                }
+                            )
+                    }
+                    .frame(height: v4ListHeight(for: fleet))
+                    .onPreferenceChange(V4ContentHeightKey.self) {
+                        v4ContentHeight = PanelHeight.settled(v4ContentHeight, $0)
+                    }
                 }
             case .sessions:
                 sessionsTab(fleet)
@@ -342,11 +479,11 @@ struct FleetView: View {
     private var v4Footer: some View {
         PanelFooter(
             leading: v4FooterLeading,
-            leadingSystemImage: selectedTab == .sessions ? "shippingbox" : nil,
+            leadingSystemImage: visibleTab == .sessions ? "shippingbox" : nil,
             trailing: v4FooterTrailing
         ) {
             VStack(alignment: .leading, spacing: V4.buttonGap) {
-                if selectedTab == .accounts {
+                if visibleTab == .accounts {
                     v4Actions
                 }
                 if let loginError {
@@ -373,7 +510,7 @@ struct FleetView: View {
     /// Where this tab's numbers come from — the mockup gives each tab its own
     /// provenance line rather than repeating one global block on all three.
     private var v4FooterLeading: String {
-        switch selectedTab {
+        switch visibleTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
         case .sessions: return "proxy + Claude Code session files"
         case .tools: return "from request bodies only · nothing logged"
@@ -381,7 +518,7 @@ struct FleetView: View {
     }
 
     private var v4FooterTrailing: String? {
-        if selectedTab == .sessions { return "sparkline: req/min, 30m" }
+        if visibleTab == .sessions { return "sparkline: req/min, 30m" }
         guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }
@@ -1198,12 +1335,14 @@ struct FleetView: View {
                 }
             }
             if !fleet.toolsSlowest.isEmpty {
+                // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
+                // across every session, and a panel this tall shows half of
+                // them before the fold.
+                let slowest = Array(fleet.toolsSlowest.prefix(Self.slowestVisibleRows))
+                let width = slowestColumnWidth(slowest)
                 toolsSection("SLOWEST TODAY", subtitle: nil) {
-                    // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
-                    // across every session, and a panel this tall shows half of
-                    // them before the fold.
-                    ForEach(fleet.toolsSlowest.prefix(Self.slowestVisibleRows)) { entry in
-                        slowestToolRow(entry)
+                    ForEach(slowest) { entry in
+                        slowestToolRow(entry, width: width)
                     }
                 }
             }
@@ -1267,7 +1406,20 @@ struct FleetView: View {
                         RoundedRectangle(cornerRadius: V4.barRadius)
                             .fill(Tok.ink.opacity(V4.barTrackAlpha))
                         RoundedRectangle(cornerRadius: V4.barRadius)
-                            .fill(byToolColor(category.name))
+                            // One neutral tint for all three categories, not
+                            // the mockup's own `--ok` green for Bash and
+                            // `--info` blue (`.accent`) for Agent
+                            // (`docs/design/panel-tabs-review.md` finding 12,
+                            // left unresolved there; review #6's cap list,
+                            // `data/plans/interface-review-2026-09-13.md`,
+                            // raises it again). This bar's whole job is a
+                            // share-of-total width comparison — the category
+                            // is already named beside it in text — so a
+                            // borrowed status colour told the reader
+                            // something untrue: green reads as "healthy
+                            // quota" and the accent reads as "selected", and
+                            // neither is what a tool-call count is.
+                            .fill(Tok.inkFaint)
                             .frame(width: max(V4.barMinWidth, proxy.size.width * share))
                     }
                 }
@@ -1284,19 +1436,6 @@ struct FleetView: View {
                 .foregroundStyle(Tok.dim)
                 .lineLimit(1)
                 .fixedSize()
-        }
-    }
-
-    /// Bash is `--ok` green, Agent is `--info` blue (`.accent`, the closest
-    /// token this palette has to the mockup's dedicated info role — see
-    /// `docs/design/panel-tabs-review.md` finding 12, unresolved here), and
-    /// Read/Grep/Edit is the neutral `--mute` — `docs/design/panel-tabs-mockup.html`'s
-    /// three bar tints.
-    private func byToolColor(_ category: String) -> Color {
-        switch category {
-        case "Bash": return Tok.ok
-        case "Agent": return Tok.accent
-        default: return Tok.inkFaint
         }
     }
 
@@ -1417,30 +1556,56 @@ struct FleetView: View {
         }
     }
 
-    private func slowestToolRow(_ entry: SessionToolEntry) -> some View {
+    /// `width` is the SLOWEST TODAY list's shared duration column — one width
+    /// for every row in the list, never per row, or the durations zig-zag down
+    /// the tab (``TrailingColumn``'s own reason for existing). It widens for
+    /// the whole list when any call in it was killed, because "timed out" is a
+    /// longer string than "9m 43s" and the column has to hold the widest thing
+    /// the list says.
+    private func slowestToolRow(_ entry: SessionToolEntry, width: CGFloat) -> some View {
         // ONE line, as the mockup draws it: the command, ellipsised at the pill
         // column. The second line the pre-v4 row added ("Bash · mycelium-c2")
         // cost 55 pt a row and pushed three of the five slowest below the fold.
         V4Row {
             MonoText(text: entry.call.commandHead ?? entry.call.tool)
         } trailing: {
-            TrailingColumn(width: V4.durationColumnWidth) {
+            TrailingColumn(width: width) {
                 if let seconds = entry.call.seconds {
+                    // A killed call says so in WORDS. Red against grey was the
+                    // whole difference before (review finding 4), and the pill
+                    // spoke the duration alone, so a listener heard "10m 0s"
+                    // for a call the proxy had killed.
+                    let spoken = ToolCallLabel.spoken(
+                        seconds: seconds, timeout: bashTimeoutSeconds)
                     V4Pill(
-                        text: durationLabel(seconds),
-                        role: seconds >= bashTimeoutSeconds ? .bad : .neutral)
+                        text: ToolCallLabel.pill(seconds: seconds, timeout: bashTimeoutSeconds),
+                        role: ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
+                            ? .bad : .neutral
+                    )
+                    .accessibilityValue(spoken ?? "")
+                    .help(spoken ?? "")
                 }
             }
         }
     }
 
-    /// `"45s"`, `"4m 12s"` — no day tier: the longest call this tab shows is
-    /// the Bash tool's own timeout, six orders of magnitude under a day.
+    /// Whether the SLOWEST TODAY list has to hold a "timed out" pill, and
+    /// therefore which width its duration column takes. `V4.trailingColumnWidth`
+    /// is the Tools tab's own full trailing column (ring + gap + duration), so
+    /// the wider case is still a declared token rather than a number invented
+    /// for the word.
+    private func slowestColumnWidth(_ entries: [SessionToolEntry]) -> CGFloat {
+        let anyTimedOut = entries.contains {
+            guard let seconds = $0.call.seconds else { return false }
+            return ToolCallLabel.timedOut(seconds: seconds, timeout: bashTimeoutSeconds)
+        }
+        return anyTimedOut ? V4.trailingColumnWidth : V4.durationColumnWidth
+    }
+
+    /// `"45s"`, `"4m 12s"`. The rule itself is ``ToolCallLabel/duration(_:)``,
+    /// in `TcrBarCore` where a test can read it.
     private func durationLabel(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        let minutes = total / 60
-        let rest = total % 60
-        return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
+        ToolCallLabel.duration(seconds)
     }
 
     /// "updated 4s ago" — `docs/design/panel-tabs-mockup.html` F14. No day/hour
@@ -2131,16 +2296,50 @@ struct FleetView: View {
             // list drew under a globally pinned control row; sectioning removed
             // both the pin and the separator, so charging for it here would
             // hand the viewport 8.5pt of empty space under the last card.
-            budget: PanelHeight.listBudget(
-                cap: Tok.panelMaxHeight,
-                headerOverflow: PanelHeight.headerOverflow(
-                    lineHeight: usageLineHeight,
-                    oneLineHeight: usageLineBaseline,
-                    // The line's own render condition, read from the fleet
-                    // rather than from the last measurement: a measurement
-                    // taken while the line existed does not expire on its own.
-                    lineIsDrawn: fleet.usageSummaryLine != nil),
-                minimum: Tok.panelMinListHeight))
+            budget: listBudget(for: fleet))
+    }
+
+    /// What the account list may occupy: the cap, less whatever the header grew
+    /// past one line. Shared by both viewports so the v4 tab and the legacy
+    /// list can never disagree about the budget itself — only about how each
+    /// one measures the content inside it.
+    private func listBudget(for fleet: Fleet) -> CGFloat {
+        PanelHeight.listBudget(
+            cap: Tok.panelMaxHeight,
+            headerOverflow: PanelHeight.headerOverflow(
+                lineHeight: usageLineHeight,
+                oneLineHeight: usageLineBaseline,
+                // The line's own render condition, read from the fleet
+                // rather than from the last measurement: a measurement
+                // taken while the line existed does not expire on its own.
+                lineIsDrawn: fleet.usageSummaryLine != nil),
+            minimum: Tok.panelMinListHeight)
+    }
+
+    /// The v4 Accounts viewport: the tab's own measured content, clamped to
+    /// that budget.
+    ///
+    /// Review finding 11. The v4 tab was calling ``visibleRowsHeight(for:)``,
+    /// whose dictionary NOTHING under `PanelV4/` has ever populated, so it took
+    /// its empty-dictionary branch on every frame and returned the budget
+    /// itself: a two-account fleet was drawn in a 520 pt viewport, the same as
+    /// a thirteen-account one, with the remainder painted as panel fill under
+    /// the last card.
+    ///
+    /// One measurement rather than a dictionary because `AccountsTabV4` is one
+    /// subtree that already owns its sections, boxes, cards and the gaps
+    /// between them: there is nothing here to sum, and an emitter per card
+    /// would make the view re-derive spacing the subtree knows exactly.
+    ///
+    /// What this does NOT subtract is a wrapped v4 summary. `headerOverflow`
+    /// reads the two preferences the LEGACY header emits, which the v4 header
+    /// does not, so a summary that wraps adds its second line on top of the cap
+    /// rather than spending it. Bounded, and deliberately left: the unbounded
+    /// spend line that made overflow worth measuring is drawn by the legacy
+    /// header only, and the v4 summary is at most three short lines.
+    private func v4ListHeight(for fleet: Fleet) -> CGFloat {
+        PanelHeight.viewportHeight(
+            contentHeight: v4ContentHeight, budget: listBudget(for: fleet))
     }
 
     /// Every child `accountList` draws, in draw order, as its height key.
@@ -2545,6 +2744,20 @@ struct RowHeightsKey: PreferenceKey {
 /// preference-key pattern the rows use, for the same reason: the wrap point
 /// depends on the font, the panel width and the string, so it is measured, not
 /// computed.
+/// The v4 Accounts tab's whole content height — ONE number, not a dictionary.
+///
+/// `AccountsTabV4` is a single subtree that owns its sections, its group boxes,
+/// its cards and every gap between them, so unlike the pre-v4 list there is
+/// nothing to sum and no gap count to infer. `max` for the same reason the two
+/// usage keys use it: sibling subtrees in the same reader contribute and the
+/// tallest is the one the viewport has to hold.
+struct V4ContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct UsageLineHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {

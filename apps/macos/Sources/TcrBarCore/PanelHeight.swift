@@ -127,6 +127,31 @@ public enum PanelHeight {
         return min(max(summed, spacing), budget)
     }
 
+    /// The height to give a viewport whose content is measured as ONE height
+    /// rather than row by row: the content itself, clamped to the budget.
+    ///
+    /// ``visibleRowsHeight(rowHeights:spacing:controlHairline:budget:)`` sums a
+    /// per-row dictionary because the pre-v4 list publishes one measurement per
+    /// row and needs the gaps between them derived from the count. The v4
+    /// Accounts tab draws a single `AccountsTabV4` subtree — sections, group
+    /// boxes, cards and their gaps all inside it — so its height arrives as one
+    /// number and there is nothing to sum or to infer gaps for.
+    ///
+    /// That distinction is the whole of interface review finding 11. Nothing
+    /// under `PanelV4/` emits `RowHeightsKey`, so the row dictionary the v4
+    /// panel passed was permanently EMPTY and `visibleRowsHeight` took its
+    /// first-frame branch on every frame: every tab, on every fleet, pinned at
+    /// the cap. A two-account fleet got the same 520 pt as a thirteen-account
+    /// one, with the empty remainder drawn as panel fill under the last card.
+    ///
+    /// `0` — nothing measured yet, the first frame — returns the budget itself,
+    /// the same first-frame rule the row form has always had: a panel that
+    /// renders at zero height while waiting for a measurement reads as broken.
+    public static func viewportHeight(contentHeight: CGFloat, budget: CGFloat) -> CGFloat {
+        guard contentHeight > 0 else { return budget }
+        return min(contentHeight, budget)
+    }
+
     /// The grain every `GeometryReader` measurement this panel feeds into a
     /// `PreferenceKey` is snapped to before it is published.
     ///

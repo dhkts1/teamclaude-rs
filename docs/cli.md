@@ -130,6 +130,35 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
 | `--name <name>` | string | none | name this account explicitly instead of letting `login` mint a name for it; refused when another account already has that name |
+| `--non-interactive` | bool | `false` | drive the login from another program: never reads stdin, never opens the browser, reports progress as JSON lines — see below |
+
+### `--non-interactive`: driving the login from another program
+
+This is the mode TcrBar's own "Add account…" sheet runs the CLI in, and it is usable by
+anything else that can read lines and open a URL. It changes four things and nothing else:
+
+* **stdin is never read.** The pasted-code fallback and the name prompt are not merely
+  ignored, they are not constructed, so the loopback callback is the only way the login
+  can complete. A profile with no email at all — the inference-only case that would
+  otherwise prompt — is named with the same `unnamed` default an empty answer gives; pass
+  `--name` to choose.
+* **The browser is not opened here.** The URL is printed instead and the caller opens it,
+  because only the caller can bring its own window forward afterwards.
+* **Progress is JSON, one object per line on stdout**, and nothing else is printed there:
+
+  ```
+  {"event":"browser","url":"https://claude.ai/oauth/authorize?…"}
+  {"event":"waiting"}
+  {"event":"saved","account":"alice@example.com"}
+  ```
+
+  A failure is `{"event":"error","reason":"…"}` on stdout instead of `saved`.
+* **A failure exits non-zero** with that same reason on ONE stderr line, rather than
+  anyhow's indented multi-line chain. The 2-minute callback timeout is a failure like any
+  other.
+
+It refuses to combine with `--token`, which reads the credential from stdin: that is the
+one input this mode has no way to supply.
 
 **A login names the account itself, and never asks on the happy path.** The name is the
 profile's email when no other account carries it, and `email/<org-slug>` when one does —
