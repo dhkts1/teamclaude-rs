@@ -8,3 +8,13 @@ description = "SCM_RIGHTS listening-socket passing, isolated so the main crate k
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["socket", "uio"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Peer code-signature verification (`peer.rs`). `core-foundation` is the safe
+# RAII wrapper over the CF types the Security framework speaks; hand-managing
+# CFRelease across every error path is exactly the thing that leaks or
+# double-frees under review pressure.
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+libc = "0.2"
+
