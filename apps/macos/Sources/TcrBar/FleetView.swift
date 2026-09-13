@@ -240,14 +240,29 @@ struct FleetView: View {
             switch selectedTab {
             case .accounts:
                 SummaryLine.accounts(fleet)
+            // Both gated on `sessionsSupported`, which is the guard the pre-v4
+            // header at ``header`` has always carried and the v4 summary block
+            // dropped: a server that predates the sessions wire reports no
+            // sessions and no tool calls, and "0 sessions · 0 busy · 0 waiting
+            // · 0 idle" over the banner that says so is four fabricated
+            // measurements. `FleetStatus.swift:2241-2244` refuses the same
+            // false zero one clause over (`toolsOverOneMinute` returns `nil`
+            // rather than 0) and `StatusPoller.swift:102-106` refuses it for
+            // the menu bar. The tab body's own banner — "This server predates
+            // sessions — update tcr." — is then the only sentence on screen
+            // about either count, which is the whole truth and all of it.
             case .sessions:
-                sessionsSummaryLine(fleet)
-                    .padding(.horizontal, V4.summaryPaddingSide)
-                    .padding(.bottom, V4.summaryPaddingBottom)
+                if fleet.sessionsSupported {
+                    sessionsSummaryLine(fleet)
+                        .padding(.horizontal, V4.summaryPaddingSide)
+                        .padding(.bottom, V4.summaryPaddingBottom)
+                }
             case .tools:
-                toolsSummaryLine(fleet)
-                    .padding(.horizontal, V4.summaryPaddingSide)
-                    .padding(.bottom, V4.summaryPaddingBottom)
+                if fleet.sessionsSupported {
+                    toolsSummaryLine(fleet)
+                        .padding(.horizontal, V4.summaryPaddingSide)
+                        .padding(.bottom, V4.summaryPaddingBottom)
+                }
             }
         }
     }
