@@ -21,6 +21,13 @@
 # source, and the hooks that call its sibling library, have to describe the
 # tokens they block in prose.
 #
+# `.gitignore` is excluded for a different reason. It does not CITE an
+# internal path, it DEFINES the ignore rules that keep those files out of the
+# repository in the first place: its own ignore patterns and the comment
+# that explains them.
+# Scanning it means the file that implements the policy trips the check that
+# enforces it, which is what turned main red when this scan first shipped.
+#
 # Output is `file:line: error: internal-scaffolding reference: <text>`, one
 # line per hit, greppable and intuitive at a glance; exits 1 on any hit.
 #
@@ -71,7 +78,8 @@ if [ "${1:-}" = "--stdin" ]; then
   exit $?
 fi
 
-found="$(git grep -n -I -i -E "$TCR_SCAFFOLDING_PATTERN" -- . ':(exclude).githooks/**' 2>/dev/null || true)"
+found="$(git grep -n -I -i -E "$TCR_SCAFFOLDING_PATTERN" -- . \
+  ':(exclude).githooks/**' ':(exclude).gitignore' 2>/dev/null || true)"
 if [ -n "$found" ]; then
   printf '%s\n' "$found" | while IFS=: read -r file lineno content; do
     echo "${file}:${lineno}: error: internal-scaffolding reference:${content}"
