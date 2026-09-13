@@ -42,8 +42,7 @@ impl Manager {
     /// `quota_input` is the QUOTA figure (`UsageRecord::input_total()`, verbatim) and folds
     /// into the session's existing `input_tokens` total, unchanged in meaning. `base_input`,
     /// `cache_5m` and `cache_1h` (`UsageRecord::input`/`cache_5m`/`cache_1h`) are the pricing
-    /// dimensions, kept in [`crate::session_wire::WireSession::by_model`] — wire 2
-    /// (`data/plans/wire-2-bridge.md`).
+    /// dimensions, kept in [`crate::session_wire::WireSession::by_model`] — wire 2.
     #[allow(clippy::too_many_arguments)]
     pub fn record_wire_session_usage(
         &self,

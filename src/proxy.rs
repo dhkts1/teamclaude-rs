@@ -2017,7 +2017,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // loop, and drives per-model (Fable-aware) account selection below.
     let request_model = crate::model::parse_request_model(&body_bytes);
 
-    // F1 (`docs/design/panel-tabs.md`, `data/plans/sessions-wire-bridge.md`): the Claude Code
+    // F1 (`docs/design/panel-tabs.md`): the Claude Code
     // session id embedded in `metadata.user_id`, plus any `tool_use`/`tool_result` blocks in
     // the LAST TWO messages — parsed ONCE per request, independent of whether session
     // affinity is on (unlike `stable_session_key`'s peek below, which only runs when the
@@ -4290,8 +4290,8 @@ fn every_attempt_transport_failed(transport_failures: usize, upstream_responses:
 ///   so its effect there is unknown and a blind client retry could double-send
 ///   a POST. `502` + `x-should-retry: false`; main previously answered this
 ///   case identically to the safe one, which is the gap
-///   `data/plans/review-yogev-fork.md` § network-recovery (A-05, minimal
-///   version) named as worth fixing.
+///   a fork-contributed review named as worth fixing (network-recovery, A-05,
+///   minimal version).
 ///
 /// `retry-after` reuses [`OFFLINE_RETRY_AFTER_SECS`] rather than a new constant:
 /// both are "a network hiccup, not a durable fault, come back in a few
@@ -10695,8 +10695,8 @@ mod tests {
     /// before hanging up — a NON-connect failure (`is_connect() == false`), so this
     /// is exactly the "outcome unknown" case: the request may have already reached
     /// the upstream. `x-should-retry: false` is the assertion that pins this to the
-    /// review's minimal fix (`data/plans/review-yogev-fork.md` § network-recovery,
-    /// A-05) rather than the pre-existing bare 502.
+    /// review's minimal fix (network-recovery, A-05) rather than the pre-existing
+    /// bare 502.
     #[tokio::test]
     async fn all_transport_failures_still_502() {
         let up_addr = spawn_scripted_upstream(vec![None]).await; // every connection blips

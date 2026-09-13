@@ -3075,7 +3075,7 @@ mod sticky_divert_replay_tests {
     }
 }
 
-/// Reserved-group semantics test #5 (`docs/plans/reserved-groups-bridge.md`):
+/// Reserved-group semantics test #5:
 /// `eligible` and `account_gate` must AGREE on the RESERVED gate over many
 /// account/reserved-set/ask combinations — a property test over the two
 /// predicates, not two example tests that can drift apart the way

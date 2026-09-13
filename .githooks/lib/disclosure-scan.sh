@@ -20,6 +20,13 @@
 #
 # shellcheck shell=bash
 
+# The internal-scaffolding token list (check 4, below), lifted out to one
+# place so `.githooks/pre-commit`'s staged-diff check and
+# `scripts/check-public-disclosure.sh`'s tracked-tree / PR-title-and-body
+# check (the CI-side gate, for forks that never run our hooks) scan for
+# EXACTLY the same tokens rather than two lists that can drift apart.
+TCR_SCAFFOLDING_PATTERN='data/plans/|-bridge\.md|\bcoordinator\b|\blane [abc]\b|\bswarm\b'
+
 # The list is local-only and gitignored, so no clone or worktree carries it: a
 # committed list of the real names would itself be the disclosure this gate
 # exists to stop. A MISSING list is a hard failure for the same reason a missing
@@ -107,7 +114,7 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
   #    below) precisely so this gate's own source can describe, in prose, the
   #    tokens it blocks without tripping on itself.
   found="$(printf '%s\n' "$text" \
-           | grep -E -m3 -i 'data/plans/|-bridge\.md|\bcoordinator\b|\blane [abc]\b|\bswarm\b' || true)"
+           | grep -E -m3 -i "$TCR_SCAFFOLDING_PATTERN" || true)"
   [ -n "$found" ] && hits="$hits
   internal-scaffolding reference in $what:
 $(printf '%s\n' "$found" | sed 's/^/      /')"

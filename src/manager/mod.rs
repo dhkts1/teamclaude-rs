@@ -1901,8 +1901,8 @@ impl Manager {
 
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
     /// `parked`, `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
-    /// the last check — the fix for group edits appearing to do nothing
-    /// (`docs/plans/live-reload-bridge.md`, problem 1). Called from a natural
+    /// the last check — the fix for group edits appearing to do nothing.
+    /// Called from a natural
     /// cadence point ([`Self::select_with_group`], [`Self::select_revalidation`],
     /// [`Self::snapshot`]) rather than a dedicated watcher thread — one more
     /// background task is one more thing to keep alive, and every one of
