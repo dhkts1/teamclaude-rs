@@ -113,6 +113,64 @@ Second test: the port is never unbound. Hold a connection open across a handoff
 and assert it is served, and that a connection opened mid-swap is accepted
 rather than refused.
 
+## Who is allowed to receive the socket
+
+The handoff gives the peer the live listening socket of the proxy that holds
+every account's OAuth credentials. Whoever holds it serves Claude Code traffic,
+and every request carries a bearer token. So the question is not rhetorical: a
+handoff socket with no peer check turns "can run code as this user" into "owns
+the Anthropic credentials", which is an escalation the rest of this system
+takes some trouble to prevent.
+
+File permissions are the floor and not the answer. The socket lives `0600` in a
+`0700` directory, which stops other *users* and does nothing about other
+processes belonging to this one — and this one is exactly the account every
+locally-running tool already has.
+
+So the predecessor verifies the peer's **code signature** before sending the
+descriptor, and the successor verifies the predecessor's before adopting it.
+Both binaries already carry one:
+
+```
+$ codesign -dv --verbose=2 /Applications/TcrBar.app
+Authority=Developer ID Application: Gil Portnoy (UJQ3GQF56Y)
+TeamIdentifier=UJQ3GQF56Y
+```
+
+The requirement to check is team-scoped rather than bundle-scoped:
+
+```
+anchor apple generic and certificate leaf[subject.OU] = "UJQ3GQF56Y"
+```
+
+Bundle-scoped would be wrong here, because a CLI `tcr` handing over to a TcrBar
+(or the reverse) is a supported and ordinary case, and those have different
+identifiers.
+
+### Use the audit token, never the pid
+
+`getsockopt` offers `LOCAL_PEERPID` (`sys/un.h:0x002`) and it is the wrong one.
+A pid can be reused, and a peer can `exec` between the moment it is checked and
+the moment it is trusted, so a pid-keyed check validates one program and then
+hands the socket to another. This is the classic form of the bug and Apple
+documents it as such.
+
+`LOCAL_PEERTOKEN` (`sys/un.h:0x006`) returns the peer's **audit token**, which
+identifies the process instance rather than a reusable number. Feed it to
+`SecCodeCopyGuestWithAttributes` as `kSecGuestAttributeAudit`, then
+`SecCodeCheckValidity` against the requirement above. Verified present on the
+macOS SDK this repo builds against.
+
+### Unsigned builds do not get a handoff, and that is correct
+
+A `cargo build` binary is not Developer ID signed, so a development proxy fails
+the requirement. It therefore does not receive the socket, stands down, and says
+why — which is the same path an older or wedged incumbent takes, already
+described below. An operator who genuinely wants a dev build to take the port
+uses `--replace`, explicitly, and pays the sub-second window. The alternative
+(an escape hatch that waives the check when the peer is unsigned) would waive it
+for an attacker too, since an attacker's binary is also unsigned.
+
 ## Fallback: explicit, never automatic
 
 The handoff needs both sides to speak it, so it cannot be the only path:
