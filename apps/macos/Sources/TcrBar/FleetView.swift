@@ -501,7 +501,32 @@ struct FleetView: View {
                         .foregroundStyle(Tok.mute)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                v4FooterAwakeQuit
             }
+        }
+    }
+
+    /// Last row above the rule, on every tab: it is app state, not tab state,
+    /// so it does not switch with `visibleTab` the way `v4Actions` does.
+    ///
+    /// Left, the keep-awake switch; right, Quit behind the same confirm alert
+    /// Settings uses (``QuitConfirmation``) — the panel's own most-expensive
+    /// action, same as `v4Actions`' "Take over port…".
+    private var v4FooterAwakeQuit: some View {
+        HStack(spacing: V4.buttonGap) {
+            Toggle(
+                isOn: Binding(get: { awake.isOn }, set: { awake.setOn($0) })
+            ) {
+                Text("Keep awake")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .help("While any session is busy.")
+            .accessibilityLabel("Keep this Mac awake")
+            Spacer(minLength: 0)
+            V4Button(title: "Quit", role: .danger) { QuitConfirmation.confirm() }
         }
     }
 

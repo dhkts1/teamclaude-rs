@@ -172,8 +172,7 @@ final class MenuBarShell {
             rootView: FleetPanel(
                 poller: self.poller, server: self.server, loginItem: self.loginItem,
                 accounts: self.accounts, control: self.control, awake: self.awake,
-                preference: self.preference, countsPreference: self.countsPreference,
-                updater: self.updater,
+                preference: self.preference, updater: self.updater,
                 groupController: self.groupController, removeController: self.removeController,
                 onWhatsNew: { [weak self] in self?.openWhatsNew() },
                 onSettings: { [weak self] in self?.openSettings() },
@@ -602,7 +601,6 @@ struct FleetPanel: View {
     @ObservedObject var control: ControlAccountController
     @ObservedObject var awake: AwakeController
     @ObservedObject var preference: LaunchPreference
-    @ObservedObject var countsPreference: MenuBarCountsPreference
     @ObservedObject var updater: Updater
     @ObservedObject var groupController: GroupController
     @ObservedObject var removeController: RemoveAccountController
@@ -611,38 +609,20 @@ struct FleetPanel: View {
     var initialTab: PanelTab = .accounts
 
     var body: some View {
-        VStack(spacing: 0) {
-            FleetView(
-                poller: poller,
-                server: server,
-                loginItem: loginItem,
-                accounts: accounts,
-                control: control,
-                awake: awake,
-                updater: updater,
-                groupController: groupController,
-                removeController: removeController,
-                startServerAtLaunch: $preference.startServerAtLaunch,
-                onWhatsNew: onWhatsNew,
-                onSettings: onSettings,
-                initialTab: initialTab
-            )
-            // Kept OUTSIDE `FleetView` rather than folded into its own
-            // preferences footer: this feature (F5) is scoped away from
-            // `FleetView.swift`, which is owned concurrently by other work —
-            // an edit there risks a collision. A one-row toggle appended below the
-            // existing panel is the whole cost of keeping this feature inside
-            // its own files.
-            Divider()
-            Toggle("Show counts in the menu bar", isOn: $countsPreference.showCounts)
-                .toggleStyle(.checkbox)
-                .font(Tok.secondaryFont)
-                .help(
-                    "Shows the ready/enabled fraction (e.g. \u{201c}9/13\u{201d}) "
-                        + "beside the gauge glyph in the menu bar."
-                )
-                .padding(.horizontal, Tok.space4)
-                .padding(.vertical, Tok.space3)
-        }
+        FleetView(
+            poller: poller,
+            server: server,
+            loginItem: loginItem,
+            accounts: accounts,
+            control: control,
+            awake: awake,
+            updater: updater,
+            groupController: groupController,
+            removeController: removeController,
+            startServerAtLaunch: $preference.startServerAtLaunch,
+            onWhatsNew: onWhatsNew,
+            onSettings: onSettings,
+            initialTab: initialTab
+        )
     }
 }

@@ -40,23 +40,22 @@ enum RenderStates {
     /// Every state worth looking at, with the name its PNG gets.
     ///
     /// `awake` is a per-scene flag rather than a twelfth state because it is
-    /// orthogonal to the poll: the mode can be on under any fleet at all. One
-    /// scene carries it, and what that scene reviews is narrower than "the ON
-    /// appearance" — it is the caveat line under the checkbox, and the footer
-    /// moving down to make room for it. Nothing more:
+    /// orthogonal to the poll: the mode can be on under any fleet at all. Two
+    /// scenes carry it ON — one on the Accounts tab, one on Sessions, since
+    /// `FleetView.v4FooterAwakeQuit` draws on every tab and a single scene
+    /// would only prove the Accounts case. Neither scene reviews the switch's
+    /// visual ON state, and that is a measured limitation, not an oversight:
     ///
     ///  - The tinted mark is drawn on the status item (``MenuBarShell``), which
     ///    is not part of this view, so no scene here renders it.
-    ///  - The tick is not rendered either. `ImageRenderer` draws a `.checkbox`
-    ///    toggle as the same placeholder in both states, which
-    ///    `FleetView.keepAwakeToggle` already says.
-    ///
-    /// Measured rather than assumed: a band diff of `01-healthy-dark` against
-    /// `12-keeping-awake-dark` (max channel delta > 8) differs on 85 of the 897
-    /// rows they share, in ONE contiguous band, `y=812..896` — the caveat line
-    /// and everything the extra line pushes down. Every row above `y=812`,
-    /// checkbox included, is pixel-identical. Scene 12 is also 34px taller,
-    /// which is that same line and nothing else.
+    ///  - The thumb position is not rendered either. `ImageRenderer` draws a
+    ///    `.switch` toggle as the same "prohibited" placeholder regardless of
+    ///    `isOn` — the same limitation this file already records for a
+    ///    `.checkbox` toggle. Measured, not assumed: `01-healthy-auto-dark.png`
+    ///    against `12-keeping-awake-auto-dark.png` (same fleet, `awake` the
+    ///    only input that differs) has zero pixels over a channel delta of 8,
+    ///    same dimensions. What these scenes prove is that the row renders at
+    ///    all on each tab, not what it looks like on.
     ///
     /// Those figures move whenever the footer's wording or spacing does; if they
     /// look stale, re-measure rather than trusting them.
@@ -91,6 +90,11 @@ enum RenderStates {
             ("10-undecodable", .undecodable(message: "DecodingError.valueNotFound: quota"), false, nil),
             ("11-pending", .pending, false, nil),
             ("12-keeping-awake", .loaded(fleet(healthyJSON)), true, nil),
+            // The same switch, on a tab other than Accounts — the footer row
+            // is app state, not tab state (`FleetView.v4FooterAwakeQuit`), so
+            // one ON scene away from Accounts is what proves that rather than
+            // assumes it.
+            ("12b-keeping-awake-sessions-tab", .loaded(sessionsTabFleet), true, nil),
             // The control-account row indicator (`FleetView.controlIndicator`) —
             // the ONE piece of this feature `ImageRenderer` can actually draw.
             // `Menu` contents (the gear's "Use as control account" item, its
@@ -204,8 +208,8 @@ enum RenderStates {
     /// every existing scene would have to grow.
     private static func initialTab(for sceneName: String) -> PanelTab {
         switch sceneName {
-        case "16-sessions-tab", "18-sessions-tab-old-server", "18c-sessions-tab-old-tcr",
-            "18e-sessions-tab-command-failed":
+        case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
+            "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed":
             return .sessions
         case "17-tools-tab", "18b-tools-tab-old-server", "18d-tools-tab-old-tcr": return .tools
         default: return .accounts
