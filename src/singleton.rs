@@ -653,6 +653,52 @@ fn is_alive(pid: u32) -> bool {
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
+/// How long [`takeover_port`] gives a SIGTERMed incumbent to exit on its own
+/// before escalating to SIGKILL.
+///
+/// A **ceiling, not a floor**: [`wait_for_exit`] returns the moment the process
+/// is gone. This used to be a flat `sleep`, and that is why a bounce cost about
+/// a second of refused connections even when the incumbent had already exited.
+/// Measured 2026-09-13 across three restarts, the port sat unbound for 1.124s,
+/// 0.976s and 1.020s (`no longer accepting` to `server started` in
+/// `~/.cache/teamclaude/logs/`), nearly all of it spent sleeping out this
+/// window after the incumbent was already gone.
+const TERM_GRACE: Duration = Duration::from_millis(800);
+
+/// How long to wait after SIGKILL for the process table entry to clear. Same
+/// ceiling-not-floor rule as [`TERM_GRACE`].
+const KILL_GRACE: Duration = Duration::from_millis(300);
+
+/// How often [`wait_for_exit`] re-checks. Each check is a fresh one-pid
+/// `sysinfo` refresh, so this bounds both the overshoot past the real exit (one
+/// interval) and the syscall load during the wait (at most 80 checks across
+/// [`TERM_GRACE`]).
+const EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Wait up to `grace` for `pid` to leave the process table.
+///
+/// Returns `true` as soon as it has, `false` if it was still there when `grace`
+/// ran out. A caller that gets `false` holds exactly what the old flat `sleep`
+/// plus [`is_alive`] pair told it, and holds it no later.
+///
+/// **Never slower than the ceiling it replaces.** A zombie still occupies the
+/// process table, so an incumbent whose parent has not reaped it yet keeps this
+/// polling for the whole of `grace` — identical to the `sleep` this replaces,
+/// not a regression on it.
+fn wait_for_exit(pid: u32, grace: Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if !is_alive(pid) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        sleep(EXIT_POLL_INTERVAL.min(remaining));
+    }
+}
+
 /// Send `signal` to `pid` via [`sysinfo::Process::kill_with`] — never
 /// [`sysinfo::Process::kill`], which always sends `SIGKILL` regardless of what
 /// the caller asked for and would silently delete the graceful-shutdown window
@@ -930,11 +976,18 @@ pub fn takeover_port(port: u16, replace: bool) -> Takeover {
         // survived. `signal_pid` calls `kill_with`, never `kill` (which always
         // sends SIGKILL) — collapsing these two calls onto `kill` would delete
         // this exact grace window and cost every live session its prompt cache.
+        //
+        // The grace is a CEILING. `wait_for_exit` returns the instant the
+        // incumbent is gone, so the successor binds as soon as the port can
+        // actually be had rather than sleeping out a fixed window the incumbent
+        // already finished inside. See `TERM_GRACE` for the measurement.
         signal_pid(pid, Signal::Term);
-        sleep(Duration::from_millis(800));
-        if is_alive(pid) {
+        if !wait_for_exit(pid, TERM_GRACE) {
             signal_pid(pid, Signal::Kill);
-            sleep(Duration::from_millis(300));
+            // The verdict is deliberately not checked: after SIGKILL we proceed
+            // either way, exactly as the old unconditional 300ms sleep did. The
+            // bind is what actually adjudicates whether the port came free.
+            wait_for_exit(pid, KILL_GRACE);
         }
     }
     decision
@@ -1139,6 +1192,69 @@ mod tests {
             "signal_pid(.., Signal::Term) must deliver SIGTERM (15), not SIGKILL (9) \
              or any other signal -- this is the graceful-shutdown window the module \
              exists to protect"
+        );
+    }
+
+    /// The defect this replaced: `takeover_port` slept a FLAT 800ms after
+    /// SIGTERM, so a successor waited out the whole window even though the
+    /// incumbent had already exited, and the port sat unbound the entire time.
+    /// Measured 2026-09-13, that cost ~1.0s of refused connections per bounce.
+    ///
+    /// Guards the ceiling-not-floor property: against an already-dead pid this
+    /// must return essentially at once, nowhere near `TERM_GRACE`.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_returns_as_soon_as_the_process_is_gone() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning our own throwaway child");
+        let pid = child.id();
+        signal_pid(pid, Signal::Kill);
+        // Reap it, so the pid is genuinely out of the process table rather than
+        // a zombie -- a zombie is still `is_alive`, and that case is covered by
+        // the ceiling test below, not by this one.
+        child.wait().expect("waiting on our own child");
+
+        let started = std::time::Instant::now();
+        let gone = wait_for_exit(pid, TERM_GRACE);
+        let elapsed = started.elapsed();
+
+        assert!(gone, "wait_for_exit must report a reaped pid as gone");
+        assert!(
+            elapsed < TERM_GRACE / 2,
+            "wait_for_exit returned in {elapsed:?}, which is not meaningfully \
+             faster than the {TERM_GRACE:?} ceiling it replaced -- the whole \
+             point is that an already-exited incumbent is not waited out"
+        );
+    }
+
+    /// The other half: the grace is still a real bound. A process that does NOT
+    /// exit must keep us waiting the full window and then report that it is
+    /// still there, which is exactly what the old `sleep` + `is_alive` pair
+    /// told the SIGKILL escalation.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_exit_honours_the_ceiling_for_a_survivor() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawning our own throwaway child");
+        let pid = child.id();
+        let grace = Duration::from_millis(100);
+
+        let started = std::time::Instant::now();
+        let gone = wait_for_exit(pid, grace);
+        let elapsed = started.elapsed();
+
+        signal_pid(pid, Signal::Kill);
+        child.wait().expect("waiting on our own child");
+
+        assert!(!gone, "a live process must not be reported as gone");
+        assert!(
+            elapsed >= grace,
+            "wait_for_exit returned in {elapsed:?}, short of its own {grace:?} \
+             ceiling -- the escalation to SIGKILL would then fire early"
         );
     }
 
