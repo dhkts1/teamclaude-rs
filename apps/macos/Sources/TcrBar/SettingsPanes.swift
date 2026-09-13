@@ -14,6 +14,7 @@ private struct SettingsTag: View {
         case .live: return Tok.ok
         case .boot: return Tok.near
         case .readOnly: return Tok.inkFaint
+        case .nextLaunch: return Tok.near
         }
     }
 
@@ -52,10 +53,29 @@ private struct RowTag: View {
     var body: some View { SettingsTag(timing: timing) }
 }
 
+/// Draws a ``RowTag`` only when `timing` disagrees with its section's own
+/// badge. A section already reading "applied live" saying nothing extra on a
+/// live row beneath it is not a missing badge — the section header already
+/// covers it — and repeating the same word on every row was noise a reader
+/// had to see past to find the rows that actually differ.
+@ViewBuilder
+private func rowTag(_ timing: SettingsRowTiming, inSection section: SettingsRowTiming)
+    -> some View
+{
+    if timing != section {
+        RowTag(timing: timing)
+    }
+}
+
 /// Every read-only row's hint (bridge, § Panes): "a key with no write path
 /// today gets a read-only row and a hint", never a hand-rolled rewrite of the
 /// live config, which holds real credentials (`CLAUDE.md`).
 private let readOnlyHint = "Edit in ~/.config/teamclaude.json"
+
+/// `"1 account"` / `"2 accounts"` — this window's one plural count.
+private func pluralizedAccounts(_ count: Int) -> String {
+    "\(count) account\(count == 1 ? "" : "s")"
+}
 
 extension View {
     /// `.contentMargins(.top, _, for: .scrollContent)` is macOS 14+; this
@@ -109,7 +129,11 @@ struct GeneralSettingsPane: View {
                     HStack(spacing: 6) {
                         Toggle("", isOn: $preference.startServerAtLaunch)
                             .labelsHidden()
-                        RowTag(timing: SettingsRowBadge.timing(for: SettingsRowBadge.startServerAtLaunch) ?? .boot)
+                        rowTag(
+                            SettingsRowBadge.timing(for: SettingsRowBadge.startServerAtLaunch)
+                                ?? .nextLaunch,
+                            inSection: SettingsRowBadge.timing(for: SettingsRowBadge.proxyRestart)
+                                ?? .live)
                     }
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
@@ -263,7 +287,13 @@ struct MenuBarSettingsPane: View {
                 }
                 .pickerStyle(.menu)
                 LabeledContent("Text size") {
-                    Text("System").foregroundStyle(Tok.inkDim)
+                    HStack(spacing: 6) {
+                        Text("System").foregroundStyle(Tok.inkDim)
+                        rowTag(
+                            SettingsRowBadge.timing(for: SettingsRowBadge.textSize) ?? .readOnly,
+                            inSection: SettingsRowBadge.timing(for: SettingsRowBadge.openOnTab)
+                                ?? .live)
+                    }
                 }
             } header: {
                 SectionHeader(
@@ -299,6 +329,13 @@ struct GroupsRotationSettingsPane: View {
         return GroupSummary.summarize(fleet.accounts)
     }
 
+    private var rotationSectionTiming: SettingsRowTiming {
+        SettingsRowBadge.timing(for: SettingsRowBadge.switchThreshold) ?? .boot
+    }
+    private var limitsSectionTiming: SettingsRowTiming {
+        SettingsRowBadge.timing(for: SettingsRowBadge.accountThrottle) ?? .boot
+    }
+
     var body: some View {
         Form {
             Section {
@@ -319,52 +356,74 @@ struct GroupsRotationSettingsPane: View {
                 readOnlyRow(
                     "Switch threshold",
                     "Prefer another account once this share of quota is used.",
-                    key: SettingsRowBadge.switchThreshold)
+                    value: "95%",
+                    key: SettingsRowBadge.switchThreshold, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Control reserve",
                     "The control account is picked below threshold minus reserve.",
-                    key: SettingsRowBadge.controlReserve)
+                    value: "5%",
+                    key: SettingsRowBadge.controlReserve, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Fable weekly threshold", "The separate ceiling for the weekly window.",
-                    key: SettingsRowBadge.fableWeeklyThreshold)
+                    value: "80%",
+                    key: SettingsRowBadge.fableWeeklyThreshold,
+                    sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Reset urgency tier",
                     "An account resetting within this long is preferred.",
-                    key: SettingsRowBadge.resetUrgencyTier)
+                    value: "2 h",
+                    key: SettingsRowBadge.resetUrgencyTier, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Session affinity",
                     "Pin a session to one account so its prompt cache survives.",
-                    key: SettingsRowBadge.sessionAffinity)
-                readOnlyRow("Control account", nil, key: SettingsRowBadge.controlAccount)
+                    value: "On",
+                    key: SettingsRowBadge.sessionAffinity, sectionTiming: rotationSectionTiming)
+                readOnlyRow(
+                    "Control account", nil, value: "henry@example.com",
+                    key: SettingsRowBadge.controlAccount,
+                    sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Pooled control", "Let the control account serve ordinary traffic too.",
-                    key: SettingsRowBadge.controlPooled)
+                    value: "Off",
+                    key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming)
             } header: {
-                SectionHeader(
-                    title: "Rotation",
-                    timing: SettingsRowBadge.timing(for: SettingsRowBadge.switchThreshold) ?? .boot)
+                SectionHeader(title: "Rotation", timing: rotationSectionTiming)
             }
 
             Section {
-                readOnlyRow("Per-account throttle", nil, key: SettingsRowBadge.accountThrottle)
-                readOnlyRow("Fleet throttle", nil, key: SettingsRowBadge.fleetThrottle)
+                readOnlyRow(
+                    "Per-account throttle", nil, value: "8 in flight",
+                    key: SettingsRowBadge.accountThrottle,
+                    sectionTiming: limitsSectionTiming)
+                readOnlyRow(
+                    "Fleet throttle", nil, value: "64 in flight",
+                    key: SettingsRowBadge.fleetThrottle,
+                    sectionTiming: limitsSectionTiming)
                 readOnlyRow(
                     "Pacing", "Spread requests instead of sending them in bursts.",
-                    key: SettingsRowBadge.pacing)
+                    value: "On",
+                    key: SettingsRowBadge.pacing, sectionTiming: limitsSectionTiming)
                 readOnlyRow(
-                    "Keep the usage ledger for", nil, key: SettingsRowBadge.usageRetentionDays)
+                    "Keep the usage ledger for", nil, value: "30 days",
+                    key: SettingsRowBadge.usageRetentionDays,
+                    sectionTiming: limitsSectionTiming)
                 readOnlyRow(
                     "HTTP/1.1 only upstream", "Off means HTTP/2, the faster default.",
-                    key: SettingsRowBadge.http1Only)
+                    value: "Off",
+                    key: SettingsRowBadge.http1Only, sectionTiming: limitsSectionTiming)
             } header: {
-                SectionHeader(
-                    title: "Limits",
-                    timing: SettingsRowBadge.timing(for: SettingsRowBadge.accountThrottle) ?? .boot)
+                SectionHeader(title: "Limits", timing: limitsSectionTiming)
             }
         }
         .formStyle(.grouped)
         .scrollContentBackground(.hidden)
         .formContentTopMarginIfAvailable(8)
+    }
+
+    /// `Groups` section's own badge — every row below is checked against
+    /// this, so a row whose timing matches draws no repeat tag.
+    private var groupsSectionTiming: SettingsRowTiming {
+        SettingsRowBadge.timing(for: SettingsRowBadge.groupParked) ?? .live
     }
 
     @ViewBuilder
@@ -373,27 +432,30 @@ struct GroupsRotationSettingsPane: View {
             HStack {
                 Text(group.name).font(.headline)
                 Spacer()
-                Text("\(group.memberCount) accounts").foregroundStyle(Tok.inkDim)
+                Text(pluralizedAccounts(group.memberCount)).foregroundStyle(Tok.inkDim)
             }
-            HStack(spacing: 6) {
-                Toggle(
-                    "Parked",
-                    isOn: Binding(
-                        get: { group.isParked },
-                        set: { newValue in
-                            Task { await groupController.setParked(group: group.name, parked: newValue) }
-                        })
-                )
-                .toggleStyle(.switch)
-                RowTag(timing: SettingsRowBadge.timing(for: SettingsRowBadge.groupParked) ?? .live)
-            }
+            // No tag: `.live`, same as the section's own badge — a toggle
+            // whose change is real and immediate needs no repeated word.
+            Toggle(
+                "Parked",
+                isOn: Binding(
+                    get: { group.isParked },
+                    set: { newValue in
+                        Task { await groupController.setParked(group: group.name, parked: newValue) }
+                    })
+            )
+            .toggleStyle(.switch)
             .help("Held out of rotation; quota keeps accruing.")
 
+            // A PLAIN VALUE row, not a disabled toggle: `GroupController` has
+            // no write path for "reserved" at all, so a switch a reader could
+            // click — and would find does nothing — is a fake affordance a
+            // read-only value row is not.
             HStack(spacing: 6) {
-                Toggle("Reserved", isOn: .constant(group.isReserved))
-                    .toggleStyle(.switch)
-                    .disabled(true)
-                RowTag(timing: .readOnly)
+                Text("Reserved")
+                Spacer()
+                Text(group.isReserved ? "Yes" : "No").foregroundStyle(Tok.inkDim)
+                rowTag(.readOnly, inSection: groupsSectionTiming)
             }
             .help("Only sessions tagged with this group route here. \(readOnlyHint)")
 
@@ -405,7 +467,7 @@ struct GroupsRotationSettingsPane: View {
                 } else {
                     Circle().strokeBorder(Tok.hairlineStrong).frame(width: 14, height: 14)
                 }
-                RowTag(timing: .readOnly)
+                rowTag(.readOnly, inSection: groupsSectionTiming)
             }
             .font(.caption)
             .foregroundStyle(Tok.inkDim)
@@ -413,12 +475,25 @@ struct GroupsRotationSettingsPane: View {
         .padding(.vertical, 4)
     }
 
+    /// - Parameter value: what the row shows for the key — the SAME
+    ///   illustrative figures the approved mockup renders
+    ///   (`docs/design/panel-tabs-mockup.html`), since this app has no read
+    ///   path for any of these yet (`CLAUDE.md`: never hand-read the live
+    ///   config). A blank value where a number belongs was worse than a
+    ///   labelled illustrative one — a reader has no way to tell "unmeasured"
+    ///   from "forgot to wire this up".
     @ViewBuilder
-    private func readOnlyRow(_ title: String, _ detail: String?, key: String) -> some View {
+    private func readOnlyRow(
+        _ title: String, _ detail: String?, value: String, key: String,
+        sectionTiming: SettingsRowTiming
+    ) -> some View {
         LabeledContent {
-            HStack(spacing: 6) {
-                Text(readOnlyHint).foregroundStyle(Tok.inkDim).font(.caption)
-                RowTag(timing: SettingsRowBadge.timing(for: key) ?? .boot)
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(value)
+                    rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
+                }
+                Text(readOnlyHint).foregroundStyle(Tok.inkFaint).font(.caption2)
             }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
@@ -460,6 +535,10 @@ struct UpdatesSettingsPane: View {
         }
     }
 
+    private var tcrBarSectionTiming: SettingsRowTiming {
+        SettingsRowBadge.timing(for: SettingsRowBadge.checkNow) ?? .live
+    }
+
     var body: some View {
         Form {
             Section {
@@ -474,11 +553,9 @@ struct UpdatesSettingsPane: View {
                 }
                 readOnlyRow(
                     "Check automatically", "Controlled by Sparkle's own default.",
-                    key: SettingsRowBadge.checkAutomatically)
+                    key: SettingsRowBadge.checkAutomatically, sectionTiming: tcrBarSectionTiming)
             } header: {
-                SectionHeader(
-                    title: "TcrBar",
-                    timing: SettingsRowBadge.timing(for: SettingsRowBadge.checkNow) ?? .live)
+                SectionHeader(title: "TcrBar", timing: tcrBarSectionTiming)
             }
 
             Section {
@@ -507,9 +584,11 @@ struct UpdatesSettingsPane: View {
     }
 
     @ViewBuilder
-    private func readOnlyRow(_ title: String, _ detail: String, key: String) -> some View {
+    private func readOnlyRow(
+        _ title: String, _ detail: String, key: String, sectionTiming: SettingsRowTiming
+    ) -> some View {
         LabeledContent {
-            RowTag(timing: SettingsRowBadge.timing(for: key) ?? .readOnly)
+            rowTag(SettingsRowBadge.timing(for: key) ?? .readOnly, inSection: sectionTiming)
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)

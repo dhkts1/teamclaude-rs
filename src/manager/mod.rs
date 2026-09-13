@@ -7572,6 +7572,107 @@ mod tests {
         );
     }
 
+    /// APP-16 (measured 2026-09-11): an idle-cold pin on an over-threshold account
+    /// has nothing left to lose by moving — its prompt cache is already cold by the
+    /// crate's own [`CACHE_WARM_HOLD_SECS`] clock, so serving the pin only keeps a
+    /// dead-weight session off the accounts sitting idle. `select` must fall through
+    /// to the normal pick, which durably re-keys onto the least-loaded ELIGIBLE
+    /// account, exactly as a genuinely dead pin does.
+    #[test]
+    fn idle_cold_session_on_over_threshold_account_rekeys_to_an_eligible_account() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        set_over_threshold(&manager, 0, 0.95, "allowed_warning");
+        let key = 9001u64;
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (0, odt_to_ms(now) - (CACHE_WARM_HOLD_SECS + 1) * 1000));
+        }
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("the eligible account b serves this request");
+        assert_eq!(
+            served, 1,
+            "an idle-cold pin on an over-threshold account must fall through to \
+             the eligible account, not serve the dead-weight pin"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(1),
+            "the session's pin must durably move to the account that served it"
+        );
+    }
+
+    /// The complement, pinned so the change above cannot widen: a session touched
+    /// well inside [`CACHE_WARM_HOLD_SECS`] still has a warm cache to protect, so an
+    /// over-threshold pin is served exactly as `soft_gated_pin_is_served_not_diverted`
+    /// already established — this is today's behaviour, unchanged.
+    #[test]
+    fn warm_session_on_over_threshold_account_keeps_its_pin() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0), account("b", 0)]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        set_over_threshold(&manager, 0, 0.95, "allowed_warning");
+        let key = 9002u64;
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (0, odt_to_ms(now) - 10_000));
+        }
+
+        let served = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("the pinned account is still eligible on hard gates");
+        assert_eq!(
+            served, 0,
+            "a warm (well within CACHE_WARM_HOLD_SECS) over-threshold pin still \
+             serves its own session"
+        );
+        assert_eq!(
+            pin_of(&manager, key),
+            Some(0),
+            "the pin must not move while the cache is still warm"
+        );
+    }
+
+    /// Falling through must not turn a soft threshold into a hard 429: with no
+    /// eligible alternative (B disabled), the idle-cold pin still serves its own
+    /// over-threshold account — the same last-resort the fall-through pick already
+    /// gives a genuinely dead pin.
+    #[test]
+    fn idle_cold_session_stays_when_no_eligible_alternative() {
+        let manager = build_manager(
+            config_with(vec![
+                account("a", 0),
+                Account {
+                    disabled: Some(true),
+                    ..account("b", 0)
+                },
+            ]),
+            pacing_refresher(),
+        );
+        let now = OffsetDateTime::now_utc();
+        set_over_threshold(&manager, 0, 0.95, "allowed_warning");
+        let key = 9003u64;
+        {
+            let mut pins = manager.affinity.lock().expect("affinity lock poisoned");
+            pins.insert(key, (0, odt_to_ms(now) - (CACHE_WARM_HOLD_SECS + 1) * 1000));
+        }
+
+        let served = manager.select(&HashSet::new(), now, None, Some(key), "/v1/messages", None);
+        assert_eq!(
+            served,
+            Some(0),
+            "with no eligible alternative, an idle-cold pin must still serve its \
+             over-threshold account rather than 429 the request"
+        );
+    }
+
     /// The guard against over-correcting: a HARD gate still re-keys durably. A
     /// rate-limit hold that outlives the prompt cache means the account is gone for
     /// longer than the session's prefix survives, so the session moves and STAYS

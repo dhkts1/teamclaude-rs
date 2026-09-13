@@ -74,5 +74,14 @@ final class SettingsRowBadgeTests: XCTestCase {
         XCTAssertEqual(SettingsRowTiming.live.label, "applied live")
         XCTAssertEqual(SettingsRowTiming.boot.label, "restart to apply")
         XCTAssertEqual(SettingsRowTiming.readOnly.label, "read-only")
+        XCTAssertEqual(SettingsRowTiming.nextLaunch.label, "next launch")
+    }
+
+    /// A TcrBar-own preference read once at launch is `.nextLaunch`, never
+    /// `.boot` — `.boot` means the SERVER re-reading its own config file, and
+    /// "start the server at launch" never touches that file.
+    func testStartServerAtLaunchIsNextLaunchNotBoot() {
+        XCTAssertEqual(
+            SettingsRowBadge.timing(for: SettingsRowBadge.startServerAtLaunch), .nextLaunch)
     }
 }
