@@ -21,18 +21,26 @@ import XCTest
 final class QuotaTailWidthTests: XCTestCase {
 
     /// Every string ``AccountCard`` can put in the trailing column: the spend
-    /// tail on the first row, the plan name on the second. Chosen at the wide
-    /// end of plausible rather than the typical one, because the column is
-    /// sized once for all of them and a four-figure spend is an ordinary
-    /// weekend here.
+    /// tail on the first row, the Fable figure on the second — the plan name
+    /// left the tail entirely in round 2 (it is in ``AccountCard/nameRow``
+    /// now, in both shapes). Chosen at the wide end of plausible rather than
+    /// the typical one, because the column is sized once for all of them and
+    /// a four-figure spend is an ordinary weekend here.
     private let tailStrings = [
         "$540 · 1.5M",  // the one the old 68 pt was sized for
         "$1,190 · 3.1M",  // the one that was eliding
         "$1,810 · 12.3M",
         "$12,345 · 120M",
         "$1,190+ · 3.1M",  // the `+` an unpriced request adds
-        "Max 20x",
-        "Team Standard",
+        // Round 2 deleted the equal/different-resets branching in
+        // ``Account/fableTailLabel``: the tail is the bare figure, ALWAYS —
+        // even the SHORTEST captioned form round 1 tried, "fable 0% · in
+        // 1h", measures 86.4 pt against this 88 pt column, and round 1's own
+        // worked example, "fable 72% · in 3d 18h", is 118.8 pt — past even
+        // ``testTheColumnDoesNotGrowWideEnoughToStarveTheBar``'s 96 pt
+        // ceiling. No width this column can safely take fits a caption, so
+        // it never draws one; the full reset stays in the tail's own hover.
+        "fable 100%",
     ]
 
     func testEveryTrailingStringFitsTheColumnItIsDrawnIn() throws {
@@ -59,35 +67,105 @@ final class QuotaTailWidthTests: XCTestCase {
         XCTAssertLessThanOrEqual(
             width, 96,
             "V4.usageTailWidth is \(width) pt. Past ~96 the quota bar is narrower than the "
-                + "text beside it; put the long string on its own line (AccountCard.fableLine) "
-                + "instead of widening this column.")
+                + "text beside it; put the long string on its own line instead of widening "
+                + "this column.")
     }
 
-    /// The card draws TWO bar rows. The model-scoped weekly window is a caption
-    /// line under them (``Account/fableWeeklyLabel(now:)``), which is where it
-    /// sat before v4 — a third bar row cost every card a measured 21 pt, and
-    /// putting it in the trailing column cost both bars far more than that.
-    func testTheModelScopedWindowIsACaptionLineAndNotAThirdBarRow() throws {
+    /// Every shape ``QuotaFormat/resetCaption(resetAtMs:now:)`` can print.
+    /// Round 1's motivating example for this column, `"in 4d 12h"`
+    /// (`duration(minutes:)`'s day tier), is NOT the widest one: the hour
+    /// tier lives entirely under a day and can carry a two-digit hour AND a
+    /// two-digit minute at once, `"in 23h 59m"`, which measures wider. Both
+    /// tiers are reachable from EITHER window — the format is a function of
+    /// minutes remaining, not which window sent them, so a 7d row can show
+    /// the hour-tier shape too, once under a day is left on it.
+    private let resetCaptionStrings = [
+        "in 4d 12h",
+        "in 6d 23h",
+        "in 9d 23h",  // the days digit does not change the width measured here
+        "in 23h 59m",  // the actual widest: two two-digit numbers, hour tier
+        "in 1h 0m",
+    ]
+
+    func testEveryResetCaptionFitsItsOwnFixedColumn() throws {
+        let width = try token("resetCaptionWidth")
+        let size = try muteSize()
+        for string in resetCaptionStrings {
+            let drawn = (string as NSString)
+                .size(withAttributes: [.font: NSFont.systemFont(ofSize: size)]).width
+            XCTAssertLessThanOrEqual(
+                drawn, width,
+                "\"\(string)\" needs \(String(format: "%.1f", drawn)) pt and the column is "
+                    + "\(width) pt, so it draws elided. Widen V4.resetCaptionWidth to fit it.")
+        }
+    }
+
+    /// This column is reserved on EVERY row now, whether or not that row has
+    /// a live caption (Gil, 2026-09-13: "not aligned nicely" — an auto-width
+    /// column here is what made alike bars draw at different lengths
+    /// depending on which row happened to carry the longer reset string).
+    /// Pinned at the source because a rendered pair of bars cannot tell "this
+    /// column is reserved unconditionally" from "it happened to be reserved
+    /// on every fixture this suite tried".
+    func testTheCaptionColumnIsReservedWhetherOrNotThereIsALiveCaption() throws {
+        let source = try panelSource("PanelV4/QuotaRow.swift")
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        XCTAssertTrue(
+            squashed.contains(
+                "Text(QuotaFormat.resetCaption(resetAtMs:resetAtMs,now:now)??\"\")"),
+            "the caption is conditionally drawn again (`if let caption = …`), so a row with "
+                + "no live reset no longer reserves the column and its bar draws a different "
+                + "length from its sibling's")
+        XCTAssertTrue(
+            squashed.contains(".frame(width:V4.resetCaptionWidth,alignment:.trailing)"),
+            "the caption no longer has a fixed, right-aligned column")
+    }
+
+    /// The card draws TWO bar rows and no more. The model-scoped weekly
+    /// window is a STRING in the second row's own trailing column
+    /// (``AccountCard/rowTail(_:)``), which is where the pre-v4 card drew it
+    /// too — a third bar row costs every card a measured 21 pt, and a caption
+    /// line under the bars (the v4 transcription, then briefly reverted to
+    /// only to be reverted again) costs every fable card a measured line of
+    /// height. Gil, 2026-09-13: "no like we had both … align it like we had
+    /// before."
+    func testTheModelScopedWindowIsATailStringAndNotAThirdBarRowOrACaptionLine() throws {
         let source = try panelSource("PanelV4/AccountCard.swift")
         let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
         XCTAssertFalse(
             squashed.contains("QuotaWindowSpec(label:\"fable\""),
             "the model-scoped window is a bar row again — that is the 21 pt per card "
                 + "this layout exists to give back")
+        XCTAssertFalse(
+            squashed.contains("fableLine"),
+            "the caption line under the bars is back — the card is one line taller per "
+                + "fable account again, which is what Gil asked to undo")
         XCTAssertTrue(
-            squashed.contains("account.fableWeeklyLabel(now:now)"),
-            "the caption line no longer uses Account.fableWeeklyLabel, so the panel now has "
+            squashed.contains("case1:returnaccount.fableTailLabel"),
+            "row 2's tail no longer reads from Account.fableTailLabel, so the panel now has "
                 + "a second spelling of that string and the two can drift")
-        // ADJACENCY, not presence: `fableLine` also NAMES the declaration below,
-        // so `contains("fableLine")` stays true with the draw call deleted —
-        // watched, 2026-09-13, that exact mutation exited 0 against it. What is
-        // pinned here is the CALL: the line sits right after the window loop's
-        // closing brace, inside the `shape == .full` block, so it draws under
-        // the bars and only on the shape that has them.
+    }
+
+    /// Round 2 deleted the `.compact`-only `ViewThatFits` wrap: the mockup's
+    /// three-piece name row (local part, `@domain`, plan) draws on ONE line in
+    /// both shapes, the domain giving way first, so the card never grows a
+    /// second line for the plan (Gil approved the render this way
+    /// 2026-09-13). A `ViewThatFits` back in this file is that fallback
+    /// returning.
+    func testTheNameRowNeverWrapsToASecondLine() throws {
+        let source = try panelSource("PanelV4/AccountCard.swift")
+        // Line-filtered, not a bare `contains`: this very doc-comment names
+        // `ViewThatFits` in prose to explain what round 2 deleted, and a bare
+        // substring check would fail against its own explanation.
+        let hits = source.split(separator: "\n").filter {
+            $0.contains("ViewThatFits")
+                && !$0.trimmingCharacters(in: .whitespaces)
+                    .hasPrefix("///")
+        }
         XCTAssertTrue(
-            squashed.contains("trailingHelp:planLine)}fableLine}"),
-            "the fable caption line is no longer drawn directly under the quota rows "
-                + "(it may still be declared — that is not the same thing)")
+            hits.isEmpty,
+            "the name row wraps the plan onto a second line again — the mockup's own "
+                + "`.name .dom` gives way first instead:\n" + hits.joined(separator: "\n"))
     }
 
     /// A card inside a group box is ``AccountCard/Shape/compact``, which is NOT
@@ -107,18 +185,22 @@ final class QuotaTailWidthTests: XCTestCase {
             "the quota rows are gated on the card's shape again, so accounts inside a group "
                 + "draw no windows at all")
         // Comments survive whitespace-squashing, so an adjacency string here
-        // would break every time the block's own doc comment is reworded. What
-        // matters is that `shape` gates nothing structural: its two remaining
-        // uses fold the plan into a grouped card's name row and drop a
-        // redundant pill, neither of which removes a measurement.
+        // would break every time the block's own doc comment is reworded.
+        // Round 2 deleted the other two uses `shape` used to gate here (the
+        // name row's `ViewThatFits` fallback, and the tail's plan-name
+        // fallback on row 1) — both the plan and the Fable figure now draw
+        // identically in both shapes. The ONE use left is a label choice,
+        // not a measurement: `rotationPillText` drops the redundant
+        // "Rotating" word on a grouped card, the group's own legend already
+        // saying whether the GROUP is parked.
         let gates =
             source
             .split(separator: "\n")
             .filter { $0.contains("shape ==") && !$0.contains("//") }
             .map { $0.trimmingCharacters(in: .whitespaces) }
         XCTAssertEqual(
-            gates.count, 3,
-            "`shape` gates \(gates.count) branches now, not the 3 that are about labels:\n"
+            gates.count, 1,
+            "`shape` gates \(gates.count) branches now, not the 1 that is about a label:\n"
                 + gates.joined(separator: "\n")
                 + "\nA new one that skips a bar or a caption hides a measurement on every "
                 + "grouped card. Check what it removes before updating this count.")

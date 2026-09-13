@@ -96,6 +96,28 @@ final class FableWindowTests: XCTestCase {
         XCTAssertEqual(stale.fableWeeklyLabel(now: now), "fable 71%")
     }
 
+    // MARK: The row-2 tail — the same figure, NEVER a caption
+
+    /// Round 1 tried a caption whenever it differed from the 7d row's own —
+    /// deleted in round 2. Even the SHORTEST captioned form, `"fable 0% · in
+    /// 1h"`, measures 86.4pt against the 88pt column, and round 1's own
+    /// worked example, `"fable 72% · in 3d 18h"`, is 118.8pt — past the 96pt
+    /// ceiling that protects the bar beside it. The tail is the bare figure,
+    /// always; the reset stays in ``fableWeeklyLabel``'s hover, which has the
+    /// room.
+    func testTheTailIsTheBareFigureNeverACaption() throws {
+        let alice = try decoded(oi: "0.72", state: "\"near\"", reset: "\(fourDaysTwelveHours)")
+        XCTAssertEqual(alice.fableTailLabel, "fable 72%")
+    }
+
+    /// An older server, or an account this window was never learned for,
+    /// draws nothing in the tail either — the same absence rule
+    /// ``fableWeeklyLabel`` follows.
+    func testNilSevenDayOiDrawsNoTail() throws {
+        let never = try decoded(oi: "null", state: "null", reset: "null")
+        XCTAssertNil(never.fableTailLabel)
+    }
+
     // MARK: What VoiceOver hears
 
     func testTheSpokenFormNamesTheWindowInWordsAndSaysUsed() throws {

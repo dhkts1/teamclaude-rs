@@ -613,6 +613,58 @@ extension FleetSectionsTests {
 
         XCTAssertEqual(section.collapsedSummaryLine, "6 accounts · $2.50 today")
     }
+
+    // MARK: parkedStatsLine — worst-of and per-segment nil omission
+
+    /// "worst" is the HIGHEST fraction any member reports for a window, never
+    /// an average or the first row's own — a group is not less spent than its
+    /// worst member.
+    func testParkedStatsLineReportsTheWorstOfEachWindow() {
+        let accounts = [
+            sectionAccount(
+                "p1@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"],
+                todayCost: 4.10, fiveHour: 0.18, sevenDay: 0.30, sevenDayOi: 0.40),
+            sectionAccount(
+                "p2@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"],
+                todayCost: 8.20, fiveHour: 0.05, sevenDay: 0.62, sevenDayOi: 0.12),
+        ]
+        let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
+
+        XCTAssertEqual(
+            section.parkedStatsLine,
+            "$12.3 today · worst 5h 18% · 7d 62% · fable 40%",
+            "the worst 5h and fable readings are p1's, the worst 7d is p2's — the line must "
+                + "take the max of EACH window independently, not one row's whole readout")
+    }
+
+    /// No member carries the Fable window at all: the segment is omitted
+    /// entirely, never "fable n/a" — the same absence rule every other figure
+    /// here follows.
+    func testParkedStatsLineOmitsFableWhenNoMemberHasThatWindow() {
+        let accounts = (1...3).map {
+            sectionAccount(
+                "p\($0)@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"],
+                fiveHour: 0.10, sevenDay: 0.20, sevenDayOi: nil)
+        }
+        let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
+
+        XCTAssertEqual(section.parkedStatsLine, "worst 5h 10% · 7d 20%")
+    }
+
+    /// Not one member priced, and none of the three windows measured either:
+    /// every segment is independently absent, and the line is empty — never
+    /// "worst n/a" or "$0.00 today" about a group nobody has a reading for.
+    func testParkedStatsLineIsEmptyWhenNothingWasMeasured() {
+        let accounts = (1...3).map {
+            sectionAccount(
+                "p\($0)@example.com", groups: ["henry-token"], parkedGroups: ["henry-token"],
+                fiveHour: nil, sevenDay: nil, sevenDayOi: nil)
+        }
+        let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
+
+        XCTAssertNil(section.todaySpend)
+        XCTAssertEqual(section.parkedStatsLine, "")
+    }
 }
 
 private func sectionAccount(
@@ -624,7 +676,10 @@ private func sectionAccount(
     status: String = "active",
     disabled: Bool = false,
     groupColors: [String: String]? = nil,
-    todayCost: Double? = nil
+    todayCost: Double? = nil,
+    fiveHour: Double? = 0,
+    sevenDay: Double? = 0,
+    sevenDayOi: Double? = 0
 ) -> Account {
     Account(
         name: name,
@@ -633,9 +688,9 @@ private func sectionAccount(
         disabled: disabled,
         quota: quota,
         quotaState: quotaState,
-        fiveHour: 0,
-        sevenDay: 0,
-        sevenDayOi: 0,
+        fiveHour: fiveHour,
+        sevenDay: sevenDay,
+        sevenDayOi: sevenDayOi,
         held: [],
         requests: 0,
         inputTokens: 0,

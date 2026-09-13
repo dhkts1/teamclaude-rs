@@ -97,13 +97,20 @@ enum V4 {
     static var cardInsetH: CGFloat { cardPaddingH + panelBorderWidth }
     /// The flex gap inside a `.row`.
     static var rowGap: CGFloat { compact ? 6 : 8 }
-    /// `.sess .row{padding:4px 0}` — the ONLY `.row` in the sheet with vertical
+    /// `.sess .row{padding:2px 0}` — the ONLY `.row` in the sheet with vertical
     /// padding, and it is the session block's. A card's rows have none: their
     /// height is their line box and nothing else, which is what
     /// ``lineHeight(_:)`` supplies. Measured: padding the card's rows as well
     /// made every account card 3 pt tall per row — a parked card measured 47 pt
     /// against the mockup's 43.
-    static var sessRowPaddingV: CGFloat { compact ? 3 : 4 }
+    ///
+    /// Flat 2 in both densities — the mockup carries no density split here,
+    /// and round 1's `3 : 4` was measured against an EARLIER copy that read
+    /// 4px; the current one on disk reads 2px in both the busy-session row
+    /// and its subline. Round 2 also wires this into ``sessionRow(_:)`` for
+    /// the first time — it was declared and never applied, so "matching" the
+    /// mockup's number had no visible effect until now.
+    static let sessRowPaddingV: CGFloat = 2
 
     // MARK: - Quota grid (`.q`)
 
@@ -120,6 +127,29 @@ enum V4 {
     static var quotaLabelWidth: CGFloat { compact ? 32 : 34 }
     static let quotaPercentWidth: CGFloat = 40
     static let quotaGap: CGFloat = 8
+
+    /// The reset caption's own column — FIXED, and reserved on every
+    /// `QuotaRow` whether or not that row draws a caption at all (Gil,
+    /// 2026-09-13: "not aligned nicely" — the caption used to be
+    /// `.fixedSize()`, an auto-width column, so the bar beside it was
+    /// whatever was left over: 66pt on alice's 5h row (`"in 2h 10m"`) against
+    /// 94.5pt on her 7d row (`"in 3d"`), and a row with no live caption at
+    /// all got the whole remainder. One bar length per card, and one across
+    /// every card, needs one column width regardless of content.
+    ///
+    /// Sized by MEASURING every shape ``QuotaFormat/resetCaption(resetAtMs:now:)``
+    /// can print, at Comfortable's 12 pt, the same way ``usageTailWidth`` was:
+    /// the day tier never carries minutes (`"6d 23h"`, `"9d 23h"` — the days
+    /// digit does not change the width because `duration(minutes:)` never
+    /// prints more of it than fits one digit's row here), so the WIDEST shape
+    /// is actually the hour tier's own ceiling, `"in 23h 59m"` at 64.0pt —
+    /// wider than the day-tier example that motivated this column
+    /// (`"in 4d 12h"`, 51.7pt), because a two-digit hour AND a two-digit
+    /// minute both fit under the "under a day" branch. Reachable for a 7d
+    /// window too: the format is a function of MINUTES REMAINING, not which
+    /// window sent them, so a 7d window with under a day left prints the same
+    /// hour-tier shape a 5h window does.
+    static let resetCaptionWidth: CGFloat = 66
 
     /// The width every quota row reserves for the account's cost figure, on
     /// a card that carries one.
@@ -138,8 +168,9 @@ enum V4 {
     /// It does not grow past that. The column is a FIXED width shared by every
     /// quota row, so every point given to it comes out of BOTH bars on EVERY
     /// card: at 112 pt, for a window caption, the bar went from a measured
-    /// 154 pt to 48 pt. A caption too long for this column belongs on its own
-    /// line (`AccountCard.fableLine`), not in it.
+    /// 154 pt to 48 pt. A string too long for this column belongs on a line of
+    /// its own, not in it — `QuotaTailWidthTests` is the gate that catches one
+    /// before it ships.
     static let usageTailWidth: CGFloat = 88
     static var quotaMarginTop: CGFloat { compact ? 2 : 3 }
     static var barHeight: CGFloat { compact ? 6 : 7 }
@@ -176,8 +207,10 @@ enum V4 {
     static let sessMarginBottom: CGFloat = 2
     static let sessPaddingLeft: CGFloat = 10
     static let sessRuleWidth: CGFloat = 2
-    static let sparklineWidth: CGFloat = 64
-    static let sparklineHeight: CGFloat = 18
+    /// `.spark{width:56px;height:14px}` — round 2 matched the mockup's
+    /// current values; the earlier 64x18 was measured against a stale copy.
+    static let sparklineWidth: CGFloat = 56
+    static let sparklineHeight: CGFloat = 14
     static let sparklineStroke: CGFloat = 1.5
 
     // MARK: - Section head (`.sec`)

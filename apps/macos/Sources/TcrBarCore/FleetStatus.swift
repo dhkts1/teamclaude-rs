@@ -1830,6 +1830,27 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return "\(figure) · \(caption)"
     }
 
+    /// `"fable 72%"` — the SAME figure as ``fableWeeklyLabel``, for the
+    /// trailing column on the card's 7d row rather than a caption line under
+    /// the bars (Gil, 2026-09-13: "no like we had both … align it like we had
+    /// before").
+    ///
+    /// NEVER carries a reset caption, in round 1 or round 2. Round 1 tried
+    /// showing one whenever it differed from the 7d row's own — measured
+    /// against `V4.usageTailWidth` (88pt, hard-ceilinged at 96pt to protect
+    /// the bar beside it): even the SHORTEST captioned form, `"fable 0% · in
+    /// 1h"`, is already 86.4pt, and the round-1 bridge's own worked example,
+    /// `"fable 72% · in 3d 18h"`, is 118.8pt — well past the ceiling. No width
+    /// this column can safely take fits a caption, so it never draws one; the
+    /// column stays 88pt and Gil approved the render this way 2026-09-13.
+    ///
+    /// ``fableWeeklyLabel`` is untouched and carries the reset in the tail's
+    /// own hover, which has the room.
+    public var fableTailLabel: String? {
+        guard let sevenDayOi else { return nil }
+        return "fable \(QuotaFormat.percent(sevenDayOi))"
+    }
+
     /// ``fableWeeklyLabel`` for VoiceOver, spoken as part of the row's combined
     /// label for the same reason the spend figures are: a fact only a sighted
     /// user gets is half built.

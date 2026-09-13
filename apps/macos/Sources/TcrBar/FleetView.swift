@@ -1131,6 +1131,7 @@ struct FleetView: View {
                     VStack(alignment: .leading, spacing: 0) {
                         ForEach(entry.rows) { row in
                             sessionRow(row)
+                                .padding(.vertical, V4.sessRowPaddingV)
                         }
                     }
                     // `.sess{margin:8px 0 2px;padding-left:10px;
@@ -1593,25 +1594,25 @@ struct FleetView: View {
                 toolCallSubLine(entry, remaining: isNearTimeout ? remaining : nil)
             }
         } trailing: {
-                // Ring and duration on ONE line, inside the shared column: the
-                // two are one reading ("how far through its timeout is this
-                // call"), and stacking them made the pair read as two items.
-                TrailingColumn {
-                    HStack(spacing: V4.rowGap) {
-                        Spacer(minLength: 0)
-                        ProgressRing(
-                            fraction: (elapsed ?? 0) / bashTimeoutSeconds,
-                            tint: isNearTimeout ? Tok.spent : Tok.ok,
-                            accessibilityText: elapsed.map {
-                                "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
-                            })
-                        Text(elapsed.map(durationLabel) ?? "")
-                            .font(V4.font(V4.dimSize))
-                            .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
-                            .lineLimit(1)
-                            .frame(width: V4.durationColumnWidth, alignment: .trailing)
-                    }
+            // Ring and duration on ONE line, inside the shared column: the
+            // two are one reading ("how far through its timeout is this
+            // call"), and stacking them made the pair read as two items.
+            TrailingColumn {
+                HStack(spacing: V4.rowGap) {
+                    Spacer(minLength: 0)
+                    ProgressRing(
+                        fraction: (elapsed ?? 0) / bashTimeoutSeconds,
+                        tint: isNearTimeout ? Tok.spent : Tok.ok,
+                        accessibilityText: elapsed.map {
+                            "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
+                        })
+                    Text(elapsed.map(durationLabel) ?? "")
+                        .font(V4.font(V4.dimSize))
+                        .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
+                        .lineLimit(1)
+                        .frame(width: V4.durationColumnWidth, alignment: .trailing)
                 }
+            }
         }
         .frame(minHeight: V4.ringRowMinHeight)
     }

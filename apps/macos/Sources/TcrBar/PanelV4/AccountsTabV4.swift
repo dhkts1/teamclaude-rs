@@ -38,8 +38,11 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     @ViewBuilder var actions: (Account) -> Actions
 
     /// How many accounts a parked group shows before its "Show N more accounts"
-    /// button — the mockup's HENRY-TOKEN group draws three of its five.
-    static var parkedVisibleRows: Int { 3 }
+    /// button — round 2's approved mockup draws two of HENRY-TOKEN's five
+    /// ("Show 3 more accounts"), one fewer than round 1's three, now that the
+    /// group's own header line carries the worst-of figures the extra card
+    /// used to be the only way to see.
+    static var parkedVisibleRows: Int { 2 }
 
     private var sections: [FleetSection] {
         let all = fleet.sectionsInDisplayOrder(pinning: controlName)
@@ -117,6 +120,18 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     }
                 }
             } else {
+                // The parked group's own one-line header
+                // (`docs/design/panel-tabs-mockup.html`'s `.grpsum.tally`
+                // under `HENRY-TOKEN · PARKED · 5`): a dot per state, then the
+                // spend and worst-of figures. Drawn for EVERY wholly-parked
+                // section, capped or fully expanded — the mockup draws it
+                // while still showing two of its five member cards, so this
+                // is not the collapsed-group summary above; that one
+                // REPLACES the cards, this one sits above them.
+                if section.isWhollyParked {
+                    parkedHeader(section)
+                        .padding(.top, V4.groupCardGap)
+                }
                 // `.grp .card{margin:6px 0}` — EVERY card, the first included.
                 // Its top margin does not collapse into the group's own 12 pt
                 // padding, so the first card sits 18 pt under the stroke; giving
@@ -184,6 +199,46 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
         if expanded { return "Show fewer accounts" }
         if isSummarised(section) { return section.expandButtonLabel }
         return "Show \(hidden) more \(hidden == 1 ? "account" : "accounts")"
+    }
+
+    /// ONE 11pt line (`docs/design/panel-tabs-mockup.html`'s `.grpsum.tally`):
+    /// a dot+count per state ``FleetSection/breakdown`` reports — the same
+    /// array the collapsed-group summary above draws its pills from, so the
+    /// two headers cannot disagree about one section's tally — then
+    /// ``FleetSection/parkedStatsLine``, dropped entirely when empty (a group
+    /// whose members carry no spend and no quota reading at all).
+    ///
+    /// Each dot's colour is ``pillRole(_:)``'s own tint, the same mapping the
+    /// pill it replaced used — `ok` green, `near` amber, `unmeasured` blue,
+    /// same as the mockup's own three states in this fixture, and every other
+    /// kind by the same rule. Each carries ``FleetTally/label`` ("3 ok") as
+    /// both its hover and its spoken name — a coloured dot says nothing on
+    /// its own to a reader who cannot see colour.
+    @ViewBuilder
+    private func parkedHeader(_ section: FleetSection) -> some View {
+        HStack(spacing: 4) {
+            ForEach(section.breakdown, id: \.kind.token) { tally in
+                HStack(spacing: 3) {
+                    Circle()
+                        .fill(pillRole(tally.kind).tint)
+                        .frame(width: 7, height: 7)
+                    Text("\(tally.count)")
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.mute)
+                }
+                .help(tally.label)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(tally.label)
+            }
+            if !section.parkedStatsLine.isEmpty {
+                Text("· \(section.parkedStatsLine)")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.mute)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     private func pillRole(_ kind: FleetTally.Kind) -> V4Pill.Role {

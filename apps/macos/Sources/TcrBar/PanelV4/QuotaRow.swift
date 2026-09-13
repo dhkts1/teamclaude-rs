@@ -89,6 +89,12 @@ struct QuotaRow: View {
     /// to fit beside a bar; the full phrase it abbreviates stays one hover
     /// away rather than being lost with the row it used to occupy.
     var trailingHelp: String? = nil
+    /// The tail text's colour. `nil` (the default) draws `Tok.mute`, the
+    /// figure's ordinary colour — the cost tail and the plan name both stay
+    /// neutral. The Fable tail passes its own window's tint
+    /// (``Account/fableBarTintSource``) so a near-empty Fable window is still
+    /// amber or red at a glance, the way its caption used to read.
+    var trailingTint: Color? = nil
 
     private var fraction: Double {
         switch QuotaFormat.barFill(value) {
@@ -152,17 +158,30 @@ struct QuotaRow: View {
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.dim)
                 .frame(width: V4.quotaPercentWidth, alignment: .trailing)
-            if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: now) {
-                Text(caption)
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(captionTint)
-                    .fixedSize()
-            }
+            // FIXED width, reserved on EVERY row whether or not this one has
+            // a live caption — an auto-width column here is what made alike
+            // bars draw at different lengths depending on which row happened
+            // to carry the longer reset string (Gil, 2026-09-13: "not
+            // aligned nicely").
+            Text(QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: now) ?? "")
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(captionTint)
+                .lineLimit(1)
+                .frame(width: V4.resetCaptionWidth, alignment: .trailing)
             if trailingReserved {
-                Spacer(minLength: V4.quotaGap)
+                // `.q .tail{border-left:1px solid var(--line)}` — one aligned
+                // divider on every row that reserves the column, never a
+                // floating `·`, so the boundary lines up whether or not the
+                // row beside it draws a caption. Drawn even when `trailing`
+                // is empty (round 2's Fable-less row 1): the column's LEFT
+                // edge is a fact about the row, not about its content.
+                Rectangle()
+                    .fill(Tok.cardLine)
+                    .frame(width: V4.panelBorderWidth)
+                    .frame(maxHeight: .infinity)
                 Text(trailing ?? "")
                     .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
+                    .foregroundStyle(trailingTint ?? Tok.mute)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(width: V4.usageTailWidth, alignment: .trailing)
