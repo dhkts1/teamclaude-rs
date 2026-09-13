@@ -37,11 +37,12 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 
-use core_foundation::base::TCFType;
+use core_foundation::base::{CFTypeID, TCFType};
 use core_foundation::data::CFData;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::CFString;
-use core_foundation_sys::base::{CFRelease, CFTypeRef, OSStatus};
+use core_foundation::{declare_TCFType, impl_TCFType};
+use core_foundation_sys::base::OSStatus;
 use core_foundation_sys::dictionary::CFDictionaryRef;
 use core_foundation_sys::string::CFStringRef;
 
@@ -62,12 +63,35 @@ struct AuditToken {
     val: [u32; 8],
 }
 
-type SecCodeRef = *mut std::ffi::c_void;
-type SecRequirementRef = *mut std::ffi::c_void;
+/// The two Security-framework types this module touches, as proper CF types.
+///
+/// `declare_TCFType!`/`impl_TCFType!` are what `core-foundation` provides for
+/// exactly this, and they replace a hand-rolled ownership wrapper that had to
+/// be trusted by eye. They generate `Drop` (release), `Clone` (retain) and the
+/// `TCFType` conversions, so ownership stops being something this file asserts
+/// and becomes something the type system carries. It is also the shape
+/// `security-framework` uses, which is what these bindings should eventually
+/// become part of.
+#[repr(C)]
+pub struct __SecCode(std::ffi::c_void);
+/// Opaque handle to a running program, as the Security framework sees it.
+pub type SecCodeRef = *const __SecCode;
+declare_TCFType!(SecCode, SecCodeRef);
+impl_TCFType!(SecCode, SecCodeRef, SecCodeGetTypeID);
+
+#[repr(C)]
+pub struct __SecRequirement(std::ffi::c_void);
+/// Opaque handle to a parsed code-signing requirement.
+pub type SecRequirementRef = *const __SecRequirement;
+declare_TCFType!(SecRequirement, SecRequirementRef);
+impl_TCFType!(SecRequirement, SecRequirementRef, SecRequirementGetTypeID);
 
 #[link(name = "Security", kind = "framework")]
 extern "C" {
     static kSecGuestAttributeAudit: CFStringRef;
+
+    fn SecCodeGetTypeID() -> CFTypeID;
+    fn SecRequirementGetTypeID() -> CFTypeID;
 
     fn SecCodeCopyGuestWithAttributes(
         host: SecCodeRef,
@@ -89,22 +113,19 @@ extern "C" {
     ) -> OSStatus;
 }
 
-/// A Core Foundation object this module owns and must release.
+/// Reject a Security call that reported failure OR handed back nothing.
 ///
-/// The Security calls below hand back `+1` references through out-parameters,
-/// and there are several early returns between acquiring one and finishing with
-/// it. Rather than place a `CFRelease` on each path and hope none is missed,
-/// ownership is expressed in the type and `Drop` does it once.
-struct OwnedCf(*mut std::ffi::c_void);
-
-impl Drop for OwnedCf {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            // SAFETY: `self.0` is a +1 CF reference obtained from one of the
-            // Security create/copy calls below, released exactly once here.
-            unsafe { CFRelease(self.0 as CFTypeRef) };
-        }
+/// Both halves matter. A non-zero `OSStatus` is the documented failure, and a
+/// zero status with a null out-parameter is the undocumented one; treating
+/// either as success means wrapping a null in a CF type and releasing it later.
+fn created<T>(status: OSStatus, out: *const T, call: &str, kind: io::ErrorKind) -> io::Result<()> {
+    if status != 0 || out.is_null() {
+        return Err(io::Error::new(
+            kind,
+            format!("{call} failed (OSStatus {status})"),
+        ));
     }
+    Ok(())
 }
 
 /// Read the audit token of the process on the other end of `stream`.
@@ -138,7 +159,7 @@ fn peer_audit_token(stream: &UnixStream) -> io::Result<AuditToken> {
 }
 
 /// Resolve an audit token to a code object for that running process.
-fn code_for_token(token: &AuditToken) -> io::Result<OwnedCf> {
+fn code_for_token(token: &AuditToken) -> io::Result<SecCode> {
     // SAFETY: reading the 32 bytes of a live `audit_token_t` as bytes. The
     // Security framework expects exactly these bytes.
     let bytes = unsafe {
@@ -153,25 +174,28 @@ fn code_for_token(token: &AuditToken) -> io::Result<OwnedCf> {
     let key = unsafe { CFString::wrap_under_get_rule(kSecGuestAttributeAudit) };
     let attrs = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), data.as_CFType())]);
 
-    let mut code: SecCodeRef = std::ptr::null_mut();
+    let mut code: SecCodeRef = std::ptr::null();
     // SAFETY: `attrs` outlives the call; `code` is a valid out-parameter.
     let status = unsafe {
         SecCodeCopyGuestWithAttributes(
-            std::ptr::null_mut(),
+            std::ptr::null(),
             attrs.as_concrete_TypeRef(),
             SEC_CS_DEFAULT_FLAGS,
             &mut code,
         )
     };
-    if status != 0 || code.is_null() {
-        // 100001 is kPOSIXErrorEPERM and is a documented outcome here, not an
-        // impossible one. It still means "cannot establish what the peer is",
-        // which is a refusal like any other.
-        return Err(io::Error::other(format!(
-            "SecCodeCopyGuestWithAttributes failed for the peer audit token (OSStatus {status})"
-        )));
-    }
-    Ok(OwnedCf(code))
+    // 100001 is kPOSIXErrorEPERM and is a documented outcome here, not an
+    // impossible one. It still means "cannot establish what the peer is",
+    // which is a refusal like any other.
+    created(
+        status,
+        code,
+        "SecCodeCopyGuestWithAttributes for the peer audit token",
+        io::ErrorKind::Other,
+    )?;
+    // SAFETY: a Copy-rule call returns +1, which is exactly what
+    // `wrap_under_create_rule` takes ownership of.
+    Ok(unsafe { SecCode::wrap_under_create_rule(code) })
 }
 
 /// Check that the process on the other end of `stream` satisfies `requirement`,
@@ -192,21 +216,28 @@ pub fn verify_peer(stream: &UnixStream, requirement: &str) -> io::Result<()> {
     let code = code_for_token(&token)?;
 
     let text = CFString::new(requirement);
-    let mut req: SecRequirementRef = std::ptr::null_mut();
+    let mut req: SecRequirementRef = std::ptr::null();
     // SAFETY: `text` outlives the call; `req` is a valid out-parameter.
     let status = unsafe {
         SecRequirementCreateWithString(text.as_concrete_TypeRef(), SEC_CS_DEFAULT_FLAGS, &mut req)
     };
-    if status != 0 || req.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("could not parse the code requirement (OSStatus {status}): {requirement}"),
-        ));
-    }
-    let req = OwnedCf(req);
+    created(
+        status,
+        req,
+        &format!("parsing the code requirement {requirement:?}"),
+        io::ErrorKind::InvalidInput,
+    )?;
+    // SAFETY: a Create-rule call returns +1.
+    let req = unsafe { SecRequirement::wrap_under_create_rule(req) };
 
-    // SAFETY: both handles are live +1 references owned by this frame.
-    let status = unsafe { SecCodeCheckValidity(code.0, SEC_CS_DEFAULT_FLAGS, req.0) };
+    // SAFETY: both handles are live CF references owned by this frame.
+    let status = unsafe {
+        SecCodeCheckValidity(
+            code.as_concrete_TypeRef(),
+            SEC_CS_DEFAULT_FLAGS,
+            req.as_concrete_TypeRef(),
+        )
+    };
     if status != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -234,6 +265,32 @@ mod tests {
         String::from_utf8_lossy(&out.stderr)
             .lines()
             .find_map(|l| l.strip_prefix("Identifier=").map(str::to_string))
+    }
+
+    /// `created` has two independent rejection reasons and the integration
+    /// tests only exercise one of them.
+    ///
+    /// In practice the Security calls return null *and* a non-zero status when
+    /// they fail, so the null check alone makes every higher-level test pass
+    /// even with the status check deleted (verified: removing `status != 0`
+    /// leaves all four peer tests green). A call that returned a partial result
+    /// with a failing status would then be wrapped and trusted. Tested directly
+    /// because nothing above it can see the difference.
+    #[test]
+    fn created_rejects_a_failing_status_even_with_a_non_null_result() {
+        let non_null: *const u8 = &1u8;
+
+        created(0, non_null, "ok", io::ErrorKind::Other).expect("success must pass");
+
+        let err = created(-1, non_null, "failing", io::ErrorKind::Other)
+            .expect_err("a non-zero OSStatus must be rejected even when a pointer came back");
+        assert!(
+            err.to_string().contains("-1"),
+            "the status belongs in the message: {err}"
+        );
+
+        created(0, std::ptr::null::<u8>(), "null", io::ErrorKind::Other)
+            .expect_err("a null result must be rejected even when the status says success");
     }
 
     /// POSITIVE CONTROL for the audit-token plumbing.
