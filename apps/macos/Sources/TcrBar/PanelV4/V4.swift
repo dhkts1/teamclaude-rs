@@ -1,0 +1,254 @@
+import SwiftUI
+import TcrBarCore
+
+/// The v4 number sheet, as Swift.
+///
+/// `data/plans/v4-spec.md` is the extraction of `docs/design/panel-tabs-mockup.html`'s
+/// `<style>` block; this enum is that sheet with one name per CSS declaration, at
+/// 1 CSS px = 1 pt. It is the ONE file under `PanelV4/` allowed to hold a raw
+/// number — `scripts/check-panel-v4.sh` fails the build if any sibling view
+/// writes a literal size or reaches for a pre-v4 geometry token, because the
+/// eleven adaptation rounds before this one drifted exactly that way: a 16 here,
+/// an 8 there, each locally defensible and collectively a different design.
+///
+/// Colour is deliberately NOT restated here. `Tok` already carries the v4 sheet's
+/// own role names (`Tok.cardFill`, `Tok.cardLine`, `Tok.dim`, `Tok.mute`) bound to
+/// the gated palette, and a second set of hexes in this file would be a second
+/// source of truth for the thing `scripts/tcrbar-palette.py` exists to gate. The
+/// two exceptions below (`trend`, `info`) are roles the palette has no token for
+/// and are named as such.
+enum V4 {
+
+    // MARK: - Panel (`.panel`)
+
+    /// The mockup's own `width:372px`. `Tok.panelWidth` is bound to this, so the
+    /// popover, the size probe and this view cannot disagree about how wide the
+    /// panel is.
+    static let panelWidth: CGFloat = 372
+    static let panelRadius: CGFloat = 18
+    static let panelPaddingTop: CGFloat = 10
+    static let panelPaddingSide: CGFloat = 10
+    static let panelPaddingBottom: CGFloat = 8
+    /// `border:1px solid var(--line)` with `border-top-color:rgba(255,255,255,.18)`.
+    static let panelBorderWidth: CGFloat = 1
+    static let panelTopEdgeAlpha: Double = 0.18
+
+    // MARK: - Header (`.hdr`)
+
+    static let headerPaddingTop: CGFloat = 2
+    static let headerPaddingSide: CGFloat = 4
+    static let headerPaddingBottom: CGFloat = 6
+    /// `.gear` — a 26×26 button, radius 7, `rgba(255,255,255,.08)`, 15 pt glyph.
+    static let gearSize: CGFloat = 26
+    static let gearRadius: CGFloat = 7
+    static let gearFillAlpha: Double = 0.08
+    static let gearGlyphSize: CGFloat = 15
+    /// `.hdr` puts the title and the freshness on one baseline with a gap.
+    static let headerGap: CGFloat = 8
+
+    // MARK: - Summary (`.sum`)
+
+    static let summaryPaddingSide: CGFloat = 4
+    static let summaryPaddingBottom: CGFloat = 10
+
+    // MARK: - Segmented control (`.seg` / `.tab` / `.badge`)
+
+    static let segRadius: CGFloat = 10
+    static let segPadding: CGFloat = 3
+    static let segGap: CGFloat = 3
+    static let segFillAlpha: Double = 0.06
+    static let segMarginBottom: CGFloat = 12
+    static let tabMinHeight: CGFloat = 32
+    static let tabRadius: CGFloat = 8
+    static let tabSelectedAlpha: Double = 0.12
+    static let tabIconBox: CGFloat = 14
+    static let tabIconStroke: CGFloat = 1.8
+    static let tabGap: CGFloat = 6
+    static let badgeRadius: CGFloat = 9
+    static let badgePaddingH: CGFloat = 6
+    static let badgeFillAlpha: Double = 0.14
+
+    // MARK: - Card (`.card` / `.row`)
+
+    static let cardRadius: CGFloat = 8
+    static let cardPaddingV: CGFloat = 10
+    static let cardPaddingH: CGFloat = 12
+    /// `.card{margin:14px 0}` — adjacent cards collapse to one 14 pt gap.
+    static let cardGap: CGFloat = 14
+    /// `.row{padding:4px 0}` — so two adjacent rows sit 8 pt apart.
+    static let rowPaddingV: CGFloat = 4
+    /// The flex gap inside a `.row`.
+    static let rowGap: CGFloat = 8
+
+    // MARK: - Quota grid (`.q`)
+
+    /// `grid-template-columns:24px 1fr 40px auto`.
+    static let quotaLabelWidth: CGFloat = 24
+    static let quotaPercentWidth: CGFloat = 40
+    static let quotaGap: CGFloat = 8
+    static let quotaMarginTop: CGFloat = 6
+    static let barHeight: CGFloat = 7
+    static let barRadius: CGFloat = 4
+    static let barTrackAlpha: Double = 0.08
+    static let barMinWidth: CGFloat = 2
+    /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
+    static let barCappedWidth: CGFloat = 110
+
+    // MARK: - Pill (`.pill`)
+
+    static let pillFontSize: CGFloat = 10.5
+    /// `letter-spacing:.06em` at 10.5 pt.
+    static let pillTracking: CGFloat = 0.06 * 10.5
+    static let pillPaddingV: CGFloat = 2
+    static let pillPaddingH: CGFloat = 7
+    static let pillRadius: CGFloat = 7
+    static let pillBorderWidth: CGFloat = 1
+    /// `.pill.ok{border-color:rgba(95,208,122,.35)}` and `.4` for the others.
+    static let pillBorderAlpha: Double = 0.4
+    static let pillGap: CGFloat = 6
+
+    // MARK: - Status dot (`.dot`)
+
+    static let dotSize: CGFloat = 8
+    static let dotTrailingGap: CGFloat = 6
+    /// `box-shadow:0 0 0 3px rgba(...,.18)` — a 3 pt ring, so a 14 pt halo.
+    static let dotHaloWidth: CGFloat = 3
+    static var dotHaloSize: CGFloat { dotSize + 2 * dotHaloWidth }
+
+    // MARK: - Session block (`.sess`) and sparkline (`.spark`)
+
+    static let sessMarginTop: CGFloat = 8
+    static let sessMarginBottom: CGFloat = 2
+    static let sessPaddingLeft: CGFloat = 10
+    static let sessRuleWidth: CGFloat = 2
+    static let sparklineWidth: CGFloat = 64
+    static let sparklineHeight: CGFloat = 18
+    static let sparklineStroke: CGFloat = 1.5
+
+    // MARK: - Section head (`.sec`)
+
+    static let sectionHeadMarginTop: CGFloat = 12
+    static let sectionHeadMarginSide: CGFloat = 4
+    static let sectionHeadMarginBottom: CGFloat = 4
+    static let sectionHeadGlyph: CGFloat = 12
+    static let sectionHeadGap: CGFloat = 6
+    static let sectionHeadSize: CGFloat = 11
+    static let sectionHeadTracking: CGFloat = 0.1 * 11
+
+    // MARK: - Ring (`.ring`)
+
+    static let ringSize: CGFloat = 34
+    static let ringStroke: CGFloat = 4
+    static let ringTrackAlpha: Double = 0.08
+    /// The Bash tool's own timeout — the denominator the ring fills toward, and
+    /// the figure the RUNNING NOW section head states out loud.
+    static let toolTimeoutSeconds: Double = 600
+    /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
+    /// and the row says how long is left.
+    static let toolTimeoutWarnSeconds: Double = 30
+
+    // MARK: - Group (`.grp`)
+
+    static let groupPaddingTop: CGFloat = 12
+    static let groupPaddingSide: CGFloat = 8
+    static let groupPaddingBottom: CGFloat = 4
+    static let groupMarginTop: CGFloat = 20
+    static let groupMarginBottom: CGFloat = 8
+    static let groupRadius: CGFloat = 16
+    static let groupStroke: CGFloat = 1.5
+    /// `.grp .card{margin:6px 0}`.
+    static let groupCardGap: CGFloat = 6
+    /// The legend sits at `top:-7px; left:calc(var(--n0) + 4px)` with `--n0:10px`,
+    /// and the stroke is masked out for a 9 px band behind it.
+    static let legendOffsetY: CGFloat = -7
+    static let legendNotchStart: CGFloat = 10
+    static let legendNotchPadding: CGFloat = 4
+    static let legendMaskBand: CGFloat = 9
+    static let legendFontSize: CGFloat = 11
+    static let legendTracking: CGFloat = 0.08 * 11
+    static let legendGlyph: CGFloat = 11
+    static let legendGap: CGFloat = 6
+
+    // MARK: - Button (`.btn` / `.more`)
+
+    static let buttonRadius: CGFloat = 7
+    static let buttonMinHeight: CGFloat = 28
+    static let buttonPaddingV: CGFloat = 5
+    static let buttonPaddingH: CGFloat = 11
+    static let buttonFillAlpha: Double = 0.10
+    static let buttonFontSize: CGFloat = 13
+    static let buttonGap: CGFloat = 8
+    /// `.more` — the disclosure control: full width, 12.5 pt/600, its own 6 pt
+    /// top margin and a 12 pt chevron.
+    static let discFontSize: CGFloat = 12.5
+    static let discMarginTop: CGFloat = 6
+    static let discGlyph: CGFloat = 12
+    static let discRadius: CGFloat = 8
+    static let discPaddingV: CGFloat = 5
+    static let discPaddingH: CGFloat = 10
+    /// `.aside` — "3 accounts have no sessions".
+    static let asideFontSize: CGFloat = 12
+    static let asidePaddingTop: CGFloat = 6
+
+    // MARK: - Footer (`.foot`)
+
+    static let footerMarginTop: CGFloat = 10
+    static let footerPaddingTop: CGFloat = 8
+    static let footerRuleWidth: CGFloat = 1
+    static let footerGap: CGFloat = 10
+    static let footerGlyph: CGFloat = 12
+
+    // MARK: - Type
+
+    static let titleSize: CGFloat = 17
+    static let titleTracking: CGFloat = -0.01 * 17
+    static let freshnessSize: CGFloat = 12.5
+    static let summarySize: CGFloat = 15
+    static let tabLabelSize: CGFloat = 12.5
+    static let tabLabelTracking: CGFloat = 0.02 * 12.5
+    static let badgeSize: CGFloat = 11
+    static let nameSize: CGFloat = 15
+    static let nameTracking: CGFloat = -0.005 * 15
+    static let dimSize: CGFloat = 13
+    static let muteSize: CGFloat = 12
+    static let monoSize: CGFloat = 12
+    static let footerSize: CGFloat = 12.5
+
+    // MARK: - Motion
+
+    /// `scale .96 over 120 ms` on press; `spring, damping 1.0, response 0.3` for a
+    /// tab switch or an expand.
+    static let pressScale: CGFloat = 0.96
+    static let springResponse: Double = 0.3
+    static let springDamping: Double = 1.0
+
+    // MARK: - The two colours the gated palette has no name for
+
+    /// `--trend`, the sparkline stroke. Decorative: it draws a 1.5 pt line, never
+    /// text, so it carries no contrast obligation and is not a palette token.
+    static let trend = Color(red: 0x7f / 255, green: 0xb2 / 255, blue: 0xff / 255)
+    /// `--info`, the UNMEASURED pill and the Agent bar. `Tok.unmeasured` is this
+    /// role in the gated palette and is what the pill and bar actually use; this
+    /// value is kept beside `trend` only so the sheet's own two extra roles are
+    /// both named in one place.
+    static let info = Color(red: 0x6a / 255, green: 0xa9 / 255, blue: 0xff / 255)
+
+    // MARK: - Derived helpers
+
+    /// `font-variant-numeric:tabular-nums` is set on `.panel`, so every number on
+    /// this panel is tabular. Applied through one helper rather than remembered
+    /// at forty call sites.
+    static func font(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight).monospacedDigit()
+    }
+
+    static func mono(_ size: CGFloat) -> Font {
+        .system(size: size, design: .monospaced).monospacedDigit()
+    }
+
+    /// A group's identity colour, as SwiftUI. Never a status hue — the sheet is
+    /// explicit that group identity is "outline + legend only".
+    static func groupColor(_ rgb: GroupTagColor.RGB) -> Color {
+        Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+    }
+}

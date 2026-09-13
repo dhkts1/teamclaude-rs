@@ -388,7 +388,13 @@ public enum Tok {
     public static let space4: CGFloat = 12
     public static let space5: CGFloat = 16
 
-    public static let panelWidth: CGFloat = 380
+    /// 372, the v4 sheet's own `.panel{width:372px}` — it was 380 until the v4
+    /// migration, which is where every measured x-offset against the mockup came
+    /// from. One value, so the popover (`MenuBarShell`), the size probe
+    /// (`PanelSizeProbe`, `ShellProbe`) and the panel itself cannot disagree
+    /// about how wide the thing is; `V4.panelWidth` is the sheet's copy and is
+    /// what the panel body actually frames to.
+    public static let panelWidth: CGFloat = 372
     /// The cap on the scrolling account list — what keeps Quit and the
     /// checkboxes on screen under a long fleet.
     ///

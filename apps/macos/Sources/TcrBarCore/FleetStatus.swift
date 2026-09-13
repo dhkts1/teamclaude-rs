@@ -2022,7 +2022,12 @@ public struct FleetTally: Equatable, Sendable {
         /// `hasQuotaEvidence` — a broken account has no quota reading either,
         /// and checking evidence first would land every one of them back in
         /// `.unmeasured`.
-        init(account: Account) {
+        /// Public because the v4 account card (`PanelV4/AccountCard.swift`, a
+        /// different module) draws its state pill from this and nothing else:
+        /// the card's pill and the group's tally are then the same
+        /// classification, which is the defect the pre-v4 card had — an OK pill
+        /// over a 98% bar.
+        public init(account: Account) {
             if account.health == .needsRelogin {
                 self = .needsRelogin
             } else {

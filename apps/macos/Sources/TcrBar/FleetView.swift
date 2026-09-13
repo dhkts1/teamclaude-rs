@@ -176,7 +176,205 @@ struct FleetView: View {
         self._sessionFiles = State(initialValue: initialSessionFiles)
     }
 
+    /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
+    /// so the two can be put side by side on the same live fleet. Read once per
+    /// render off the environment rather than a preference: it is a comparison
+    /// switch for whoever is holding the migration, not a setting anyone ships.
+    static var drawsLegacyPanel: Bool {
+        ProcessInfo.processInfo.environment["TCRBAR_LEGACY_PANEL"] == "1"
+    }
+
     var body: some View {
+        Group {
+            if Self.drawsLegacyPanel {
+                legacyBody
+            } else {
+                v4Body
+            }
+        }
+        // `snapshotMode` never touches disk here: the render harness's session
+        // ids are fixture strings that join to nothing real, so the read
+        // would only ever populate an unused dictionary — see
+        // `RenderStates.swift`'s sessions-tab fixtures.
+        .onAppear { if !snapshotMode { sessionFiles = SessionFiles.read() } }
+        .onChange(of: poller.lastPollAt) { _ in
+            if !snapshotMode { sessionFiles = SessionFiles.read() }
+        }
+    }
+
+    /// The panel as `docs/design/panel-tabs-mockup.html` draws it — chrome from
+    /// ``PanelV4``, the Accounts tab transcribed class by class under
+    /// `PanelV4/`, and Sessions and Tools still drawn by the views below (Gil,
+    /// 2026-09-13: "i think just accounts need fixing … the others i think ours
+    /// look better").
+    private var v4Body: some View {
+        PanelV4(
+            freshness: poller.lastPollAt.map { freshnessLabel(since: $0, now: Date()) },
+            tabs: PanelTab.allCases,
+            selected: selectedTab,
+            badges: v4Badges,
+            onSelect: { selectedTab = $0 },
+            onSettings: onSettings,
+            summary: { v4Summary },
+            content: { v4Content },
+            footer: { v4Footer }
+        )
+    }
+
+    /// A badge per tab, from the same counts on EVERY tab — including the one
+    /// being looked at, which the pre-v4 strip dropped (`/tmp/parity/
+    /// delta-list.md` #7). Accounts carries none: the mockup gives it none
+    /// either, and the summary line directly above already counts the fleet.
+    private var v4Badges: [PanelTab: Int] {
+        guard case .loaded(let fleet) = poller.state else { return [:] }
+        var out: [PanelTab: Int] = [:]
+        if !fleet.sessions.isEmpty { out[.sessions] = fleet.sessions.count }
+        if !fleet.toolsRunning.isEmpty { out[.tools] = fleet.toolsRunning.count }
+        return out
+    }
+
+    @ViewBuilder
+    private var v4Summary: some View {
+        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
+            switch selectedTab {
+            case .accounts:
+                SummaryLine.accounts(fleet)
+            case .sessions:
+                sessionsSummaryLine(fleet)
+                    .padding(.horizontal, V4.summaryPaddingSide)
+                    .padding(.bottom, V4.summaryPaddingBottom)
+            case .tools:
+                toolsSummaryLine(fleet)
+                    .padding(.horizontal, V4.summaryPaddingSide)
+                    .padding(.bottom, V4.summaryPaddingBottom)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var v4Content: some View {
+        switch poller.state {
+        case .loaded(let fleet) where !fleet.accounts.isEmpty:
+            switch selectedTab {
+            case .accounts:
+                if fleet.source.countersAreStructural {
+                    offlineNotice(fleet.source)
+                }
+                if snapshotMode {
+                    accountsTabV4(fleet)
+                } else {
+                    ScrollView { accountsTabV4(fleet) }
+                        .frame(height: visibleRowsHeight(for: fleet))
+                }
+            case .sessions:
+                sessionsTab(fleet)
+            case .tools:
+                toolsTab(fleet)
+            }
+        default:
+            // Every not-a-fleet state keeps the banner it already had: those
+            // are sentences, not layout, and the migration has no quarrel
+            // with them.
+            content
+        }
+    }
+
+    private func accountsTabV4(_ fleet: Fleet) -> some View {
+        AccountsTabV4(
+            fleet: fleet,
+            controlName: control.current,
+            expandedGroups: expandedGroups,
+            onToggleGroup: { toggleGroupExpansion($0) },
+            now: Date()
+        ) { account in
+            // The row's own actions, from the ONE definition of them —
+            // `AccountRow`'s menu, rendered with no row around it. A second
+            // copy of that menu for the v4 card is a second thing to keep in
+            // step with `tcr`'s subcommands.
+            AccountRow(
+                account: account,
+                countersAreStructural: fleet.source.countersAreStructural,
+                accounts: accounts,
+                control: control,
+                onChanged: { await poller.pollOnce() },
+                onRelogin: { reloginAccount(account.ref) },
+                onMint: { mintAccountToken(account.ref) },
+                onMintGroup: { group in mintGroupTokens(group) },
+                groupController: groupController,
+                removeController: removeController,
+                allAccounts: fleet.accounts,
+                snapshotMode: snapshotMode,
+                menuOnly: true
+            )
+        }
+    }
+
+    /// `.foot` plus everything that has to sit above its rule: the action row,
+    /// a login failure, and the not-supervised controls.
+    private var v4Footer: some View {
+        PanelFooter(
+            leading: v4FooterLeading,
+            leadingSystemImage: selectedTab == .sessions ? "shippingbox" : nil,
+            trailing: v4FooterTrailing
+        ) {
+            VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+                if selectedTab == .accounts {
+                    v4Actions
+                }
+                if let loginError {
+                    Text(loginError)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.spent)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !server.state.isOurChild || server.state.summary != "" {
+                    Text(server.state.summary)
+                        .font(V4.font(V4.footerSize))
+                        .foregroundStyle(Tok.mute)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                dangerZone
+            }
+        }
+    }
+
+    /// Where this tab's numbers come from — the mockup gives each tab its own
+    /// provenance line rather than repeating one global block
+    /// (`/tmp/parity/delta-list.md` #16).
+    private var v4FooterLeading: String {
+        switch selectedTab {
+        case .accounts: return AppBuild.label ?? "TcrBar"
+        case .sessions: return "proxy + Claude Code session files"
+        case .tools: return "from request bodies only · nothing logged"
+        }
+    }
+
+    private var v4FooterTrailing: String? {
+        if selectedTab == .sessions { return "sparkline: req/min, 30m" }
+        guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
+        return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
+    }
+
+    /// `.btn` — the two fleet actions the mockup keeps, plus the server control
+    /// the app cannot do without. Above the footer rule, which is where the
+    /// sheet puts them and the opposite of where the pre-v4 panel did.
+    private var v4Actions: some View {
+        HStack(spacing: V4.buttonGap) {
+            if server.state.isOurChild {
+                V4Button(title: "Stop server") { server.stop() }
+            } else {
+                V4Button(title: "Start server") { server.start() }
+            }
+            V4Button(title: "Refresh") { Task { await poller.pollOnce() } }
+            V4Button(
+                title: "Add account…",
+                help: "Opens `tcr login` in a Terminal window."
+            ) { addAccount() }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var legacyBody: some View {
         VStack(alignment: .leading, spacing: Tok.rowSpacing) {
             header
             Hairline()
@@ -187,14 +385,6 @@ struct FleetView: View {
         .padding(Tok.gutter)
         .frame(width: Tok.panelWidth)
         .background(Tok.panel)
-        // `snapshotMode` never touches disk here: the render harness's session
-        // ids are fixture strings that join to nothing real, so the read
-        // would only ever populate an unused dictionary — see
-        // `RenderStates.swift`'s sessions-tab fixtures.
-        .onAppear { if !snapshotMode { sessionFiles = SessionFiles.read() } }
-        .onChange(of: poller.lastPollAt) { _ in
-            if !snapshotMode { sessionFiles = SessionFiles.read() }
-        }
     }
 
     // MARK: Header
@@ -2342,6 +2532,16 @@ struct AccountRow: View {
     /// Defaults to `false` so every other call site (the live panel) is
     /// unchanged.
     var snapshotMode: Bool = false
+    /// Render ONLY this row's menu items, with no row around them — what the v4
+    /// account card attaches as its context menu (``AccountsTabV4``).
+    ///
+    /// A flag rather than a second view: every item in ``contextMenuItems`` is
+    /// wired to this row's own controllers and its own `perform…` methods, and
+    /// lifting them into a standalone menu view would make the gear menu and the
+    /// card menu two definitions of what an account can do. The row is
+    /// constructed exactly as the legacy panel constructs it; only its `body`
+    /// differs.
+    var menuOnly: Bool = false
     /// The last "Copy Access Token" that did not land — `tcr`'s own words,
     /// drawn under the row like the other failure lines. Row-local rather
     /// than a controller: nothing else needs to know, and a copy that did
@@ -2929,6 +3129,14 @@ struct AccountRow: View {
     }
 
     var body: some View {
+        if menuOnly {
+            contextMenuItems
+        } else {
+            rowBody
+        }
+    }
+
+    private var rowBody: some View {
         rowContent
             // The card box — radius, padding, fill and border — is
             // ``SwiftUI/View/panelCard()``, shared with the Sessions and Tools
