@@ -25,14 +25,22 @@ public enum SettingsRowTiming: Equatable, Sendable {
     /// TcrBar only displays this; there is no write path through this window
     /// at all.
     case readOnly
+    /// A TcrBar-own preference, read once at
+    /// `applicationDidFinishLaunching` (`TcrBarApp.swift`) — distinct from
+    /// `.boot`, which is the SERVER re-reading its own config file. Both
+    /// share the shape "written now, observed later", but conflating them
+    /// told a reader to restart the proxy for a box that only needs TcrBar
+    /// itself relaunched.
+    case nextLaunch
 
-    /// The two-word tag the mockup and this window both draw
+    /// The tag the mockup and this window both draw
     /// (`docs/design/panel-tabs-mockup.html` `.tag.live` / `.tag.boot`).
     public var label: String {
         switch self {
         case .live: return "applied live"
         case .boot: return "restart to apply"
         case .readOnly: return "read-only"
+        case .nextLaunch: return "next launch"
         }
     }
 }
@@ -90,15 +98,11 @@ public enum SettingsRowBadge {
     /// ``SettingsRowBadgeTests`` enumerates both directions.
     public static let timing: [String: SettingsRowTiming] = [
         proxyRestart: .live,
-        // Its own row-level tag in the mockup ("takes effect next launch")
-        // rather than the section's "applied live": TcrBar reads this
-        // preference once, at `applicationDidFinishLaunching`, not on every
-        // poll — so `.boot` is the honest word even though nothing here is
-        // server config. `SettingsRowBadge` has no fourth case for "next
-        // app launch specifically", and boot-time is the closer of the two
-        // to what a reader should expect: the change is inert until
-        // something restarts.
-        startServerAtLaunch: .boot,
+        // TcrBar reads this preference once, at
+        // `applicationDidFinishLaunching`, not on every poll — `.nextLaunch`,
+        // never `.boot`: `.boot` means the SERVER re-reading its own config
+        // file, and this key never touches that file at all.
+        startServerAtLaunch: .nextLaunch,
         pollInterval: .live,
         launchAtLogin: .live,
         keepAwake: .live,

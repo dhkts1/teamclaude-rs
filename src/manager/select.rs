@@ -267,10 +267,20 @@ impl Manager {
     /// fact never re-keys, and — the second half of the same argument — mostly does
     /// not even DIVERT, because a divert costs that request the same cold prefix a
     /// re-key would. The five split by how much they actually know:
-    ///  - **over the utilization threshold** → **SERVE the pin anyway.** That
-    ///    threshold is our own arithmetic over headers that go stale by minutes, and
-    ///    Anthropic keeps answering 200s for accounts it benches. Upstream is the
-    ///    oracle: serve, and let a real 429 arm a real (HARD) hold.
+    ///  - **over the utilization threshold** → **SERVE the pin anyway, UNLESS the
+    ///    session has also gone idle-cold** (no request in [`CACHE_WARM_HOLD_SECS`])
+    ///    AND an eligible alternative account exists — then there is nothing left to
+    ///    protect, so the pin durably re-keys instead (measured 2026-09-11: an
+    ///    8-of-18-account morning burst left ten accounts idle for six hours while a
+    ///    session that had gone cold anyway kept its pin on a saturated one; falling
+    ///    through requires the same eligible-alternative check the normal pool pick
+    ///    makes, so a fleet-wide soft threshold still gets a last-resort serve rather
+    ///    than a spurious 429). Otherwise: that threshold is our own arithmetic over
+    ///    headers that go stale by minutes, and Anthropic keeps answering 200s for
+    ///    accounts it benches. Upstream is the oracle: serve, and let a real 429 arm a
+    ///    real (HARD) hold. No config flag governs the idle-cold carve-out — it fires
+    ///    only when the cache is already cold by the crate's own constant AND the
+    ///    account is over the soft threshold, so there is nothing to opt out of.
     ///  - **paced out** (at the in-flight cap / inside min-spacing, see
     ///    [`Self::paced_out`]) → divert this ONE request, keep the pin. Our own
     ///    concurrency is measured exactly and never stale, and spreading a session's
@@ -414,14 +424,14 @@ impl Manager {
             // documented deadlock).
             let (pinned, counts) = {
                 let pins = self.affinity.lock().expect("affinity lock poisoned");
-                let pinned = pins.get(&key).map(|&(idx, _)| idx);
+                let pinned = pins.get(&key).map(|&(idx, touched_ms)| (idx, touched_ms));
                 let mut counts: HashMap<usize, usize> = HashMap::new();
                 for &(idx, _) in pins.values() {
                     *counts.entry(idx).or_insert(0) += 1;
                 }
                 (pinned, counts)
             };
-            if let Some(idx) = pinned {
+            if let Some((idx, pin_touched_ms)) = pinned {
                 if tried.contains(&idx) {
                     // The pin already failed THIS request upstream. That is NOT proof
                     // the account is gone — a transient blip (a dropped connection, a
@@ -520,18 +530,36 @@ impl Manager {
                             //    a one-line title call re-keys a 200k-token Opus
                             //    conversation onto a cold account.
                             //
-                            //  - OVER THE UTILIZATION THRESHOLD → SERVE THE PIN. That
-                            //    threshold is our own arithmetic over headers stale by
-                            //    minutes, and Anthropic keeps answering 200s for
-                            //    accounts it benches. Keeping the pin while still
-                            //    diverting the request — the earlier half-fix — bought
-                            //    nothing: the pin survived and the request paid the
-                            //    cold prefix anyway (measured live: a 44.4%
-                            //    account-switch rate on SUCCESSFUL serves, with zero
-                            //    pacing events and zero hard failures). This is the
-                            //    behaviour `select_revalidation`'s PIN-HONOR path
-                            //    already had, hoisted to where it is reachable; both
-                            //    log the identical line so they grep together.
+                            //  - OVER THE UTILIZATION THRESHOLD → SERVE THE PIN, UNLESS
+                            //    the session has also gone IDLE-COLD (no request in
+                            //    [`CACHE_WARM_HOLD_SECS`]), in which case there is
+                            //    nothing left to protect and we fall through to a
+                            //    durable re-key instead (see below). That threshold is
+                            //    our own arithmetic over headers stale by minutes, and
+                            //    Anthropic keeps answering 200s for accounts it
+                            //    benches. Keeping the pin while still diverting the
+                            //    request — the earlier half-fix — bought nothing: the
+                            //    pin survived and the request paid the cold prefix
+                            //    anyway (measured live: a 44.4% account-switch rate on
+                            //    SUCCESSFUL serves, with zero pacing events and zero
+                            //    hard failures). This is the behaviour
+                            //    `select_revalidation`'s PIN-HONOR path already had,
+                            //    hoisted to where it is reachable; both log the
+                            //    identical line so they grep together.
+                            //
+                            //    Measured 2026-09-11 (four retained log days): a
+                            //    morning burst of 23,745 requests in four hours ran on
+                            //    8 of 18 accounts because affinity pins held every
+                            //    session where it started; ten accounts sat idle while
+                            //    those eight drained, and the whole pool went empty for
+                            //    six hours (525 requests returned 429 to clients). A
+                            //    session idle long enough for its own prompt cache to
+                            //    be cold anyway has nothing to lose by moving — this is
+                            //    the one rule that would have spread that burst, and it
+                            //    needs no config flag: it fires only when the cache is
+                            //    already cold by the crate's own constant AND the
+                            //    account is over the soft threshold, so there is
+                            //    nothing to opt out of.
                             let account_alive = accounts.get(idx).is_some_and(|a| {
                                 Self::account_hard_ok(
                                     a,
@@ -580,23 +608,81 @@ impl Manager {
                                     .unwrap_or(0);
                                 None
                             } else {
-                                let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
-                                let util = accounts
-                                    .get(idx)
-                                    .map(|a| a.quota.max_utilization(now, is_fable))
-                                    .unwrap_or_default();
-                                if let Some(account) = accounts.get_mut(idx) {
-                                    account.last_selected_seq = tick;
+                                let idle_ms = now_ms - pin_touched_ms;
+                                // An eligible alternative must exist before we give up
+                                // this pin — otherwise falling through would turn a soft
+                                // threshold into a hard 429 the account itself never
+                                // produced. Same gate the normal pool pick applies (the
+                                // soft-inclusive `eligible`, no group narrowing), just
+                                // asked here first so a genuinely fleet-wide soft
+                                // threshold still gets a last-resort serve.
+                                let has_eligible_alternative =
+                                    accounts.iter().enumerate().any(|(cand, account)| {
+                                        cand != idx
+                                            && Self::eligible(
+                                                account,
+                                                self.global_threshold,
+                                                self.fable_weekly_threshold,
+                                                &self.pacing,
+                                                true,
+                                                now,
+                                                now_ms,
+                                                is_fable,
+                                                None,
+                                                group,
+                                                &reserved_groups,
+                                                &parked_groups,
+                                            )
+                                    });
+                                if idle_ms >= CACHE_WARM_HOLD_SECS * 1000
+                                    && has_eligible_alternative
+                                {
+                                    // Idle-cold, and there is somewhere better to go: the
+                                    // prompt cache is already dead by our own clock, so
+                                    // serving the pin protects nothing — fall through to
+                                    // the normal pick, which durably re-keys onto the
+                                    // least-loaded ELIGIBLE account (the same path a
+                                    // genuinely dead pin takes).
+                                    let util = accounts
+                                        .get(idx)
+                                        .map(|a| a.quota.max_utilization(now, is_fable))
+                                        .unwrap_or_default();
+                                    let name = accounts
+                                        .get(idx)
+                                        .map(|a| a.name.clone())
+                                        .unwrap_or_default();
                                     tracing::info!(
-                                        account = %account.name,
+                                        idle_s = idle_ms / 1000,
+                                        cache_warm_hold_secs = CACHE_WARM_HOLD_SECS,
+                                        account = %name,
                                         utilization = util,
                                         is_fable,
-                                        "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                                        "revalidation-rekey (idle-cold): session idle {}s >= {}s on over-threshold account {} utilization {}; re-keying",
+                                        idle_ms / 1000,
+                                        CACHE_WARM_HOLD_SECS,
+                                        name,
+                                        util
                                     );
+                                    None
+                                } else {
+                                    let tick = self.select_seq.fetch_add(1, Ordering::Relaxed);
+                                    let util = accounts
+                                        .get(idx)
+                                        .map(|a| a.quota.max_utilization(now, is_fable))
+                                        .unwrap_or_default();
+                                    if let Some(account) = accounts.get_mut(idx) {
+                                        account.last_selected_seq = tick;
+                                        tracing::info!(
+                                            account = %account.name,
+                                            utilization = util,
+                                            is_fable,
+                                            "revalidation-serve (pin-honor): serving session's pinned account over soft threshold to keep its cache warm"
+                                        );
+                                    }
+                                    // `target == idx`, so the commit section below is a
+                                    // plain pin refresh: OLD index, fresh `now_ms`.
+                                    Some((idx, None))
                                 }
-                                // `target == idx`, so the commit section below is a
-                                // plain pin refresh: OLD index, fresh `now_ms`.
-                                Some((idx, None))
                             }
                         } else {
                             // Default: honour the pin. With migration disabled (the
