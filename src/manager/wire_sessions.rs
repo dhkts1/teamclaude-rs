@@ -141,6 +141,19 @@ impl Manager {
                     calls: s.tools.calls,
                     errors: s.tools.errors,
                     timeouts: s.tools.timeouts,
+                    timeouts_by_class: s.tools.timeouts_by_class.clone(),
+                    timed_out: s
+                        .tools
+                        .timed_out
+                        .iter()
+                        .map(|t| tcr_status_wire::SlowToolRow {
+                            tool: t.tool.clone(),
+                            seconds: t.seconds,
+                            command_head: t.command_head.clone(),
+                            command_class: t.command_class.map(|c| c.as_str().to_string()),
+                            ended_ms: t.ended_ms,
+                        })
+                        .collect(),
                     over_one_minute: s.tools.over_one_minute,
                     subagents_running: s
                         .tools
@@ -249,6 +262,9 @@ impl Manager {
             summary.calls += row.tools.calls;
             summary.over_one_minute += row.tools.over_one_minute;
             summary.timeouts += row.tools.timeouts;
+            for (class, count) in &row.tools.timeouts_by_class {
+                *summary.timeouts_by_class.entry(class.clone()).or_insert(0) += count;
+            }
             summary.cost_usd += row.cost_usd;
             for bucket in &row.tools.by_tool {
                 let entry = by_tool.entry(bucket.tool.clone()).or_insert_with(|| {
@@ -505,6 +521,110 @@ mod tests {
         assert_eq!(
             snap.wire_sessions_summary.cost_usd, 15.0,
             "the fleet-wide summary sums the same per-session totals"
+        );
+    }
+
+    /// The wire row, and the fleet summary above it, carry the per-class timeout split and
+    /// the timed-out commands themselves — not just the headline count a panel could not
+    /// act on. Two sessions, so the summary is proved to SUM rather than to copy one row.
+    #[test]
+    fn timeouts_by_class_and_the_timed_out_commands_reach_the_wire() {
+        let manager = Manager::from_runtimes(vec![]);
+        let now = OffsetDateTime::now_utc();
+        let timed_out = |id: &str| ToolResultEvent {
+            id: id.to_string(),
+            is_error: true,
+            timed_out: true,
+        };
+        let bash = |id: &str, command: &str| {
+            crate::session_wire::tool_use_event_from_block(
+                id.to_string(),
+                Some("Bash".to_string()),
+                Some(&serde_json::json!({ "command": command })),
+            )
+        };
+
+        manager.record_wire_session(
+            Some("sess-one"),
+            None,
+            None,
+            now,
+            &[
+                bash("tu_wait", "until grep -q ready build.log; do sleep 5; done"),
+                bash("tu_push", "git push origin main"),
+            ],
+            &[],
+        );
+        let later = now + Duration::seconds(1);
+        manager.record_wire_session(
+            Some("sess-one"),
+            None,
+            None,
+            later,
+            &[],
+            &[timed_out("tu_wait")],
+        );
+        let later2 = now + Duration::seconds(2);
+        manager.record_wire_session(
+            Some("sess-one"),
+            None,
+            None,
+            later2,
+            &[],
+            &[timed_out("tu_push")],
+        );
+
+        // A second session times out on another `git push`, so the fleet's `git-net` count
+        // must read 2 while each session's own reads 1.
+        manager.record_wire_session(
+            Some("sess-two"),
+            None,
+            None,
+            now,
+            &[bash("tu_push2", "git push origin feature")],
+            &[],
+        );
+        manager.record_wire_session(
+            Some("sess-two"),
+            None,
+            None,
+            later,
+            &[],
+            &[timed_out("tu_push2")],
+        );
+
+        let snap = manager.snapshot(later2);
+        let one = snap
+            .wire_sessions
+            .iter()
+            .find(|r| r.session_id == "sess-one")
+            .expect("sess-one");
+        assert_eq!(one.tools.timeouts, 2);
+        assert_eq!(one.tools.timeouts_by_class.get("wait"), Some(&1));
+        assert_eq!(one.tools.timeouts_by_class.get("git-net"), Some(&1));
+        assert_eq!(one.tools.timed_out.len(), 2);
+        assert_eq!(
+            one.tools.timed_out[0].command_head.as_deref(),
+            Some("git push origin main"),
+            "newest first, with the command, not a bare tool name"
+        );
+        assert_eq!(
+            one.tools.timed_out[0].command_class.as_deref(),
+            Some("git-net")
+        );
+
+        let summary = &snap.wire_sessions_summary;
+        assert_eq!(summary.timeouts, 3);
+        assert_eq!(
+            summary.timeouts_by_class.get("git-net"),
+            Some(&2),
+            "the fleet sums both sessions' git-net timeouts"
+        );
+        assert_eq!(summary.timeouts_by_class.get("wait"), Some(&1));
+        assert_eq!(
+            summary.timeouts_by_class.values().sum::<u64>(),
+            summary.timeouts,
+            "the headline and the section read one number"
         );
     }
 

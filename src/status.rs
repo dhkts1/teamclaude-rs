@@ -537,7 +537,15 @@ mod tests {
                 tools: tcr_status_wire::SessionToolsRow {
                     calls: 2,
                     errors: 0,
-                    timeouts: 0,
+                    timeouts: 1,
+                    timeouts_by_class: [("git-net".to_string(), 1u64)].into_iter().collect(),
+                    timed_out: vec![tcr_status_wire::SlowToolRow {
+                        tool: "Bash".to_string(),
+                        seconds: 600.0,
+                        command_head: Some("git push origin main".to_string()),
+                        command_class: Some("git-net".to_string()),
+                        ended_ms: crate::now_ms(),
+                    }],
                     running: vec![tcr_status_wire::RunningToolRow {
                         tool: "Bash".to_string(),
                         started_ms: crate::now_ms() - 5_000,
@@ -567,7 +575,8 @@ mod tests {
             wire_sessions_summary: tcr_status_wire::SessionsSummary {
                 calls: 2,
                 over_one_minute: 0,
-                timeouts: 0,
+                timeouts: 1,
+                timeouts_by_class: [("git-net".to_string(), 1u64)].into_iter().collect(),
                 by_tool: vec![tcr_status_wire::ToolBucketRow {
                     tool: "Bash".to_string(),
                     calls: 2,
