@@ -146,12 +146,29 @@ impl Manager {
                         .tools
                         .running
                         .values()
-                        .filter(|r| r.tool == "Agent" || r.tool == "Task")
+                        .filter(|r| {
+                            (r.tool == "Agent" || r.tool == "Task")
+                                && !crate::session_wire::running_tool_is_lost(
+                                    &r.tool,
+                                    r.started_ms,
+                                    now_ms,
+                                )
+                        })
                         .count() as u64,
+                    // Belt and braces beside `WireSessionTracker::restore`'s own drop: an
+                    // entry too old to still be running is a LOST result, whatever put it
+                    // there — see `crate::session_wire::running_tool_is_lost`.
                     running: s
                         .tools
                         .running
                         .into_values()
+                        .filter(|r| {
+                            !crate::session_wire::running_tool_is_lost(
+                                &r.tool,
+                                r.started_ms,
+                                now_ms,
+                            )
+                        })
                         .map(|r| tcr_status_wire::RunningToolRow {
                             tool: r.tool,
                             started_ms: r.started_ms,
@@ -305,6 +322,8 @@ impl Manager {
 
 #[cfg(test)]
 mod tests {
+    use time::Duration;
+
     use super::*;
 
     /// `WireSessionTracker` itself is unit-tested in `session_wire.rs` with canned bodies;
@@ -380,6 +399,52 @@ mod tests {
         assert_eq!(
             row.tools.subagents_running, 2,
             "only the Agent and Task entries count, not the Bash call"
+        );
+    }
+
+    /// Belt and braces beside `WireSessionTracker::restore`'s drop: a `Bash` entry older than
+    /// the tool's own timeout plus its grace is not a running call, it is a lost result, and
+    /// the projection drops it however it got there. `Agent`/`Task` have no such deadline and
+    /// stay — they are the calls that legitimately run for an hour.
+    #[test]
+    fn a_bash_entry_past_its_timeout_is_not_projected_as_running() {
+        let manager = Manager::from_runtimes(vec![]);
+        let started = OffsetDateTime::now_utc();
+        let uses = vec![
+            ToolUseEvent {
+                id: "tu_bash".to_string(),
+                name: Some("Bash".to_string()),
+                command_head: Some("cargo test --release".to_string()),
+                command_class: None,
+            },
+            ToolUseEvent {
+                id: "tu_agent".to_string(),
+                name: Some("Agent".to_string()),
+                command_head: Some("reviewer: check the wire fixtures".to_string()),
+                command_class: None,
+            },
+        ];
+        manager.record_wire_session(Some("sess-lost"), None, None, started, &uses, &[]);
+
+        let grace_ms = crate::session_wire::RUNNING_BASH_LOST_MS;
+        let inside = manager.snapshot(started + Duration::milliseconds(grace_ms));
+        assert_eq!(
+            inside.wire_sessions[0].tools.running.len(),
+            2,
+            "at the line both are still running"
+        );
+
+        let past = manager.snapshot(started + Duration::milliseconds(grace_ms + 1_000));
+        let row = &past.wire_sessions[0];
+        assert_eq!(
+            row.tools.running.len(),
+            1,
+            "the Bash entry is dropped, the Agent stays"
+        );
+        assert_eq!(row.tools.running[0].tool, "Agent");
+        assert_eq!(
+            row.tools.subagents_running, 1,
+            "the count and the list agree about what is running"
         );
     }
 

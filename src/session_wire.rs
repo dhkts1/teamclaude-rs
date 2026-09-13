@@ -182,11 +182,17 @@ fn strip_wrappers(mut s: &str) -> &str {
     s
 }
 
-/// Reduce `cd <dir> && <clause>` (or `cd <dir>; <clause>`) to just `<clause>`, ONLY when
-/// `<clause>` itself contains no further `;`, `&` or `|` — the hook's own measurement: 18%
-/// of its "compound" rows were exactly this shape, a free `cd` in front of the real work.
-/// `None` when `s` does not start with a standalone `cd`, has no such separator, or the
-/// remainder is still a genuine compound.
+/// Reduce `cd <dir> && <clause>` (or `cd <dir>; <clause>`) to just `<clause>` — the hook's
+/// own measurement: 18% of its "compound" rows were exactly this shape, a free `cd` in front
+/// of the real work.
+///
+/// The reduction runs whatever `<clause>` turns out to be, compound or not. It used to bail
+/// when the remainder still held a `;`, `&` or `|`, and that bail is what put a path where a
+/// verb belongs on the live panel (2026-09-13: three RUNNING NOW rows reading
+/// `cd ~/src/example/st…`, every one of them a pipeline whose `cd` therefore survived). A `cd` prefix is never the interesting half of a row; [`classify_command`]
+/// still reads `Compound` off the remainder, so the class is unchanged by dropping it.
+///
+/// `None` when `s` does not start with a standalone `cd`, or has no such separator.
 fn reduce_cd_prefix(s: &str) -> Option<String> {
     let after_cd = s.strip_prefix("cd")?;
     if !after_cd.starts_with(char::is_whitespace) {
@@ -202,7 +208,7 @@ fn reduce_cd_prefix(s: &str) -> Option<String> {
         .strip_prefix("&&")
         .or_else(|| after_dir.strip_prefix(';'))?;
     let clause = after_sep.trim();
-    if clause.is_empty() || clause.contains([';', '&', '|']) {
+    if clause.is_empty() {
         return None;
     }
     Some(clause.to_string())
@@ -699,6 +705,40 @@ pub const SLOWEST_CAP: usize = 10;
 /// A session unseen for this long is evicted — see the bridge ("an hour").
 pub const SESSION_TTL_MS: i64 = 60 * 60 * 1000;
 
+/// How long a `Bash` entry may sit in `running` before the panel calls it LOST rather than
+/// running: the Bash tool's own 600 s timeout plus a 60 s grace for the round trip that
+/// carries the `tool_result` back to the proxy.
+///
+/// Past that line the call cannot still be running — the client killed it at the timeout —
+/// so an entry still here is one whose `tool_result` never reached this process (a request
+/// served by a previous proxy, or a client that never sent the closing turn). Showing it as
+/// running is the ghost Gil saw on 2026-09-13: two `Bash · 0s to timeout` rows at 17 minutes,
+/// with a red ring, that nothing would ever close.
+pub const RUNNING_BASH_LOST_MS: i64 = (600 + 60) * 1000;
+
+/// The same line for every tool the Bash timeout does not govern — `Agent`, `Task`,
+/// `TaskOutput` and the file tools have no known deadline, so this is a liveness backstop
+/// rather than a deduction: six hours is longer than any real subagent this fleet has run
+/// and shorter than a stale entry's useful life. Anything still `running` past it is a lost
+/// result, not work in flight.
+pub const RUNNING_UNBOUNDED_LOST_MS: i64 = 6 * 60 * 60 * 1000;
+
+/// Is this `running` entry a call still in flight, or a result that was lost?
+///
+/// See [`RUNNING_BASH_LOST_MS`] and [`RUNNING_UNBOUNDED_LOST_MS`]. Read at PROJECTION time
+/// (`crate::manager::wire_sessions::wire_sessions_snapshot`) rather than folded into the
+/// table, so a `tool_result` that does arrive late still closes its entry and lands in
+/// `slowest` with a real duration.
+pub fn running_tool_is_lost(tool: &str, started_ms: i64, now_ms: i64) -> bool {
+    let age_ms = now_ms.saturating_sub(started_ms);
+    let limit = if tool == "Bash" {
+        RUNNING_BASH_LOST_MS
+    } else {
+        RUNNING_UNBOUNDED_LOST_MS
+    };
+    age_ms > limit
+}
+
 /// The bounded, in-memory table `tcr status --json`'s `sessions` array is read from. No I/O; a
 /// caller (`Manager`) is responsible for locking.
 #[derive(Debug, Default)]
@@ -928,8 +968,17 @@ impl WireSessionTracker {
     /// between boot and this call is fresher than anything on disk, same rule
     /// `Manager::restore_affinity` follows for pins — so this is meant to run once, at
     /// boot, before the listener binds.
+    ///
+    /// Every restored session's `tools.running` is DROPPED. A running list cannot be
+    /// restored truthfully: the `tool_result` that closes one of these entries was addressed
+    /// to the process that died, so nothing this process ever sees will close it, and the
+    /// panel would draw it as a live call forever (measured 2026-09-13: two `Bash` rows at 17
+    /// minutes against a 600 s timeout, restored across a restart). Counts, `slowest` and the
+    /// per-tool buckets are all facts about calls that already FINISHED, so they restore
+    /// unchanged.
     pub fn restore(&mut self, sessions: std::collections::HashMap<String, WireSession>) {
-        for (session_id, session) in sessions {
+        for (session_id, mut session) in sessions {
+            session.tools.running.clear();
             self.sessions.entry(session_id).or_insert(session);
         }
     }
@@ -968,18 +1017,50 @@ mod tests {
         assert_eq!(class, CommandClass::Build);
     }
 
-    /// A genuine compound — `cd` reduction only fires when the clause after `&&`/`;` is
-    /// itself simple, so a SECOND `&&` (or `;`, or `|`) anywhere in it must leave the whole
-    /// thing untouched and classified as `compound`.
+    /// A genuine compound loses its `cd` too, and stays `compound`.
+    ///
+    /// This assertion used to read the other way — the reduction bailed when the remainder
+    /// held another `;`, `&` or `|`, so the whole string including the `cd` was the head.
+    /// That is exactly what put `cd ~/src/example/st…` on three RUNNING NOW rows
+    /// (2026-09-13): a path where the row's one line should carry a verb. The class is read
+    /// off the remainder and is unchanged by the drop, which is why dropping it is safe.
     #[test]
-    fn a_genuine_compound_is_not_reduced() {
-        let raw = "cd ~/src/example && cargo build && cargo test";
-        let (head, class) = normalize_bash_command(raw);
-        assert_eq!(
-            head, raw,
-            "no reduction — the clause after && is itself compound"
-        );
+    fn a_genuine_compound_loses_its_cd_and_stays_compound() {
+        let (head, class) = normalize_bash_command("cd ~/src/example && cargo build && cargo test");
+        assert_eq!(head, "cargo build && cargo test");
         assert_eq!(class, CommandClass::Compound);
+    }
+
+    /// The live shape from finding 3: a `cd` in front of a PIPELINE. The row must say what
+    /// the pipeline starts with, not which directory it ran in.
+    #[test]
+    fn a_cd_in_front_of_a_pipeline_is_reduced() {
+        let (head, class) = normalize_bash_command("cd ~/src/example && rg -n TODO | head -20");
+        assert_eq!(head, "rg -n TODO | head -20");
+        assert_eq!(class, CommandClass::Compound);
+    }
+
+    /// `;` as the separator, with a compound remainder — the same rule as `&&`.
+    #[test]
+    fn a_cd_with_a_semicolon_separator_is_reduced() {
+        let (head, _) = normalize_bash_command("cd ~/src/example; cargo build; cargo test");
+        assert_eq!(head, "cargo build; cargo test");
+    }
+
+    /// A bare `cd X` has no clause to reduce TO, so it is left alone — dropping it would
+    /// leave the row with an empty head.
+    #[test]
+    fn a_bare_cd_is_left_alone() {
+        let (head, _) = normalize_bash_command("cd ~/src/example");
+        assert_eq!(head, "cd ~/src/example");
+    }
+
+    /// `cd` is matched as a whole word: `cdx` is somebody's own command, not a directory
+    /// change, and its first token is what the class is read off.
+    #[test]
+    fn a_command_merely_starting_with_cd_is_left_alone() {
+        let (head, _) = normalize_bash_command("cdx ~/src/example && cargo build");
+        assert_eq!(head, "cdx ~/src/example && cargo build");
     }
 
     /// A multi-line script collapses to one line (`⏎` between lines) for display, and is
@@ -1483,6 +1564,90 @@ mod tests {
             tracker.snapshot(SESSION_TTL_MS + 1).len(),
             0,
             "one ms past the TTL it is gone"
+        );
+    }
+
+    /// A restored session comes back with its finished-call facts and an EMPTY running list.
+    ///
+    /// The ghost this pins (2026-09-13): the `tool_result` that would close a running entry
+    /// was addressed to the process that died, so a restored entry never closes and the panel
+    /// draws it as live forever. Counts and `slowest` describe calls that already finished,
+    /// so they survive the restart untouched.
+    #[test]
+    fn restore_drops_running_and_keeps_the_finished_facts() {
+        let mut source = WireSessionTracker::new();
+        source.record_request("sess-ghost", None, None, 1_000, &[], &[]);
+        let uses = vec![
+            ToolUseEvent {
+                id: "tu_done".into(),
+                name: Some("Bash".into()),
+                command_head: Some("cargo test --release".into()),
+                command_class: None,
+            },
+            ToolUseEvent {
+                id: "tu_ghost".into(),
+                name: Some("Bash".into()),
+                command_head: Some("sleep 900".into()),
+                command_class: None,
+            },
+        ];
+        source.record_response_tool_uses("sess-ghost", 2_000, &uses);
+        source.record_request(
+            "sess-ghost",
+            None,
+            None,
+            5_000,
+            &[],
+            &[ToolResultEvent {
+                id: "tu_done".into(),
+                is_error: false,
+                timed_out: false,
+            }],
+        );
+        let saved: std::collections::HashMap<String, WireSession> =
+            source.snapshot(5_000).into_iter().collect();
+        assert_eq!(
+            saved["sess-ghost"].tools.running.len(),
+            1,
+            "the source table still holds the unclosed entry"
+        );
+
+        let mut restored = WireSessionTracker::new();
+        restored.restore(saved);
+        let snap = restored.snapshot(5_000);
+        let (_, session) = &snap[0];
+        assert!(
+            session.tools.running.is_empty(),
+            "no restored entry may be shown as running"
+        );
+        assert_eq!(session.tools.calls, 1, "the finished call survives");
+        assert_eq!(session.tools.slowest.len(), 1);
+        assert_eq!(session.requests, 2);
+    }
+
+    /// A running entry too old to still be running is a LOST result — the projection's own
+    /// check, at both limits and on both sides of each.
+    #[test]
+    fn a_running_entry_past_its_limit_reads_as_lost() {
+        assert!(
+            !running_tool_is_lost("Bash", 0, RUNNING_BASH_LOST_MS),
+            "exactly at the timeout-plus-grace line it may still be running"
+        );
+        assert!(
+            running_tool_is_lost("Bash", 0, RUNNING_BASH_LOST_MS + 1),
+            "one ms past it, the result was lost"
+        );
+        assert!(
+            !running_tool_is_lost("Agent", 0, RUNNING_BASH_LOST_MS + 1),
+            "a subagent has no Bash timeout — it may legitimately run for hours"
+        );
+        assert!(
+            !running_tool_is_lost("Agent", 0, RUNNING_UNBOUNDED_LOST_MS),
+            "exactly at the backstop it is still live"
+        );
+        assert!(
+            running_tool_is_lost("TaskOutput", 0, RUNNING_UNBOUNDED_LOST_MS + 1),
+            "one ms past the backstop, any tool is lost"
         );
     }
 
