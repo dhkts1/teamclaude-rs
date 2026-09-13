@@ -3,8 +3,9 @@
 //!
 //! A normal bounce closes the listener and the successor binds a fresh one.
 //! Between those two moments nothing is listening and every new connection is
-//! refused. Measured 2026-09-13 that window was about a second per restart; see
-//! `docs/design/zero-downtime-restart.md` for the numbers and the wider design.
+//! refused. Measured 2026-09-13 across three restarts, that window was 1.124s,
+//! 0.976s and 1.020s: the gap between the incumbent logging that it has stopped
+//! accepting and the successor logging that it has bound.
 //!
 //! Passing the *same* socket closes the window entirely rather than shrinking
 //! it. The successor receives a duplicate of the predecessor's listening file
