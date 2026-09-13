@@ -71,6 +71,56 @@ final class QuotaTailWidthTests: XCTestCase {
                 + "this column.")
     }
 
+    /// Every shape ``QuotaFormat/resetCaption(resetAtMs:now:)`` can print.
+    /// Round 1's motivating example for this column, `"in 4d 12h"`
+    /// (`duration(minutes:)`'s day tier), is NOT the widest one: the hour
+    /// tier lives entirely under a day and can carry a two-digit hour AND a
+    /// two-digit minute at once, `"in 23h 59m"`, which measures wider. Both
+    /// tiers are reachable from EITHER window — the format is a function of
+    /// minutes remaining, not which window sent them, so a 7d row can show
+    /// the hour-tier shape too, once under a day is left on it.
+    private let resetCaptionStrings = [
+        "in 4d 12h",
+        "in 6d 23h",
+        "in 9d 23h",  // the days digit does not change the width measured here
+        "in 23h 59m",  // the actual widest: two two-digit numbers, hour tier
+        "in 1h 0m",
+    ]
+
+    func testEveryResetCaptionFitsItsOwnFixedColumn() throws {
+        let width = try token("resetCaptionWidth")
+        let size = try muteSize()
+        for string in resetCaptionStrings {
+            let drawn = (string as NSString)
+                .size(withAttributes: [.font: NSFont.systemFont(ofSize: size)]).width
+            XCTAssertLessThanOrEqual(
+                drawn, width,
+                "\"\(string)\" needs \(String(format: "%.1f", drawn)) pt and the column is "
+                    + "\(width) pt, so it draws elided. Widen V4.resetCaptionWidth to fit it.")
+        }
+    }
+
+    /// This column is reserved on EVERY row now, whether or not that row has
+    /// a live caption (Gil, 2026-09-13: "not aligned nicely" — an auto-width
+    /// column here is what made alike bars draw at different lengths
+    /// depending on which row happened to carry the longer reset string).
+    /// Pinned at the source because a rendered pair of bars cannot tell "this
+    /// column is reserved unconditionally" from "it happened to be reserved
+    /// on every fixture this suite tried".
+    func testTheCaptionColumnIsReservedWhetherOrNotThereIsALiveCaption() throws {
+        let source = try panelSource("PanelV4/QuotaRow.swift")
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        XCTAssertTrue(
+            squashed.contains(
+                "Text(QuotaFormat.resetCaption(resetAtMs:resetAtMs,now:now)??\"\")"),
+            "the caption is conditionally drawn again (`if let caption = …`), so a row with "
+                + "no live reset no longer reserves the column and its bar draws a different "
+                + "length from its sibling's")
+        XCTAssertTrue(
+            squashed.contains(".frame(width:V4.resetCaptionWidth,alignment:.trailing)"),
+            "the caption no longer has a fixed, right-aligned column")
+    }
+
     /// The card draws TWO bar rows and no more. The model-scoped weekly
     /// window is a STRING in the second row's own trailing column
     /// (``AccountCard/rowTail(_:)``), which is where the pre-v4 card drew it

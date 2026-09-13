@@ -128,6 +128,29 @@ enum V4 {
     static let quotaPercentWidth: CGFloat = 40
     static let quotaGap: CGFloat = 8
 
+    /// The reset caption's own column — FIXED, and reserved on every
+    /// `QuotaRow` whether or not that row draws a caption at all (Gil,
+    /// 2026-09-13: "not aligned nicely" — the caption used to be
+    /// `.fixedSize()`, an auto-width column, so the bar beside it was
+    /// whatever was left over: 66pt on alice's 5h row (`"in 2h 10m"`) against
+    /// 94.5pt on her 7d row (`"in 3d"`), and a row with no live caption at
+    /// all got the whole remainder. One bar length per card, and one across
+    /// every card, needs one column width regardless of content.
+    ///
+    /// Sized by MEASURING every shape ``QuotaFormat/resetCaption(resetAtMs:now:)``
+    /// can print, at Comfortable's 12 pt, the same way ``usageTailWidth`` was:
+    /// the day tier never carries minutes (`"6d 23h"`, `"9d 23h"` — the days
+    /// digit does not change the width because `duration(minutes:)` never
+    /// prints more of it than fits one digit's row here), so the WIDEST shape
+    /// is actually the hour tier's own ceiling, `"in 23h 59m"` at 64.0pt —
+    /// wider than the day-tier example that motivated this column
+    /// (`"in 4d 12h"`, 51.7pt), because a two-digit hour AND a two-digit
+    /// minute both fit under the "under a day" branch. Reachable for a 7d
+    /// window too: the format is a function of MINUTES REMAINING, not which
+    /// window sent them, so a 7d window with under a day left prints the same
+    /// hour-tier shape a 5h window does.
+    static let resetCaptionWidth: CGFloat = 66
+
     /// The width every quota row reserves for the account's cost figure, on
     /// a card that carries one.
     ///

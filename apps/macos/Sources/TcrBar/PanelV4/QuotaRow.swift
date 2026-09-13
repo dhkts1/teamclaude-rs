@@ -158,12 +158,16 @@ struct QuotaRow: View {
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.dim)
                 .frame(width: V4.quotaPercentWidth, alignment: .trailing)
-            if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: now) {
-                Text(caption)
-                    .font(V4.font(V4.muteSize))
-                    .foregroundStyle(captionTint)
-                    .fixedSize()
-            }
+            // FIXED width, reserved on EVERY row whether or not this one has
+            // a live caption — an auto-width column here is what made alike
+            // bars draw at different lengths depending on which row happened
+            // to carry the longer reset string (Gil, 2026-09-13: "not
+            // aligned nicely").
+            Text(QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: now) ?? "")
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(captionTint)
+                .lineLimit(1)
+                .frame(width: V4.resetCaptionWidth, alignment: .trailing)
             if trailingReserved {
                 // `.q .tail{border-left:1px solid var(--line)}` — one aligned
                 // divider on every row that reserves the column, never a
