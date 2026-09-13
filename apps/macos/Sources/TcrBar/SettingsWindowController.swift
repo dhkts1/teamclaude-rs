@@ -62,7 +62,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         window.delegate = self
         window.contentViewController = NSHostingController(
-            rootView: SettingsRootView(dependencies: dependencies))
+            rootView: SettingsRootView(dependencies: dependencies, navigation: .shared))
     }
 
     /// - Parameter tab: jump straight to a pane — the gear's per-tab menu

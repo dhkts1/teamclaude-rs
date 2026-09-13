@@ -53,15 +53,18 @@ final class SettingsNavigation: ObservableObject {
 struct SettingsRootView: View {
     let dependencies: SettingsDependencies
 
-    /// Defaults to the shared singleton for real use
-    /// (`SettingsWindowController`); the render harness passes a fresh
-    /// instance per capture — see ``SettingsNavigation``'s own doc-comment.
+    /// Always passed in, never defaulted: ``SettingsWindowController`` hands over
+    /// the shared singleton, the render harness a fresh instance per capture — see
+    /// ``SettingsNavigation``'s own doc-comment. A `= .shared` default argument
+    /// reads a main-actor singleton from a nonisolated context, which is an error
+    /// in the Swift 6 language mode; naming it at the call site costs one word and
+    /// shows which callers reach for the singleton.
     @ObservedObject private var navigation: SettingsNavigation
     @State private var navigationHistory: [SettingsTab] = [.general]
     @State private var historyIndex = 0
     @State private var isHistoryNavigation = false
 
-    init(dependencies: SettingsDependencies, navigation: SettingsNavigation = .shared) {
+    init(dependencies: SettingsDependencies, navigation: SettingsNavigation) {
         self.dependencies = dependencies
         self.navigation = navigation
     }
