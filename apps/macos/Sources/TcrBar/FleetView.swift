@@ -2252,8 +2252,16 @@ struct FleetView: View {
     /// account: the mockup's own button ("Show 7 more sessions") counts across
     /// accounts, and a per-account switch would leave a reader clicking five
     /// buttons to answer one question.
-    @State private var sessionsExpanded: Bool = UserDefaults.standard.bool(
-        forKey: FleetView.sessionsExpandedKey)
+    ///
+    /// Default ON, and `UserDefaults.bool` alone cannot express that: it
+    /// returns `false` for a key nobody has written, which is the same answer
+    /// as a reader who collapsed the list on purpose. So the default reads the
+    /// OBJECT first. Gil, 2026-09-13, with eleven live sessions and five rows
+    /// drawn: "why i still dont see all my tools and sessions and all?" A cap
+    /// that hides six of eleven by default answers a question nobody asked;
+    /// the button stays, for the reader who wants the short list.
+    @State private var sessionsExpanded: Bool =
+        UserDefaults.standard.object(forKey: FleetView.sessionsExpandedKey) as? Bool ?? true
 
     static let sessionsExpandedKey = "sessionsListExpanded"
 
