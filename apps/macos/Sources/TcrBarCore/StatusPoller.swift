@@ -58,18 +58,33 @@ public enum PollState: Equatable {
         }
     }
 
-    /// The `ready/enabled` label drawn beside the gauge glyph, e.g. `"9/13"`.
+    /// The `ready/enabled` label, e.g. `"9/13"` — opt-in, drawn only when the
+    /// counts preference is on; the cup's fill level (``capacityFraction``)
+    /// carries the same fact on the glyph itself by default.
     ///
     /// `nil` for anything but a healthy read of a fleet with at least one
-    /// enabled account: the glyph alone already carries "pending", "tool
-    /// missing" and "poll failed" (``MenuBarShell/gaugeSymbol(for:)``), and an
-    /// all-disabled fleet has no numerator/denominator worth showing — `0/0`
-    /// would read as a fault, not a fact, the same reasoning
+    /// enabled account: the cup's colour and fill already carry "pending",
+    /// "tool missing" and "poll failed" (``MenuBarShell/cupTint(for:awake:)``),
+    /// and an all-disabled fleet has no numerator/denominator worth showing —
+    /// `0/0` would read as a fault, not a fact, the same reasoning
     /// ``Fleet/countsSentence`` gives for returning `nil` in the identical
     /// case.
     public var countsLabel: String? {
         guard case .loaded(let fleet) = self, !fleet.enabledAccounts.isEmpty else { return nil }
         return "\(fleet.readyCount)/\(fleet.enabledCount)"
+    }
+
+    /// The cup's fill level: `readyCount / enabledCount`, `0...1`.
+    ///
+    /// `nil` when there is nothing to divide by — a poll that has not loaded a
+    /// fleet yet, a read failure, or a fleet with no enabled accounts — the
+    /// same condition ``countsLabel`` already treats as "nothing to show", so
+    /// the two never disagree about which fleets have a real ratio. The mark
+    /// draws `nil` as an empty cup (`MenuBarMark.image(fraction:tint:)`), never
+    /// a `0` a reader could mistake for a measured "all spent".
+    public var capacityFraction: Double? {
+        guard case .loaded(let fleet) = self, fleet.enabledCount > 0 else { return nil }
+        return Double(fleet.readyCount) / Double(fleet.enabledCount)
     }
 
     /// The menu-bar tooltip's own line: ``Fleet/countsSentence`` when there is
@@ -114,6 +129,50 @@ public enum PollState: Equatable {
     public var countIsNearCapacity: Bool {
         guard case .loaded(let fleet) = self else { return false }
         return fleet.capacityGlyphState == .near
+    }
+
+    /// Which colour REGIME the one coffee-cup glyph is in — the part of
+    /// ``MenuBarMark/Tint`` that does not need an actual `NSColor` to decide,
+    /// so it can live (and be tested) here in `TcrBarCore` rather than in
+    /// `MenuBarShell`, which the test target does not link (see
+    /// `RunningToolsMarkTests`'s own doc-comment on that boundary). The
+    /// caller (`MenuBarShell.cupTint(for:awake:)`) turns this into a real
+    /// ``MenuBarMark/Tint`` by attaching `Tok`'s colours.
+    ///
+    /// Precedence, highest first:
+    ///
+    ///  1. A read failure (`toolMissing`, `commandFailed`, `undecodable`) is
+    ///     `.failed` — there is no fleet to ask about capacity or keep-awake
+    ///     at all, so this outranks everything else.
+    ///  2. `Fleet.capacityGlyphState == .near` is `.near` — fleet *capacity*,
+    ///     not the worst account: in a rotating pool spent accounts are the
+    ///     mechanism working, so a worst-wins colour would sit at its most
+    ///     alarming setting whenever any one of thirteen accounts was spent,
+    ///     which is nearly always. Reuses the identical predicate
+    ///     ``countIsNearCapacity`` does, so the two can never disagree about
+    ///     which state they are both describing.
+    ///  3. Otherwise: `.awake` while keep-awake holds the Mac up, else
+    ///     `.template` — the plain, system-tinted cup.
+    ///
+    /// `.pending` and an all-disabled fleet both fall through to step 3:
+    /// neither is a failure, so the cup stays whatever keep-awake says while
+    /// its fill level (``capacityFraction``) draws empty.
+    public enum CupTintKind: Equatable {
+        case template
+        case awake
+        case near
+        case failed
+    }
+
+    public func capacityTintKind(awake: Bool) -> CupTintKind {
+        switch self {
+        case .toolMissing, .commandFailed, .undecodable:
+            return .failed
+        case .loaded(let fleet) where fleet.capacityGlyphState == .near:
+            return .near
+        case .pending, .loaded:
+            return awake ? .awake : .template
+        }
     }
 }
 

@@ -1,6 +1,19 @@
 import AppKit
 
-/// The tinted mark that sits beside the capacity gauge while keep-awake is on.
+/// The cup symbol name and its VoiceOver string — the two facts about
+/// keep-awake's mark that outlive the mark itself.
+///
+/// ## History: this used to compose the whole glyph
+///
+/// Before the coffee-mark rework there were two glyphs side by side — a
+/// capacity gauge, and this file's tinted cup beside it while keep-awake was
+/// on — and `image(tint:)` below built the second one. ``MenuBarMark`` now
+/// draws ONE cup, whose fill level carries capacity and whose colour carries
+/// keep-awake/near/failed, composing `symbolName` and its filled variant
+/// itself rather than calling through to this type. `image(tint:)` stays,
+/// still covered by its own tests, as the standalone builder for any caller
+/// that wants a plain tinted cup without a fill level or a menu-bar canvas —
+/// it is no longer on the path that draws the status item.
 ///
 /// ## Why an `NSImage` and not `Image(systemName:).foregroundStyle(…)`
 ///
@@ -13,28 +26,9 @@ import AppKit
 ///
 /// Handing the result to SwiftUI was not enough, and that is measured: a
 /// `MenuBarExtra` flattens its label to monochrome whatever the image says, for
-/// every construction that was tried. ``MenuBarMark`` carries the table and is
-/// what composes this cup into the image the app now sets on the status button
-/// itself. It calls this function from inside its drawing handler, so a dynamic
-/// `tint` resolves against the appearance current at draw time.
-///
-/// ## What is measured, and what is not
-///
-/// `KeepAwakeGlyphTests` rasterises what this function returns and asserts that
-/// `isTemplate == false` and that a pixel inside the glyph really carries the
-/// tint. `MenuBarMarkTests` asserts the same of the composed image, with the OFF
-/// mark as its negative control. `TcrBar --shell-probe` goes one step further: it
-/// rasterises the real `NSStatusBarButton` and counts cyan pixels there, with
-/// the OFF state as a negative control.
-///
-/// Neither reaches the window server's final composite of the menu bar —
-/// reading that back needs `screencapture`, which needs Screen Recording, which
-/// is not granted on the machine this was written on. That last step is a human
-/// looking at their own menu bar.
-///
-/// Which is the reason colour is the *second* channel and not the only one —
-/// see ``MenuBarMark``. If the tint is lost, a glyph that is present or absent
-/// still says whether the mode is on.
+/// every construction that was tried — the six-row table now lives in
+/// ``MenuBarMark``, the type that composes the mark this app sets on the
+/// status button itself.
 ///
 /// ## Why it lives in `TcrBarCore`
 ///
@@ -43,9 +37,8 @@ import AppKit
 /// The tint is a parameter for the matching reason: `Tok` stays the one place a
 /// colour is written down, and this file stays out of the view layer.
 public enum KeepAwakeGlyph {
-    /// A cup. The one mark for "caffeinated" that needs no legend, and it is
-    /// nothing like a gauge — the two are told apart by silhouette before
-    /// colour is involved at all.
+    /// A cup. The one mark for "caffeinated" that needs no legend, and now
+    /// the whole menu-bar mark, not a second glyph beside a gauge.
     public static let symbolName = "cup.and.saucer.fill"
 
     /// What VoiceOver says. The menu bar is the one surface with no room for a
