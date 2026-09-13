@@ -112,15 +112,29 @@ enum RenderSettings {
     private static func render(
         _ tab: SettingsTab, appearance: Appearance, into directory: URL
     ) -> Bool {
-        let previous = NSAppearance.current
-        NSAppearance.current = appearance.nsAppearance
+        // Two appearances, two mechanisms: `NSApp.appearance` is what the window
+        // and its title bar adopt, and the DRAWING appearance is what every
+        // dynamic `NSColor` in the view tree resolves against.
         let previousAppAppearance = NSApp.appearance
         NSApp.appearance = appearance.nsAppearance
-        defer {
-            NSAppearance.current = previous
-            NSApp.appearance = previousAppAppearance
-        }
+        defer { NSApp.appearance = previousAppAppearance }
 
+        return withDrawingAppearance(appearance.nsAppearance) {
+            renderUnderCurrentAppearance(tab, appearance: appearance, into: directory)
+        }
+    }
+
+    /// The body of ``render(_:appearance:into:)``, run with the drawing
+    /// appearance already installed.
+    ///
+    /// A separate function only because the macOS 12 replacement for assigning
+    /// `NSAppearance.current` takes a block (``withDrawingAppearance(_:perform:)``):
+    /// wrapping the body in a closure would have re-indented the whole function
+    /// to change nothing.
+    @MainActor
+    private static func renderUnderCurrentAppearance(
+        _ tab: SettingsTab, appearance: Appearance, into directory: URL
+    ) -> Bool {
         let fleet = Fleet(accounts: fixtureAccounts())
         let dependencies = SettingsDependencies(
             poller: StatusPoller(pinnedState: .loaded(fleet), lastPollAt: Date()),
