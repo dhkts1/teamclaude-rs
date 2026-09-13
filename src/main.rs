@@ -1461,11 +1461,7 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
             } => ShutdownTrigger::Sigterm,
             () = handle.serving_stopped() => ShutdownTrigger::ServingStopped,
         };
-        match trigger {
-            ShutdownTrigger::CtrlC => tracing::info!("shutdown signal received"),
-            ShutdownTrigger::Sigterm => tracing::info!("SIGTERM received; shutting down"),
-            ShutdownTrigger::ServingStopped => {}
-        }
+        tracing::info!("{}", trigger.shutdown_line());
     } else {
         // The TUI owns the foreground. Under raw mode Ctrl-C arrives as a keystroke,
         // so the loop (not a signal) handles it. But an EXTERNAL SIGTERM — e.g. the
@@ -1536,6 +1532,29 @@ enum ShutdownTrigger {
     CtrlC,
     Sigterm,
     ServingStopped,
+}
+
+impl ShutdownTrigger {
+    /// The line this trigger logs on the way out. Every variant returns one.
+    ///
+    /// `ServingStopped` used to return nothing: its match arm was `=> {}`, and
+    /// the only thing after the match is a `warn!` that fires solely when tasks
+    /// had to be aborted. So a shutdown down that path left the durable log
+    /// unable to say the process had stopped, let alone why. This repo counts
+    /// boots with `rg 'server started' ~/.cache/teamclaude/logs/*` precisely
+    /// because a restart is the most expensive event in the system; a stop with
+    /// no matching line makes that count unreadable.
+    ///
+    /// Returned rather than logged inline so every variant is forced to have
+    /// one by the type system, and so `every_shutdown_trigger_logs_a_line` can
+    /// check them without a running server.
+    fn shutdown_line(self) -> &'static str {
+        match self {
+            Self::CtrlC => "shutdown signal received",
+            Self::Sigterm => "SIGTERM received; shutting down",
+            Self::ServingStopped => "serving stopped on its own; shutting down",
+        }
+    }
 }
 
 /// How to recover from a WEDGED incumbent — the half of the not-answering warning
@@ -2822,5 +2841,45 @@ mod tests {
             "the refusal must say why: {err}"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Every shutdown trigger must log a distinct, non-empty line.
+    ///
+    /// `ServingStopped` previously logged NOTHING: its arm was `=> {}` and the
+    /// only statement after the match warns solely when tasks were aborted. A
+    /// process that stopped down that path left no trace of having stopped.
+    ///
+    /// Distinctness matters as much as presence. `tests/headless_sigterm.rs`
+    /// asserts on the SIGTERM text specifically, so two triggers sharing a line
+    /// would make that assertion pass for the wrong trigger, which is a green
+    /// test for a broken reason.
+    #[test]
+    fn every_shutdown_trigger_logs_a_line() {
+        let triggers = [
+            ShutdownTrigger::CtrlC,
+            ShutdownTrigger::Sigterm,
+            ShutdownTrigger::ServingStopped,
+        ];
+        let mut seen: Vec<&str> = Vec::new();
+        for trigger in triggers {
+            let line = trigger.shutdown_line();
+            assert!(
+                !line.trim().is_empty(),
+                "{trigger:?} logs nothing on the way out"
+            );
+            assert!(
+                !seen.contains(&line),
+                "{trigger:?} shares its line with another trigger ({line:?}); \
+                 the SIGTERM assertion in tests/headless_sigterm.rs would then \
+                 pass for the wrong reason"
+            );
+            seen.push(line);
+        }
+        assert_eq!(
+            ShutdownTrigger::Sigterm.shutdown_line(),
+            "SIGTERM received; shutting down",
+            "tests/headless_sigterm.rs matches this exact text; changing it here \
+             without changing it there turns that test red for no real reason"
+        );
     }
 }
