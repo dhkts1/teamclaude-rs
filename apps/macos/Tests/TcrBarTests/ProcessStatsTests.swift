@@ -168,7 +168,7 @@ final class ProcessStatsTests: XCTestCase {
         // No `cpu` in the LINE (Gil, 2026-09-14: the session name must not
         // truncate to pay for a unit word) and the unit in full on HOVER,
         // which has no width budget.
-        XCTAssertEqual(ProcessStatsLabel.clause(stats), " · 640% · 2.1 GB")
+        XCTAssertEqual(ProcessStatsLabel.clause(stats), " · 640% · 2.1G")
         XCTAssertEqual(
             ProcessStatsLabel.hover(stats, tool: "Bash"), "pid 48765 · Bash · 640% cpu")
     }
@@ -180,11 +180,17 @@ final class ProcessStatsTests: XCTestCase {
         let firstPoll = RunningCallStats(
             pid: 48765, processGroup: 48765, cpuSeconds: 16.4,
             residentBytes: 2_254_857_830, cpuPercent: nil, readAt: callStart)
-        XCTAssertEqual(ProcessStatsLabel.clause(firstPoll), " · 2.1 GB")
+        XCTAssertEqual(ProcessStatsLabel.clause(firstPoll), " · 2.1G")
         // Hover drops the rate it has not measured too, rather than saying
         // "0% cpu" about a process nobody has watched yet.
         XCTAssertEqual(ProcessStatsLabel.hover(firstPoll, tool: "Bash"), "pid 48765 · Bash")
         XCTAssertEqual(ProcessStatsLabel.clause(nil), "")
+        // Under a gibibyte the unit changes rather than the decimal carrying
+        // the whole reading: 900 MiB is `900M`, never `0.9G`.
+        let smaller = RunningCallStats(
+            pid: 48765, processGroup: 48765, cpuSeconds: 1,
+            residentBytes: 943_718_400, cpuPercent: 12, readAt: callStart)
+        XCTAssertEqual(ProcessStatsLabel.clause(smaller), " · 12% · 900M")
         XCTAssertNil(ProcessStatsLabel.hover(nil, tool: "Bash"))
     }
 

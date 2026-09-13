@@ -243,7 +243,7 @@ public enum ProcessStats {
 /// a test reads them without a live process, the same split
 /// ``ToolCallLabel`` makes for the duration pill.
 public enum ProcessStatsLabel {
-    /// `" · 640% · 2.1 GB"`, or `" · 2.1 GB"` on the first poll, or `""` for a
+    /// `" · 640% · 2.1G"`, or `" · 2.1G"` on the first poll, or `""` for a
     /// call with no matched process at all.
     ///
     /// The word `cpu` is NOT here (Gil, 2026-09-14, ruling on the first
@@ -252,14 +252,15 @@ public enum ProcessStatsLabel {
     /// name is the row's distinguishing text and must not give ground to a
     /// unit word. `640%` is unambiguous beside a memory figure in gigabytes,
     /// and the unit is spelled out in full on hover
-    /// (``hover(_:tool:)``) for anyone who wants it.
+    /// (``hover(_:tool:)``) for anyone who wants it. The memory figure carries
+    /// its own unit letter — see ``memoryFigure(_:)``.
     ///
     /// Leading separator included: this lands directly after the row's
     /// `· Bash`, and a caller assembling the `·` itself is a second place for
     /// the empty case to get it wrong.
     public static func clause(_ stats: RunningCallStats?) -> String {
         guard let stats else { return "" }
-        let memory = " · \(gigabytes(stats.residentBytes)) GB"
+        let memory = " · \(memoryFigure(stats.residentBytes))"
         guard let percent = stats.cpuPercent else { return memory }
         return " · \(Int(percent.rounded()))%\(memory)"
     }
@@ -304,14 +305,25 @@ public enum ProcessStatsLabel {
         "\(subject) in \(session). The session gets a tool error and continues."
     }
 
-    /// Resident memory in binary GB with one decimal — the same unit
-    /// ``MachineStats/gibibytes(_:)`` states the machine's own memory in, so
-    /// the row and the line above it are quoting one number system. One
-    /// decimal, unlike the machine line's whole units: a running call's
-    /// footprint is routinely under a gigabyte, and "0 GB" beside a build is
-    /// a reading nobody can act on.
-    static func gigabytes(_ bytes: UInt64) -> String {
-        String(format: "%.1f", Double(bytes) / 1_073_741_824)
+    /// Resident memory, abbreviated: `2.1G`, `860M`.
+    ///
+    /// Binary units — the same number system ``MachineStats/gibibytes(_:)``
+    /// states the machine's own memory in, so the row and the line above it
+    /// cannot be read against each other wrongly.
+    ///
+    /// The unit is a SINGLE letter, `ByteCountFormatter`'s own abbreviation
+    /// style, and that is the last ~12 pt that made this line fit (Gil,
+    /// 2026-09-14, after the smaller ring and tighter gap left it still
+    /// short): name, figure, memory, elapsed and ✕ all on one 372 pt line.
+    ///
+    /// Under a gibibyte it switches to `M` rather than printing `0.4G`: a
+    /// running call's footprint is routinely a few hundred megabytes, and the
+    /// decimal that would carry the whole reading is the digit most easily
+    /// misread.
+    static func memoryFigure(_ bytes: UInt64) -> String {
+        let gibibytes = Double(bytes) / 1_073_741_824
+        if gibibytes >= 1 { return String(format: "%.1fG", gibibytes) }
+        return String(format: "%.0fM", Double(bytes) / 1_048_576)
     }
 }
 

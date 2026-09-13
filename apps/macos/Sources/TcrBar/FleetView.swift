@@ -155,7 +155,7 @@ struct FleetView: View {
     @State private var machine: MachineStats?
 
     /// What each RUNNING Bash call's process tree is costing, keyed by
-    /// ``SessionToolEntry/id`` — the row's `640% · 2.1 GB`, and the pid
+    /// ``SessionToolEntry/id`` — the row's `640% · 2.1G`, and the pid
     /// its ✕ would signal. Empty for every call this build could not match a
     /// process to, which is the state that draws neither figure nor button.
     ///
@@ -1740,14 +1740,18 @@ struct FleetView: View {
             meta: ProcessStatsLabel.clause(stats),
             metaHover: ProcessStatsLabel.hover(stats, tool: entry.call.tool),
             trailing: {
-                HStack(spacing: V4.rowGap) {
+                // `pillGap`, not `rowGap`: the mockup's own
+                // `.tool .tt{gap:6px}` for this row, and two of the points
+                // that pay for the cpu/memory clause beside the session name.
+                HStack(spacing: V4.pillGap) {
                     if capped {
                         ProgressRing(
                             fraction: (elapsed ?? 0) / bashTimeoutSeconds,
                             tint: isNearTimeout ? Tok.spent : Tok.ok,
                             accessibilityText: elapsed.map {
                                 "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
-                            })
+                            },
+                            size: V4.toolRowRingSize)
                     }
                     // Elapsed and "20s left" are ONE reading, so they are one
                     // Text: a call in the warning band is red AND says how
@@ -1955,7 +1959,7 @@ struct FleetView: View {
                     // ``ProcessStatsLabel/clause(_:)``.
                     NameText(text: toolCallOwnerName(entry.sessionId))
                         .layoutPriority(1)
-                    // ` · Bash`, REPLACED by ` · 640% · 2.1 GB` once a process
+                    // ` · Bash`, REPLACED by ` · 640% · 2.1G` once a process
                     // is matched. The tool word goes rather than the figure
                     // because this row's tool is already said by the ring
                     // (only a Bash call has one), by the ✕ (only a Bash call
@@ -1967,9 +1971,17 @@ struct FleetView: View {
                     // process matched: this panel draws a figure it measured
                     // or it draws nothing, and inventing one to fill a slot is
                     // the one thing a panel about trust cannot do.
-                    MuteText(text: meta.isEmpty ? " · \(entry.call.tool)" : meta)
-                        .help(metaHover ?? "")
-                        .accessibilityValue(metaHover ?? "")
+                    // Two types, because the mockup gives the two strings two
+                    // sizes: `.tool .who` at 12 for `· Bash`, `.tool .stat` at
+                    // 11 for the figure. The point that buys is also what made
+                    // the line fit with the session name whole.
+                    if meta.isEmpty {
+                        MuteText(text: " · \(entry.call.tool)")
+                    } else {
+                        StatText(text: meta)
+                            .help(metaHover ?? "")
+                            .accessibilityValue(metaHover ?? "")
+                    }
                 }
             } trailing: {
                 trailing()

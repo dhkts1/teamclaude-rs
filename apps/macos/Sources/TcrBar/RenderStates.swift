@@ -618,7 +618,7 @@ enum RenderStates {
     }
 
     /// One running Bash row's process reading, fixed — the mockup's own
-    /// `640% cpu · 2.1 GB`. Never ``ProcessTable/read()``: the harness must
+    /// `640% · 2.1G`. Never ``ProcessTable/read()``: the harness must
     /// draw the same pixels on a quiet laptop and on a box mid-build, the
     /// same rule ``machineFixture`` states for the machine line.
     ///

@@ -19,17 +19,27 @@ struct ProgressRing: View {
     var tint: Color = Tok.ok
     /// What the ring is a fraction OF, for the reader who cannot see it.
     var accessibilityText: String?
+    /// Diameter. Defaults to the panel-wide ``V4/ringSize``; the Tools tab's
+    /// running rows pass ``V4/toolRowRingSize`` because that row carries four
+    /// other things beside it — see that token's own comment.
+    var size: CGFloat = V4.ringSize
+
+    /// Stroke scaled with the diameter, at the ratio ``V4/ringSize`` and
+    /// ``V4/ringStroke`` already set (3.5 on 28, an eighth). A stroke left at
+    /// 3.5 on a 22 pt ring closes the hole and the thing stops reading as a
+    /// ring at all.
+    private var stroke: CGFloat { V4.ringStroke * size / V4.ringSize }
 
     var body: some View {
         ZStack {
             Circle()
-                .stroke(Tok.ink.opacity(V4.ringTrackAlpha), lineWidth: V4.ringStroke)
+                .stroke(Tok.ink.opacity(V4.ringTrackAlpha), lineWidth: stroke)
             Circle()
                 .trim(from: 0, to: max(0, min(fraction, 1)))
-                .stroke(tint, style: StrokeStyle(lineWidth: V4.ringStroke, lineCap: .round))
+                .stroke(tint, style: StrokeStyle(lineWidth: stroke, lineCap: .round))
                 .rotationEffect(.degrees(-90))
         }
-        .frame(width: V4.ringSize, height: V4.ringSize)
+        .frame(width: size, height: size)
         .accessibilityHidden(accessibilityText == nil)
         .accessibilityLabel(accessibilityText ?? "")
     }
