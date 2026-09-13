@@ -1,8 +1,12 @@
 //! The predecessor's side of a listening-socket handoff.
 //!
-//! `docs/design/zero-downtime-restart.md` carries the whole design. This module
-//! owns one step of it: the ordered sequence a predecessor performs once a
-//! verified successor has connected.
+//! A restart normally closes the listener and the successor binds a fresh one,
+//! so the port is unbound in between and every new connection is refused. The
+//! predecessor instead hands its socket to the successor, which keeps the
+//! socket's refcount above zero and means a connection arriving mid-swap waits
+//! in the kernel's accept queue instead. This module owns one step of that: the
+//! ordered sequence a predecessor performs once a verified successor has
+//! connected.
 //!
 //! The successor's side is [`crate::server::ServeOptions::inherited_listener`],
 //! and the descriptor transport plus the peer check live in `tcr-fdpass`,
