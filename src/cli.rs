@@ -1735,8 +1735,8 @@ fn render_window(
 /// Minimum served requests before [`cache_hit_ratio`] reports a number rather
 /// than no-signal.
 ///
-/// Grounded in two read measurements, not taste: `docs/plans/divert-budget-swarm-state.md`
-/// records the median distinct divert destinations per hold episode as 2.0, so
+/// Grounded in two read measurements, not taste. A measurement of hold
+/// episodes put the median distinct divert destinations at 2.0, so
 /// an account whose only traffic is "a few cold diverts" sits at single-digit
 /// requests; a live read of the running fleet on 2026-08-15 (`tcr status
 /// --json`) showed every account with a real, sustained cache ratio at 376+
@@ -4629,7 +4629,6 @@ mod tests {
     /// as a confident measured number (as low as single digits of percent),
     /// which read exactly like "this account's cache is broken" and sent a
     /// lead chasing a regression that was never there
-    /// (`docs/plans/divert-budget-swarm-state.md`, "Falsified on the way").
     /// This pins the fix: under `CACHE_SIGNAL_FLOOR_REQUESTS`, the ratio is
     /// `null`/`n/a` — no-signal — same as the honest-zero case, never a
     /// number.
