@@ -21,6 +21,8 @@ pub mod cache_ttl;
 pub mod cli;
 pub mod config;
 pub mod demo;
+#[cfg(unix)]
+pub mod handoff;
 pub mod identity;
 pub mod manager;
 pub mod mint;
