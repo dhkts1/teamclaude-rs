@@ -661,6 +661,28 @@ public enum QuotaFormat {
         return parts.joined(separator: ", ")
     }
 
+    /// The dense Compact quota line's own accessibility value — one sentence
+    /// naming every window it draws, with its reset, in the words
+    /// ``spokenWindowValue(value:state:resetAtMs:now:)`` gives each ``QuotaRow``
+    /// individually.
+    ///
+    /// The line drops every window's reset caption from what it draws — that is
+    /// the whole point of going to one line per card (`data/plans/dense-quota-bridge.md`)
+    /// — so this is where the caption comes back for a listener. Built here
+    /// rather than assembled at the SwiftUI call site so the sentence is a
+    /// property of the model a test can assert on directly, the same reason
+    /// every formatter in this enum lives here rather than in a view.
+    public static func denseLineSpokenValue(
+        windows: [(label: String, value: Double?, state: QuotaState?, resetAtMs: Int64?)],
+        now: Date
+    ) -> String {
+        windows.map { window in
+            "\(window.label) window, "
+                + spokenWindowValue(
+                    value: window.value, state: window.state, resetAtMs: window.resetAtMs, now: now)
+        }.joined(separator: "; ")
+    }
+
     /// Shared guard: `nil` in → `nil` out, never a placeholder — the same
     /// house rule ``percent(_:)`` states above. A reset at or before `now`
     /// also yields `nil`: the Rust side only ever sends future resets, but a
