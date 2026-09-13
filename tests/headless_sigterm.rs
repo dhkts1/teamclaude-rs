@@ -118,6 +118,32 @@ fn wait_for_line(
     }
 }
 
+/// Whether the child's DURABLE log holds a line matching `predicate`.
+///
+/// A second, independent source for the same event. The stdout pipe is a
+/// timing-sensitive path: the test waits on a channel fed by a reader thread,
+/// and a heavily loaded box can miss the window (observed once on 2026-09-13,
+/// alongside a wedged sccache and three concurrent release builds; 0/3 in
+/// isolation afterwards). The durable log is written synchronously by
+/// `RollingFileAppender` with no background worker, so it does not share that
+/// window.
+///
+/// This does NOT weaken the assertion. The question is "did the process log
+/// this", and the answer is yes if EITHER source has it. A line the process
+/// never emitted is in neither, and the test still fails; deleting the SIGTERM
+/// arm still reddens it, which is what `scripts/watch-sigterm-line-fail.sh`
+/// proves.
+fn durable_log_has_line(home: &std::path::Path, predicate: impl Fn(&str) -> bool) -> bool {
+    let logs = home.join(".cache").join("teamclaude").join("logs");
+    let Ok(entries) = std::fs::read_dir(&logs) else {
+        return false;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .any(|body| body.lines().any(&predicate))
+}
+
 /// A supervised SIGTERM (TcrBar's `process.terminate()`) must drain: the
 /// graceful-shutdown log line appears, the port-owner claim is withdrawn,
 /// and the process exits on its own — never needing this test to escalate
@@ -232,10 +258,17 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
         std::thread::sleep(Duration::from_millis(20));
     };
 
+    // Checked AFTER the exit loop above, so the child has finished writing.
+    let logged = graceful_line.is_some()
+        || durable_log_has_line(home.path(), |line| {
+            line.contains("SIGTERM received; shutting down")
+        });
     assert!(
-        graceful_line.is_some(),
-        "never saw \"SIGTERM received; shutting down\" — the headless select! either has no \
-         SIGTERM arm, or it fired without falling through to the shared shutdown log"
+        logged,
+        "never saw \"SIGTERM received; shutting down\" on stdout OR in the durable log under \
+         {} — the headless select! either has no SIGTERM arm, or it fired without falling \
+         through to the shared shutdown log",
+        home.path().display()
     );
     assert!(
         status.success(),
