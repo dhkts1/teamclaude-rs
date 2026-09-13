@@ -1,0 +1,383 @@
+import AppKit
+import SwiftUI
+import TcrBarCore
+
+/// The v4 number sheet, as Swift.
+///
+/// `data/plans/v4-spec.md` is the extraction of `docs/design/panel-tabs-mockup.html`'s
+/// `<style>` block; this enum is that sheet with one name per CSS declaration, at
+/// 1 CSS px = 1 pt. It is the ONE file under `PanelV4/` allowed to hold a raw
+/// number — `scripts/check-panel-v4.sh` fails the build if any sibling view
+/// writes a literal size or reaches for a pre-v4 geometry token, because the
+/// eleven adaptation rounds before this one drifted exactly that way: a 16 here,
+/// an 8 there, each locally defensible and collectively a different design.
+///
+/// Colour is deliberately NOT restated here. `Tok` already carries the v4 sheet's
+/// own role names (`Tok.cardFill`, `Tok.cardLine`, `Tok.dim`, `Tok.mute`) bound to
+/// the gated palette, and a second set of hexes in this file would be a second
+/// source of truth for the thing `scripts/tcrbar-palette.py` exists to gate. The
+/// two exceptions below (`trend`, `info`) are roles the palette has no token for
+/// and are named as such.
+enum V4 {
+
+    // MARK: - Panel (`.panel`)
+
+    /// The mockup's own `width:372px`. `Tok.panelWidth` is bound to this, so the
+    /// popover, the size probe and this view cannot disagree about how wide the
+    /// panel is.
+    static let panelWidth: CGFloat = 372
+    static let panelRadius: CGFloat = 18
+    static let panelPaddingTop: CGFloat = 10
+    static let panelPaddingSide: CGFloat = 10
+    static let panelPaddingBottom: CGFloat = 8
+    /// `border:1px solid var(--line)` with `border-top-color:rgba(255,255,255,.18)`.
+    static let panelBorderWidth: CGFloat = 1
+    static let panelTopEdgeAlpha: Double = 0.18
+
+    // MARK: - Header (`.hdr`)
+
+    static let headerPaddingTop: CGFloat = 2
+    static let headerPaddingSide: CGFloat = 4
+    static let headerPaddingBottom: CGFloat = 6
+    /// `.gear` — a 26×26 button, radius 7, `rgba(255,255,255,.08)`, 15 pt glyph.
+    static let gearSize: CGFloat = 26
+    static let gearRadius: CGFloat = 7
+    static let gearFillAlpha: Double = 0.08
+    static let gearGlyphSize: CGFloat = 15
+    /// `.hdr` puts the title and the freshness on one baseline with a gap.
+    static let headerGap: CGFloat = 8
+
+    // MARK: - Summary (`.sum`)
+
+    static let summaryPaddingSide: CGFloat = 4
+    static let summaryPaddingBottom: CGFloat = 10
+
+    // MARK: - Segmented control (`.seg` / `.tab` / `.badge`)
+
+    static let segRadius: CGFloat = 10
+    static let segPadding: CGFloat = 3
+    static let segGap: CGFloat = 3
+    static let segFillAlpha: Double = 0.06
+    static let segMarginBottom: CGFloat = 12
+    static let tabMinHeight: CGFloat = 32
+    static let tabRadius: CGFloat = 8
+    static let tabSelectedAlpha: Double = 0.12
+    static let tabIconBox: CGFloat = 14
+    static let tabIconStroke: CGFloat = 1.8
+    static let tabGap: CGFloat = 6
+    static let badgeRadius: CGFloat = 9
+    static let badgePaddingH: CGFloat = 6
+    static let badgeFillAlpha: Double = 0.14
+
+    // MARK: - Card (`.card` / `.row`)
+
+    static let cardRadius: CGFloat = 8
+    static let cardPaddingV: CGFloat = 10
+    static let cardPaddingH: CGFloat = 12
+    /// `.card{margin:14px 0}` — adjacent cards collapse to one 14 pt gap.
+    static let cardGap: CGFloat = 14
+    /// Padding PLUS the border, which is what `box-sizing:border-box` charges a
+    /// CSS box for and what a SwiftUI `strokeBorder` overlay does not: the
+    /// overlay takes no layout at all, so a card padded by the CSS figure alone
+    /// draws 2 pt shorter and 2 pt narrower than the same card in the browser.
+    /// Measured on the first v4 render: 41 pt against the mockup's 43.
+    static var cardInsetV: CGFloat { cardPaddingV + panelBorderWidth }
+    static var cardInsetH: CGFloat { cardPaddingH + panelBorderWidth }
+    /// The flex gap inside a `.row`.
+    static let rowGap: CGFloat = 8
+    /// `.sess .row{padding:4px 0}` — the ONLY `.row` in the sheet with vertical
+    /// padding, and it is the session block's. A card's rows have none: their
+    /// height is their line box and nothing else, which is what
+    /// ``lineHeight(_:)`` supplies. Measured: padding the card's rows as well
+    /// made every account card 3 pt tall per row — a parked card measured 47 pt
+    /// against the mockup's 43.
+    static let sessRowPaddingV: CGFloat = 4
+
+    // MARK: - Quota grid (`.q`)
+
+    /// `grid-template-columns:24px 1fr 40px auto`.
+    static let quotaLabelWidth: CGFloat = 24
+    static let quotaPercentWidth: CGFloat = 40
+    static let quotaGap: CGFloat = 8
+    static let quotaMarginTop: CGFloat = 6
+    static let barHeight: CGFloat = 7
+    static let barRadius: CGFloat = 4
+    static let barTrackAlpha: Double = 0.08
+    static let barMinWidth: CGFloat = 2
+    /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
+    static let barCappedWidth: CGFloat = 110
+
+    // MARK: - Pill (`.pill`)
+
+    static let pillFontSize: CGFloat = 10.5
+    /// `letter-spacing:.06em` at 10.5 pt.
+    static let pillTracking: CGFloat = 0.06 * 10.5
+    static let pillPaddingV: CGFloat = 2
+    static let pillPaddingH: CGFloat = 7
+    static let pillRadius: CGFloat = 7
+    static let pillBorderWidth: CGFloat = 1
+    /// `.pill.ok{border-color:rgba(95,208,122,.35)}` and `.4` for the others.
+    static let pillBorderAlpha: Double = 0.4
+    static let pillGap: CGFloat = 6
+
+    // MARK: - Status dot (`.dot`)
+
+    static let dotSize: CGFloat = 8
+    static let dotTrailingGap: CGFloat = 6
+    /// `box-shadow:0 0 0 3px rgba(...,.18)` — a 3 pt ring, so a 14 pt halo.
+    static let dotHaloWidth: CGFloat = 3
+    static var dotHaloSize: CGFloat { dotSize + 2 * dotHaloWidth }
+
+    // MARK: - Session block (`.sess`) and sparkline (`.spark`)
+
+    static let sessMarginTop: CGFloat = 8
+    static let sessMarginBottom: CGFloat = 2
+    static let sessPaddingLeft: CGFloat = 10
+    static let sessRuleWidth: CGFloat = 2
+    static let sparklineWidth: CGFloat = 64
+    static let sparklineHeight: CGFloat = 18
+    static let sparklineStroke: CGFloat = 1.5
+
+    // MARK: - Section head (`.sec`)
+
+    static let sectionHeadMarginTop: CGFloat = 12
+    static let sectionHeadMarginSide: CGFloat = 4
+    static let sectionHeadMarginBottom: CGFloat = 4
+    static let sectionHeadGlyph: CGFloat = 12
+    static let sectionHeadGap: CGFloat = 6
+    static let sectionHeadSize: CGFloat = 11
+    static let sectionHeadTracking: CGFloat = 0.1 * 11
+
+    // MARK: - Ring (`.ring`)
+
+    /// 28 / 3.5, not the sheet's 34 / 4 (Gil, 2026-09-13, measuring his own
+    /// Tools crop: the app's ring drew 39 pt against the mockup's 32, and three
+    /// rows took 200 pt where the mockup takes 150). This supersedes the
+    /// extracted CSS: the mockup's own `.ring` is 34 in a row whose two text
+    /// lines are taller than ours, and a ring sized from the stylesheet rather
+    /// than from the row it sits in is what made the rows grow around it.
+    static let ringSize: CGFloat = 28
+    static let ringStroke: CGFloat = 3.5
+    static let ringTrackAlpha: Double = 0.08
+    /// The Bash tool's own timeout — the denominator the ring fills toward, and
+    /// the figure the RUNNING NOW section head states out loud.
+    static let toolTimeoutSeconds: Double = 600
+    /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
+    /// and the row says how long is left (Gil, 2026-09-13: "red plus
+    /// `· 20s to timeout` within 60 s of the 600 s limit").
+    static let toolTimeoutWarnSeconds: Double = 60
+
+    /// The fixed column every row's trailing content occupies — the ring and
+    /// its duration on Tools, the sparkline or the status on Sessions.
+    ///
+    /// A column sized per row from its own content is what made the durations
+    /// zig-zag down the tab. Two widths, one per tab, because the widest
+    /// trailing string differs: Tools prints "19,913 · median 2.1s" and Sessions
+    /// prints "2 running · oldest 9m 40s". A single width wide enough for both
+    /// would eat the session NAME, which is the one string on the row that has
+    /// to stay readable.
+    /// Tools: the ring, the gap, and the duration's own right-aligned column.
+    /// Nothing wider — every point past those three is a point taken from the
+    /// command the row is about, which is the string a reader is scanning.
+    static var trailingColumnWidth: CGFloat { ringSize + rowGap + durationColumnWidth }
+    /// The duration's own sub-column inside the Tools column, right-aligned so
+    /// every duration ends at the card's content edge and the ring beside it
+    /// starts at one x on every row.
+    static let durationColumnWidth: CGFloat = 60
+    /// A row carrying a ``ProgressRing`` is at least the ring plus the gap that
+    /// keeps two rings from touching. `.row`'s own line box is 21 pt and the
+    /// ring is 34, so without this the rings of consecutive rows overlap —
+    /// measured at 74 px of ring inside a 68 px row.
+    ///
+    /// The row is its own two text lines, not the ring: a 15 pt mono line and a
+    /// 12 pt mute line are 21 + 17 = 38 pt, and the 28 pt ring fits inside that
+    /// with room to spare. Sizing the row from the ring instead is what put
+    /// 67 pt between rows the mockup sets 56 pt apart.
+    static var ringRowMinHeight: CGFloat { lineHeight(monoSize) + lineHeight(muteSize) }
+
+    // MARK: - Group (`.grp`)
+
+    static let groupPaddingTop: CGFloat = 12
+    static let groupPaddingSide: CGFloat = 8
+    static let groupPaddingBottom: CGFloat = 4
+    /// `.grp.collapsed{padding-bottom:8px}`.
+    static let groupPaddingBottomCollapsed: CGFloat = 8
+    static let groupMarginTop: CGFloat = 20
+    static let groupMarginBottom: CGFloat = 8
+    static let groupRadius: CGFloat = 16
+    static let groupStroke: CGFloat = 1.5
+    /// `.grp .card{margin:6px 0}`.
+    static let groupCardGap: CGFloat = 6
+    /// The legend sits at `top:-7px; left:calc(var(--n0) + 4px)` with `--n0:10px`,
+    /// and the stroke is masked out for a 9 px band behind it.
+    ///
+    /// The legend is NOT offset by a constant: `top:-7px` is the CSS's way of
+    /// writing "centre an 11 pt line box on the 1.5 pt stroke" (a 15.4 pt line
+    /// box lifted 7 pt sits 0.7 pt below the edge, i.e. centred), and a SwiftUI
+    /// label whose height is its own text metrics is a different number.
+    /// ``GroupBox`` lifts it by half its MEASURED height instead, which is the
+    /// same intent and survives a font change; the constant put the legend
+    /// 1.75 pt high on the first render.
+    static let legendNotchStart: CGFloat = 10
+    static let legendNotchPadding: CGFloat = 4
+    static let legendMaskBand: CGFloat = 9
+    /// How wide the stroke's notch is for a legend that measured `width`: the
+    /// mask's `--n1`, clamped so a zero-width legend cannot ask for a negative
+    /// band. Here rather than in the view because it is the sheet's geometry.
+    static func legendNotchWidth(forLegendWidth width: CGFloat) -> CGFloat {
+        max(0, legendNotchStart + legendNotchPadding * 2 + width - legendNotchStart)
+    }
+
+    /// How far a legend of height `height` is lifted so it sits centred on the
+    /// stroke — the intent behind the CSS's `top:-7px` (see the note above).
+    static func legendLift(forLegendHeight height: CGFloat) -> CGFloat {
+        -height / 2
+    }
+
+    static let legendFontSize: CGFloat = 11
+    static let legendTracking: CGFloat = 0.08 * 11
+    /// 12, not the CSS's 11: the swatch reads as a rounded square beside an
+    /// 11 pt uppercase legend and at 11 it sat visibly smaller than the cap
+    /// height next to it (Gil, 2026-09-13).
+    static let legendGlyph: CGFloat = 12
+    static let legendGap: CGFloat = 6
+
+    // MARK: - Button (`.btn` / `.more`)
+
+    static let buttonRadius: CGFloat = 7
+    static let buttonMinHeight: CGFloat = 28
+    static let buttonPaddingV: CGFloat = 5
+    static let buttonPaddingH: CGFloat = 11
+    /// The border again (see ``cardInsetV``).
+    static var buttonInsetV: CGFloat { buttonPaddingV + panelBorderWidth }
+    static var buttonInsetH: CGFloat { buttonPaddingH + panelBorderWidth }
+    static let buttonFillAlpha: Double = 0.10
+    static let buttonFontSize: CGFloat = 13
+    static let buttonGap: CGFloat = 8
+    /// `.btn.danger{border-color:rgba(239,107,107,.38)}`.
+    static let dangerBorderAlpha: Double = 0.38
+    /// `.more` — the disclosure control: full width, 12.5 pt/600, its own 6 pt
+    /// top margin and a 12 pt chevron.
+    static let discFontSize: CGFloat = 12.5
+    static let discMarginTop: CGFloat = 6
+    static let discGlyph: CGFloat = 12
+    static let discRadius: CGFloat = 8
+    static let discPaddingV: CGFloat = 5
+    static let discPaddingH: CGFloat = 10
+    static var discInsetV: CGFloat { discPaddingV + panelBorderWidth }
+    static var discInsetH: CGFloat { discPaddingH + panelBorderWidth }
+    /// `.aside` — "3 accounts have no sessions".
+    static let asideFontSize: CGFloat = 12
+    static let asidePaddingTop: CGFloat = 6
+
+    // MARK: - Footer (`.foot`)
+
+    static let footerMarginTop: CGFloat = 10
+    static let footerPaddingTop: CGFloat = 8
+    static let footerRuleWidth: CGFloat = 1
+    static let footerGap: CGFloat = 10
+    static let footerGlyph: CGFloat = 12
+
+    // MARK: - Type
+
+    static let titleSize: CGFloat = 17
+    static let titleTracking: CGFloat = -0.01 * 17
+    static let freshnessSize: CGFloat = 12.5
+    static let summarySize: CGFloat = 15
+    static let tabLabelSize: CGFloat = 12.5
+    static let tabLabelTracking: CGFloat = 0.02 * 12.5
+    static let badgeSize: CGFloat = 11
+    static let nameSize: CGFloat = 15
+    static let nameTracking: CGFloat = -0.005 * 15
+    static let dimSize: CGFloat = 13
+    static let muteSize: CGFloat = 12
+    static let monoSize: CGFloat = 12
+    static let footerSize: CGFloat = 12.5
+
+    // MARK: - Motion
+
+    /// `scale .96 over 120 ms` on press; `spring, damping 1.0, response 0.3` for a
+    /// tab switch or an expand.
+    static let pressScale: CGFloat = 0.96
+    static let springResponse: Double = 0.3
+    static let springDamping: Double = 1.0
+
+    // MARK: - The two colours the gated palette has no name for
+
+    /// `--trend`, the sparkline stroke. Decorative: it draws a 1.5 pt line, never
+    /// text, so it carries no contrast obligation and is not a palette token.
+    static let trend = Color(red: 0x7f / 255, green: 0xb2 / 255, blue: 0xff / 255)
+    /// `--info`, the UNMEASURED pill and the Agent bar. `Tok.unmeasured` is this
+    /// role in the gated palette and is what the pill and bar actually use; this
+    /// value is kept beside `trend` only so the sheet's own two extra roles are
+    /// both named in one place.
+    static let info = Color(red: 0x6a / 255, green: 0xa9 / 255, blue: 0xff / 255)
+
+    // MARK: - Line boxes
+
+    /// `body{font:15px/1.4}` — the mockup's ONE line-height, inherited by every
+    /// line on the panel.
+    ///
+    /// This is the number eleven adaptation rounds did not have. A browser gives
+    /// a 15 pt line a 21 pt box; SwiftUI gives it ~18 pt, so a transcription that
+    /// gets every padding right still draws every card 3 pt per row short — and
+    /// the previous round compensated by padding `.row` by 4, which the sheet
+    /// only does for `.sess .row` and which then overshot in the other
+    /// direction. One factor, applied to each text role's own size.
+    static let lineHeightFactor: CGFloat = 1.4
+
+    /// The line box a run of `size` pt text occupies, rounded the way a layout
+    /// engine rounds it.
+    static func lineHeight(_ size: CGFloat) -> CGFloat {
+        (size * lineHeightFactor).rounded()
+    }
+
+    /// What to add BETWEEN two wrapped lines of `size` pt text so the pair
+    /// occupies the same box the browser gives it.
+    ///
+    /// ``lineHeight(_:)`` alone only fixes a single line (it is a minimum on the
+    /// frame); a `Text` that wraps stacks its own natural line height twice and
+    /// comes out short again. The natural height is asked of the font rather
+    /// than guessed at a factor, so this survives a font change and a
+    /// Larger-Text setting.
+    static func lineSpacing(_ size: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: size)
+        let natural = font.ascender - font.descender + font.leading
+        return max(0, lineHeight(size) - natural)
+    }
+
+    /// A `.card`'s `.row`: its tallest child is the 15 pt name, so the row is
+    /// that name's line box. Every line INSIDE that row gets the same box —
+    /// a CSS line box is set by its block's strut, not by the smallest span on
+    /// it, so a 12 pt plan wrapping under a 15 pt name still occupies 21 pt.
+    static var rowLineHeight: CGFloat { lineHeight(nameSize) }
+
+    /// What a block's top margin becomes when it follows the segmented strip.
+    ///
+    /// Adjacent CSS margins COLLAPSE to the larger of the two: the strip's
+    /// `margin-bottom:12` and the first card's `margin-top:14` make one 14 pt
+    /// gap, not 26. SwiftUI adds paddings, which is how the first v4 render put
+    /// 29 pt of nothing under the tabs against the mockup's 15.
+    static func marginAfterStrip(_ own: CGFloat) -> CGFloat {
+        max(own, segMarginBottom) - segMarginBottom
+    }
+
+    // MARK: - Derived helpers
+
+    /// `font-variant-numeric:tabular-nums` is set on `.panel`, so every number on
+    /// this panel is tabular. Applied through one helper rather than remembered
+    /// at forty call sites.
+    static func font(_ size: CGFloat, _ weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight).monospacedDigit()
+    }
+
+    static func mono(_ size: CGFloat) -> Font {
+        .system(size: size, design: .monospaced).monospacedDigit()
+    }
+
+    /// A group's identity colour, as SwiftUI. Never a status hue — the sheet is
+    /// explicit that group identity is "outline + legend only".
+    static func groupColor(_ rgb: GroupTagColor.RGB) -> Color {
+        Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
+    }
+}

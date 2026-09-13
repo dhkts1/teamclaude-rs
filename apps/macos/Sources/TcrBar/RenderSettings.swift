@@ -45,7 +45,7 @@ import TcrBarCore
 ///
 /// ## Usage
 ///
-///     TcrBar.app/Contents/MacOS/TcrBar --render-settings /tmp/tcrbar-settings
+///     TcrBar.app/Contents/MacOS/TcrBar --render-settings <output-directory>
 ///
 /// Writes one PNG per pane per appearance and exits without ever showing a
 /// menu-bar item, polling `tcr`, or touching a server.

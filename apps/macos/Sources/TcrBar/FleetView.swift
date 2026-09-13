@@ -147,7 +147,17 @@ struct FleetView: View {
         snapshotMode: Bool = false,
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
-        initialTab: PanelTab = .accounts
+        initialTab: PanelTab = .accounts,
+        // Coordinator-flagged gap (2026-09-12): `snapshotMode` never reads
+        // real session files (comment above, `body`'s `.onAppear`), so every
+        // render-states Sessions/Tools fixture used to join to NOTHING and
+        // read `.unknown` → the summary line's "idle" bucket for every
+        // session, regardless of what the fixture's own `Session.tools`
+        // narrative says. `RenderStates` seeds this so its fixture sessions
+        // actually carry the busy/waiting/idle status their own doc-comments
+        // describe, instead of the pixelmatch gate comparing a made-up
+        // "0 busy · 0 waiting · 3 idle" against the mockup's real counts.
+        initialSessionFiles: [String: SessionFile] = [:]
     ) {
         self.poller = poller
         self.server = server
@@ -163,19 +173,25 @@ struct FleetView: View {
         self.onWhatsNew = onWhatsNew
         self.onSettings = onSettings
         self._selectedTab = State(initialValue: initialTab)
+        self._sessionFiles = State(initialValue: initialSessionFiles)
+    }
+
+    /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
+    /// so the two can be put side by side on the same live fleet. Read once per
+    /// render off the environment rather than a preference: it is a comparison
+    /// switch for whoever is holding the migration, not a setting anyone ships.
+    static var drawsLegacyPanel: Bool {
+        ProcessInfo.processInfo.environment["TCRBAR_LEGACY_PANEL"] == "1"
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            header
-            Hairline()
-            content
-            Hairline()
-            footer
+        Group {
+            if Self.drawsLegacyPanel {
+                legacyBody
+            } else {
+                v4Body
+            }
         }
-        .padding(Tok.gutter)
-        .frame(width: Tok.panelWidth)
-        .background(Tok.panel)
         // `snapshotMode` never touches disk here: the render harness's session
         // ids are fixture strings that join to nothing real, so the read
         // would only ever populate an unused dictionary — see
@@ -186,17 +202,249 @@ struct FleetView: View {
         }
     }
 
+    /// The panel as `docs/design/panel-tabs-mockup.html` draws it — chrome from
+    /// ``PanelV4``, the Accounts tab transcribed class by class under
+    /// `PanelV4/`, and Sessions and Tools still drawn by the views below (Gil,
+    /// 2026-09-13: "i think just accounts need fixing … the others i think ours
+    /// look better").
+    private var v4Body: some View {
+        PanelV4(
+            freshness: poller.lastPollAt.map { freshnessLabel(since: $0, now: Date()) },
+            tabs: PanelTab.allCases,
+            selected: selectedTab,
+            badges: v4Badges,
+            onSelect: { selectedTab = $0 },
+            onSettings: onSettings,
+            summary: { v4Summary },
+            content: { v4Content },
+            footer: { v4Footer }
+        )
+    }
+
+    /// A badge per tab, from the same counts on EVERY tab — including the one
+    /// being looked at, which the pre-v4 strip dropped: it drew zero badge
+    /// pixels on Accounts while showing both counts on Sessions and Tools.
+    /// Accounts itself carries no count of its own; the summary line directly
+    /// above it already counts the fleet.
+    private var v4Badges: [PanelTab: Int] {
+        guard case .loaded(let fleet) = poller.state else { return [:] }
+        var out: [PanelTab: Int] = [:]
+        if !fleet.sessions.isEmpty { out[.sessions] = fleet.sessions.count }
+        if !fleet.toolsRunning.isEmpty { out[.tools] = fleet.toolsRunning.count }
+        return out
+    }
+
+    @ViewBuilder
+    private var v4Summary: some View {
+        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
+            switch selectedTab {
+            case .accounts:
+                SummaryLine.accounts(fleet)
+            case .sessions:
+                sessionsSummaryLine(fleet)
+                    .padding(.horizontal, V4.summaryPaddingSide)
+                    .padding(.bottom, V4.summaryPaddingBottom)
+            case .tools:
+                toolsSummaryLine(fleet)
+                    .padding(.horizontal, V4.summaryPaddingSide)
+                    .padding(.bottom, V4.summaryPaddingBottom)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var v4Content: some View {
+        switch poller.state {
+        case .loaded(let fleet) where !fleet.accounts.isEmpty:
+            switch selectedTab {
+            case .accounts:
+                if fleet.source.countersAreStructural {
+                    offlineNotice(fleet.source)
+                }
+                if snapshotMode {
+                    accountsTabV4(fleet)
+                } else {
+                    ScrollView { accountsTabV4(fleet) }
+                        .frame(height: visibleRowsHeight(for: fleet))
+                }
+            case .sessions:
+                sessionsTab(fleet)
+            case .tools:
+                toolsTab(fleet)
+            }
+        default:
+            // Every not-a-fleet state keeps the banner it already had: those
+            // are sentences, not layout, and the migration has no quarrel
+            // with them.
+            content
+        }
+    }
+
+    private func accountsTabV4(_ fleet: Fleet) -> some View {
+        AccountsTabV4(
+            fleet: fleet,
+            controlName: control.current,
+            expandedGroups: expandedGroups,
+            onToggleGroup: { toggleGroupExpansion($0) },
+            now: Date()
+        ) { account in
+            // The row's own actions, from the ONE definition of them —
+            // `AccountRow`'s menu, rendered with no row around it. A second
+            // copy of that menu for the v4 card is a second thing to keep in
+            // step with `tcr`'s subcommands.
+            AccountRow(
+                account: account,
+                countersAreStructural: fleet.source.countersAreStructural,
+                accounts: accounts,
+                control: control,
+                onChanged: { await poller.pollOnce() },
+                onRelogin: { reloginAccount(account.ref) },
+                onMint: { mintAccountToken(account.ref) },
+                onMintGroup: { group in mintGroupTokens(group) },
+                groupController: groupController,
+                removeController: removeController,
+                allAccounts: fleet.accounts,
+                snapshotMode: snapshotMode,
+                menuOnly: true
+            )
+        }
+    }
+
+    /// `.foot` plus everything that has to sit above its rule: the action row,
+    /// a login failure, and the not-supervised controls.
+    private var v4Footer: some View {
+        PanelFooter(
+            leading: v4FooterLeading,
+            leadingSystemImage: selectedTab == .sessions ? "shippingbox" : nil,
+            trailing: v4FooterTrailing
+        ) {
+            VStack(alignment: .leading, spacing: V4.buttonGap) {
+                if selectedTab == .accounts {
+                    v4Actions
+                }
+                if let loginError {
+                    Text(loginError)
+                        .font(V4.font(V4.muteSize))
+                        .foregroundStyle(Tok.spent)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // Only when something is off. `.supervising` says "Supervised
+                // by TcrBar (pid N)", which the row of controls right above it
+                // already says by offering "Stop server" — a footer line that
+                // repeats the state of the button beside it is a line the
+                // mockup's footer does not have and does not need.
+                if !server.state.isOurChild {
+                    Text(server.state.summary)
+                        .font(V4.font(V4.footerSize))
+                        .foregroundStyle(Tok.mute)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    /// Where this tab's numbers come from — the mockup gives each tab its own
+    /// provenance line rather than repeating one global block on all three.
+    private var v4FooterLeading: String {
+        switch selectedTab {
+        case .accounts: return AppBuild.label ?? "TcrBar"
+        case .sessions: return "proxy + Claude Code session files"
+        case .tools: return "from request bodies only · nothing logged"
+        }
+    }
+
+    private var v4FooterTrailing: String? {
+        if selectedTab == .sessions { return "sparkline: req/min, 30m" }
+        guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
+        return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
+    }
+
+    /// `.btn` — the two fleet actions the mockup keeps, plus the server controls
+    /// the app cannot do without. Above the footer rule, which is where the
+    /// sheet puts them and the opposite of where the pre-v4 panel did.
+    ///
+    /// Two rows, not one: four buttons do not fit across 352 pt, and the second
+    /// row is where the destructive one goes. That separation is the whole point
+    /// of the pre-v4 `dangerZone` and it survives the migration — "Refresh"
+    /// costs nothing and "Take over port…" costs every live session a cold
+    /// prompt-cache prefix, so a misclick between neighbours must not be able to
+    /// spend that. What does NOT survive is its layout: a hairline of its own
+    /// under the footer text, which put the panel's most expensive control below
+    /// the line that ends the panel.
+    private var v4Actions: some View {
+        VStack(alignment: .leading, spacing: V4.buttonGap) {
+            HStack(spacing: V4.buttonGap) {
+                if server.state.isOurChild {
+                    V4Button(title: "Stop server") { server.stop() }
+                } else {
+                    V4Button(title: "Start server") { server.start() }
+                }
+                V4Button(title: "Refresh") { Task { await poller.pollOnce() } }
+                V4Button(
+                    title: "Add account…",
+                    help: "Opens `tcr login` in a Terminal window."
+                ) { addAccount() }
+                Spacer(minLength: 0)
+            }
+            // Disabled rather than silently no-op: the spawn path refuses a
+            // second child, so with one already supervised the click would do
+            // nothing and look like a failure.
+            if !server.state.isOurChild {
+                HStack(spacing: V4.buttonGap) {
+                    Spacer(minLength: 0)
+                    V4Button(
+                        title: "Take over port…",
+                        role: .danger,
+                        help:
+                            "Replace the proxy currently holding the port. Expensive — asks first."
+                    ) { confirmTakeover() }
+                }
+            }
+        }
+    }
+
+    private var legacyBody: some View {
+        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+            header
+            Hairline()
+            content
+            Hairline()
+            footer
+        }
+        .padding(Tok.gutter)
+        .frame(width: Tok.panelWidth)
+        .background(Tok.panel)
+    }
+
     // MARK: Header
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack {
-                Text("tcr fleet").font(.headline)
+                // v4-spec: panel title 17pt/700 — `.headline` resolves to
+                // 13pt/semibold on macOS, well under the mockup's size.
+                // Literal per the tokens-parity fence; swap for a `Tok` name
+                // once one exists.
+                Text("tcr fleet").font(Tok.panelTitleFont)
                 Spacer()
                 if let at = poller.lastPollAt {
-                    Text(at, style: .time)
-                        .font(Tok.secondaryDigitFont).lineSpacing(Tok.secondaryLineSpacing)
-                        .foregroundStyle(Tok.inkDim)
+                    // `docs/design/panel-tabs-mockup.html` F14: the header's
+                    // trailing slot answers "is this current", not "what time
+                    // is it" — the system clock is already a couple of
+                    // centimetres away in the same menu bar. Computed once per
+                    // render, same as `trailingStatus`'s `now:` parameter
+                    // elsewhere in this file — there is no live timer driving
+                    // a re-render between polls, so this reads as of the last
+                    // paint, not truly live-ticking.
+                    //
+                    // v4-spec: freshness is 12.5pt/400, `--mute`, not `--dim`
+                    // — `Tok.inkFaint` is this build's mute-role token
+                    // (`Tokens.swift`'s own naming: "Tertiary text and
+                    // hints"), so this corrects the colour role along with
+                    // the size.
+                    Text(freshnessLabel(since: at, now: Date()))
+                        .font(Tok.tabular(Tok.freshnessFont))
+                        .foregroundStyle(Tok.inkFaint)
                 }
                 // Gear opens Settings — in the header, not the footer, and
                 // present regardless of which tab is selected: it is window
@@ -224,10 +472,28 @@ struct FleetView: View {
                     .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
+            // F1: each tab answers a different question in this slot, so the
+            // summary line switches with `selectedTab` rather than always
+            // showing the Accounts one — `docs/design/panel-tabs-mockup.html`
+            // draws three different sentences here, one per panel.
+            if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty,
+                selectedTab == .accounts
+            {
                 capacitySummary(fleet)
             }
-            usageSummary
+            if selectedTab == .accounts {
+                usageSummary
+            }
+            if case .loaded(let fleet) = poller.state, selectedTab == .sessions,
+                fleet.sessionsSupported, !fleet.sessions.isEmpty
+            {
+                sessionsSummaryLine(fleet)
+            }
+            if case .loaded(let fleet) = poller.state, selectedTab == .tools,
+                fleet.sessionsSupported
+            {
+                toolsSummaryLine(fleet)
+            }
             updateStateLine
         }
         // OUTSIDE `usageSummary`'s own `if`, and outside the subtree that
@@ -342,16 +608,19 @@ struct FleetView: View {
     /// truncate — while concatenated runs flow onto a second line and keep
     /// their own colours.
     private func capacitySummary(_ fleet: Fleet) -> some View {
+        // v4-spec: summary line is 15pt/400 with numbers at 600 — literal
+        // per the tokens-parity fence; `.subheadline`/`Tok.secondaryDigitFont`
+        // were 13pt/11pt.
         var line =
             Text(fleet.capacitySummary)
-            .font(.subheadline.weight(.semibold))
+            .font(Tok.nameFont)
             .foregroundColor(Tok.color(for: fleet.capacityState))
         for tally in fleet.breakdown {
             line =
                 line
-                + Text(" · ").font(Tok.secondaryFont).foregroundColor(Tok.inkFaint)
+                + Text(" · ").font(Tok.summaryFont).foregroundColor(Tok.inkFaint)
                 + Text(tally.label)
-                .font(Tok.secondaryDigitFont)
+                .font(Tok.nameFont).monospacedDigit()
                 .foregroundColor(Tok.color(for: tally.kind))
         }
         return
@@ -530,15 +799,22 @@ struct FleetView: View {
                         .font(.caption2.weight(.semibold))
                         .contentTransition(.numericText())
                         .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: badge)
-                        .padding(.horizontal, Tok.space2)
-                        .background(Capsule().fill(Tok.hover))
+                        // v4-spec: tab badge 11pt on rgba(255,255,255,.14),
+                        // radius 9, padding 0 6 — literal per the
+                        // tokens-parity fence.
+                        .font(.system(size: Tok.tabBadgeFontSize))
+                        .padding(.horizontal, 6)
+                        .background(Capsule().fill(Color.white.opacity(0.14)))
                 }
             }
-            .font(.caption.weight(.semibold))
+            // v4-spec: segmented tab label 12.5pt/600/+0.02em.
+            .font(Tok.tabLabelFont)
+            .tracking(0.02 * 12.5)
             .foregroundStyle(isOn ? Tok.ink : Tok.inkDim)
             .frame(maxWidth: .infinity)
-            .padding(.vertical, Tok.space2)
-            .background(RoundedRectangle(cornerRadius: Tok.radiusSmall).fill(isOn ? Tok.hover : Color.clear))
+            // v4-spec: item min-height 32, radius 8.
+            .frame(minHeight: 32)
+            .background(RoundedRectangle(cornerRadius: 8).fill(isOn ? Tok.hover : Color.clear))
         }
         .buttonStyle(.plain)
         .accessibilityLabel(badge.map { "\(tab.title), \($0)" } ?? tab.title)
@@ -581,49 +857,195 @@ struct FleetView: View {
             if lhs.isEmpty != rhs.isEmpty { return rhs.isEmpty }
             return lhs < rhs
         }
-        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
-            ForEach(order, id: \.self) { key in
-                VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-                    Text(key.isEmpty ? "Unassigned" : key)
-                        .font(.subheadline.weight(.semibold))
-                    ForEach(byAccount[key] ?? []) { row in
-                        sessionRow(row)
+        // The cap is across the WHOLE tab, not per account — the mockup's own
+        // button counts that way ("Show 7 more sessions") — so the budget is
+        // spent walking the accounts in display order and stops mid-account if
+        // that is where the fifth session falls.
+        let limit = sessionsExpanded ? Int.max : Self.sessionsVisibleRows
+        var remaining = limit
+        var visible: [(key: String, rows: [JoinedSession])] = []
+        for key in order {
+            guard remaining > 0 else { break }
+            let rows = Array((byAccount[key] ?? []).prefix(remaining))
+            remaining -= rows.count
+            visible.append((key, rows))
+        }
+        let hidden = sessions.count - visible.reduce(0) { $0 + $1.rows.count }
+        // `Tok.cardGap` — the same gap the Accounts tab's own list uses.
+        return VStack(alignment: .leading, spacing: Tok.cardGap) {
+            ForEach(visible, id: \.key) { entry in
+                // v4-spec: each account's session block is a card, with the
+                // account name as its first row and the sessions indented
+                // under a 2px left rule.
+                V4Card {
+                    V4Row {
+                        NameText(text: entry.key.isEmpty ? "Unassigned" : entry.key)
+                            .layoutPriority(1)
+                    } trailing: {
+                        DimText(text: sessionBlockSummary(entry.rows)).fixedSize()
+                    }
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(entry.rows) { row in
+                            sessionRow(row)
+                        }
+                    }
+                    // `.sess{margin:8px 0 2px;padding-left:10px;
+                    // border-left:2px solid var(--line)}`.
+                    .padding(.top, V4.sessMarginTop)
+                    .padding(.bottom, V4.sessMarginBottom)
+                    .padding(.leading, V4.sessPaddingLeft)
+                    .overlay(alignment: .leading) {
+                        Rectangle().fill(Tok.cardLine).frame(width: V4.sessRuleWidth)
                     }
                 }
+            }
+            if hidden > 0 {
+                disclosureButton(
+                    "Show \(hidden) more \(hidden == 1 ? "session" : "sessions")",
+                    hint: "Shows every session the proxy has seen in the last hour."
+                ) { toggleSessionsExpansion() }
             }
         }
     }
 
-    private func sessionRow(_ row: JoinedSession) -> some View {
-        VStack(alignment: .leading, spacing: Tok.space1) {
-            HStack(spacing: Tok.tightSpacing) {
-                Circle()
-                    .fill(activityColor(row.activity))
-                    .frame(width: 8, height: 8)
-                Text(row.displayName).font(.subheadline.weight(.semibold))
-                if let project = row.project {
-                    Text(project).font(Tok.secondaryFont).foregroundStyle(Tok.inkDim)
-                }
-                Spacer()
-            }
-            HStack(spacing: Tok.tightSpacing) {
-                Text("\(row.session.requests) req")
-                    .monospacedDigit()
-                    .contentTransition(.numericText())
-                    .animation(reduceMotion ? nil : .easeOut(duration: 0.2), value: row.session.requests)
-                if let model = row.session.model { Text(model) }
-                Spacer()
-                // A rolling digit transition here would need this string's
-                // VALUE, not its rendered text, to drive `.animation(value:)`
-                // — it is age-since-oldest-running-tool, recomputed from
-                // `Date()` on every render, so a state-driven transition has
-                // no discrete value to key off. Left as a plain `Text`.
-                Text(trailingStatus(row, now: Date())).monospacedDigit()
-            }
-            .font(Tok.secondaryDigitFont)
-            .foregroundStyle(Tok.inkDim)
+    /// "3 sessions · $9.41" — the trailing half of a session card's first row.
+    ///
+    /// The spend clause is dropped when not one session in the block was
+    /// priced (``Session/costUsd`` is absent on any server built before wire
+    /// 2), never printed as `$0.00`: the same rule the account cards' own
+    /// spend line follows, through the same ``UsageTotals/addCost(_:_:)``.
+    private func sessionBlockSummary(_ rows: [JoinedSession]) -> String {
+        var spend: Double?
+        for row in rows {
+            spend = UsageTotals.addCost(spend, row.session.costUsd)
         }
-        .padding(.vertical, Tok.space1)
+        let noun = rows.count == 1 ? "session" : "sessions"
+        guard let spend else { return "\(rows.count) \(noun)" }
+        return "\(rows.count) \(noun) · \(QuotaFormat.usd(spend))"
+    }
+
+    /// An idle (or unknown-state) session draws ONE line — dot, name,
+    /// subtitle, trailing "idle 40m" — never the second line's request
+    /// count, cache percentage or sparkline. `docs/design/panel-tabs-mockup.html`'s
+    /// `m-075377`/`token-b4` rows are exactly this shape: no metrics line at
+    /// all under an idle session, where a busy or waiting one always has
+    /// one. Splitting on that rather than always drawing both lines and
+    /// hiding parts of the second is what keeps an idle row from claiming a
+    /// sparkline and a cache reading nobody is currently producing.
+    private var isCompactRow: (SessionActivity) -> Bool {
+        { $0 == .idle || $0 == .unknown }
+    }
+
+    @ViewBuilder
+    private func sessionRow(_ row: JoinedSession) -> some View {
+        if isCompactRow(row.activity) {
+            V4Row {
+                HStack(spacing: V4.dotTrailingGap) {
+                    StatusDot(activity: row.activity)
+                    NameText(text: row.displayName)
+                    DimText(text: sessionSubtitle(row))
+                }
+                .layoutPriority(1)
+            } trailing: {
+                Text(trailingStatus(row, now: Date()))
+                    .font(V4.font(V4.dimSize))
+                    .foregroundStyle(row.activity == .waiting ? Tok.near : Tok.dim)
+                    .monospacedDigit()
+                    .lineLimit(1)
+                    .fixedSize()
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 0) {
+                V4Row {
+                    HStack(spacing: V4.dotTrailingGap) {
+                        StatusDot(activity: row.activity)
+                        NameText(text: row.displayName)
+                    }
+                    .layoutPriority(1)
+                } trailing: {
+                    if let series = row.session.reqPerMinute, !series.isEmpty {
+                        Sparkline(values: series)
+                            .stroke(V4.trend, lineWidth: V4.sparklineStroke)
+                            .frame(width: V4.sparklineWidth, height: V4.sparklineHeight)
+                    }
+                }
+                // `repo · model` drops to its own line when a sparkline occupies
+                // the right of the row, as the mockup wraps it. Kept
+                // inline, it competes with a 64 pt sparkline for the same width
+                // and the SESSION NAME is what loses — "teamclau…".
+                DimText(text: sessionSubtitle(row))
+                HStack(spacing: 0) {
+                    Text("\(row.session.requests) req")
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .layoutPriority(1)
+                        .contentTransition(.numericText())
+                        .animation(
+                            reduceMotion ? nil : .easeOut(duration: 0.2),
+                            value: row.session.requests)
+                    // `docs/design/panel-tabs-mockup.html`'s "$4.12" — the
+                    // SERVER's own per-session figure (`SessionRow::cost_usd`,
+                    // wire 2), never a price-per-token this app computes. No
+                    // clause at all on a server that does not send it: the two
+                    // earlier rounds of this bridge left the `$` out entirely
+                    // for exactly that reason, and the field existing is what
+                    // changed, not the rule.
+                    if let cost = row.session.costUsd {
+                        Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
+                            .lineLimit(1).layoutPriority(1)
+                    }
+                    if let cache = cacheHitPercent(row.session) {
+                        Text(" · cache \(cache)%").monospacedDigit()
+                            .lineLimit(1).layoutPriority(1)
+                    }
+                    // Zero, not the row gap: the pair fits across the block's
+                    // 312 pt with nothing to spare, and 8 pt of enforced gap is
+                    // what pushed `· cache 97%` onto a second line.
+                    Spacer(minLength: 0)
+                    // A rolling digit transition here would need this string's
+                    // VALUE, not its rendered text, to drive `.animation(value:)`
+                    // — it is age-since-oldest-running-tool, recomputed from
+                    // `Date()` on every render, so a state-driven transition has
+                    // no discrete value to key off. Left as a plain `Text`.
+                    //
+                    // In the SAME fixed column as the sparkline above it, so a
+                    // session's two trailing readings line up with each other
+                    // and with every other row's.
+                    // The metrics are the measurement; the status is a
+                    // restatement of the dot two lines up. When they cannot
+                    // both fit, the status drops a WORD rather than losing
+                    // characters — see ``sessionStatusLine(_:now:)``.
+                    sessionStatusLine(row, now: Date())
+                }
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(Tok.dim)
+                .frame(minHeight: V4.lineHeight(V4.dimSize))
+            }
+        }
+    }
+
+    /// "teamclaude-rs · fable-5" — project and model on the session's title
+    /// row, `docs/design/panel-tabs-mockup.html`'s `.sub`. Neither, one, or
+    /// both may be missing (no session file, no reported model); this joins
+    /// only what's present rather than drawing a bare "·". The model goes
+    /// through ``QuotaFormat/modelLabel(_:)`` — the same `claude-` prefix
+    /// and date-suffix strip the usage-by-model view already applies — so
+    /// this row reads "opus-5", not the wire's "claude-opus-5", matching the
+    /// mockup exactly instead of growing a second, subtly different
+    /// shortener.
+    private func sessionSubtitle(_ row: JoinedSession) -> String {
+        [row.project, row.session.model.map(QuotaFormat.modelLabel)]
+            .compactMap { $0 }.joined(separator: " · ")
+    }
+
+    /// `cacheReadTokens / (inputTokens + cacheReadTokens)`, the same ratio
+    /// the account-level cache figure already uses elsewhere in this build.
+    /// `nil` when the session has recorded no tokens at all yet, rather than
+    /// a divide-by-zero "0%" that would claim a measured cold cache.
+    private func cacheHitPercent(_ session: Session) -> Int? {
+        let total = session.inputTokens + session.cacheReadTokens
+        guard total > 0 else { return nil }
+        return Int((Double(session.cacheReadTokens) / Double(total) * 100).rounded())
     }
 
     /// `docs/design/panel-tabs-review.md` finding 2: a session with a tool
@@ -633,10 +1055,69 @@ struct FleetView: View {
     /// `row.session.tools.running` here is the exact array
     /// ``Fleet/toolsRunning`` pools for the Tools tab, so the two tabs can no
     /// longer derive two different counts for the same session.
+    /// The running status as the mockup draws it: the COUNT in `ok` at 600
+    /// ("2 running"), then how long the oldest call has been going, in `dim`.
+    ///
+    /// Three candidates, widest first. The middle one drops the word "oldest"
+    /// — a word, not a measurement, and the tab's own footer legend already
+    /// says what the number is — so a tight row loses vocabulary before it
+    /// loses digits. Truncation is the last of the three and cuts the TAIL: the
+    /// first draft let SwiftUI cut the head, which turned "2 running" into
+    /// "…ing" and took the row's only green with it.
+    @ViewBuilder
+    private func sessionStatusLine(_ row: JoinedSession, now: Date) -> some View {
+        let running = row.session.tools.running
+        if !running.isEmpty, let oldestStartedMs = running.compactMap(\.startedMs).min() {
+            let elapsed = max(
+                0,
+                now.timeIntervalSince(
+                    Date(timeIntervalSince1970: Double(oldestStartedMs) / 1000)))
+            let count = Text("\(running.count) running")
+                .font(V4.font(V4.dimSize, .semibold))
+                .foregroundColor(Tok.ok)
+            let duration = durationLabel(elapsed)
+            ViewThatFits(in: .horizontal) {
+                sessionStatusText(count, " · oldest \(duration)").fixedSize()
+                sessionStatusText(count, " · \(duration)").fixedSize()
+                sessionStatusText(count, " · \(duration)")
+            }
+        } else {
+            Text(trailingStatus(row, now: now))
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(row.activity == .waiting ? Tok.near : Tok.dim)
+                .monospacedDigit()
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    private func sessionStatusText(_ count: Text, _ tail: String) -> some View {
+        (count
+            + Text(tail)
+            .font(V4.font(V4.dimSize))
+            .foregroundColor(Tok.dim))
+            .monospacedDigit()
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
     private func trailingStatus(_ row: JoinedSession, now: Date) -> String {
         let running = row.session.tools.running
         guard !running.isEmpty, let oldestStartedMs = running.compactMap(\.startedMs).min() else {
-            return row.ageLabel(now: now)
+            // `docs/design/panel-tabs-mockup.html`'s "waiting 12m" / "idle
+            // 40m" — the activity word the dot already carries as colour,
+            // said again in text so the row still reads without it (the
+            // same "the color-alone trigger never fires" property every
+            // other status on this tab already has). `.unknown` prints no
+            // word: it is the join-has-no-file case, not a fourth state
+            // this build has a name for, and inventing one here would claim
+            // a reading nobody made.
+            let age = row.ageLabel(now: now)
+            switch row.activity {
+            case .waiting: return "waiting \(age)"
+            case .idle: return "idle \(age)"
+            case .busy, .unknown: return age
+            }
         }
         let elapsed = max(
             0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(oldestStartedMs) / 1000)))
@@ -670,62 +1151,166 @@ struct FleetView: View {
     }
 
     private func toolsList(_ fleet: Fleet) -> some View {
-        VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+        // v4-spec: each section (RUNNING NOW, SLOWEST TODAY, BY TOOL) is a
+        // card under its own section head, at the same `Tok.cardGap` the other
+        // two tabs use — Gil, reading round 7's renders: "why sessions and
+        // tools missing containers?". The head sits INSIDE its card here
+        // rather than above it, so a section reads as one object; the mockup
+        // draws it the same way.
+        VStack(alignment: .leading, spacing: Tok.cardGap) {
             // `docs/design/panel-tabs-review.md` finding 3: the sum over
             // EVERY tool, never one category standing in for the total —
             // `toolsTotalCalls` already sums across every session's
             // `tools.calls`, whatever tool made each call.
-            Text(
-                "\(fleet.toolsTotalCalls) calls · \(fleet.toolsTotalErrors) errors"
-                    + " · \(fleet.toolsTotalTimeouts) timeouts"
-            )
-            .font(Tok.secondaryDigitFont)
-            .foregroundStyle(Tok.inkDim)
-
             if !fleet.toolsRunning.isEmpty {
-                VStack(alignment: .leading, spacing: Tok.space1) {
-                    sectionHeading("RUNNING NOW")
+                toolsSection("RUNNING NOW", subtitle: "Ring fills toward the 600s timeout") {
                     // Finding 5: state the denominator a ring fills toward,
-                    // rather than drawing a fraction with no stated whole.
-                    Text("Ring fills toward the 600s Bash timeout")
-                        .font(Tok.detailFont)
-                        .foregroundStyle(Tok.inkFaint)
+                    // rather than drawing a fraction with no stated whole —
+                    // that is the `subtitle` above.
+                    ForEach(fleet.toolsRunning) { entry in runningToolRow(entry) }
                 }
-                ForEach(fleet.toolsRunning) { entry in runningToolRow(entry) }
             }
             if !fleet.toolsSlowest.isEmpty {
-                sectionHeading("SLOWEST TODAY")
-                ForEach(fleet.toolsSlowest) { entry in slowestToolRow(entry) }
+                toolsSection("SLOWEST TODAY", subtitle: nil) {
+                    // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
+                    // across every session, and a panel this tall shows half of
+                    // them before the fold.
+                    ForEach(fleet.toolsSlowest.prefix(Self.slowestVisibleRows)) { entry in
+                        slowestToolRow(entry)
+                    }
+                }
             }
             if fleet.toolsRunning.isEmpty && fleet.toolsSlowest.isEmpty {
                 Text("No tool calls recorded yet.")
-                    .font(Tok.secondaryFont)
+                    .font(Tok.dimLineFont)
                     .foregroundStyle(Tok.inkDim)
+            }
+            if let categories = fleet.toolsByCategory {
+                toolsSection("BY TOOL", subtitle: "share of \(QuotaFormat.count(fleet.toolsTotalCalls))") {
+                    ForEach(categories) { category in
+                        byToolRow(category, total: fleet.toolsTotalCalls)
+                    }
+                }
             }
         }
     }
 
+    /// One Tools-tab section: its head, an optional subtitle, and its rows,
+    /// inside the panel's shared card box.
+    ///
+    /// The head lives inside the card rather than above it because the card IS
+    /// the section — the mockup draws it that way, and a head floating over a
+    /// box labels the gap as much as the box.
+    private func toolsSection<Content: View>(
+        _ title: String, subtitle: String?, @ViewBuilder rows: @escaping () -> Content
+    ) -> some View {
+        // The head sits ABOVE the card, not inside it — `.sec` is a sibling of
+        // `.card` in the mockup, with `margin:12px 4px 4px`. Inside, it reads as
+        // the card's first row and competes with the rows that carry data.
+        VStack(alignment: .leading, spacing: 0) {
+            SectionHead(title: title, unit: subtitle.map { "· \($0)" })
+                .padding(.horizontal, V4.sectionHeadMarginSide)
+                .padding(.bottom, V4.sectionHeadMarginBottom)
+            V4Card {
+                // `V4Card` stacks at 0 and a card's rows carry their own line
+                // box; these rows are two lines each with a 34 pt ring beside
+                // them, so without a gap the rings touch and the meta line of
+                // one row reads as the third line of the row above.
+                VStack(alignment: .leading, spacing: V4.rowGap) {
+                    rows()
+                }
+            }
+        }
+    }
+
+    /// One `BY TOOL` bar — `docs/design/panel-tabs-mockup.html` F15: every
+    /// bar is a share of the STATED total (never its own category's max), so
+    /// the three widths are directly comparable at a glance.
+    private func byToolRow(_ category: ToolCategory, total: Int) -> some View {
+        let share = total > 0 ? Double(category.calls) / Double(total) : 0
+        return V4Row {
+            HStack(spacing: V4.quotaGap) {
+                Text(category.name)
+                    .font(V4.font(V4.dimSize))
+                    .foregroundStyle(Tok.dim)
+                    .lineLimit(1)
+                    .fixedSize()
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            .fill(Tok.ink.opacity(V4.barTrackAlpha))
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            .fill(byToolColor(category.name))
+                            .frame(width: max(V4.barMinWidth, proxy.size.width * share))
+                    }
+                }
+                .frame(height: V4.barHeight)
+                .frame(maxWidth: V4.barCappedWidth)
+            }
+        } trailing: {
+            // Not in the ring column: this row has no ring, its value is the
+            // row's whole point, and the bar beside it is capped at 110 pt and
+            // can give up the space. Right edge at the card's content edge, the
+            // same as every other trailing item on the tab.
+            Text(byToolTrailingLabel(category))
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(Tok.dim)
+                .lineLimit(1)
+                .fixedSize()
+        }
+    }
+
+    /// Bash is `--ok` green, Agent is `--info` blue (`.accent`, the closest
+    /// token this palette has to the mockup's dedicated info role — see
+    /// `docs/design/panel-tabs-review.md` finding 12, unresolved here), and
+    /// Read/Grep/Edit is the neutral `--mute` — `docs/design/panel-tabs-mockup.html`'s
+    /// three bar tints.
+    private func byToolColor(_ category: String) -> Color {
+        switch category {
+        case "Bash": return Tok.ok
+        case "Agent": return Tok.accent
+        default: return Tok.inkFaint
+        }
+    }
+
+    /// "19,913 · median 2.1s" — drops the median clause entirely when no
+    /// session reported one, the same silence-over-a-guess rule as the rest
+    /// of this tab.
+    private func byToolTrailingLabel(_ category: ToolCategory) -> String {
+        let calls = QuotaFormat.count(category.calls)
+        guard let median = category.medianSeconds else { return calls }
+        let formatted = median < 60 ? String(format: "%.1fs", median) : durationLabel(median)
+        return "\(calls) · median \(formatted)"
+    }
+
     private func sectionHeading(_ text: String) -> some View {
+        // v4-spec: section head is 11pt/700/+0.1em uppercase — `.caption2` is
+        // ~10pt; literal per the tokens-parity fence. The text itself is
+        // already authored uppercase at every call site, so no `.uppercased()`
+        // is added here.
         Text(text)
-            .font(.caption2.weight(.bold))
+            .font(Tok.sectionHeadFont)
             .foregroundStyle(Tok.inkFaint)
-            .tracking(Tok.pillTracking)
+            .tracking(0.1 * 11)
     }
 
     /// `commandHead` in monospace, truncated to one line — `panel-tabs-bridge.md`:
     /// "`command_head` shown in monospace, truncated to one line." Shared by
     /// ``runningToolRow(_:)`` and ``slowestToolRow(_:)`` so the two rows never
     /// drift on how a call names itself.
-    private func toolCallLabel(_ entry: SessionToolEntry) -> some View {
-        VStack(alignment: .leading, spacing: Tok.space1) {
-            Text(entry.call.commandHead ?? entry.call.tool)
-                .font(.system(size: Tok.detailFontSize, design: .monospaced))
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Text("\(entry.call.tool) · \(String(entry.sessionId.prefix(8)))")
-                .font(Tok.detailFont)
-                .foregroundStyle(Tok.inkDim)
-        }
+    /// `docs/design/panel-tabs-mockup.html`'s "Bash · teamclaude-rs-c7" — the
+    /// same ``JoinedSession/displayName`` the Sessions tab already draws for
+    /// this session id, read off ``sessionFiles`` directly: `Fleet.toolsRunning`/
+    /// `toolsSlowest` are pooled at the MODEL layer from the bare wire
+    /// sessions and carry no file join (`SessionToolEntry` is `{sessionId,
+    /// call}` only), so joining here — the one place this tab draws a
+    /// session id — is cheaper than threading `SessionFile` through the
+    /// model just to duplicate a lookup the Sessions tab already owns. Falls
+    /// back to the id's first 8 characters, same as `JoinedSession`'s own
+    /// rule, when no file matches.
+    private func toolCallOwnerName(_ sessionId: String) -> String {
+        if let name = sessionFiles[sessionId]?.name, !name.isEmpty { return name }
+        return String(sessionId.prefix(8))
     }
 
     /// The Bash tool's own timeout — the one denominator this build knows,
@@ -735,7 +1320,10 @@ struct FleetView: View {
     /// no ring, per finding 5's own fix ("state the denominator … set to the
     /// third ring") — inventing one for a tool this build has no timeout
     /// figure for would be the same overclaim finding 5 exists to remove.
-    private let bashTimeoutSeconds: Double = 600
+    private var bashTimeoutSeconds: Double { V4.toolTimeoutSeconds }
+
+    /// How many of the ten slowest calls the tab draws.
+    static let slowestVisibleRows = 5
 
     /// A running call: its ring (Bash only, filling toward
     /// ``bashTimeoutSeconds``) and its elapsed time since `startedMs`, turning
@@ -746,52 +1334,77 @@ struct FleetView: View {
         let elapsed = entry.call.startedMs.map { started in
             max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
         }
-        let isBash = entry.call.tool == "Bash"
         let remaining = elapsed.map { bashTimeoutSeconds - $0 }
-        let isNearTimeout = isBash && (remaining ?? .infinity) <= 20
-        return HStack(spacing: Tok.tightSpacing) {
-            toolCallLabel(entry)
-            Spacer()
-            VStack(alignment: .trailing, spacing: Tok.space1) {
-                if isBash, let elapsed {
-                    ZStack {
-                        Circle().stroke(Tok.hairline, lineWidth: 3)
-                        Circle()
-                            .trim(from: 0, to: min(elapsed / bashTimeoutSeconds, 1))
-                            .stroke(
-                                isNearTimeout ? Tok.spent : Tok.ok,
-                                style: StrokeStyle(lineWidth: 3, lineCap: .round)
-                            )
-                            .rotationEffect(.degrees(-90))
-                    }
-                    .frame(width: 18, height: 18)
-                }
-                if let elapsed {
-                    Text(
-                        isNearTimeout
-                            ? "\(Int(max(0, remaining ?? 0)))s to timeout" : durationLabel(elapsed)
-                    )
-                    .font(Tok.secondaryDigitFont)
-                    .monospacedDigit()
-                    .foregroundStyle(isNearTimeout ? Tok.spent : Tok.inkDim)
-                }
+        let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
+        return V4Row {
+            // The two text lines are the row; the ring sits beside BOTH of them,
+            // vertically centred, rather than pairing with the first and letting
+            // the row grow to the ring's height (Gil, 2026-09-13: three rows took
+            // 200 pt where the mockup takes 150). The sub line now has the whole
+            // leading column — 224 pt against the 200 pt it needs — so
+            // "· 20s to timeout" survives without a `fixedSize` fight.
+            VStack(alignment: .leading, spacing: 0) {
+                MonoText(text: entry.call.commandHead ?? entry.call.tool)
+                toolCallSubLine(entry, remaining: isNearTimeout ? remaining : nil)
             }
+        } trailing: {
+                // Ring and duration on ONE line, inside the shared column: the
+                // two are one reading ("how far through its timeout is this
+                // call"), and stacking them made the pair read as two items.
+                TrailingColumn {
+                    HStack(spacing: V4.rowGap) {
+                        Spacer(minLength: 0)
+                        ProgressRing(
+                            fraction: (elapsed ?? 0) / bashTimeoutSeconds,
+                            tint: isNearTimeout ? Tok.spent : Tok.ok,
+                            accessibilityText: elapsed.map {
+                                "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
+                            })
+                        Text(elapsed.map(durationLabel) ?? "")
+                            .font(V4.font(V4.dimSize))
+                            .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
+                            .lineLimit(1)
+                            .frame(width: V4.durationColumnWidth, alignment: .trailing)
+                    }
+                }
         }
-        .padding(.vertical, Tok.space1)
+        .frame(minHeight: V4.ringRowMinHeight)
+    }
+
+    /// "Agent · teamclaude-rs-c7 · 20s to timeout" — the tool, whose session it
+    /// belongs to, and what is left of its timeout.
+    private func toolCallSubLine(_ entry: SessionToolEntry, remaining: Double?) -> some View {
+        HStack(spacing: 0) {
+            MuteText(text: "\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
+            if let remaining {
+                Text(" · \(Int(max(0, remaining.rounded())))s to timeout")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.spent)
+                    .lineLimit(1)
+                    // Never the clause that gives way: the tool and its owner
+                    // are said again elsewhere on the panel, and this is the
+                    // only place the row says how long is left.
+                    .fixedSize()
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     private func slowestToolRow(_ entry: SessionToolEntry) -> some View {
-        HStack(spacing: Tok.tightSpacing) {
-            toolCallLabel(entry)
-            Spacer()
-            if let seconds = entry.call.seconds {
-                Text(durationLabel(seconds))
-                    .font(Tok.secondaryDigitFont)
-                    .monospacedDigit()
-                    .foregroundStyle(seconds >= bashTimeoutSeconds ? Tok.spent : Tok.inkDim)
+        // ONE line, as the mockup draws it: the command, ellipsised at the pill
+        // column. The second line the pre-v4 row added ("Bash · mycelium-c2")
+        // cost 55 pt a row and pushed three of the five slowest below the fold.
+        V4Row {
+            MonoText(text: entry.call.commandHead ?? entry.call.tool)
+        } trailing: {
+            TrailingColumn(width: V4.durationColumnWidth) {
+                if let seconds = entry.call.seconds {
+                    V4Pill(
+                        text: durationLabel(seconds),
+                        role: seconds >= bashTimeoutSeconds ? .bad : .neutral)
+                }
             }
         }
-        .padding(.vertical, Tok.space1)
     }
 
     /// `"45s"`, `"4m 12s"` — no day tier: the longest call this tab shows is
@@ -801,6 +1414,77 @@ struct FleetView: View {
         let minutes = total / 60
         let rest = total % 60
         return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
+    }
+
+    /// "updated 4s ago" — `docs/design/panel-tabs-mockup.html` F14. No day/hour
+    /// tier: a poll older than a few minutes is already covered by the
+    /// non-healthy-read summary line above it in ``header``.
+    private func freshnessLabel(since: Date, now: Date) -> String {
+        let elapsed = max(0, now.timeIntervalSince(since))
+        // Coordinator-flagged (2026-09-12): a fixture pinned to a fixed past
+        // `referenceDate` (`RenderStates.referenceDate`) produced "updated
+        // 54097m ago" against a real `Date()` — a five-digit minute count is
+        // a defect regardless of what produced the gap, so this tiers all
+        // the way up rather than assuming a poll is always recent.
+        if elapsed < 60 { return "updated \(Int(elapsed.rounded()))s ago" }
+        if elapsed < 3600 { return "updated \(Int((elapsed / 60).rounded()))m ago" }
+        if elapsed < 86400 { return "updated \(Int((elapsed / 3600).rounded()))h ago" }
+        return "updated \(Int((elapsed / 86400).rounded()))d ago"
+    }
+
+    /// Sessions tab summary — "12 sessions · 7 busy · 1 waiting · 4 idle",
+    /// `docs/design/panel-tabs-mockup.html`'s Sessions panel. Joined with
+    /// ``sessionFiles`` the same way ``sessionsList(_:)`` does, so the two
+    /// counts on this tab (the summary and the rows below it) can never
+    /// disagree about what "busy" means for a given session.
+    private func sessionsSummaryLine(_ fleet: Fleet) -> some View {
+        let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
+        let busy = joined.filter { $0.activity == .busy }.count
+        let waiting = joined.filter { $0.activity == .waiting }.count
+        let idle = joined.count - busy - waiting
+        var line = Text("\(joined.count) sessions").font(.subheadline.weight(.semibold))
+        line =
+            line + Text(" · ").foregroundColor(Tok.inkFaint)
+            + Text("\(busy) busy").foregroundColor(Tok.ok)
+        line =
+            line + Text(" · ").foregroundColor(Tok.inkFaint)
+            + Text("\(waiting) waiting").foregroundColor(Tok.near)
+        line =
+            line + Text(" · ").foregroundColor(Tok.inkFaint)
+            + Text("\(idle) idle").foregroundColor(Tok.inkDim)
+        return
+            line
+            .font(Tok.secondaryDigitFont)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, Tok.tightSpacing)
+            .lineSpacing(Tok.secondaryLineSpacing)
+    }
+
+    /// Tools tab summary — "24,677 tool calls today · 405 ran over 1m · 31 hit
+    /// the 600s timeout", `docs/design/panel-tabs-mockup.html`'s Tools panel.
+    /// `toolsTotalTimeouts` IS "hit the 600s timeout": the only tool this
+    /// build tracks a timeout for is Bash, and its timeout is 600s
+    /// (``bashTimeoutSeconds``), so a counted timeout and a 600s hit are the
+    /// same event, not two facts that happen to agree.
+    private func toolsSummaryLine(_ fleet: Fleet) -> some View {
+        var line =
+            Text("\(fleet.toolsTotalCalls) tool calls today").fontWeight(.semibold)
+        if let overOneMinute = fleet.toolsOverOneMinute {
+            line =
+                line + Text(" · ").foregroundColor(Tok.inkFaint)
+                + Text("\(overOneMinute) ran over 1m").foregroundColor(Tok.inkDim)
+        }
+        if fleet.toolsTotalTimeouts > 0 {
+            line =
+                line + Text(" · ").foregroundColor(Tok.inkFaint)
+                + Text("\(fleet.toolsTotalTimeouts) hit the 600s timeout").foregroundColor(Tok.spent)
+        }
+        return
+            line
+            .font(Tok.secondaryDigitFont)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, Tok.tightSpacing)
+            .lineSpacing(Tok.secondaryLineSpacing)
     }
 
     /// The account list, cut into sections: a state band heading, then a group
@@ -838,17 +1522,20 @@ struct FleetView: View {
     /// direction.
     private func accountList(_ fleet: Fleet) -> some View {
         let sections = fleet.sectionsInDisplayOrder(pinning: control.current)
-        return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
+        // v4-spec: gap between cards is 14pt — `Tok.cardGap` since #240,
+        // which is that same value under the tokens lane's own name.
+        // `Tok.rowSpacing` (8) is the gap between lines INSIDE a card.
+        return VStack(alignment: .leading, spacing: Tok.cardGap) {
             // Identified by `FleetSection.id` (band + group), not by group
             // alone: a group whose accounts differ in state appears in more
             // than one band, and two sections sharing a SwiftUI identity paint
             // one section's rows into the other's slot.
             ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                if sections.isFirstOfBand(index) {
+                if drawsBandHeading(sections, at: index) {
                     bandHeading(section.band, soleGroupInBand: sections.soleGroupInBand(at: index))
                 }
                 sectionBody(
-                    section, drawsHeading: sections.drawsGroupHeading(at: index), fleet: fleet)
+                    section, drawsHeading: drawsGroupHeading(sections, at: index), fleet: fleet)
             }
         }
     }
@@ -871,13 +1558,24 @@ struct FleetView: View {
     private func sectionBody(_ section: FleetSection, drawsHeading: Bool, fleet: Fleet)
         -> some View
     {
+        // Two collapsed shapes, one expansion switch (`expandedGroups`).
+        //
         // "maybe smoush the group" (Gil, 2026-09-12): a wholly-parked NAMED
         // group renders one line per account — no quota bars, no cost line —
-        // until its own legend is clicked. Remembered per group name across
-        // launches (`expandedParkedGroups`), never for a live group: there is
-        // nothing here worth hiding from an operator who can act on it right
-        // now.
-        let collapsed = section.isWhollyParked && !expandedParkedGroups.contains(section.group.token)
+        // and now stops after ``parkedVisibleRows`` of them with a "Show N
+        // more accounts" button, `docs/design/panel-tabs-mockup.html`'s own
+        // HENRY-TOKEN shape (3 of 5 visible).
+        //
+        // A LIVE group of four or more whose rows all still serve traffic
+        // (``FleetSection/collapsesByDefault``) renders NO cards at all: one
+        // summary line, its state tally, and a button. That is the mockup's
+        // MYCELIUM group, and it is a real state rather than a clipped list —
+        // `snapshotMode` draws it exactly as the live panel does.
+        let expanded = expandedGroups.contains(section.group.token)
+        let summarised = section.collapsesByDefault && !expanded
+        let smooshed = section.isWhollyParked && !expanded
+        let visibleParked = Array(section.rows.prefix(Self.parkedVisibleRows))
+        let hiddenParked = section.rows.count - visibleParked.count
         return VStack(alignment: .leading, spacing: Tok.rowSpacing) {
             // The plain-text heading is for a section with no stroke to carry
             // a legend on — the unlabelled pile, or a named group whose
@@ -886,9 +1584,21 @@ struct FleetView: View {
             if drawsHeading && section.outlineColor == nil {
                 groupHeading(section)
             }
-            if collapsed {
-                ForEach(section.rows) { row in
-                    smooshedAccountRow(row)
+            if summarised {
+                measured(summaryHeightKey(section)) {
+                    collapsedGroupSummary(section)
+                }
+            } else if smooshed {
+                ForEach(visibleParked) { row in
+                    measured(row.id) { smooshedAccountRow(row) }
+                }
+                if hiddenParked > 0 {
+                    measured(disclosureHeightKey(section)) {
+                        disclosureButton(
+                            "Show \(hiddenParked) more \(hiddenParked == 1 ? "account" : "accounts")",
+                            hint: "Shows the rest of this parked group."
+                        ) { toggleGroupExpansion(section.group.token) }
+                    }
                 }
             } else {
                 ForEach(section.rows) { row in
@@ -911,6 +1621,93 @@ struct FleetView: View {
         }
     }
 
+    /// How many accounts a collapsed, wholly-parked group still shows before
+    /// the "Show N more accounts" button —
+    /// `docs/design/panel-tabs-mockup.html`'s HENRY-TOKEN group draws three of
+    /// its five. Three is enough for the group to read as a list of real
+    /// accounts rather than as a number, and small enough that a large parked
+    /// group cannot push the live ones off the panel.
+    static let parkedVisibleRows = 3
+
+    /// The whole of a collapsed LIVE group: "6 accounts · $8.42 today", its
+    /// state tally, and the button that opens it.
+    ///
+    /// Everything drawn here is a ``FleetSection`` property — the line, the
+    /// tally and the button's wording — so what an operator reads is testable
+    /// without SwiftUI and cannot drift from what the section actually holds.
+    private func collapsedGroupSummary(_ section: FleetSection) -> some View {
+        VStack(alignment: .leading, spacing: Tok.space1) {
+            HStack(spacing: Tok.tightSpacing) {
+                // v4-spec: the dim line is 13pt/400. Tabular, like every
+                // other changing number on this panel.
+                Text(section.collapsedSummaryLine)
+                    .font(Tok.dimLineFont)
+                    .monospacedDigit()
+                    .foregroundStyle(Tok.inkDim)
+                    .lineLimit(1)
+                Spacer(minLength: Tok.tightSpacing)
+                ForEach(section.breakdown, id: \.kind.token) { tally in
+                    StatusPill(tally.label, tint: tallyTint(tally.kind))
+                }
+            }
+            disclosureButton(
+                section.expandButtonLabel,
+                hint: "Shows every account in this group."
+            ) { toggleGroupExpansion(section.group.token) }
+        }
+    }
+
+    /// The tint for one ``FleetTally/Kind``. `.needsRelogin` shares `spent`'s
+    /// red because both mean the account serves nothing right now; the pill's
+    /// own text is what distinguishes them, the same way every other status on
+    /// this panel reads without its colour.
+    private func tallyTint(_ kind: FleetTally.Kind) -> Color {
+        switch kind {
+        case .ok: return Tok.color(for: QuotaState.ok)
+        case .near: return Tok.color(for: QuotaState.near)
+        case .spent, .needsRelogin: return Tok.spent
+        case .unknown: return Tok.unknown
+        case .unmeasured: return Tok.unmeasured
+        case .disabled: return Tok.disabled
+        }
+    }
+
+    /// The one disclosure control on this panel — "Show 6 accounts in this
+    /// group", "Show 2 more accounts", "Show 7 more sessions".
+    ///
+    /// v4-spec's button box (13pt label, radius 7, min-height 28, `line`
+    /// border over a 10% white wash) drawn by hand rather than
+    /// `.buttonStyle(.bordered)`: the system chrome is a capsule of a
+    /// different height and cannot span the group's width, and this control's
+    /// whole job is to be the width of the thing it opens.
+    ///
+    /// `hint` is spoken, never drawn — the label already says what the button
+    /// shows, and a VoiceOver user gets the consequence instead of the same
+    /// words twice.
+    private func disclosureButton(
+        _ title: String, hint: String, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: Tok.space1) {
+                Image(systemName: "chevron.down")
+                Text(title)
+            }
+            .font(Tok.buttonFont)
+            .foregroundStyle(Tok.ink)
+            .frame(maxWidth: .infinity, minHeight: Tok.buttonMinHeight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .background(
+            RoundedRectangle(cornerRadius: Tok.buttonRadius).fill(Tok.raised)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: Tok.buttonRadius)
+                .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
+        )
+        .accessibilityHint(hint)
+    }
+
     /// One line per account inside a collapsed, wholly-parked group: the
     /// name, its plan in dim text, and the SAME quota-state pill
     /// `AccountRow.information` draws — never its rotation pill, since every
@@ -922,13 +1719,13 @@ struct FleetView: View {
         let account = row.account
         return HStack(spacing: Tok.tightSpacing) {
             Text(account.name)
-                .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
+                .font(Tok.nameFont).lineSpacing(Tok.bodyLineSpacing)
                 .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                 .lineLimit(1)
                 .help(account.name)
             if let plan = account.plan, !plan.isEmpty {
                 Text(plan)
-                    .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
+                    .font(Tok.muteLineFont).lineSpacing(Tok.detailLineSpacing)
                     .foregroundStyle(Tok.inkFaint)
                     .lineLimit(1)
             }
@@ -1016,12 +1813,48 @@ struct FleetView: View {
     /// ``groupHeading(_:)`` already follows: an unkeyed, undrawn heading
     /// charges the viewport nothing, and a keyed-but-undrawn one would
     /// charge for a row that is not there.
+    /// Whether the list draws a band heading above the section at `index`.
+    ///
+    /// The draw loop and ``listChildKeys(_:)`` both ask THIS, not
+    /// ``Array/isFirstOfBand(_:)`` directly: a heading drawn but unkeyed is a
+    /// row the viewport never charges for, and a heading keyed but not drawn
+    /// charges for a row that is not there. Both clip. `bandHeading` itself
+    /// then makes the same two refusals (sole group in band, and the LIVE
+    /// band) — kept there too because that is where each one's reason lives.
+    private func drawsBandHeading(_ sections: [FleetSection], at index: Int) -> Bool {
+        guard sections.isFirstOfBand(index), sections.indices.contains(index) else { return false }
+        let section = sections[index]
+        return !sections.soleGroupInBand(at: index) && section.band != .live
+    }
+
+    /// Whether the list draws a plain-text group heading above the section at
+    /// `index` — ``Array/drawsGroupHeading(at:)``, minus the unlabelled pile.
+    ///
+    /// v4 draws no "Ungrouped" heading: the mockup's Accounts panel opens on
+    /// the solo cards with nothing over them, and a heading whose whole
+    /// content is "these have no group" is the row of dead space
+    /// `drawsGroupHeading`'s own doc-comment already argues against for the
+    /// single-section case. The model's rule is left alone — this is a
+    /// drawing decision, and `FleetSectionsTests` pins the model's.
+    private func drawsGroupHeading(_ sections: [FleetSection], at index: Int) -> Bool {
+        guard sections.indices.contains(index) else { return false }
+        return sections.drawsGroupHeading(at: index) && sections[index].group != .ungrouped
+    }
+
     @ViewBuilder
     private func bandHeading(_ band: FleetBand, soleGroupInBand: Bool) -> some View {
-        if !soleGroupInBand {
+        // The LIVE band draws no heading at all in v4 (Gil, reading the panel
+        // beside `docs/design/panel-tabs-mockup.html`: the mockup's Accounts
+        // panel opens straight onto the solo cards, and each group labels
+        // itself with its own legend). `outOfTokens` and `parked` keep theirs:
+        // the mockup never draws either state, so its silence is not evidence
+        // for deleting the only label an ungrouped spent row has — a named
+        // group carries "· PARKED" in its legend, an unlabelled pile carries
+        // nothing.
+        if !soleGroupInBand && band != .live {
             measured(bandHeightKey(band)) {
                 Text(band.title.uppercased())
-                    .font(Tok.detailFont.weight(.semibold)).lineSpacing(Tok.detailLineSpacing)
+                    .font(Tok.sectionHeadFont).lineSpacing(Tok.detailLineSpacing)
                     .tracking(Tok.pillTracking)
                     .foregroundStyle(Tok.inkDim)
             }
@@ -1059,38 +1892,49 @@ struct FleetView: View {
     private func groupHeading(_ section: FleetSection) -> some View {
         if let rgb = section.outlineColor {
             let color = Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
-            let legend = Text(section.legendText)
-                .font(Tok.detailFont.weight(.bold)).lineSpacing(Tok.detailLineSpacing)
-                .tracking(Tok.pillTracking)
-                .foregroundStyle(color)
-                .padding(.horizontal, Tok.space1)
-                .padding(.vertical, Tok.space1)
-                // Matches the panel body behind it, so the stroke line reads
-                // as broken by the legend rather than running behind it.
-                //
-                // `Tok.panel` is a flat, fully opaque `Color` — this panel is
-                // NOT a real translucent material (no `NSVisualEffectView`
-                // anywhere in this target; `FleetView`'s own root is
-                // `.background(Tok.panel)`, a plain fill). The tabs-mockup
-                // review's finding 11 (an opaque legend patch reads as a
-                // black bar over a backdrop-filter panel) is a defect in that
-                // CSS approximation and does not reproduce here — checked
-                // against both appearances in `--render-states`, scene
-                // `15-parked-group`: the legend's background is pixel-
-                // identical to the panel around it in both. Revisit this
-                // comment the day this panel ever gains real vibrancy.
-                .background(Tok.panel)
-            if section.isWhollyParked {
+            // The mockup's own legend glyph — a rounded square in the group's
+            // colour, `<rect rx=4>` at 11px, ahead of the name
+            // (`docs/design/panel-tabs-mockup.html:291`). It is the second
+            // channel the group's identity rides on: the outline is the same
+            // hue and a reader who cannot separate two purples still gets a
+            // mark tying legend to box.
+            let legend = HStack(spacing: 4) {
+                Image(systemName: "square.fill")
+                    .font(.system(size: 8))
+                Text(section.legendText)
+                    .tracking(Tok.pillTracking)
+            }
+            .font(Tok.sectionHeadFont)
+            .lineSpacing(Tok.detailLineSpacing)
+            .foregroundStyle(color)
+            .padding(.horizontal, Tok.space1)
+            .padding(.vertical, Tok.space1)
+            // Matches the panel body behind it, so the stroke line reads
+            // as broken by the legend rather than running behind it.
+            //
+            // `Tok.panel` is a flat, fully opaque `Color` — this panel is
+            // NOT a real translucent material (no `NSVisualEffectView`
+            // anywhere in this target; `FleetView`'s own root is
+            // `.background(Tok.panel)`, a plain fill). The tabs-mockup
+            // review's finding 11 (an opaque legend patch reads as a
+            // black bar over a backdrop-filter panel) is a defect in that
+            // CSS approximation and does not reproduce here — checked
+            // against both appearances in `--render-states`, scene
+            // `15-parked-group`: the legend's background is pixel-
+            // identical to the panel around it in both. Revisit this
+            // comment the day this panel ever gains real vibrancy.
+            .background(Tok.panel)
+            if section.isWhollyParked || section.collapsesByDefault {
                 Button {
-                    toggleParkedGroupExpansion(section.group.token)
+                    toggleGroupExpansion(section.group.token)
                 } label: {
                     legend
                 }
                 .buttonStyle(.plain)
                 .accessibilityHint(
-                    expandedParkedGroups.contains(section.group.token)
-                        ? "Collapses this parked group."
-                        : "Expands this parked group."
+                    expandedGroups.contains(section.group.token)
+                        ? "Collapses this group."
+                        : "Expands this group."
                 )
             } else {
                 legend
@@ -1104,29 +1948,60 @@ struct FleetView: View {
         }
     }
 
-    /// Persisted across launches under ``expandedParkedGroupsKey`` — a
-    /// wholly-parked group an operator has already looked at once should
-    /// stay open, not re-collapse on the next poll or the next time the
-    /// panel opens. Keyed on ``FleetGroupKey/token`` rather than the bare
-    /// name for the same collision reason `FleetSectionRow.id` uses it: a
-    /// group literally named `Ungrouped` cannot borrow the sentinel's key.
-    @State private var expandedParkedGroups: Set<String> = Set(
-        UserDefaults.standard.stringArray(forKey: FleetView.expandedParkedGroupsKey) ?? [])
+    /// Persisted across launches under ``expandedGroupsKey`` — a collapsed
+    /// group an operator has already opened once should stay open, not
+    /// re-collapse on the next poll or the next time the panel opens. Keyed on
+    /// ``FleetGroupKey/token`` rather than the bare name for the same collision
+    /// reason `FleetSectionRow.id` uses it: a group literally named
+    /// `Ungrouped` cannot borrow the sentinel's key.
+    ///
+    /// ONE set for both collapsed shapes — the parked smoosh and a live
+    /// group's summary line. "This group is open" is one fact about one group,
+    /// and a second set keyed the same way would let the two disagree about a
+    /// group that is parked today and live tomorrow.
+    @State private var expandedGroups: Set<String> = Set(
+        UserDefaults.standard.stringArray(forKey: FleetView.expandedGroupsKey) ?? [])
 
     /// Internal, not `private`, so ``RenderStates`` — this file's `--render-
     /// states` harness, same target — can seed and clear it around one scene
     /// (`15b-parked-group-expanded`) without a second copy of the literal.
-    static let expandedParkedGroupsKey = "expandedParkedGroupNames"
+    static let expandedGroupsKey = "expandedGroupNames"
 
-    private func toggleParkedGroupExpansion(_ groupToken: String) {
-        if expandedParkedGroups.contains(groupToken) {
-            expandedParkedGroups.remove(groupToken)
+    private func toggleGroupExpansion(_ groupToken: String) {
+        if expandedGroups.contains(groupToken) {
+            expandedGroups.remove(groupToken)
         } else {
-            expandedParkedGroups.insert(groupToken)
+            expandedGroups.insert(groupToken)
         }
-        UserDefaults.standard.set(
-            Array(expandedParkedGroups), forKey: Self.expandedParkedGroupsKey)
+        UserDefaults.standard.set(Array(expandedGroups), forKey: Self.expandedGroupsKey)
     }
+
+    /// Whether the SESSIONS tab is showing every session or the first
+    /// ``sessionsVisibleRows``. One flag for the whole tab, not one per
+    /// account: the mockup's own button ("Show 7 more sessions") counts across
+    /// accounts, and a per-account switch would leave a reader clicking five
+    /// buttons to answer one question.
+    @State private var sessionsExpanded: Bool = UserDefaults.standard.bool(
+        forKey: FleetView.sessionsExpandedKey)
+
+    static let sessionsExpandedKey = "sessionsListExpanded"
+
+    /// How many session rows the Sessions tab draws before its own disclosure
+    /// button — `docs/design/panel-tabs-mockup.html` shows five of twelve.
+    static let sessionsVisibleRows = 5
+
+    private func toggleSessionsExpansion() {
+        sessionsExpanded.toggle()
+        UserDefaults.standard.set(sessionsExpanded, forKey: Self.sessionsExpandedKey)
+    }
+
+    /// Height key for a collapsed group's summary block. Same `<letter>:`
+    /// shape as every other key here, and `s:` cannot collide with a row key
+    /// (those start with `g:`/`u:`) or with the band and heading keys.
+    private func summaryHeightKey(_ section: FleetSection) -> String { "s:\(section.id)" }
+
+    /// Height key for a disclosure button drawn under a section's rows.
+    private func disclosureHeightKey(_ section: FleetSection) -> String { "d:\(section.id)" }
 
     /// Height key for a band heading. The `b:` prefix cannot collide with a row
     /// key — those start with a ``FleetGroupKey/token``, `g:` or `u:` — and the
@@ -1256,14 +2131,29 @@ struct FleetView: View {
     private func listChildKeys(_ sections: [FleetSection]) -> [String] {
         var keys: [String] = []
         for (index, section) in sections.enumerated() {
-            if sections.isFirstOfBand(index) {
+            if drawsBandHeading(sections, at: index) {
                 keys.append(bandHeightKey(section.band))
             }
             // Same predicate as the draw loop, deliberately. See there.
-            if sections.drawsGroupHeading(at: index) {
+            if drawsGroupHeading(sections, at: index) {
                 keys.append(groupHeightKey(section))
             }
-            keys.append(contentsOf: section.rows.map(\.id))
+            // Same three branches as `sectionBody`, in the same order and on
+            // the same predicates — a collapsed group draws ONE block where
+            // the expanded one draws a card per account, and charging the
+            // viewport for six cards it is not drawing is how a panel ends up
+            // with a scroll view taller than its own content.
+            let expanded = expandedGroups.contains(section.group.token)
+            if section.collapsesByDefault && !expanded {
+                keys.append(summaryHeightKey(section))
+            } else if section.isWhollyParked && !expanded {
+                keys.append(contentsOf: section.rows.prefix(Self.parkedVisibleRows).map(\.id))
+                if section.rows.count > Self.parkedVisibleRows {
+                    keys.append(disclosureHeightKey(section))
+                }
+            } else {
+                keys.append(contentsOf: section.rows.map(\.id))
+            }
         }
         return keys
     }
@@ -1301,14 +2191,18 @@ struct FleetView: View {
             // the header, pushing the fleet's own numbers down for a string
             // read about once a release.
             HStack(spacing: Tok.tightSpacing) {
+                // v4-spec: footer is 12.5pt/400, `--mute` throughout — both
+                // runs were two different sizes/roles (`Tok.secondaryFont`
+                // 11pt/dim, `Tok.detailDigitFont` 10pt/faint). Literal per
+                // the tokens-parity fence.
                 Text(server.state.summary)
-                    .font(Tok.secondaryFont).lineSpacing(Tok.secondaryLineSpacing)
-                    .foregroundStyle(Tok.inkDim)
+                    .font(Tok.freshnessFont)
+                    .foregroundStyle(Tok.inkFaint)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: Tok.tightSpacing)
                 if case .loaded(let fleet) = poller.state, let sha = fleet.serverSha {
                     Text("server \(sha)\(fleet.serverDirty ? "-dirty" : "")")
-                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
+                        .font(Tok.tabular(Tok.freshnessFont))
                         .foregroundStyle(Tok.inkFaint)
                         .lineLimit(1)
                 }
@@ -1588,6 +2482,30 @@ enum PanelTab: Equatable, CaseIterable {
     }
 }
 
+/// A session row's req/min trend — `docs/design/panel-tabs-mockup.html`'s
+/// `.spark` polyline. Draws `nil`/negative values as zero rather than
+/// crashing the normalisation on an empty range; a flat all-zero series
+/// still draws a flat line at the bottom, which is the honest shape for
+/// "measured, and nothing happened."
+struct Sparkline: Shape {
+    let values: [UInt16]
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard values.count > 1 else { return path }
+        let maxValue = max(1, Double(values.max() ?? 1))
+        let stepX = rect.width / CGFloat(values.count - 1)
+        func point(_ index: Int) -> CGPoint {
+            let x = CGFloat(index) * stepX
+            let y = rect.height * (1 - CGFloat(Double(values[index]) / maxValue))
+            return CGPoint(x: x, y: y)
+        }
+        path.move(to: point(0))
+        for i in 1..<values.count { path.addLine(to: point(i)) }
+        return path
+    }
+}
+
 struct RowHeightsKey: PreferenceKey {
     static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
@@ -1611,6 +2529,37 @@ struct UsageLineBaselineKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+extension View {
+    /// The panel's one card box — v4-spec's `.card`: radius 8, padding 10 12,
+    /// the raised surface fill and a 1px `line` border.
+    ///
+    /// One definition for all three tabs. The Accounts tab had it inline on
+    /// ``AccountRow``; Sessions and Tools drew their content flat against the
+    /// panel, which is the gap Gil read off round 7's renders ("why sessions
+    /// and tools missing containers?"). Writing a second, near-identical box
+    /// for them would have been two places to change a radius.
+    ///
+    /// The radius stays a literal 8 after `feat/tokens-parity` landed (#240),
+    /// and that is deliberate: its `Tok.cardRadius` is an alias for
+    /// `radiusMedium`, 16, while `data/plans/v4-spec.md` measures the mockup's
+    /// card at 8. Swapping the name in would double the curve this bridge
+    /// exists to close. The gap between cards DID move to `Tok.cardGap` (14),
+    /// which agrees with the sheet. Revisit when `feat/tokens-v4` restyles the
+    /// radius family.
+    func panelCard() -> some View {
+        self
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: 8).fill(Tok.raised)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
+            )
     }
 }
 
@@ -1688,6 +2637,16 @@ struct AccountRow: View {
     /// Defaults to `false` so every other call site (the live panel) is
     /// unchanged.
     var snapshotMode: Bool = false
+    /// Render ONLY this row's menu items, with no row around them — what the v4
+    /// account card attaches as its context menu (``AccountsTabV4``).
+    ///
+    /// A flag rather than a second view: every item in ``contextMenuItems`` is
+    /// wired to this row's own controllers and its own `perform…` methods, and
+    /// lifting them into a standalone menu view would make the gear menu and the
+    /// card menu two definitions of what an account can do. The row is
+    /// constructed exactly as the legacy panel constructs it; only its `body`
+    /// differs.
+    var menuOnly: Bool = false
     /// The last "Copy Access Token" that did not land — `tcr`'s own words,
     /// drawn under the row like the other failure lines. Row-local rather
     /// than a controller: nothing else needs to know, and a copy that did
@@ -1993,7 +2952,7 @@ struct AccountRow: View {
     @ViewBuilder
     private var designationsLine: some View {
         if account.ref.displayHalves.orgTag != nil || account.plan != nil
-            || !visibleGroupTags.isEmpty
+            || account.windowUsageLabel != nil || !visibleGroupTags.isEmpty
         {
             HStack(spacing: Tok.tightSpacing) {
                 orgIndicator
@@ -2043,12 +3002,34 @@ struct AccountRow: View {
     @ViewBuilder
     private var planIndicator: some View {
         if let plan = account.plan, !plan.isEmpty {
-            Text(plan)
+            Text(planLineText(plan: plan))
                 .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
                 .foregroundStyle(Tok.inkFaint)
                 .fixedSize()
                 .help("This account's plan, as Anthropic reports it for its organization.")
+        } else if let usageLabel = account.windowUsageLabel {
+            // No plan on the wire, but there is still a spend figure to show
+            // — draw it alone rather than losing it, the same "an absent
+            // measurement never renders as a fabricated value" rule this
+            // slot already followed when it lived on the quota row.
+            Text(usageLabel)
+                .font(Tok.pillFont).lineSpacing(Tok.detailLineSpacing)
+                .foregroundStyle(usageFigureStyle)
+                .fixedSize()
         }
+    }
+
+    /// "Max 20x · $540 · 1.5M output tokens this week" —
+    /// `docs/design/panel-tabs-mockup.html`'s plan line, F8: spend and
+    /// output tokens moved off the quota grid and onto this line, which
+    /// already carried the plan name. `account.windowUsageLabel` is
+    /// `"$4.20 · 48k out"` (see its own doc-comment for the day-fallback and
+    /// partial-pricing markers it already carries); `nil` when the proxy
+    /// never measured this account, and the plan then draws alone rather
+    /// than growing a placeholder.
+    private func planLineText(plan: String) -> String {
+        guard let usageLabel = account.windowUsageLabel else { return plan }
+        return "\(plan) · \(usageLabel)"
     }
 
     @ViewBuilder
@@ -2253,35 +3234,28 @@ struct AccountRow: View {
     }
 
     var body: some View {
+        if menuOnly {
+            contextMenuItems
+        } else {
+            rowBody
+        }
+    }
+
+    private var rowBody: some View {
         rowContent
-            // The card inset. Concentric with the border below it: the corner
-            // radius is `Tok.radiusMedium` and this is the padding that keeps
-            // that curve from clipping the account name or the toggle button —
-            // an outer radius with no matching inset draws a border that bites
-            // into its own content at the corners.
+            // The card box — radius, padding, fill and border — is
+            // ``SwiftUI/View/panelCard()``, shared with the Sessions and Tools
+            // tabs so all three read as one design. It carries the concentric
+            // inset this comment used to describe: an outer radius with no
+            // matching padding draws a border that bites into its own content
+            // at the corners, which is why the padding and the radius are one
+            // definition and not two call sites.
             //
-            // Vertical padding moved from `Tok.space2` to `Tok.space3` when
-            // `radiusMedium` went from 8 to 14: the margin this comment
-            // describes is the inset minus roughly 0.29x the radius (where a
-            // `CGPath` corner arc stops intruding on a rectangular content
-            // box), and at the new radius `space2` (4pt) undercuts that by a
-            // fraction of a point. `space3` (8pt) clears it the way `space2`
-            // cleared the old, smaller radius.
-            //
-            // It is also the only inner padding now. `rowContent` carried a
-            // second one (`Tok.rowPaddingV`) from before this card had a border,
-            // when a row needed its own breathing room. Inside a bordered card
-            // with `Tok.rowSpacing` between cards it was 4pt of nothing.
-            .padding(.horizontal, Tok.space3)
-            .padding(.vertical, Tok.space3)
-            .background(
-                RoundedRectangle(cornerRadius: Tok.radiusMedium)
-                    .fill(Tok.raised)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: Tok.radiusMedium)
-                    .strokeBorder(Tok.hairlineStrong, lineWidth: Tok.hairlineWidth)
-            )
+            // That inset is also the row's ONLY inner padding now. `rowContent`
+            // carried a second one (`Tok.rowPaddingV`) from before this card had
+            // a border, when a row needed its own breathing room; inside a
+            // bordered card it was 4pt of nothing.
+            .panelCard()
             .contextMenu { contextMenuItems }
     }
 
@@ -2817,7 +3791,13 @@ struct AccountRow: View {
                 // would paste verbatim. `.help` below and "Copy Account
                 // Name" are the sanctioned ways to get the real address.
                 Text(emailWithBreakHint)
-                    .font(Tok.bodyFont).lineSpacing(Tok.bodyLineSpacing)
+                    // v4-spec: account name is 15pt/600/-0.005em, system
+                    // design — `Tok.bodyFont` is 13pt/medium/rounded, a
+                    // token owned by `feat/tokens-parity`; literal here per
+                    // the coordinator's fence until that lane's name lands.
+                    .font(Tok.nameFont)
+                    .tracking(-0.005 * 15)
+                    .lineSpacing(Tok.bodyLineSpacing)
                     .foregroundStyle(account.disabled ? Tok.disabled : Tok.ink)
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2920,28 +3900,14 @@ struct AccountRow: View {
                 resetAtMs: account.fiveHourResetAtMs,
                 captionTint: captionTint(for: .fiveHour)
             ) {
-                // This 5h window's spend and output tokens — `$4.20 · 48k out`,
-                // the account's own quota window when the server can name its
-                // start, otherwise its day (`Account.windowUsageLabel`).
-                // Absent, not zero, when the proxy did not measure this
-                // account: `windowUsageLabel` is nil there and this slot stays
-                // empty, because `$0.00 · 0` beside a live account is a claim
-                // nobody made. Demoted with `hasStaleQuotaReading` like the
-                // percentage beside it — a row must not read half live and
-                // half historical.
-                //
-                // Every form carries its unit and its span, because this slot
-                // sits in one HStack beside a percentage and a countdown: a
-                // bare `900` there read as 900 requests, 900 dollars or a
-                // second percentage. `$9.41 today` marks the day fallback,
-                // `$5.61+` marks a cost some of whose requests could not be
-                // priced, and tokens are `12k out`.
-                if let usageLabel = account.windowUsageLabel {
-                    Text(usageLabel)
-                        .font(Tok.detailDigitFont).lineSpacing(Tok.detailLineSpacing)
-                        .foregroundStyle(usageFigureStyle)
-                        .lineLimit(1)
-                }
+                // The spend/output-tokens figure that used to sit here moved
+                // to the plan line (`designationsLine` → `planIndicator`),
+                // per `docs/design/panel-tabs-mockup.html`'s plan line
+                // ("Max 20x · $540 · 1.5M output tokens this week") and the
+                // panel-parity finding that this column should carry one
+                // meaning — the reset countdown — on every row. See
+                // `planIndicator`'s doc-comment for where it draws now.
+                EmptyView()
             }
             .padding(.top, Tok.space1)
             quotaLine(
@@ -3099,8 +4065,12 @@ struct AccountRow: View {
                 // reachable.
                 .foregroundStyle(hasStaleQuotaReading ? Tok.disabled : Tok.inkDim)
             // Drawn whenever the wire has a reset for this window, beside the
-            // number it belongs to. Colour: `captionTint(for:)`.
-            if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: Date()) {
+            // number it belongs to. Colour: `captionTint(for:)`. `resetsCaption`,
+            // not `resetCaption`: this column is the grid's one meaning now
+            // that the spend figure that used to compete with it for the row's
+            // width moved onto the plan line (`designationsLine`) — see that
+            // formatter's own doc-comment.
+            if let caption = QuotaFormat.resetsCaption(resetAtMs: resetAtMs, now: Date()) {
                 Text(caption)
                     // Tabular, like the percentage it sits beside: this string
                     // carries digits (`in 4d 12h`) that change under the poll,
@@ -3304,7 +4274,9 @@ struct QuotaBar: View {
                     .strokeBorder(tint, style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
             }
         }
-        .frame(width: width, height: Tok.barHeight)
+        // v4-spec: quota bar height is 7pt (`Tok.barHeight` is 6) — literal
+        // per the tokens-parity fence.
+        .frame(width: width, height: 7)
         .animation(reduceMotion ? nil : Tok.standardAnimation, value: fraction)
         // A second binding, not a merged one: `fraction` and `tint` change
         // independently (a re-poll moves the fill; a band crossing recolours

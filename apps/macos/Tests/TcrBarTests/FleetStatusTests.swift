@@ -327,6 +327,40 @@ final class FleetStatusTests: XCTestCase {
             requests: requests, tools: tools)
     }
 
+    /// A `SessionRow` decoded from the payload the proxy actually sends.
+    ///
+    /// The keys here are copied from `crates/tcr-status-wire/src/lib.rs`'s
+    /// `SessionRow`, which carries `#[serde(rename_all = "camelCase")]` —
+    /// verified on `feat/wire-2` (`e13e6f0`). This decoder was written against
+    /// `"req_per_minute"` and therefore read `nil` from every real session
+    /// while the Swift-built render fixtures, which never go through JSON,
+    /// drew their sparklines perfectly. A test that constructs a `Session`
+    /// cannot catch that; only one that decodes the server's own spelling can.
+    func testSessionDecodesTheWiresCamelCaseKeys() throws {
+        let json = """
+            {"sessionId":"aaaa","account":"alice@example.com","model":"claude-opus-5",
+             "firstSeenMs":1000,"lastSeenMs":2000,"requests":412,"inputTokens":10,
+             "outputTokens":20,"cacheReadTokens":30,
+             "reqPerMinute":[1,2,3],"costUsd":4.12}
+            """
+        let decoded = try JSONDecoder().decode(Session.self, from: Data(json.utf8))
+
+        XCTAssertEqual(decoded.reqPerMinute, [1, 2, 3])
+        XCTAssertEqual(decoded.costUsd, 4.12)
+    }
+
+    /// A server built before wire 2 sends neither key. Both must come back
+    /// `nil` — absent, never an all-zero series or a measured `$0.00`.
+    func testSessionDecodesWithoutTheWireTwoKeys() throws {
+        let json = """
+            {"sessionId":"aaaa","firstSeenMs":1000,"lastSeenMs":2000}
+            """
+        let decoded = try JSONDecoder().decode(Session.self, from: Data(json.utf8))
+
+        XCTAssertNil(decoded.reqPerMinute)
+        XCTAssertNil(decoded.costUsd)
+    }
+
     /// `Fleet.decode` never populates `sessions`/`sessionsSupported`, on any
     /// input — including a row that happens to carry a `"sessions"` key,
     /// which a synthesized `Decodable` simply ignores as an unknown key
@@ -666,6 +700,40 @@ final class QuotaFormatTests: XCTestCase {
             QuotaFormat.resetCaption(resetAtMs: Int64(reset.timeIntervalSince1970 * 1000), now: now),
             "in 4d 12h"
         )
+    }
+}
+
+extension FleetStatusTests {
+    /// ``Fleet/breakdown`` deliberately omits the unmeasured and
+    /// need-re-login buckets, because the pre-v4 header names them in the
+    /// clause beside it. ``Fleet/sentenceBreakdown`` is the list for a surface
+    /// with no such clause — the v4 summary line — and it must account for
+    /// EVERY row, or the sentence quietly loses an account.
+    func testSentenceBreakdownNamesEveryBucketBreakdownOmits() {
+        let fleet = Fleet(accounts: [
+            account("ready@example.com", state: .ok),
+            account("near@example.com", state: .near),
+            // Never probed: `quota: nil`, `probeStatus: .never` — the
+            // `.unmeasured` bucket, not a zero reading.
+            Account(
+                name: "never-probed@example.com", priority: 1, status: "active",
+                disabled: false, quota: nil, quotaState: .ok, fiveHour: nil,
+                sevenDay: nil, sevenDayOi: nil, held: [], requests: 0, inputTokens: 0,
+                outputTokens: 0, cacheReadTokens: 0, cacheHitRatio: nil,
+                probeStatus: .never, probeError: nil, lastStreamError: nil,
+                streamErrorCount: 0, source: .live, serverSha: nil, serverDirty: nil),
+            brokenAccount("dead@example.com"),
+        ])
+
+        XCTAssertEqual(
+            fleet.breakdown.map(\.label), ["1 ok", "1 near"],
+            "the pre-v4 list is unchanged")
+        XCTAssertEqual(
+            fleet.sentenceBreakdown.map(\.sentenceLabel),
+            ["1 ready", "1 near limit", "1 unmeasured", "1 need re-login"])
+        XCTAssertEqual(
+            fleet.sentenceBreakdown.map(\.count).reduce(0, +), fleet.accounts.count,
+            "every account lands in exactly one bucket of the sentence")
     }
 }
 

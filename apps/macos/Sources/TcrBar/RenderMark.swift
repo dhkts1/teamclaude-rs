@@ -21,7 +21,7 @@ import TcrBarCore
 ///
 /// ## Usage
 ///
-///     TcrBar.app/Contents/MacOS/TcrBar --render-mark /tmp/tcrbar-mark
+///     TcrBar.app/Contents/MacOS/TcrBar --render-mark <output-directory>
 ///
 /// Writes one PNG per scene and exits without ever showing a menu-bar item,
 /// polling `tcr`, or touching a server.

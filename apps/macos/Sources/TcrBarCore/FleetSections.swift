@@ -282,13 +282,103 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// formatter in this codebase does: a live section's legend and a
     /// wholly-parked one's are a fact about the model, testable without
     /// SwiftUI.
+    ///
+    /// A LIVE named group takes `· ACTIVE` in the same slot `· PARKED`
+    /// occupies, per `docs/design/panel-tabs-mockup.html`'s own two legends
+    /// ("HENRY-TOKEN · PARKED · 5", "MYCELIUM · ACTIVE · 6"). The word earns
+    /// its line once a group can be COLLAPSED: a one-line summary hides
+    /// whether the accounts behind it are serving traffic or held out of
+    /// rotation, and that is the first thing an operator reads a group for.
     public var legendText: String {
         var text = title.uppercased()
         if isWhollyParked {
             text += " · PARKED"
+        } else if band == .live, group != .ungrouped {
+            text += " · ACTIVE"
         }
         text += " · \(rows.count)"
         return text
+    }
+
+    /// Per-bucket counts for the rows inside this section, in the same fixed
+    /// severity order ``Fleet/breakdown`` uses and built from the same
+    /// ``FleetTally/Kind`` classifier — never a second one.
+    ///
+    /// Unlike the fleet-wide version this one KEEPS `.needsRelogin` and
+    /// `.unmeasured`. There they were dropped because ``Fleet/capacitySummary``
+    /// spells both out one line above; here the tally is the only thing drawn
+    /// for a collapsed group, so dropping them would hide a dead credential
+    /// behind a row of `ok`s.
+    public var breakdown: [FleetTally] {
+        var counts: [FleetTally.Kind: Int] = [:]
+        for row in rows {
+            let kind: FleetTally.Kind =
+                row.account.disabled ? .disabled : FleetTally.Kind(account: row.account)
+            counts[kind, default: 0] += 1
+        }
+        let order: [FleetTally.Kind] = [
+            .ok, .near, .spent, .unknown, .needsRelogin, .unmeasured, .disabled,
+        ]
+        return order.compactMap { kind in
+            guard let count = counts[kind], count > 0 else { return nil }
+            return FleetTally(kind: kind, count: count)
+        }
+    }
+
+    /// What this section's accounts spent TODAY, or `nil` when not one of them
+    /// was priced.
+    ///
+    /// ``UsageTotals/addCost(_:_:)`` is the adder, so an unpriced row does not
+    /// silently count as zero — the same rule the per-account line follows.
+    /// `today`, never ``UsageRow/windowOrToday``, because the label this feeds
+    /// says "today" out loud.
+    public var todaySpend: Double? {
+        var total: Double?
+        for row in rows {
+            total = UsageTotals.addCost(total, row.account.usage?.today.measuredCost)
+        }
+        return total
+    }
+
+    /// "6 accounts · $8.42 today" — the one line a collapsed group draws in
+    /// place of its cards (`docs/design/panel-tabs-mockup.html`, the MYCELIUM
+    /// group). The spend clause is dropped entirely when ``todaySpend`` is
+    /// `nil`; an unpriced group reads "6 accounts", never "$0.00 today".
+    public var collapsedSummaryLine: String {
+        let noun = rows.count == 1 ? "account" : "accounts"
+        guard let spend = todaySpend else { return "\(rows.count) \(noun)" }
+        return "\(rows.count) \(noun) · \(QuotaFormat.usd(spend)) today"
+    }
+
+    /// The bordered button under a collapsed group: "Show 6 accounts in this
+    /// group", the mockup's own wording. Says the whole count, not a
+    /// remainder, because a collapsed group shows no cards at all — "show 6
+    /// more" would imply six in addition to something visible.
+    public var expandButtonLabel: String {
+        "Show \(rows.count) \(rows.count == 1 ? "account" : "accounts") in this group"
+    }
+
+    /// True when this section should default to ONE summary line instead of a
+    /// card per account: a named, live group of four or more whose rows all
+    /// still serve traffic.
+    ///
+    /// **`near` does NOT block this, and `spent`/rejected/needs-re-login do.**
+    /// The mockup's own collapsed group tallies "5 OK · 1 NEAR" on its summary
+    /// line, so a near row is not hidden by collapsing — it is named in
+    /// ``breakdown`` right there. A row an operator has to act on now is a
+    /// different matter: a dead credential or an account out of tokens needs
+    /// the card, its reset countdown and its menu, so one of those keeps the
+    /// whole group open. Four is the mockup's own smallest collapsed group
+    /// (six) rounded down to where a group stops being readable at a glance;
+    /// below it the cards cost less height than the summary saves.
+    public var collapsesByDefault: Bool {
+        guard case .named = group, band == .live, rows.count >= 4 else { return false }
+        return !rows.contains { row in
+            switch FleetTally.Kind(account: row.account) {
+            case .spent, .needsRelogin: return true
+            case .ok, .near, .unknown, .unmeasured, .disabled: return false
+            }
+        }
     }
 }
 

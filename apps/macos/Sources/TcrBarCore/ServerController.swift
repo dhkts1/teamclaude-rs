@@ -135,6 +135,21 @@ public final class ServerController: ObservableObject {
 
     public init() {}
 
+    /// A controller pinned to one state, for `--render-states` and tests.
+    ///
+    /// Spawns nothing and signals nothing: `child` stays `nil`, so `stop()`
+    /// takes its early return and `supervisedChildPID` is never written. Same
+    /// shape as ``AwakeController/harness()`` and for the same reason — a render
+    /// of the supervised panel must not be able to start or kill a proxy, and
+    /// the parity scene has to compare like with like: with `.idle` it draws
+    /// "Start server", "Take over port…" and "Not supervised by TcrBar", three
+    /// controls the mockup never had because the mockup's server was running.
+    public static func harness(pinned state: State) -> ServerController {
+        let controller = ServerController()
+        controller.state = state
+        return controller
+    }
+
     /// The two — and only two — argument sets this app will ever spawn.
     ///
     /// `safeArguments` is the default for every routine start. It withholds

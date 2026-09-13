@@ -54,6 +54,13 @@ jobs:
       - name: No hierarchical styles used as panel ink
         run: scripts/check-panel-ink.sh
 
+      # `PanelV4/` is a transcription of the approved mockup's stylesheet, one
+      # CSS declaration to one `V4` constant. Eleven adaptation rounds before it
+      # drifted through hand-written sizes — a 16 here, an 8 there — so a view
+      # that writes one, or reaches for a pre-v4 geometry token, is refused.
+      - name: PanelV4 writes no sizes of its own
+        run: scripts/check-panel-v4.sh
+
       # The disclosure gate's own fixtures. The hooks themselves are local and a
       # fork may not have them wired, so CI runs the suite that proves the scan
       # still refuses what it exists to refuse — a name, a home path, a real
