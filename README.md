@@ -144,6 +144,9 @@ Every flag is in [`docs/cli.md`](docs/cli.md).
 | `tcr control <account> [--clear \| --show]` | Nominate the account that serves control-plane traffic. |
 | `tcr group ls \| add \| rm \| reserve \| color` | Label accounts, and hold a labelled set back for traffic that asks for it. |
 | `tcr run --group <name>` | Start a session that prefers one group. |
+| `tcr sessions [--json]` | List the sessions the running proxy has seen in the last hour — the same feed the panel's Sessions and Tools tabs read. |
+| `tcr wrap [--days N]` | A usage report off the on-disk ledger: cost, tokens and cache-hit ratio, broken down by model, account and day. Needs no running proxy. |
+| `tcr token <account>` | Print an account's access token to stdout, for piping. |
 | `tcr update` | Update `tcr` in place, from the checkout or the published installer. |
 
 ## Watching it
@@ -151,16 +154,23 @@ Every flag is in [`docs/cli.md`](docs/cli.md).
 `apps/macos` is a native front end over the same `tcr status --json` the TUI reads. The
 menu-bar item is the whole app: no Dock icon, no window. The glyph carries fleet-wide capacity
 rather than the worst account, because one spent account in a rotating pool is the mechanism
-working, not an alarm. Each row is one line per quota window — bar, percentage and the
-countdown to that window's reset — plus probe health, the account's group tags, and a
-right-click menu that shells out to `tcr`, so you can steer the fleet from the panel.
+working, not an alarm.
 
-Rows also carry the model-scoped weekly window, Fable's on current plans, for an account the
-proxy has learned one for; an account it has not shows nothing there rather than a zero. That
-window is enforced as well as displayed: a request targeting that model skips an account which
-has exhausted it, and requests for every other model ignore it. The header and each card carry
-the spend figures described above. TcrBar can also supervise the proxy, hold the Mac awake
-while it does, and self-update through [Sparkle](https://sparkle-project.org).
+The panel has three tabs. **Accounts** is one row per account, one line per quota window on
+each — bar, percentage and the countdown to that window's reset — plus probe health, group
+tags, and a right-click menu that shells out to `tcr`, so you can steer the fleet from the
+panel. **Sessions** groups the proxy's live sessions by the account each is pinned to.
+**Tools** shows what is running now, the slowest calls today, and totals by tool. Sessions and
+Tools read from the running proxy and keep a snapshot of what they last saw, so a proxy
+restart leaves the tabs showing their last known state rather than going blank.
+
+Accounts rows also carry the model-scoped weekly window, Fable's on current plans, for an
+account the proxy has learned one for; an account it has not shows nothing there rather than a
+zero. That window is enforced as well as displayed: a request targeting that model skips an
+account which has exhausted it, and requests for every other model ignore it. The header and
+each card carry the spend figures described above. The footer holds a keep-awake switch and
+Quit. TcrBar can also supervise the proxy, hold the Mac awake while it does, and self-update
+through [Sparkle](https://sparkle-project.org).
 
 Install it from the [latest release](https://github.com/dhkts1/teamclaude-rs/releases/latest), or run
 `tcr ui`. Build it here with `apps/macos/scripts/install.sh`; releases: [`docs/RELEASING.md`](docs/RELEASING.md).
