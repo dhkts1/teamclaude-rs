@@ -1380,7 +1380,20 @@ struct FleetView: View {
                         RoundedRectangle(cornerRadius: V4.barRadius)
                             .fill(Tok.ink.opacity(V4.barTrackAlpha))
                         RoundedRectangle(cornerRadius: V4.barRadius)
-                            .fill(byToolColor(category.name))
+                            // One neutral tint for all three categories, not
+                            // the mockup's own `--ok` green for Bash and
+                            // `--info` blue (`.accent`) for Agent
+                            // (`docs/design/panel-tabs-review.md` finding 12,
+                            // left unresolved there; review #6's cap list,
+                            // `data/plans/interface-review-2026-09-13.md`,
+                            // raises it again). This bar's whole job is a
+                            // share-of-total width comparison — the category
+                            // is already named beside it in text — so a
+                            // borrowed status colour told the reader
+                            // something untrue: green reads as "healthy
+                            // quota" and the accent reads as "selected", and
+                            // neither is what a tool-call count is.
+                            .fill(Tok.inkFaint)
                             .frame(width: max(V4.barMinWidth, proxy.size.width * share))
                     }
                 }
@@ -1397,19 +1410,6 @@ struct FleetView: View {
                 .foregroundStyle(Tok.dim)
                 .lineLimit(1)
                 .fixedSize()
-        }
-    }
-
-    /// Bash is `--ok` green, Agent is `--info` blue (`.accent`, the closest
-    /// token this palette has to the mockup's dedicated info role — see
-    /// `docs/design/panel-tabs-review.md` finding 12, unresolved here), and
-    /// Read/Grep/Edit is the neutral `--mute` — `docs/design/panel-tabs-mockup.html`'s
-    /// three bar tints.
-    private func byToolColor(_ category: String) -> Color {
-        switch category {
-        case "Bash": return Tok.ok
-        case "Agent": return Tok.accent
-        default: return Tok.inkFaint
         }
     }
 

@@ -53,6 +53,12 @@ public enum SettingsRowBadge {
     /// `Server` section, General pane.
     public static let proxyRestart = "server.proxyRestart"
     public static let startServerAtLaunch = "server.startServerAtLaunch"
+    /// The one label this row draws, shared by its visible `Text` and its
+    /// `Toggle`'s accessibility name — a `Toggle("", isOn:)` with
+    /// `.labelsHidden()` was announced to VoiceOver as "off, checkbox" with no
+    /// name at all (review #2), and a second, independently-typed string here
+    /// would drift from the visible one the next time either changed.
+    public static let startServerAtLaunchLabel = "Start the server at launch"
     public static let pollInterval = "server.pollInterval"
     /// `This Mac` section, General pane.
     public static let launchAtLogin = "mac.launchAtLogin"

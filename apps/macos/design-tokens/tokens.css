@@ -24,12 +24,12 @@
     --tcr-ink-faint: #62605a;
     --tcr-dim: #494843;
     --tcr-mute: #62605a;
-    --tcr-ready: #00873c;
-    --tcr-near: #ba7702;
-    --tcr-spent: #c0041f;
-    --tcr-unmeasured: #4c829c;
-    --tcr-disabled: #7f8083;
-    --tcr-awake: #017272;
+    --tcr-ready: #06652d;
+    --tcr-near: #925d0b;
+    --tcr-spent: #940015;
+    --tcr-unmeasured: #0a7196;
+    --tcr-disabled: #67696b;
+    --tcr-awake: #005f5f;
 
     --tcr-wash-alpha: 0.14;
     --tcr-line-alpha: 0.34;
