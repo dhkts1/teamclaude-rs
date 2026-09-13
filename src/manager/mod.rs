@@ -1723,8 +1723,11 @@ impl Manager {
     ///
     /// Called by the predecessor in a socket handoff, AFTER its final flush and
     /// BEFORE the successor starts serving. See [`Self::mutation_released`] for
-    /// what each refusal prevents, and `docs/design/zero-downtime-restart.md`
-    /// for why the release sits exactly there and not one step either side.
+    /// what each refusal prevents. The release sits between the predecessor's
+    /// last legitimate write and the successor's first: any earlier and the
+    /// final flush is gated off by this very flag, any later and the
+    /// predecessor's own shutdown persist lands on the successor's fresh
+    /// tokens.
     pub fn release_mutation_ownership(&self) {
         // `swap` rather than `store` so the log line fires once even if a
         // caller releases twice.
