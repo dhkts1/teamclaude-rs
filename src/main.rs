@@ -386,6 +386,17 @@ struct LoginArgs {
     /// cannot be evaluated must fail closed.
     #[arg(long)]
     token: bool,
+    /// Drive the login from another program instead of a terminal: stdin is
+    /// never read, the browser is never opened here, and progress goes to
+    /// stdout as one JSON object per line — `{"event":"browser","url":…}`,
+    /// `{"event":"waiting"}`, `{"event":"saved","account":…}`,
+    /// `{"event":"error","reason":…}`. The caller opens the URL; the loopback
+    /// callback is then the only way the login can complete, and the same
+    /// 2-minute timeout exits non-zero with the reason on one stderr line.
+    /// Refuses to combine with `--token`, which reads the credential from
+    /// stdin: that is the one input this mode has no way to supply.
+    #[arg(long, conflicts_with = "token")]
+    non_interactive: bool,
     /// Name this account explicitly, overriding the name login would mint for
     /// it. Refused if some other account already has that name — names are
     /// unique, and taking one from an existing row is how a login overwrites
@@ -1204,15 +1215,40 @@ async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
         println!("Logged in as '{name}'.");
         return Ok(());
     }
-    let name = oauth::login(
+    let ui = if args.non_interactive {
+        oauth::LoginUi::Machine
+    } else {
+        oauth::LoginUi::Terminal
+    };
+    let result = oauth::login(
         &config_path,
         args.force,
         args.account.as_deref(),
         args.name.as_deref(),
+        ui,
     )
     .await
-    .context("OAuth login failed")?;
-    println!("Logged in as '{name}'.");
+    .context("OAuth login failed");
+    let name = match result {
+        Ok(name) => name,
+        // A machine caller gets the failure the same way it got every other
+        // step — one JSON line on stdout — and the human-readable half on one
+        // stderr line rather than as anyhow's indented multi-line chain,
+        // which a GUI would have to render as a wall of text. Exits here
+        // rather than returning the error, because `main`'s reporter would
+        // print that chain on top of what was just said.
+        Err(error) if args.non_interactive => {
+            let reason = oauth::one_line_reason(&error);
+            println!("{}", oauth::LoginEvent::Error { reason: &reason }.line());
+            eprintln!("{reason}");
+            std::process::exit(1);
+        }
+        Err(error) => return Err(error),
+    };
+    // The machine stream already said this, as `{"event":"saved",…}`.
+    if !args.non_interactive {
+        println!("Logged in as '{name}'.");
+    }
     Ok(())
 }
 
