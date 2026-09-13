@@ -34,6 +34,13 @@ struct AccountCard<Actions: View>: View {
     let account: Account
     var shape: Shape = .full
     let now: Date
+    /// True when this account is the identity-bound control account
+    /// (`tcr control --show`) — every quota figure the fleet draws is measured
+    /// through it. Drawn as the card's own `CONTROL` pill rather than a
+    /// standalone line above the tab: the pre-v4 line stated the fact once for
+    /// the whole panel and required a reader to hold "which account" in their
+    /// head while scanning the cards below it (review's card-pill ask).
+    var isControl: Bool = false
     /// The card's visible per-account controls — the actions menu, and the
     /// re-login button on a broken account. A closure so ``AccountCard`` stays
     /// free of the controllers those controls are wired to: they are built from
@@ -53,6 +60,14 @@ struct AccountCard<Actions: View>: View {
                     nameRow
                 } trailing: {
                     HStack(spacing: V4.pillGap) {
+                        // Drawn first: a designation, read before either state
+                        // word, the same order ``cardSummaryLabel`` speaks it.
+                        if isControl {
+                            V4Pill(
+                                text: "Control",
+                                help: "Every quota figure on this panel is measured through "
+                                    + "\(account.name).")
+                        }
                         if let rotation = rotationPillText {
                             V4Pill(text: rotation, help: account.rotationHelp)
                         }
@@ -89,7 +104,7 @@ struct AccountCard<Actions: View>: View {
         // name, so it cannot take focus and a user arriving at the card is told
         // nothing about which account they have arrived at.
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(account.cardSummaryLabel(now: now))
+        .accessibilityLabel(account.cardSummaryLabel(now: now, isControl: isControl))
     }
 
     @ViewBuilder
