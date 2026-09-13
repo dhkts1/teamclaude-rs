@@ -120,10 +120,19 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                 // `.grp .card{margin:6px 0}` — EVERY card, the first included.
                 // Its top margin does not collapse into the group's own 12 pt
                 // padding, so the first card sits 18 pt under the stroke; giving
-                // the first card nothing put it at 11 pt.
-                ForEach(visible) { row in
+                // the first card nothing put it at 11 pt. The LAST card carries
+                // the same margin on its OWN bottom, but only when nothing else
+                // follows it: `GroupBox`'s own bottom padding (4 pt) plus this
+                // 6 pt closes the box at the mockup's 10, and a disclosure row
+                // right below the cards gets the 6 pt instead, so the two never
+                // stack into 12.
+                ForEach(Array(visible.enumerated()), id: \.element.id) { index, row in
                     card(row, shape: .compact)
                         .padding(.top, V4.groupCardGap)
+                        .padding(
+                            .bottom,
+                            index == visible.count - 1 && !isCollapsible(section)
+                                ? V4.groupCardGap : 0)
                 }
             }
             if isCollapsible(section) {
@@ -134,6 +143,7 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                         ? "Collapses this group again."
                         : "Shows every account in this group."
                 ) { onToggleGroup(section.group.token) }
+                .padding(.bottom, V4.groupCardGap)
             }
         }
         // A group that leads the tab collapses its own 20 pt top margin with the

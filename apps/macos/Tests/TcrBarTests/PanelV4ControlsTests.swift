@@ -163,6 +163,86 @@ final class PanelV4ControlsTests: XCTestCase {
         }
     }
 
+    // MARK: - Panel footer: keep-awake switch and Quit, the counts checkbox
+    // moves to Settings
+
+    /// App state, not tab state: `v4FooterAwakeQuit` sits directly after the
+    /// not-supervised line, outside the `if visibleTab == .accounts` block that
+    /// gates `v4Actions` — so it draws on Accounts, Sessions and Tools alike.
+    func testTheFooterDrawsKeepAwakeAndQuitOnEveryTab() throws {
+        let source = try panelSource("FleetView.swift")
+        // Whitespace-stripped so the assertion survives re-indentation: what it
+        // actually checks is ADJACENCY — `v4FooterAwakeQuit` sits right after
+        // the not-supervised block's closing brace, not inside the
+        // `if visibleTab == .accounts` block that gates `v4Actions` above it.
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        XCTAssertTrue(
+            squashed.contains(
+                "if!server.state.isOurChild{Text(server.state.summary)"
+                    + ".font(V4.font(V4.footerSize)).foregroundStyle(Tok.mute)"
+                    + ".fixedSize(horizontal:false,vertical:true)}v4FooterAwakeQuit"),
+            "v4FooterAwakeQuit is no longer the last, unconditional row in v4Footer")
+        XCTAssertTrue(
+            source.contains(".accessibilityLabel(\"Keep this Mac awake\")"),
+            "the keep-awake switch lost its accessibility name")
+        XCTAssertTrue(
+            source.contains("V4Button(title: \"Quit\", role: .danger)"),
+            "the footer's Quit button is gone or changed role")
+        XCTAssertTrue(
+            source.contains("Binding(get: { awake.isOn }, set: { awake.setOn($0) })"),
+            "the footer switch is no longer bound to the same AwakeController "
+                + "Settings uses")
+    }
+
+    /// It already lives in Settings → Menu Bar ("Show the ready count beside
+    /// the cup"); a second copy under the panel is the thing this feature
+    /// removes.
+    func testTheCountsCheckboxIsNoLongerInThePanel() throws {
+        // Scoped to `FleetPanel`, not the whole file: `MenuBarShell` itself
+        // legitimately keeps `countsPreference` for `updateMark`, and its doc
+        // comment quotes the Settings row's own label — neither is the panel
+        // checkbox this feature removes.
+        let source = try panelSource("MenuBarShell.swift")
+        guard
+            let start = source.range(of: "struct FleetPanel: View {"),
+            let end = source.range(of: "\n}", range: start.upperBound..<source.endIndex)
+        else {
+            XCTFail("FleetPanel struct not found in MenuBarShell.swift")
+            return
+        }
+        let fleetPanel = source[start.lowerBound..<end.upperBound]
+        XCTAssertFalse(
+            fleetPanel.contains("Show counts in the menu bar"),
+            "the panel-footer counts checkbox is back — it belongs in Settings only")
+        XCTAssertFalse(
+            fleetPanel.contains("countsPreference"),
+            "FleetPanel no longer needs MenuBarCountsPreference once its only "
+                + "use (the panel checkbox) is gone")
+    }
+
+    /// One text, one alert, called from both Settings and the panel footer —
+    /// never two `NSAlert`s that can drift apart.
+    func testTheQuitConfirmationIsOneSharedAlert() throws {
+        let quit = try panelSource("QuitConfirmation.swift")
+        XCTAssertTrue(quit.contains("\"Quit TcrBar?\""))
+        XCTAssertTrue(quit.contains("Every live session loses its"))
+
+        let settings = try panelSource("SettingsPanes.swift")
+        XCTAssertFalse(
+            settings.contains("private func confirmQuit"),
+            "Settings grew back its own confirm-quit alert")
+        XCTAssertTrue(settings.contains("QuitConfirmation.confirm()"))
+        XCTAssertFalse(
+            settings.contains("\"Quit TcrBar?\""),
+            "the alert text is duplicated in Settings instead of shared")
+
+        let footer = try panelSource("FleetView.swift")
+        XCTAssertTrue(footer.contains("QuitConfirmation.confirm()"))
+        XCTAssertFalse(
+            footer.contains("\"Quit TcrBar?\""),
+            "the alert text is duplicated in the footer instead of shared")
+    }
+
     private func panelSource(_ relative: String) throws -> String {
         let repoRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // -> TcrBarTests

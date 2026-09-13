@@ -197,7 +197,7 @@ struct GeneralSettingsPane: View {
                     )
                     .font(.caption).foregroundStyle(Tok.inkDim)
                     Spacer()
-                    Button("Quit TcrBar…") { confirmQuit() }
+                    Button("Quit TcrBar…") { QuitConfirmation.confirm() }
                         .controlSize(.small)
                 }
             }
@@ -231,21 +231,6 @@ struct GeneralSettingsPane: View {
         server.start()
     }
 
-    private func confirmQuit() {
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Quit TcrBar?"
-        alert.informativeText =
-            "This stops the proxy TcrBar supervises. Every live session loses its "
-            + "prompt cache."
-        let quit = alert.addButton(withTitle: "Quit")
-        quit.hasDestructiveAction = true
-        alert.addButton(withTitle: "Cancel")
-        quit.keyEquivalent = ""
-        alert.buttons.last?.keyEquivalent = "\r"
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        NSApplication.shared.terminate(nil)
-    }
 }
 
 // MARK: - Menu Bar
