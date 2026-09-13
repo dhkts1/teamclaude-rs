@@ -2381,12 +2381,15 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             };
-            let field = |key: &str| {
-                url.split(&format!("{key}="))
+            let field = |key: &str| -> String {
+                let Some(raw) = url
+                    .split(&format!("{key}="))
                     .nth(1)
                     .and_then(|rest| rest.split('&').next())
-                    .map(percent_decode)
-                    .unwrap_or_else(|| panic!("the authorize URL carries {key}: {url}"))
+                else {
+                    panic!("the authorize URL carries {key}: {url}")
+                };
+                percent_decode(raw)
             };
             let callback = format!(
                 "{}?code=fake-code&state={}",
