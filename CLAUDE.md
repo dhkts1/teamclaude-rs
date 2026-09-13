@@ -76,7 +76,12 @@ A `tcr` server may be serving real traffic on `127.0.0.1:3456`, with client sess
 - Branch **before** you start editing. `git switch -c` carries uncommitted work onto the new branch,
   which is what you want; a *worktree* created after the fact does not — it branches from `HEAD`
   without those changes, and any shared file (`Cargo.toml`) blocks a clean move afterwards.
-- `main` requires a pull request, one approval, and the `ci`, `audit` and `macos` checks; an admin
+- `main` requires a pull request and **four** passing checks: `ci`, `audit`, `macos` and `plan`. It
+  does **not** require an approving review — `required_approving_review_count` is `0`, so the gate is
+  the checks, not a reviewer, and there is no one to wait for. `plan` is the one that gets missed: it
+  is a job in `release.yml` (cargo-dist's `dist plan`, which runs on `pull_request`), *not* in
+  `ci.yml`, so reading the CI workflow alone will never turn it up. Protection is `strict`, so each
+  merge leaves every other open PR behind and needing an update before it can land. An admin
   bypass exists and is a deliberate decision, never a shortcut. The CI job table and how a bypass
   shows up in the push output are in [`CONTRIBUTING.md`](CONTRIBUTING.md) § "Pull requests and CI".
 - Without push access here, work from a fork; the pull request's base is this repository and its head
