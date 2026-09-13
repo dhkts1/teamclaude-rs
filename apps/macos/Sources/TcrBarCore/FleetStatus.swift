@@ -1891,6 +1891,39 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public var servesGroupTrafficOnly: Bool {
         groupTags.contains(where: \.isReserved)
     }
+
+    /// What the pool-membership pill says about this account, or `nil` when it
+    /// has nothing to claim.
+    ///
+    /// `"Rotating"` means one thing — the pool is sending this account traffic
+    /// right now — and it is the single most misreadable word on the panel,
+    /// because every reason it is FALSE is invisible in the account's own quota
+    /// numbers. So the ladder is exclusions first, in the order the pre-v4 row
+    /// walks them (`FleetView.swift`'s `rotationPill`), and the claim last:
+    ///
+    ///  - disabled, or ``isParkedByGroup`` — the group's legend and the state
+    ///    pill already say it; a second pill saying "Rotating" beside them is
+    ///    the contradiction.
+    ///  - `health == .needsRelogin` — a dead refresh token. The card used to
+    ///    draw ROTATING beside NEEDS RE-LOGIN, which reads as "traffic is
+    ///    landing here" over an account serving none, and an operator who reads
+    ///    it does not re-login.
+    ///  - ``isRejected`` — Anthropic's verdict. Nothing else on the row says
+    ///    it: `disabled` is false, the status reads active, and the quota bars
+    ///    can look perfectly healthy.
+    ///  - ``servesGroupTrafficOnly`` — reserved, so it serves requests that ask
+    ///    for its group and no pool traffic at all. `"Group only"`, the word
+    ///    the pre-v4 row already uses.
+    ///
+    /// Lives on the model rather than in the card so the two panels cannot
+    /// drift into two different ladders, and so the rule is testable without
+    /// standing up SwiftUI.
+    public var rotationLabel: String? {
+        if disabled || isParkedByGroup { return nil }
+        if health == .needsRelogin || isRejected { return nil }
+        if servesGroupTrafficOnly { return "Group only" }
+        return "Rotating"
+    }
 }
 
 /// One entry in ``Account/groupMenuActions``, the row-level context menu
@@ -2020,6 +2053,15 @@ public struct FleetTally: Equatable, Sendable {
         /// `.unmeasured` would tell the operator to wait for a sweep that will
         /// never fix a dead credential.
         case needsRelogin
+        /// Anthropic itself has rejected the account — ``Account/isRejected``,
+        /// the server's own `gate == "rejected"`. Its own bucket for the same
+        /// reason ``needsRelogin`` is one: the router will never select this
+        /// account however healthy its quota reads, so counting its last-known
+        /// `.ok` state as capacity is a claim the fleet cannot honour. The
+        /// pre-v4 row has drawn this case since the `gate` key shipped
+        /// (`FleetView.swift`'s rotation pill); the tally had no bucket for it,
+        /// so the v4 card drew a lone green OK over it.
+        case rejected
         /// Enabled, but nothing has ever been measured about it. Its own bucket
         /// because folding it into `ok` is precisely the overclaim this exists
         /// to stop, and folding it into `unknown` would conflate "a quota state
@@ -2034,6 +2076,7 @@ public struct FleetTally: Equatable, Sendable {
             case .spent: return "spent"
             case .unknown: return "unknown"
             case .needsRelogin: return "need re-login"
+            case .rejected: return "rejected"
             case .unmeasured: return "unmeasured"
             case .disabled: return "disabled"
             }
@@ -2055,6 +2098,7 @@ public struct FleetTally: Equatable, Sendable {
             case .spent: return "spent"
             case .unknown: return "unknown"
             case .needsRelogin: return "need re-login"
+            case .rejected: return "rejected by Anthropic"
             case .unmeasured: return "unmeasured"
             case .disabled: return "parked"
             }
@@ -2070,20 +2114,43 @@ public struct FleetTally: Equatable, Sendable {
             }
         }
 
-        /// The bucket an *enabled* account falls into, measurement included.
-        /// An unmeasured account's `quotaState` is a default, so it never
-        /// reaches the quota-state mapping at all. Health is checked BEFORE
-        /// `hasQuotaEvidence` — a broken account has no quota reading either,
-        /// and checking evidence first would land every one of them back in
-        /// `.unmeasured`.
+        /// The bucket ANY account falls into, measurement included.
+        ///
+        /// The ladder is the pre-v4 rotation pill's own branch order
+        /// (`FleetView.swift`'s `rotationPill`), because a card and a row
+        /// looking at one account may not reach two verdicts:
+        ///
+        ///  1. `disabled` — the operator's own decision, and the reason this
+        ///     bucket exists at all: an account held out by hand still has a
+        ///     `quotaState`, and counting it as `ok` inflates the capacity the
+        ///     fleet has.
+        ///  2. ``Account/isParkedByGroup`` — the SERVER holds it out because
+        ///     one of its groups is parked. Same bucket, same word ("parked"),
+        ///     because the operator faces the same fact: nothing lands here.
+        ///     It used to fall through to the quota cases, so inside one box
+        ///     legended PARKED two equally idle accounts read `OK` and
+        ///     `PARKED`, and the headline counted the `OK` one as capacity.
+        ///  3. `health == .needsRelogin` — a dead credential.
+        ///  4. ``Account/isRejected`` — Anthropic's own verdict.
+        ///  5. the quota state, or `.unmeasured` when nothing was ever probed.
+        ///
+        /// 3 and 4 sit ahead of `hasQuotaEvidence` deliberately: a broken or
+        /// rejected account has no quota reading either, and checking evidence
+        /// first would land every one of them back in `.unmeasured` — telling
+        /// the operator to wait for a sweep that will never fix either cause.
+        ///
         /// Public because the v4 account card (`PanelV4/AccountCard.swift`, a
         /// different module) draws its state pill from this and nothing else:
         /// the card's pill and the group's tally are then the same
         /// classification, which is the defect the pre-v4 card had — an OK pill
         /// over a 98% bar.
         public init(account: Account) {
-            if account.health == .needsRelogin {
+            if account.disabled || account.isParkedByGroup {
+                self = .disabled
+            } else if account.health == .needsRelogin {
                 self = .needsRelogin
+            } else if account.isRejected {
+                self = .rejected
             } else {
                 self = account.hasQuotaEvidence ? Kind(quotaState: account.quotaState) : .unmeasured
             }
@@ -2535,6 +2602,13 @@ public struct Fleet: Equatable, Sendable {
     /// Per-bucket counts in fixed severity order, with empty buckets omitted so
     /// a healthy fleet reads just `"12 ok"`.
     ///
+    /// The loop runs over EVERY account and lets ``FleetTally/Kind/init(account:)``
+    /// place it, rather than over `enabledAccounts` with `counts[.disabled]`
+    /// assigned afterwards. That assignment was the group-parked defect's second
+    /// half: it OVERWROTE whatever the loop had put in `.disabled`, so an
+    /// enabled account the server holds out of rotation could not be counted as
+    /// parked however the classifier bucketed it.
+    ///
     /// `.needsRelogin` and `.unmeasured` are excluded from the order: both are
     /// already named by ``capacitySummary`` (`"1 need re-login"`,
     /// `"1 unmeasured"`), and this tally used to name them a second time —
@@ -2543,12 +2617,10 @@ public struct Fleet: Equatable, Sendable {
     /// number folded into `readyCount`, never spelled out on its own, so it
     /// keeps its place here.
     public var breakdown: [FleetTally] {
-        let disabledCount = accounts.count - enabledCount
         var counts: [FleetTally.Kind: Int] = [:]
-        for account in enabledAccounts {
+        for account in accounts {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
-        counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
             .ok, .near, .spent, .unknown, .disabled,
         ]
@@ -2568,15 +2640,18 @@ public struct Fleet: Equatable, Sendable {
     /// same omission silently deletes an account from the count: a fleet of
     /// thirteen read "9 ready · 3 near limit" and the reader was left to notice
     /// the missing one. Two surfaces, two lists, one place each.
+    ///
+    /// `.rejected` is in this order and not in ``breakdown``'s for the same
+    /// reason `.needsRelogin` is: the pre-v4 header names it in
+    /// ``capacitySummary`` one line above, the v4 summary line has no such
+    /// second clause.
     public var sentenceBreakdown: [FleetTally] {
-        let disabledCount = accounts.count - enabledCount
         var counts: [FleetTally.Kind: Int] = [:]
-        for account in enabledAccounts {
+        for account in accounts {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
-        counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .disabled,
+            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .rejected, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }

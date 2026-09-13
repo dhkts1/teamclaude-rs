@@ -84,7 +84,7 @@ extension SummaryLine {
         switch kind {
         case .ok: return Tok.ok
         case .near: return Tok.near
-        case .spent, .needsRelogin: return Tok.spent
+        case .spent, .needsRelogin, .rejected: return Tok.spent
         case .unknown, .unmeasured, .disabled: return Tok.dim
         }
     }

@@ -131,7 +131,7 @@ struct AccountsTabV4<Menu: View>: View {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin: return .bad
+        case .spent, .needsRelogin, .rejected: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }

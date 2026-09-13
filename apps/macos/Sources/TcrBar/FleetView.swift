@@ -1665,7 +1665,7 @@ struct FleetView: View {
         switch kind {
         case .ok: return Tok.color(for: QuotaState.ok)
         case .near: return Tok.color(for: QuotaState.near)
-        case .spent, .needsRelogin: return Tok.spent
+        case .spent, .needsRelogin, .rejected: return Tok.spent
         case .unknown: return Tok.unknown
         case .unmeasured: return Tok.unmeasured
         case .disabled: return Tok.disabled

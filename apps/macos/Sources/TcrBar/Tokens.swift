@@ -611,6 +611,9 @@ public enum Tok {
         // colour palette is generated — a new token drags in a regeneration
         // and two blocking gates for a fact this one already covers.
         case .needsRelogin: return spent
+        // `.rejected` reuses `spent` for the same reason `.needsRelogin` does,
+        // one line up: Anthropic's verdict is known-cannot-serve.
+        case .rejected: return spent
         case .unmeasured: return unmeasured
         case .disabled: return disabled
         }

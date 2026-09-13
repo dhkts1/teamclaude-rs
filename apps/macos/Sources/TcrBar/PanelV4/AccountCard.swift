@@ -32,8 +32,8 @@ struct AccountCard: View {
                 nameRow
             } trailing: {
                 HStack(spacing: V4.pillGap) {
-                    if shape == .full, isRotating {
-                        V4Pill(text: "Rotating")
+                    if shape == .full, let rotation = account.rotationLabel {
+                        V4Pill(text: rotation)
                     }
                     V4Pill(text: statePillText, role: statePillRole)
                 }
@@ -79,15 +79,15 @@ struct AccountCard: View {
         }
     }
 
-    /// `Rotating` — the account is in the pool right now. Suppressed on a
-    /// compact card: every row inside a parked group is out of rotation and the
-    /// legend says so once for all of them.
-    private var isRotating: Bool {
-        !account.disabled && !account.isParkedByGroup && !account.isRejected
-    }
-
+    /// `Rotating` / `Group only` — ``Account/rotationLabel``, and nothing
+    /// re-derived here. Suppressed on a compact card: every row inside a parked
+    /// group is out of rotation and the legend says so once for all of them.
+    ///
+    /// It used to be `!disabled && !isParkedByGroup && !isRejected`, which
+    /// missed the dead-credential case entirely — a card read ROTATING beside
+    /// NEEDS RE-LOGIN — and had no word for a reserved account at all.
     private var kind: FleetTally.Kind {
-        account.disabled ? .disabled : FleetTally.Kind(account: account)
+        FleetTally.Kind(account: account)
     }
 
     private var statePillText: String {
@@ -97,6 +97,7 @@ struct AccountCard: View {
         case .spent: return "Spent"
         case .unknown: return "Unknown"
         case .needsRelogin: return "Needs re-login"
+        case .rejected: return "Rejected"
         case .unmeasured: return "Unmeasured"
         case .disabled: return "Parked"
         }
@@ -106,7 +107,7 @@ struct AccountCard: View {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin: return .bad
+        case .spent, .needsRelogin, .rejected: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }
