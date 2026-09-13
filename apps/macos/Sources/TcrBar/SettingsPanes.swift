@@ -127,8 +127,10 @@ struct GeneralSettingsPane: View {
                 }
                 LabeledContent {
                     HStack(spacing: 6) {
-                        Toggle("", isOn: $preference.startServerAtLaunch)
-                            .labelsHidden()
+                        Toggle(isOn: $preference.startServerAtLaunch) {
+                            Text(SettingsRowBadge.startServerAtLaunchLabel)
+                        }
+                        .labelsHidden()
                         rowTag(
                             SettingsRowBadge.timing(for: SettingsRowBadge.startServerAtLaunch)
                                 ?? .nextLaunch,
@@ -137,7 +139,7 @@ struct GeneralSettingsPane: View {
                     }
                 } label: {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Start the server at launch")
+                        Text(SettingsRowBadge.startServerAtLaunchLabel)
                         Text("TcrBar supervises a server it starts itself.")
                             .font(.caption).foregroundStyle(Tok.inkDim)
                     }
