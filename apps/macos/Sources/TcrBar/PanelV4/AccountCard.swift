@@ -81,19 +81,19 @@ struct AccountCard<Actions: View>: View {
                 actions()
             }
             if shape == .full {
-                if let plan = planLine {
-                    MuteText(text: plan)
-                }
                 // One row per window in both shapes. Compact used to fold
                 // these onto a single dense line (the fix for a measured
                 // +42 pt over its own two-row card) — Gil saw that line and
                 // preferred readable bars, so Compact draws the same rows as
                 // Comfortable, just at Compact's own tighter density tokens
                 // (`V4.quotaLabelWidth`, `V4.quotaMarginTop`, `V4.barHeight`).
-                ForEach(quotaWindows, id: \.label) { window in
+                ForEach(Array(quotaWindows.enumerated()), id: \.element.label) {
+                    index, window in
                     QuotaRow(
                         label: window.label, value: window.value, tint: window.tint,
-                        resetAtMs: window.resetAtMs, now: now)
+                        resetAtMs: window.resetAtMs, now: now,
+                        trailing: index == 0 ? usageTail : nil,
+                        trailingHelp: index == 0 ? planLine : nil)
                 }
             }
         }
@@ -185,6 +185,22 @@ struct AccountCard<Actions: View>: View {
     /// on a card 355 pt wide, where the full phrase fits. Built from the same
     /// ``QuotaFormat`` figures ``Account/windowUsageLabel`` uses — the same
     /// numbers, spelled for a card that has the room.
+    /// The plan line's figures, abbreviated to sit at the end of the first
+    /// quota row: `"$5.61 · 12k out"`. The pre-v4 card drew exactly this, in
+    /// exactly this place, and the v4 card's full-width `planLine` above the
+    /// bars is what made the card 28 pt taller for the same content. The full
+    /// phrase, plan name included, is the hover.
+    private var usageTail: String? {
+        guard let usage = account.usage else { return nil }
+        let bucket = usage.windowOrToday
+        var parts: [String] = []
+        if let cost = bucket.measuredCost {
+            parts.append(QuotaFormat.usd(cost) + (bucket.unpricedRequests > 0 ? "+" : ""))
+        }
+        parts.append("\(QuotaFormat.tokens(bucket.outputTokens)) out")
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     private var planLine: String? {
         var parts: [String] = []
         if let plan = account.plan, !plan.isEmpty { parts.append(plan) }
