@@ -88,6 +88,33 @@ public enum PollState: Equatable {
         guard let unreadable = fleet.unreadableNotice else { return sentence }
         return "\(sentence) · \(unreadable)"
     }
+
+    /// The running-tools segment count, or `nil` when it must not be shown.
+    ///
+    /// Two independent gates, both required (`docs/design/menubar-mark-mockup.html`
+    /// Rules: "appears only when the preference is on AND the wire carries
+    /// `sessions`"): `showRunningTools` is the Settings toggle, and
+    /// ``Fleet/sessionsSupported`` is whether THIS read actually populated
+    /// ``Fleet/sessions`` — distinct from an empty ``Fleet/toolsRunning``, which
+    /// is also true of a fleet with nothing running right now. A preference left
+    /// on for months must never draw a false `0` while the wire that would fill
+    /// it in does not exist yet (see ``Fleet/sessions``'s own doc-comment).
+    public func runningToolsCount(showRunningTools: Bool) -> Int? {
+        guard showRunningTools, case .loaded(let fleet) = self, fleet.sessionsSupported else {
+            return nil
+        }
+        return fleet.toolsRunning.count
+    }
+
+    /// Whether the `ready/enabled` count should draw amber: zero accounts ready
+    /// and at least one near its limit. Reuses ``Fleet/capacityGlyphState``'s own
+    /// `.near` case rather than a second predicate that could drift from the
+    /// glyph's shape — the glyph and the count's colour must always agree on
+    /// which state they are both describing.
+    public var countIsNearCapacity: Bool {
+        guard case .loaded(let fleet) = self else { return false }
+        return fleet.capacityGlyphState == .near
+    }
 }
 
 /// Runs `tcr status --json` on a timer and publishes the result.

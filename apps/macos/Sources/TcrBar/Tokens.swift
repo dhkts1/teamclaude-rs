@@ -167,6 +167,12 @@ public enum Tok {
     public static let ok = dyn(dark: "#66d081", light: "#00873c")
     /// Close to a gating limit.
     public static let near = dyn(dark: "#ffd16b", light: "#ba7702")
+    /// `near`, as an `NSColor` — same reason ``awakeNSColor`` exists beside
+    /// ``awake``: the menu-bar mark's running-tools count is drawn into an
+    /// `NSAttributedString`, not a SwiftUI view, and it tints amber with the
+    /// identical hex this token already carries, so no new value needs the
+    /// palette script's gate.
+    public static let nearNSColor = dynNS(dark: "#ffd16b", light: "#ba7702")
     /// Spent on a gating window until it resets.
     public static let spent = dyn(dark: "#ea5a56", light: "#c0041f")
     /// Enabled, but nothing has ever been measured about it.

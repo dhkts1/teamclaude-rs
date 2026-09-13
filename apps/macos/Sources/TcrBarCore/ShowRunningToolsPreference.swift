@@ -5,14 +5,11 @@ import Foundation
 /// alongside ``MenuBarCountsPreference``'s ready/enabled fraction. Same shape,
 /// same reason there is no `@AppStorage` to reach for.
 ///
-/// **Not yet wired to the glyph.** `MenuBarShell.updateMark` composes the
-/// ready/enabled label from ``MenuBarCountsPreference`` and the running-tool
-/// count from a live poll is not threaded through it — this preference exists
-/// so the Settings window row from the bridge (`data/plans/
-/// settings-window-bridge.md` § Panes, "Menu Bar") is real and persists,
-/// without also rewriting `updateMark`'s composition, which touches a
-/// different feature's tests than this window's own. Reading it back always
-/// answers correctly; the mark itself does not consult it yet.
+/// Wired into `MenuBarShell.updateMark` (`data/plans/menubar-mark-bridge.md`):
+/// the segment it gates only ever draws when this is `true` AND the poll's
+/// payload actually carries `sessions` (``PollState/runningToolsCount(showRunningTools:)``)
+/// — a live server that has not grown the wire yet leaves the mark exactly as
+/// it was before this preference existed.
 @MainActor
 public final class ShowRunningToolsPreference: ObservableObject {
     /// The `UserDefaults` key. Do not change it — the same trap
