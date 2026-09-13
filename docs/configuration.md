@@ -424,19 +424,26 @@ ordinary rotating proxy unless you read the log at boot.
 
 `accounts[].groups` labels an account. A client asks for a label with `tcr run --group
 <label>`, which sets the `x-tcr-group` header on its requests, and selection then **prefers**
-accounts carrying that label.
+accounts carrying that label — and, when none can serve, is **strict** about it: `tcr run
+--group gil` is a request to be served by `gil`'s accounts or not at all, never quietly by
+whichever account happens to be free.
 
-Prefers, not requires. If no account in the group can serve the request, the proxy does not
-queue and does not fail — it falls back to the whole pool and serves from any account,
-because dropping a servable request is worse than serving it from the wrong place. The
-fallback logs one line naming the group and the reason, at the moment it happens.
+Prefers, but requires on exhaustion (2026-09-13). If some account in the group can serve the
+request, that account wins over the whole rest of the pool, even a better-priority account
+outside the group — that half has not changed. But if **no** account in the group can serve
+it, the proxy no longer falls back to the whole pool by default: it refuses, and the caller's
+own retry/backoff (or an honest 429) is what happens next, exactly the way a request against
+an exhausted, ungrouped fleet already behaves. The refusal logs one line naming the group and
+the reason, at the moment it happens. Before 2026-09-13 this fell back to the whole pool
+instead — see [`spillToPool`](#spilltopool-restoring-the-old-fall-back-to-the-pool-behaviour)
+below if you relied on that.
 
 The trap is `controlAccount`. That account is the identity plane's designated account, and by
 default inference requests **never** select it — not when it is enabled, not when it is idle.
 That is the point: it exists so login and quota bookkeeping keep coming from one stable
 account, and letting inference spend its quota is how you lose that. So by default a group
 whose only member is the control account can never serve inference. Every request asking for
-it falls back, on every request. Nothing about the group looks wrong: it has a member, a
+it refuses, on every request. Nothing about the group looks wrong: it has a member, a
 colour, and a healthy line in `tcr status`.
 
 Two opt-ins lift the exclusion, both off by default, and both keep the `controlReserve` floor
@@ -456,11 +463,34 @@ one group use it with `tcr group allow-control <label>`; or let the whole pool u
 `controlPooled`. `tcr group add` prints the same warning at the moment you create the
 situation.
 
-Reserving is the other half and solves a different problem. `tcr group reserve <label>` makes
-an account carrying that label off-limits to traffic that did *not* ask for one of its
-groups, and it makes the group's own traffic strict in the same breath: a `--group <label>`
-request with no member free waits or answers 429 rather than spilling onto an account outside
-the group. The two directions are one intent, which is why they are one flag.
+Reserving solves a different problem, and is no longer the only way to get strictness — every
+group is strict on its own exhaustion by default now, `reserved` or not. `tcr group reserve
+<label>` makes an account carrying that label off-limits to traffic that did *not* ask for one
+of its groups: the group's own `--group <label>` ask can still reach it, but nothing else can.
+That inbound half is what `reserved` means today. It does not additionally loosen the
+outbound half — a reserved group ignores `spillToPool` (below) and stays strict on its own
+traffic even if you set it, because spilling a reserved group's traffic into the pool would
+hand it to an account other traffic cannot reach any other way, which defeats the point of
+reserving it.
+
+### `spillToPool`: restoring the old fall-back-to-the-pool behaviour
+
+`groupSettings.<label>.spillToPool: true` is the escape hatch back to the pre-2026-09-13
+default: with it set, a `--group <label>` request whose members are all unavailable falls
+back to the whole pool instead of refusing, the same way an ordinary (ungrouped) request
+does. Absent or `false` (the default) is strict.
+
+```json
+{
+  "groupSettings": {
+    "codereview": { "spillToPool": true }
+  }
+}
+```
+
+It has no effect on a `reserved` group — see above. It is read live, the same
+`groupSettings` hot-reload cadence as `reserved`/`parked`/`allowControlAccount`: editing it
+in the config file takes effect on the next request, no restart.
 
 ### `parked`: a whole group out of rotation
 

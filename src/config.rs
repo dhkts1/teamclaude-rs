@@ -258,26 +258,30 @@ impl Account {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupSettings {
-    /// When `true`, this group is PRIVATE IN BOTH DIRECTIONS. This is the
-    /// canonical statement of what `reserved` means; every other mention should
-    /// point here rather than restate it.
+    /// When `true`, this group is additionally private in the INBOUND
+    /// direction: an account carrying it is off-limits to traffic that did not
+    /// ask for one of its groups — see [`crate::manager::select::eligible`] for
+    /// the exact rule.
     ///
-    /// 1. **Nothing else comes in.** An account carrying this group is
-    ///    off-limits to traffic that did not ask for one of its groups — see
-    ///    [`crate::manager::select::eligible`] for the exact rule.
-    /// 2. **Its own traffic never leaves.** An explicit `--group` ask for this
-    ///    group is STRICT: when no member can serve, the request refuses rather
-    ///    than falling back to the pool, and the caller's exhaustion ladder
-    ///    soft-waits for a member or answers an honest 429. An UNRESERVED group
-    ///    keeps prefer-only semantics and still spills.
+    /// This used to be the ONLY way to get the OUTBOUND half too — an explicit
+    /// `--group` ask for this group refusing rather than spilling into the pool
+    /// when no member can serve. That coupling is gone: the outbound half is
+    /// now the DEFAULT for every `--group` ask, reserved or not (see
+    /// [`Self::spill_to_pool`] for the escape hatch), so `reserved` today means
+    /// only the inbound half — keeping OTHER traffic out. It does not loosen
+    /// the outbound half; a reserved group with `spillToPool` unset is still
+    /// strict on its own traffic, same as any other group.
     ///
-    /// Direction 2 is deliberately not a second flag. The two are one intent —
-    /// "this group is mine" — and splitting them produced a group that looked
-    /// private while still leaking: measured on the live fleet 2026-09-01, an
-    /// unreserved group's member absorbed 127 pool diverts in a day, and the
-    /// rate-limit that caused then spilled that group's own traffic 33 times.
+    /// The split exists because the old single flag produced a group that
+    /// looked private while still leaking: measured on the live fleet
+    /// 2026-09-01, an unreserved group's member absorbed 127 pool diverts in a
+    /// day, and the rate-limit that caused then spilled that group's own
+    /// traffic 33 times. Closing only the inbound leak (this field) was not
+    /// enough — the outbound leak needed its own default, which is why strict
+    /// output is now universal instead of tied to this flag.
     ///
-    /// Absent/`false` (default) is prefer-only in both directions.
+    /// Absent/`false` (default) admits unrequested traffic; `--group` strictness
+    /// is governed separately, by [`Self::spill_to_pool`].
     #[serde(default)]
     pub reserved: bool,
     /// When `true`, every account carrying this group is OUT OF ROTATION, the
@@ -301,6 +305,24 @@ pub struct GroupSettings {
     /// group whose only member is the control account can never route.
     #[serde(default)]
     pub allow_control_account: bool,
+    /// When `true`, an explicit `--group` ask for this group is allowed to
+    /// SPILL: when no member can serve, the request falls back to the whole
+    /// pool instead of refusing — the pre-2026-09-13 behaviour, kept as an
+    /// opt-in escape hatch. Absent/`false` (default) is STRICT: the ask
+    /// refuses rather than spilling, and the caller's exhaustion ladder
+    /// soft-waits for a member or answers an honest 429 — see
+    /// [`crate::manager::select::select_with_group`]'s `strict_group` handling
+    /// for the exact rule.
+    ///
+    /// Independent of [`Self::reserved`]: a reserved group ignores this field
+    /// and is always strict, because spilling a reserved group's own traffic
+    /// into the pool would contradict the inbound half of what `reserved`
+    /// promises — an account walled off from other traffic is not a sane
+    /// landing spot for traffic that could not reach it any other way. This
+    /// field only ever widens an UNRESERVED group back to the pre-2026-09-13
+    /// default.
+    #[serde(default)]
+    pub spill_to_pool: bool,
     /// A configured `#RRGGBB` (or `#RGB`, normalized on write) color for this
     /// group's panel tag. Absent → no color was ever set, and
     /// [`Config::group_color`] derives one deterministically from the group
@@ -1025,6 +1047,30 @@ impl Config {
         self.group_settings
             .get(group)
             .is_some_and(|s| s.allow_control_account)
+    }
+
+    /// The set of group labels currently opted in to `spillToPool` — an
+    /// explicit `--group` ask for one of these falls back to the whole pool
+    /// on exhaustion instead of refusing. Same cheap, one-shot-use posture as
+    /// [`Self::reserved_group_names`].
+    pub fn spill_group_names(&self) -> HashSet<String> {
+        self.group_settings
+            .iter()
+            .filter(|(_, s)| s.spill_to_pool)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Whether `group` currently opts in to `spillToPool`. `false` for a group
+    /// name with no `groupSettings` entry at all — same "absent means false"
+    /// default the field's own doc-comment promises. Callers deciding
+    /// strictness must also check [`Self::is_group_reserved`] — a reserved
+    /// group ignores this and is always strict; see [`GroupSettings::spill_to_pool`]'s
+    /// doc-comment.
+    pub fn group_allows_spill(&self, group: &str) -> bool {
+        self.group_settings
+            .get(group)
+            .is_some_and(|s| s.spill_to_pool)
     }
 
     /// Every group label that currently has at least one member — the same

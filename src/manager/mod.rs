@@ -982,6 +982,13 @@ pub struct Manager {
     /// [`Self::reload_groups_if_changed`]. See `select.rs`'s
     /// `control_excluded` handling for the rule this drives.
     control_allowed_groups: RwLock<HashSet<String>>,
+    /// The set of group labels opted in to `spillToPool` (the escape hatch
+    /// back to pre-2026-09-13 spill-on-exhaustion behaviour). Seeded from the
+    /// config at construction and **hot-reloaded** thereafter, same cadence
+    /// and same `RwLock` reasoning as [`Self::reserved_groups`] — see
+    /// [`Self::reload_groups_if_changed`]. See `select.rs`'s `strict_group`
+    /// handling for the rule this drives.
+    spill_groups: RwLock<HashSet<String>>,
     /// Every group on the fleet mapped to its resolved color
     /// (`config::Config::group_colors`). Seeded at construction and
     /// hot-reloaded alongside [`Self::reserved_groups`] — same
@@ -1321,6 +1328,7 @@ impl Manager {
         let reserved_groups = config.reserved_group_names();
         let parked_groups = config.parked_group_names();
         let control_allowed_groups = config.control_allowed_group_names();
+        let spill_groups = config.spill_group_names();
         // Snapshotted at construction, same restart-to-take-effect contract as
         // `reserved_groups` above and `config::Account::groups` itself — a
         // `tcr group color` write needs a restart before the running server's
@@ -1412,6 +1420,7 @@ impl Manager {
             reserved_groups: RwLock::new(reserved_groups),
             parked_groups: RwLock::new(parked_groups),
             control_allowed_groups: RwLock::new(control_allowed_groups),
+            spill_groups: RwLock::new(spill_groups),
             group_colors: RwLock::new(group_colors),
             groups_reload_mtime: Mutex::new(None),
             pacing,
@@ -1926,6 +1935,16 @@ impl Manager {
             .clone()
     }
 
+    /// A cloned snapshot of the group names currently opted in to
+    /// `spillToPool`. Same clone-not-guard reasoning as
+    /// [`Self::reserved_groups`].
+    pub(super) fn spill_groups(&self) -> HashSet<String> {
+        self.spill_groups
+            .read()
+            .expect("spill_groups lock poisoned")
+            .clone()
+    }
+
     /// Re-read [`config::Account::groups`] and `groupSettings` (`reserved`,
     /// `parked`, `allowControlAccount`, `color`) from `self.config_path` when the file's mtime has moved since
     /// the last check — the fix for group edits appearing to do nothing.
@@ -2026,6 +2045,7 @@ impl Manager {
         let new_reserved = fresh.reserved_group_names();
         let new_parked = fresh.parked_group_names();
         let new_control_allowed = fresh.control_allowed_group_names();
+        let new_spill = fresh.spill_group_names();
         let new_colors = fresh.group_colors();
         let mut changed: Vec<String> = Vec::new();
 
@@ -2069,6 +2089,20 @@ impl Manager {
                     sorted_groups(&new_control_allowed)
                 ));
                 *control_allowed = new_control_allowed;
+            }
+        }
+        {
+            let mut spill = self
+                .spill_groups
+                .write()
+                .expect("spill_groups lock poisoned");
+            if *spill != new_spill {
+                changed.push(format!(
+                    "spill-to-pool groups: {:?} -> {:?}",
+                    sorted_groups(&spill),
+                    sorted_groups(&new_spill)
+                ));
+                *spill = new_spill;
             }
         }
         {
@@ -4023,15 +4057,20 @@ mod tests {
 
     // ---- `--group` prefer-routing (Phase 1: PREFER, never `--only`) -----------
 
-    /// The whole feature: with exactly one account carrying the requested group,
-    /// an unpinned select with that group MUST land on it — even though the
-    /// OTHER account would win the ordinary (no-preference) LRU/priority pick.
-    /// Then, group-out the grouped account (via `disabled`, the simplest hard
-    /// gate) and confirm the SAME select call FALLS BACK to the ungrouped
-    /// account rather than returning `None` — the prefer-semantics that make
-    /// Phase 1 different from the restricting `--only` of Phase 2.
+    /// The prefer half of the feature: with exactly one account carrying the
+    /// requested group, an unpinned select with that group MUST land on it —
+    /// even though the OTHER account would win the ordinary (no-preference)
+    /// LRU/priority pick. Then, group-out the grouped account (via `disabled`,
+    /// the simplest hard gate) and confirm the SAME select call REFUSES
+    /// (`None`) rather than spilling into the pool — an explicit `--group` ask
+    /// is strict by default (2026-09-13): served by that group or not at all.
+    ///
+    /// This used to assert a pool fallback here; that was the pre-2026-09-13
+    /// rule, encoded now by
+    /// [`group_preference_falls_back_to_the_pool_when_spill_to_pool_is_set`]
+    /// with the `spillToPool` escape hatch explicitly on.
     #[test]
-    fn group_preference_prefers_then_falls_back_to_the_pool() {
+    fn group_preference_prefers_then_refuses_when_exhausted() {
         let grouped = account_in_groups("grouped", 5, &["codereview"]);
         let plain = account("plain", 0); // lower priority number sorts FIRST ordinarily
         let manager = build_manager(config_with(vec![grouped, plain]), lock_refresher());
@@ -4068,9 +4107,78 @@ mod tests {
             accounts[0].disabled = true;
         }
 
-        // The prefer-semantics that distinguish Phase 1 from Phase 2's `--only`:
-        // the group has no capacity, so the SAME request falls back to the whole
-        // pool rather than failing.
+        // POSITIVE CONTROL: the pool itself is still perfectly servable. Without
+        // this, the `None` below would also be satisfied by a fleet where
+        // nothing at all could be picked — proving the assertion about
+        // strictness rather than about an empty pool.
+        assert_eq!(
+            manager.select_with_group(&HashSet::new(), now, None, None, "/v1/messages", None, None),
+            Some(1),
+            "control: the ungrouped pool is servable, so a None below is strictness, not exhaustion"
+        );
+
+        // Strict-by-default: the group has no capacity, so an explicit ask for
+        // it refuses rather than spilling into the whole pool.
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            None,
+            "group exhausted, no spillToPool set: must refuse, not spill into the pool"
+        );
+    }
+
+    /// The escape hatch: with `groupSettings.<g>.spillToPool` set, the SAME
+    /// exhausted-group scenario as
+    /// [`group_preference_prefers_then_refuses_when_exhausted`] falls back to
+    /// the whole pool instead of refusing — the pre-2026-09-13 behaviour,
+    /// restored per group on request.
+    #[test]
+    fn group_preference_falls_back_to_the_pool_when_spill_to_pool_is_set() {
+        let grouped = account_in_groups("grouped", 5, &["codereview"]);
+        let plain = account("plain", 0);
+        let mut config = config_with(vec![grouped, plain]);
+        config.group_settings.insert(
+            "codereview".to_string(),
+            crate::config::GroupSettings {
+                reserved: false,
+                parked: false,
+                allow_control_account: false,
+                spill_to_pool: true,
+                color: None,
+                extra: serde_json::Map::new(),
+            },
+        );
+        let manager = build_manager(config, lock_refresher());
+        let now = OffsetDateTime::now_utc();
+
+        // Confirm the preference still applies before exhausting the group —
+        // `spillToPool` only changes what happens on exhaustion.
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            Some(0),
+            "spillToPool does not change the prefer half of the feature"
+        );
+
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].disabled = true;
+        }
+
         assert_eq!(
             manager.select_with_group(
                 &HashSet::new(),
@@ -4082,7 +4190,7 @@ mod tests {
                 Some("codereview"),
             ),
             Some(1),
-            "group exhausted: must fall back to the whole pool, not return None"
+            "spillToPool restores the pre-2026-09-13 rule: group exhausted, fall back to the pool"
         );
     }
 
@@ -4099,6 +4207,7 @@ mod tests {
                     reserved: true,
                     parked: false,
                     allow_control_account: false,
+                    spill_to_pool: false,
                     color: None,
                     extra: serde_json::Map::new(),
                 },
@@ -4168,22 +4277,21 @@ mod tests {
         );
     }
 
-    /// Semantics test #2b: a RESERVED group is strict — when its members are
-    /// all gated, the ask returns `None` instead of spilling into the pool.
+    /// Semantics test #2b: a RESERVED group stays strict — when its members
+    /// are all gated, the ask returns `None` instead of spilling into the
+    /// pool, and unlike an unreserved group this cannot be reopened with
+    /// `spillToPool` (see [`GroupSettings::spill_to_pool`]'s doc-comment).
     ///
-    /// This is the second half of what `reserved` means. Reservation already
-    /// keeps unrequested traffic OUT of the group
-    /// ([`reserved_group_blocks_unrequested_traffic_both_directions`]); this
-    /// keeps the group's own traffic IN. Without it, a reserved group's request
-    /// silently lands on an account the operator deliberately walled off from
+    /// Strict-by-default (2026-09-13) now covers every group, reserved or
+    /// not — see
+    /// [`group_preference_prefers_then_refuses_when_exhausted`] for the
+    /// unreserved case, which behaves identically here. What this test still
+    /// proves that the unreserved one does not: a reserved group's strictness
+    /// is NOT an opt-out surface. Without it, a reserved group's request could
+    /// silently land on an account the operator deliberately walled off from
     /// it — measured on the live fleet 2026-09-01, 33 times in one day, every
     /// one `reason="all-members-unavailable"`, after pool traffic had
     /// rate-limited the group's only member.
-    ///
-    /// The contrast case is deliberately left to
-    /// [`group_preference_prefers_then_falls_back_to_the_pool`]: an
-    /// UNRESERVED group keeps the prefer-and-spill behaviour unchanged, so
-    /// strictness rides entirely on `reserved` and needs no second flag.
     #[test]
     fn a_reserved_group_never_falls_back_to_the_pool() {
         let reserved_acct = account_in_groups("reserved-acct", 5, &["codereview"]);
@@ -4195,7 +4303,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
 
         // Gate the group's only member out entirely (disabled = hard-ineligible),
-        // exactly as `group_preference_prefers_then_falls_back_to_the_pool` does.
+        // exactly as `group_preference_prefers_then_refuses_when_exhausted` does.
         {
             let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
             accounts[0].disabled = true;
@@ -4224,6 +4332,58 @@ mod tests {
             None,
             "a reserved group must never spill into the pool — refuse and let the \
              caller's exhaustion ladder soft-wait or answer an honest 429"
+        );
+    }
+
+    /// The escape hatch does not reopen a RESERVED group: `spillToPool: true`
+    /// on a reserved group's `groupSettings` entry is ignored, because
+    /// spilling its own traffic into the pool would hand it to an account
+    /// other traffic cannot reach any other way — the opposite of what
+    /// `reserved` promises inbound. Same scenario as
+    /// [`a_reserved_group_never_falls_back_to_the_pool`], with `spillToPool`
+    /// deliberately set to prove it has no effect here.
+    #[test]
+    fn a_reserved_group_ignores_spill_to_pool() {
+        let reserved_acct = account_in_groups("reserved-acct", 5, &["codereview"]);
+        let plain = account("plain", 0);
+        let mut config = config_with(vec![reserved_acct, plain]);
+        config.group_settings.insert(
+            "codereview".to_string(),
+            crate::config::GroupSettings {
+                reserved: true,
+                parked: false,
+                allow_control_account: false,
+                spill_to_pool: true,
+                color: None,
+                extra: serde_json::Map::new(),
+            },
+        );
+        let manager = build_manager(config, lock_refresher());
+        let now = OffsetDateTime::now_utc();
+
+        {
+            let mut accounts = manager.accounts.write().expect("accounts lock poisoned");
+            accounts[0].disabled = true;
+        }
+
+        assert_eq!(
+            manager.select_with_group(&HashSet::new(), now, None, None, "/v1/messages", None, None),
+            Some(1),
+            "control: the ungrouped pool is servable"
+        );
+
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("codereview"),
+            ),
+            None,
+            "reserved + spillToPool: still refuses — spillToPool cannot reopen a reserved group"
         );
     }
 
@@ -4325,6 +4485,7 @@ mod tests {
                     reserved: false,
                     parked: true,
                     allow_control_account: false,
+                    spill_to_pool: false,
                     color: None,
                     extra: serde_json::Map::new(),
                 },
@@ -4367,8 +4528,9 @@ mod tests {
                 None,
                 Some("codereview"),
             ),
-            Some(1),
-            "a --group ask for a parked group must not select the parked member"
+            None,
+            "a --group ask for a parked group must not select the parked member, and \
+             strict-by-default means it refuses rather than falling back to the pool"
         );
 
         // Same fixture with the parked group as the fleet's ONLY group member
@@ -4533,6 +4695,7 @@ mod tests {
                     reserved: false,
                     parked: false,
                     allow_control_account: true,
+                    spill_to_pool: false,
                     color: None,
                     extra: serde_json::Map::new(),
                 },
@@ -4543,8 +4706,10 @@ mod tests {
 
     /// The whole feature, both directions: a group whose only member is the
     /// control account cannot serve `--group research` inference by default —
-    /// but the SAME fixture, with `allowControlAccount` set on `research`,
-    /// serves it.
+    /// strict-by-default (2026-09-13) means that ask now refuses rather than
+    /// spilling to the pool, since an explicit `--group` ask is served by that
+    /// group or not at all — but the SAME fixture, with `allowControlAccount`
+    /// set on `research`, serves it.
     #[test]
     fn control_only_group_serves_inference_only_once_opted_in() {
         let control = account_in_groups("control-acct", 0, &["research"]);
@@ -4556,6 +4721,11 @@ mod tests {
         );
         let now = OffsetDateTime::now_utc();
         assert_eq!(
+            blocked.select_with_group(&HashSet::new(), now, None, None, "/v1/messages", None, None),
+            Some(1),
+            "control: with no group requested, the pool is servable"
+        );
+        assert_eq!(
             blocked.select_with_group(
                 &HashSet::new(),
                 now,
@@ -4565,8 +4735,8 @@ mod tests {
                 None,
                 Some("research"),
             ),
-            Some(1),
-            "not opted in: falls back to the whole pool, never the control account"
+            None,
+            "not opted in: strict by default, refuses rather than falling back to the pool"
         );
 
         let mut opted_in_config = config_with_control(vec![control, other], "control-acct");
@@ -4576,6 +4746,7 @@ mod tests {
                 reserved: false,
                 parked: false,
                 allow_control_account: true,
+                spill_to_pool: false,
                 color: None,
                 extra: serde_json::Map::new(),
             },
@@ -4934,8 +5105,8 @@ mod tests {
                 None,
                 Some("research"),
             ),
-            Some(1),
-            "not opted in at boot: falls back to the whole pool"
+            None,
+            "not opted in at boot: strict by default, refuses rather than falling back to the pool"
         );
 
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -4952,6 +5123,7 @@ mod tests {
                 reserved: false,
                 parked: false,
                 allow_control_account: true,
+                spill_to_pool: false,
                 color: None,
                 extra: serde_json::Map::new(),
             },
