@@ -69,10 +69,19 @@ struct AccountCard<Actions: View>: View {
                 if let plan = planLine {
                     MuteText(text: plan)
                 }
-                ForEach(quotaWindows, id: \.label) { window in
-                    QuotaRow(
-                        label: window.label, value: window.value, tint: window.tint,
-                        resetAtMs: window.resetAtMs, now: now)
+                // Compact draws every window on one line — the fix for the
+                // measured +42 pt the restored `fable` row cost a Compact card
+                // (`data/plans/dense-quota-bridge.md`). Comfortable keeps the
+                // three full rows exactly as before this change: this is a
+                // shorter card, never a smaller font on the same rows.
+                if V4.compact {
+                    DenseQuotaLine(windows: quotaWindows, now: now)
+                } else {
+                    ForEach(quotaWindows, id: \.label) { window in
+                        QuotaRow(
+                            label: window.label, value: window.value, tint: window.tint,
+                            resetAtMs: window.resetAtMs, now: now)
+                    }
                 }
             }
         }
@@ -179,13 +188,6 @@ struct AccountCard<Actions: View>: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private struct Window {
-        let label: String
-        let value: Double?
-        let tint: QuotaBarTintSource
-        let resetAtMs: Int64?
-    }
-
     /// The windows the card draws: the mockup's two, plus `fable` under them
     /// when this account has one.
     ///
@@ -209,20 +211,20 @@ struct AccountCard<Actions: View>: View {
     /// `quotaBarTintSource(for:)`: that function's old-server fallback borrows
     /// the composite `quotaState`, which for this window would be a reading of
     /// something else entirely.
-    private var quotaWindows: [Window] {
+    private var quotaWindows: [QuotaWindowSpec] {
         var windows = [
-            Window(
+            QuotaWindowSpec(
                 label: "5h", value: account.fiveHour,
                 tint: account.quotaBarTintSource(for: .fiveHour),
                 resetAtMs: account.fiveHourResetAtMs),
-            Window(
+            QuotaWindowSpec(
                 label: "7d", value: account.sevenDay,
                 tint: account.quotaBarTintSource(for: .sevenDay),
                 resetAtMs: account.sevenDayResetAtMs),
         ]
         if account.sevenDayOi != nil {
             windows.append(
-                Window(
+                QuotaWindowSpec(
                     label: "fable", value: account.sevenDayOi,
                     tint: account.fableBarTintSource,
                     resetAtMs: account.sevenDayOiResetAtMs))
