@@ -30,14 +30,24 @@
 //! never show a tool still running.
 //!
 //! `command_head` (capped to 120 chars; the per-tool shape is on
-//! [`ToolUseEvent::command_head`]) is held in this in-memory table — never written to
-//! `~/.cache/teamclaude/logs` or any other log file. That is the same
-//! body-content-never-hits-disk rule `src/proxy.rs` states for the request log. The
-//! affinity-style snapshot in [`crate::session_wire_persist`] round-trips [`WireSession`]
-//! to `~/.cache/teamclaude/session-wire.json`, but [`RunningTool::command_head`] and
-//! [`SlowTool::command_head`] carry `#[serde(skip_serializing)]`, so that file never holds
-//! one: `command_class` (a coarse category, not a command) is the only per-tool shape that
-//! reaches disk.
+//! [`ToolUseEvent::command_head`]) is held in this in-memory table and is never written to
+//! `~/.cache/teamclaude/logs` or any other log file — the same
+//! body-content-never-hits-disk rule `src/proxy.rs` states for the request log.
+//!
+//! It DOES reach one file: the affinity-style snapshot in
+//! [`crate::session_wire_persist`], which round-trips [`WireSession`] to
+//! `~/.cache/teamclaude/session-wire.json`. Between #299 and 2026-09-13 both
+//! [`RunningTool::command_head`] and [`SlowTool::command_head`] carried
+//! `#[serde(skip_serializing)]` and that file held no command at all. Gil reversed it the
+//! same day, on a measurement: after a restart, 72 of 95 restored SLOWEST TODAY rows read
+//! as a bare `Bash`, because the class survived and the command did not — a slowest-today
+//! list with no commands in it is junk, not a reduced-detail version of the real thing. So
+//! the head persists, bounded by what it already was: 120 characters of a NORMALIZED
+//! command (env prefixes, wrappers and the leading `cd` clause are stripped before it is
+//! stored), a file path, or a grep pattern — never a request or response body, which this
+//! table has never held. The file is written `0600` by [`crate::config::write_atomic`],
+//! which both creates its temp file with that mode and normalises the destination after the
+//! rename, so an operator's umask cannot loosen it.
 
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -515,17 +525,23 @@ fn url_host(raw: &str) -> &str {
 pub struct RunningTool {
     pub tool: String,
     pub started_ms: i64,
-    #[serde(skip_serializing, default)]
+    /// `#[serde(default)]` — NOT `skip_serializing`: the head persists (Gil, 2026-09-13,
+    /// reversing #299; the module doc has the why). `default` stays so a cache file written
+    /// by a build between #299 and that ruling, which omits the field entirely, still loads
+    /// rather than taking every session in the file down with it.
+    #[serde(default)]
     pub command_head: Option<String>,
     pub command_class: Option<CommandClass>,
 }
 
-/// One completed tool call, for the "ten slowest" list.
+/// One completed tool call, for the "ten slowest" list — and, with the same fields, for
+/// [`ToolStats::timed_out`].
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SlowTool {
     pub tool: String,
     pub seconds: f64,
-    #[serde(skip_serializing, default)]
+    /// Same `#[serde(default)]` reasoning as [`RunningTool::command_head`].
+    #[serde(default)]
     pub command_head: Option<String>,
     pub command_class: Option<CommandClass>,
     pub ended_ms: i64,
@@ -588,6 +604,20 @@ pub struct ToolStats {
     pub calls: u64,
     pub errors: u64,
     pub timeouts: u64,
+    /// [`Self::timeouts`] split by what the command WAS, keyed on
+    /// [`CommandClass::as_str`] for a `Bash` call that carried one and on the tool's own
+    /// name (`"Agent"`) for everything else — so the map always sums to `timeouts` and the
+    /// panel's "TIMED OUT TODAY" section and its headline count read one number.
+    ///
+    /// `BTreeMap` rather than `HashMap` because this one is DISPLAYED: a stable key order
+    /// keeps the section from reshuffling between two snapshots that say the same thing.
+    /// `#[serde(default)]` so a cache file written before this field existed still loads.
+    #[serde(default)]
+    pub timeouts_by_class: std::collections::BTreeMap<String, u64>,
+    /// The commands that timed out, newest first, capped at [`TIMED_OUT_CAP`].
+    /// `#[serde(default)]` for the same restore reason as [`Self::timeouts_by_class`].
+    #[serde(default)]
+    pub timed_out: Vec<SlowTool>,
     /// Completed calls (any tool) whose duration was 60 seconds or more — the session-wide
     /// total; [`ToolBucket::over_one_minute`] carries the same count per tool.
     pub over_one_minute: u64,
@@ -702,6 +732,12 @@ pub const PENDING_TOOL_CAP: usize = 64;
 pub const SESSION_CAP: usize = 512;
 /// How many of the slowest completed tool calls each session keeps.
 pub const SLOWEST_CAP: usize = 10;
+/// How many timed-out commands each session keeps, newest first
+/// ([`ToolStats::timed_out`]). Twice [`SLOWEST_CAP`]: a timeout is rarer than a slow call
+/// but its list is the one a person reads to spot a REPEATING command, and a pattern needs
+/// more than ten rows to be visible. Still bounded — this rides the session-wire snapshot
+/// to disk, once per session.
+pub const TIMED_OUT_CAP: usize = 20;
 /// A session unseen for this long is evicted — see the bridge ("an hour").
 pub const SESSION_TTL_MS: i64 = 60 * 60 * 1000;
 
@@ -802,9 +838,6 @@ impl WireSessionTracker {
                 if tr.is_error {
                     entry.tools.errors += 1;
                 }
-                if tr.timed_out {
-                    entry.tools.timeouts += 1;
-                }
                 if seconds >= 60.0 {
                     entry.tools.over_one_minute += 1;
                 }
@@ -814,16 +847,26 @@ impl WireSessionTracker {
                     .entry(running.tool.clone())
                     .or_default()
                     .record(seconds, tr.is_error);
-                Self::insert_slowest(
-                    &mut entry.tools.slowest,
-                    SlowTool {
-                        tool: running.tool,
-                        seconds,
-                        command_head: running.command_head,
-                        command_class: running.command_class,
-                        ended_ms: now_ms,
-                    },
-                );
+                let completed = SlowTool {
+                    tool: running.tool,
+                    seconds,
+                    command_head: running.command_head,
+                    command_class: running.command_class,
+                    ended_ms: now_ms,
+                };
+                if tr.timed_out {
+                    entry.tools.timeouts += 1;
+                    // The class if the classifier gave this call one, the tool's own name
+                    // otherwise — so the map sums to `timeouts` for every tool, not just
+                    // the `Bash` calls that have a class.
+                    let key = completed
+                        .command_class
+                        .map_or_else(|| completed.tool.clone(), |c| c.as_str().to_string());
+                    *entry.tools.timeouts_by_class.entry(key).or_insert(0) += 1;
+                    entry.tools.timed_out.insert(0, completed.clone());
+                    entry.tools.timed_out.truncate(TIMED_OUT_CAP);
+                }
+                Self::insert_slowest(&mut entry.tools.slowest, completed);
             }
         }
 
@@ -1706,6 +1749,155 @@ mod tests {
         assert_eq!(session.tools.calls, 1);
         assert_eq!(session.tools.errors, 1);
         assert_eq!(session.tools.timeouts, 1);
+    }
+
+    /// Two timeouts of different command classes split into `timeouts_by_class` (which sums
+    /// to `timeouts`) and land in `timed_out` newest first, carrying the head the call had
+    /// while it was running. The classes come from the real classifier via
+    /// [`tool_use_event_from_block`], not hand-set, so this test fails if the classifier's
+    /// names and the wire's keys ever stop agreeing.
+    #[test]
+    fn timeouts_split_by_command_class_and_keep_the_commands() {
+        let mut tracker = WireSessionTracker::new();
+        let wait = tool_use_event_from_block(
+            "tu_wait".into(),
+            Some("Bash".into()),
+            Some(&serde_json::json!({
+                "command": "until grep -q ready build.log; do sleep 5; done"
+            })),
+        );
+        let push = tool_use_event_from_block(
+            "tu_push".into(),
+            Some("Bash".into()),
+            Some(&serde_json::json!({ "command": "git push origin main" })),
+        );
+        assert_eq!(wait.command_class, Some(CommandClass::Wait));
+        assert_eq!(push.command_class, Some(CommandClass::GitNet));
+
+        tracker.record_request("sess-t", None, None, 1_000, &[wait, push], &[]);
+        // The `until` loop times out first, the `git push` a minute later — so the push is
+        // the newer of the two and must lead `timed_out`.
+        tracker.record_request(
+            "sess-t",
+            None,
+            None,
+            601_000,
+            &[],
+            &[ToolResultEvent {
+                id: "tu_wait".into(),
+                is_error: true,
+                timed_out: true,
+            }],
+        );
+        tracker.record_request(
+            "sess-t",
+            None,
+            None,
+            661_000,
+            &[],
+            &[ToolResultEvent {
+                id: "tu_push".into(),
+                is_error: true,
+                timed_out: true,
+            }],
+        );
+
+        let snap = tracker.snapshot(661_000);
+        let (_, session) = &snap[0];
+        assert_eq!(session.tools.timeouts, 2);
+        assert_eq!(
+            session.tools.timeouts_by_class,
+            [("wait".to_string(), 1u64), ("git-net".to_string(), 1u64)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
+        assert_eq!(
+            session.tools.timeouts_by_class.values().sum::<u64>(),
+            session.tools.timeouts,
+            "the per-class split must sum to the headline count"
+        );
+        assert_eq!(session.tools.timed_out.len(), 2);
+        assert_eq!(
+            session.tools.timed_out[0].command_head.as_deref(),
+            Some("git push origin main"),
+            "newest first"
+        );
+        assert_eq!(
+            session.tools.timed_out[0].command_class,
+            Some(CommandClass::GitNet)
+        );
+        assert_eq!(session.tools.timed_out[0].ended_ms, 661_000);
+        assert_eq!(
+            session.tools.timed_out[1].command_head.as_deref(),
+            Some("until grep -q ready build.log; do sleep 5; done")
+        );
+    }
+
+    /// A timed-out call that is not a classified `Bash` command counts under its TOOL name,
+    /// so the map still sums to `timeouts` rather than dropping the row on the floor.
+    #[test]
+    fn a_non_bash_timeout_counts_under_its_tool_name() {
+        let mut tracker = WireSessionTracker::new();
+        let agent = tool_use_event_from_block(
+            "tu_agent".into(),
+            Some("Agent".into()),
+            Some(&serde_json::json!({ "description": "check the wire fixtures" })),
+        );
+        assert_eq!(agent.command_class, None);
+        tracker.record_request("sess-a", None, None, 1_000, &[agent], &[]);
+        tracker.record_request(
+            "sess-a",
+            None,
+            None,
+            2_000,
+            &[],
+            &[ToolResultEvent {
+                id: "tu_agent".into(),
+                is_error: true,
+                timed_out: true,
+            }],
+        );
+        let snap = tracker.snapshot(2_000);
+        let (_, session) = &snap[0];
+        assert_eq!(session.tools.timeouts, 1);
+        assert_eq!(session.tools.timeouts_by_class.get("Agent"), Some(&1));
+    }
+
+    /// `timed_out` is bounded like every other per-session list here, and drops the OLDEST
+    /// rows when it overflows — the newest timeout is the one worth reading.
+    #[test]
+    fn timed_out_is_capped_and_keeps_the_newest() {
+        let mut tracker = WireSessionTracker::new();
+        for i in 0..(TIMED_OUT_CAP + 5) {
+            let id = format!("tu_{i}");
+            let use_event = tool_use_event_from_block(
+                id.clone(),
+                Some("Bash".into()),
+                Some(&serde_json::json!({ "command": format!("sleep {i}") })),
+            );
+            let clock = 1_000 + i as i64 * 1_000;
+            tracker.record_request("sess-c", None, None, clock, &[use_event], &[]);
+            tracker.record_request(
+                "sess-c",
+                None,
+                None,
+                clock + 500,
+                &[],
+                &[ToolResultEvent {
+                    id,
+                    is_error: true,
+                    timed_out: true,
+                }],
+            );
+        }
+        let snap = tracker.snapshot(1_000 + (TIMED_OUT_CAP + 5) as i64 * 1_000);
+        let (_, session) = &snap[0];
+        assert_eq!(session.tools.timeouts, (TIMED_OUT_CAP + 5) as u64);
+        assert_eq!(session.tools.timed_out.len(), TIMED_OUT_CAP);
+        assert_eq!(
+            session.tools.timed_out[0].command_head.as_deref(),
+            Some(format!("sleep {}", TIMED_OUT_CAP + 4).as_str())
+        );
     }
 
     /// `by_tool` keeps separate buckets per tool NAME (three tools, two of which get more

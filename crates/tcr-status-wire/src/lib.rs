@@ -188,6 +188,19 @@ pub struct SessionToolsRow {
     pub errors: u64,
     #[serde(default)]
     pub timeouts: u64,
+    /// [`Self::timeouts`] split by what the command WAS — keyed on the command class
+    /// (`wait`, `build`, `git-net`, …) for a classified `Bash` call and on the tool's own
+    /// name (`Agent`) for everything else, so the map sums to `timeouts` and a panel's
+    /// "TIMED OUT TODAY" section and its headline count cannot disagree. A `BTreeMap`
+    /// because it is displayed: the key order is stable between snapshots.
+    /// `#[serde(default)]` so a payload from a server built before this field existed
+    /// decodes as "no split known" rather than a parse failure.
+    #[serde(default)]
+    pub timeouts_by_class: std::collections::BTreeMap<String, u64>,
+    /// The commands that timed out in this session, newest first, capped at 20 — the rows
+    /// behind [`Self::timeouts_by_class`]. Same `#[serde(default)]` reasoning.
+    #[serde(default)]
+    pub timed_out: Vec<SlowToolRow>,
     /// Completed calls (any tool) whose duration was 60 seconds or more — the session-wide
     /// total; [`ToolBucketRow::over_one_minute`] carries the same count per tool.
     /// `#[serde(default)]` so a payload from a server built before this field existed decodes
@@ -225,6 +238,11 @@ pub struct SessionsSummary {
     pub over_one_minute: u64,
     #[serde(default)]
     pub timeouts: u64,
+    /// Fleet-wide sum of [`SessionToolsRow::timeouts_by_class`], summed server-side for the
+    /// same reason [`Self::by_tool`] is: the panel's headline and its "TIMED OUT TODAY"
+    /// section read one number rather than two client-side re-sums that can drift.
+    #[serde(default)]
+    pub timeouts_by_class: std::collections::BTreeMap<String, u64>,
     #[serde(default)]
     pub by_tool: Vec<ToolBucketRow>,
     /// Sum of [`SessionRow::cost_usd`] across every live session — see that field's
