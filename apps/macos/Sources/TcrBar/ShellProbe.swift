@@ -344,32 +344,35 @@ enum ShellProbe {
 
     // MARK: - Assertion 7
 
+    /// Retired the "the gauge differs between appearances" half of this check:
+    /// the coffee-mark rework (`data/plans/coffee-mark-bridge.md`) removed the
+    /// separate gauge glyph this assertion used to split against by colour —
+    /// there is now one cup, and its own colour IS the awake tint end to end.
+    /// What is still real and still worth a shell-level check, since a unit
+    /// test never touches the real `NSStatusBarButton`: the composed image's
+    /// dynamic tint (`Tok.awakeNSColor`, a different hex in each appearance)
+    /// resolves to a real cyan pixel under BOTH `.aqua` and `.darkAqua`, which
+    /// is only true if the drawing handler re-resolves it at draw time rather
+    /// than baking in whichever appearance was current when the mark was
+    /// composed — the same claim ``MenuBarMark``'s own doc-comment makes.
     @MainActor
     private static func appearanceCheck() -> Check {
         guard
-            let mark = MenuBarMark.image(
-                gaugeSymbol: "gauge.with.dots.needle.33percent", awake: true,
-                awakeTint: Tok.awakeNSColor),
+            let mark = MenuBarMark.image(fraction: 1.0, tint: .awake(Tok.awakeNSColor)),
             let aqua = NSAppearance(named: .aqua),
             let dark = NSAppearance(named: .darkAqua),
             let light = rasterise(mark, in: aqua),
             let night = rasterise(mark, in: dark)
         else {
             return Check(
-                7, "ON image re-resolves labelColor per appearance", passed: false,
+                7, "ON image re-resolves the awake tint per appearance", passed: false,
                 detail: "could not compose or rasterise the mark")
         }
-        // The gauge is whatever is NOT cyan; the cup is whatever is. Splitting
-        // by colour rather than by pixel column keeps this from silently
-        // measuring the wrong half if the composition ever changes its layout.
-        let gaugeMoved = abs(light.nonCyanLuma - night.nonCyanLuma) > 0.2
         let cupHeld = light.cyan > 0 && night.cyan > 0
         return Check(
-            7, "ON image: gauge differs between .aqua and .darkAqua, cup cyan in both",
-            passed: gaugeMoved && cupHeld,
-            detail: String(
-                format: "aqua gaugeLuma=%.3f cyan=%d · dark gaugeLuma=%.3f cyan=%d",
-                light.nonCyanLuma, light.cyan, night.nonCyanLuma, night.cyan))
+            7, "ON image: the cup carries the awake tint under both .aqua and .darkAqua",
+            passed: cupHeld,
+            detail: String(format: "aqua cyan=%d · dark cyan=%d", light.cyan, night.cyan))
     }
 
     // MARK: - Pixels

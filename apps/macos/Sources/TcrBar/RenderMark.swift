@@ -2,9 +2,9 @@ import AppKit
 import TcrBarCore
 
 /// Rasterise the menu-bar mark itself — the composed `NSImage`
-/// ``MenuBarMark/image(gaugeSymbol:awake:awakeTint:)`` builds, plus the
-/// `ready/enabled` label this feature (F5, `data/plans/menubar-counts-bridge.md`)
-/// adds beside it — to PNG, in-process, then exit.
+/// ``MenuBarMark/image(fraction:tint:)`` builds, plus the opt-in
+/// `ready/enabled` label (F5, `data/plans/menubar-counts-bridge.md`) beside it
+/// when a scene turns it on — to PNG, in-process, then exit.
 ///
 /// ## Why this exists, separate from `--render-states`
 ///
@@ -33,32 +33,34 @@ enum RenderMark {
         return URL(fileURLWithPath: arguments[i + 1])
     }
 
-    /// The six states `docs/design/menubar-mark-mockup.html` shows, in its own
-    /// order, plus the same "counts off" and "poll failed" branches this
-    /// feature's own predecessor (F5, `menubar-counts-bridge.md`) already
-    /// covered here. `appearance` is `nil` for the process default (matching
-    /// the mockup's dark scenes, which is what every state but the last one
-    /// is) and `.aqua` only for the light scene — the one place the mockup
-    /// asks to see the SAME state rendered under the other appearance rather
-    /// than a different fleet.
+    /// The coffee-cup mark's own state set (`docs/design/menubar-mark-mockup.html`
+    /// § "Coffee-mark rule"), one scene per named point in the bridge's gate —
+    /// "0%, 40%, 100%, near, failed, off" — each carrying keep-awake ON except
+    /// the one scene named `off`, plus a light-appearance repeat of the 100%
+    /// scene the same way the predecessor mockup repeated one state under the
+    /// other appearance rather than a different fleet. `appearance` is `nil`
+    /// for the process default (dark) and `.aqua` only for the light scene.
     private static var scenes:
         [
             (
-                name: String, state: PollState, showCounts: Bool, showRunningTools: Bool,
-                appearance: NSAppearance.Name?
+                name: String, state: PollState, awake: Bool, showCounts: Bool,
+                showRunningTools: Bool, appearance: NSAppearance.Name?
             )
         ]
     {
         [
-            ("01-dark-counts-on", .loaded(mixedFleet), true, false, nil),
-            ("02-dark-running-tools-count", .loaded(runningToolsFleet), true, true, nil),
-            ("03-dark-near-the-limit", .loaded(nearTheLimitFleet), true, false, nil),
+            ("01-dark-awake-0pct", .loaded(noneReadyFleet), true, false, false, nil),
+            ("02-dark-awake-40pct", .loaded(partialReadyFleet), true, false, false, nil),
+            ("03-dark-awake-100pct", .loaded(fullReadyFleet), true, false, false, nil),
+            ("04-dark-near", .loaded(nearTheLimitFleet), true, false, false, nil),
             (
-                "04-dark-poll-failed", .commandFailed(exitCode: 1, message: "connection refused"),
-                true, false, nil
+                "05-dark-failed", .commandFailed(exitCode: 1, message: "connection refused"),
+                true, false, false, nil
             ),
-            ("05-dark-counts-off", .loaded(mixedFleet), false, false, nil),
-            ("06-light", .loaded(mixedFleet), true, false, .aqua),
+            ("06-dark-off-template", .loaded(partialReadyFleet), false, false, false, nil),
+            ("07-dark-counts-on", .loaded(mixedFleet), true, true, false, nil),
+            ("08-dark-running-tools-count", .loaded(runningToolsFleet), true, true, true, nil),
+            ("09-light-awake-100pct", .loaded(fullReadyFleet), true, false, false, .aqua),
         ]
     }
 
@@ -90,15 +92,15 @@ enum RenderMark {
     @MainActor
     private static func render(
         _ scene: (
-            name: String, state: PollState, showCounts: Bool, showRunningTools: Bool,
-            appearance: NSAppearance.Name?
+            name: String, state: PollState, awake: Bool, showCounts: Bool,
+            showRunningTools: Bool, appearance: NSAppearance.Name?
         ),
         into directory: URL
     ) -> Bool {
-        let gauge = MenuBarShell.gaugeSymbol(for: scene.state)
-        guard let mark = MenuBarMark.image(gaugeSymbol: gauge, awake: false, awakeTint: .systemCyan)
+        let tint = MenuBarShell.cupTint(for: scene.state, awake: scene.awake)
+        guard let mark = MenuBarMark.image(fraction: scene.state.capacityFraction, tint: tint)
         else {
-            FileHandle.standardError.write(Data("no such SF Symbol: \(gauge)\n".utf8))
+            FileHandle.standardError.write(Data("no such SF Symbol: \(MenuBarMark.symbolName)\n".utf8))
             return false
         }
 
@@ -223,6 +225,125 @@ enum RenderMark {
 
     private static var mixedFleet: Fleet {
         (try? Fleet.decode(Data(mixedFleetJSON.utf8))) ?? Fleet(accounts: [])
+    }
+
+    /// Two enabled accounts, neither ready and neither near — `0/2`, the cup's
+    /// empty scene. Distinct from the near-the-limit fixture below: this one
+    /// must NOT trip `capacityGlyphState == .near`, so the cup draws its
+    /// default tint (template/awake) at fraction 0, not amber.
+    private static let noneReadyJSON = """
+        [
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "henry@example.com", "priority": 1, "status": "active",
+            "disabled": false, "quota": 1.0, "quotaState": "spent",
+            "fiveHour": 1.0, "sevenDay": 1.0, "sevenDayOi": 0.0,
+            "held": [{"window": "5h", "minutesUntilReset": 200, "resetAtMs": 999000000000}],
+            "requests": 9, "inputTokens": 90, "outputTokens": 9,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "iris@example.com", "priority": 2, "status": "active",
+            "disabled": false, "quota": 1.0, "quotaState": "spent",
+            "fiveHour": 1.0, "sevenDay": 1.0, "sevenDayOi": 0.0,
+            "held": [{"window": "5h", "minutesUntilReset": 150, "resetAtMs": 999000000000}],
+            "requests": 4, "inputTokens": 40, "outputTokens": 4,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          }
+        ]
+        """
+
+    private static var noneReadyFleet: Fleet {
+        (try? Fleet.decode(Data(noneReadyJSON.utf8))) ?? Fleet(accounts: [])
+    }
+
+    /// Five enabled accounts, two ready — `2/5`, `0.4`, the cup's 40% scene.
+    private static let partialReadyJSON = """
+        [
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "jack@example.com", "priority": 1, "status": "active",
+            "disabled": false, "quota": 0.1, "quotaState": "ok",
+            "fiveHour": 0.1, "sevenDay": 0.1, "sevenDayOi": 0.0,
+            "held": [], "requests": 6, "inputTokens": 60, "outputTokens": 6,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "kim@example.com", "priority": 2, "status": "active",
+            "disabled": false, "quota": 0.2, "quotaState": "ok",
+            "fiveHour": 0.2, "sevenDay": 0.2, "sevenDayOi": 0.0,
+            "held": [], "requests": 3, "inputTokens": 30, "outputTokens": 3,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "liam@example.com", "priority": 3, "status": "active",
+            "disabled": false, "quota": 1.0, "quotaState": "spent",
+            "fiveHour": 1.0, "sevenDay": 1.0, "sevenDayOi": 0.0,
+            "held": [{"window": "5h", "minutesUntilReset": 100, "resetAtMs": 999000000000}],
+            "requests": 2, "inputTokens": 20, "outputTokens": 2,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "maya@example.com", "priority": 4, "status": "active",
+            "disabled": false, "quota": 1.0, "quotaState": "spent",
+            "fiveHour": 1.0, "sevenDay": 1.0, "sevenDayOi": 0.0,
+            "held": [{"window": "5h", "minutesUntilReset": 110, "resetAtMs": 999000000000}],
+            "requests": 1, "inputTokens": 10, "outputTokens": 1,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "noah@example.com", "priority": 5, "status": "active",
+            "disabled": false, "quota": 1.0, "quotaState": "spent",
+            "fiveHour": 1.0, "sevenDay": 1.0, "sevenDayOi": 0.0,
+            "held": [{"window": "5h", "minutesUntilReset": 120, "resetAtMs": 999000000000}],
+            "requests": 1, "inputTokens": 10, "outputTokens": 1,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          }
+        ]
+        """
+
+    private static var partialReadyFleet: Fleet {
+        (try? Fleet.decode(Data(partialReadyJSON.utf8))) ?? Fleet(accounts: [])
+    }
+
+    /// Two enabled accounts, both ready — `2/2`, `1.0`, the cup's full scene.
+    private static let fullReadyJSON = """
+        [
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "olive@example.com", "priority": 1, "status": "active",
+            "disabled": false, "quota": 0.05, "quotaState": "ok",
+            "fiveHour": 0.05, "sevenDay": 0.05, "sevenDayOi": 0.0,
+            "held": [], "requests": 2, "inputTokens": 20, "outputTokens": 2,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "pat@example.com", "priority": 2, "status": "active",
+            "disabled": false, "quota": 0.05, "quotaState": "ok",
+            "fiveHour": 0.05, "sevenDay": 0.05, "sevenDayOi": 0.0,
+            "held": [], "requests": 1, "inputTokens": 10, "outputTokens": 1,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          }
+        ]
+        """
+
+    private static var fullReadyFleet: Fleet {
+        (try? Fleet.decode(Data(fullReadyJSON.utf8))) ?? Fleet(accounts: [])
     }
 
     /// Zero ready, at least one near — the exact condition
