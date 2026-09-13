@@ -155,12 +155,31 @@ struct AccountCard: View {
         let resetAtMs: Int64?
     }
 
-    /// The two windows the mockup's card draws. A window with no reading at all
-    /// is still drawn — an empty track is a fact ("never measured"), and dropping
-    /// the row would make a card that has never been probed look like one with
-    /// nothing to report.
+    /// The windows the card draws: the mockup's two, plus `fable` under them
+    /// when this account has one.
+    ///
+    /// `5h` and `7d` are drawn even with no reading at all — an empty track is
+    /// a fact ("never measured"), and dropping the row would make a card that
+    /// has never been probed look like one with nothing to report.
+    ///
+    /// `fable` is the opposite case and is drawn only when ``Account/sevenDayOi``
+    /// is non-nil. It is a SEPARATE window with a separate reset, gating Fable
+    /// requests alone (`docs/cli.md`, "The weekly quota pair on `--json`"): a
+    /// non-Fable request never checks it, and `held[]`/`quotaState` never
+    /// reflect it — so it cannot be read off the `7d` bar above it, and an
+    /// empty `fable` track on an account that simply has no such window would
+    /// be a claim about a window that does not exist. The pre-v4 card drew it
+    /// as a label on the 7d line (`Account.fableWeeklyLabel`, "fable 71% · in
+    /// 4d 12h"); the v4 transcription referenced it nowhere at all, so the
+    /// panel drew no Fable figure while the router was gating on one (Gil,
+    /// 2026-09-13: "why i dont see fable like we had before?").
+    ///
+    /// Its tint comes from ``Account/fableBarTintSource`` and never from
+    /// `quotaBarTintSource(for:)`: that function's old-server fallback borrows
+    /// the composite `quotaState`, which for this window would be a reading of
+    /// something else entirely.
     private var quotaWindows: [Window] {
-        [
+        var windows = [
             Window(
                 label: "5h", value: account.fiveHour,
                 tint: account.quotaBarTintSource(for: .fiveHour),
@@ -170,5 +189,13 @@ struct AccountCard: View {
                 tint: account.quotaBarTintSource(for: .sevenDay),
                 resetAtMs: account.sevenDayResetAtMs),
         ]
+        if account.sevenDayOi != nil {
+            windows.append(
+                Window(
+                    label: "fable", value: account.sevenDayOi,
+                    tint: account.fableBarTintSource,
+                    resetAtMs: account.sevenDayOiResetAtMs))
+        }
+        return windows
     }
 }

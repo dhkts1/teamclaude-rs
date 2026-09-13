@@ -108,8 +108,17 @@ enum V4 {
 
     // MARK: - Quota grid (`.q`)
 
-    /// `grid-template-columns:24px 1fr 40px auto`.
-    static let quotaLabelWidth: CGFloat = 24
+    /// `grid-template-columns:24px 1fr 40px auto` — with the first track
+    /// widened from the sheet's 24.
+    ///
+    /// 24 pt fits `5h` and `7d`, which is every label the mockup's card has.
+    /// The Fable weekly window's label is a WORD, and at 24 pt `fable` wrapped
+    /// to `fabl` / `e` and grew the row by a line — measured in
+    /// `01-healthy-auto-dark.png` before this changed. One track, not two:
+    /// three bars starting at three different x is the misalignment this grid
+    /// exists to prevent, so the column is sized for the longest label the card
+    /// can draw and every row keeps it.
+    static var quotaLabelWidth: CGFloat { compact ? 32 : 34 }
     static let quotaPercentWidth: CGFloat = 40
     static let quotaGap: CGFloat = 8
     static var quotaMarginTop: CGFloat { compact ? 4 : 6 }

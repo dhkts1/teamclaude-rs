@@ -2730,6 +2730,9 @@ struct AccountRow: View {
         if hasStaleQuotaReading { return Tok.disabled }
         switch account.quotaBarTintSource(for: .fiveHour) {
         case .unmeasured: return Tok.unmeasured
+        // `quotaBarTintSource(for:)` never returns this — it belongs to the
+        // Fable window, which this legacy row draws as a label, not a bar.
+        case .measuredWithoutState: return Tok.mute
         case .state(let state): return Tok.color(for: state)
         }
     }
@@ -2740,6 +2743,7 @@ struct AccountRow: View {
         if hasStaleQuotaReading { return Tok.disabled }
         switch account.quotaBarTintSource(for: .sevenDay) {
         case .unmeasured: return Tok.unmeasured
+        case .measuredWithoutState: return Tok.mute
         case .state(let state): return Tok.color(for: state)
         }
     }

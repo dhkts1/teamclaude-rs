@@ -88,6 +88,28 @@ public enum QuotaState: Equatable, Sendable {
         }
     }
 
+    /// The state as a listener hears it, in the panel's prose register.
+    ///
+    /// Not ``token``. A quota row's spoken value is a sentence — "94% used,
+    /// near the limit, resets in 47m" — and `"near"` on its own in that
+    /// position parses as an adjective with nothing to modify. The same split
+    /// ``FleetTally/Kind/phrase`` makes against ``FleetTally/Kind/token``, for
+    /// the same reason: a pill has three characters to spend and a sentence has
+    /// to survive being read out loud.
+    ///
+    /// `.ok` is "within limit" rather than "ok": the row's whole subject is a
+    /// limit, and the listener has no green bar beside them to read it off.
+    /// An `.unknown` token is spoken verbatim — this build cannot name it, and
+    /// inventing a word for it is exactly what the pill refuses to do.
+    public var spokenWord: String {
+        switch self {
+        case .ok: return "within limit"
+        case .near: return "near the limit"
+        case .spent: return "spent"
+        case .unknown(let raw): return raw
+        }
+    }
+
     /// Ordering used to pick the worst account for the menu-bar glyph.
     public var severity: Int {
         switch self {
@@ -607,6 +629,36 @@ public enum QuotaFormat {
     public static func resetsCaption(resetAtMs: Int64?, now: Date) -> String? {
         guard let duration = durationUntilReset(resetAtMs: resetAtMs, now: now) else { return nil }
         return "resets \(duration)"
+    }
+
+    /// `"94% used, near the limit, resets 47m"` — everything a quota row draws,
+    /// as the one string its `accessibilityValue` speaks.
+    ///
+    /// The row's per-window verdict rides on HUE in pixels: the bar's fill and
+    /// the reset caption both turn amber at the near threshold and red past it,
+    /// and measured off the shipped build two rows with identical wording
+    /// differed only by `#ffd16b` against `#94928d`. None of that reaches a
+    /// listener, so the state word is spoken here.
+    ///
+    /// The reset countdown is the row's one actionable fact, and an
+    /// `accessibilityLabel` that names the window overrode the combined
+    /// children that used to carry it — so it was spoken by nobody at all.
+    ///
+    /// `state` is `nil` for a window nothing has measured, which is a different
+    /// sentence, not a missing clause: `"never measured"` rather than a `"0%"`
+    /// that reads as a reading.
+    public static func spokenWindowValue(
+        value: Double?, state: QuotaState?, resetAtMs: Int64?, now: Date
+    ) -> String {
+        var parts: [String] = []
+        if value == nil && state == nil {
+            parts.append("never measured")
+        } else {
+            parts.append("\(percent(value)) used")
+            if let state { parts.append(state.spokenWord) }
+        }
+        if let caption = resetsCaption(resetAtMs: resetAtMs, now: now) { parts.append(caption) }
+        return parts.joined(separator: ", ")
     }
 
     /// Shared guard: `nil` in → `nil` out, never a placeholder — the same
@@ -1728,6 +1780,24 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return "\(span): \(priced), \(tokens)"
     }
 
+    /// What the Fable weekly window's bar is allowed to be tinted with.
+    ///
+    /// A sibling of ``quotaBarTintSource(for:)`` rather than a third
+    /// ``QuotaWindow`` case, because the two differ in exactly the way that
+    /// function's doc-comment warns about: `fiveHourState`/`sevenDayState`
+    /// legitimately fall back to the composite `quotaState` for an old server
+    /// that sent a fraction and no word, and ``sevenDayOiState`` may NEVER do
+    /// that — the Fable window gates Fable requests only, so the composite
+    /// state is not a weaker reading of it, it is a reading of something else.
+    ///
+    /// `.unmeasured` when there is no figure, which is also the case the card
+    /// uses to draw no Fable row at all.
+    public var fableBarTintSource: QuotaBarTintSource {
+        guard sevenDayOi != nil else { return .unmeasured }
+        guard let state = sevenDayOiState else { return .measuredWithoutState }
+        return .state(state)
+    }
+
     /// What the card's 7d line shows on its right: `"fable 71% · in 4d 12h"` —
     /// this account's FABLE weekly window, the third quota window the row
     /// otherwise never names.
@@ -2057,6 +2127,17 @@ public enum GroupTagColor {
 public enum QuotaBarTintSource: Equatable, Sendable {
     case unmeasured
     case state(QuotaState)
+    /// The window has a reading, and the server sent no state word for it —
+    /// the Fable weekly window against a build that reports the figure but not
+    /// its band (``Account/sevenDayOiState`` `nil`).
+    ///
+    /// Its own case rather than `.state(.unknown(""))` or a fall-through to
+    /// the composite: the bar must DRAW, because something really was
+    /// measured, and it must draw neutral, because borrowing `quotaState` here
+    /// is the exact overclaim ``Account/quotaBarTintSource(for:)`` exists to
+    /// prevent one window over. An empty `.unknown` token would also be spoken
+    /// as an empty word.
+    case measuredWithoutState
 }
 
 /// One bucket of the fleet breakdown line.
