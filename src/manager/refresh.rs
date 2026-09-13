@@ -140,6 +140,19 @@ impl Manager {
         force: bool,
         now_ms: i64,
     ) -> Option<(String, String)> {
+        // A refresh token is single-use. Once this process has handed its
+        // listening socket to a successor, the successor holds the same tokens
+        // and is the one entitled to rotate them: rotating here would invalidate
+        // its copy, which is the token war `crate::singleton` exists to prevent
+        // arriving from inside one lineage instead of between two rival proxies.
+        //
+        // Gated at `refresh_plan` rather than in `ensure_fresh_inner` because
+        // this is the single point where the decision to refresh is made, and
+        // `ensure_fresh_inner` already returns early on `None`. One gate, not
+        // one per caller.
+        if self.mutation_is_released() {
+            return None;
+        }
         let accounts = self.accounts.read().expect("accounts lock poisoned");
         let account = accounts.get(idx)?;
         if account.account_type != "oauth" {

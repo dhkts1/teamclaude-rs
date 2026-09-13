@@ -925,6 +925,29 @@ pub struct Manager {
     /// resource (the file), not data.
     config_write: Mutex<()>,
     config_path: Option<PathBuf>,
+    /// Set once, by [`Self::release_mutation_ownership`], when this process has
+    /// handed the listening socket to a successor and is only draining.
+    ///
+    /// While it is set, this `Manager` refuses to rotate a token or write the
+    /// config file. Both refusals are load-bearing and for different reasons.
+    ///
+    /// A refresh token is SINGLE-USE, so a draining request that reaches
+    /// `ensure_fresh` would rotate a token the successor is also holding, and
+    /// invalidate the successor's copy — the token war `crate::singleton`
+    /// exists to prevent, arriving from inside one lineage rather than between
+    /// two rival proxies.
+    ///
+    /// A config write is worse, because it needs no request at all:
+    /// `ServerHandle::shutdown_within` ends by calling [`Self::persist_now`],
+    /// so an ungated predecessor writes its now-stale in-memory tokens over the
+    /// successor's fresh ones as its LAST act. That is the failure
+    /// `crate::singleton`'s module doc describes — boot-time tokens written
+    /// back over fresh ones — through a new door.
+    ///
+    /// Terminal on purpose: nothing clears it. A process that has given away
+    /// its socket never gets ownership back, and a flag that could be unset is
+    /// a flag a future caller can unset by mistake.
+    mutation_released: AtomicBool,
     upstream: String,
     proxy_api_key: Option<String>,
     global_threshold: f64,
@@ -1373,6 +1396,7 @@ impl Manager {
             config: Mutex::new(config),
             config_write: Mutex::new(()),
             config_path,
+            mutation_released: AtomicBool::new(false),
             upstream,
             proxy_api_key,
             global_threshold,
@@ -1695,7 +1719,35 @@ impl Manager {
     /// Writes via [`config::save_tokens`], NOT [`config::save`]: the in-memory
     /// `Config` is a boot-time snapshot, so flushing it whole would revert every
     /// setting the user edited while the proxy was running.
+    /// Give up the right to mutate account state, permanently.
+    ///
+    /// Called by the predecessor in a socket handoff, AFTER its final flush and
+    /// BEFORE the successor starts serving. See [`Self::mutation_released`] for
+    /// what each refusal prevents, and `docs/design/zero-downtime-restart.md`
+    /// for why the release sits exactly there and not one step either side.
+    pub fn release_mutation_ownership(&self) {
+        // `swap` rather than `store` so the log line fires once even if a
+        // caller releases twice.
+        if !self.mutation_released.swap(true, Ordering::SeqCst) {
+            tracing::info!(
+                "mutation ownership released; this process will not refresh a token or write the config again"
+            );
+        }
+    }
+
+    /// Whether [`Self::release_mutation_ownership`] has been called.
+    pub fn mutation_is_released(&self) -> bool {
+        self.mutation_released.load(Ordering::SeqCst)
+    }
+
     pub fn persist_now(&self) {
+        // After a handoff this write would land our stale in-memory tokens on
+        // top of the successor's fresh ones. `shutdown_within` calls this on
+        // the way out, so the gate has to be here and not at the call site.
+        if self.mutation_is_released() {
+            tracing::debug!("skipping config persist: mutation ownership was released");
+            return;
+        }
         let Some(path) = &self.config_path else {
             return;
         };
@@ -1724,6 +1776,13 @@ impl Manager {
         org_name: Option<String>,
         tokens: &Tokens,
     ) {
+        // Defence in depth: `refresh_plan` already refuses to produce a refresh
+        // once ownership is released, so nothing should reach here. Gated anyway
+        // because this is the function that actually touches the credential file.
+        if self.mutation_is_released() {
+            tracing::debug!("skipping token persist: mutation ownership was released");
+            return;
+        }
         let Some(path) = &self.config_path else {
             return;
         };
@@ -3507,6 +3566,121 @@ mod tests {
             Arc::new(NoWarmer),
             Some(path),
         )
+    }
+
+    /// THE test for the handoff's safety property. A refresh token is
+    /// single-use, so once this process has given its listening socket to a
+    /// successor, the successor holds the same tokens and is the only one
+    /// entitled to rotate them. A draining request that reaches `ensure_fresh`
+    /// here would invalidate the successor's copy.
+    ///
+    /// Two managers, identical but for the release, because the obvious
+    /// one-manager shape does not test anything. Calling `ensure_fresh_force`
+    /// once as a precondition and again after releasing looks like a control,
+    /// but a FORCED SUCCESS re-arms the refresh cooldown
+    /// (`refresh.rs`, `cooldown_after = force.then(..)`), and `refresh_plan`
+    /// then declines the second call on cooldown grounds before it ever reaches
+    /// the gate. That version passes with the gate deleted. This one was watched
+    /// failing without it.
+    ///
+    /// The force path is used deliberately: plain `ensure_fresh` would decline
+    /// on expiry grounds, the fixture's token having an hour left, and pass for
+    /// the wrong reason again.
+    #[tokio::test]
+    async fn a_released_manager_refuses_to_refresh_even_when_forced() {
+        // Control: identical manager, ownership NOT released.
+        let control_calls = Arc::new(AtomicUsize::new(0));
+        let control = build_manager(
+            config_with(vec![account("owning", 0)]),
+            Arc::new(CountingRefresher {
+                calls: control_calls.clone(),
+            }),
+        );
+        assert!(
+            control.ensure_fresh_force(0).await,
+            "control: a force refresh must succeed while ownership is held"
+        );
+        assert_eq!(
+            control_calls.load(Ordering::SeqCst),
+            1,
+            "control: the force must actually reach the refresher, or the \
+             subject's zero below proves nothing"
+        );
+
+        // Subject: same fixture, same call, ownership released first.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let manager = build_manager(
+            config_with(vec![account("draining", 0)]),
+            Arc::new(CountingRefresher {
+                calls: calls.clone(),
+            }),
+        );
+        manager.release_mutation_ownership();
+
+        let applied = manager.ensure_fresh_force(0).await;
+
+        assert!(
+            !applied,
+            "a released manager reported that it applied a refresh"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a released manager sent a SINGLE-USE refresh token upstream; the \
+             successor holds that same token and its copy is now dead"
+        );
+    }
+
+    /// The other half, and the one that needs no request at all to fire:
+    /// `ServerHandle::shutdown_within` ends by calling `persist_now`, so an
+    /// ungated predecessor writes its stale in-memory tokens over the
+    /// successor's fresh ones as its very last act.
+    #[tokio::test]
+    async fn a_released_manager_does_not_write_the_config() {
+        let path = tmp_config_path("released-no-persist");
+        let manager = build_manager_with_path(config_with(vec![account("a", 0)]), path.clone());
+
+        // A persist while ownership is held establishes the file and proves the
+        // write path is live -- without this, an unchanged file below could just
+        // mean nothing ever writes here.
+        manager.persist_now();
+        let owned = std::fs::read(&path).expect("the owned persist must have written the file");
+        assert!(
+            !owned.is_empty(),
+            "precondition: the owned persist wrote bytes"
+        );
+
+        // Stand in for the successor having rewritten the file after the handoff.
+        std::fs::write(&path, b"{\"successor\":true}").expect("writing the successor's file");
+
+        manager.release_mutation_ownership();
+        manager.persist_now();
+
+        assert_eq!(
+            std::fs::read(&path).expect("reading the file back"),
+            b"{\"successor\":true}",
+            "a released manager overwrote the successor's config file"
+        );
+    }
+
+    /// Released is terminal. Nothing clears it, and releasing twice is safe --
+    /// both `shutdown` and `Drop` can reach the same path.
+    #[test]
+    fn releasing_mutation_ownership_is_terminal_and_idempotent() {
+        let manager = build_manager(
+            config_with(vec![account("a", 0)]),
+            Arc::new(CountingRefresher {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        assert!(!manager.mutation_is_released(), "starts owning mutation");
+        manager.release_mutation_ownership();
+        assert!(manager.mutation_is_released());
+        manager.release_mutation_ownership();
+        assert!(
+            manager.mutation_is_released(),
+            "a second release must not toggle it back"
+        );
     }
 
     /// A plan prober that answers one canned reading and counts its calls — the
