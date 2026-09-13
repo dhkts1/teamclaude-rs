@@ -81,7 +81,10 @@ public final class AwakeController: ObservableObject {
     /// Exposed because the gate needs to name them: `pmset -g assertions` is
     /// the only thing that can see a power assertion, and a gate that greps for
     /// one of three passes on a controller that dropped the other two.
-    public static let assertionTypes: [String] = [
+    /// `nonisolated` because ``Activity/powerAssertions`` reads it, and a `static
+    /// let` initialiser is not main-actor isolated — an error in the Swift 6
+    /// language mode. An immutable `[String]` has nothing to isolate.
+    public nonisolated static let assertionTypes: [String] = [
         kIOPMAssertPreventUserIdleSystemSleep as String,
         // No modern constant exists; see the note above before "fixing" this.
         "PreventSystemSleep",

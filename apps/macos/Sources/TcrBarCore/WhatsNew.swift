@@ -20,7 +20,11 @@ import Foundation
 @MainActor
 public final class WhatsNewStore: ObservableObject {
     /// The `UserDefaults` key. Do not change it. See the type's doc-comment.
-    public static let lastSeenVersionKey = "lastSeenVersion"
+    ///
+    /// `nonisolated` so the test that pins the literal can read it from an
+    /// `XCTAssertEqual` autoclosure, which is not main-actor isolated — an error
+    /// in the Swift 6 language mode. An immutable `String` has nothing to isolate.
+    public nonisolated static let lastSeenVersionKey = "lastSeenVersion"
 
     private let defaults: UserDefaults?
 
@@ -48,7 +52,10 @@ public final class WhatsNewStore: ObservableObject {
 @MainActor
 public final class LaunchVersionMarker {
     /// The `UserDefaults` key. Do not change it.
-    public static let lastLaunchedVersionKey = "lastLaunchedVersion"
+    ///
+    /// `nonisolated` for the same reason as ``WhatsNewStore/lastSeenVersionKey``:
+    /// the test that pins the literal reads it from a nonisolated autoclosure.
+    public nonisolated static let lastLaunchedVersionKey = "lastLaunchedVersion"
 
     private let defaults: UserDefaults?
 
