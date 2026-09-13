@@ -131,6 +131,7 @@ enum RenderSettings {
             countsPreference: MenuBarCountsPreference(),
             runningToolsPreference: ShowRunningToolsPreference(),
             defaultTabPreference: DefaultTabPreference(),
+            panelDensityPreference: PanelDensityPreference(),
             groupController: GroupController(),
             updater: Updater(startingUpdater: false),
             onWhatsNew: {})

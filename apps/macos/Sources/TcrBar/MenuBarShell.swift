@@ -68,6 +68,12 @@ final class MenuBarShell {
     /// the Settings window happens to be open.
     let runningToolsPreference: ShowRunningToolsPreference
     let defaultTabPreference: DefaultTabPreference
+    /// "Panel density" (Settings window, Menu Bar pane). Owned here, same
+    /// shape as `defaultTabPreference`, even though `V4.compact` never reads
+    /// this instance — the picker binding in `SettingsPanes` needs a live
+    /// `ObservedObject` to write through, and one built per Settings-window
+    /// open would lose the picker's selection to the window's own rebuild.
+    let panelDensityPreference: PanelDensityPreference
     /// The Settings window itself. Lazy and reused, same shape as
     /// `whatsNewWindow` — a window rebuilt per open loses its sidebar
     /// selection and its size.
@@ -77,6 +83,7 @@ final class MenuBarShell {
             preference: preference, countsPreference: countsPreference,
             runningToolsPreference: runningToolsPreference,
             defaultTabPreference: defaultTabPreference,
+            panelDensityPreference: panelDensityPreference,
             groupController: groupController, updater: updater,
             onWhatsNew: { [weak self] in self?.openWhatsNew() }))
 
@@ -104,7 +111,8 @@ final class MenuBarShell {
         removeController: RemoveAccountController? = nil,
         whatsNew: WhatsNewController? = nil,
         runningToolsPreference: ShowRunningToolsPreference? = nil,
-        defaultTabPreference: DefaultTabPreference? = nil
+        defaultTabPreference: DefaultTabPreference? = nil,
+        panelDensityPreference: PanelDensityPreference? = nil
     ) {
         self.poller = poller ?? StatusPoller()
         self.server = server ?? ServerController()
@@ -129,6 +137,7 @@ final class MenuBarShell {
         self.whatsNewWindow = WhatsNewWindow(controller: self.whatsNew)
         self.runningToolsPreference = runningToolsPreference ?? ShowRunningToolsPreference()
         self.defaultTabPreference = defaultTabPreference ?? DefaultTabPreference()
+        self.panelDensityPreference = panelDensityPreference ?? PanelDensityPreference()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         // An `NSStatusItem`'s visibility is *persisted*, and the app must never

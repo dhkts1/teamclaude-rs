@@ -194,7 +194,23 @@ enum RenderStates {
         for scene in scenes {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(scene, appearance: appearance, into: directory) { written += 1 }
+                if render(scene, appearance: appearance, density: .compact, into: directory) {
+                    written += 1
+                }
+            }
+            // The parity fixture also renders at `.comfortable`, suffixed —
+            // see `densityVariantScenes` — so the mockup comparison stays
+            // possible at both densities `PanelDensityPreference` offers,
+            // not only the shipped default.
+            if densityVariantScenes.contains(scene.name) {
+                for appearance in Appearance.allCases {
+                    attempted += 1
+                    if render(
+                        scene, appearance: appearance, density: .comfortable, into: directory)
+                    {
+                        written += 1
+                    }
+                }
             }
         }
 
@@ -213,10 +229,20 @@ enum RenderStates {
         }
     }
 
+    /// Scenes rendered twice — once at `V4`'s shipped `.compact` default,
+    /// once forced to `.comfortable` — so the one fixture compared against
+    /// the mockup crop (`data/plans/panel-density-bridge.md`) stays
+    /// comparable at both densities, not only the one now shipping. Every
+    /// other scene renders `.compact` alone: this harness is a review
+    /// artifact, and doubling all 24 scenes would be 24 extra PNGs nobody
+    /// asked to review.
+    private static let densityVariantScenes: Set<String> = ["19-accounts-tab-parity"]
+
     @MainActor
     private static func render(
         _ scene: (name: String, state: PollState, awake: Bool, control: String?),
         appearance: Appearance,
+        density: PanelDensity,
         into directory: URL
     ) -> Bool {
         // The appearance has to be current for the duration of the rasterisation:
@@ -225,6 +251,17 @@ enum RenderStates {
         let previous = NSAppearance.current
         NSAppearance.current = appearance.nsAppearance
         defer { NSAppearance.current = previous }
+
+        // `V4.compact` reads this key straight out of `UserDefaults`
+        // (`PanelDensityPreference.current()`), so forcing a density for one
+        // render is a write-then-restore around this call, the same pattern
+        // `expandedGroupsKey` already uses below for scene 15b. Removed
+        // rather than restored to a prior value: nothing in this process
+        // should be running under a real density preference already set, and
+        // "absent" is `PanelDensityPreference`'s own definition of the
+        // shipped default.
+        UserDefaults.standard.set(density.rawValue, forKey: PanelDensityPreference.key)
+        defer { UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key) }
 
         // `.harness()`, never a real controller: drawing a checkbox in its ON
         // state must not actually stop this machine sleeping. A harness with a
@@ -303,7 +340,13 @@ enum RenderStates {
         renderer.scale = 2
         renderer.proposedSize = .unspecified
 
-        let name = "\(scene.name)-\(appearance.rawValue).png"
+        // The shipped default stays unsuffixed — every existing filename this
+        // harness produces is unchanged — and only the forced `.comfortable`
+        // variant gets `-comfortable`, per `densityVariantScenes`.
+        let name =
+            density == .compact
+            ? "\(scene.name)-\(appearance.rawValue).png"
+            : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
         guard let image = renderer.nsImage,
             let tiff = image.tiffRepresentation,
             let rep = NSBitmapImageRep(data: tiff),
