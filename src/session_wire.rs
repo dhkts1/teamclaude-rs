@@ -489,7 +489,11 @@ pub fn tool_use_event_from_block(
         // and the row only needs to say where the call went.
         Some("WebFetch") => field("url").map(|url| capped(format!("WebFetch {}", url_host(url)))),
         Some("WebSearch") => field("query").map(|query| capped(format!("WebSearch {query}"))),
-        _ => None,
+        // Every tool without a dedicated arm above (`Monitor` and anything added after this
+        // list) still gets a head: the bare tool name, so the row says what ran instead of
+        // rendering blank. `None` here is what produced the head-less `slowest`/`timed_out`
+        // rows this module's doc-comment and `WireSessionTracker::restore` both describe.
+        _ => name.clone().map(capped),
     };
     ToolUseEvent {
         id,
@@ -1030,10 +1034,20 @@ impl WireSessionTracker {
     /// panel would draw it as a live call forever (measured 2026-09-13: two `Bash` rows at 17
     /// minutes against a 600 s timeout, restored across a restart). Counts, `slowest` and the
     /// per-tool buckets are all facts about calls that already FINISHED, so they restore
-    /// unchanged.
+    /// unchanged — except `slowest` and `timed_out`, which each drop any entry whose
+    /// `command_head` is `None`. Between #299 (heads stripped before save) and #302 (heads
+    /// persisted again), every entry written to `session-wire.json` lost its head; restoring
+    /// one gives a row with no command, and it sits there — Gil's screenshot, 2026-09-14 —
+    /// until the session ages out (`SESSION_TTL_MS`). Since #298 every tool gets a head
+    /// (`tool_use_event_from_block`'s default arm now falls back to the tool's own name), so
+    /// a file written by the current build never has a head-less entry and this filter is a
+    /// no-op on it; `calls`, `timeouts` and the other counts describe calls that happened
+    /// regardless of whether a head survived, so they are untouched.
     pub fn restore(&mut self, sessions: std::collections::HashMap<String, WireSession>) {
         for (session_id, mut session) in sessions {
             session.tools.running.clear();
+            session.tools.slowest.retain(|t| t.command_head.is_some());
+            session.tools.timed_out.retain(|t| t.command_head.is_some());
             self.sessions.entry(session_id).or_insert(session);
         }
     }
@@ -1480,8 +1494,14 @@ mod tests {
                 serde_json::json!({"query": "rust sse parser"}),
                 Some("WebSearch rust sse parser"),
             ),
-            // Unchanged: a tool with no rule keeps `None` and the panel falls back to its name.
-            ("SomeFutureTool", serde_json::json!({"whatever": 1}), None),
+            // A tool with no dedicated rule falls back to its own name as the head — see
+            // `a_tool_with_no_dedicated_head_arm_gets_its_own_name_as_the_head` for why `None`
+            // here was the #299→#302 bug, not a deliberate fallback.
+            (
+                "SomeFutureTool",
+                serde_json::json!({"whatever": 1}),
+                Some("SomeFutureTool"),
+            ),
         ];
 
         for (name, input, expected) in cases {
@@ -1678,6 +1698,89 @@ mod tests {
         assert_eq!(session.tools.calls, 1, "the finished call survives");
         assert_eq!(session.tools.slowest.len(), 1);
         assert_eq!(session.requests, 2);
+    }
+
+    /// The #299→#302 window wrote `slowest`/`timed_out` entries with `command_head: None` to
+    /// `session-wire.json`; restoring one gave a row with no command that sat there until the
+    /// session aged out (2026-09-14, `slowest total 180, headless 80` on the live proxy). A
+    /// restored session must drop those entries but keep the headed ones, and `calls` — a
+    /// fact about calls that happened, head or no head — must not move.
+    #[test]
+    fn restore_drops_headless_slowest_and_timed_out_entries_but_keeps_calls() {
+        let mut source = WireSessionTracker::new();
+        source.record_request("sess-headless", None, None, 1_000, &[], &[]);
+        let uses = vec![
+            ToolUseEvent {
+                id: "tu_headless".into(),
+                name: Some("Bash".into()),
+                command_head: None,
+                command_class: None,
+            },
+            ToolUseEvent {
+                id: "tu_headed".into(),
+                name: Some("Bash".into()),
+                command_head: Some("cargo test --release".into()),
+                command_class: None,
+            },
+        ];
+        source.record_response_tool_uses("sess-headless", 2_000, &uses);
+        source.record_request(
+            "sess-headless",
+            None,
+            None,
+            5_000,
+            &[],
+            &[
+                ToolResultEvent {
+                    id: "tu_headless".into(),
+                    is_error: false,
+                    timed_out: true,
+                },
+                ToolResultEvent {
+                    id: "tu_headed".into(),
+                    is_error: false,
+                    timed_out: false,
+                },
+            ],
+        );
+        let saved: std::collections::HashMap<String, WireSession> =
+            source.snapshot(5_000).into_iter().collect();
+        assert_eq!(saved["sess-headless"].tools.slowest.len(), 2);
+        assert_eq!(saved["sess-headless"].tools.timed_out.len(), 1);
+        assert_eq!(saved["sess-headless"].tools.calls, 2);
+
+        let mut restored = WireSessionTracker::new();
+        restored.restore(saved);
+        let snap = restored.snapshot(5_000);
+        let (_, session) = &snap[0];
+        assert_eq!(
+            session.tools.slowest.len(),
+            1,
+            "the head-less entry is dropped"
+        );
+        assert_eq!(
+            session.tools.slowest[0].command_head.as_deref(),
+            Some("cargo test --release"),
+            "the headed entry survives"
+        );
+        assert!(
+            session.tools.timed_out.is_empty(),
+            "the head-less timed-out entry is dropped too"
+        );
+        assert_eq!(
+            session.tools.calls, 2,
+            "the count describes calls that happened, unaffected by whether a head survived"
+        );
+    }
+
+    /// The default arm of [`tool_use_event_from_block`] — every tool without a dedicated
+    /// arm, `Monitor` included — must fall back to the tool's own name rather than `None`.
+    /// This is the other half of the #299→#302 fix: after it, no NEW entry can ever be
+    /// head-less, so [`restore`]'s filter above is a no-op on a healthy file.
+    #[test]
+    fn a_tool_with_no_dedicated_head_arm_gets_its_own_name_as_the_head() {
+        let event = tool_use_event_from_block("tu_1".into(), Some("Monitor".into()), None);
+        assert_eq!(event.command_head.as_deref(), Some("Monitor"));
     }
 
     /// A running entry too old to still be running is a LOST result — the projection's own
