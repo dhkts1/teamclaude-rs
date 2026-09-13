@@ -110,6 +110,37 @@ if ! hits="$(tcr_disclosure_staged_added | tcr_disclosure_scan_text "the staged 
   exit 1
 fi
 
+# --- Working notes never enter a public repository -------------------------
+#
+# docs/design/, docs/plans/ and data/plans/ hold design documents, plans,
+# bridges, findings and census files. They are kept on disk and deliberately
+# UNTRACKED: ten of the thirteen files under docs/design/ show `??` in
+# `git status`, and that is the convention rather than neglect. They carry
+# measured machine facts, internal paths, account counts and product direction.
+#
+# This gate exists because the rule was broken twice in two days by someone who
+# had it written down and did not consult it. A note you must remember to read
+# is not a control; a gate is.
+#
+# Only ADDITIONS are refused. A few files under docs/design/ were tracked before
+# the convention settled, and editing or deleting those has to stay possible.
+staged_notes="$(git diff --cached --name-only --diff-filter=A \
+  | grep -E '^(docs/design/|docs/plans/|data/plans/)' || true)"
+if [ -n "$staged_notes" ]; then
+  echo "" >&2
+  echo "pre-commit: BLOCKED — these are working notes, and this repository is PUBLIC." >&2
+  echo "$staged_notes" | sed 's/^/    /' >&2
+  echo "" >&2
+  echo "  Design docs, plans and bridges stay untracked on disk. Keep the file," >&2
+  echo "  unstage it, and put the reasoning a reader needs into doc-comments" >&2
+  echo "  next to the code instead, where it cannot become a dangling pointer:" >&2
+  echo "" >&2
+  echo "      git restore --staged <path>" >&2
+  echo "" >&2
+  echo "  If this file genuinely belongs in the published docs:  git commit --no-verify" >&2
+  exit 1
+fi
+
 # ── Rust format gate ────────────────────────────────────────────────────────
 # Mirror CI's `cargo fmt --check` Format job so a formatting slip is caught here,
 # not after a push goes red. Only fires when the commit stages Rust files.
