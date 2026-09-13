@@ -7,7 +7,7 @@ import Foundation
 /// is the shipped default (Gil, 2026-09-13: "make compact the default please
 /// above 4 accounts"). `compact` and `comfortable` are the two manual
 /// overrides — `compact` is the spacing Gil approved from the side-by-side
-/// (`data/plans/panel-density-bridge.md`, "yes the right compact is better"),
+/// ("yes the right compact is better"),
 /// `comfortable` the original v4 sheet's own numbers.
 ///
 /// Resolving `auto` is ``PanelDensityPreference/resolved(defaults:accounts:)``

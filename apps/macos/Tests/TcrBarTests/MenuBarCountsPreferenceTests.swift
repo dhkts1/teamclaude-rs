@@ -2,7 +2,7 @@ import XCTest
 
 @testable import TcrBarCore
 
-/// "Show counts in the menu bar" (F5, `data/plans/menubar-counts-bridge.md`).
+/// "Show counts in the menu bar" (F5).
 /// Same storage shape as `LaunchPreferenceTests`, with the one deliberate
 /// difference this type exists for: the default is ON.
 @MainActor

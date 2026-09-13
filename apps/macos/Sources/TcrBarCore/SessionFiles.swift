@@ -2,8 +2,7 @@ import Foundation
 
 /// The join for the Sessions tab: `~/.claude/sessions/*.json`, one file per
 /// live Claude Code process, keyed by `sessionId` to line up with
-/// ``Session/sessionId`` from the proxy's own wire (`panel-tabs-bridge.md`
-/// "The join for the Sessions tab").
+/// ``Session/sessionId`` from the proxy's own wire.
 ///
 /// One field of this file (`bridgeSessionId`) is read by the sessions-wire
 /// lane server-side, not by this build — see `panel-tabs.md`'s "Not
@@ -46,9 +45,8 @@ public enum SessionFiles {
     /// `tcr` have never run Claude Code's CLI at all) and a file that is not
     /// valid JSON or does not carry ``SessionFile``'s shape (a partial write
     /// mid-save is routine for a file another process rewrites continuously).
-    /// Both skip rather than fail the whole read, per `panel-tabs-bridge.md`:
-    /// "Tolerate a missing directory and unparsable files: skip, never fail
-    /// the poll."
+    /// Both skip rather than fail the whole read: tolerate a missing
+    /// directory and unparsable files — skip, never fail the poll.
     public static func read(directory: URL = defaultDirectory) -> [String: SessionFile] {
         guard
             let urls = try? FileManager.default.contentsOfDirectory(
@@ -89,9 +87,8 @@ public enum SessionActivity: Equatable, Sendable {
 /// A wire ``Session`` joined to its ``SessionFile``, if any — the row the
 /// Sessions and Tools tabs actually draw.
 ///
-/// `file == nil` is routine, not an error: `panel-tabs-bridge.md` names it
-/// directly ("A wire session with no file shows its id's first 8 chars and no
-/// project") for the case where the harness on the other end of the proxy is
+/// `file == nil` is routine, not an error: a wire session with no file
+/// shows its id's first 8 chars and no project, for the case where the harness on the other end of the proxy is
 /// not Claude Code at all, or its session file has already aged out.
 public struct JoinedSession: Identifiable, Equatable, Sendable {
     public let session: Session
@@ -134,8 +131,8 @@ public struct JoinedSession: Identifiable, Equatable, Sendable {
 }
 
 /// Joins the wire's sessions to the files on disk. A file with no matching
-/// wire session is dropped — `panel-tabs-bridge.md`: "it never went through
-/// the proxy" — so this always returns exactly `sessions.count` rows.
+/// wire session is dropped — it never went through
+/// the proxy — so this always returns exactly `sessions.count` rows.
 public enum SessionJoin {
     public static func join(sessions: [Session], files: [String: SessionFile]) -> [JoinedSession] {
         sessions.map { JoinedSession(session: $0, file: files[$0.sessionId]) }

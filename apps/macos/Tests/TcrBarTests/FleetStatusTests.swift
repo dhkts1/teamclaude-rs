@@ -228,8 +228,8 @@ final class FleetStatusTests: XCTestCase {
     /// Round 3 fixed the compiler warning with `?? 0`, which silently turned
     /// an offline "not measured" row into a claimed zero-traffic reading —
     /// exactly the mistake ``QuotaFormat/percent(_:)``'s own doc comment
-    /// names for the sibling `Double?` fields. This is the seam the
-    /// coordinator asked for: `QuotaFormat.count(_:)` is the exact function
+    /// names for the sibling `Double?` fields. This is the seam
+    /// review asked for: `QuotaFormat.count(_:)` is the exact function
     /// both `FleetView.swift` call sites now route through, so asserting on
     /// its output here IS asserting on the rendered string, without a
     /// SwiftUI rendering harness.
@@ -301,7 +301,7 @@ final class FleetStatusTests: XCTestCase {
         )
     }
 
-    // MARK: F2/F3 — sessions (`data/plans/panel-tabs-bridge.md`)
+    // MARK: F2/F3 — sessions
     //
     // `Fleet.decode` decodes ONLY the bare account array `tcr status
     // --json` sends — confirmed against the merged F1 work
@@ -1328,8 +1328,7 @@ final class FleetCapacitySummaryTests: XCTestCase {
     }
 }
 
-/// `Fleet.countsSentence` — the menu-bar tooltip's capacity sentence (F5,
-/// `data/plans/menubar-counts-bridge.md`).
+/// `Fleet.countsSentence` — the menu-bar tooltip's capacity sentence (F5).
 final class FleetCountsSentenceTests: XCTestCase {
     /// A genuinely never-probed account — `quota: nil`, `probeStatus: .never`,
     /// `status: "active"` — the same shape `testGlyphIsSpentNotUnknownWhenOnlyBrokenAccountsAreNotReady`
@@ -1703,7 +1702,7 @@ final class AccountCommandTests: XCTestCase {
 }
 
 /// `PollState.countsLabel` — the `ready/enabled` label beside the gauge glyph
-/// (F5, `data/plans/menubar-counts-bridge.md`).
+/// (F5).
 final class PollStateCountsLabelTests: XCTestCase {
     func testMixedFleetLabel() {
         let fleet = Fleet(accounts: [
@@ -1736,7 +1735,7 @@ final class PollStateCountsLabelTests: XCTestCase {
     }
 }
 
-/// `PollState.tooltipSentence` (F5, `data/plans/menubar-counts-bridge.md`) —
+/// `PollState.tooltipSentence` (F5) —
 /// the capacity sentence for a healthy read, `summary` unchanged otherwise.
 final class PollStateTooltipSentenceTests: XCTestCase {
     func testLoadedFleetUsesTheCountsSentence() {

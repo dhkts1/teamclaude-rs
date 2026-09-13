@@ -3,7 +3,7 @@ import TcrBarCore
 
 /// Rasterise the menu-bar mark itself — the composed `NSImage`
 /// ``MenuBarMark/image(fraction:tint:)`` builds, plus the opt-in
-/// `ready/enabled` label (F5, `data/plans/menubar-counts-bridge.md`) beside it
+/// `ready/enabled` label (F5) beside it
 /// when a scene turns it on — to PNG, in-process, then exit.
 ///
 /// ## Why this exists, separate from `--render-states`
@@ -34,7 +34,7 @@ enum RenderMark {
     }
 
     /// The coffee-cup mark's own state set (`docs/design/menubar-mark-mockup.html`
-    /// § "Coffee-mark rule"), one scene per named point in the bridge's gate —
+    /// § "Coffee-mark rule"), one scene per named point in the acceptance gate —
     /// "0%, 40%, 100%, near, failed, off" — each carrying keep-awake ON except
     /// the one scene named `off`, plus a light-appearance repeat of the 100%
     /// scene the same way the predecessor mockup repeated one state under the

@@ -124,9 +124,8 @@ enum RenderStates {
             // predates sessions — update tcr." (finding 9). A scene nobody
             // renders is a claim nobody can check.
             ("18b-tools-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
-            // Wave 2, phase 1 (`data/plans/panel-parity-bridge.md`): the
-            // Accounts tab's structure, matching
-            // `docs/design/panel-tabs-mockup.html`'s Accounts panel —
+            // The Accounts tab's structure, matching
+            // the mockup's Accounts panel —
             // 2 solo cards, a 3-member parked group, a 6-member active
             // group — so the pixelmatch gate compares two panels with the
             // same SHAPE, not a 2-card fixture against a 4-section mockup.
@@ -195,7 +194,7 @@ enum RenderStates {
     }
 
     /// `SessionFile`s for ``sessionsFixture``'s three sessions, on the two
-    /// scenes that render it — coordinator-flagged (2026-09-12): without
+    /// scenes that render it — found in review (2026-09-12): without
     /// these, `FleetView`'s `snapshotMode` never reads a file for any
     /// session (its own doc-comment: "the harness's session ids are fixture
     /// strings that join to nothing real"), so every session read as
@@ -296,8 +295,8 @@ enum RenderStates {
 
     /// Scenes rendered twice — once at `V4`'s shipped `.auto` default, once
     /// forced to `.comfortable` — so the one fixture compared against
-    /// the mockup crop (`data/plans/panel-density-bridge.md`) stays
-    /// comparable at both densities, not only the one now shipping. Every
+    /// the mockup crop stays comparable at both densities, not only the one
+    /// now shipping. Every
     /// other scene renders `.compact` alone: this harness is a review
     /// artifact, and doubling all 24 scenes would be 24 extra PNGs nobody
     /// asked to review.
@@ -880,7 +879,7 @@ enum RenderStates {
             + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"], plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
     }
 
-    /// F1's wire shape (`data/plans/sessions-wire-bridge.md`), attached to
+    /// F1's wire shape, attached to
     /// `alice`'s row the way the server sends it — see ``Account/sessions``'s
     /// doc-comment for why nothing here is wired to a live fetch yet: this
     /// build has no safe channel for real session data, so the review
@@ -1222,8 +1221,8 @@ enum RenderStates {
     ///
     /// Carries `groupColors` (`widestRowSceneColors`), which every earlier
     /// version of this fixture omitted. This is also the one scene that puts
-    /// ONE account in TWO group sections at once (`docs/plans/
-    /// group-outline-bridge.md`, decision #4) — the case the group-outline
+    /// ONE account in TWO group sections at once (the group-outline design's
+    /// decision #4) — the case the group-outline
     /// feature most needs a real render of, and a fixture with no colours
     /// draws the section-outline feature's neutral FALLBACK stroke in both
     /// sections, which reads as identical grey regardless of whether the two

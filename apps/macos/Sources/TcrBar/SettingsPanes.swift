@@ -38,8 +38,7 @@ private struct SectionHeader: View {
     let timing: SettingsRowTiming
     /// Stated ONCE for a section where every row shares it — "Edit in
     /// ~/.config/teamclaude.json" no longer repeats under each of a
-    /// section's read-only values (review #30,
-    /// `data/plans/interface-review-2026-09-13.md`): four copies of one
+    /// section's read-only values (review #30): four copies of one
     /// sentence out-inked the four numbers they annotated.
     var hint: String? = nil
 
@@ -531,8 +530,8 @@ struct GroupsRotationSettingsPane: View {
                 }
             }
         }
-        // Was a repeated `Text(readOnlyHint)` under every value (review #53,
-        // `data/plans/interface-review-2026-09-13.md`): four copies of one
+        // Was a repeated `Text(readOnlyHint)` under every value (review #53):
+        // four copies of one
         // sentence out-inked the four numbers they annotated and doubled
         // each row's height on the value side. The section header now
         // states it once (`SectionHeader(hint:)`); `.help` keeps it

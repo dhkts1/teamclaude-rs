@@ -3,7 +3,7 @@ import XCTest
 @testable import TcrBarCore
 
 /// The two pure facts the menu-bar mark's running-tools segment and amber rule
-/// (F5 remainder, `data/plans/menubar-mark-bridge.md`) rest on:
+/// (F5 remainder) rest on:
 /// ``PollState/runningToolsCount(showRunningTools:)`` and
 /// ``PollState/countIsNearCapacity``. The rendered title and glyph — the
 /// AppKit half — are `TcrBar`, not `TcrBarCore`, so they are reviewed through
@@ -128,7 +128,7 @@ final class RunningToolsMarkTests: XCTestCase {
 
     // MARK: - capacityFraction (the cup's fill level, F6 coffee-mark)
 
-    /// The gate's own worked example: `9/13` → `0.69` (`data/plans/coffee-mark-bridge.md`).
+    /// The gate's own worked example: `9/13` → `0.69`.
     func testCapacityFractionIsReadyOverEnabled() {
         let fleet = Fleet(accounts: [
             account(name: "a1@example.com", quotaState: "ok", probeStatus: "ok"),

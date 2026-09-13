@@ -5,7 +5,7 @@ import Foundation
 /// alongside ``MenuBarCountsPreference``'s ready/enabled fraction. Same shape,
 /// same reason there is no `@AppStorage` to reach for.
 ///
-/// Wired into `MenuBarShell.updateMark` (`data/plans/menubar-mark-bridge.md`):
+/// Wired into `MenuBarShell.updateMark`:
 /// the segment it gates only ever draws when this is `true` AND the poll's
 /// payload actually carries `sessions` (``PollState/runningToolsCount(showRunningTools:)``)
 /// — a live server that has not grown the wire yet leaves the mark exactly as

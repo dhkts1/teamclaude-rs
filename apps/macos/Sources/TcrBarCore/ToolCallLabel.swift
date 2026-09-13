@@ -6,8 +6,7 @@
 /// halves of it — what a sighted reader sees and what VoiceOver speaks — are
 /// pinned to the same facts by a test.
 ///
-/// The defect it exists for (`data/plans/interface-review-2026-09-13.md`,
-/// finding 4): a call KILLED at the Bash tool's 600 s timeout and one that
+/// The defect it exists for (review finding 4): a call KILLED at the Bash tool's 600 s timeout and one that
 /// merely ran long drew the identical string in the identical pill, red against
 /// grey the only difference. Measured on `17-tools-tab-dark.png`: `10M 0S` in
 /// `#ea5a56`, `9M 43S` in `#bfbeb9`, same size, same shape. State carried by

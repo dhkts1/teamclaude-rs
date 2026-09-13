@@ -70,8 +70,8 @@ struct AccountCard<Actions: View>: View {
                     MuteText(text: plan)
                 }
                 // Compact draws every window on one line — the fix for the
-                // measured +42 pt the restored `fable` row cost a Compact card
-                // (`data/plans/dense-quota-bridge.md`). Comfortable keeps the
+                // measured +42 pt the restored `fable` row cost a Compact card.
+                // Comfortable keeps the
                 // three full rows exactly as before this change: this is a
                 // shorter card, never a smaller font on the same rows.
                 if V4.compact {

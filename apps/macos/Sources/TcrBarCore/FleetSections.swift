@@ -223,8 +223,7 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
 
     /// The server-resolved colour to stroke this section's outline in, or
     /// `nil` when there is nothing to draw: `.ungrouped`
-    /// (`docs/plans/group-outline-bridge.md`, decision #1 — the absence of
-    /// an outline there IS the signal), OR a named group whose colour has
+    /// (the absence of an outline there IS the signal), OR a named group whose colour has
     /// not resolved (an older server, or the field genuinely absent).
     ///
     /// Both `nil` cases draw NOTHING, on purpose — this does NOT mirror
