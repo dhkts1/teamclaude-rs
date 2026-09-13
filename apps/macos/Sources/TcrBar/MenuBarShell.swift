@@ -286,20 +286,16 @@ final class MenuBarShell {
 
     // MARK: - The mark
 
-    /// Which gauge the capacity state draws. Fleet *capacity*, not the worst
-    /// account: in a rotating pool spent accounts are the mechanism working, so a
-    /// worst-wins glyph pinned itself to the alarm state whenever any one of
-    /// thirteen accounts was spent, which is nearly always. The mapping itself
-    /// lives in `Fleet.capacityGlyphState`; there is no logic here. A failed read
-    /// shows a warning glyph rather than a healthy-looking gauge.
-    static func gaugeSymbol(for state: PollState) -> String {
-        switch state {
-        case .loaded(let fleet):
-            return Tok.glyph(for: fleet.capacityGlyphState)
-        case .pending:
-            return "gauge.with.dots.needle.33percent"
-        case .toolMissing, .commandFailed, .undecodable:
-            return Tok.unreadableGlyph
+    /// Which colour the one coffee-cup glyph wears. `PollState.capacityTintKind(awake:)`
+    /// (`TcrBarCore/StatusPoller.swift`) is the whole decision — testable there,
+    /// against no `NSColor` at all — and this is the one place `Tok`'s actual
+    /// colours attach to it.
+    static func cupTint(for state: PollState, awake: Bool) -> MenuBarMark.Tint {
+        switch state.capacityTintKind(awake: awake) {
+        case .failed: return .failed(Tok.spentNSColor)
+        case .near: return .near(Tok.nearNSColor)
+        case .awake: return .awake(Tok.awakeNSColor)
+        case .template: return .template
         }
     }
 
@@ -331,11 +327,13 @@ final class MenuBarShell {
     /// the running-tools segment (`9/13 · ⌘3`-shaped, mockup's second bar) when
     /// `runningTools` is non-`nil`.
     ///
-    /// `amber` tints the ready/enabled label only — never the glyph, which
-    /// stays the plain template `MenuBarMark` draws regardless of capacity
-    /// state (that type's own doc-comment: shape is the channel that survives
-    /// greyscale, colour is a second one layered on top only where it costs
-    /// nothing to lose). The separator dot is drawn `Tok.mute` so it reads as
+    /// This label is opt-in (the counts preference, default off): the cup
+    /// itself already carries capacity by default, as its fill level and its
+    /// own colour (``MenuBarShell/cupTint(for:awake:)``) — this is a second,
+    /// numeric rendering of the identical fact for an operator who wants it
+    /// spelled out. `amber` matches whatever tint the cup drew for the same
+    /// poll, so the two can never disagree about which state they describe.
+    /// The separator dot is drawn `Tok.mute` so it reads as
     /// punctuation rather than a second urgency signal, and the running count
     /// itself is `labelColor` — amber marks capacity, not tool activity.
     /// Internal, not `private`: `RenderMark` composes the identical title this
@@ -381,12 +379,11 @@ final class MenuBarShell {
     ) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
-            gaugeSymbol: Self.gaugeSymbol(for: state), awake: isOn,
-            awakeTint: Tok.awakeNSColor)
+            fraction: state.capacityFraction, tint: Self.cupTint(for: state, awake: isOn))
         {
             button.image = mark
             // `state.countsLabel` (`TcrBarCore/StatusPoller.swift`) is `nil`
-            // for the same cases the glyph alone already carries — pending, a
+            // for the same cases the cup's fill already carries — pending, a
             // failed read, an all-disabled fleet — so the guard below is
             // purely `showCounts`; the state check already happened.
             if showCounts, let label = state.countsLabel {
