@@ -90,6 +90,40 @@ final class QuotaTailWidthTests: XCTestCase {
                 + "(it may still be declared — that is not the same thing)")
     }
 
+    /// A card inside a group box is ``AccountCard/Shape/compact``, which is NOT
+    /// the density preference of the same name (`V4.compact`). The window rows
+    /// were gated on `shape == .full`, so every grouped account drew its name,
+    /// its pills and no quota at all — seven of eighteen accounts on this
+    /// machine — while the block's own comment said both shapes drew them.
+    ///
+    /// Pinned at the source, because the difference is a `ForEach` being inside
+    /// or outside an `if`, and a rendered card cannot tell "no rows" from "no
+    /// windows to draw".
+    func testEveryCardDrawsItsWindowsWhetherOrNotItIsInAGroup() throws {
+        let source = try panelSource("PanelV4/AccountCard.swift")
+        let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
+        XCTAssertFalse(
+            squashed.contains("ifshape==.full{ForEach(Array(quotaWindows"),
+            "the quota rows are gated on the card's shape again, so accounts inside a group "
+                + "draw no windows at all")
+        // Comments survive whitespace-squashing, so an adjacency string here
+        // would break every time the block's own doc comment is reworded. What
+        // matters is that `shape` gates nothing structural: its two remaining
+        // uses fold the plan into a grouped card's name row and drop a
+        // redundant pill, neither of which removes a measurement.
+        let gates =
+            source
+            .split(separator: "\n")
+            .filter { $0.contains("shape ==") && !$0.contains("//") }
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        XCTAssertEqual(
+            gates.count, 3,
+            "`shape` gates \(gates.count) branches now, not the 3 that are about labels:\n"
+                + gates.joined(separator: "\n")
+                + "\nA new one that skips a bar or a caption hides a measurement on every "
+                + "grouped card. Check what it removes before updating this count.")
+    }
+
     // MARK: - Reading the tokens out of the app target's source
 
     private func token(_ name: String) throws -> CGFloat {

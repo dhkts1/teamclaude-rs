@@ -80,24 +80,32 @@ struct AccountCard<Actions: View>: View {
                 // card one stop and taken every per-account action with it.
                 actions()
             }
-            if shape == .full {
-                // One row per window in both shapes. Compact used to fold
-                // these onto a single dense line (the fix for a measured
-                // +42 pt over its own two-row card) — Gil saw that line and
-                // preferred readable bars, so Compact draws the same rows as
-                // Comfortable, just at Compact's own tighter density tokens
-                // (`V4.quotaLabelWidth`, `V4.quotaMarginTop`, `V4.barHeight`).
-                ForEach(Array(quotaWindows.enumerated()), id: \.element.label) {
-                    index, window in
-                    QuotaRow(
-                        label: window.label, value: window.value, tint: window.tint,
-                        resetAtMs: window.resetAtMs, now: now,
-                        trailing: rowTail(index),
-                        trailingReserved: usageTail != nil || planName != nil,
-                        trailingHelp: planLine)
-                }
-                fableLine
+            // One row per window in BOTH shapes, which is what the comment
+            // here has claimed since #248 while the code drew them in one.
+            // `if shape == .full` read as if it were the density switch it
+            // sits beside in every other token (`V4.compact`), but
+            // ``Shape/compact`` means something else entirely: a card inside a
+            // group box. So every grouped account drew its name, its pills and
+            // NOTHING ELSE — no 5h, no 7d, no model-scoped window — while the
+            // router was rotating on exactly those numbers. Seven of Gil's
+            // eighteen accounts are in a group (Gil, 2026-09-13: "why i dont
+            // see any fable?").
+            //
+            // Compact used to fold these onto a single dense line (the fix for
+            // a measured +42 pt over its own two-row card) — Gil saw that line
+            // and preferred readable bars, so it draws the same rows, just at
+            // Compact's own tighter density tokens (`V4.quotaLabelWidth`,
+            // `V4.quotaMarginTop`, `V4.barHeight`).
+            ForEach(Array(quotaWindows.enumerated()), id: \.element.label) {
+                index, window in
+                QuotaRow(
+                    label: window.label, value: window.value, tint: window.tint,
+                    resetAtMs: window.resetAtMs, now: now,
+                    trailing: rowTail(index),
+                    trailingReserved: usageTail != nil || rowTail(1) != nil,
+                    trailingHelp: planLine)
             }
+            fableLine
         }
         // `.contain` WITH a label. Without one the container has no accessible
         // name, so it cannot take focus and a user arriving at the card is told
@@ -201,7 +209,10 @@ struct AccountCard<Actions: View>: View {
     private func rowTail(_ index: Int) -> String? {
         switch index {
         case 0: return usageTail
-        case 1: return planName
+        // A grouped card already carries the plan INSIDE its name row
+        // (``nameRow``), so repeating it here would print it twice on the one
+        // card that is short of width.
+        case 1: return shape == .compact ? nil : planName
         default: return nil
         }
     }
