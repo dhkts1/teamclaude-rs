@@ -92,8 +92,9 @@ struct AccountCard<Actions: View>: View {
                     QuotaRow(
                         label: window.label, value: window.value, tint: window.tint,
                         resetAtMs: window.resetAtMs, now: now,
-                        trailing: index == 0 ? usageTail : nil,
-                        trailingHelp: index == 0 ? planLine : nil)
+                        trailing: rowTail(index),
+                        trailingReserved: usageTail != nil || planName != nil,
+                        trailingHelp: planLine)
                 }
             }
         }
@@ -190,6 +191,26 @@ struct AccountCard<Actions: View>: View {
     /// exactly this place, and the v4 card's full-width `planLine` above the
     /// bars is what made the card 28 pt taller for the same content. The full
     /// phrase, plan name included, is the hover.
+    /// What the reserved right-hand column says on row `index`.
+    ///
+    /// The first row carries the money and tokens, the second the plan name —
+    /// the two halves of the old full-width plan line, parked in a column the
+    /// rows already reserve. Gil, 2026-09-13, on the shorter card: "i like
+    /// right more but it missing the type can we have it somehow?"
+    private func rowTail(_ index: Int) -> String? {
+        switch index {
+        case 0: return usageTail
+        case 1: return planName
+        default: return nil
+        }
+    }
+
+    /// `"Max 20x"` — the plan, on its own, for the row-2 tail.
+    private var planName: String? {
+        guard let plan = account.plan, !plan.isEmpty else { return nil }
+        return plan
+    }
+
     private var usageTail: String? {
         guard let usage = account.usage else { return nil }
         let bucket = usage.windowOrToday
@@ -197,7 +218,7 @@ struct AccountCard<Actions: View>: View {
         if let cost = bucket.measuredCost {
             parts.append(QuotaFormat.usd(cost) + (bucket.unpricedRequests > 0 ? "+" : ""))
         }
-        parts.append("\(QuotaFormat.tokens(bucket.outputTokens)) out")
+        parts.append(QuotaFormat.tokens(bucket.outputTokens))
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
