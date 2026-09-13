@@ -322,6 +322,139 @@ pub const OAUTH_SCOPES: &str = "user:inference user:profile user:file_upload";
 /// Overall login timeout matching the JS 2-minute callback-server deadline.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Who is on the other end of `tcr login`.
+///
+/// Every interactive thing the login does — reading stdin, prompting for a
+/// name, opening a browser, narrating on stdout — is decided by this one
+/// value rather than by four scattered `is_terminal()` probes, so a caller
+/// cannot end up half-interactive: [`LoginUi::Machine`] is exactly the set of
+/// behaviours a GUI parent (TcrBar's `LoginSession`) can drive, and there is
+/// no way to switch one of them on without the others.
+///
+/// The browser is deliberately NOT opened in [`LoginUi::Machine`]: the parent
+/// opens it, because only the parent can bring its own window forward
+/// afterwards. A CLI `open` from a background child leaves the browser behind
+/// whatever had focus.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginUi {
+    /// A human at a terminal. Prose progress on stdout, `read_stdin_code` and
+    /// `prompt_account_name` live, browser opened here.
+    Terminal,
+    /// A parent process. One JSON object per line on stdout
+    /// ([`LoginEvent::line`]), stdin never read, browser left to the caller.
+    Machine,
+}
+
+/// Whether the human-prose lines this module prints on the way to a finished
+/// login are wanted at all.
+///
+/// Ambient rather than threaded, deliberately and narrowly: the three prose
+/// lines that survive deep inside the persist path
+/// ([`finish_login`], [`persist_via_file`], [`account_write_result`]) would
+/// otherwise need a display mode threaded through six function signatures and
+/// twenty test call sites to silence one `println!` each. Nothing about
+/// BEHAVIOUR reads this — stdin, the browser and the name prompt are all
+/// decided by an explicit [`LoginUi`] argument — so the worst a wrong value
+/// can do is print or omit a sentence. One process runs one login, which is
+/// what makes a process-wide answer the true one here.
+static PROSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Print one human line, unless [`PROSE`] is off (machine mode), in which case
+/// stdout stays one JSON object per line and nothing else.
+fn prose(message: std::fmt::Arguments<'_>) {
+    if PROSE.load(std::sync::atomic::Ordering::Relaxed) {
+        println!("{message}");
+    }
+}
+
+impl LoginUi {
+    /// Point [`PROSE`] at this mode for the rest of the process. Called once,
+    /// at the top of [`login`].
+    fn install(self) {
+        PROSE.store(
+            self == LoginUi::Terminal,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// True when stdin is a completion path and a prompt has somewhere to go.
+    fn reads_stdin(self) -> bool {
+        self == LoginUi::Terminal
+    }
+
+    /// Emit one progress event, or nothing at all in [`LoginUi::Terminal`]
+    /// (which narrates in prose instead — see [`LoginUi::say`]).
+    fn emit(self, event: LoginEvent<'_>) {
+        if self == LoginUi::Machine {
+            println!("{}", event.line());
+        }
+    }
+
+    /// Print one line of human prose, suppressed in [`LoginUi::Machine`] so
+    /// the machine stdout stays one-JSON-object-per-line with nothing else in
+    /// it. Goes through [`prose`] rather than `println!` so this mode and the
+    /// deep persist-path lines can never disagree about what silence means.
+    fn say(self, message: &str) {
+        if self == LoginUi::Terminal {
+            prose(format_args!("{message}"));
+        }
+    }
+}
+
+/// A `tcr login --non-interactive` progress line.
+///
+/// The wire format is the contract `apps/macos/Sources/TcrBarCore/LoginSession.swift`
+/// parses, so it is a type with one rendering function rather than four
+/// `println!("{{\"event\":…")` call sites that can drift from the parser one
+/// at a time.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoginEvent<'a> {
+    /// Open this URL. Nothing has been read or written yet.
+    Browser { url: &'a str },
+    /// The authorize URL is out; waiting for the loopback callback.
+    Waiting,
+    /// The account is written. `account` is the name it was written under.
+    Saved { account: &'a str },
+    /// The login failed, and this is the whole reason, on one line.
+    Error { reason: &'a str },
+}
+
+impl LoginEvent<'_> {
+    /// One JSON object, no newline. `serde_json` does the escaping — a URL
+    /// carries `&` and `=` and a failure reason carries quotes and newlines,
+    /// and hand-built JSON is how a reason containing a `"` becomes an
+    /// unparseable line at the worst possible moment.
+    pub fn line(&self) -> String {
+        let value = match self {
+            LoginEvent::Browser { url } => {
+                serde_json::json!({ "event": "browser", "url": url })
+            }
+            LoginEvent::Waiting => serde_json::json!({ "event": "waiting" }),
+            LoginEvent::Saved { account } => {
+                serde_json::json!({ "event": "saved", "account": account })
+            }
+            LoginEvent::Error { reason } => {
+                serde_json::json!({ "event": "error", "reason": reason })
+            }
+        };
+        value.to_string()
+    }
+}
+
+/// Flatten an error and its whole `anyhow` context chain onto ONE line.
+///
+/// `{:#}` already does this, but a message can still carry an embedded
+/// newline (a `bail!` with a wrapped multi-line explanation — this module has
+/// several), and one physical line is what both the JSON event stream and a
+/// GUI's single-line failure label need. Whitespace runs collapse to a single
+/// space rather than being dropped, so words never fuse together.
+pub fn one_line_reason(error: &anyhow::Error) -> String {
+    format!("{error:#}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// PKCE + CSRF material for one login attempt, produced by the `oauth2` crate.
 /// Holds the plaintext `verifier` and `state` secrets we replay at the manual
 /// token exchange, plus the fully-built authorize URL.
@@ -539,7 +672,22 @@ async fn read_stdin_code(expected_state: &str) -> anyhow::Result<String> {
 
 /// Wait for the authorization code from whichever source arrives first — the
 /// browser callback or a manual stdin paste — bounded by the 2-minute timeout.
-async fn wait_for_code(listener: TcpListener, expected_state: &str) -> anyhow::Result<String> {
+/// In [`LoginUi::Machine`] the stdin branch is not merely inert, it is not
+/// constructed: a GUI parent's child process has a pipe (or `/dev/null`) on
+/// stdin, and `read_stdin_code`'s first act is an `eprint!` prompt to a human
+/// who is not there. The callback and the timeout are the only two ways that
+/// mode can settle.
+async fn wait_for_code(
+    listener: TcpListener,
+    expected_state: &str,
+    ui: LoginUi,
+) -> anyhow::Result<String> {
+    if !ui.reads_stdin() {
+        return tokio::select! {
+            result = run_callback_server(listener, expected_state) => result,
+            _ = tokio::time::sleep(LOGIN_TIMEOUT) => Err(anyhow!("Login timed out after 2 minutes")),
+        };
+    }
     tokio::select! {
         result = run_callback_server(listener, expected_state) => result,
         result = read_stdin_code(expected_state) => result,
@@ -1121,6 +1269,62 @@ async fn login_route(
     }
 }
 
+/// What the browser half of a login produced: the PKCE/CSRF material, the
+/// redirect URI it was bound to, and the authorization code that came back.
+/// All three are needed together by [`exchange_code`], so they travel as one
+/// value rather than as three locals a caller could pair wrongly.
+struct Authorized {
+    flow: LoginFlow,
+    redirect_uri: String,
+    code: String,
+}
+
+/// The offline half of [`login`]: bind the loopback callback, build the
+/// authorize URL, tell whoever is listening about it, and wait for the code.
+///
+/// Split out of `login` so the event sequence is testable at all. Everything
+/// after this point talks to Anthropic's token and profile endpoints, so an
+/// end-to-end test of `login` is not possible without the network; a test can
+/// drive THIS with a fake callback and assert both the emitted lines and the
+/// code that comes back. `emit` is the sink for that reason — the shipping
+/// caller hands it [`LoginUi::emit`] (stdout), a test hands it a `Vec`.
+///
+/// The two modes differ in exactly two places, both here: who opens the
+/// browser, and whether the progress is prose or JSON.
+async fn authorize_and_wait(
+    hint: Option<&str>,
+    ui: LoginUi,
+    emit: &mut dyn FnMut(LoginEvent<'_>),
+) -> anyhow::Result<Authorized> {
+    // Bind the callback server on a random loopback port (127.0.0.1 only).
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("bind local OAuth callback server")?;
+    let callback_port = listener.local_addr()?.port();
+    let redirect_uri = format!("http://localhost:{callback_port}/callback");
+
+    // PKCE + CSRF state + authorize URL, built by the oauth2 crate.
+    let flow = build_login_flow(&redirect_uri, hint)?;
+    match ui {
+        LoginUi::Terminal => {
+            println!("Opening browser for authentication...");
+            println!("If it doesn't open, visit:\n  {}\n", flow.auth_url);
+            open_browser(&flow.auth_url);
+        }
+        LoginUi::Machine => emit(LoginEvent::Browser {
+            url: &flow.auth_url,
+        }),
+    }
+    emit(LoginEvent::Waiting);
+
+    let code = wait_for_code(listener, &flow.state, ui).await?;
+    Ok(Authorized {
+        flow,
+        redirect_uri,
+        code,
+    })
+}
+
 /// Run the full browser OAuth login and persist the account. Returns the
 /// account name on success. Never logs or prints the tokens.
 ///
@@ -1139,7 +1343,9 @@ pub async fn login(
     force: bool,
     account: Option<&str>,
     name_override: Option<&str>,
+    ui: LoginUi,
 ) -> anyhow::Result<String> {
+    ui.install();
     let port = login_target_port(config_path);
     let incumbent = singleton::live_proxy_server(port);
     let route = login_route(config_path, incumbent, port, force).await?;
@@ -1173,22 +1379,14 @@ pub async fn login(
         None => None,
     };
 
-    // Bind the callback server on a random loopback port (127.0.0.1 only).
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .context("bind local OAuth callback server")?;
-    let callback_port = listener.local_addr()?.port();
-    let redirect_uri = format!("http://localhost:{callback_port}/callback");
+    let authorized = authorize_and_wait(hint.as_deref(), ui, &mut |event| ui.emit(event)).await?;
+    let Authorized {
+        flow,
+        redirect_uri,
+        code,
+    } = authorized;
 
-    // PKCE + CSRF state + authorize URL, built by the oauth2 crate.
-    let flow = build_login_flow(&redirect_uri, hint.as_deref())?;
-    println!("Opening browser for authentication...");
-    println!("If it doesn't open, visit:\n  {}\n", flow.auth_url);
-    open_browser(&flow.auth_url);
-
-    let code = wait_for_code(listener, &flow.state).await?;
-
-    println!("Exchanging authorization code for tokens...");
+    ui.say("Exchanging authorization code for tokens...");
     let tokens = exchange_code(&code, &flow.verifier, &flow.state, &redirect_uri).await?;
 
     // Load the existing config once (missing file → empty default; a corrupt
@@ -1197,9 +1395,9 @@ pub async fn login(
 
     // Fetch the account+org identity, then MINT a name for it.
     let profile = fetch_profile(&tokens.access_token).await;
-    let name = mint_login_name(&config, &profile, account, name_override)?;
+    let name = mint_login_name(&config, &profile, account, name_override, ui)?;
 
-    finish_login_checked(
+    let saved = finish_login_checked(
         config_path,
         route,
         &mut config,
@@ -1208,7 +1406,9 @@ pub async fn login(
         profile,
         account,
     )
-    .await
+    .await?;
+    ui.emit(LoginEvent::Saved { account: &saved });
+    Ok(saved)
 }
 
 /// The name a browser login writes under.
@@ -1230,12 +1430,15 @@ pub async fn login(
 ///   [`assert_requested_identity`] a moment later.
 /// * A profile with no email at all — the inference-only case — is the only path
 ///   left that prompts ([`prompt_account_name`]), and the name it comes back
-///   with is minted for uniqueness too.
+///   with is minted for uniqueness too. Under [`LoginUi::Machine`] there is
+///   nobody to prompt, so that path takes [`unnamed_fallback`] directly — the
+///   same answer an empty reply to the prompt gives.
 fn mint_login_name(
     config: &Config,
     profile: &Profile,
     requested_account: Option<&str>,
     name_override: Option<&str>,
+    ui: LoginUi,
 ) -> anyhow::Result<String> {
     let taken: std::collections::HashSet<String> =
         config.accounts.iter().map(|a| a.name.clone()).collect();
@@ -1258,9 +1461,14 @@ fn mint_login_name(
         return Ok(config.accounts[idx].name.clone());
     }
 
-    let base = match &profile.email {
-        Some(email) => email.clone(),
-        None => prompt_account_name(&unnamed_fallback(&config.accounts)),
+    let base = match (&profile.email, ui) {
+        (Some(email), _) => email.clone(),
+        // No email and no human: take the same fallback the prompt itself
+        // defaults to on an empty answer, rather than prompting into a pipe
+        // and reading EOF. A machine caller that wants a specific name passes
+        // `--name`.
+        (None, LoginUi::Machine) => unnamed_fallback(&config.accounts),
+        (None, LoginUi::Terminal) => prompt_account_name(&unnamed_fallback(&config.accounts)),
     };
     Ok(crate::identity::mint_name(
         &base,
@@ -1453,7 +1661,10 @@ pub async fn login_with_token(
     }
 
     let profile = fetch_profile(&tokens.access_token).await;
-    let resolved_name = mint_login_name(&config, &profile, None, name)?;
+    // Always `Terminal`: `--token` reads the credential from stdin itself, so
+    // it is refused in combination with `--non-interactive` (see `LoginArgs`
+    // in `src/main.rs`) and this path never runs under a GUI parent.
+    let resolved_name = mint_login_name(&config, &profile, None, name, LoginUi::Terminal)?;
 
     let result = finish_login(
         config_path,
@@ -1678,7 +1889,10 @@ fn persist_via_file(
             first_account.priority = Some(0);
             fresh.accounts.push(first_account);
             config::save(config_path, &fresh).context("save config after login")?;
-            println!("Saved account '{name}' to {}", config_path.display());
+            prose(format_args!(
+                "Saved account '{name}' to {}",
+                config_path.display()
+            ));
             Ok(name.to_string())
         }
         Err(err) => Err(err).context("save config after login"),
@@ -1716,11 +1930,11 @@ fn account_write_result(
 ) -> anyhow::Result<String> {
     match outcome {
         config::AccountWrite::Added | config::AccountWrite::Updated => {
-            println!(
+            prose(format_args!(
                 "Saved account '{}' to {}",
                 account.name,
                 config_path.display()
-            );
+            ));
             Ok(account.name.clone())
         }
         config::AccountWrite::Ambiguous => bail!(
@@ -1825,10 +2039,10 @@ async fn finish_login(
             };
             match crate::cli::post_add_account(config, &account).await {
                 Ok(applied) => {
-                    println!(
+                    prose(format_args!(
                         "Saved account '{}' to the running proxy on :{}",
                         applied.name, config.proxy.port
-                    );
+                    ));
                     if let Some(warning) = &applied.warning {
                         eprintln!("[tcr] warning: {warning}");
                     }
@@ -2054,6 +2268,180 @@ mod tests {
         // Normal values are unchanged: default 3600s and an explicit value.
         assert_eq!(expires_at_from(0, None), 3_600 * 1000);
         assert_eq!(expires_at_from(1000, Some(60)), 1000 + 60 * 1000);
+    }
+
+    // --- `--non-interactive` (the TcrBar in-app login) ----------------------
+
+    /// The whole wire contract `LoginSession.swift` parses, pinned as literal
+    /// text. Hardcoded rather than built from the same `serde_json::json!`
+    /// the production code uses — an assertion written that way passes no
+    /// matter what the key names become, which is the one thing this test
+    /// exists to stop.
+    #[test]
+    fn every_event_renders_the_exact_line_the_app_parses() {
+        // Key ORDER is serde's (alphabetical) and no JSON parser cares, so
+        // each object is compared as a whole parsed value: that still fails on
+        // a renamed key, a dropped key or an extra one, which is what the
+        // Swift side would break on.
+        let parsed = |line: String| -> serde_json::Value {
+            serde_json::from_str(&line).expect("every event line is one JSON object")
+        };
+        assert_eq!(
+            parsed(
+                LoginEvent::Browser {
+                    url: "https://claude.ai/oauth/authorize?code=true&state=abc"
+                }
+                .line()
+            ),
+            serde_json::json!({
+                "event": "browser",
+                "url": "https://claude.ai/oauth/authorize?code=true&state=abc"
+            })
+        );
+        assert_eq!(LoginEvent::Waiting.line(), r#"{"event":"waiting"}"#);
+        assert_eq!(
+            parsed(
+                LoginEvent::Saved {
+                    account: "alice@example.com"
+                }
+                .line()
+            ),
+            serde_json::json!({ "event": "saved", "account": "alice@example.com" })
+        );
+        assert_eq!(
+            parsed(
+                LoginEvent::Error {
+                    reason: "the proxy on :3456 rejected the api-key"
+                }
+                .line()
+            ),
+            serde_json::json!({
+                "event": "error",
+                "reason": "the proxy on :3456 rejected the api-key"
+            })
+        );
+    }
+
+    /// A reason carrying a quote and a newline still leaves ONE parseable
+    /// line. Hand-built JSON is what makes a message like this an unparseable
+    /// line at the worst possible moment, so the escaping is asserted rather
+    /// than assumed.
+    #[test]
+    fn an_event_line_survives_quotes_and_newlines_in_its_payload() {
+        let line = LoginEvent::Error {
+            reason: "config \"accounts\"\nis not an array",
+        }
+        .line();
+        assert!(
+            !line.contains('\n'),
+            "one event is one physical line: {line}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("must stay parseable");
+        assert_eq!(parsed["reason"], "config \"accounts\"\nis not an array");
+    }
+
+    /// `one_line_reason` flattens an `anyhow` chain AND any newline inside a
+    /// single message, because both reach a GUI label that has one line to
+    /// render them in.
+    #[test]
+    fn one_line_reason_flattens_the_whole_chain_onto_one_line() {
+        let error = anyhow!("the proxy on :3456 answered\nbut not usably (timeout)")
+            .context("OAuth login failed");
+        let reason = one_line_reason(&error);
+        assert_eq!(
+            reason,
+            "OAuth login failed: the proxy on :3456 answered but not usably (timeout)"
+        );
+    }
+
+    /// The event sequence, driven for real: `authorize_and_wait` in
+    /// [`LoginUi::Machine`] emits `browser` then `waiting`, and a fake
+    /// callback — the only completion path that mode has — hands back the
+    /// code. The URL in the `browser` event is the one the callback answers,
+    /// state and all, so this also pins that the app is told to open the URL
+    /// this very listener is waiting on.
+    ///
+    /// Watched failing: with the `emit(LoginEvent::Waiting)` line deleted the
+    /// sequence assertion fails with `["browser"] != ["browser", "waiting"]`;
+    /// with `LoginUi::Machine`'s arm switched to `open_browser` and no emit,
+    /// it fails on an empty sequence.
+    #[tokio::test]
+    async fn machine_mode_emits_browser_then_waiting_and_completes_on_the_callback() {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+        // The fake browser: wait for the `browser` event, then GET the
+        // loopback callback exactly as Claude's redirect would.
+        let watched = recorded.clone();
+        let browser = tokio::spawn(async move {
+            let url = loop {
+                let first = watched.lock().expect("sink mutex").first().cloned();
+                if let Some(line) = first {
+                    let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    break parsed["url"].as_str().unwrap().to_string();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            };
+            let field = |key: &str| {
+                url.split(&format!("{key}="))
+                    .nth(1)
+                    .and_then(|rest| rest.split('&').next())
+                    .map(percent_decode)
+                    .unwrap_or_else(|| panic!("the authorize URL carries {key}: {url}"))
+            };
+            let callback = format!(
+                "{}?code=fake-code&state={}",
+                field("redirect_uri"),
+                field("state")
+            );
+            let _ = reqwest::get(&callback).await;
+        });
+
+        let collected = recorded.clone();
+        let mut sink = |event: LoginEvent<'_>| {
+            collected.lock().expect("sink mutex").push(event.line());
+        };
+        let authorized = authorize_and_wait(None, LoginUi::Machine, &mut sink)
+            .await
+            .expect("the fake callback must settle the login");
+        browser.await.expect("fake browser task");
+
+        let events = recorded.lock().expect("sink mutex").clone();
+        assert_eq!(
+            events,
+            vec![
+                LoginEvent::Browser {
+                    url: &authorized.flow.auth_url
+                }
+                .line(),
+                LoginEvent::Waiting.line(),
+            ],
+            "machine mode publishes exactly browser then waiting before the callback"
+        );
+        assert_eq!(authorized.code, "fake-code");
+        assert!(
+            authorized.redirect_uri.starts_with("http://localhost:"),
+            "the callback is loopback-only: {}",
+            authorized.redirect_uri
+        );
+    }
+
+    /// Percent-decode just enough for the test above to read the
+    /// `redirect_uri` back out of an authorize URL.
+    fn percent_decode(value: &str) -> String {
+        form_urlencoded::parse(format!("v={value}").as_bytes())
+            .next()
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default()
+    }
+
+    /// The email-less profile — the one path that prompts — takes the
+    /// prompt's own default instead of reading a stdin that is a pipe.
+    #[test]
+    fn machine_mode_names_an_email_less_account_without_prompting() {
+        let empty: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
+        let name =
+            mint_login_name(&empty, &all_none_profile(), None, None, LoginUi::Machine).unwrap();
+        assert_eq!(name, "unnamed");
     }
 
     // --- token-exchange refresh_token guard --------------------------------
@@ -4376,7 +4764,7 @@ mod tests {
             Some("Henry Token"),
         );
         assert_eq!(
-            mint_login_name(&empty, &profile, None, None).unwrap(),
+            mint_login_name(&empty, &profile, None, None, LoginUi::Terminal).unwrap(),
             "me@example.com"
         );
 
@@ -4387,7 +4775,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            mint_login_name(&occupied, &profile, None, None).unwrap(),
+            mint_login_name(&occupied, &profile, None, None, LoginUi::Terminal).unwrap(),
             "me@example.com/henry-token"
         );
 
@@ -4399,7 +4787,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            mint_login_name(&occupied, &no_org_name, None, None).unwrap(),
+            mint_login_name(&occupied, &no_org_name, None, None, LoginUi::Terminal).unwrap(),
             "me@example.com/22222222"
         );
     }
@@ -4419,12 +4807,25 @@ mod tests {
         let profile = profile_named("bob@example.com");
 
         assert_eq!(
-            mint_login_name(&occupied, &profile, None, Some("bob-work")).unwrap(),
+            mint_login_name(
+                &occupied,
+                &profile,
+                None,
+                Some("bob-work"),
+                LoginUi::Terminal
+            )
+            .unwrap(),
             "bob-work"
         );
 
-        let err = mint_login_name(&occupied, &profile, None, Some("alice@example.com"))
-            .expect_err("a --name already in use must refuse");
+        let err = mint_login_name(
+            &occupied,
+            &profile,
+            None,
+            Some("alice@example.com"),
+            LoginUi::Terminal,
+        )
+        .expect_err("a --name already in use must refuse");
         assert!(
             err.to_string()
                 .contains("already the name of another account"),
@@ -4444,7 +4845,14 @@ mod tests {
         .unwrap();
         let profile = profile_named("me@example.com");
         assert_eq!(
-            mint_login_name(&config, &profile, Some("me@example.com/corp"), None).unwrap(),
+            mint_login_name(
+                &config,
+                &profile,
+                Some("me@example.com/corp"),
+                None,
+                LoginUi::Terminal
+            )
+            .unwrap(),
             "me@example.com/corp"
         );
     }
@@ -4536,7 +4944,14 @@ mod tests {
     #[test]
     fn a_name_override_skips_the_prompt_on_an_empty_profile() {
         let empty: Config = serde_json::from_str(r#"{ "accounts": [] }"#).unwrap();
-        let name = mint_login_name(&empty, &all_none_profile(), None, Some("bob-work")).unwrap();
+        let name = mint_login_name(
+            &empty,
+            &all_none_profile(),
+            None,
+            Some("bob-work"),
+            LoginUi::Terminal,
+        )
+        .unwrap();
         assert_eq!(name, "bob-work");
     }
 
@@ -4551,6 +4966,7 @@ mod tests {
             &profile_named("carol@example.com"),
             None,
             Some("carol-personal"),
+            LoginUi::Terminal,
         )
         .unwrap();
         assert_eq!(name, "carol-personal");
