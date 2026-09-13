@@ -2125,3 +2125,153 @@ final class TcrToolTests: XCTestCase {
         )
     }
 }
+
+// ---------------------------------------------------------------------------
+// The `tcr sessions --json` channel — `Fleet.decodeSessions` and the
+// `StatusPoller` classification that wraps it.
+// ---------------------------------------------------------------------------
+
+/// Fixtures here use obviously-fake session UUIDs and account emails only —
+/// see CLAUDE.md, this repository is public.
+final class SessionsChannelDecodeTests: XCTestCase {
+    private func data(_ json: String) -> Data { Data(json.utf8) }
+
+    private let rowJSON = """
+        {"sessionId": "11111111-1111-1111-1111-111111111111",
+         "account": "alice@example.com",
+         "model": "claude-sonnet-5",
+         "firstSeenMs": 1700000000000,
+         "lastSeenMs": 1700000060000,
+         "requests": 3,
+         "inputTokens": 400,
+         "outputTokens": 50,
+         "cacheReadTokens": 900,
+         "reqPerMinute": [0, 1, 2],
+         "costUsd": 0.5}
+        """
+
+    func testSupportedWithRowsIsALiveChannel() throws {
+        let read = try Fleet.decodeSessions(
+            data(
+                """
+                {"supported": true, "sessions": [\(rowJSON)]}
+                """))
+        XCTAssertEqual(read.channel, .live)
+        XCTAssertEqual(read.sessions.count, 1)
+        XCTAssertEqual(read.sessions[0].sessionId, "11111111-1111-1111-1111-111111111111")
+        XCTAssertEqual(read.sessions[0].account, "alice@example.com")
+        XCTAssertEqual(read.sessions[0].cacheReadTokens, 900)
+        XCTAssertEqual(read.sessions[0].reqPerMinute, [0, 1, 2])
+        XCTAssertEqual(read.sessions[0].costUsd, 0.5)
+        XCTAssertTrue(read.unreadable.isEmpty)
+    }
+
+    /// The case the whole `supported` flag exists for: an idle proxy is a LIVE
+    /// channel with no rows, and must never be told it predates sessions.
+    func testSupportedWithNoRowsIsStillLive() throws {
+        let read = try Fleet.decodeSessions(data(#"{"supported": true, "sessions": []}"#))
+        XCTAssertEqual(read.channel, .live)
+        XCTAssertTrue(read.sessions.isEmpty)
+
+        let fleet = Fleet(accounts: []).withSessions(read)
+        XCTAssertTrue(fleet.sessionsSupported)
+        XCTAssertNil(
+            fleet.sessionsUnavailableDetail,
+            "an idle live server draws the tab's own empty state, not an apology")
+    }
+
+    func testUnsupportedIsAServerThatPredatesSessions() throws {
+        let read = try Fleet.decodeSessions(data(#"{"supported": false, "sessions": []}"#))
+        XCTAssertEqual(read.channel, .serverPredatesSessions)
+
+        let fleet = Fleet(accounts: []).withSessions(read)
+        XCTAssertFalse(fleet.sessionsSupported)
+        XCTAssertEqual(
+            fleet.sessionsUnavailableDetail, "This server predates sessions — update tcr.")
+    }
+
+    /// A document with no `supported` key at all is not this contract. It
+    /// throws, so the caller says "unreadable" rather than drawing a tab that
+    /// claims nothing is running.
+    func testAMissingSupportedKeyThrows() {
+        XCTAssertThrowsError(try Fleet.decodeSessions(data(#"{"sessions": []}"#)))
+        XCTAssertThrowsError(try Fleet.decodeSessions(data("[]")))
+    }
+
+    /// One malformed row costs one row — the same rule `Fleet.decode` follows
+    /// for accounts, and for the same reason.
+    func testOneBadRowDoesNotDropTheRest() throws {
+        let read = try Fleet.decodeSessions(
+            data(
+                """
+                {"supported": true, "sessions": [\(rowJSON), {"account": "bob@example.com"}, 42]}
+                """))
+        XCTAssertEqual(read.channel, .live)
+        XCTAssertEqual(read.sessions.count, 1, "the good row survives its two broken neighbours")
+        XCTAssertEqual(read.unreadable.count, 2)
+        XCTAssertEqual(read.unreadable[1].message, "session row is not a JSON object")
+    }
+
+    /// The fold may only ADD: the accounts half of the fleet is the same
+    /// object either way, whatever the second call did.
+    func testWithSessionsNeverTouchesTheAccountsHalf() throws {
+        let fleet = try Fleet.decode(Data(liveFixture.utf8))
+        let before = fleet.accounts
+        let folded = fleet.withSessions(Fleet.SessionsRead(channel: .toolPredatesSessions))
+        XCTAssertEqual(folded.accounts, before)
+        XCTAssertTrue(folded.sessions.isEmpty)
+        XCTAssertFalse(folded.sessionsSupported)
+    }
+}
+
+final class SessionsChannelClassifyTests: XCTestCase {
+    private func output(_ exit: Int32, _ stdout: String, _ stderr: String = "") -> TcrTool.Output {
+        TcrTool.Output(exitCode: exit, stdout: Data(stdout.utf8), stderr: stderr)
+    }
+
+    /// The bundled binary is the old half, not the proxy. Blaming the server
+    /// here is what sent an operator to restart a healthy process.
+    func testAnUnrecognizedSubcommandBlamesTheTool() {
+        let read = StatusPoller.classifySessions(
+            output(2, "", "error: unrecognized subcommand 'sessions'"))
+        XCTAssertEqual(read.channel, .toolPredatesSessions)
+        let fleet = Fleet(accounts: []).withSessions(read)
+        XCTAssertEqual(
+            fleet.sessionsUnavailableDetail,
+            "This copy of tcr predates sessions — update the app.")
+    }
+
+    /// Any OTHER non-zero exit is a command failure carrying the CLI's own
+    /// words — a dead proxy reads as a dead proxy.
+    func testADeadProxyIsACommandFailureWithItsReason() {
+        let read = StatusPoller.classifySessions(
+            output(1, "", "could not read live status from the proxy on :3456 (no server)\n"))
+        XCTAssertEqual(
+            read.channel,
+            .commandFailed("could not read live status from the proxy on :3456 (no server)"))
+        let fleet = Fleet(accounts: []).withSessions(read)
+        XCTAssertEqual(
+            fleet.sessionsUnavailableDetail,
+            "tcr sessions failed: could not read live status from the proxy on :3456 (no server)")
+    }
+
+    func testExitZeroWithGarbageIsUnreadable() {
+        let read = StatusPoller.classifySessions(output(0, "not json"))
+        guard case .unreadable = read.channel else {
+            return XCTFail("garbage on stdout is unreadable, got \(read.channel)")
+        }
+        XCTAssertTrue(read.sessions.isEmpty)
+    }
+
+    func testExitZeroWithTheRealDocumentIsLive() {
+        let read = StatusPoller.classifySessions(
+            output(
+                0,
+                """
+                {"supported":true,"sessions":[{"sessionId":"22222222-2222-2222-2222-222222222222",
+                "firstSeenMs":1,"lastSeenMs":2}]}
+                """))
+        XCTAssertEqual(read.channel, .live)
+        XCTAssertEqual(read.sessions.count, 1)
+    }
+}

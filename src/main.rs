@@ -70,6 +70,13 @@ enum Command {
     Group(GroupArgs),
     /// Probe every account's live quota and print the fleet status.
     Status(StatusArgs),
+    /// Print the live sessions the running proxy has seen in the last hour.
+    ///
+    /// Separate from `status` on purpose: `tcr status --json` emits a bare
+    /// array of accounts and that contract has clients (the panel, `jq`
+    /// one-liners in the docs). Sessions get their own object-shaped verb
+    /// rather than a flag that changes `status`'s top-level type.
+    Sessions(SessionsArgs),
     /// Print a usage report for the last N days (default 7), read from the
     /// usage ledger — cost, tokens, cache-hit ratio, by model/account/day, and
     /// the busiest sessions.
@@ -332,6 +339,16 @@ struct StatusArgs {
 }
 
 #[derive(clap::Args)]
+struct SessionsArgs {
+    /// Path to the config file (default: ~/.config/teamclaude.json).
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Emit `{"supported": bool, "sessions": [...]}` instead of greppable text.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
 struct WrapArgs {
     /// Path to the config file (default: ~/.config/teamclaude.json) —
     /// consulted only for pricing overrides, never for accounts.
@@ -489,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Control(args)) => run_control(args).await,
         Some(Command::Group(args)) => run_group(args),
         Some(Command::Status(args)) => run_status(args).await,
+        Some(Command::Sessions(args)) => run_sessions(args).await,
         Some(Command::Wrap(args)) => run_wrap(args),
         Some(Command::Update(args)) => update::run_update(args.force),
         Some(Command::Demo) => demo::run_demo().await.map_err(anyhow::Error::from),
@@ -614,6 +632,12 @@ fn run_group(args: GroupArgs) -> anyhow::Result<()> {
 async fn run_status(args: StatusArgs) -> anyhow::Result<()> {
     let config_path = args.config.unwrap_or_else(config::default_path);
     cli::status(&config_path, args.json).await
+}
+
+/// `tcr sessions [--json]` — the running proxy's live sessions.
+async fn run_sessions(args: SessionsArgs) -> anyhow::Result<()> {
+    let config_path = args.config.unwrap_or_else(config::default_path);
+    cli::sessions(&config_path, args.json).await
 }
 
 /// `tcr wrap [--days N] [--json]` — a usage report read from the ledger.
