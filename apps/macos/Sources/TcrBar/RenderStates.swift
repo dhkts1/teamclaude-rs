@@ -130,20 +130,25 @@ enum RenderStates {
         ]
     }
 
-    /// The sign-in sheet (``LoginSheet``), one PNG per state.
+    /// The sign-in sheet (``LoginSheet``), one PNG per state, drawn WHERE IT
+    /// APPEARS: over the Accounts tab, on the dimming scrim a real sheet puts
+    /// there.
     ///
     /// A separate list because a sheet is not a `PollState`: it is presented
-    /// OVER the panel, and `ImageRenderer` draws a view, never a presentation —
-    /// a `.sheet` modifier on the panel would rasterise as the panel alone. So
-    /// the harness draws the sheet's content directly, which is exactly why
-    /// ``LoginSheet`` takes a phase rather than a live ``LoginSession``.
+    /// over the panel, and `ImageRenderer` draws a view, never a presentation —
+    /// a `.sheet` modifier on the panel rasterises as the panel alone. So the
+    /// harness composes the two by hand, which is exactly why ``LoginSheet``
+    /// takes a phase rather than a live ``LoginSession``. The composition is
+    /// an approximation of AppKit's presentation (which insets and shadows the
+    /// sheet itself), and it answers the question a bare sheet could not: how
+    /// much of the panel is still legible behind it, and where the eye lands.
     ///
-    /// **The spinner is not the spinner.** `ImageRenderer` draws a
-    /// `ProgressView` as a placeholder glyph — the same limitation this file
-    /// already records for a `.checkbox` toggle — so the two waiting scenes
-    /// show a crossed circle where the app shows motion. Everything around it
-    /// (wording, wrapping, the button row) is real; the glyph is not, and is
-    /// not evidence about it either way.
+    /// **The spinner is drawn as a still `clock`** (`LoginSheet.snapshotMode`).
+    /// `ImageRenderer` rasterises a `ProgressView` as the macOS "prohibited"
+    /// placeholder — a red crossed-out circle, the same class of limitation
+    /// this file already records for a `.checkbox` toggle — so the fixture
+    /// showed a state the app never draws. The still glyph is a stand-in for
+    /// motion, and is not evidence about the spinner either way.
     ///
     /// `.failed` is the state this list exists for. It is the one nobody sees
     /// until it happens to them, it carries the longest string on the sheet
@@ -362,11 +367,55 @@ enum RenderStates {
         NSAppearance.current = appearance.nsAppearance
         defer { NSAppearance.current = previous }
 
-        let view = LoginSheet(phase: scene.phase, authorizeURL: scene.url)
+        // The panel underneath is the ordinary healthy Accounts tab, built the
+        // same way every other scene builds one — pinned state, harness
+        // controllers, nothing that can spawn or signal anything.
+        UserDefaults.standard.removeObject(forKey: FleetView.expandedGroupsKey)
+        let panel =
+            FleetView(
+                poller: StatusPoller(
+                    pinnedState: .loaded(fleet(healthyJSON)), lastPollAt: referenceDate),
+                server: ServerController.harness(pinned: .supervising(pid: 4242)),
+                loginItem: LoginItem(),
+                accounts: AccountController(),
+                control: ControlAccountController(pinned: nil),
+                awake: AwakeController.harness(),
+                updater: Updater(startingUpdater: false),
+                groupController: GroupController(),
+                removeController: RemoveAccountController(),
+                startServerAtLaunch: .constant(false),
+                snapshotMode: true,
+                initialTab: .accounts,
+                initialSessionFiles: [:]
+            )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             .fixedSize()
+
+        let view = panel
+            .overlay {
+                ZStack {
+                    Color.black.opacity(sheetScrimAlpha)
+                    // The rounded fill goes UNDER the sheet rather than
+                    // clipping it: `.clipShape` + `.shadow` rasterises through
+                    // an offscreen layer whose backing showed as white corners
+                    // around the light-mode sheet, which is not a surface this
+                    // app has.
+                    LoginSheet(phase: scene.phase, authorizeURL: scene.url, snapshotMode: true)
+                        .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
+                        .shadow(radius: sheetShadowRadius)
+                }
+            }
+            .environment(\.colorScheme, appearance == .dark ? .dark : .light)
         return rasterise(view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
     }
+
+    /// Harness-only geometry for the sheet composition above: how far the
+    /// panel behind a sheet is dimmed, and the sheet's drop shadow. Not design
+    /// tokens and not in `V4.swift` — AppKit owns both for a real
+    /// presentation, and `V4.swift` holds transcribed mockup values only.
+    /// These exist so the fixture reads like the thing it is picturing.
+    private static let sheetScrimAlpha: Double = 0.45
+    private static let sheetShadowRadius: CGFloat = 12
 
     /// Rasterise one view to a PNG under `directory`. The single writer for
     /// every scene in this file, so a panel render and a sheet render cannot

@@ -22,6 +22,13 @@ struct LoginSheet: View {
     var onCopyLink: () -> Void = {}
     var onCancel: () -> Void = {}
     var onDone: () -> Void = {}
+    /// Draw a still glyph where the spinner goes. `--render-states` only:
+    /// `ImageRenderer` rasterises a `ProgressView` as the macOS "prohibited"
+    /// placeholder, so a fixture of the waiting states showed a red
+    /// crossed-out circle where a person sees motion — a picture of a state
+    /// this app never draws. Same switch the panel already threads for the
+    /// same reason (``FleetView/snapshotMode``).
+    var snapshotMode: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: V4.buttonGap) {
@@ -67,8 +74,13 @@ struct LoginSheet: View {
     private var glyph: some View {
         switch phase {
         case .opening, .waitingForBrowser:
-            ProgressView()
-                .controlSize(.small)
+            if snapshotMode {
+                Image(systemName: "clock")
+                    .foregroundStyle(Tok.inkDim)
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+            }
         case .saved:
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(Tok.ok)
