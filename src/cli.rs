@@ -151,7 +151,12 @@ fn load_for_edit(config_path: &Path) -> anyhow::Result<Config> {
 /// Save the config after a management verb, warning if a server is live.
 fn save_after_edit(config_path: &Path, config: &Config) -> anyhow::Result<()> {
     warn_if_server_running(config);
-    config::save(config_path, config)
+    // `save_settings`, never `save`: no verb reaching here changes a credential,
+    // and this config was loaded before the edit. Writing its credentials whole
+    // reverts any rotation the server landed in between, and a single-use
+    // refresh token does not survive that. The warning above covers losing YOUR
+    // edit; it cannot cover losing somebody else's token.
+    config::save_settings(config_path, config)
         .with_context(|| format!("save config at {}", config_path.display()))
 }
 
@@ -6975,5 +6980,70 @@ mod tests {
             serde_json::from_value(wire).expect("a row with no parkedGroups key still decodes");
         let (rebuilt, _) = back.into_snapshot();
         assert_eq!(rebuilt.accounts[0].parked_groups, Vec::<String>::new());
+    }
+
+    /// `save_after_edit` must not revert a credential rotated since its config
+    /// was loaded.
+    ///
+    /// THE WIRING TEST. `config`'s own
+    /// `a_settings_edit_does_not_revert_a_rotated_credential` calls
+    /// `save_settings` directly, so pointing `save_after_edit` back at
+    /// `config::save` leaves it green.
+    ///
+    /// It calls `save_after_edit` rather than `edit_account` on purpose, and the
+    /// first attempt at this test got that wrong. `edit_account` runs
+    /// `load_for_edit` itself, so driving the whole chain reads the file AFTER
+    /// any rotation and the revert cannot happen; the test passed with the fix
+    /// removed. The exposure here is the window between `load_for_edit` and this
+    /// write, which is milliseconds rather than the seconds a stale server
+    /// snapshot holds. Narrow is not zero, a token refresh is exactly the thing
+    /// that lands in it, and the cost is an account dead until `tcr login`.
+    #[test]
+    fn save_after_edit_does_not_revert_a_rotated_credential() {
+        let path = write_config(
+            "save-after-edit-preserves",
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a", "refreshToken": "rt-a", "expiresAt": 1 },
+                   { "name": "acct-b", "accessToken": "at-b", "refreshToken": "rt-b", "expiresAt": 1 } ] }"#,
+        );
+
+        // What `load_for_edit` handed the verb.
+        let mut cli = config::load(&path).expect("the fixture loads");
+
+        // The server rotates acct-b inside the window, before the write below.
+        let mut server = config::load(&path).expect("the fixture loads");
+        server.accounts[1].access_token = "at-b-rotated".to_string();
+        server.accounts[1].refresh_token = Some("rt-b-rotated".to_string());
+        config::save_tokens_for(&path, &server, config::CredentialScope::Only(1))
+            .expect("the rotation write");
+        let rotated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read back"))
+                .expect("valid json");
+        assert_eq!(
+            rotated["accounts"][1]["refreshToken"],
+            serde_json::json!("rt-b-rotated"),
+            "precondition: the rotation must land, or the assertion below proves nothing"
+        );
+
+        // The verb finishes and writes.
+        cli.accounts[0].priority = Some(9);
+        save_after_edit(&path, &cli).expect("the edit must save");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).expect("read back"))
+                .expect("valid json");
+        assert_eq!(
+            value["accounts"][0]["priority"],
+            serde_json::json!(9),
+            "the verb's own edit must land"
+        );
+        assert_eq!(
+            value["accounts"][1]["refreshToken"],
+            serde_json::json!("rt-b-rotated"),
+            "a priority edit on acct-a reverted acct-b's rotated refresh token; \
+             that token is single-use and acct-b is now dead until `tcr login`"
+        );
+
+        fs::remove_file(&path).ok();
     }
 }
