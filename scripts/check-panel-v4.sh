@@ -84,6 +84,38 @@ if [ -n "$stale" ]; then
     done <<<"$stale"
 fi
 
+# Every density token — `static var x: T { compact ? a : b }` — must be
+# `compact ? a : b`, exactly two numeric values either side of one colon, and
+# the FIRST (compact) value must never be the larger one: compact is meant to
+# shrink the token, not grow it.
+#
+# A positive control first: if this stops matching at all (a rename of
+# `compact`, a reformat onto multiple lines), the loop below runs zero times
+# and the gate reports clean for the wrong reason — the same trap `count`
+# above exists to catch for the file glob.
+density_lines=$(grep -nE 'compact \? -?[0-9]+(\.[0-9]+)? : -?[0-9]+(\.[0-9]+)?' "$sheet" || true)
+density_count=$(printf '%s' "$density_lines" | grep -c . || true)
+if [ "$density_count" -lt 10 ]; then
+    echo "error: found $density_count \"compact ? a : b\" density tokens in $sheet — expected at least 10. Did V4.compact get renamed or reformatted?" >&2
+    exit 1
+fi
+while IFS= read -r hit; do
+    lineno=$(echo "$hit" | cut -d: -f1)
+    rest=$(echo "$hit" | cut -d: -f2-)
+    compact_value=$(echo "$rest" | grep -oE 'compact \? -?[0-9]+(\.[0-9]+)?' | grep -oE -- '-?[0-9]+(\.[0-9]+)?$')
+    comfortable_value=$(echo "$rest" | grep -oE ': -?[0-9]+(\.[0-9]+)? *\}' | grep -oE -- '-?[0-9]+(\.[0-9]+)?')
+    if [ -z "$compact_value" ] || [ -z "$comfortable_value" ]; then
+        findings="${findings}V4.swift:${lineno}: error: v4: a density token does not match the \"compact ? a : b\" shape — cannot verify its two values
+"
+        continue
+    fi
+    ordered=$(awk -v a="$compact_value" -v b="$comfortable_value" 'BEGIN{print (a<=b)?"ok":"bad"}')
+    if [ "$ordered" != "ok" ]; then
+        findings="${findings}V4.swift:${lineno}: error: v4: compact value ($compact_value) is greater than comfortable ($comfortable_value) — compact must be the smaller (or equal) number
+"
+    fi
+done <<<"$density_lines"
+
 if [ -n "$findings" ]; then
     printf '%s' "$findings" >&2
     echo "" >&2
@@ -91,4 +123,4 @@ if [ -n "$findings" ]; then
     exit 1
 fi
 
-echo "check-panel-v4: clean ($count files, no hand-written sizes, no pre-v4 geometry tokens)"
+echo "check-panel-v4: clean ($count files, no hand-written sizes, no pre-v4 geometry tokens, $density_count density tokens ordered compact <= comfortable)"

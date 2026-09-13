@@ -19,6 +19,14 @@ import TcrBarCore
 /// two exceptions below (`trend`, `info`) are roles the palette has no token for
 /// and are named as such.
 enum V4 {
+    /// Which of the two ``PanelDensity`` values the type and box tokens below
+    /// shrink for (Gil, 2026-09-13: "yes the right compact is better" —
+    /// `data/plans/panel-density-bridge.md`). A plain `UserDefaults` read
+    /// through `PanelDensityPreference.current()`, not a stored value: every
+    /// token below is a computed `static var` re-evaluated on each draw, so
+    /// the Settings-window picker takes effect on the panel's next redraw
+    /// with nothing to wire, restart or invalidate.
+    static var compact: Bool { PanelDensityPreference.current() == .compact }
 
     // MARK: - Panel (`.panel`)
 
@@ -58,8 +66,8 @@ enum V4 {
     static let segPadding: CGFloat = 3
     static let segGap: CGFloat = 3
     static let segFillAlpha: Double = 0.06
-    static let segMarginBottom: CGFloat = 12
-    static let tabMinHeight: CGFloat = 32
+    static var segMarginBottom: CGFloat { compact ? 8 : 12 }
+    static var tabMinHeight: CGFloat { compact ? 28 : 32 }
     static let tabRadius: CGFloat = 8
     static let tabSelectedAlpha: Double = 0.12
     static let tabIconBox: CGFloat = 14
@@ -72,10 +80,10 @@ enum V4 {
     // MARK: - Card (`.card` / `.row`)
 
     static let cardRadius: CGFloat = 8
-    static let cardPaddingV: CGFloat = 10
-    static let cardPaddingH: CGFloat = 12
+    static var cardPaddingV: CGFloat { compact ? 7 : 10 }
+    static var cardPaddingH: CGFloat { compact ? 10 : 12 }
     /// `.card{margin:14px 0}` — adjacent cards collapse to one 14 pt gap.
-    static let cardGap: CGFloat = 14
+    static var cardGap: CGFloat { compact ? 8 : 14 }
     /// Padding PLUS the border, which is what `box-sizing:border-box` charges a
     /// CSS box for and what a SwiftUI `strokeBorder` overlay does not: the
     /// overlay takes no layout at all, so a card padded by the CSS figure alone
@@ -84,14 +92,14 @@ enum V4 {
     static var cardInsetV: CGFloat { cardPaddingV + panelBorderWidth }
     static var cardInsetH: CGFloat { cardPaddingH + panelBorderWidth }
     /// The flex gap inside a `.row`.
-    static let rowGap: CGFloat = 8
+    static var rowGap: CGFloat { compact ? 6 : 8 }
     /// `.sess .row{padding:4px 0}` — the ONLY `.row` in the sheet with vertical
     /// padding, and it is the session block's. A card's rows have none: their
     /// height is their line box and nothing else, which is what
     /// ``lineHeight(_:)`` supplies. Measured: padding the card's rows as well
     /// made every account card 3 pt tall per row — a parked card measured 47 pt
     /// against the mockup's 43.
-    static let sessRowPaddingV: CGFloat = 4
+    static var sessRowPaddingV: CGFloat { compact ? 3 : 4 }
 
     // MARK: - Quota grid (`.q`)
 
@@ -99,8 +107,8 @@ enum V4 {
     static let quotaLabelWidth: CGFloat = 24
     static let quotaPercentWidth: CGFloat = 40
     static let quotaGap: CGFloat = 8
-    static let quotaMarginTop: CGFloat = 6
-    static let barHeight: CGFloat = 7
+    static var quotaMarginTop: CGFloat { compact ? 4 : 6 }
+    static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4
     static let barTrackAlpha: Double = 0.08
     static let barMinWidth: CGFloat = 2
@@ -140,7 +148,7 @@ enum V4 {
 
     // MARK: - Section head (`.sec`)
 
-    static let sectionHeadMarginTop: CGFloat = 12
+    static var sectionHeadMarginTop: CGFloat { compact ? 8 : 12 }
     static let sectionHeadMarginSide: CGFloat = 4
     static let sectionHeadMarginBottom: CGFloat = 4
     static let sectionHeadGlyph: CGFloat = 12
@@ -156,7 +164,7 @@ enum V4 {
     /// extracted CSS: the mockup's own `.ring` is 34 in a row whose two text
     /// lines are taller than ours, and a ring sized from the stylesheet rather
     /// than from the row it sits in is what made the rows grow around it.
-    static let ringSize: CGFloat = 28
+    static var ringSize: CGFloat { compact ? 24 : 28 }
     static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
     /// The Bash tool's own timeout — the denominator the ring fills toward, and
@@ -283,14 +291,14 @@ enum V4 {
     static let titleSize: CGFloat = 17
     static let titleTracking: CGFloat = -0.01 * 17
     static let freshnessSize: CGFloat = 12.5
-    static let summarySize: CGFloat = 15
-    static let tabLabelSize: CGFloat = 12.5
+    static var summarySize: CGFloat { compact ? 13 : 15 }
+    static var tabLabelSize: CGFloat { compact ? 12 : 12.5 }
     static let tabLabelTracking: CGFloat = 0.02 * 12.5
     static let badgeSize: CGFloat = 11
-    static let nameSize: CGFloat = 15
+    static var nameSize: CGFloat { compact ? 13 : 15 }
     static let nameTracking: CGFloat = -0.005 * 15
-    static let dimSize: CGFloat = 13
-    static let muteSize: CGFloat = 12
+    static var dimSize: CGFloat { compact ? 12 : 13 }
+    static var muteSize: CGFloat { compact ? 11 : 12 }
     static let monoSize: CGFloat = 12
     static let footerSize: CGFloat = 12.5
 
