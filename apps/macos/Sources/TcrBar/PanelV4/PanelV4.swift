@@ -59,7 +59,7 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
             // the sides keep the `line` colour the sheet gives them.
             RoundedRectangle(cornerRadius: V4.panelRadius, style: .continuous)
                 .strokeBorder(
-                    Tok.ink.opacity(V4.panelTopEdgeAlpha), lineWidth: V4.panelBorderWidth
+                    Tok.panelTopEdge.opacity(V4.panelTopEdgeAlpha), lineWidth: V4.panelBorderWidth
                 )
                 .mask(
                     LinearGradient(

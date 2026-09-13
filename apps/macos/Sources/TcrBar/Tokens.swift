@@ -131,6 +131,22 @@ public enum Tok {
     /// overriding it would be this app asserting a preference it does not own.
     public static let accent = Color(nsColor: .controlAccentColor)
 
+    /// The panel's lit top edge (`PanelV4`, the mockup's own
+    /// `border-top-color:rgba(255,255,255,.18)`) — literal white, in EVERY
+    /// appearance, matching the mockup's own literal value. A highlight
+    /// reads as "catching light from above" by being lighter than the
+    /// surface it sits on, in both appearances; a dark panel shows that
+    /// clearly and a near-white one shows it faintly, but "faint" is not
+    /// "inverted".
+    ///
+    /// `Tok.ink` drew this before review #6's cap list
+    /// (`data/plans/interface-review-2026-09-13.md`): ink is a TEXT token
+    /// that answers to appearance for legibility (near-white on the dark
+    /// panel, near-black on the light one), and reusing it for the bevel
+    /// meant the edge went near-black in light appearance too — a dark line
+    /// in the highlight's own position, so the panel read as lit from below.
+    public static let panelTopEdge = Color.white
+
     // MARK: - Ink
     //
     // Warm-neutral off-white on dark, never pure white — pure white on a dark
