@@ -1794,6 +1794,92 @@ pub(crate) fn write_atomic(path: &Path, json: &str) -> Result<(), ConfigError> {
 /// key the user just DELETED would reappear as its default (`"pacing": {}`) and a
 /// key they never wrote would appear for the first time. Editing the parsed
 /// document leaves the file byte-identical apart from the credential fields.
+/// The credential fields, named once.
+///
+/// [`merge_tokens`] writes exactly these from memory (via [`Credentials`]) and
+/// [`carry_disk_credentials`] preserves exactly these from disk. A key in one
+/// list and not the other is a field that silently stops being protected, which
+/// is what `the_credential_key_list_matches_what_merge_tokens_writes` exists to
+/// catch.
+const CREDENTIAL_KEYS: [&str; 3] = ["accessToken", "refreshToken", "expiresAt"];
+
+/// Write `config` back, taking every account's CREDENTIALS from the file rather
+/// than from `config`.
+///
+/// The mirror of [`save_tokens`]: that one writes credentials and preserves
+/// everything else, this one writes everything else and preserves credentials.
+/// Between them no writer has to serialize a field it did not change.
+///
+/// Every mutating `tcr account` verb reaches here through `cli::save_after_edit`,
+/// and none of them changes a credential: they set a priority, a threshold,
+/// `disabled`, group membership, or remove an entry outright. Writing
+/// credentials from their snapshot could therefore only ever revert someone
+/// else's rotation, and a single-use refresh token does not survive being
+/// reverted (see `a_settings_edit_does_not_revert_a_rotated_credential`). The
+/// server's own `warn_if_server_running` already told users to "expect to
+/// re-apply" after such a clash, which is not something you can do for a
+/// rotated token you never saw.
+///
+/// Unknown per-account keys need no help here. `Account::extra` is
+/// `#[serde(flatten)]`, so they already round-trip through the typed `Config`;
+/// the modeled credential triple is the whole exposure.
+pub fn save_settings(path: &Path, config: &Config) -> Result<(), ConfigError> {
+    // No readable file means there are no on-disk credentials to preserve, and
+    // writing the snapshot whole is exactly what this call did before.
+    let Ok(disk) = read_document(path) else {
+        return save(path, config);
+    };
+    let Ok(Value::Object(mut doc)) = serde_json::to_value(config) else {
+        // `Config` is a struct, so this is the total-function tail rather than a
+        // reachable outcome. Falling back rather than failing keeps a verb that
+        // would have worked before working.
+        return save(path, config);
+    };
+    carry_disk_credentials(&mut doc, &disk, &config.accounts);
+    write_atomic(path, &serde_json::to_string_pretty(&doc)?)
+}
+
+/// Copy each matched account's credential fields from `disk` into `doc`.
+///
+/// Matched with [`plan_merge`], the same unambiguous-in-both-directions pairing
+/// [`merge_tokens`] uses, so the two cannot drift on what counts as the same
+/// account. An entry the planner declines to pair keeps whatever the snapshot
+/// held, which is what it would have had anyway.
+fn carry_disk_credentials(
+    doc: &mut Map<String, Value>,
+    disk: &Map<String, Value>,
+    memory: &[Account],
+) {
+    let Some(entries) = disk.get("accounts").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(out) = doc.get_mut("accounts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (entry, (_, plan)) in entries.iter().zip(plan_merge(entries, memory)) {
+        let EntryPlan::Write(position) = plan else {
+            continue;
+        };
+        let (Some(from), Some(Value::Object(into))) = (entry.as_object(), out.get_mut(position))
+        else {
+            continue;
+        };
+        for key in CREDENTIAL_KEYS {
+            match from.get(key) {
+                Some(value) => {
+                    into.insert(key.to_string(), value.clone());
+                }
+                // Absent on disk, so absent here. Leaving the snapshot's value
+                // would reinstate a credential the user or another process
+                // deliberately removed.
+                None => {
+                    into.remove(key);
+                }
+            }
+        }
+    }
+}
+
 /// Which accounts' credentials a token write is allowed to touch.
 ///
 /// The in-memory config is a boot-time snapshot. [`Manager::persist_tokens`]
@@ -6580,5 +6666,157 @@ mod tests {
             report.absent_from_disk.is_empty(),
             "acct-b is on disk; it was simply out of scope"
         );
+    }
+
+    /// THE regression guard for `save_settings`.
+    ///
+    /// A `tcr account` verb loads the config, changes a SETTING, and writes the
+    /// whole `Config` back via `config::save`. Every account's credentials go
+    /// with it, from a snapshot taken before the edit. The server rotating a
+    /// token in between has that rotation reverted, and a single-use refresh
+    /// token does not survive being reverted.
+    #[test]
+    fn a_settings_edit_does_not_revert_a_rotated_credential() {
+        let path = tmp_path("settings-edit-revert");
+        fs::write(&path, two_account_file()).unwrap();
+
+        // The CLI loads the config for an edit.
+        let mut cli = load(&path).unwrap();
+
+        // The server rotates acct-b. Completes before the CLI writes.
+        let mut server = load(&path).unwrap();
+        server.accounts[1].access_token = "at-b-rotated".to_string();
+        server.accounts[1].refresh_token = Some("rt-b-rotated".to_string());
+        save_tokens_for(&path, &server, CredentialScope::Only(1)).unwrap();
+        assert_eq!(
+            read_json(&path)["accounts"][1]["refreshToken"],
+            json!("rt-b-rotated"),
+            "precondition: the rotation must land, or the assertion below proves nothing"
+        );
+
+        // The CLI applies its edit. A priority change, nothing to do with credentials.
+        cli.accounts[0].priority = Some(9);
+        save_settings(&path, &cli).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["priority"],
+            json!(9),
+            "the edit must land"
+        );
+        assert_eq!(
+            value["accounts"][1]["refreshToken"],
+            json!("rt-b-rotated"),
+            "a settings edit reverted a rotated refresh token"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// Plain `save` is still destructive from a stale snapshot, pinned here
+    /// rather than left to be rediscovered.
+    ///
+    /// The fix is not that `save` became safe. It is that the CLI edit path
+    /// stopped using it. `save` remains correct for its other callers, which
+    /// write a config they just built rather than one they loaded earlier: the
+    /// first-account-after-login path in `oauth.rs` (reached only when the file
+    /// does not exist yet) and the one-time legacy-throttle migration in
+    /// `main.rs`. A new caller has to argue with this test.
+    #[test]
+    fn plain_save_still_reverts_a_rotated_credential() {
+        let path = tmp_path("plain-save-reverts");
+        fs::write(&path, two_account_file()).unwrap();
+
+        let mut stale = load(&path).unwrap();
+
+        let mut server = load(&path).unwrap();
+        server.accounts[1].refresh_token = Some("rt-b-rotated".to_string());
+        save_tokens_for(&path, &server, CredentialScope::Only(1)).unwrap();
+
+        stale.accounts[0].priority = Some(9);
+        save(&path, &stale).unwrap();
+
+        assert_eq!(
+            read_json(&path)["accounts"][1]["refreshToken"],
+            json!("rt-b"),
+            "documenting the hazard `save` still carries: it reverted the rotation"
+        );
+
+        fs::remove_file(&path).ok();
+    }
+
+    /// `CREDENTIAL_KEYS` must name exactly the fields `merge_tokens` writes.
+    ///
+    /// Two lists, one truth. `merge_tokens` writes credentials from memory by
+    /// serializing [`Credentials`]; `carry_disk_credentials` preserves them from
+    /// disk by walking `CREDENTIAL_KEYS`. A field added to one and not the other
+    /// is a credential that is written but never protected, and nothing else in
+    /// the stack would say so.
+    #[test]
+    fn the_credential_key_list_matches_what_merge_tokens_writes() {
+        let creds = Credentials {
+            access_token: "at",
+            refresh_token: Some("rt"),
+            expires_at: Some(1),
+        };
+        let Ok(Value::Object(fields)) = serde_json::to_value(&creds) else {
+            panic!("Credentials must serialize to an object");
+        };
+        let mut written: Vec<&str> = fields.keys().map(String::as_str).collect();
+        written.sort_unstable();
+        let mut protected: Vec<&str> = CREDENTIAL_KEYS.to_vec();
+        protected.sort_unstable();
+        assert_eq!(
+            written, protected,
+            "merge_tokens writes {written:?} but carry_disk_credentials protects {protected:?}"
+        );
+    }
+
+    /// A credential the FILE no longer carries must not be reinstated from the
+    /// snapshot.
+    ///
+    /// "Credentials come from disk" has to mean absence too. A `claude
+    /// setup-token` account legitimately has no refresh token, and a user can
+    /// delete one by hand. Carrying only the keys the file HAS would leave the
+    /// snapshot's copy in place and silently resurrect it, which is the same
+    /// class of bug as the revert this whole change exists to stop, pointed the
+    /// other way.
+    #[test]
+    fn a_credential_absent_on_disk_is_removed_rather_than_reinstated() {
+        let path = tmp_path("absent-credential");
+        fs::write(&path, two_account_file()).unwrap();
+
+        // The CLI's snapshot carries acct-b's refresh token.
+        let mut cli = load(&path).unwrap();
+        assert!(
+            cli.accounts[1].refresh_token.is_some(),
+            "precondition: the snapshot holds a refresh token to reinstate"
+        );
+
+        // The file loses it: a setup-token re-auth, or a hand edit.
+        fs::write(
+            &path,
+            r#"{ "accounts": [
+                   { "name": "acct-a", "accessToken": "at-a", "refreshToken": "rt-a", "expiresAt": 1 },
+                   { "name": "acct-b", "accessToken": "at-b", "expiresAt": 1 } ] }"#,
+        )
+        .unwrap();
+
+        cli.accounts[0].priority = Some(9);
+        save_settings(&path, &cli).unwrap();
+
+        let value = read_json(&path);
+        assert_eq!(
+            value["accounts"][0]["priority"],
+            json!(9),
+            "the edit must still land"
+        );
+        assert!(
+            value["accounts"][1].get("refreshToken").is_none(),
+            "a refresh token the file no longer carries was reinstated from the snapshot: {}",
+            value["accounts"][1]
+        );
+
+        fs::remove_file(&path).ok();
     }
 }
