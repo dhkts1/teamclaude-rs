@@ -80,23 +80,32 @@ struct AccountCard<Actions: View>: View {
                 // card one stop and taken every per-account action with it.
                 actions()
             }
-            if shape == .full {
-                // One row per window in both shapes. Compact used to fold
-                // these onto a single dense line (the fix for a measured
-                // +42 pt over its own two-row card) — Gil saw that line and
-                // preferred readable bars, so Compact draws the same rows as
-                // Comfortable, just at Compact's own tighter density tokens
-                // (`V4.quotaLabelWidth`, `V4.quotaMarginTop`, `V4.barHeight`).
-                ForEach(Array(quotaWindows.enumerated()), id: \.element.label) {
-                    index, window in
-                    QuotaRow(
-                        label: window.label, value: window.value, tint: window.tint,
-                        resetAtMs: window.resetAtMs, now: now,
-                        trailing: rowTail(index),
-                        trailingReserved: usageTail != nil || planName != nil,
-                        trailingHelp: planLine)
-                }
+            // One row per window in BOTH shapes, which is what the comment
+            // here has claimed since #248 while the code drew them in one.
+            // `if shape == .full` read as if it were the density switch it
+            // sits beside in every other token (`V4.compact`), but
+            // ``Shape/compact`` means something else entirely: a card inside a
+            // group box. So every grouped account drew its name, its pills and
+            // NOTHING ELSE — no 5h, no 7d, no model-scoped window — while the
+            // router was rotating on exactly those numbers. Seven of Gil's
+            // eighteen accounts are in a group (Gil, 2026-09-13: "why i dont
+            // see any fable?").
+            //
+            // Compact used to fold these onto a single dense line (the fix for
+            // a measured +42 pt over its own two-row card) — Gil saw that line
+            // and preferred readable bars, so it draws the same rows, just at
+            // Compact's own tighter density tokens (`V4.quotaLabelWidth`,
+            // `V4.quotaMarginTop`, `V4.barHeight`).
+            ForEach(Array(quotaWindows.enumerated()), id: \.element.label) {
+                index, window in
+                QuotaRow(
+                    label: window.label, value: window.value, tint: window.tint,
+                    resetAtMs: window.resetAtMs, now: now,
+                    trailing: rowTail(index),
+                    trailingReserved: usageTail != nil || rowTail(1) != nil,
+                    trailingHelp: planLine)
             }
+            fableLine
         }
         // `.contain` WITH a label. Without one the container has no accessible
         // name, so it cannot take focus and a user arriving at the card is told
@@ -200,7 +209,10 @@ struct AccountCard<Actions: View>: View {
     private func rowTail(_ index: Int) -> String? {
         switch index {
         case 0: return usageTail
-        case 1: return planName
+        // A grouped card already carries the plan INSIDE its name row
+        // (``nameRow``), so repeating it here would print it twice on the one
+        // card that is short of width.
+        case 1: return shape == .compact ? nil : planName
         default: return nil
         }
     }
@@ -260,8 +272,17 @@ struct AccountCard<Actions: View>: View {
     /// `quotaBarTintSource(for:)`: that function's old-server fallback borrows
     /// the composite `quotaState`, which for this window would be a reading of
     /// something else entirely.
+    /// The windows that get a BAR ROW: the rolling session window and the weekly
+    /// one, and only those two.
+    ///
+    /// The model-scoped weekly window is drawn as a caption in the tail beside
+    /// the `7d` bar (``fableTail``) instead, which is where it sat before it was
+    /// promoted to a row of its own. A row costs every card a measured 21 pt; a
+    /// caption costs nothing, because the tail column is already reserved for
+    /// the cost figure above it. Gil, 2026-09-13: "can we have the fable line be
+    /// like here again?"
     private var quotaWindows: [QuotaWindowSpec] {
-        var windows = [
+        [
             QuotaWindowSpec(
                 label: "5h", value: account.fiveHour,
                 tint: account.quotaBarTintSource(for: .fiveHour),
@@ -271,13 +292,36 @@ struct AccountCard<Actions: View>: View {
                 tint: account.quotaBarTintSource(for: .sevenDay),
                 resetAtMs: account.sevenDayResetAtMs),
         ]
-        if account.sevenDayOi != nil {
-            windows.append(
-                QuotaWindowSpec(
-                    label: "fable", value: account.sevenDayOi,
-                    tint: account.fableBarTintSource,
-                    resetAtMs: account.sevenDayOiResetAtMs))
+    }
+
+    /// `"fable 71% · in 4d 12h"` — the model-scoped weekly window as ONE
+    /// caption line under the two bars, which is where the pre-v4 card drew it
+    /// (Gil, 2026-09-13: "can we have the fable line be like here again?").
+    ///
+    /// A caption line, not a third ``QuotaRow``, and not a string in the rows'
+    /// trailing column. As a row it cost every card a measured 21 pt. In the
+    /// trailing column it cost more and less visibly: that column is a FIXED
+    /// width shared by every row, so sizing it for this string (127 pt at
+    /// Comfortable, against 67 pt for the cost figure it was built for) came
+    /// straight out of the bars — measured 154 pt of bar down to 48 pt, on both
+    /// rows, on every card, which is the one thing ``QuotaRow``'s own
+    /// doc-comment says the full-width bar exists to protect. Here it is laid
+    /// out against the whole card and cannot truncate.
+    ///
+    /// The string is ``Account/fableWeeklyLabel(now:)`` — the pre-v4 card's own
+    /// function, not a second spelling of it, so the two cannot drift. `nil`
+    /// when the proxy has never learned this window for the account, which
+    /// stays different from a zero.
+    @ViewBuilder
+    private var fableLine: some View {
+        if let label = account.fableWeeklyLabel(now: now) {
+            Text(label)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(account.fableBarTintSource.fillColor ?? Tok.mute)
+                .lineLimit(1)
+                .padding(.top, V4.quotaMarginTop)
+                .accessibilityLabel(
+                    account.fableWeeklySpokenLabel(now: now) ?? label)
         }
-        return windows
     }
 }

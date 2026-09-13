@@ -152,7 +152,7 @@ struct QuotaRow: View {
                 .font(V4.font(V4.dimSize))
                 .foregroundStyle(Tok.dim)
                 .frame(width: V4.quotaPercentWidth, alignment: .trailing)
-            if let caption = QuotaFormat.resetsCaption(resetAtMs: resetAtMs, now: now) {
+            if let caption = QuotaFormat.resetCaption(resetAtMs: resetAtMs, now: now) {
                 Text(caption)
                     .font(V4.font(V4.muteSize))
                     .foregroundStyle(captionTint)

@@ -129,8 +129,19 @@ enum V4 {
     /// bar shorter than the two below it, and equal percentages then drew
     /// unequal ink inside ONE card — the exact confusion `QuotaRow`'s own
     /// doc-comment says the full-width bar exists to remove.
-    static let usageTailWidth: CGFloat = 68
-    static var quotaMarginTop: CGFloat { compact ? 4 : 6 }
+    /// Sized by MEASURING the strings it carries, at Comfortable's 12 pt:
+    /// `$12,345 · 120M` is 87.2 pt and `Team Standard` is 85.1 pt. It was 68,
+    /// which fits `$540 · 1.5M` (66.9) and nothing else — `$1,190 · 3.1M` is
+    /// 73.5 and was drawing as `$1,1…3.1M`, eliding the middle of a figure
+    /// whose middle is the number.
+    ///
+    /// It does not grow past that. The column is a FIXED width shared by every
+    /// quota row, so every point given to it comes out of BOTH bars on EVERY
+    /// card: at 112 pt, for a window caption, the bar went from a measured
+    /// 154 pt to 48 pt. A caption too long for this column belongs on its own
+    /// line (`AccountCard.fableLine`), not in it.
+    static let usageTailWidth: CGFloat = 88
+    static var quotaMarginTop: CGFloat { compact ? 2 : 3 }
     static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4
     static let barTrackAlpha: Double = 0.08
