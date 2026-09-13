@@ -1559,6 +1559,18 @@ struct FleetView: View {
         return String(sessionId.prefix(8))
     }
 
+    /// The line a tool row leads with — ``ToolCallLabel/headline(commandHead:tool:owner:)``
+    /// with this tab's own session label, so a row whose command head the wire
+    /// could not carry says `Bash · teamclaude-rs-bc` rather than the bare word
+    /// `Bash`. Shared by both rows for the same reason ``MonoText`` is: the two
+    /// must never drift on how a call names itself.
+    private func toolCallHeadline(_ entry: SessionToolEntry) -> String {
+        ToolCallLabel.headline(
+            commandHead: entry.call.commandHead,
+            tool: entry.call.tool,
+            owner: toolCallOwnerName(entry.sessionId))
+    }
+
     /// The Bash tool's own timeout — the one denominator this build knows,
     /// and the reason `docs/design/panel-tabs.md` names 600s specifically:
     /// "The ten slowest calls today all sit at 600s: the Bash tool's own
@@ -1590,8 +1602,15 @@ struct FleetView: View {
             // leading column — 224 pt against the 200 pt it needs — so
             // "· 20s to timeout" survives without a `fixedSize` fight.
             VStack(alignment: .leading, spacing: 0) {
-                MonoText(text: entry.call.commandHead ?? entry.call.tool)
-                toolCallSubLine(entry, remaining: isNearTimeout ? remaining : nil)
+                MonoText(text: toolCallHeadline(entry))
+                // When the wire carried no command head the headline IS
+                // "Bash · teamclaude-rs-bc", so the sub line must not say it a
+                // second time — it keeps only the clause the headline cannot
+                // carry, the seconds left.
+                toolCallSubLine(
+                    entry,
+                    remaining: isNearTimeout ? remaining : nil,
+                    namesOwner: entry.call.commandHead?.isEmpty == false)
             }
         } trailing: {
             // Ring and duration on ONE line, inside the shared column: the
@@ -1619,9 +1638,17 @@ struct FleetView: View {
 
     /// "Agent · teamclaude-rs-c7 · 20s to timeout" — the tool, whose session it
     /// belongs to, and what is left of its timeout.
-    private func toolCallSubLine(_ entry: SessionToolEntry, remaining: Double?) -> some View {
+    ///
+    /// `namesOwner` is false when the row's HEADLINE is already
+    /// "\<tool\> · \<owner\>" (the no-command-head fallback), leaving this line
+    /// with the timeout clause alone rather than the same words twice.
+    private func toolCallSubLine(
+        _ entry: SessionToolEntry, remaining: Double?, namesOwner: Bool = true
+    ) -> some View {
         HStack(spacing: 0) {
-            MuteText(text: "\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
+            if namesOwner {
+                MuteText(text: "\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
+            }
             if let remaining {
                 Text(" · \(Int(max(0, remaining.rounded())))s to timeout")
                     .font(V4.font(V4.muteSize))
@@ -1647,7 +1674,7 @@ struct FleetView: View {
         // column. The second line the pre-v4 row added ("Bash · mycelium-c2")
         // cost 55 pt a row and pushed three of the five slowest below the fold.
         V4Row {
-            MonoText(text: entry.call.commandHead ?? entry.call.tool)
+            MonoText(text: toolCallHeadline(entry))
         } trailing: {
             TrailingColumn(width: width) {
                 if let seconds = entry.call.seconds {

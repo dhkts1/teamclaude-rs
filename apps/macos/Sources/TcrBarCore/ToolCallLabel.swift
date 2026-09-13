@@ -55,4 +55,26 @@ public enum ToolCallLabel {
         guard timedOut(seconds: seconds, timeout: timeout) else { return nil }
         return "ran \(duration(seconds)), killed at the \(Int(timeout)) second timeout"
     }
+
+    /// The one line a RUNNING NOW or SLOWEST TODAY row leads with: the command
+    /// when the wire carried one, and `"Bash · teamclaude-rs-bc"` when it did
+    /// not.
+    ///
+    /// Command heads are memory-only — `RunningTool::command_head` and
+    /// `SlowTool::command_head` carry `#[serde(skip_serializing)]`, the privacy
+    /// call `src/session_wire.rs`'s module doc states — so every row restored
+    /// from `~/.cache/teamclaude/session-wire.json`, and every row closed out of
+    /// a restored one, arrives with `commandHead` nil. Measured 2026-09-13 on
+    /// the live proxy: 72 of 95 `slowest` entries. Those rows used to print the
+    /// bare word `Bash`, five of them in a column, telling a reader nothing.
+    /// Naming the session at least says WHOSE call it was, which is the fact
+    /// that makes the row worth reading at all.
+    ///
+    /// `owner` is the caller's already-resolved session label (the Sessions
+    /// tab's own `displayName`, falling back to the id's first 8 characters),
+    /// never a raw session id built here.
+    public static func headline(commandHead: String?, tool: String, owner: String) -> String {
+        if let commandHead, !commandHead.isEmpty { return commandHead }
+        return owner.isEmpty ? tool : "\(tool) · \(owner)"
+    }
 }

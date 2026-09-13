@@ -52,4 +52,39 @@ final class ToolCallLabelTests: XCTestCase {
             ToolCallLabel.spoken(seconds: 600, timeout: 600),
             ToolCallLabel.spoken(seconds: 583, timeout: 600))
     }
+
+    /// A row whose command head the wire could not carry names its session.
+    ///
+    /// Command heads never reach `session-wire.json` (the privacy call in
+    /// `src/session_wire.rs`), so every restored row arrives with none — 72 of
+    /// 95 `slowest` entries on the live proxy, 2026-09-13 — and each of those
+    /// rows printed the single word `Bash`. Whose call it was is the least this
+    /// row can say and still be worth reading.
+    func testARowWithNoCommandHeadNamesItsSession() {
+        XCTAssertEqual(
+            ToolCallLabel.headline(commandHead: nil, tool: "Bash", owner: "teamclaude-rs-bc"),
+            "Bash · teamclaude-rs-bc")
+        // An empty string is the same absence as nil — the wire's `Option` and a
+        // head truncated to nothing must not print two different rows.
+        XCTAssertEqual(
+            ToolCallLabel.headline(commandHead: "", tool: "Agent", owner: "example-c2"),
+            "Agent · example-c2")
+    }
+
+    /// A real command head is the row, untouched — the owner is said on the sub
+    /// line and must not be appended here.
+    func testACommandHeadIsTheHeadlineOnItsOwn() {
+        XCTAssertEqual(
+            ToolCallLabel.headline(
+                commandHead: "cargo test --release", tool: "Bash", owner: "teamclaude-rs-bc"),
+            "cargo test --release")
+    }
+
+    /// No owner to name (no session file, and an id that resolved to nothing):
+    /// the bare tool, never a dangling separator.
+    func testAnUnknownOwnerLeavesTheToolAlone() {
+        XCTAssertEqual(
+            ToolCallLabel.headline(commandHead: nil, tool: "Bash", owner: ""),
+            "Bash")
+    }
 }
