@@ -52,11 +52,33 @@ struct V4Row<Leading: View, Trailing: View>: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: V4.rowGap) {
+            // The label is BOUNDED and CLIPPED, not merely truncated.
+            //
+            // `MonoText` carries `.textSelection(.enabled)` so a command can
+            // be copied (`V4Text.swift`), and a selectable `Text` lays its
+            // FULL string out when it is clicked — a truncated command
+            // re-drew itself at full length, under the pill, the moment the
+            // operator clicked it (2026-09-13). `lineLimit` does not bind
+            // that: a frame does.
             leading()
-                .layoutPriority(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .clipped()
             Spacer(minLength: 0)
+            // The PRIORITY sits on the trailing column, not on the label.
+            //
+            // It used to sit on `leading()`, which meant SwiftUI handed the
+            // label its ideal width first: a command longer than the row
+            // pushed the `Spacer` to zero and drew the `.fixedSize()` pill
+            // ON TOP of its own last characters (seen in the Tools tab's
+            // SLOWEST TODAY rows, 2026-09-13). The trailing column is the one
+            // with a fixed width and no way to shrink; the leading label is
+            // `MonoText`/`DimText`, which already carry `lineLimit(1)` and a
+            // truncation mode and can give ground. So the pill claims its
+            // width and the label ellipsises into what is left, which is what
+            // every row here documents itself as doing.
             trailing()
                 .fixedSize()
+                .layoutPriority(1)
         }
         .frame(minHeight: V4.rowLineHeight)
     }

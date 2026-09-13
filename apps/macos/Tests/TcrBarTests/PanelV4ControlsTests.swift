@@ -146,9 +146,24 @@ final class PanelV4ControlsTests: XCTestCase {
 
     // MARK: - Review #10: whitespace collapses before a character does
 
-    func testTheRowGivesItsLeadingSlotPriority() throws {
+    /// The priority moved to the TRAILING column on 2026-09-13, and this test
+    /// moved with it. With the priority on the label, SwiftUI handed the label
+    /// its ideal width first: a command longer than the row collapsed the
+    /// `Spacer` and drew the fixed-width pill on top of the label's own last
+    /// characters. The pill cannot shrink; the label carries `lineLimit(1)`
+    /// and a truncation mode and can.
+    func testTheRowGivesItsTrailingColumnPriority() throws {
         let source = try panelSource("PanelV4/V4Card.swift")
-        XCTAssertTrue(source.contains(".layoutPriority(1)"))
+        let trailing = try XCTUnwrap(source.range(of: "trailing()"))
+        let priority = try XCTUnwrap(source.range(of: ".layoutPriority(1)"))
+        XCTAssertTrue(
+            priority.lowerBound > trailing.lowerBound,
+            "the fixed-width trailing column takes the priority, not the label")
+        XCTAssertTrue(
+            source.contains(".frame(maxWidth: .infinity, alignment: .leading)")
+                && source.contains(".clipped()"),
+            "a selectable Text lays out its FULL string when clicked, so the "
+                + "label needs a frame and a clip, not only a line limit")
         XCTAssertTrue(
             source.contains("Spacer(minLength: 0)"),
             "a Spacer is a view, so the stack's spacing is charged on both sides "
