@@ -217,6 +217,19 @@ pub struct ServeOptions {
     /// existed. It is only an *embedded* proxy that the matcher cannot see, and an
     /// embedder must therefore pass a directory.
     pub owner_dir: Option<PathBuf>,
+    /// A listening socket handed over by a predecessor instead of bound here.
+    ///
+    /// When set, this proxy does not bind and does not consult the incumbent
+    /// policy: the predecessor gave us its socket, so there is no port to
+    /// contest and nothing to signal. The port therefore never goes unbound
+    /// across the swap, and a connection arriving mid-handoff waits in the
+    /// kernel's accept queue instead of being refused. `docs/design/
+    /// zero-downtime-restart.md` has the whole sequence.
+    ///
+    /// The caller is responsible for having verified who it took this from.
+    /// `serve` cannot: by the time the descriptor is in hand the peer may
+    /// already be gone, and a socket is not self-describing.
+    pub inherited_listener: Option<std::net::TcpListener>,
 }
 
 impl ServeOptions {
@@ -244,6 +257,7 @@ impl ServeOptions {
             // write a file spell the pair out together.
             host: singleton::ProxyHost::Cli,
             owner_dir: None,
+            inherited_listener: None,
         }
     }
 }
@@ -702,6 +716,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         tls,
         host,
         owner_dir,
+        inherited_listener,
     } = options;
 
     if let Some(port) = port_override {
@@ -744,6 +759,11 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // picks an ephemeral port, so no process can be "holding" it and there is
     // nothing an ephemeral-port caller could possibly want signalled.
     let takeover = match (port, incumbent.0) {
+        // A handed-over socket settles the port question before it is asked:
+        // the predecessor is not an incumbent to displace, it is the peer that
+        // just gave us its listener. Signalling it here would kill the process
+        // that is still draining the connections it accepted.
+        _ if inherited_listener.is_some() => singleton::Takeover::Proceed,
         (0, _) => singleton::Takeover::Proceed,
         (_, Signal::Never) => match singleton::live_proxy_server(port) {
             Some(incumbent) => singleton::Takeover::IncumbentPresent(incumbent),
@@ -967,9 +987,22 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
 
     // Hybrid proxy server task: base-URL mode and HTTPS_PROXY/CONNECT mode on the
     // same port. The listener peeks each connection and routes accordingly.
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?;
+    let listener = match inherited_listener {
+        // Adopted, not bound. `set_nonblocking` is required before tokio may
+        // own it: the descriptor arrives with whatever mode the predecessor had
+        // it in, and a blocking listener wedges the accept loop's runtime
+        // thread on the first connectionless poll.
+        Some(std_listener) => {
+            std_listener
+                .set_nonblocking(true)
+                .with_context(|| "failed to set the inherited listener non-blocking".to_string())?;
+            tokio::net::TcpListener::from_std(std_listener)
+                .context("failed to adopt the inherited listener")?
+        }
+        None => tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .with_context(|| format!("failed to bind 127.0.0.1:{port}"))?,
+    };
     let bound = listener.local_addr()?;
 
     // The boot marker. The durable log at `~/.cache/teamclaude/logs/` rotates
@@ -1639,6 +1672,41 @@ mod tests {
             }"#,
         )
         .expect("the inline test config parses")
+    }
+
+    /// A handed-over socket is adopted, not re-bound.
+    ///
+    /// The assertion is deliberately the CONNECT, not just the address. `serve`
+    /// takes ownership of the descriptor, so if it dropped it and bound its own
+    /// the original socket would close and connecting to `addr` would be
+    /// refused. Comparing addresses alone would also catch that in practice,
+    /// but only because an ephemeral re-bind almost never lands on the same
+    /// port -- "almost never" is not what this should rest on.
+    #[tokio::test]
+    async fn an_inherited_listener_is_adopted_rather_than_rebound() {
+        let predecessor =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding the predecessor's socket");
+        let addr = predecessor.local_addr().expect("reading the bound address");
+
+        let mut handle = serve(ServeOptions {
+            tls: TlsSetup::Disabled,
+            inherited_listener: Some(predecessor),
+            ..ServeOptions::new(boot_line_test_config())
+        })
+        .await
+        .expect("serving on an inherited listener")
+        .expect_started();
+
+        assert_eq!(
+            handle.addr(),
+            addr,
+            "the proxy must serve on the inherited port, not one it bound itself"
+        );
+
+        std::net::TcpStream::connect(addr)
+            .expect("the inherited socket must still accept connections after adoption");
+
+        handle.shutdown().await;
     }
 
     /// THE bite: every knob this unit added to the "server started" boot line
