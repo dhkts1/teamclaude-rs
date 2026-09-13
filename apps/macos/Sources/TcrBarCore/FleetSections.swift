@@ -347,6 +347,51 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
         return "\(rows.count) \(noun) · \(QuotaFormat.usd(spend)) today"
     }
 
+    /// "$12.30 today · worst 5h 18% · 7d 62% · fable 40%" — the FIRST of a
+    /// wholly-parked section's own two header lines
+    /// (`docs/design/panel-tabs-mockup.html`'s `.grpsum` lines under
+    /// `HENRY-TOKEN · PARKED · 5`), which still draws its member cards rather
+    /// than collapsing to one line — living beside ``collapsedSummaryLine``
+    /// so the two additions cannot drift from the section's own rows.
+    ///
+    /// `worst` is the HIGHEST fraction any member reports for a window — the
+    /// account closest to spent is the one an operator needs to see before
+    /// opening the group, and a group is never LESS spent than its worst
+    /// member. `fable` joins the other two only when at least one member
+    /// carries that window at all (``Account/sevenDayOi``); every segment,
+    /// including the spend clause, is dropped independently when every
+    /// member's reading for it is `nil` — the same per-figure absence rule
+    /// every other quota string in this codebase follows, applied here
+    /// per-window instead of per-account.
+    public var parkedStatsLine: String {
+        var parts: [String] = []
+        if let spend = todaySpend {
+            parts.append("\(QuotaFormat.usd(spend)) today")
+        }
+        var worst: [String] = []
+        if let fiveHour = worstFraction(\.fiveHour) {
+            worst.append("5h \(QuotaFormat.percent(fiveHour))")
+        }
+        if let sevenDay = worstFraction(\.sevenDay) {
+            worst.append("7d \(QuotaFormat.percent(sevenDay))")
+        }
+        if let fable = worstFraction(\.sevenDayOi) {
+            worst.append("fable \(QuotaFormat.percent(fable))")
+        }
+        if !worst.isEmpty {
+            parts.append("worst " + worst.joined(separator: " · "))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// The highest fraction any row reports for one window, ignoring members
+    /// that never measured it — `nil` when NONE of them did, which is what
+    /// tells ``parkedStatsLine`` to omit that window's segment entirely
+    /// rather than claim a "worst" of a window nobody has a reading for.
+    private func worstFraction(_ window: KeyPath<Account, Double?>) -> Double? {
+        rows.compactMap { $0.account[keyPath: window] }.max()
+    }
+
     /// The bordered button under a collapsed group: "Show 6 accounts in this
     /// group", the mockup's own wording. Says the whole count, not a
     /// remainder, because a collapsed group shows no cards at all — "show 6

@@ -1830,29 +1830,25 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return "\(figure) · \(caption)"
     }
 
-    /// `"fable 72%"` or `"fable 72% · in 1d 2h"` — the SAME figure as
-    /// ``fableWeeklyLabel``, for the trailing column on the card's 7d row
-    /// rather than a caption line under the bars (Gil, 2026-09-13: "no like we
-    /// had both … align it like we had before").
+    /// `"fable 72%"` — the SAME figure as ``fableWeeklyLabel``, for the
+    /// trailing column on the card's 7d row rather than a caption line under
+    /// the bars (Gil, 2026-09-13: "no like we had both … align it like we had
+    /// before").
     ///
-    /// The caption is dropped when it would just restate the 7d row's own
-    /// reset, passed in as `sevenDayResetAtMs` — that row already prints "in
-    /// 3d 18h" beside its bar, and printing it a second time here is noise,
-    /// not a second fact. It stays when the two windows reset at different
-    /// times, which is the ordinary case: the Fable window has its own reset
-    /// clock, unrelated to the 7d one beside it.
+    /// NEVER carries a reset caption, in round 1 or round 2. Round 1 tried
+    /// showing one whenever it differed from the 7d row's own — measured
+    /// against `V4.usageTailWidth` (88pt, hard-ceilinged at 96pt to protect
+    /// the bar beside it): even the SHORTEST captioned form, `"fable 0% · in
+    /// 1h"`, is already 86.4pt, and the round-1 bridge's own worked example,
+    /// `"fable 72% · in 3d 18h"`, is 118.8pt — well past the ceiling. No width
+    /// this column can safely take fits a caption, so it never draws one; the
+    /// column stays 88pt and Gil approved the render this way 2026-09-13.
     ///
-    /// ``fableWeeklyLabel`` is untouched and keeps feeding the tooltip and
-    /// ``fableWeeklySpokenLabel`` — both have the room to say a reset even
-    /// when it repeats the 7d row's.
-    public func fableTailLabel(now: Date, sevenDayResetAtMs: Int64?) -> String? {
+    /// ``fableWeeklyLabel`` is untouched and carries the reset in the tail's
+    /// own hover, which has the room.
+    public var fableTailLabel: String? {
         guard let sevenDayOi else { return nil }
-        let figure = "fable \(QuotaFormat.percent(sevenDayOi))"
-        guard let caption = QuotaFormat.resetCaption(resetAtMs: sevenDayOiResetAtMs, now: now)
-        else { return figure }
-        let rowCaption = QuotaFormat.resetCaption(resetAtMs: sevenDayResetAtMs, now: now)
-        if caption == rowCaption { return figure }
-        return "\(figure) · \(caption)"
+        return "fable \(QuotaFormat.percent(sevenDayOi))"
     }
 
     /// ``fableWeeklyLabel`` for VoiceOver, spoken as part of the row's combined

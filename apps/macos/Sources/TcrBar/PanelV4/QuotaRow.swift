@@ -165,7 +165,16 @@ struct QuotaRow: View {
                     .fixedSize()
             }
             if trailingReserved {
-                Spacer(minLength: V4.quotaGap)
+                // `.q .tail{border-left:1px solid var(--line)}` — one aligned
+                // divider on every row that reserves the column, never a
+                // floating `·`, so the boundary lines up whether or not the
+                // row beside it draws a caption. Drawn even when `trailing`
+                // is empty (round 2's Fable-less row 1): the column's LEFT
+                // edge is a fact about the row, not about its content.
+                Rectangle()
+                    .fill(Tok.cardLine)
+                    .frame(width: V4.panelBorderWidth)
+                    .frame(maxHeight: .infinity)
                 Text(trailing ?? "")
                     .font(V4.font(V4.muteSize))
                     .foregroundStyle(trailingTint ?? Tok.mute)

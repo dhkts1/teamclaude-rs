@@ -8,10 +8,11 @@ import TcrBarCore
 /// tall, 6 pt apart, inset inside the group's 8 pt padding. The pre-v4 panel drew
 /// them as unfilled 29 pt rows whose text started flush against the group stroke.
 ///
-///  - `.full`: name and pills, the plan line, then one `.q` row per quota window.
-///  - `.compact`: one row — name, its plan inline in `mute`, and the state pill.
-///    What a card inside a group draws, where the group's own legend already
-///    carries the context the plan line would repeat.
+///  - `.full`: name, pills and plan on one line, then one `.q` row per quota
+///    window.
+///  - `.compact`: the same one-line name row, and the state pill. What a card
+///    inside a group draws, where the group's own legend already carries the
+///    context a second line would repeat.
 ///
 /// The trailing slot carries the account's own controls — the actions menu, and
 /// `Re-login…` on a broken card. They used to be reachable by right-click ALONE
@@ -103,7 +104,7 @@ struct AccountCard<Actions: View>: View {
                     resetAtMs: window.resetAtMs, now: now,
                     trailing: rowTail(index),
                     trailingReserved: usageTail != nil || rowTail(1) != nil,
-                    trailingHelp: index == 1 ? row1TrailingHelp : planLine,
+                    trailingHelp: index == 1 ? row1TrailingHelp : usageTailHelp,
                     trailingTint: index == 1 ? fableTailTint : nil)
             }
         }
@@ -114,31 +115,64 @@ struct AccountCard<Actions: View>: View {
         .accessibilityLabel(account.cardSummaryLabel(now: now, isControl: isControl))
     }
 
+    /// Three pieces, ONE line, in BOTH shapes (`.name.acct` in the mockup):
+    /// the local part at the name's usual weight, `@domain` at medium weight
+    /// in ``Tok/dim`` — the ONLY piece allowed to truncate — then the plan in
+    /// `mute`, never truncated. Split at the first `@`; ``Account/name`` may
+    /// lack one, in which case the whole string is the local part and there
+    /// is no domain span at all.
+    ///
+    /// Round 1 gave `.compact` a `ViewThatFits` that wrapped the plan onto a
+    /// second line when the pair did not fit — that is what the mockup's own
+    /// `henry1@example.com` / `Team Standard` two-line card shows, because
+    /// round 1 did not restructure those two rows. Round 2 does: the mockup's
+    /// `.name .dom` gives way FIRST, so the card never grows a line for the
+    /// plan, in either shape — Gil approved the render this way 2026-09-13.
     @ViewBuilder
     private var nameRow: some View {
-        if shape == .compact, let plan = account.plan, !plan.isEmpty {
-            // `.name .mute` — the plan sits INSIDE the name span, so the row
-            // reads as one subject with a qualifier. It is an inline span, not a
-            // column: when the pair does not fit, the browser WRAPS it and the
-            // card grows a line (the mockup's own `henry1@example.com` /
-            // `Team Standard`). `ViewThatFits` is that wrap. The first v4 render
-            // had no second candidate and truncated the ADDRESS instead —
-            // "henry1@exam…" — which is the one string on the row that has to
-            // stay readable.
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: V4.tabGap) {
-                    NameText(text: account.name)
-                    MuteText(text: plan)
-                }
-                VStack(alignment: .leading, spacing: 0) {
-                    NameText(text: account.name)
-                    MuteText(text: plan)
-                        .frame(minHeight: V4.rowLineHeight, alignment: .leading)
-                }
+        HStack(alignment: .firstTextBaseline, spacing: V4.tabGap) {
+            // NEITHER of these two takes `.fixedSize()` — that forces a view
+            // to its ideal width regardless of what the row can actually
+            // give it, which is the opposite of "never truncated": measured
+            // on `01g-widest-row`, it overflowed the row's whole HStack and
+            // corrupted the layout above it. `layoutPriority` is what the
+            // mockup's "domain gives way FIRST" needs: default priority
+            // (0) here beats the domain's lowered one below, so `HStack`
+            // asks the domain to shrink before it asks either of these to.
+            Text(localPart)
+                .font(V4.font(V4.nameSize, .semibold))
+                .tracking(V4.nameTracking)
+                .foregroundStyle(Tok.ink)
+                .lineLimit(1)
+            if let domain {
+                Text(domain)
+                    .font(V4.font(V4.nameSize, .medium))
+                    .foregroundStyle(Tok.dim)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .layoutPriority(-1)
             }
-        } else {
-            NameText(text: account.name)
+            if let plan = planName {
+                MuteText(text: plan)
+            }
         }
+        .frame(minHeight: V4.lineHeight(V4.nameSize), alignment: .leading)
+        .help(account.name)
+        .accessibilityValue(account.name)
+    }
+
+    /// `"henry10"` — everything before the first `@`, or the whole name when
+    /// it has none.
+    private var localPart: String {
+        guard let at = account.name.firstIndex(of: "@") else { return account.name }
+        return String(account.name[account.name.startIndex..<at])
+    }
+
+    /// `"@example.com"`, `@` included so the split does not have to be undone
+    /// by whatever draws it — or `nil` for a name with no `@` at all.
+    private var domain: String? {
+        guard let at = account.name.firstIndex(of: "@") else { return nil }
+        return String(account.name[at...])
     }
 
     /// `Rotating` / `Group only` — ``Account/rotationLabel``, and nothing
@@ -188,38 +222,19 @@ struct AccountCard<Actions: View>: View {
         }
     }
 
-    /// "Max 20x · $540 · 1.5M output tokens this week" — F8's plan line: the
-    /// plan, what it spent, and what it produced, in full words.
+    /// What the reserved right-hand column says on row `index`. The plan name
+    /// left the tail entirely in round 2 — it is visible in ``nameRow`` now,
+    /// in both shapes, so a second copy here would say it twice.
     ///
-    /// The pre-v4 line abbreviated the tail to "1.5M out" (`delta-list.md` #33)
-    /// on a card 355 pt wide, where the full phrase fits. Built from the same
-    /// ``QuotaFormat`` figures ``Account/windowUsageLabel`` uses — the same
-    /// numbers, spelled for a card that has the room.
-    /// The plan line's figures, abbreviated to sit at the end of the first
-    /// quota row: `"$5.61 · 12k out"`. The pre-v4 card drew exactly this, in
-    /// exactly this place, and the v4 card's full-width `planLine` above the
-    /// bars is what made the card 28 pt taller for the same content. The full
-    /// phrase, plan name included, is the hover.
-    /// What the reserved right-hand column says on row `index`.
-    ///
-    /// The first row carries the money and tokens. The second carries the
-    /// Fable weekly figure when this account has one (``Account/fableTailLabel(now:sevenDayResetAtMs:)``),
-    /// which is where the pre-v4 card drew it too (Gil, 2026-09-13: "no like
-    /// we had both … align it like we had before") — never both at once, so a
-    /// Fable account's plan name is one hover away (``row1TrailingHelp``)
-    /// rather than a second line. Falls back to the plan name, the pre-Fable
-    /// behaviour, for every account this window was never learned for.
+    /// Row 0 carries the money and tokens. Row 1 carries the Fable weekly
+    /// figure (``Account/fableTailLabel``) when this account has one, which is
+    /// where the pre-v4 card drew it too (Gil, 2026-09-13: "no like we had
+    /// both … align it like we had before") — `nil`, an EMPTY column, for
+    /// every account this window was never learned for.
     private func rowTail(_ index: Int) -> String? {
         switch index {
         case 0: return usageTail
-        case 1:
-            if account.sevenDayOi != nil {
-                return account.fableTailLabel(now: now, sevenDayResetAtMs: account.sevenDayResetAtMs)
-            }
-            // A grouped card already carries the plan INSIDE its name row
-            // (``nameRow``), so repeating it here would print it twice on the
-            // one card that is short of width.
-            return shape == .compact ? nil : planName
+        case 1: return account.fableTailLabel
         default: return nil
         }
     }
@@ -229,31 +244,31 @@ struct AccountCard<Actions: View>: View {
     /// amber or red at a glance, never `quotaBarTintSource(for:)` — that
     /// function's old-server fallback borrows the composite `quotaState`,
     /// which for this window would be a reading of something else entirely.
-    /// `nil` when there is no Fable figure, which falls back to `QuotaRow`'s
-    /// own `Tok.mute` for the plan name it draws instead.
+    /// `nil` when there is no Fable figure — the column is empty, so there is
+    /// nothing to tint.
     private var fableTailTint: Color? {
         account.sevenDayOi != nil ? account.fableBarTintSource.fillColor : nil
     }
 
-    /// The row-2 tail's hover text: the full ``Account/fableWeeklyLabel(now:)``
-    /// plus the plan name (`"fable 72% · in 3d 18h · Max 20x"`), so the plan
-    /// is one hover away rather than lost when the tail carries Fable
-    /// instead of it. Falls back to ``planLine`` when there is no Fable
-    /// figure, matching what row 2 actually shows.
+    /// The row-2 tail's hover text: the full ``Account/fableWeeklyLabel(now:)``,
+    /// reset included — `"fable 72% · in 3d 18h"`, the mockup's own tail
+    /// title, with no plan appended, since the plan is already visible in
+    /// ``nameRow``. `nil` when the column is empty, matching what row 2
+    /// actually shows.
     private var row1TrailingHelp: String? {
-        guard account.sevenDayOi != nil, let fable = account.fableWeeklyLabel(now: now) else {
-            return planLine
-        }
-        guard let plan = planName else { return fable }
-        return "\(fable) · \(plan)"
+        guard account.sevenDayOi != nil else { return nil }
+        return account.fableWeeklyLabel(now: now)
     }
 
-    /// `"Max 20x"` — the plan, on its own, for the row-2 tail.
+    /// `"Max 20x"` — the plan, on its own, for ``nameRow``.
     private var planName: String? {
         guard let plan = account.plan, !plan.isEmpty else { return nil }
         return plan
     }
 
+    /// `"$540 · 1.5M"` — the mockup's own row-0 tail text, unabbreviated
+    /// further: ``QuotaFormat/tokens(_:)`` already omits the `" out"` suffix,
+    /// so nothing here needs to strip it.
     private var usageTail: String? {
         guard let usage = account.usage else { return nil }
         let bucket = usage.windowOrToday
@@ -265,19 +280,20 @@ struct AccountCard<Actions: View>: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    private var planLine: String? {
+    /// The row-0 tail's hover: `"$540 · 1.5M output tokens this week"`, the
+    /// mockup's own tail title — no plan, which is visible in ``nameRow``
+    /// already and would otherwise say the same fact twice.
+    private var usageTailHelp: String? {
+        guard let usage = account.usage else { return nil }
+        let bucket = usage.windowOrToday
+        let span = usage.windowOrTodaySpan == .day ? "today" : "this week"
         var parts: [String] = []
-        if let plan = account.plan, !plan.isEmpty { parts.append(plan) }
-        if let usage = account.usage {
-            let bucket = usage.windowOrToday
-            let span = usage.windowOrTodaySpan == .day ? "today" : "this week"
-            if let cost = bucket.measuredCost {
-                // A partially priced bucket keeps its `+`: the figure is a floor.
-                parts.append(QuotaFormat.usd(cost) + (bucket.unpricedRequests > 0 ? "+" : ""))
-            }
-            parts.append("\(QuotaFormat.tokens(bucket.outputTokens)) output tokens \(span)")
+        if let cost = bucket.measuredCost {
+            // A partially priced bucket keeps its `+`: the figure is a floor.
+            parts.append(QuotaFormat.usd(cost) + (bucket.unpricedRequests > 0 ? "+" : ""))
         }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+        parts.append("\(QuotaFormat.tokens(bucket.outputTokens)) output tokens \(span)")
+        return parts.joined(separator: " · ")
     }
 
     /// The windows that get a BAR ROW: the rolling session window and the
@@ -288,9 +304,9 @@ struct AccountCard<Actions: View>: View {
     /// non-Fable request never checks it, and `held[]`/`quotaState` never
     /// reflect it — so it cannot be read off the `7d` bar beside it, and it
     /// gets no bar row of its own. It is drawn in the SAME trailing column as
-    /// the cost figure and the plan name (``rowTail(_:)``), on the 7d row,
-    /// which is where the pre-v4 card drew it too (Gil, 2026-09-13: "no like
-    /// we had both … align it like we had before"). A row costs every card a
+    /// the cost figure (``rowTail(_:)``), on the 7d row, which is where the
+    /// pre-v4 card drew it too (Gil, 2026-09-13: "no like we had both … align
+    /// it like we had before"). A row costs every card a
     /// measured 21 pt; the tail column costs nothing extra, because it is
     /// already reserved for the figure above it.
     private var quotaWindows: [QuotaWindowSpec] {

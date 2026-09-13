@@ -21,28 +21,25 @@ import XCTest
 final class QuotaTailWidthTests: XCTestCase {
 
     /// Every string ``AccountCard`` can put in the trailing column: the spend
-    /// tail on the first row, the plan name on the second. Chosen at the wide
-    /// end of plausible rather than the typical one, because the column is
-    /// sized once for all of them and a four-figure spend is an ordinary
-    /// weekend here.
+    /// tail on the first row, the Fable figure on the second — the plan name
+    /// left the tail entirely in round 2 (it is in ``AccountCard/nameRow``
+    /// now, in both shapes). Chosen at the wide end of plausible rather than
+    /// the typical one, because the column is sized once for all of them and
+    /// a four-figure spend is an ordinary weekend here.
     private let tailStrings = [
         "$540 · 1.5M",  // the one the old 68 pt was sized for
         "$1,190 · 3.1M",  // the one that was eliding
         "$1,810 · 12.3M",
         "$12,345 · 120M",
         "$1,190+ · 3.1M",  // the `+` an unpriced request adds
-        "Max 20x",
-        "Team Standard",
-        // The Fable tail's no-caption form (``Account/fableTailLabel``, when
-        // the Fable window's reset equals the 7d row's own) — the common
-        // case, since most fixtures learn both windows from the same poll.
-        // The WITH-caption form ("fable 72% · in 3d 18h", the bridge's own
-        // example) measures 118.8 pt at this size — already past even
+        // Round 2 deleted the equal/different-resets branching in
+        // ``Account/fableTailLabel``: the tail is the bare figure, ALWAYS —
+        // even the SHORTEST captioned form round 1 tried, "fable 0% · in
+        // 1h", measures 86.4 pt against this 88 pt column, and round 1's own
+        // worked example, "fable 72% · in 3d 18h", is 118.8 pt — past even
         // ``testTheColumnDoesNotGrowWideEnoughToStarveTheBar``'s 96 pt
-        // ceiling, so no width this column can safely take fits it. That
-        // case elides through the same `.truncationMode(.middle)` the cost
-        // tail already relies on; it is not asserted here because there is
-        // no width to widen to that would make it pass.
+        // ceiling. No width this column can safely take fits a caption, so
+        // it never draws one; the full reset stays in the tail's own hover.
         "fable 100%",
     ]
 
@@ -94,10 +91,31 @@ final class QuotaTailWidthTests: XCTestCase {
             "the caption line under the bars is back — the card is one line taller per "
                 + "fable account again, which is what Gil asked to undo")
         XCTAssertTrue(
-            squashed.contains(
-                "account.fableTailLabel(now:now,sevenDayResetAtMs:account.sevenDayResetAtMs)"),
+            squashed.contains("case1:returnaccount.fableTailLabel"),
             "row 2's tail no longer reads from Account.fableTailLabel, so the panel now has "
                 + "a second spelling of that string and the two can drift")
+    }
+
+    /// Round 2 deleted the `.compact`-only `ViewThatFits` wrap: the mockup's
+    /// three-piece name row (local part, `@domain`, plan) draws on ONE line in
+    /// both shapes, the domain giving way first, so the card never grows a
+    /// second line for the plan (Gil approved the render this way
+    /// 2026-09-13). A `ViewThatFits` back in this file is that fallback
+    /// returning.
+    func testTheNameRowNeverWrapsToASecondLine() throws {
+        let source = try panelSource("PanelV4/AccountCard.swift")
+        // Line-filtered, not a bare `contains`: this very doc-comment names
+        // `ViewThatFits` in prose to explain what round 2 deleted, and a bare
+        // substring check would fail against its own explanation.
+        let hits = source.split(separator: "\n").filter {
+            $0.contains("ViewThatFits")
+                && !$0.trimmingCharacters(in: .whitespaces)
+                    .hasPrefix("///")
+        }
+        XCTAssertTrue(
+            hits.isEmpty,
+            "the name row wraps the plan onto a second line again — the mockup's own "
+                + "`.name .dom` gives way first instead:\n" + hits.joined(separator: "\n"))
     }
 
     /// A card inside a group box is ``AccountCard/Shape/compact``, which is NOT
@@ -117,18 +135,22 @@ final class QuotaTailWidthTests: XCTestCase {
             "the quota rows are gated on the card's shape again, so accounts inside a group "
                 + "draw no windows at all")
         // Comments survive whitespace-squashing, so an adjacency string here
-        // would break every time the block's own doc comment is reworded. What
-        // matters is that `shape` gates nothing structural: its two remaining
-        // uses fold the plan into a grouped card's name row and drop a
-        // redundant pill, neither of which removes a measurement.
+        // would break every time the block's own doc comment is reworded.
+        // Round 2 deleted the other two uses `shape` used to gate here (the
+        // name row's `ViewThatFits` fallback, and the tail's plan-name
+        // fallback on row 1) — both the plan and the Fable figure now draw
+        // identically in both shapes. The ONE use left is a label choice,
+        // not a measurement: `rotationPillText` drops the redundant
+        // "Rotating" word on a grouped card, the group's own legend already
+        // saying whether the GROUP is parked.
         let gates =
             source
             .split(separator: "\n")
             .filter { $0.contains("shape ==") && !$0.contains("//") }
             .map { $0.trimmingCharacters(in: .whitespaces) }
         XCTAssertEqual(
-            gates.count, 3,
-            "`shape` gates \(gates.count) branches now, not the 3 that are about labels:\n"
+            gates.count, 1,
+            "`shape` gates \(gates.count) branches now, not the 1 that is about a label:\n"
                 + gates.joined(separator: "\n")
                 + "\nA new one that skips a bar or a caption hides a measurement on every "
                 + "grouped card. Check what it removes before updating this count.")

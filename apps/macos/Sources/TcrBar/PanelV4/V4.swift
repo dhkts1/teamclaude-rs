@@ -97,13 +97,20 @@ enum V4 {
     static var cardInsetH: CGFloat { cardPaddingH + panelBorderWidth }
     /// The flex gap inside a `.row`.
     static var rowGap: CGFloat { compact ? 6 : 8 }
-    /// `.sess .row{padding:4px 0}` — the ONLY `.row` in the sheet with vertical
+    /// `.sess .row{padding:2px 0}` — the ONLY `.row` in the sheet with vertical
     /// padding, and it is the session block's. A card's rows have none: their
     /// height is their line box and nothing else, which is what
     /// ``lineHeight(_:)`` supplies. Measured: padding the card's rows as well
     /// made every account card 3 pt tall per row — a parked card measured 47 pt
     /// against the mockup's 43.
-    static var sessRowPaddingV: CGFloat { compact ? 3 : 4 }
+    ///
+    /// Flat 2 in both densities — the mockup carries no density split here,
+    /// and round 1's `3 : 4` was measured against an EARLIER copy that read
+    /// 4px; the current one on disk reads 2px in both the busy-session row
+    /// and its subline. Round 2 also wires this into ``sessionRow(_:)`` for
+    /// the first time — it was declared and never applied, so "matching" the
+    /// mockup's number had no visible effect until now.
+    static let sessRowPaddingV: CGFloat = 2
 
     // MARK: - Quota grid (`.q`)
 
@@ -177,8 +184,10 @@ enum V4 {
     static let sessMarginBottom: CGFloat = 2
     static let sessPaddingLeft: CGFloat = 10
     static let sessRuleWidth: CGFloat = 2
-    static let sparklineWidth: CGFloat = 64
-    static let sparklineHeight: CGFloat = 18
+    /// `.spark{width:56px;height:14px}` — round 2 matched the mockup's
+    /// current values; the earlier 64x18 was measured against a stale copy.
+    static let sparklineWidth: CGFloat = 56
+    static let sparklineHeight: CGFloat = 14
     static let sparklineStroke: CGFloat = 1.5
 
     // MARK: - Section head (`.sec`)
