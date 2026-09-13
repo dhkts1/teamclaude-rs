@@ -9,9 +9,28 @@ import TcrBarCore
 /// panel is translucent, and a patch would paint a rectangle of the wrong colour
 /// over whatever is behind it. The mask is built from the legend's own measured
 /// width, so a long group name cannot leave stroke showing through its text.
+///
+/// ## The identity colour draws the box, never the words
+///
+/// `color` reaches the 1.5 pt stroke and the 12 pt legend swatch and stops
+/// there. The legend TEXT is always ``Tok/mute`` — the gated tertiary ink this
+/// panel already gives every section head (``SectionHead``), 5.8:1 dark and
+/// 4.8:1 light.
+///
+/// One value used to drive all three, which made the legend fail as text twice
+/// over. With no identity hue the caller passed ``Tok/cardLine``, a 0.5 pt
+/// DIVIDER colour: measured, `#c5c7cb` on the light panel is 1.52:1 and
+/// `#393e43` on the dark is 1.68:1, both under APCA's discernible floor. With
+/// one, the raw wire hue shipped into both appearances unchanged — `#92d188`
+/// reads 1.62:1 light, `#c79ae8` 2.05:1. The legend is the only string that
+/// names the box and counts it, so it is the one part of a group that may not
+/// be drawn in a colour nobody gated.
 struct GroupBox<Content: View>: View {
     let legend: String
-    let color: Color
+    /// The group's identity hue, or `nil` for a group that has none. Drives the
+    /// stroke and the legend's swatch; ``Tok/cardLine`` is the fallback for
+    /// both, which is what that token is for.
+    let color: Color?
     /// `.grp.collapsed{padding-bottom:8px}` — a box holding one line and a
     /// button closes a little further under it than one holding cards.
     var collapsed: Bool = false
@@ -27,6 +46,10 @@ struct GroupBox<Content: View>: View {
     private var notchWidth: CGFloat {
         V4.legendNotchWidth(forLegendWidth: legendWidth)
     }
+
+    /// The stroke and the swatch: the group's hue, or the panel's own line
+    /// colour when it has none.
+    private var identityColor: Color { color ?? Tok.cardLine }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -46,7 +69,7 @@ struct GroupBox<Content: View>: View {
 
     private var outline: some View {
         RoundedRectangle(cornerRadius: V4.groupRadius)
-            .strokeBorder(color, lineWidth: V4.groupStroke)
+            .strokeBorder(identityColor, lineWidth: V4.groupStroke)
             .mask(
                 // Two bands, exactly as the CSS mask is: everything below the
                 // legend's 9 pt band, plus that band with the legend's own span
@@ -67,12 +90,12 @@ struct GroupBox<Content: View>: View {
     private var legendLabel: some View {
         HStack(spacing: V4.legendGap) {
             RoundedRectangle(cornerRadius: V4.legendGlyph / 4)
-                .stroke(color, lineWidth: V4.panelBorderWidth)
+                .stroke(identityColor, lineWidth: V4.panelBorderWidth)
                 .frame(width: V4.legendGlyph, height: V4.legendGlyph)
             Text(legend)
                 .font(V4.font(V4.legendFontSize, .bold))
                 .tracking(V4.legendTracking)
-                .foregroundStyle(color)
+                .foregroundStyle(Tok.mute)
                 .lineLimit(1)
                 .fixedSize()
         }

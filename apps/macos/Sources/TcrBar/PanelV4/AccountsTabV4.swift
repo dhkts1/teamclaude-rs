@@ -81,7 +81,7 @@ struct AccountsTabV4<Menu: View>: View {
 
         GroupBox(
             legend: section.legendText,
-            color: section.outlineColor.map(V4.groupColor) ?? Tok.cardLine,
+            color: section.outlineColor.map(V4.groupColor),
             collapsed: summarised
         ) {
             if summarised {
