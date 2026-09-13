@@ -378,6 +378,14 @@ public enum QuotaFormat {
         return "$" + grouped(String(format: "%.\(decimals)f", value))
     }
 
+    /// `24677` → `"24,677"` — a plain count, grouped. The Tools tab wrote
+    /// `24677 calls` one line under its own header's `24,677`
+    /// (`/tmp/parity/delta-list.md` #54): the same number, twice, in two
+    /// formats.
+    public static func count(_ value: Int) -> String {
+        grouped(String(value))
+    }
+
     /// `1190.4` → `"1,190.4"`: thousands separators on the integer part.
     ///
     /// The panel wrote `$1190` beside a mockup that writes `$1,190`

@@ -877,34 +877,27 @@ struct FleetView: View {
                 // v4-spec: each account's session block is a card, with the
                 // account name as its first row and the sessions indented
                 // under a 2px left rule.
-                VStack(alignment: .leading, spacing: Tok.tightSpacing) {
-                    HStack(spacing: Tok.tightSpacing) {
-                        Text(entry.key.isEmpty ? "Unassigned" : entry.key)
-                            // v4-spec: an account name is 15pt/600, the same
-                            // value the Accounts tab's own name row uses.
-                            .font(Tok.nameFont)
-                            .foregroundStyle(Tok.ink)
-                            .lineLimit(1)
-                        Spacer(minLength: Tok.tightSpacing)
-                        Text(sessionBlockSummary(entry.rows))
-                            .font(Tok.dimLineFont)
-                            .monospacedDigit()
-                            .foregroundStyle(Tok.inkDim)
-                            .lineLimit(1)
+                V4Card {
+                    V4Row {
+                        NameText(text: entry.key.isEmpty ? "Unassigned" : entry.key)
+                            .layoutPriority(1)
+                    } trailing: {
+                        DimText(text: sessionBlockSummary(entry.rows)).fixedSize()
                     }
-                    VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+                    VStack(alignment: .leading, spacing: 0) {
                         ForEach(entry.rows) { row in
                             sessionRow(row)
                         }
                     }
-                    // v4-spec "session block": padding-left 10, a 2px left
-                    // rule in `line`.
-                    .padding(.leading, 10)
+                    // `.sess{margin:8px 0 2px;padding-left:10px;
+                    // border-left:2px solid var(--line)}`.
+                    .padding(.top, V4.sessMarginTop)
+                    .padding(.bottom, V4.sessMarginBottom)
+                    .padding(.leading, V4.sessPaddingLeft)
                     .overlay(alignment: .leading) {
-                        Rectangle().fill(Tok.hairlineStrong).frame(width: 2)
+                        Rectangle().fill(Tok.cardLine).frame(width: V4.sessRuleWidth)
                     }
                 }
-                .panelCard()
             }
             if hidden > 0 {
                 disclosureButton(
@@ -946,52 +939,46 @@ struct FleetView: View {
     @ViewBuilder
     private func sessionRow(_ row: JoinedSession) -> some View {
         if isCompactRow(row.activity) {
-            HStack(spacing: Tok.tightSpacing) {
-                Circle()
-                    .fill(activityColor(row.activity))
-                    .frame(width: 8, height: 8)
-                Text(row.displayName).font(.subheadline.weight(.semibold))
-                Text(sessionSubtitle(row))
-                    .font(Tok.dimLineFont)
-                    .foregroundStyle(Tok.inkDim)
-                    .lineLimit(1)
-                Spacer()
+            V4Row {
+                HStack(spacing: V4.dotTrailingGap) {
+                    StatusDot(activity: row.activity)
+                    NameText(text: row.displayName)
+                    DimText(text: sessionSubtitle(row))
+                }
+                .layoutPriority(1)
+            } trailing: {
                 Text(trailingStatus(row, now: Date()))
-                    .font(Tok.secondaryDigitFont)
+                    .font(V4.font(V4.dimSize))
+                    .foregroundStyle(row.activity == .waiting ? Tok.near : Tok.dim)
                     .monospacedDigit()
-                    .foregroundStyle(Tok.inkDim)
+                    .lineLimit(1)
+                    .fixedSize()
             }
-            .padding(.vertical, Tok.space1)
         } else {
-            VStack(alignment: .leading, spacing: Tok.space1) {
-                HStack(spacing: Tok.tightSpacing) {
-                    // Busy/waiting get a halo ring — `docs/design/panel-tabs-mockup.html`'s
-                    // `.dot.busy`/`.dot.wait` box-shadow — the same "the
-                    // color-alone trigger never fires" the review already
-                    // credits this row for (the text beside it always says
-                    // the state too).
-                    Circle()
-                        .fill(activityColor(row.activity))
-                        .frame(width: 8, height: 8)
-                        .background(
-                            Circle().fill(Tok.halo(activityColor(row.activity)))
-                                .frame(width: 16, height: 16)
-                        )
-                    Text(row.displayName).font(.subheadline.weight(.semibold))
-                    Text(sessionSubtitle(row))
-                        .font(Tok.dimLineFont)
-                        .foregroundStyle(Tok.inkDim)
-                        .lineLimit(1)
-                    Spacer()
+            VStack(alignment: .leading, spacing: 0) {
+                V4Row {
+                    HStack(spacing: V4.dotTrailingGap) {
+                        StatusDot(activity: row.activity)
+                        NameText(text: row.displayName)
+                    }
+                    .layoutPriority(1)
+                } trailing: {
                     if let series = row.session.reqPerMinute, !series.isEmpty {
                         Sparkline(values: series)
-                            .stroke(Tok.accent, lineWidth: 1.5)
-                            .frame(width: 44, height: 14)
+                            .stroke(V4.trend, lineWidth: V4.sparklineStroke)
+                            .frame(width: V4.sparklineWidth, height: V4.sparklineHeight)
                     }
                 }
-                HStack(spacing: Tok.tightSpacing) {
+                // `repo · model` drops to its own line when a sparkline occupies
+                // the right of the row (`/tmp/parity/delta-list.md` #40). Kept
+                // inline, it competes with a 64 pt sparkline for the same width
+                // and the SESSION NAME is what loses — "teamclau…".
+                DimText(text: sessionSubtitle(row))
+                HStack(spacing: 0) {
                     Text("\(row.session.requests) req")
                         .monospacedDigit()
+                        .lineLimit(1)
+                        .layoutPriority(1)
                         .contentTransition(.numericText())
                         .animation(
                             reduceMotion ? nil : .easeOut(duration: 0.2),
@@ -1004,23 +991,36 @@ struct FleetView: View {
                     // for exactly that reason, and the field existing is what
                     // changed, not the rule.
                     if let cost = row.session.costUsd {
-                        Text("· \(QuotaFormat.usd(cost))").monospacedDigit()
+                        Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
+                            .lineLimit(1).layoutPriority(1)
                     }
                     if let cache = cacheHitPercent(row.session) {
-                        Text("· cache \(cache)%").monospacedDigit()
+                        Text(" · cache \(cache)%").monospacedDigit()
+                            .lineLimit(1).layoutPriority(1)
                     }
-                    Spacer()
+                    // Zero, not the row gap: the pair fits across the block's
+                    // 312 pt with nothing to spare, and 8 pt of enforced gap is
+                    // what pushed `· cache 97%` onto a second line.
+                    Spacer(minLength: 0)
                     // A rolling digit transition here would need this string's
                     // VALUE, not its rendered text, to drive `.animation(value:)`
                     // — it is age-since-oldest-running-tool, recomputed from
                     // `Date()` on every render, so a state-driven transition has
                     // no discrete value to key off. Left as a plain `Text`.
-                    Text(trailingStatus(row, now: Date())).monospacedDigit()
+                    //
+                    // In the SAME fixed column as the sparkline above it, so a
+                    // session's two trailing readings line up with each other
+                    // and with every other row's.
+                    // The metrics are the measurement; the status is a
+                    // restatement of the dot two lines up. When they cannot
+                    // both fit, the status drops a WORD rather than losing
+                    // characters — see ``sessionStatusLine(_:now:)``.
+                    sessionStatusLine(row, now: Date())
                 }
-                .font(Tok.secondaryDigitFont)
-                .foregroundStyle(Tok.inkDim)
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(Tok.dim)
+                .frame(minHeight: V4.lineHeight(V4.dimSize))
             }
-            .padding(.vertical, Tok.space1)
         }
     }
 
@@ -1055,6 +1055,52 @@ struct FleetView: View {
     /// `row.session.tools.running` here is the exact array
     /// ``Fleet/toolsRunning`` pools for the Tools tab, so the two tabs can no
     /// longer derive two different counts for the same session.
+    /// The running status as the mockup draws it: the COUNT in `ok` at 600
+    /// ("2 running"), then how long the oldest call has been going, in `dim`.
+    ///
+    /// Three candidates, widest first. The middle one drops the word "oldest"
+    /// — a word, not a measurement, and the tab's own footer legend already
+    /// says what the number is — so a tight row loses vocabulary before it
+    /// loses digits. Truncation is the last of the three and cuts the TAIL: the
+    /// first draft let SwiftUI cut the head, which turned "2 running" into
+    /// "…ing" and took the row's only green with it.
+    @ViewBuilder
+    private func sessionStatusLine(_ row: JoinedSession, now: Date) -> some View {
+        let running = row.session.tools.running
+        if !running.isEmpty, let oldestStartedMs = running.compactMap(\.startedMs).min() {
+            let elapsed = max(
+                0,
+                now.timeIntervalSince(
+                    Date(timeIntervalSince1970: Double(oldestStartedMs) / 1000)))
+            let count = Text("\(running.count) running")
+                .font(V4.font(V4.dimSize, .semibold))
+                .foregroundColor(Tok.ok)
+            let duration = durationLabel(elapsed)
+            ViewThatFits(in: .horizontal) {
+                sessionStatusText(count, " · oldest \(duration)").fixedSize()
+                sessionStatusText(count, " · \(duration)").fixedSize()
+                sessionStatusText(count, " · \(duration)")
+            }
+        } else {
+            Text(trailingStatus(row, now: now))
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(row.activity == .waiting ? Tok.near : Tok.dim)
+                .monospacedDigit()
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+    }
+
+    private func sessionStatusText(_ count: Text, _ tail: String) -> some View {
+        (count
+            + Text(tail)
+            .font(V4.font(V4.dimSize))
+            .foregroundColor(Tok.dim))
+            .monospacedDigit()
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
     private func trailingStatus(_ row: JoinedSession, now: Date) -> String {
         let running = row.session.tools.running
         guard !running.isEmpty, let oldestStartedMs = running.compactMap(\.startedMs).min() else {
@@ -1116,13 +1162,6 @@ struct FleetView: View {
             // EVERY tool, never one category standing in for the total —
             // `toolsTotalCalls` already sums across every session's
             // `tools.calls`, whatever tool made each call.
-            Text(
-                "\(fleet.toolsTotalCalls) calls · \(fleet.toolsTotalErrors) errors"
-                    + " · \(fleet.toolsTotalTimeouts) timeouts"
-            )
-            .font(Tok.secondaryDigitFont)
-            .foregroundStyle(Tok.inkDim)
-
             if !fleet.toolsRunning.isEmpty {
                 toolsSection("RUNNING NOW", subtitle: "Ring fills toward the 600s timeout") {
                     // Finding 5: state the denominator a ring fills toward,
@@ -1133,7 +1172,12 @@ struct FleetView: View {
             }
             if !fleet.toolsSlowest.isEmpty {
                 toolsSection("SLOWEST TODAY", subtitle: nil) {
-                    ForEach(fleet.toolsSlowest) { entry in slowestToolRow(entry) }
+                    // Five, as the mockup draws: `Fleet.toolsSlowest` pools ten
+                    // across every session, and a panel this tall shows half of
+                    // them before the fold.
+                    ForEach(fleet.toolsSlowest.prefix(Self.slowestVisibleRows)) { entry in
+                        slowestToolRow(entry)
+                    }
                 }
             }
             if fleet.toolsRunning.isEmpty && fleet.toolsSlowest.isEmpty {
@@ -1142,7 +1186,7 @@ struct FleetView: View {
                     .foregroundStyle(Tok.inkDim)
             }
             if let categories = fleet.toolsByCategory {
-                toolsSection("BY TOOL", subtitle: "share of \(fleet.toolsTotalCalls)") {
+                toolsSection("BY TOOL", subtitle: "share of \(QuotaFormat.count(fleet.toolsTotalCalls))") {
                     ForEach(categories) { category in
                         byToolRow(category, total: fleet.toolsTotalCalls)
                     }
@@ -1158,19 +1202,25 @@ struct FleetView: View {
     /// the section — the mockup draws it that way, and a head floating over a
     /// box labels the gap as much as the box.
     private func toolsSection<Content: View>(
-        _ title: String, subtitle: String?, @ViewBuilder rows: () -> Content
+        _ title: String, subtitle: String?, @ViewBuilder rows: @escaping () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: Tok.space1) {
-            sectionHeading(title)
-            if let subtitle {
-                Text(subtitle)
-                    .font(Tok.dimLineFont)
-                    .foregroundStyle(Tok.inkFaint)
+        // The head sits ABOVE the card, not inside it — `.sec` is a sibling of
+        // `.card` in the mockup, with `margin:12px 4px 4px`. Inside, it reads as
+        // the card's first row and competes with the rows that carry data.
+        VStack(alignment: .leading, spacing: 0) {
+            SectionHead(title: title, unit: subtitle.map { "· \($0)" })
+                .padding(.horizontal, V4.sectionHeadMarginSide)
+                .padding(.bottom, V4.sectionHeadMarginBottom)
+            V4Card {
+                // `V4Card` stacks at 0 and a card's rows carry their own line
+                // box; these rows are two lines each with a 34 pt ring beside
+                // them, so without a gap the rings touch and the meta line of
+                // one row reads as the third line of the row above.
+                VStack(alignment: .leading, spacing: V4.rowGap) {
+                    rows()
+                }
             }
-            rows()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .panelCard()
     }
 
     /// One `BY TOOL` bar — `docs/design/panel-tabs-mockup.html` F15: every
@@ -1178,27 +1228,36 @@ struct FleetView: View {
     /// the three widths are directly comparable at a glance.
     private func byToolRow(_ category: ToolCategory, total: Int) -> some View {
         let share = total > 0 ? Double(category.calls) / Double(total) : 0
-        return HStack(spacing: Tok.tightSpacing) {
-            Text(category.name)
-                .font(Tok.dimLineFont)
-                .foregroundStyle(Tok.inkDim)
-                .frame(width: 84, alignment: .leading)
-            GeometryReader { proxy in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Tok.hairline)
-                    Capsule()
-                        .fill(byToolColor(category.name))
-                        .frame(width: max(2, proxy.size.width * share))
+        return V4Row {
+            HStack(spacing: V4.quotaGap) {
+                Text(category.name)
+                    .font(V4.font(V4.dimSize))
+                    .foregroundStyle(Tok.dim)
+                    .lineLimit(1)
+                    .fixedSize()
+                GeometryReader { proxy in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            .fill(Tok.ink.opacity(V4.barTrackAlpha))
+                        RoundedRectangle(cornerRadius: V4.barRadius)
+                            .fill(byToolColor(category.name))
+                            .frame(width: max(V4.barMinWidth, proxy.size.width * share))
+                    }
                 }
+                .frame(height: V4.barHeight)
+                .frame(maxWidth: V4.barCappedWidth)
             }
-            .frame(height: 7)
+        } trailing: {
+            // Not in the ring column: this row has no ring, its value is the
+            // row's whole point, and the bar beside it is capped at 110 pt and
+            // can give up the space. Right edge at the card's content edge, the
+            // same as every other trailing item on the tab.
             Text(byToolTrailingLabel(category))
-                .font(Tok.dimLineFont)
-                .foregroundStyle(Tok.inkDim)
+                .font(V4.font(V4.dimSize))
+                .foregroundStyle(Tok.dim)
                 .lineLimit(1)
                 .fixedSize()
         }
-        .padding(.vertical, Tok.space1)
     }
 
     /// Bash is `--ok` green, Agent is `--info` blue (`.accent`, the closest
@@ -1218,9 +1277,10 @@ struct FleetView: View {
     /// session reported one, the same silence-over-a-guess rule as the rest
     /// of this tab.
     private func byToolTrailingLabel(_ category: ToolCategory) -> String {
-        guard let median = category.medianSeconds else { return "\(category.calls)" }
+        let calls = QuotaFormat.count(category.calls)
+        guard let median = category.medianSeconds else { return calls }
         let formatted = median < 60 ? String(format: "%.1fs", median) : durationLabel(median)
-        return "\(category.calls) · median \(formatted)"
+        return "\(calls) · median \(formatted)"
     }
 
     private func sectionHeading(_ text: String) -> some View {
@@ -1238,18 +1298,6 @@ struct FleetView: View {
     /// "`command_head` shown in monospace, truncated to one line." Shared by
     /// ``runningToolRow(_:)`` and ``slowestToolRow(_:)`` so the two rows never
     /// drift on how a call names itself.
-    private func toolCallLabel(_ entry: SessionToolEntry) -> some View {
-        VStack(alignment: .leading, spacing: Tok.space1) {
-            Text(entry.call.commandHead ?? entry.call.tool)
-                .font(Tok.monoFont)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Text("\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
-                .font(Tok.dimLineFont)
-                .foregroundStyle(Tok.inkDim)
-        }
-    }
-
     /// `docs/design/panel-tabs-mockup.html`'s "Bash · teamclaude-rs-c7" — the
     /// same ``JoinedSession/displayName`` the Sessions tab already draws for
     /// this session id, read off ``sessionFiles`` directly: `Fleet.toolsRunning`/
@@ -1272,7 +1320,10 @@ struct FleetView: View {
     /// no ring, per finding 5's own fix ("state the denominator … set to the
     /// third ring") — inventing one for a tool this build has no timeout
     /// figure for would be the same overclaim finding 5 exists to remove.
-    private let bashTimeoutSeconds: Double = 600
+    private var bashTimeoutSeconds: Double { V4.toolTimeoutSeconds }
+
+    /// How many of the ten slowest calls the tab draws.
+    static let slowestVisibleRows = 5
 
     /// A running call: its ring (Bash only, filling toward
     /// ``bashTimeoutSeconds``) and its elapsed time since `startedMs`, turning
@@ -1283,52 +1334,77 @@ struct FleetView: View {
         let elapsed = entry.call.startedMs.map { started in
             max(0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(started) / 1000)))
         }
-        let isBash = entry.call.tool == "Bash"
         let remaining = elapsed.map { bashTimeoutSeconds - $0 }
-        let isNearTimeout = isBash && (remaining ?? .infinity) <= 20
-        return HStack(spacing: Tok.tightSpacing) {
-            toolCallLabel(entry)
-            Spacer()
-            VStack(alignment: .trailing, spacing: Tok.space1) {
-                if isBash, let elapsed {
-                    ZStack {
-                        Circle().stroke(Tok.hairline, lineWidth: 3)
-                        Circle()
-                            .trim(from: 0, to: min(elapsed / bashTimeoutSeconds, 1))
-                            .stroke(
-                                isNearTimeout ? Tok.spent : Tok.ok,
-                                style: StrokeStyle(lineWidth: 3, lineCap: .round)
-                            )
-                            .rotationEffect(.degrees(-90))
-                    }
-                    .frame(width: 18, height: 18)
-                }
-                if let elapsed {
-                    Text(
-                        isNearTimeout
-                            ? "\(Int(max(0, remaining ?? 0)))s to timeout" : durationLabel(elapsed)
-                    )
-                    .font(Tok.secondaryDigitFont)
-                    .monospacedDigit()
-                    .foregroundStyle(isNearTimeout ? Tok.spent : Tok.inkDim)
-                }
+        let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
+        return V4Row {
+            // The two text lines are the row; the ring sits beside BOTH of them,
+            // vertically centred, rather than pairing with the first and letting
+            // the row grow to the ring's height (Gil, 2026-09-13: three rows took
+            // 200 pt where the mockup takes 150). The sub line now has the whole
+            // leading column — 224 pt against the 200 pt it needs — so
+            // "· 20s to timeout" survives without a `fixedSize` fight.
+            VStack(alignment: .leading, spacing: 0) {
+                MonoText(text: entry.call.commandHead ?? entry.call.tool)
+                toolCallSubLine(entry, remaining: isNearTimeout ? remaining : nil)
             }
+        } trailing: {
+                // Ring and duration on ONE line, inside the shared column: the
+                // two are one reading ("how far through its timeout is this
+                // call"), and stacking them made the pair read as two items.
+                TrailingColumn {
+                    HStack(spacing: V4.rowGap) {
+                        Spacer(minLength: 0)
+                        ProgressRing(
+                            fraction: (elapsed ?? 0) / bashTimeoutSeconds,
+                            tint: isNearTimeout ? Tok.spent : Tok.ok,
+                            accessibilityText: elapsed.map {
+                                "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
+                            })
+                        Text(elapsed.map(durationLabel) ?? "")
+                            .font(V4.font(V4.dimSize))
+                            .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
+                            .lineLimit(1)
+                            .frame(width: V4.durationColumnWidth, alignment: .trailing)
+                    }
+                }
         }
-        .padding(.vertical, Tok.space1)
+        .frame(minHeight: V4.ringRowMinHeight)
+    }
+
+    /// "Agent · teamclaude-rs-c7 · 20s to timeout" — the tool, whose session it
+    /// belongs to, and what is left of its timeout.
+    private func toolCallSubLine(_ entry: SessionToolEntry, remaining: Double?) -> some View {
+        HStack(spacing: 0) {
+            MuteText(text: "\(entry.call.tool) · \(toolCallOwnerName(entry.sessionId))")
+            if let remaining {
+                Text(" · \(Int(max(0, remaining.rounded())))s to timeout")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.spent)
+                    .lineLimit(1)
+                    // Never the clause that gives way: the tool and its owner
+                    // are said again elsewhere on the panel, and this is the
+                    // only place the row says how long is left.
+                    .fixedSize()
+            }
+            Spacer(minLength: 0)
+        }
     }
 
     private func slowestToolRow(_ entry: SessionToolEntry) -> some View {
-        HStack(spacing: Tok.tightSpacing) {
-            toolCallLabel(entry)
-            Spacer()
-            if let seconds = entry.call.seconds {
-                Text(durationLabel(seconds))
-                    .font(Tok.secondaryDigitFont)
-                    .monospacedDigit()
-                    .foregroundStyle(seconds >= bashTimeoutSeconds ? Tok.spent : Tok.inkDim)
+        // ONE line, as the mockup draws it: the command, ellipsised at the pill
+        // column. The second line the pre-v4 row added ("Bash · mycelium-c2")
+        // cost 55 pt a row and pushed three of the five slowest below the fold.
+        V4Row {
+            MonoText(text: entry.call.commandHead ?? entry.call.tool)
+        } trailing: {
+            TrailingColumn(width: V4.durationColumnWidth) {
+                if let seconds = entry.call.seconds {
+                    V4Pill(
+                        text: durationLabel(seconds),
+                        role: seconds >= bashTimeoutSeconds ? .bad : .neutral)
+                }
             }
         }
-        .padding(.vertical, Tok.space1)
     }
 
     /// `"45s"`, `"4m 12s"` — no day tier: the longest call this tab shows is

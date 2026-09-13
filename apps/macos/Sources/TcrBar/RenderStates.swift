@@ -268,7 +268,7 @@ enum RenderStates {
                 // about this machine rather than by a layout decision. Pinned,
                 // never spawned: `ServerController.harness(pinned:)` signals
                 // nothing.
-                server: scene.name == "19-accounts-tab-parity"
+                server: parityScenes.contains(scene.name)
                     ? ServerController.harness(pinned: .supervising(pid: 4242))
                     : ServerController(),
                 loginItem: LoginItem(),
@@ -327,6 +327,15 @@ enum RenderStates {
     /// Tall enough that thirteen rows are all visible rather than scrolled. This
     /// is a review artifact, so seeing everything beats fidelity to the clip.
     private static let renderHeight: CGFloat = 900
+
+    /// The three scenes that are compared against the mockup crops. Each is
+    /// rendered with a SUPERVISED server for the reason
+    /// `ServerController.harness(pinned:)` states: the mockup's proxy was
+    /// running, and a panel drawing "Start server" and "Take over port…" differs
+    /// from it by a fact about this machine rather than by a layout decision.
+    private static let parityScenes: Set<String> = [
+        "19-accounts-tab-parity", "16-sessions-tab", "17-tools-tab",
+    ]
 
     // MARK: - Fixtures
     //
@@ -783,11 +792,29 @@ enum RenderStates {
                 requests: 5756, inputTokens: 60_000, outputTokens: 88_000, cacheReadTokens: 940_000,
                 tools: SessionTools(
                     calls: 7_477, errors: 4, timeouts: 1,
+                    // Five, the mockup's own count for SLOWEST TODAY — and the
+                    // reason there are five: `Fleet.toolsSlowest` pools ten
+                    // across every session and the tab draws the top five, so a
+                    // fixture with two rows cannot tell "the cap works" apart
+                    // from "there was nothing to cap". The seconds are the
+                    // mockup's: one at the 600 s timeout, then 583, 556, 343.
                     slowest: [
                         ToolCall(
                             tool: "Bash",
                             commandHead: "/opt/homebrew/bin/bash /tmp/disk-scan.sh 2>&1 | tee",
-                            endedMs: msAgo(11 * 60), seconds: 600.0)
+                            endedMs: msAgo(11 * 60), seconds: 600.0),
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "bash /tmp/retro-review-wait.sh --until green",
+                            endedMs: msAgo(23 * 60), seconds: 583.0),
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "until grep -qE \"^(error|warning)\" /tmp/build.log",
+                            endedMs: msAgo(36 * 60), seconds: 556.0),
+                        ToolCall(
+                            tool: "Bash",
+                            commandHead: "./scripts/cargo-q.sh test -p teamclaude --all-features",
+                            endedMs: msAgo(48 * 60), seconds: 343.0),
                     ],
                     overOneMinute: 5,
                     byTool: [

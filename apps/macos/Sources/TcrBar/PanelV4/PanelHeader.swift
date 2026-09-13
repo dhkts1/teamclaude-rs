@@ -14,18 +14,29 @@ struct PanelHeader: View {
     let onSettings: () -> Void
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: V4.headerGap) {
-            Text(title)
-                .font(V4.font(V4.titleSize, .bold))
-                .tracking(V4.titleTracking)
-                .foregroundStyle(Tok.ink)
-            Spacer(minLength: V4.headerGap)
-            if let freshness {
-                Text(freshness)
-                    .font(V4.font(V4.freshnessSize))
-                    .foregroundStyle(Tok.mute)
-                    .lineLimit(1)
+        // Two nestings, one per alignment the row needs. `.hdr` is
+        // `align-items:baseline` for its TEXT — the title and the freshness sit
+        // on one baseline, which is what stops a 17 pt word and a 12.5 pt one
+        // from looking like two rows — while the gear is a BOX and centres on
+        // the line like any inline-block. One flat `.firstTextBaseline` stack
+        // aligned all three by text metrics and lifted the gear 4 pt off the
+        // row; the `alignmentGuide` that compensated for it was a constant
+        // tuned to one font size.
+        HStack(alignment: .center, spacing: V4.headerGap) {
+            HStack(alignment: .firstTextBaseline, spacing: V4.headerGap) {
+                Text(title)
+                    .font(V4.font(V4.titleSize, .bold))
+                    .tracking(V4.titleTracking)
+                    .foregroundStyle(Tok.ink)
+                Spacer(minLength: V4.headerGap)
+                if let freshness {
+                    Text(freshness)
+                        .font(V4.font(V4.freshnessSize))
+                        .foregroundStyle(Tok.mute)
+                        .lineLimit(1)
+                }
             }
+            .frame(minHeight: V4.lineHeight(V4.titleSize))
             gear
         }
         .padding(.top, V4.headerPaddingTop)
@@ -48,9 +59,5 @@ struct PanelHeader: View {
         .accessibilityLabel("Settings")
         .keyboardShortcut(",", modifiers: .command)
         .help("Settings… ⌘,")
-        // The gear sits on the title's baseline row, not on its text baseline:
-        // it is a box, and aligning a box by the baseline of the label beside it
-        // is what put it 4 pt low on every earlier round.
-        .alignmentGuide(.firstTextBaseline) { $0[.bottom] - V4.headerPaddingBottom / 2 }
     }
 }

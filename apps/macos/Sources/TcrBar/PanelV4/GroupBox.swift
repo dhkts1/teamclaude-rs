@@ -24,8 +24,8 @@ struct GroupBox<Content: View>: View {
 
     private var legendWidth: CGFloat { legendSize.width }
 
-    private var notchEnd: CGFloat {
-        V4.legendNotchStart + V4.legendNotchPadding * 2 + legendWidth
+    private var notchWidth: CGFloat {
+        V4.legendNotchWidth(forLegendWidth: legendWidth)
     }
 
     var body: some View {
@@ -54,7 +54,7 @@ struct GroupBox<Content: View>: View {
                 VStack(spacing: 0) {
                     HStack(spacing: 0) {
                         Color.black.frame(width: V4.legendNotchStart)
-                        Color.clear.frame(width: max(0, notchEnd - V4.legendNotchStart))
+                        Color.clear.frame(width: notchWidth)
                         Color.black
                     }
                     .frame(height: V4.legendMaskBand)
@@ -83,7 +83,7 @@ struct GroupBox<Content: View>: View {
         )
         .onPreferenceChange(LegendSizeKey.self) { legendSize = $0 }
         .padding(.leading, V4.legendNotchStart + V4.legendNotchPadding)
-        .offset(y: -legendSize.height / 2)
+        .offset(y: V4.legendLift(forLegendHeight: legendSize.height))
         .accessibilityHidden(true)
     }
 }

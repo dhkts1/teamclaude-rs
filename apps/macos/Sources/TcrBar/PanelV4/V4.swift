@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 import TcrBarCore
 
@@ -149,15 +150,50 @@ enum V4 {
 
     // MARK: - Ring (`.ring`)
 
-    static let ringSize: CGFloat = 34
-    static let ringStroke: CGFloat = 4
+    /// 28 / 3.5, not the sheet's 34 / 4 (Gil, 2026-09-13, measuring his own
+    /// Tools crop: the app's ring drew 39 pt against the mockup's 32, and three
+    /// rows took 200 pt where the mockup takes 150). This supersedes the
+    /// extracted CSS: the mockup's own `.ring` is 34 in a row whose two text
+    /// lines are taller than ours, and a ring sized from the stylesheet rather
+    /// than from the row it sits in is what made the rows grow around it.
+    static let ringSize: CGFloat = 28
+    static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
     /// The Bash tool's own timeout — the denominator the ring fills toward, and
     /// the figure the RUNNING NOW section head states out loud.
     static let toolTimeoutSeconds: Double = 600
     /// Inside this many seconds of ``toolTimeoutSeconds`` the ring turns `bad`
-    /// and the row says how long is left.
-    static let toolTimeoutWarnSeconds: Double = 30
+    /// and the row says how long is left (Gil, 2026-09-13: "red plus
+    /// `· 20s to timeout` within 60 s of the 600 s limit").
+    static let toolTimeoutWarnSeconds: Double = 60
+
+    /// The fixed column every row's trailing content occupies — the ring and
+    /// its duration on Tools, the sparkline or the status on Sessions.
+    ///
+    /// A column sized per row from its own content is what made the durations
+    /// zig-zag down the tab. Two widths, one per tab, because the widest
+    /// trailing string differs: Tools prints "19,913 · median 2.1s" and Sessions
+    /// prints "2 running · oldest 9m 40s". A single width wide enough for both
+    /// would eat the session NAME, which is the one string on the row that has
+    /// to stay readable.
+    /// Tools: the ring, the gap, and the duration's own right-aligned column.
+    /// Nothing wider — every point past those three is a point taken from the
+    /// command the row is about, which is the string a reader is scanning.
+    static var trailingColumnWidth: CGFloat { ringSize + rowGap + durationColumnWidth }
+    /// The duration's own sub-column inside the Tools column, right-aligned so
+    /// every duration ends at the card's content edge and the ring beside it
+    /// starts at one x on every row.
+    static let durationColumnWidth: CGFloat = 60
+    /// A row carrying a ``ProgressRing`` is at least the ring plus the gap that
+    /// keeps two rings from touching. `.row`'s own line box is 21 pt and the
+    /// ring is 34, so without this the rings of consecutive rows overlap —
+    /// measured at 74 px of ring inside a 68 px row.
+    ///
+    /// The row is its own two text lines, not the ring: a 15 pt mono line and a
+    /// 12 pt mute line are 21 + 17 = 38 pt, and the 28 pt ring fits inside that
+    /// with room to spare. Sizing the row from the ring instead is what put
+    /// 67 pt between rows the mockup sets 56 pt apart.
+    static var ringRowMinHeight: CGFloat { lineHeight(monoSize) + lineHeight(muteSize) }
 
     // MARK: - Group (`.grp`)
 
@@ -185,9 +221,25 @@ enum V4 {
     static let legendNotchStart: CGFloat = 10
     static let legendNotchPadding: CGFloat = 4
     static let legendMaskBand: CGFloat = 9
+    /// How wide the stroke's notch is for a legend that measured `width`: the
+    /// mask's `--n1`, clamped so a zero-width legend cannot ask for a negative
+    /// band. Here rather than in the view because it is the sheet's geometry.
+    static func legendNotchWidth(forLegendWidth width: CGFloat) -> CGFloat {
+        max(0, legendNotchStart + legendNotchPadding * 2 + width - legendNotchStart)
+    }
+
+    /// How far a legend of height `height` is lifted so it sits centred on the
+    /// stroke — the intent behind the CSS's `top:-7px` (see the note above).
+    static func legendLift(forLegendHeight height: CGFloat) -> CGFloat {
+        -height / 2
+    }
+
     static let legendFontSize: CGFloat = 11
     static let legendTracking: CGFloat = 0.08 * 11
-    static let legendGlyph: CGFloat = 11
+    /// 12, not the CSS's 11: the swatch reads as a rounded square beside an
+    /// 11 pt uppercase legend and at 11 it sat visibly smaller than the cap
+    /// height next to it (Gil, 2026-09-13).
+    static let legendGlyph: CGFloat = 12
     static let legendGap: CGFloat = 6
 
     // MARK: - Button (`.btn` / `.more`)
@@ -278,6 +330,20 @@ enum V4 {
     /// engine rounds it.
     static func lineHeight(_ size: CGFloat) -> CGFloat {
         (size * lineHeightFactor).rounded()
+    }
+
+    /// What to add BETWEEN two wrapped lines of `size` pt text so the pair
+    /// occupies the same box the browser gives it.
+    ///
+    /// ``lineHeight(_:)`` alone only fixes a single line (it is a minimum on the
+    /// frame); a `Text` that wraps stacks its own natural line height twice and
+    /// comes out short again. The natural height is asked of the font rather
+    /// than guessed at a factor, so this survives a font change and a
+    /// Larger-Text setting.
+    static func lineSpacing(_ size: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: size)
+        let natural = font.ascender - font.descender + font.leading
+        return max(0, lineHeight(size) - natural)
     }
 
     /// A `.card`'s `.row`: its tallest child is the 15 pt name, so the row is
