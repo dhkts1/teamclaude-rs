@@ -19,11 +19,22 @@
 //! (`Manager::wire_sessions_snapshot`) rather than a second, parallel one that
 //! could drift from it.
 //!
-//! Two things this file does NOT do, both deliberate:
+//! What is in this file, and at what permissions. **No body content** — a
+//! `WireSession` has never held a request or response body, so there is nothing
+//! to redact. It DOES hold each tool call's `command_head`: up to 120
+//! characters of a normalized shell command, a file path or a grep pattern, for
+//! the running tools, the ten slowest, and the timed-out list. That is Gil's
+//! 2026-09-13 ruling, reversing #299, and it is what makes a restored SLOWEST
+//! TODAY row readable — without it, 72 of 95 rows came back after a restart
+//! saying the bare word `Bash` (measured the same day). The file is written
+//! `0600` by [`crate::config::write_atomic`], which creates its temp file with
+//! that mode and normalises the destination's mode after the rename, so the
+//! heads are readable by their owner and nobody else; this module adds no
+//! `set_permissions` call of its own because there would be nothing left for it
+//! to tighten.
 //!
-//! - **No body content.** Every field here already excludes it — `WireSession`
-//!   never held request/response bodies in the first place (see
-//!   `session_wire.rs`'s own module doc), so there is nothing to redact.
+//! One thing this file deliberately does NOT do:
+//!
 //! - **No rebuild from the usage ledger.** `~/.cache/teamclaude/usage/*.jsonl`
 //!   persists every request already, but keyed on an internal `u64` session
 //!   NUMBER (`UsageRecord::session`), not the wire's session id string — it
@@ -230,6 +241,8 @@ pub fn load(path: &Path, now_ms: i64, ttl_ms: i64) -> LoadReport {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
     use crate::session_wire::{RunningTool, SlowTool, ToolStats};
 
@@ -288,28 +301,28 @@ mod tests {
         assert_eq!(a.requests, 3);
     }
 
-    /// `command_head` never reaches disk — it is a raw shell command / file path / grep
-    /// pattern, exactly the body content this module's doc says stays out of the file — while
-    /// `command_class` (a coarse category) and `seconds` (a plain duration) still round-trip.
+    /// `command_head` DOES reach disk, and comes back — the inverse of what this test
+    /// asserted between #299 and Gil's 2026-09-13 ruling. A restored SLOWEST TODAY row
+    /// whose command is gone says only `Bash`, which is not a row anyone can act on
+    /// (measured the same day: 72 of 95 restored rows were bare tool names). The file is
+    /// `0600` and holds a 120-character head, not a body; see this module's doc.
     #[test]
-    fn command_head_does_not_reach_disk() {
-        let path = tmp("no-heads");
+    fn command_head_round_trips_through_disk() {
+        let path = tmp("heads-round-trip");
         let now = 1_000_000;
         let mut sess = session("alice@example.com", now, 1);
-        sess.tools.running.insert(
-            "tool-1".to_string(),
-            RunningTool {
-                tool: "Bash".to_string(),
-                started_ms: now - 500,
-                command_head: Some("rm -rf /secret/customer-data".to_string()),
-                command_class: None,
-            },
-        );
         sess.tools.slowest.push(SlowTool {
             tool: "Bash".to_string(),
             seconds: 12.5,
-            command_head: Some("curl https://internal.example.com/token".to_string()),
-            command_class: None,
+            command_head: Some("cargo test --release".to_string()),
+            command_class: Some(crate::session_wire::CommandClass::Build),
+            ended_ms: now,
+        });
+        sess.tools.timed_out.push(SlowTool {
+            tool: "Bash".to_string(),
+            seconds: 600.0,
+            command_head: Some("git push origin main".to_string()),
+            command_class: Some(crate::session_wire::CommandClass::GitNet),
             ended_ms: now,
         });
         let mut sessions = HashMap::new();
@@ -318,23 +331,60 @@ mod tests {
 
         let raw = std::fs::read_to_string(&path).expect("read back the file as a string");
         assert!(
-            !raw.contains("command_head"),
-            "command_head must not be serialized at all"
+            raw.contains("command_head"),
+            "command_head must be serialized"
         );
         assert!(
-            !raw.contains("rm -rf"),
-            "the running tool's head leaked to disk"
+            raw.contains("cargo test --release"),
+            "the slow head is on disk"
         );
         assert!(
-            !raw.contains("curl "),
-            "the slowest tool's head leaked to disk"
+            raw.contains("git push origin main"),
+            "the timed-out head is on disk"
         );
+
+        // 0600 comes from `config::write_atomic`, which creates the temp file with that
+        // mode AND normalises the destination after the rename; this asserts the property
+        // at the file the heads actually land in.
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the session-wire cache must be owner-only");
 
         let report = load(&path, now, RESTORE_TTL_MS);
         let restored = &report.sessions["sess-a"];
         assert_eq!(restored.tools.slowest.len(), 1);
-        assert!(restored.tools.slowest[0].command_head.is_none());
+        assert_eq!(
+            restored.tools.slowest[0].command_head.as_deref(),
+            Some("cargo test --release")
+        );
         assert_eq!(restored.tools.slowest[0].seconds, 12.5);
+        assert_eq!(
+            restored.tools.timed_out[0].command_head.as_deref(),
+            Some("git push origin main")
+        );
+    }
+
+    /// A `RunningTool`'s head persists too, even though `WireSessionTracker::restore`
+    /// clears `running` on the way back in — nothing in the serialization layer strips it.
+    #[test]
+    fn a_running_tools_head_is_serialized_too() {
+        let path = tmp("running-heads");
+        let now = 1_000_000;
+        let mut sess = session("alice@example.com", now, 1);
+        sess.tools.running.insert(
+            "tool-1".to_string(),
+            RunningTool {
+                tool: "Bash".to_string(),
+                started_ms: now - 500,
+                command_head: Some("until grep -q ready log; do sleep 1; done".to_string()),
+                command_class: Some(crate::session_wire::CommandClass::Wait),
+            },
+        );
+        let mut sessions = HashMap::new();
+        sessions.insert("sess-a".to_string(), sess);
+        save(&path, &sessions, now).expect("save");
+
+        let raw = std::fs::read_to_string(&path).expect("read back the file as a string");
+        assert!(raw.contains("until grep -q ready log"));
     }
 
     /// A session whose last request was longer ago than the TTL is dropped at
