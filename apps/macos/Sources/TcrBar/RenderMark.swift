@@ -33,19 +33,32 @@ enum RenderMark {
         return URL(fileURLWithPath: arguments[i + 1])
     }
 
-    /// A handful of states worth looking at: a mixed fleet (label visible), an
-    /// empty fleet and a failed poll (label hidden — the exact two conditions
-    /// ``PollState/countsLabel`` documents), and the mixed fleet again with
-    /// `showCounts` off, so the "hidden by preference" branch is also on
-    /// disk to look at rather than only unit-tested.
-    private static var scenes: [(name: String, state: PollState, showCounts: Bool)] {
+    /// The six states `docs/design/menubar-mark-mockup.html` shows, in its own
+    /// order, plus the same "counts off" and "poll failed" branches this
+    /// feature's own predecessor (F5, `menubar-counts-bridge.md`) already
+    /// covered here. `appearance` is `nil` for the process default (matching
+    /// the mockup's dark scenes, which is what every state but the last one
+    /// is) and `.aqua` only for the light scene — the one place the mockup
+    /// asks to see the SAME state rendered under the other appearance rather
+    /// than a different fleet.
+    private static var scenes:
         [
-            ("01-mixed-fleet-counts-on", .loaded(mixedFleet), true),
-            ("02-mixed-fleet-counts-off", .loaded(mixedFleet), false),
-            ("03-empty-fleet", .loaded(Fleet(accounts: [])), true),
             (
-                "04-poll-failed", .commandFailed(exitCode: 1, message: "connection refused"), true
+                name: String, state: PollState, showCounts: Bool, showRunningTools: Bool,
+                appearance: NSAppearance.Name?
+            )
+        ]
+    {
+        [
+            ("01-dark-counts-on", .loaded(mixedFleet), true, false, nil),
+            ("02-dark-running-tools-count", .loaded(runningToolsFleet), true, true, nil),
+            ("03-dark-near-the-limit", .loaded(nearTheLimitFleet), true, false, nil),
+            (
+                "04-dark-poll-failed", .commandFailed(exitCode: 1, message: "connection refused"),
+                true, false, nil
             ),
+            ("05-dark-counts-off", .loaded(mixedFleet), false, false, nil),
+            ("06-light", .loaded(mixedFleet), true, false, .aqua),
         ]
     }
 
@@ -69,14 +82,17 @@ enum RenderMark {
     }
 
     /// The width `NSFont.menuBarFont(ofSize: 0)`'s tallest glyph plus the label
-    /// text needs, at 2x — wide enough that a two-digit `"12/13"` is never
-    /// clipped, generous rather than measured, since this is a review artifact
-    /// and not a layout contract.
-    private static let canvasSize = NSSize(width: 160, height: 44)
+    /// text needs, at 2x — wide enough that a two-digit `"12/13"` plus the
+    /// running-tools segment is never clipped, generous rather than measured,
+    /// since this is a review artifact and not a layout contract.
+    private static let canvasSize = NSSize(width: 220, height: 44)
 
     @MainActor
     private static func render(
-        _ scene: (name: String, state: PollState, showCounts: Bool),
+        _ scene: (
+            name: String, state: PollState, showCounts: Bool, showRunningTools: Bool,
+            appearance: NSAppearance.Name?
+        ),
         into directory: URL
     ) -> Bool {
         let gauge = MenuBarShell.gaugeSymbol(for: scene.state)
@@ -87,10 +103,10 @@ enum RenderMark {
         }
 
         let label = scene.showCounts ? scene.state.countsLabel : nil
-        let font = NSFont.monospacedDigitSystemFont(
-            ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
+        let running = scene.state.runningToolsCount(showRunningTools: scene.showRunningTools)
+        let amber = scene.state.countIsNearCapacity
 
-        let composed = NSImage(size: canvasSize, flipped: false) { rect in
+        let draw: (NSRect) -> Bool = { rect in
             NSColor.windowBackgroundColor.setFill()
             rect.fill()
             let markRect = NSRect(
@@ -98,9 +114,8 @@ enum RenderMark {
                 width: mark.size.width, height: mark.size.height)
             mark.draw(in: markRect, from: .zero, operation: .sourceOver, fraction: 1)
             if let label {
-                let attributed = NSAttributedString(
-                    string: label,
-                    attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+                let attributed = MenuBarShell.countsAttributedTitle(
+                    label, amber: amber, runningTools: running)
                 let labelOrigin = NSPoint(
                     x: markRect.maxX + 4, y: (rect.height - attributed.size().height) / 2)
                 attributed.draw(at: labelOrigin)
@@ -108,8 +123,33 @@ enum RenderMark {
             return true
         }
 
+        // Rasterised (`tiffRepresentation`, which is what actually invokes
+        // `draw`) INSIDE `performAsCurrentDrawingAppearance` where an
+        // appearance override applies, same as `MenuBarMarkTests.rasterise`.
+        // `NSImage(size:flipped:drawingHandler:)`'s handler is lazy — it does
+        // not run at construction, so building the image inside the block and
+        // rasterising it outside would resolve every dynamic colour
+        // (`NSColor.labelColor`, `Tok.nearNSColor`, `.windowBackgroundColor`)
+        // against whatever appearance is current by the time something
+        // outside this function first asks for pixels, not the one this scene
+        // asked for.
+        func rasterise() -> Data? {
+            NSImage(size: canvasSize, flipped: false, drawingHandler: draw).tiffRepresentation
+        }
+        let tiffData: Data?
+        if let appearanceName = scene.appearance, let appearance = NSAppearance(named: appearanceName)
+        {
+            var result: Data?
+            appearance.performAsCurrentDrawingAppearance {
+                result = rasterise()
+            }
+            tiffData = result
+        } else {
+            tiffData = rasterise()
+        }
+
         let name = "\(scene.name).png"
-        guard let tiff = composed.tiffRepresentation,
+        guard let tiff = tiffData,
             let rep = NSBitmapImageRep(data: tiff),
             let png = rep.representation(using: .png, properties: [:])
         else {
@@ -120,7 +160,8 @@ enum RenderMark {
         let url = directory.appendingPathComponent(name)
         do {
             try png.write(to: url)
-            print("  \(name)  label=\(label ?? "(hidden)")")
+            let runningNote = running.map { " running=\($0)" } ?? ""
+            print("  \(name)  label=\(label ?? "(hidden)")\(runningNote)")
             return true
         } catch {
             FileHandle.standardError.write(Data("write failed \(name): \(error)\n".utf8))
@@ -182,5 +223,80 @@ enum RenderMark {
 
     private static var mixedFleet: Fleet {
         (try? Fleet.decode(Data(mixedFleetJSON.utf8))) ?? Fleet(accounts: [])
+    }
+
+    /// Zero ready, at least one near — the exact condition
+    /// ``Fleet/capacityGlyphState``'s `.near` case tests, so this scene
+    /// exercises the amber count for real rather than asserting the rule and
+    /// drawing a fleet that happens not to trigger it. Neither account carries
+    /// `quotaState: "ok"`, which is what keeps ``Account/isReady`` false for
+    /// both.
+    private static let nearTheLimitJSON = """
+        [
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "frank@example.com", "priority": 1, "status": "held",
+            "disabled": false, "quota": 0.9, "quotaState": "near",
+            "fiveHour": 0.4, "sevenDay": 0.9, "sevenDayOi": 0.05,
+            "held": [{"window": "5h", "minutesUntilReset": 40, "resetAtMs": 999000000000}],
+            "requests": 8, "inputTokens": 80, "outputTokens": 8,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.5, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          },
+          {
+            "source": "live", "serverSha": "abc1234", "serverDirty": false,
+            "name": "grace@example.com", "priority": 2, "status": "held",
+            "disabled": false, "quota": 1.0, "quotaState": "spent",
+            "fiveHour": 1.0, "sevenDay": 1.0, "sevenDayOi": 0.0,
+            "held": [{"window": "5h", "minutesUntilReset": 180, "resetAtMs": 999000000000}],
+            "requests": 3, "inputTokens": 30, "outputTokens": 3,
+            "cacheReadTokens": 0, "cacheHitRatio": 0.3, "probeStatus": "ok",
+            "probeError": null, "lastStreamError": null, "streamErrorCount": 0
+          }
+        ]
+        """
+
+    private static var nearTheLimitFleet: Fleet {
+        (try? Fleet.decode(Data(nearTheLimitJSON.utf8))) ?? Fleet(accounts: [])
+    }
+
+    /// The mixed fleet plus three live sessions with a running Bash call each
+    /// — matching the mockup's "3 tools running" example. `sessionsSupported:
+    /// true` is load-bearing: it is what ``PollState/runningToolsCount(showRunningTools:)``
+    /// checks before drawing the segment, exactly the field
+    /// ``Fleet/decode(_:)`` never sets (see that method's own doc-comment), so
+    /// this fixture is built directly rather than decoded, the same way
+    /// `RenderStates.sessionsTabFleet` already does.
+    private static var runningToolsFleet: Fleet {
+        let base = mixedFleet
+        func msAgo(_ seconds: TimeInterval) -> Int64 {
+            Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
+        }
+        let sessions = [
+            Session(
+                sessionId: "aaaaaaaa-0001", account: "alice@example.com",
+                firstSeenMs: msAgo(3600), lastSeenMs: msAgo(30),
+                tools: SessionTools(
+                    calls: 12, running: [
+                        ToolCall(tool: "Bash", commandHead: "cargo test", startedMs: msAgo(20))
+                    ])),
+            Session(
+                sessionId: "bbbbbbbb-0002", account: "bob@example.com",
+                firstSeenMs: msAgo(1800), lastSeenMs: msAgo(15),
+                tools: SessionTools(
+                    calls: 4, running: [
+                        ToolCall(tool: "Bash", commandHead: "swift build", startedMs: msAgo(10))
+                    ])),
+            Session(
+                sessionId: "cccccccc-0003", account: "bob@example.com",
+                firstSeenMs: msAgo(900), lastSeenMs: msAgo(5),
+                tools: SessionTools(
+                    calls: 2, running: [
+                        ToolCall(tool: "Read", commandHead: nil, startedMs: msAgo(3))
+                    ])),
+        ]
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable, sessions: sessions,
+            sessionsSupported: true)
     }
 }

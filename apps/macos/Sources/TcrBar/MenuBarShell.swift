@@ -249,8 +249,12 @@ final class MenuBarShell {
         // race the very publisher this sink exists to trust.
         self.poller.$state
             .combineLatest(self.awake.$isOn, self.countsPreference.$showCounts)
-            .sink { [weak self] state, isOn, showCounts in
-                self?.updateMark(state: state, awake: isOn, showCounts: showCounts)
+            .combineLatest(self.runningToolsPreference.$showRunningToolCount)
+            .sink { [weak self] combined, showRunningTools in
+                let (state, isOn, showCounts) = combined
+                self?.updateMark(
+                    state: state, awake: isOn, showCounts: showCounts,
+                    showRunningTools: showRunningTools)
             }
             .store(in: &marks)
 
@@ -295,23 +299,77 @@ final class MenuBarShell {
     /// has not opened the panel. ``PollState/tooltipSentence`` is the fuller
     /// capacity sentence when a healthy read has one to give, and
     /// ``PollState/summary`` unchanged for every other case.
-    static func toolTip(state: PollState, awake: Bool) -> String {
-        awake
-            ? "\(state.tooltipSentence) · \(KeepAwakeGlyph.accessibilityDescription)"
-            : state.tooltipSentence
+    ///
+    /// The running-tools clause, when the segment is shown, sits between that
+    /// sentence and the keep-awake clause — matching the mockup's own ordering
+    /// (`docs/design/menubar-mark-mockup.html`, "… · 2 parked · 3 tools
+    /// running"), never colour alone: the amber count on the glyph has no
+    /// accessible text of its own, but this sentence already says "near their
+    /// limit" in words, which is what "never colour alone" asks for.
+    static func toolTip(state: PollState, awake: Bool, showRunningTools: Bool) -> String {
+        var sentence = state.tooltipSentence
+        if let running = state.runningToolsCount(showRunningTools: showRunningTools) {
+            let noun = running == 1 ? "tool" : "tools"
+            sentence += " · \(running) \(noun) running"
+        }
+        return awake
+            ? "\(sentence) · \(KeepAwakeGlyph.accessibilityDescription)"
+            : sentence
     }
 
     /// `PollState.countsLabel`, rendered with tabular figures so the status
-    /// item does not jitter in width as the digits change between polls.
-    private static func countsAttributedTitle(_ label: String) -> NSAttributedString {
+    /// item does not jitter in width as the digits change between polls, plus
+    /// the running-tools segment (`9/13 · ⌘3`-shaped, mockup's second bar) when
+    /// `runningTools` is non-`nil`.
+    ///
+    /// `amber` tints the ready/enabled label only — never the glyph, which
+    /// stays the plain template `MenuBarMark` draws regardless of capacity
+    /// state (that type's own doc-comment: shape is the channel that survives
+    /// greyscale, colour is a second one layered on top only where it costs
+    /// nothing to lose). The separator dot is drawn `Tok.mute` so it reads as
+    /// punctuation rather than a second urgency signal, and the running count
+    /// itself is `labelColor` — amber marks capacity, not tool activity.
+    /// Internal, not `private`: `RenderMark` composes the identical title this
+    /// method builds, onto its own canvas rather than a real `NSStatusItem`, so
+    /// the render fixtures and the live mark can never draw the label two
+    /// different ways.
+    static func countsAttributedTitle(
+        _ label: String, amber: Bool, runningTools: Int?
+    ) -> NSAttributedString {
         let font = NSFont.monospacedDigitSystemFont(
             ofSize: NSFont.menuBarFont(ofSize: 0).pointSize, weight: .regular)
-        return NSAttributedString(
+        let result = NSMutableAttributedString(
             string: label,
-            attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+            attributes: [.font: font, .foregroundColor: amber ? Tok.nearNSColor : .labelColor])
+        guard let runningTools else { return result }
+
+        result.append(
+            NSAttributedString(
+                string: " \u{00b7} ",
+                attributes: [.font: font, .foregroundColor: NSColor(Tok.mute)]))
+        if let terminal = NSImage(
+            systemSymbolName: "terminal", accessibilityDescription: "tools running"
+        ) {
+            terminal.isTemplate = true
+            let attachment = NSTextAttachment()
+            attachment.image = terminal
+            // 13pt, matching the mockup's second bar ("the terminal glyph at
+            // 13 pt"); the small negative y nudges it onto the same baseline
+            // as the tabular digits either side of it.
+            attachment.bounds = NSRect(x: 0, y: -2, width: 13, height: 13)
+            result.append(NSAttributedString(attachment: attachment))
+            result.append(NSAttributedString(string: " ", attributes: [.font: font]))
+        }
+        result.append(
+            NSAttributedString(
+                string: "\(runningTools)",
+                attributes: [.font: font, .foregroundColor: NSColor.labelColor]))
+        return result
     }
 
-    private func updateMark(state: PollState, awake isOn: Bool, showCounts: Bool) {
+    private func updateMark(
+        state: PollState, awake isOn: Bool, showCounts: Bool, showRunningTools: Bool
+    ) {
         guard let button = statusItem.button else { return }
         if let mark = MenuBarMark.image(
             gaugeSymbol: Self.gaugeSymbol(for: state), awake: isOn,
@@ -323,7 +381,9 @@ final class MenuBarShell {
             // failed read, an all-disabled fleet — so the guard below is
             // purely `showCounts`; the state check already happened.
             if showCounts, let label = state.countsLabel {
-                button.attributedTitle = Self.countsAttributedTitle(label)
+                button.attributedTitle = Self.countsAttributedTitle(
+                    label, amber: state.countIsNearCapacity,
+                    runningTools: state.runningToolsCount(showRunningTools: showRunningTools))
             } else {
                 button.title = ""
             }
@@ -334,7 +394,7 @@ final class MenuBarShell {
             // something rather than disappear.
             button.title = "tcr"
         }
-        button.toolTip = Self.toolTip(state: state, awake: isOn)
+        button.toolTip = Self.toolTip(state: state, awake: isOn, showRunningTools: showRunningTools)
     }
 
     // MARK: - The panel's size, predicted against what it really is
