@@ -112,8 +112,9 @@ public enum PollState: Equatable {
     /// ``Fleet/sessionsSupported`` is whether THIS read actually populated
     /// ``Fleet/sessions`` — distinct from an empty ``Fleet/toolsRunning``, which
     /// is also true of a fleet with nothing running right now. A preference left
-    /// on for months must never draw a false `0` while the wire that would fill
-    /// it in does not exist yet (see ``Fleet/sessions``'s own doc-comment).
+    /// on for months must never draw a false `0` when the `tcr sessions --json`
+    /// half of the poll did not answer — an old bundled `tcr`, an old proxy, a
+    /// dead one (see ``Fleet/SessionsChannel``).
     public func runningToolsCount(showRunningTools: Bool) -> Int? {
         guard showRunningTools, case .loaded(let fleet) = self, fleet.sessionsSupported else {
             return nil
@@ -247,10 +248,61 @@ public final class StatusPoller: ObservableObject {
         case .success(let executable):
             do {
                 let output = try TcrTool.run(executable: executable, arguments: ["status", "--json"])
-                return classify(output)
+                let state = classify(output)
+                // The sessions read is a SECOND call, and it may only ever add.
+                // A fleet that decoded is published whatever the second call
+                // does — that is the whole containment rule here, so an old
+                // bundled `tcr`, a dead proxy or unreadable output costs the
+                // Sessions and Tools tabs and nothing else.
+                guard case .loaded(let fleet) = state else { return state }
+                return .loaded(fleet.withSessions(fetchSessions(executable: executable)))
             } catch {
                 return .commandFailed(exitCode: -1, message: error.localizedDescription)
             }
+        }
+    }
+
+    /// Run `tcr sessions --json` and classify it. Never throws: a spawn that
+    /// fails is a channel state, not a poll failure.
+    nonisolated static func fetchSessions(executable: URL) -> Fleet.SessionsRead {
+        do {
+            let output = try TcrTool.run(
+                executable: executable, arguments: ["sessions", "--json"])
+            return classifySessions(output)
+        } catch {
+            return Fleet.SessionsRead(channel: .commandFailed(error.localizedDescription))
+        }
+    }
+
+    /// Pure classification of a finished `tcr sessions --json` invocation — the
+    /// part worth testing, mirroring ``classify(_:)`` for the accounts half.
+    ///
+    /// The non-zero branch splits in two on purpose. A `tcr` built before this
+    /// subcommand existed does not fail, it REFUSES TO PARSE: clap exits 2 with
+    /// "unrecognized subcommand" on stderr. Reporting that as a generic command
+    /// failure — or, as the tab did before this channel, as "this server
+    /// predates sessions" — blames the proxy for the app's own staleness, and
+    /// sends an operator to restart a process that was never the problem.
+    public nonisolated static func classifySessions(_ output: TcrTool.Output) -> Fleet.SessionsRead {
+        guard output.exitCode == 0 else {
+            let stderr = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lowered = stderr.lowercased()
+            // Both clap spellings: current ("unrecognized subcommand") and the
+            // pre-4.x one ("wasn't expected"), so an older bundled binary is
+            // still identified as the old half rather than as a dead proxy.
+            if lowered.contains("unrecognized subcommand")
+                || lowered.contains("wasn't expected")
+                || lowered.contains("unexpected argument")
+            {
+                return Fleet.SessionsRead(channel: .toolPredatesSessions)
+            }
+            return Fleet.SessionsRead(
+                channel: .commandFailed(stderr.isEmpty ? "exit \(output.exitCode)" : stderr))
+        }
+        do {
+            return try Fleet.decodeSessions(output.stdout)
+        } catch {
+            return Fleet.SessionsRead(channel: .unreadable("\(error)"))
         }
     }
 

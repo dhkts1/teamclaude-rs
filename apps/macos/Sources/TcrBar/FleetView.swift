@@ -998,11 +998,14 @@ struct FleetView: View {
     /// "Unassigned", listed last.
     @ViewBuilder
     private func sessionsTab(_ fleet: Fleet) -> some View {
-        if !fleet.sessionsSupported {
+        if let detail = fleet.sessionsUnavailableDetail {
+            // One sentence per ``Fleet/SessionsChannel`` case rather than the
+            // single "the server is old" guess this used to print at an
+            // up-to-date server — see `sessionsUnavailableDetail`.
             banner(
                 icon: "person.2",
                 title: "No sessions yet",
-                detail: "This server predates sessions — update tcr.",
+                detail: detail,
                 tint: Tok.unknown)
         } else if fleet.sessions.isEmpty {
             banner(
@@ -1309,11 +1312,11 @@ struct FleetView: View {
     /// fleet-wide totals — this tab's order.
     @ViewBuilder
     private func toolsTab(_ fleet: Fleet) -> some View {
-        if !fleet.sessionsSupported {
+        if let detail = fleet.sessionsUnavailableDetail {
             banner(
                 icon: "terminal",
                 title: "No tool data yet",
-                detail: "This server predates sessions — update tcr.",
+                detail: detail,
                 tint: Tok.unknown)
         } else if snapshotMode {
             toolsList(fleet)

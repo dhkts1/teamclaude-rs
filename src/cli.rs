@@ -2406,6 +2406,31 @@ pub enum Liveness {
 /// existed has no such route, so it forwards this path UPSTREAM and hands back
 /// Anthropic's own error JSON, which must never be rendered as a fleet status.
 async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusError> {
+    parse_live_status(&fetch_live_status_body(config).await?)
+}
+
+/// The typed half of [`fetch_live_status`], split out so a caller that needs
+/// the RAW body as well (`sessions()`, which must tell an absent `sessions`
+/// key from an empty array — `#[serde(default)]` erases the difference) can
+/// read both from one request rather than issuing a second one.
+fn parse_live_status(body: &str) -> Result<StatusPayload, LiveStatusError> {
+    let payload: StatusPayload = serde_json::from_str(body).map_err(|e| {
+        LiveStatusError::Unusable(format!(
+            "the response was not a tcr status payload ({e}) — an older tcr forwards this path upstream"
+        ))
+    })?;
+    if payload.kind != STATUS_KIND {
+        return Err(LiveStatusError::Unusable(format!(
+            "unexpected payload kind '{}' (expected '{STATUS_KIND}')",
+            payload.kind
+        )));
+    }
+    Ok(payload)
+}
+
+/// The transport half of [`fetch_live_status`]: one GET, every failure mode
+/// classified, the body handed back unparsed.
+async fn fetch_live_status_body(config: &Config) -> Result<String, LiveStatusError> {
     let client = reqwest::Client::builder()
         // Never route our own loopback read through a system proxy: `HTTP_PROXY`
         // very commonly points AT tcr, so honouring it would send this query
@@ -2449,22 +2474,10 @@ async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusE
         return Err(LiveStatusError::Unusable(format!("HTTP {status}{hint}")));
     }
 
-    let body = response
+    response
         .text()
         .await
-        .map_err(|e| LiveStatusError::Unusable(format!("reading the response body: {e}")))?;
-    let payload: StatusPayload = serde_json::from_str(&body).map_err(|e| {
-        LiveStatusError::Unusable(format!(
-            "the response was not a tcr status payload ({e}) — an older tcr forwards this path upstream"
-        ))
-    })?;
-    if payload.kind != STATUS_KIND {
-        return Err(LiveStatusError::Unusable(format!(
-            "unexpected payload kind '{}' (expected '{STATUS_KIND}')",
-            payload.kind
-        )));
-    }
-    Ok(payload)
+        .map_err(|e| LiveStatusError::Unusable(format!("reading the response body: {e}")))
 }
 
 /// One probe of the incumbent on the port, answering BOTH questions the startup
@@ -2519,6 +2532,117 @@ pub async fn probe_incumbent(config: &Config) -> IncumbentProbe {
 /// usage endpoint — that endpoint rate-limits, and a second prober racing the
 /// server's is what makes a whole fleet read `probe=rate-limited`. Only the
 /// offline fallback, which has no server to inherit quota from, probes.
+/// Did this status body CARRY a top-level `sessions` key?
+///
+/// The one question the typed [`StatusPayload`] cannot answer. Its `sessions`
+/// field is `#[serde(default)]`, which is what lets a new client keep reading
+/// an old server at all, and the price of that is that "the server never
+/// reported sessions" and "the server reported none" arrive as the same empty
+/// vec. The panel draws two different sentences for those two facts, so the
+/// distinction has to survive the trip — read here off the raw body.
+///
+/// A body that is not JSON reads `false`. It never reaches this function in
+/// practice ([`parse_live_status`] rejects it first), and `false` is the
+/// conservative answer either way: it claims no channel rather than a broken one.
+fn payload_carries_sessions(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("sessions").cloned())
+        .is_some()
+}
+
+/// The `tcr sessions --json` document: `{"supported": bool, "sessions": [...]}`.
+///
+/// The rows cross verbatim as the wire emitted them — [`tcr_status_wire::SessionRow`]
+/// is the shared type both the proxy's `/_tcr/status` response and the panel's
+/// Swift decoder are written against, so re-shaping them here would be a second
+/// contract to keep in step with the first.
+///
+/// An OBJECT, deliberately, where `tcr status --json` is a bare array: the
+/// `supported` flag has nowhere to live in an array, and putting it there is
+/// what would have forced a breaking change on `status`'s existing contract.
+fn render_sessions_json(supported: bool, sessions: &[tcr_status_wire::SessionRow]) -> String {
+    serde_json::json!({ "supported": supported, "sessions": sessions }).to_string()
+}
+
+/// `tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the
+/// last hour.
+///
+/// Live-only, with no offline fallback, and that is the whole design: a session
+/// is per-process state that exists nowhere on disk, so an offline rendering
+/// could only ever be an empty list dressed as a measurement. An unreachable
+/// server is an error exit instead — the same failure `status` warns about
+/// before falling back, except here there is nothing to fall back to.
+///
+/// `supported` answers "did this server's payload CARRY a `sessions` key", not
+/// "is the array non-empty". [`StatusPayload::sessions`] is `#[serde(default)]`
+/// (so that a client built after F1 keeps reading a server built before it),
+/// which means a pre-F1 server and a completely idle server both decode to the
+/// same empty vec. Only the raw body can separate them, so the key presence is
+/// read off a [`serde_json::Value`] of the SAME response the typed parse used —
+/// never a second request, which could see a different server.
+pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
+    // Read-only verb: plain load, no clobber-warning (we never save).
+    let config = config::load(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+
+    let body = match fetch_live_status_body(&config).await {
+        Ok(body) => body,
+        Err(reason) => {
+            let why = reason.why();
+            anyhow::bail!(
+                "could not read live status from the proxy on :{} ({why}) — sessions live only in the running process, so there is no offline snapshot to fall back to.",
+                config.proxy.port
+            );
+        }
+    };
+    let payload = match parse_live_status(&body) {
+        Ok(payload) => payload,
+        Err(reason) => {
+            let why = reason.why();
+            anyhow::bail!(
+                "could not read live status from the proxy on :{} ({why}) — sessions live only in the running process, so there is no offline snapshot to fall back to.",
+                config.proxy.port
+            );
+        }
+    };
+
+    // Key presence, not array length — see this function's doc-comment.
+    let supported = payload_carries_sessions(&body);
+
+    // Build skew goes to STDERR in both modes, exactly as `status` does: the
+    // `--json` stdout is a single object a caller pipes into jq, and a
+    // diagnostic printed there would corrupt it.
+    if let Some(line) = skew_report(Some(&payload.build)) {
+        eprintln!("{line}");
+    }
+
+    if json {
+        // The rows cross verbatim as the wire emitted them — `SessionRow` is
+        // the shared `tcr-status-wire` type both the proxy and the panel's
+        // Swift decoder are written against, so re-shaping it here would be a
+        // second contract to keep in step with the first.
+        println!("{}", render_sessions_json(supported, &payload.sessions));
+    } else {
+        println!("supported={supported} sessions={}", payload.sessions.len());
+        for row in &payload.sessions {
+            println!(
+                "session={} account={} model={} requests={} inputTokens={} outputTokens={} cacheReadTokens={} toolCalls={} costUsd={:.4}",
+                row.session_id,
+                row.account.as_deref().unwrap_or("-"),
+                row.model.as_deref().unwrap_or("-"),
+                row.requests,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.tools.calls,
+                row.cost_usd,
+            );
+        }
+    }
+    Ok(())
+}
+
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = config::load(config_path)
@@ -4963,6 +5087,103 @@ mod tests {
     #[test]
     fn skew_report_is_silent_without_a_server() {
         assert_eq!(skew_report(None), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // `tcr sessions --json`
+    // ---------------------------------------------------------------------
+
+    /// A minimal but REAL status body — it must survive `parse_live_status`,
+    /// so `kind` has to be the live constant rather than a placeholder.
+    fn status_body(extra: &str) -> String {
+        format!(r#"{{"kind":"{STATUS_KIND}","accounts":[]{extra}}}"#)
+    }
+
+    /// The whole reason `supported` is read off the raw body: an EMPTY
+    /// `sessions` array is still a server that reported the key. The typed
+    /// payload cannot tell this case from the one below — both decode to an
+    /// empty vec — so a test that went through `StatusPayload` would pass
+    /// while the panel drew the wrong sentence.
+    #[test]
+    fn an_empty_sessions_array_is_still_a_supported_server() {
+        let body = status_body(r#","sessions":[]"#);
+        assert!(payload_carries_sessions(&body));
+        let Ok(payload) = parse_live_status(&body) else {
+            panic!("a well-formed status body must parse");
+        };
+        assert!(payload.sessions.is_empty());
+    }
+
+    /// The pre-F1 server: no such key at all.
+    #[test]
+    fn a_payload_without_the_sessions_key_is_unsupported() {
+        assert!(!payload_carries_sessions(&status_body("")));
+    }
+
+    #[test]
+    fn a_payload_with_rows_is_supported() {
+        let body = status_body(
+            r#","sessions":[{"sessionId":"11111111-1111-1111-1111-111111111111","firstSeenMs":1,"lastSeenMs":2}]"#,
+        );
+        assert!(payload_carries_sessions(&body));
+        let Ok(payload) = parse_live_status(&body) else {
+            panic!("a well-formed status body must parse");
+        };
+        assert_eq!(payload.sessions.len(), 1);
+    }
+
+    /// Not-JSON is not a channel. `false`, never a panic and never `true`.
+    #[test]
+    fn a_non_json_body_carries_no_sessions() {
+        assert!(!payload_carries_sessions("not json at all"));
+    }
+
+    /// The document shape the Swift poller decodes. Written as literal text
+    /// rather than round-tripped through the same `json!` macro that produced
+    /// it — an assertion built from the code under test proves only that the
+    /// code equals itself.
+    #[test]
+    fn sessions_json_is_an_object_with_supported_and_rows() {
+        let row = tcr_status_wire::SessionRow {
+            session_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            account: Some("alice@example.com".to_string()),
+            model: Some("claude-sonnet-5".to_string()),
+            first_seen_ms: 1_700_000_000_000,
+            last_seen_ms: 1_700_000_060_000,
+            requests: 3,
+            input_tokens: 400,
+            output_tokens: 50,
+            cache_read_tokens: 900,
+            tools: tcr_status_wire::SessionToolsRow::default(),
+            req_per_minute: vec![0, 1, 2],
+            cost_usd: 0.5,
+        };
+        let rendered = render_sessions_json(true, std::slice::from_ref(&row));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+        assert_eq!(value["supported"], serde_json::json!(true));
+        // camelCase keys, exactly as the Swift `Session` decoder names them
+        // (`FleetStatus.swift`'s `CodingKeys`) — a `rename_all` regression on
+        // the wire type fails here rather than on a screen.
+        assert_eq!(
+            value["sessions"][0]["sessionId"],
+            serde_json::json!("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(
+            value["sessions"][0]["cacheReadTokens"],
+            serde_json::json!(900)
+        );
+        assert_eq!(
+            value["sessions"][0]["reqPerMinute"],
+            serde_json::json!([0, 1, 2])
+        );
+        assert_eq!(value["sessions"][0]["costUsd"], serde_json::json!(0.5));
+
+        // The unsupported document still carries both keys, so the client
+        // never has to tell "absent" from "false".
+        let empty = render_sessions_json(false, &[]);
+        let value: serde_json::Value = serde_json::from_str(&empty).expect("valid JSON");
+        assert_eq!(value["supported"], serde_json::json!(false));
+        assert_eq!(value["sessions"], serde_json::json!([]));
     }
 
     /// The fallback half of the same contract: with nothing listening, the live

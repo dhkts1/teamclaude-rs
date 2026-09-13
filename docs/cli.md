@@ -610,6 +610,35 @@ a panel's fleet-wide headline never disagrees with the per-session rows by re-su
 
 ---
 
+## `tcr sessions`
+
+`tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the last hour. This is the
+channel TcrBar's panel reads for its Sessions and Tools tabs: the rows live only on the proxy's own
+`/_tcr/status` response, behind the proxy api-key, and the app may not read that key, so it shells
+out here the way it does for every other fact.
+
+Live only, with no offline fallback. A session is per-process state that exists nowhere on disk, so
+an offline rendering could only be an empty list dressed up as a measurement. With nothing listening
+the command exits non-zero and says so on stderr.
+
+```
+tcr sessions --json | jq -c '{supported, n: (.sessions|length)}'
+```
+
+`supported` answers **did this server's payload carry a `sessions` key**, not whether the array has
+anything in it. A proxy built before sessions existed and a completely idle one both report zero
+rows, and the panel has a different sentence for each, so the two must stay distinguishable. The
+rows themselves are the same `SessionRow` shape `tcr status --json`'s payload documents above,
+verbatim.
+
+`tcr status --json` is unchanged and still emits a bare array of accounts. The `supported` flag has
+nowhere to live in an array, which is why this is a separate verb rather than a flag on `status`.
+
+The build-skew warning goes to **stderr** in both modes, as `status`'s does, so `--json`'s stdout
+stays a single JSON object a script can pipe into `jq`.
+
+---
+
 ## `tcr wrap`
 
 `tcr wrap [--days N] [--json]` — a usage report for the last `N` days (default 7, ending
