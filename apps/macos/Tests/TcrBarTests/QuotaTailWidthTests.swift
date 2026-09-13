@@ -33,6 +33,17 @@ final class QuotaTailWidthTests: XCTestCase {
         "$1,190+ · 3.1M",  // the `+` an unpriced request adds
         "Max 20x",
         "Team Standard",
+        // The Fable tail's no-caption form (``Account/fableTailLabel``, when
+        // the Fable window's reset equals the 7d row's own) — the common
+        // case, since most fixtures learn both windows from the same poll.
+        // The WITH-caption form ("fable 72% · in 3d 18h", the bridge's own
+        // example) measures 118.8 pt at this size — already past even
+        // ``testTheColumnDoesNotGrowWideEnoughToStarveTheBar``'s 96 pt
+        // ceiling, so no width this column can safely take fits it. That
+        // case elides through the same `.truncationMode(.middle)` the cost
+        // tail already relies on; it is not asserted here because there is
+        // no width to widen to that would make it pass.
+        "fable 100%",
     ]
 
     func testEveryTrailingStringFitsTheColumnItIsDrawnIn() throws {
@@ -59,35 +70,34 @@ final class QuotaTailWidthTests: XCTestCase {
         XCTAssertLessThanOrEqual(
             width, 96,
             "V4.usageTailWidth is \(width) pt. Past ~96 the quota bar is narrower than the "
-                + "text beside it; put the long string on its own line (AccountCard.fableLine) "
-                + "instead of widening this column.")
+                + "text beside it; put the long string on its own line instead of widening "
+                + "this column.")
     }
 
-    /// The card draws TWO bar rows. The model-scoped weekly window is a caption
-    /// line under them (``Account/fableWeeklyLabel(now:)``), which is where it
-    /// sat before v4 — a third bar row cost every card a measured 21 pt, and
-    /// putting it in the trailing column cost both bars far more than that.
-    func testTheModelScopedWindowIsACaptionLineAndNotAThirdBarRow() throws {
+    /// The card draws TWO bar rows and no more. The model-scoped weekly
+    /// window is a STRING in the second row's own trailing column
+    /// (``AccountCard/rowTail(_:)``), which is where the pre-v4 card drew it
+    /// too — a third bar row costs every card a measured 21 pt, and a caption
+    /// line under the bars (the v4 transcription, then briefly reverted to
+    /// only to be reverted again) costs every fable card a measured line of
+    /// height. Gil, 2026-09-13: "no like we had both … align it like we had
+    /// before."
+    func testTheModelScopedWindowIsATailStringAndNotAThirdBarRowOrACaptionLine() throws {
         let source = try panelSource("PanelV4/AccountCard.swift")
         let squashed = source.components(separatedBy: .whitespacesAndNewlines).joined()
         XCTAssertFalse(
             squashed.contains("QuotaWindowSpec(label:\"fable\""),
             "the model-scoped window is a bar row again — that is the 21 pt per card "
                 + "this layout exists to give back")
+        XCTAssertFalse(
+            squashed.contains("fableLine"),
+            "the caption line under the bars is back — the card is one line taller per "
+                + "fable account again, which is what Gil asked to undo")
         XCTAssertTrue(
-            squashed.contains("account.fableWeeklyLabel(now:now)"),
-            "the caption line no longer uses Account.fableWeeklyLabel, so the panel now has "
+            squashed.contains(
+                "account.fableTailLabel(now:now,sevenDayResetAtMs:account.sevenDayResetAtMs)"),
+            "row 2's tail no longer reads from Account.fableTailLabel, so the panel now has "
                 + "a second spelling of that string and the two can drift")
-        // ADJACENCY, not presence: `fableLine` also NAMES the declaration below,
-        // so `contains("fableLine")` stays true with the draw call deleted —
-        // watched, 2026-09-13, that exact mutation exited 0 against it. What is
-        // pinned here is the CALL: the line sits right after the window loop's
-        // closing brace, inside the `shape == .full` block, so it draws under
-        // the bars and only on the shape that has them.
-        XCTAssertTrue(
-            squashed.contains("trailingHelp:planLine)}fableLine}"),
-            "the fable caption line is no longer drawn directly under the quota rows "
-                + "(it may still be declared — that is not the same thing)")
     }
 
     /// A card inside a group box is ``AccountCard/Shape/compact``, which is NOT

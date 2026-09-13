@@ -96,6 +96,39 @@ final class FableWindowTests: XCTestCase {
         XCTAssertEqual(stale.fableWeeklyLabel(now: now), "fable 71%")
     }
 
+    // MARK: The row-2 tail — the same figure, minus a repeated reset
+
+    /// The 7d row already prints its own reset caption beside its bar. When
+    /// the Fable window resets at that exact instant, saying it twice on the
+    /// same row is noise, not a second fact — so the tail drops it.
+    func testEqualResetsDropTheCaptionOnTheTail() throws {
+        let alice = try decoded(oi: "0.72", state: "\"near\"", reset: "\(fourDaysTwelveHours)")
+        XCTAssertEqual(
+            alice.fableTailLabel(now: now, sevenDayResetAtMs: fourDaysTwelveHours),
+            "fable 72%",
+            "the fable window and the 7d row reset at the same instant — the row's own "
+                + "caption already says it")
+    }
+
+    /// The Fable window has its own reset clock, unrelated to the 7d one
+    /// beside it — the ordinary case — so the tail keeps its own caption.
+    func testDifferentResetsKeepTheCaptionOnTheTail() throws {
+        let oneDayTwoHours: Int64 = 1_767_225_600_000 + (1 * 1440 + 120) * 60_000
+        let alice = try decoded(oi: "0.72", state: "\"near\"", reset: "\(oneDayTwoHours)")
+        XCTAssertEqual(
+            alice.fableTailLabel(now: now, sevenDayResetAtMs: fourDaysTwelveHours),
+            "fable 72% · in 1d 2h",
+            "the two windows reset at different times, so both facts belong on the tail")
+    }
+
+    /// An older server, or an account this window was never learned for,
+    /// draws nothing in the tail either — the same absence rule
+    /// ``fableWeeklyLabel`` follows.
+    func testNilSevenDayOiDrawsNoTail() throws {
+        let never = try decoded(oi: "null", state: "null", reset: "null")
+        XCTAssertNil(never.fableTailLabel(now: now, sevenDayResetAtMs: fourDaysTwelveHours))
+    }
+
     // MARK: What VoiceOver hears
 
     func testTheSpokenFormNamesTheWindowInWordsAndSaysUsed() throws {

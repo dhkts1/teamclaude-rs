@@ -103,9 +103,9 @@ struct AccountCard<Actions: View>: View {
                     resetAtMs: window.resetAtMs, now: now,
                     trailing: rowTail(index),
                     trailingReserved: usageTail != nil || rowTail(1) != nil,
-                    trailingHelp: planLine)
+                    trailingHelp: index == 1 ? row1TrailingHelp : planLine,
+                    trailingTint: index == 1 ? fableTailTint : nil)
             }
-            fableLine
         }
         // `.contain` WITH a label. Without one the container has no accessible
         // name, so it cannot take focus and a user arriving at the card is told
@@ -202,19 +202,50 @@ struct AccountCard<Actions: View>: View {
     /// phrase, plan name included, is the hover.
     /// What the reserved right-hand column says on row `index`.
     ///
-    /// The first row carries the money and tokens, the second the plan name —
-    /// the two halves of the old full-width plan line, parked in a column the
-    /// rows already reserve. Gil, 2026-09-13, on the shorter card: "i like
-    /// right more but it missing the type can we have it somehow?"
+    /// The first row carries the money and tokens. The second carries the
+    /// Fable weekly figure when this account has one (``Account/fableTailLabel(now:sevenDayResetAtMs:)``),
+    /// which is where the pre-v4 card drew it too (Gil, 2026-09-13: "no like
+    /// we had both … align it like we had before") — never both at once, so a
+    /// Fable account's plan name is one hover away (``row1TrailingHelp``)
+    /// rather than a second line. Falls back to the plan name, the pre-Fable
+    /// behaviour, for every account this window was never learned for.
     private func rowTail(_ index: Int) -> String? {
         switch index {
         case 0: return usageTail
-        // A grouped card already carries the plan INSIDE its name row
-        // (``nameRow``), so repeating it here would print it twice on the one
-        // card that is short of width.
-        case 1: return shape == .compact ? nil : planName
+        case 1:
+            if account.sevenDayOi != nil {
+                return account.fableTailLabel(now: now, sevenDayResetAtMs: account.sevenDayResetAtMs)
+            }
+            // A grouped card already carries the plan INSIDE its name row
+            // (``nameRow``), so repeating it here would print it twice on the
+            // one card that is short of width.
+            return shape == .compact ? nil : planName
         default: return nil
         }
+    }
+
+    /// The row-2 tail's colour: the Fable window's own tint
+    /// (``Account/fableBarTintSource``) so a near-empty Fable window is still
+    /// amber or red at a glance, never `quotaBarTintSource(for:)` — that
+    /// function's old-server fallback borrows the composite `quotaState`,
+    /// which for this window would be a reading of something else entirely.
+    /// `nil` when there is no Fable figure, which falls back to `QuotaRow`'s
+    /// own `Tok.mute` for the plan name it draws instead.
+    private var fableTailTint: Color? {
+        account.sevenDayOi != nil ? account.fableBarTintSource.fillColor : nil
+    }
+
+    /// The row-2 tail's hover text: the full ``Account/fableWeeklyLabel(now:)``
+    /// plus the plan name (`"fable 72% · in 3d 18h · Max 20x"`), so the plan
+    /// is one hover away rather than lost when the tail carries Fable
+    /// instead of it. Falls back to ``planLine`` when there is no Fable
+    /// figure, matching what row 2 actually shows.
+    private var row1TrailingHelp: String? {
+        guard account.sevenDayOi != nil, let fable = account.fableWeeklyLabel(now: now) else {
+            return planLine
+        }
+        guard let plan = planName else { return fable }
+        return "\(fable) · \(plan)"
     }
 
     /// `"Max 20x"` — the plan, on its own, for the row-2 tail.
@@ -249,38 +280,19 @@ struct AccountCard<Actions: View>: View {
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
-    /// The windows the card draws: the mockup's two, plus `fable` under them
-    /// when this account has one.
+    /// The windows that get a BAR ROW: the rolling session window and the
+    /// weekly one, and only those two.
     ///
-    /// `5h` and `7d` are drawn even with no reading at all — an empty track is
-    /// a fact ("never measured"), and dropping the row would make a card that
-    /// has never been probed look like one with nothing to report.
-    ///
-    /// `fable` is the opposite case and is drawn only when ``Account/sevenDayOi``
-    /// is non-nil. It is a SEPARATE window with a separate reset, gating Fable
+    /// `fable` is a SEPARATE window with a separate reset, gating Fable
     /// requests alone (`docs/cli.md`, "The weekly quota pair on `--json`"): a
     /// non-Fable request never checks it, and `held[]`/`quotaState` never
-    /// reflect it — so it cannot be read off the `7d` bar above it, and an
-    /// empty `fable` track on an account that simply has no such window would
-    /// be a claim about a window that does not exist. The pre-v4 card drew it
-    /// as a label on the 7d line (`Account.fableWeeklyLabel`, "fable 71% · in
-    /// 4d 12h"); the v4 transcription referenced it nowhere at all, so the
-    /// panel drew no Fable figure while the router was gating on one (Gil,
-    /// 2026-09-13: "why i dont see fable like we had before?").
-    ///
-    /// Its tint comes from ``Account/fableBarTintSource`` and never from
-    /// `quotaBarTintSource(for:)`: that function's old-server fallback borrows
-    /// the composite `quotaState`, which for this window would be a reading of
-    /// something else entirely.
-    /// The windows that get a BAR ROW: the rolling session window and the weekly
-    /// one, and only those two.
-    ///
-    /// The model-scoped weekly window is drawn as a caption in the tail beside
-    /// the `7d` bar (``fableTail``) instead, which is where it sat before it was
-    /// promoted to a row of its own. A row costs every card a measured 21 pt; a
-    /// caption costs nothing, because the tail column is already reserved for
-    /// the cost figure above it. Gil, 2026-09-13: "can we have the fable line be
-    /// like here again?"
+    /// reflect it — so it cannot be read off the `7d` bar beside it, and it
+    /// gets no bar row of its own. It is drawn in the SAME trailing column as
+    /// the cost figure and the plan name (``rowTail(_:)``), on the 7d row,
+    /// which is where the pre-v4 card drew it too (Gil, 2026-09-13: "no like
+    /// we had both … align it like we had before"). A row costs every card a
+    /// measured 21 pt; the tail column costs nothing extra, because it is
+    /// already reserved for the figure above it.
     private var quotaWindows: [QuotaWindowSpec] {
         [
             QuotaWindowSpec(
@@ -292,36 +304,5 @@ struct AccountCard<Actions: View>: View {
                 tint: account.quotaBarTintSource(for: .sevenDay),
                 resetAtMs: account.sevenDayResetAtMs),
         ]
-    }
-
-    /// `"fable 71% · in 4d 12h"` — the model-scoped weekly window as ONE
-    /// caption line under the two bars, which is where the pre-v4 card drew it
-    /// (Gil, 2026-09-13: "can we have the fable line be like here again?").
-    ///
-    /// A caption line, not a third ``QuotaRow``, and not a string in the rows'
-    /// trailing column. As a row it cost every card a measured 21 pt. In the
-    /// trailing column it cost more and less visibly: that column is a FIXED
-    /// width shared by every row, so sizing it for this string (127 pt at
-    /// Comfortable, against 67 pt for the cost figure it was built for) came
-    /// straight out of the bars — measured 154 pt of bar down to 48 pt, on both
-    /// rows, on every card, which is the one thing ``QuotaRow``'s own
-    /// doc-comment says the full-width bar exists to protect. Here it is laid
-    /// out against the whole card and cannot truncate.
-    ///
-    /// The string is ``Account/fableWeeklyLabel(now:)`` — the pre-v4 card's own
-    /// function, not a second spelling of it, so the two cannot drift. `nil`
-    /// when the proxy has never learned this window for the account, which
-    /// stays different from a zero.
-    @ViewBuilder
-    private var fableLine: some View {
-        if let label = account.fableWeeklyLabel(now: now) {
-            Text(label)
-                .font(V4.font(V4.muteSize))
-                .foregroundStyle(account.fableBarTintSource.fillColor ?? Tok.mute)
-                .lineLimit(1)
-                .padding(.top, V4.quotaMarginTop)
-                .accessibilityLabel(
-                    account.fableWeeklySpokenLabel(now: now) ?? label)
-        }
     }
 }

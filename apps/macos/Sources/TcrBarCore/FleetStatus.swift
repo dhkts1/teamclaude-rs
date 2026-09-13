@@ -1830,6 +1830,31 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return "\(figure) · \(caption)"
     }
 
+    /// `"fable 72%"` or `"fable 72% · in 1d 2h"` — the SAME figure as
+    /// ``fableWeeklyLabel``, for the trailing column on the card's 7d row
+    /// rather than a caption line under the bars (Gil, 2026-09-13: "no like we
+    /// had both … align it like we had before").
+    ///
+    /// The caption is dropped when it would just restate the 7d row's own
+    /// reset, passed in as `sevenDayResetAtMs` — that row already prints "in
+    /// 3d 18h" beside its bar, and printing it a second time here is noise,
+    /// not a second fact. It stays when the two windows reset at different
+    /// times, which is the ordinary case: the Fable window has its own reset
+    /// clock, unrelated to the 7d one beside it.
+    ///
+    /// ``fableWeeklyLabel`` is untouched and keeps feeding the tooltip and
+    /// ``fableWeeklySpokenLabel`` — both have the room to say a reset even
+    /// when it repeats the 7d row's.
+    public func fableTailLabel(now: Date, sevenDayResetAtMs: Int64?) -> String? {
+        guard let sevenDayOi else { return nil }
+        let figure = "fable \(QuotaFormat.percent(sevenDayOi))"
+        guard let caption = QuotaFormat.resetCaption(resetAtMs: sevenDayOiResetAtMs, now: now)
+        else { return figure }
+        let rowCaption = QuotaFormat.resetCaption(resetAtMs: sevenDayResetAtMs, now: now)
+        if caption == rowCaption { return figure }
+        return "\(figure) · \(caption)"
+    }
+
     /// ``fableWeeklyLabel`` for VoiceOver, spoken as part of the row's combined
     /// label for the same reason the spend figures are: a fact only a sighted
     /// user gets is half built.

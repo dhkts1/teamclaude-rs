@@ -89,6 +89,12 @@ struct QuotaRow: View {
     /// to fit beside a bar; the full phrase it abbreviates stays one hover
     /// away rather than being lost with the row it used to occupy.
     var trailingHelp: String? = nil
+    /// The tail text's colour. `nil` (the default) draws `Tok.mute`, the
+    /// figure's ordinary colour — the cost tail and the plan name both stay
+    /// neutral. The Fable tail passes its own window's tint
+    /// (``Account/fableBarTintSource``) so a near-empty Fable window is still
+    /// amber or red at a glance, the way its caption used to read.
+    var trailingTint: Color? = nil
 
     private var fraction: Double {
         switch QuotaFormat.barFill(value) {
@@ -162,7 +168,7 @@ struct QuotaRow: View {
                 Spacer(minLength: V4.quotaGap)
                 Text(trailing ?? "")
                     .font(V4.font(V4.muteSize))
-                    .foregroundStyle(Tok.mute)
+                    .foregroundStyle(trailingTint ?? Tok.mute)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .frame(width: V4.usageTailWidth, alignment: .trailing)

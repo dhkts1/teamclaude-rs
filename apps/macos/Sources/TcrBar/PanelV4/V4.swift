@@ -138,8 +138,9 @@ enum V4 {
     /// It does not grow past that. The column is a FIXED width shared by every
     /// quota row, so every point given to it comes out of BOTH bars on EVERY
     /// card: at 112 pt, for a window caption, the bar went from a measured
-    /// 154 pt to 48 pt. A caption too long for this column belongs on its own
-    /// line (`AccountCard.fableLine`), not in it.
+    /// 154 pt to 48 pt. A string too long for this column belongs on a line of
+    /// its own, not in it — `QuotaTailWidthTests` is the gate that catches one
+    /// before it ships.
     static let usageTailWidth: CGFloat = 88
     static var quotaMarginTop: CGFloat { compact ? 2 : 3 }
     static var barHeight: CGFloat { compact ? 6 : 7 }
