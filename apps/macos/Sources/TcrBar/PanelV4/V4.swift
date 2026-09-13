@@ -120,6 +120,16 @@ enum V4 {
     static var quotaLabelWidth: CGFloat { compact ? 32 : 34 }
     static let quotaPercentWidth: CGFloat = 40
     static let quotaGap: CGFloat = 8
+
+    /// The width every quota row reserves for the account's cost figure, on
+    /// a card that carries one.
+    ///
+    /// RESERVED on every row, drawn on the first. The bar is the row's `1fr`
+    /// column, so a figure that took width from one row alone left that row's
+    /// bar shorter than the two below it, and equal percentages then drew
+    /// unequal ink inside ONE card — the exact confusion `QuotaRow`'s own
+    /// doc-comment says the full-width bar exists to remove.
+    static let usageTailWidth: CGFloat = 68
     static var quotaMarginTop: CGFloat { compact ? 4 : 6 }
     static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4

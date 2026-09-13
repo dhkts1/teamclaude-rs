@@ -82,6 +82,9 @@ struct QuotaRow: View {
     /// windows). Only the FIRST window gets one; a figure repeated per row
     /// would say three different things about one account.
     var trailing: String? = nil
+    /// Set on EVERY row of a card that carries a cost figure, including the
+    /// rows that do not draw one, so all the bars keep one width.
+    var trailingReserved: Bool = false
     /// What a hover says about ``trailing``. The inline figure is abbreviated
     /// to fit beside a bar; the full phrase it abbreviates stays one hover
     /// away rather than being lost with the row it used to occupy.
@@ -155,14 +158,16 @@ struct QuotaRow: View {
                     .foregroundStyle(captionTint)
                     .fixedSize()
             }
-            if let trailing {
+            if trailingReserved {
                 Spacer(minLength: V4.quotaGap)
-                Text(trailing)
+                Text(trailing ?? "")
                     .font(V4.font(V4.muteSize))
                     .foregroundStyle(Tok.mute)
                     .lineLimit(1)
-                    .fixedSize()
-                    .help(trailingHelp ?? trailing)
+                    .truncationMode(.middle)
+                    .frame(width: V4.usageTailWidth, alignment: .trailing)
+                    .help(trailingHelp ?? trailing ?? "")
+                    .accessibilityHidden(trailing == nil)
             }
         }
         .frame(minHeight: V4.lineHeight(V4.dimSize))
