@@ -321,6 +321,15 @@ enum V4 {
     /// `scale .96 over 120 ms` on press; `spring, damping 1.0, response 0.3` for a
     /// tab switch or an expand.
     static let pressScale: CGFloat = 0.96
+    /// `.more:hover{background:rgba(255,255,255,.07)}` — and the same +.07 the
+    /// sheet's other hovers are: `.btn` goes `.10` to `.17`, `.more` `0` to
+    /// `.07`. Added OVER whatever fill a control already has, so one rule
+    /// reproduces both rather than a hover value per control.
+    static let hoverFillAlpha: Double = 0.07
+    /// `transition:background-color .15s cubic-bezier(.2,0,0,1)`. Inside the
+    /// sheet's `@media (prefers-reduced-motion:no-preference)` block, which is
+    /// why Reduce Motion drops the transition and keeps the hover.
+    static let hoverDuration: Double = 0.15
     static let springResponse: Double = 0.3
     static let springDamping: Double = 1.0
 

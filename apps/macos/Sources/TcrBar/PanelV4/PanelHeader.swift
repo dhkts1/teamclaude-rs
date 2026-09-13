@@ -56,7 +56,7 @@ struct PanelHeader: View {
                         .fill(Tok.ink.opacity(V4.gearFillAlpha))
                 )
         }
-        .buttonStyle(V4PressStyle())
+        .buttonStyle(V4PressStyle(cornerRadius: V4.gearRadius))
         .accessibilityLabel("Settings")
         .keyboardShortcut(",", modifiers: .command)
         .help("Settings… ⌘,")
