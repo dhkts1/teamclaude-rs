@@ -4,7 +4,7 @@
 # --all-targets --locked` on ubuntu, and `--all` means `--workspace`: anything
 # listed here compiles on Linux.
 [workspace]
-members = [".", "crates/tcr-status-wire"]
+members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass"]
 resolver = "2"
 
 [package]
