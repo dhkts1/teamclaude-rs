@@ -84,19 +84,16 @@ struct AccountCard<Actions: View>: View {
                 if let plan = planLine {
                     MuteText(text: plan)
                 }
-                // Compact draws every window on one line — the fix for the
-                // measured +42 pt the restored `fable` row cost a Compact card.
-                // Comfortable keeps the
-                // three full rows exactly as before this change: this is a
-                // shorter card, never a smaller font on the same rows.
-                if V4.compact {
-                    DenseQuotaLine(windows: quotaWindows, now: now)
-                } else {
-                    ForEach(quotaWindows, id: \.label) { window in
-                        QuotaRow(
-                            label: window.label, value: window.value, tint: window.tint,
-                            resetAtMs: window.resetAtMs, now: now)
-                    }
+                // One row per window in both shapes. Compact used to fold
+                // these onto a single dense line (the fix for a measured
+                // +42 pt over its own two-row card) — Gil saw that line and
+                // preferred readable bars, so Compact draws the same rows as
+                // Comfortable, just at Compact's own tighter density tokens
+                // (`V4.quotaLabelWidth`, `V4.quotaMarginTop`, `V4.barHeight`).
+                ForEach(quotaWindows, id: \.label) { window in
+                    QuotaRow(
+                        label: window.label, value: window.value, tint: window.tint,
+                        resetAtMs: window.resetAtMs, now: now)
                 }
             }
         }
