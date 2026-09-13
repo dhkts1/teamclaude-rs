@@ -3,8 +3,8 @@ import XCTest
 @testable import TcrBarCore
 
 /// `Account.groupMenuActions` — the row-level right-click menu that changes
-/// group membership (bridge: `docs/plans/group-tags-bridge.md`; originally
-/// added by `docs/plans/stacked-cards-bridge.md`, whose own deck-card
+/// group membership; originally
+/// added alongside deck cards, whose own deck-card
 /// summary-line tests this file used to carry were deleted along with
 /// `GroupSection`/`GroupDeckCard`). Account names are obviously fake — this
 /// repository is public.

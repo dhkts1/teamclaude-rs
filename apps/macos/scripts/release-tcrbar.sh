@@ -369,8 +369,8 @@ appcast_insert() {
 # Feed-outage guard
 # ---------------------------------------------------------------------------
 
-# Measured across four releases (docs/plans/swarm-retrospectives.md,
-# 2026-08-10 entry: 11m37s outage; prevented on 2026-08-14 only by a
+# Measured across four releases (2026-08-10: 11m37s outage; prevented on
+# 2026-08-14 only by a
 # disposable ad-hoc script) the update feed goes dark for the entire gap
 # between the tag-triggered workflow creating the GitHub Release — which
 # becomes `latest` immediately, carrying only CLI tarballs — and THIS script

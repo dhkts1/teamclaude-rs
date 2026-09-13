@@ -99,6 +99,19 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
   real-looking email address in $what:
 $(printf '%s\n' "$found" | sed 's/^/      /')"
 
+  # 4. Internal (Henry) scaffolding — a citation of an untracked, machine-local
+  #    path (`data/plans/…`, any `*-bridge.md`) is a dangling pointer for a
+  #    public reader, and "coordinator"/"Lane A/B/C"/"swarm" name our internal
+  #    multi-agent process rather than a fact about this codebase. `.githooks/**`
+  #    is excluded from the text this function ever sees (see the two functions
+  #    below) precisely so this gate's own source can describe, in prose, the
+  #    tokens it blocks without tripping on itself.
+  found="$(printf '%s\n' "$text" \
+           | grep -E -m3 -i 'data/plans/|-bridge\.md|\bcoordinator\b|\blane [abc]\b|\bswarm\b' || true)"
+  [ -n "$found" ] && hits="$hits
+  internal-scaffolding reference in $what:
+$(printf '%s\n' "$found" | sed 's/^/      /')"
+
   if [ -n "$hits" ]; then
     printf '%s\n' "$hits"
     return 1
@@ -109,8 +122,11 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
 # tcr_disclosure_staged_added
 # The ADDED lines of the staged changes, so pre-existing content can never block
 # you. The denylist file itself is excluded: it holds the names on purpose.
+# `.githooks/**` is excluded too: this library and its callers must describe,
+# in their own comments, the exact tokens check 4 above blocks.
 tcr_disclosure_staged_added() {
-  git diff --cached -U0 --diff-filter=ACM -- . ':(exclude).githooks/private-names' \
+  git diff --cached -U0 --diff-filter=ACM -- . \
+    ':(exclude).githooks/private-names' ':(exclude).githooks/**' \
     | sed -n 's/^+//p' || true
 }
 
@@ -120,6 +136,7 @@ tcr_disclosure_staged_added() {
 tcr_disclosure_commit_added() {
   local sha="${1:-}"
   [ -n "$sha" ] || return 0
-  git show "$sha" --format= -U0 --diff-filter=ACM -- . ':(exclude).githooks/private-names' \
+  git show "$sha" --format= -U0 --diff-filter=ACM -- . \
+    ':(exclude).githooks/private-names' ':(exclude).githooks/**' \
     | sed -n 's/^+//p' || true
 }

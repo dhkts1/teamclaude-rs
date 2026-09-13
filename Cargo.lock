@@ -2551,6 +2551,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tcr-fdpass",
  "tcr-status-wire",
  "tempfile",
  "thiserror 2.0.20",

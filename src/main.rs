@@ -1388,6 +1388,9 @@ async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
         // `serve`, and the two silently disagreeing means a claim named for a port
         // this process never bound — which every reader looks straight past.
         owner_dir: Some(singleton::default_owner_dir()),
+        // The binary always binds for itself. A handed-over socket arrives
+        // through the handoff path, which constructs its own options.
+        inherited_listener: None,
     };
 
     let handle = match server::serve(options).await? {

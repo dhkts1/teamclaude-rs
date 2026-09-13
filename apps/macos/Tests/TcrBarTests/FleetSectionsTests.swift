@@ -260,7 +260,7 @@ final class FleetSectionsTests: XCTestCase {
                 .rows.map(\.account.name), ["a@example.com", "z@example.com"])
     }
 
-    // MARK: - Group outline (docs/plans/group-outline-bridge.md)
+    // MARK: - Group outline
 
     /// A named group's section carries its own server-resolved colour.
     /// `.ungrouped` carries none — decision #1, its absent outline IS the
@@ -381,7 +381,7 @@ final class FleetSectionsTests: XCTestCase {
         }
     }
 
-    // MARK: - Group legend (data/plans/panel-groups-bridge.md)
+    // MARK: - Group legend
 
     /// A wholly-parked named group's legend carries both the group name and
     /// " · PARKED" — the one place that word survives once the per-row pill
@@ -441,7 +441,7 @@ final class FleetSectionsTests: XCTestCase {
         XCTAssertEqual(parked.legendText, "DEV · PARKED · 1")
     }
 
-    // MARK: - Sole group in band (data/plans/panel-groups-bridge.md, item 2)
+    // MARK: - Sole group in band
 
     /// A band holding exactly one group section — named or ungrouped — draws
     /// no band heading: the group's own heading (or legend) already says
@@ -473,7 +473,7 @@ final class FleetSectionsTests: XCTestCase {
 
 /// A row with everything but the group/state fields fixed — the same shape
 /// `GroupTagTests` uses, so the two files' fixtures cannot drift.
-// MARK: - Collapse (data/plans/v4-spec.md; the mockup's MYCELIUM group)
+// MARK: - Collapse (the mockup's MYCELIUM group)
 
 extension FleetSectionsTests {
 

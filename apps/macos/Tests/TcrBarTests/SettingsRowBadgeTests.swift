@@ -2,7 +2,7 @@ import XCTest
 
 @testable import TcrBarCore
 
-/// The table gate 1 of `data/plans/settings-window-bridge.md` asks for: every
+/// The table gate 1 asks for: every
 /// row the Settings window draws carries an applied-live / restart-to-apply /
 /// read-only marking, and none of them silently falls back to "no entry means
 /// live" — that fallback is exactly the review's S3 finding

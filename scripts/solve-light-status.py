@@ -6,8 +6,7 @@ into green, and deepening red to separate it from green pushed red out of the
 sRGB gamut. Those constraints are coupled, so solve them together instead of
 one at a time.
 
-The floor is 4.5:1, not 3.0:1 (review #6,
-`data/plans/interface-review-2026-09-13.md`): a status hue here is a pill
+The floor is 4.5:1, not 3.0:1 (review #6): a status hue here is a pill
 label, a summary clause and a reset caption -- body text wearing a hue, not a
 bar or a dot beside it -- so it carries the same obligation the ink scale
 does, in both appearances.

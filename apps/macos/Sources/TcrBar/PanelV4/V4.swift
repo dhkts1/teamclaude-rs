@@ -4,8 +4,7 @@ import TcrBarCore
 
 /// The v4 number sheet, as Swift.
 ///
-/// `data/plans/v4-spec.md` is the extraction of `docs/design/panel-tabs-mockup.html`'s
-/// `<style>` block; this enum is that sheet with one name per CSS declaration, at
+/// The mockup's `<style>` block, extracted here as one name per CSS declaration, at
 /// 1 CSS px = 1 pt. It is the ONE file under `PanelV4/` allowed to hold a raw
 /// number — `scripts/check-panel-v4.sh` fails the build if any sibling view
 /// writes a literal size or reaches for a pre-v4 geometry token, because the
@@ -20,7 +19,7 @@ import TcrBarCore
 /// and are named as such.
 enum V4 {
     /// Whether the type and box tokens below shrink (Gil, 2026-09-13: "yes the
-    /// right compact is better" — `data/plans/panel-density-bridge.md`).
+    /// right compact is better").
     ///
     /// ``PanelDensityPreference/resolved(defaults:accounts:)``, not
     /// `current() == .compact`: the shipped default is `.auto`, and against

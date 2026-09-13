@@ -4,7 +4,7 @@ import XCTest
 
 /// What the Tools tab's duration pill prints, and what VoiceOver hears.
 ///
-/// The finding these pin (`data/plans/interface-review-2026-09-13.md` #4): a
+/// The finding these pin (review #4): a
 /// call the proxy KILLED at the Bash timeout and one that merely ran long drew
 /// the same string in the same pill, red against grey the only difference — and
 /// the pill's accessibility label was that same string, so a listener was told

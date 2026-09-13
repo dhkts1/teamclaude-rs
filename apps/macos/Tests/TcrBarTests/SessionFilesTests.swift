@@ -10,9 +10,9 @@ final class SessionFilesTests: XCTestCase {
         return dir
     }
 
-    /// A missing directory reads as no files at all, never a thrown error —
-    /// `panel-tabs-bridge.md`: "Tolerate a missing directory … skip, never
-    /// fail the poll." Most machines running `tcr` have never run Claude
+    /// A missing directory reads as no files at all, never a thrown error:
+    /// tolerate a missing directory, skip, never fail the poll. Most
+    /// machines running `tcr` have never run Claude
     /// Code's own CLI, so this is the routine case, not the edge one.
     func testMissingDirectoryReadsAsEmpty() {
         let missing = FileManager.default.temporaryDirectory
@@ -56,8 +56,8 @@ final class SessionFilesTests: XCTestCase {
             sessionId: id, account: account, model: "claude-opus-5", firstSeenMs: 0, lastSeenMs: lastSeenMs)
     }
 
-    /// `panel-tabs-bridge.md`: "A wire session with no file shows its id's
-    /// first 8 chars and no project."
+    /// A wire session with no file shows its id's
+    /// first 8 chars and no project.
     func testWireSessionWithNoFileShowsIdHeadAndNoProject() {
         let joined = JoinedSession(session: session(id: "11111111-aaaa-bbbb"), file: nil)
         XCTAssertEqual(joined.displayName, "11111111")
@@ -77,8 +77,8 @@ final class SessionFilesTests: XCTestCase {
         XCTAssertEqual(joined.activity, .busy)
     }
 
-    /// A file with no matching wire session is dropped — `panel-tabs-bridge.md`:
-    /// "it never went through the proxy" — so the join always returns exactly
+    /// A file with no matching wire session is dropped — it never went
+    /// through the proxy — so the join always returns exactly
     /// `sessions.count` rows, never `files.count`.
     func testAFileWithNoMatchingWireSessionIsDropped() {
         let sessions = [session(id: "s1")]

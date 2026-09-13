@@ -4,8 +4,8 @@
 # geometry token.
 #
 # `apps/macos/Sources/TcrBar/PanelV4/` is a transcription of
-# `docs/design/panel-tabs-mockup.html`'s `<style>` block: one CSS declaration,
-# one `V4` constant, `data/plans/v4-spec.md` as the sheet in between. Eleven
+# the mockup's `<style>` block: one CSS declaration,
+# one `V4` constant, the v4 number sheet in between. Eleven
 # adaptation rounds before it drifted by exactly one mechanism — a 16 written
 # here because it looked right, an 8 there because the thing above it had one —
 # each locally defensible and collectively a different design from the one that

@@ -4,8 +4,7 @@ import XCTest
 
 /// What Compact's one-line quota block speaks — the reset every window's
 /// caption used to carry, moved to this line's own accessibility value and
-/// `.help` tooltip once three ``QuotaRow`` lines folded onto one
-/// (`data/plans/dense-quota-bridge.md`).
+/// `.help` tooltip once three ``QuotaRow`` lines folded onto one.
 ///
 /// `swift test` links `TcrBarCore` only, so `DenseQuotaLine` itself cannot be
 /// built here; what it speaks is `QuotaFormat.denseLineSpokenValue`, which can

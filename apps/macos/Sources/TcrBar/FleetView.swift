@@ -49,9 +49,8 @@ struct FleetView: View {
     /// Opens the "What's new" window. A closure rather than the controller so
     /// the render harness passes `{}` and can neither fetch nor open anything.
     var onWhatsNew: () -> Void = {}
-    /// Opens the Settings window (gear button, `⌘,`) — `data/plans/
-    /// settings-window-bridge.md`. Same closure shape as ``onWhatsNew``, and
-    /// for the same reason: the render harness passes `{}`.
+    /// Opens the Settings window (gear button, `⌘,`). Same closure shape as
+    /// ``onWhatsNew``, and for the same reason: the render harness passes `{}`.
     var onSettings: () -> Void = {}
 
     /// Surfaced in place rather than swallowed: a button that silently does
@@ -138,8 +137,7 @@ struct FleetView: View {
     /// loop with a pass budget rather than a convergence test.
     @State private var v4ContentHeight: CGFloat = 0
 
-    /// Accounts / Sessions / Tools (F2 + F3, `panel-tabs-bridge.md`).
-    /// `.accounts` selected by default, per the bridge.
+    /// Accounts / Sessions / Tools (F2 + F3). `.accounts` selected by default.
     @State private var selectedTab: PanelTab = .accounts
 
     /// The Claude Code session files joined to the wire's `Session`s for the
@@ -170,7 +168,7 @@ struct FleetView: View {
         onWhatsNew: @escaping () -> Void = {},
         onSettings: @escaping () -> Void = {},
         initialTab: PanelTab = .accounts,
-        // Coordinator-flagged gap (2026-09-12): `snapshotMode` never reads
+        // Found in review (2026-09-12): `snapshotMode` never reads
         // real session files (comment above, `body`'s `.onAppear`), so every
         // render-states Sessions/Tools fixture used to join to NOTHING and
         // read `.unknown` → the summary line's "idle" bucket for every
@@ -912,9 +910,9 @@ struct FleetView: View {
     // driven entirely by `rowHeights`, which the Accounts tab keeps populated
     // the instant it is on screen (the default tab), so switching to either
     // new tab reuses that same number as a FIXED height budget rather than
-    // measuring its own content. That is `panel-tabs-bridge.md`'s rule made
-    // concrete: "Each tab gets a FIXED height budget through the same
-    // functions; no tab's height may depend on content it renders" — the
+    // measuring its own content: each tab gets a FIXED height budget through
+    // the same functions, and no tab's height may depend on content it
+    // renders — the
     // popover's layout-cycle crash (`ffe8a86`) is exactly what a
     // content-dependent height on a tab switch would risk reopening.
 
@@ -935,8 +933,7 @@ struct FleetView: View {
     /// live session count on `.sessions`; the RUNNING count on `.tools` — the
     /// one figure a glance at the closed tab cannot otherwise see. Both zero
     /// out to `nil` rather than drawing a `0` badge, the same "a zero count
-    /// should never render" rule `panel-tabs-bridge.md` names for the account
-    /// cards.
+    /// should never render" rule the account cards follow.
     private func badge(for tab: PanelTab, fleet: Fleet) -> Int? {
         switch tab {
         case .accounts: return nil
@@ -1309,7 +1306,7 @@ struct FleetView: View {
     }
 
     /// The ten slowest calls across every session, then running now, then
-    /// fleet-wide totals — `panel-tabs-bridge.md`'s order for this tab.
+    /// fleet-wide totals — this tab's order.
     @ViewBuilder
     private func toolsTab(_ fleet: Fleet) -> some View {
         if !fleet.sessionsSupported {
@@ -1422,9 +1419,8 @@ struct FleetView: View {
                             // the mockup's own `--ok` green for Bash and
                             // `--info` blue (`.accent`) for Agent
                             // (`docs/design/panel-tabs-review.md` finding 12,
-                            // left unresolved there; review #6's cap list,
-                            // `data/plans/interface-review-2026-09-13.md`,
-                            // raises it again). This bar's whole job is a
+                            // left unresolved there; a later review raised it
+                            // again). This bar's whole job is a
                             // share-of-total width comparison — the category
                             // is already named beside it in text — so a
                             // borrowed status colour told the reader
@@ -1472,8 +1468,8 @@ struct FleetView: View {
             .tracking(0.1 * 11)
     }
 
-    /// `commandHead` in monospace, truncated to one line — `panel-tabs-bridge.md`:
-    /// "`command_head` shown in monospace, truncated to one line." Shared by
+    /// `commandHead` in monospace, truncated to one line: `command_head`
+    /// shown in monospace, truncated to one line. Shared by
     /// ``runningToolRow(_:)`` and ``slowestToolRow(_:)`` so the two rows never
     /// drift on how a call names itself.
     /// `docs/design/panel-tabs-mockup.html`'s "Bash · teamclaude-rs-c7" — the
@@ -1625,7 +1621,7 @@ struct FleetView: View {
     /// non-healthy-read summary line above it in ``header``.
     private func freshnessLabel(since: Date, now: Date) -> String {
         let elapsed = max(0, now.timeIntervalSince(since))
-        // Coordinator-flagged (2026-09-12): a fixture pinned to a fixed past
+        // Found in review (2026-09-12): a fixture pinned to a fixed past
         // `referenceDate` (`RenderStates.referenceDate`) produced "updated
         // 54097m ago" against a real `Date()` — a five-digit minute count is
         // a defect regardless of what produced the gap, so this tiers all
@@ -2456,10 +2452,9 @@ struct FleetView: View {
 
             // Start server at launch / Launch at login / Keep this Mac awake,
             // and Check for Updates / What's New / Quit, all moved to the
-            // Settings window the gear opens (`data/plans/
-            // settings-window-bridge.md`): "the panel loses the three
+            // Settings window the gear opens: the panel loses the three
             // toggles, Check for Updates, What's New and Quit from its
-            // bottom block; Refresh and Add account stay." ``fleetActions``
+            // bottom block; Refresh and Add account stay. ``fleetActions``
             // above is the surviving pair.
             dangerZone
         }
@@ -2751,7 +2746,7 @@ struct FleetView: View {
 /// A dictionary rather than one summed scalar because rows are not uniform
 /// height — `visibleRowsHeight(for:)` needs the first N individually, in
 /// display order, not just their total.
-/// The panel's three tabs (F2 + F3, `data/plans/panel-tabs-bridge.md`).
+/// The panel's three tabs (F2 + F3).
 /// `CaseIterable` so `panelTabBar` draws them in one declared order rather
 /// than a second list a reviewer has to keep in sync with this one.
 enum PanelTab: Equatable, CaseIterable {
@@ -2850,9 +2845,9 @@ extension View {
     ///
     /// The radius stays a literal 8 after `feat/tokens-parity` landed (#240),
     /// and that is deliberate: its `Tok.cardRadius` is an alias for
-    /// `radiusMedium`, 16, while `data/plans/v4-spec.md` measures the mockup's
-    /// card at 8. Swapping the name in would double the curve this bridge
-    /// exists to close. The gap between cards DID move to `Tok.cardGap` (14),
+    /// `radiusMedium`, 16, while the mockup's card measures at 8. Swapping
+    /// the name in would double the curve. The gap between cards DID move to
+    /// `Tok.cardGap` (14),
     /// which agrees with the sheet. Revisit when `feat/tokens-v4` restyles the
     /// radius family.
     func panelCard() -> some View {
@@ -4136,8 +4131,8 @@ struct AccountRow: View {
                 Text(emailWithBreakHint)
                     // v4-spec: account name is 15pt/600/-0.005em, system
                     // design — `Tok.bodyFont` is 13pt/medium/rounded, a
-                    // token owned by `feat/tokens-parity`; literal here per
-                    // the coordinator's fence until that lane's name lands.
+                    // token owned by `feat/tokens-parity`; literal here
+                    // until that token's name lands.
                     .font(Tok.nameFont)
                     .tracking(-0.005 * 15)
                     .lineSpacing(Tok.bodyLineSpacing)

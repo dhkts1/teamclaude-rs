@@ -100,6 +100,8 @@ fn options(tag: &str) -> ServeOptions {
         // claim overrides both fields together.
         host: ProxyHost::Cli,
         owner_dir: None,
+        // This path binds its own port; nothing is handed to it.
+        inherited_listener: None,
     }
 }
 

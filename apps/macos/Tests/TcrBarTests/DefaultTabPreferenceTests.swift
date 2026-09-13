@@ -2,8 +2,7 @@ import XCTest
 
 @testable import TcrBarCore
 
-/// "Open on" (Settings window, Menu Bar pane — `data/plans/
-/// settings-window-bridge.md`). Same scratch-suite shape as
+/// "Open on" (Settings window, Menu Bar pane). Same scratch-suite shape as
 /// `MenuBarCountsPreferenceTests`.
 @MainActor
 final class DefaultTabPreferenceTests: XCTestCase {

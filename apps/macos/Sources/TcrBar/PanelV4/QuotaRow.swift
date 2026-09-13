@@ -161,7 +161,7 @@ struct QuotaRow: View {
 /// Compact's quota block: every window ``AccountCard`` would otherwise draw as
 /// one ``QuotaRow`` each, folded onto one line — `5h ▮▮▮▯▯ 19% · 7d ▮▯▯▯▯ 3% ·
 /// fable ▯▯▯▯▯ 0%` (Gil, 2026-09-13: "its way more than what was before,
-/// recheck"; `data/plans/dense-quota-bridge.md`).
+/// recheck").
 ///
 /// The restored `fable` row plus three full ``QuotaRow`` lines cost Compact
 /// +42 pt over its own prior two-row card (222 pt against 180) — a shorter
