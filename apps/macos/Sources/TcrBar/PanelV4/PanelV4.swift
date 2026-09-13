@@ -27,11 +27,26 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
     let badges: [PanelTab: Int]
     let onSelect: (PanelTab) -> Void
     let onSettings: () -> Void
+    /// How many account rows this panel is about to draw, or `nil` on a
+    /// not-a-fleet state. Recorded — not drawn — so the density tokens can
+    /// resolve `PanelDensity.auto` (Gil, 2026-09-13: "make compact the default
+    /// please above 4 accounts").
+    var accountCount: Int?
     @ViewBuilder var summary: () -> Summary
     @ViewBuilder var content: () -> Content
     @ViewBuilder var footer: () -> Footer
 
     var body: some View {
+        // Before any `V4` token in the tree below is read. A `static var`
+        // density token is evaluated during layout by views with no fleet in
+        // scope, so the count has to be current by the time the first of them
+        // runs — which is why it is set here, in the shell, and not inside the
+        // Accounts tab three levels down.
+        PanelDensityPreference.setAccountCount(accountCount)
+        return panelBody
+    }
+
+    private var panelBody: some View {
         VStack(alignment: .leading, spacing: 0) {
             PanelHeader(title: title, freshness: freshness, onSettings: onSettings)
             summary()
@@ -59,7 +74,7 @@ struct PanelV4<Summary: View, Content: View, Footer: View>: View {
             // the sides keep the `line` colour the sheet gives them.
             RoundedRectangle(cornerRadius: V4.panelRadius, style: .continuous)
                 .strokeBorder(
-                    Tok.ink.opacity(V4.panelTopEdgeAlpha), lineWidth: V4.panelBorderWidth
+                    Tok.panelTopEdge.opacity(V4.panelTopEdgeAlpha), lineWidth: V4.panelBorderWidth
                 )
                 .mask(
                     LinearGradient(

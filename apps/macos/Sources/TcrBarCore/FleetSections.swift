@@ -312,12 +312,10 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     public var breakdown: [FleetTally] {
         var counts: [FleetTally.Kind: Int] = [:]
         for row in rows {
-            let kind: FleetTally.Kind =
-                row.account.disabled ? .disabled : FleetTally.Kind(account: row.account)
-            counts[kind, default: 0] += 1
+            counts[FleetTally.Kind(account: row.account), default: 0] += 1
         }
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .needsRelogin, .unmeasured, .disabled,
+            .ok, .near, .spent, .unknown, .needsRelogin, .rejected, .unmeasured, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }
@@ -362,7 +360,7 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     /// card per account: a named, live group of four or more whose rows all
     /// still serve traffic.
     ///
-    /// **`near` does NOT block this, and `spent`/rejected/needs-re-login do.**
+    /// **`near` does NOT block this, and `spent`/`rejected`/needs-re-login do.**
     /// The mockup's own collapsed group tallies "5 OK · 1 NEAR" on its summary
     /// line, so a near row is not hidden by collapsing — it is named in
     /// ``breakdown`` right there. A row an operator has to act on now is a
@@ -375,7 +373,7 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
         guard case .named = group, band == .live, rows.count >= 4 else { return false }
         return !rows.contains { row in
             switch FleetTally.Kind(account: row.account) {
-            case .spent, .needsRelogin: return true
+            case .spent, .needsRelogin, .rejected: return true
             case .ok, .near, .unknown, .unmeasured, .disabled: return false
             }
         }

@@ -34,9 +34,17 @@ struct PanelFooter<Extras: View>: View {
                     Text(leading)
                         .lineLimit(1)
                 }
-                Spacer(minLength: V4.footerGap)
+                .help(leading)
+                .accessibilityValue(leading)
+                // The provenance sentence outranks the build id beside it. It
+                // read "from request bodies only · nothing lo…" while
+                // "server abc1234" drew in full and 35.5 pt of the row sat
+                // empty — the panel's only privacy claim, truncated to make
+                // room for nothing.
+                .layoutPriority(1)
+                Spacer(minLength: 0)
                 if let trailing {
-                    Text(trailing).lineLimit(1)
+                    Text(trailing).lineLimit(1).fixedSize()
                 }
             }
             .font(V4.font(V4.footerSize))

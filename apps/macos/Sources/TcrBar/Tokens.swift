@@ -131,6 +131,22 @@ public enum Tok {
     /// overriding it would be this app asserting a preference it does not own.
     public static let accent = Color(nsColor: .controlAccentColor)
 
+    /// The panel's lit top edge (`PanelV4`, the mockup's own
+    /// `border-top-color:rgba(255,255,255,.18)`) — literal white, in EVERY
+    /// appearance, matching the mockup's own literal value. A highlight
+    /// reads as "catching light from above" by being lighter than the
+    /// surface it sits on, in both appearances; a dark panel shows that
+    /// clearly and a near-white one shows it faintly, but "faint" is not
+    /// "inverted".
+    ///
+    /// `Tok.ink` drew this before review #6's cap list
+    /// (`data/plans/interface-review-2026-09-13.md`): ink is a TEXT token
+    /// that answers to appearance for legibility (near-white on the dark
+    /// panel, near-black on the light one), and reusing it for the bevel
+    /// meant the edge went near-black in light appearance too — a dark line
+    /// in the highlight's own position, so the panel read as lit from below.
+    public static let panelTopEdge = Color.white
+
     // MARK: - Ink
     //
     // Warm-neutral off-white on dark, never pure white — pure white on a dark
@@ -164,26 +180,26 @@ public enum Tok {
     // in greyscale and to a viewer who cannot separate red from green.
 
     /// In rotation with headroom.
-    public static let ok = dyn(dark: "#66d081", light: "#00873c")
+    public static let ok = dyn(dark: "#66d081", light: "#06652d")
     /// Close to a gating limit.
-    public static let near = dyn(dark: "#ffd16b", light: "#ba7702")
+    public static let near = dyn(dark: "#ffd16b", light: "#925d0b")
     /// `near`, as an `NSColor` — same reason ``awakeNSColor`` exists beside
     /// ``awake``: the menu-bar mark's running-tools count is drawn into an
     /// `NSAttributedString`, not a SwiftUI view, and it tints amber with the
     /// identical hex this token already carries, so no new value needs the
     /// palette script's gate.
-    public static let nearNSColor = dynNS(dark: "#ffd16b", light: "#ba7702")
+    public static let nearNSColor = dynNS(dark: "#ffd16b", light: "#925d0b")
     /// Spent on a gating window until it resets.
-    public static let spent = dyn(dark: "#ea5a56", light: "#c0041f")
+    public static let spent = dyn(dark: "#ea5a56", light: "#940015")
     /// Enabled, but nothing has ever been measured about it.
     ///
     /// Its own hue for the same reason `FleetTally.Kind.unmeasured` is its own
     /// bucket: `ok` would overclaim capacity, `spent` would claim an exhaustion
     /// nobody observed. Low chroma on purpose — an absent reading is not an
     /// alarm, so it must not sit on the traffic-light scale at all.
-    public static let unmeasured = dyn(dark: "#82bad5", light: "#4c829c")
+    public static let unmeasured = dyn(dark: "#82bad5", light: "#0a7196")
     /// Operator-disabled: a decision, not an alarm.
-    public static let disabled = dyn(dark: "#909295", light: "#7f8083")
+    public static let disabled = dyn(dark: "#909295", light: "#67696b")
     /// A value this build cannot classify. Distinct from `unmeasured`: "a state
     /// I cannot name" is not "no state at all".
     public static let unknown = dyn(dark: "#c69bdd", light: "#7d4d96")
@@ -212,7 +228,7 @@ public enum Tok {
     /// guaranteed against anything — which is exactly why the menu bar carries
     /// this state as a glyph that is *present or absent* and uses colour only as
     /// a second channel. See `KeepAwakeGlyph`.
-    public static let awakeNSColor = dynNS(dark: "#51dfdf", light: "#017272")
+    public static let awakeNSColor = dynNS(dark: "#51dfdf", light: "#005f5f")
     public static let awake = Color(nsColor: awakeNSColor)
 
     /// The tint behind a status pill, and the hairline around it.
@@ -611,6 +627,9 @@ public enum Tok {
         // colour palette is generated — a new token drags in a regeneration
         // and two blocking gates for a fact this one already covers.
         case .needsRelogin: return spent
+        // `.rejected` reuses `spent` for the same reason `.needsRelogin` does,
+        // one line up: Anthropic's verdict is known-cannot-serve.
+        case .rejected: return spent
         case .unmeasured: return unmeasured
         case .disabled: return disabled
         }

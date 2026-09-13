@@ -19,7 +19,8 @@ final class SettingsRowBadgeTests: XCTestCase {
             SettingsRowBadge.pollInterval, SettingsRowBadge.launchAtLogin,
             SettingsRowBadge.keepAwake, SettingsRowBadge.showReadyCount,
             SettingsRowBadge.showRunningToolCount, SettingsRowBadge.openOnTab,
-            SettingsRowBadge.textSize, SettingsRowBadge.groupParked,
+            SettingsRowBadge.textSize, SettingsRowBadge.panelDensity,
+            SettingsRowBadge.groupParked,
             SettingsRowBadge.groupReserved, SettingsRowBadge.groupMayServeAsControl,
             SettingsRowBadge.groupColor, SettingsRowBadge.groupMembers,
             SettingsRowBadge.switchThreshold, SettingsRowBadge.controlReserve,
@@ -83,5 +84,16 @@ final class SettingsRowBadgeTests: XCTestCase {
     func testStartServerAtLaunchIsNextLaunchNotBoot() {
         XCTAssertEqual(
             SettingsRowBadge.timing(for: SettingsRowBadge.startServerAtLaunch), .nextLaunch)
+    }
+
+    /// Review #2: `Toggle("", isOn:)` with `.labelsHidden()` reached VoiceOver
+    /// as "off, checkbox" with no accessible name. The fix gives the Toggle's
+    /// label view the same string the visible `Text` beside it already draws
+    /// — this constant, referenced by both call sites in `SettingsPanes.swift`
+    /// — so an accessible name is spoken and the two strings cannot drift
+    /// apart from each other.
+    func testStartServerAtLaunchHasANonEmptyLabelForVoiceOver() {
+        XCTAssertEqual(SettingsRowBadge.startServerAtLaunchLabel, "Start the server at launch")
+        XCTAssertFalse(SettingsRowBadge.startServerAtLaunchLabel.isEmpty)
     }
 }

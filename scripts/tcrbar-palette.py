@@ -156,26 +156,35 @@ LIGHT_INK = {
 # flipped the dark ramp put ready and spent 1.07:1 apart, collapsing the
 # red/green pair that the dark palette holds 1.79:1 apart.
 #
-# These are judged at 3:1, not 4.5:1, and that is deliberate rather than a
-# concession: a status hue is never body text here. It is a pill label drawn on
-# a wash of its own hue, a bar fill, or a dot -- graphical elements, which
-# WCAG 1.4.11 sets at 3:1. The ink scale above carries the 4.5:1 obligation.
+# These are judged at 4.5:1, the same body-text floor the ink scale above
+# carries -- not 3:1. The 3:1 WCAG 1.4.11 non-text floor was the rule until
+# review #6 (`data/plans/interface-review-2026-09-13.md`): it assumed a status
+# hue is decorative, but since v4 it IS the pill label's own text colour, the
+# summary clause's tint and the reset caption's colour -- body text wearing a
+# hue, not a bar or a dot beside it. The dark pass already judged these same
+# six tokens at 4.5:1 (`STATUS`, above); this file judged the appearance nobody
+# reviewed by a looser standard than the one everybody looked at.
 #
 # The light ramp is compressed compared to the dark one, and amber sets the
 # floor: yellow simply has less luminance headroom, so it must go darker than
-# instinct suggests to clear 3:1 on a near-white panel. Once amber is pinned,
-# green and red are placed beneath it to keep the pairwise separation.
+# instinct suggests to clear 4.5:1 on a near-white panel -- L 0.525, panel
+# 4.99:1, the tightest margin of the six. Once amber is pinned, green and red
+# are placed beneath it to keep the pairwise separation.
 # These three came out of scripts/solve-light-status.py rather than by eye. The
-# constraints are coupled -- darkening amber to reach 3:1 pushes it into green,
-# and deepening red to separate it from green pushes red out of the sRGB gamut --
-# so they are solved together, maximising chroma subject to all of them.
+# constraints are coupled -- darkening amber to reach 4.5:1 pushes it into
+# green, and deepening red to separate it from green pushes red out of the
+# sRGB gamut -- so they are solved together, maximising chroma subject to all
+# of them. `unmeasured`, `disabled` and `awake` are not on that traffic-light
+# triple -- each was solved singly for the same 4.5:1 floor, then checked
+# against `awake` vs `unmeasured`, the one pair the LIGHT-MODE DISCRIMINATION
+# check below still gates for this appearance.
 LIGHT_STATUS = {
-    "ready":      (0.545, 0.150, 150),
-    "near":       (0.625, 0.135,  70),
-    "spent":      (0.510, 0.205,  25),
-    "unmeasured": (0.580, 0.070, 230),
-    "disabled":   (0.600, 0.004, 255),
-    "awake":      (0.500, 0.085, 195),
+    "ready":      (0.445, 0.120, 150),
+    "near":       (0.525, 0.110,  70),
+    "spent":      (0.420, 0.170,  25),
+    "unmeasured": (0.515, 0.100, 230),
+    "disabled":   (0.520, 0.004, 255),
+    "awake":      (0.440, 0.075, 195),
 }
 
 # `awake` -- keep-awake mode is held -- is NOT on the traffic-light scale, and
@@ -617,8 +626,9 @@ def main():
 
     check_set("LIGHT APPEARANCE - ink (4.5:1, body text)",
               LIGHT_SURFACES, LIGHT_INK, {}, failures)
-    check_set("LIGHT APPEARANCE - status (3:1, WCAG 1.4.11 non-text)",
-              LIGHT_SURFACES, {}, LIGHT_STATUS, failures, min_ratio=3.0)
+    check_set("LIGHT APPEARANCE - status (4.5:1, body text: pill label / "
+              "summary clause / reset caption)",
+              LIGHT_SURFACES, {}, LIGHT_STATUS, failures, min_ratio=4.5)
     check_set("DARK - status (3:1 floor; these clear it by a wide margin)",
               SURFACES, {}, STATUS, failures, min_ratio=3.0)
     check_set("DARK + INCREASED CONTRAST (ink only; status already clears 7:1)",

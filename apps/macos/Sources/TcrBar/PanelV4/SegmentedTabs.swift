@@ -78,7 +78,7 @@ struct SegmentedTabs: View {
             )
             .contentShape(Rectangle())
         }
-        .buttonStyle(V4PressStyle())
+        .buttonStyle(V4PressStyle(cornerRadius: V4.tabRadius))
         .accessibilityLabel(badges[tab].map { "\(tab.title), \($0)" } ?? tab.title)
         .accessibilityAddTraits(isOn ? [.isSelected] : [])
     }

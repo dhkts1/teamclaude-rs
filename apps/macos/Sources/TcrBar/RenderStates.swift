@@ -117,6 +117,13 @@ enum RenderStates {
             // never an empty list: `healthyJSON` carries no `sessions` key at
             // all, the shape every server shipped before F1.
             ("18-sessions-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
+            // The same server, on the Tools tab. Its own scene because the two
+            // tabs draw two different summary lines above that one sentence,
+            // and the Tools half is the one the 2026-09-13 interface review
+            // caught printing "0 tool calls today" directly over "This server
+            // predates sessions — update tcr." (finding 9). A scene nobody
+            // renders is a claim nobody can check.
+            ("18b-tools-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
             // Wave 2, phase 1 (`data/plans/panel-parity-bridge.md`): the
             // Accounts tab's structure, matching
             // `docs/design/panel-tabs-mockup.html`'s Accounts panel —
@@ -182,7 +189,7 @@ enum RenderStates {
     private static func initialTab(for sceneName: String) -> PanelTab {
         switch sceneName {
         case "16-sessions-tab", "18-sessions-tab-old-server": return .sessions
-        case "17-tools-tab": return .tools
+        case "17-tools-tab", "18b-tools-tab-old-server": return .tools
         default: return .accounts
         }
     }
@@ -240,7 +247,29 @@ enum RenderStates {
         for scene in scenes {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(scene, appearance: appearance, into: directory) { written += 1 }
+                if render(scene, appearance: appearance, density: .auto, into: directory) {
+                    written += 1
+                }
+            }
+            // The parity fixture also renders at `.comfortable`, suffixed —
+            // see `densityVariantScenes` — so the mockup comparison stays
+            // possible at both densities `PanelDensityPreference` offers,
+            // not only the shipped default.
+            //
+            // The main pass above is `.auto`, the shipped default since Gil's
+            // "make compact the default please above 4 accounts": forcing
+            // `.compact` there would have made every PNG in this set a
+            // picture of a setting nobody has, which is the one thing a
+            // review harness may not be.
+            if densityVariantScenes.contains(scene.name) {
+                for appearance in Appearance.allCases {
+                    attempted += 1
+                    if render(
+                        scene, appearance: appearance, density: .comfortable, into: directory)
+                    {
+                        written += 1
+                    }
+                }
             }
         }
         for scene in sheetScenes {
@@ -265,10 +294,20 @@ enum RenderStates {
         }
     }
 
+    /// Scenes rendered twice — once at `V4`'s shipped `.auto` default, once
+    /// forced to `.comfortable` — so the one fixture compared against
+    /// the mockup crop (`data/plans/panel-density-bridge.md`) stays
+    /// comparable at both densities, not only the one now shipping. Every
+    /// other scene renders `.compact` alone: this harness is a review
+    /// artifact, and doubling all 24 scenes would be 24 extra PNGs nobody
+    /// asked to review.
+    private static let densityVariantScenes: Set<String> = ["19-accounts-tab-parity"]
+
     @MainActor
     private static func render(
         _ scene: (name: String, state: PollState, awake: Bool, control: String?),
         appearance: Appearance,
+        density: PanelDensity,
         into directory: URL
     ) -> Bool {
         // The appearance has to be current for the duration of the rasterisation:
@@ -277,6 +316,17 @@ enum RenderStates {
         let previous = NSAppearance.current
         NSAppearance.current = appearance.nsAppearance
         defer { NSAppearance.current = previous }
+
+        // `V4.compact` reads this key straight out of `UserDefaults`
+        // (`PanelDensityPreference.current()`), so forcing a density for one
+        // render is a write-then-restore around this call, the same pattern
+        // `expandedGroupsKey` already uses below for scene 15b. Removed
+        // rather than restored to a prior value: nothing in this process
+        // should be running under a real density preference already set, and
+        // "absent" is `PanelDensityPreference`'s own definition of the
+        // shipped default.
+        UserDefaults.standard.set(density.rawValue, forKey: PanelDensityPreference.key)
+        defer { UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key) }
 
         // `.harness()`, never a real controller: drawing a checkbox in its ON
         // state must not actually stop this machine sleeping. A harness with a
@@ -349,7 +399,16 @@ enum RenderStates {
             // shown at full height instead of clipped.
             .fixedSize()
 
-        return rasterise(view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        // The shipped default stays unsuffixed — every existing filename this
+        // harness produces is unchanged — and only the forced `.comfortable`
+        // variant gets `-comfortable`, per `densityVariantScenes`. Computed
+        // here rather than in `rasterise`, which is shared with the sheet
+        // scenes and has no density of its own.
+        let name =
+            density == .compact
+            ? "\(scene.name)-\(appearance.rawValue).png"
+            : "\(scene.name)-\(density.rawValue)-\(appearance.rawValue).png"
+        return rasterise(view, named: name, into: directory)
     }
 
     /// One state of the sign-in sheet, rendered on its own.
@@ -1020,9 +1079,17 @@ enum RenderStates {
     private static var accountsParityJSON: String {
         // "$540 · 1.5M out" and "$1,190 · 3.1M out" on the two solo cards'
         // plan lines, the mockup's own figures.
+        // `henry10` carries a Fable weekly window and `henry5` below does not,
+        // so this one scene shows both halves of the rule the card follows: a
+        // third `fable` row when ``Account/sevenDayOi`` is present, and NO row
+        // at all when it is absent. An empty `fable` track on an account with
+        // no such window would claim a window that does not exist, and a
+        // fixture where every row has one could not tell the two apart.
         let solo1 = account(
             "henry10@example.com", quota: "0.07", state: "ok", sevenDay: "0.30",
-            sevenDayState: "ok", fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            sevenDayState: "ok",
+            fiveHourResetInMinutes: 182, sevenDayResetInMinutes: 6_540,
+            sevenDayOi: "0.71", sevenDayOiState: "near", sevenDayOiResetInMinutes: 6_498,
             usage: measuredUsage(
                 todayCost: 540.12, windowCost: 540.12, windowOutputTokens: 1_500_000),
             plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")

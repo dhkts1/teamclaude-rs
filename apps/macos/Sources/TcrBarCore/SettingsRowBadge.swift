@@ -53,6 +53,12 @@ public enum SettingsRowBadge {
     /// `Server` section, General pane.
     public static let proxyRestart = "server.proxyRestart"
     public static let startServerAtLaunch = "server.startServerAtLaunch"
+    /// The one label this row draws, shared by its visible `Text` and its
+    /// `Toggle`'s accessibility name — a `Toggle("", isOn:)` with
+    /// `.labelsHidden()` was announced to VoiceOver as "off, checkbox" with no
+    /// name at all (review #2), and a second, independently-typed string here
+    /// would drift from the visible one the next time either changed.
+    public static let startServerAtLaunchLabel = "Start the server at launch"
     public static let pollInterval = "server.pollInterval"
     /// `This Mac` section, General pane.
     public static let launchAtLogin = "mac.launchAtLogin"
@@ -63,6 +69,7 @@ public enum SettingsRowBadge {
     /// `When the panel opens` section, Menu Bar pane.
     public static let openOnTab = "menuBar.openOnTab"
     public static let textSize = "menuBar.textSize"
+    public static let panelDensity = "menuBar.panelDensity"
     /// `Groups` section, Groups & Rotation pane — one entry covers every
     /// group row, since they are all the same shape.
     public static let groupParked = "groups.parked"
@@ -110,6 +117,10 @@ public enum SettingsRowBadge {
         showRunningToolCount: .live,
         openOnTab: .live,
         textSize: .readOnly,
+        // A `UserDefaults` write, read back on the panel's next draw
+        // (`V4.compact`) — no restart, no relaunch, the same "applied live"
+        // as `openOnTab`.
+        panelDensity: .live,
         groupParked: .live,
         // Neither has a write path through this app today — `GroupController`
         // covers add/remove/removeAll/park, not reserve or control-eligibility

@@ -88,6 +88,28 @@ public enum QuotaState: Equatable, Sendable {
         }
     }
 
+    /// The state as a listener hears it, in the panel's prose register.
+    ///
+    /// Not ``token``. A quota row's spoken value is a sentence — "94% used,
+    /// near the limit, resets in 47m" — and `"near"` on its own in that
+    /// position parses as an adjective with nothing to modify. The same split
+    /// ``FleetTally/Kind/phrase`` makes against ``FleetTally/Kind/token``, for
+    /// the same reason: a pill has three characters to spend and a sentence has
+    /// to survive being read out loud.
+    ///
+    /// `.ok` is "within limit" rather than "ok": the row's whole subject is a
+    /// limit, and the listener has no green bar beside them to read it off.
+    /// An `.unknown` token is spoken verbatim — this build cannot name it, and
+    /// inventing a word for it is exactly what the pill refuses to do.
+    public var spokenWord: String {
+        switch self {
+        case .ok: return "within limit"
+        case .near: return "near the limit"
+        case .spent: return "spent"
+        case .unknown(let raw): return raw
+        }
+    }
+
     /// Ordering used to pick the worst account for the menu-bar glyph.
     public var severity: Int {
         switch self {
@@ -607,6 +629,36 @@ public enum QuotaFormat {
     public static func resetsCaption(resetAtMs: Int64?, now: Date) -> String? {
         guard let duration = durationUntilReset(resetAtMs: resetAtMs, now: now) else { return nil }
         return "resets \(duration)"
+    }
+
+    /// `"94% used, near the limit, resets 47m"` — everything a quota row draws,
+    /// as the one string its `accessibilityValue` speaks.
+    ///
+    /// The row's per-window verdict rides on HUE in pixels: the bar's fill and
+    /// the reset caption both turn amber at the near threshold and red past it,
+    /// and measured off the shipped build two rows with identical wording
+    /// differed only by `#ffd16b` against `#94928d`. None of that reaches a
+    /// listener, so the state word is spoken here.
+    ///
+    /// The reset countdown is the row's one actionable fact, and an
+    /// `accessibilityLabel` that names the window overrode the combined
+    /// children that used to carry it — so it was spoken by nobody at all.
+    ///
+    /// `state` is `nil` for a window nothing has measured, which is a different
+    /// sentence, not a missing clause: `"never measured"` rather than a `"0%"`
+    /// that reads as a reading.
+    public static func spokenWindowValue(
+        value: Double?, state: QuotaState?, resetAtMs: Int64?, now: Date
+    ) -> String {
+        var parts: [String] = []
+        if value == nil && state == nil {
+            parts.append("never measured")
+        } else {
+            parts.append("\(percent(value)) used")
+            if let state { parts.append(state.spokenWord) }
+        }
+        if let caption = resetsCaption(resetAtMs: resetAtMs, now: now) { parts.append(caption) }
+        return parts.joined(separator: ", ")
     }
 
     /// Shared guard: `nil` in → `nil` out, never a placeholder — the same
@@ -1728,6 +1780,24 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
         return "\(span): \(priced), \(tokens)"
     }
 
+    /// What the Fable weekly window's bar is allowed to be tinted with.
+    ///
+    /// A sibling of ``quotaBarTintSource(for:)`` rather than a third
+    /// ``QuotaWindow`` case, because the two differ in exactly the way that
+    /// function's doc-comment warns about: `fiveHourState`/`sevenDayState`
+    /// legitimately fall back to the composite `quotaState` for an old server
+    /// that sent a fraction and no word, and ``sevenDayOiState`` may NEVER do
+    /// that — the Fable window gates Fable requests only, so the composite
+    /// state is not a weaker reading of it, it is a reading of something else.
+    ///
+    /// `.unmeasured` when there is no figure, which is also the case the card
+    /// uses to draw no Fable row at all.
+    public var fableBarTintSource: QuotaBarTintSource {
+        guard sevenDayOi != nil else { return .unmeasured }
+        guard let state = sevenDayOiState else { return .measuredWithoutState }
+        return .state(state)
+    }
+
     /// What the card's 7d line shows on its right: `"fable 71% · in 4d 12h"` —
     /// this account's FABLE weekly window, the third quota window the row
     /// otherwise never names.
@@ -1891,6 +1961,157 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     public var servesGroupTrafficOnly: Bool {
         groupTags.contains(where: \.isReserved)
     }
+
+    /// What the pool-membership pill says about this account, or `nil` when it
+    /// has nothing to claim.
+    ///
+    /// `"Rotating"` means one thing — the pool is sending this account traffic
+    /// right now — and it is the single most misreadable word on the panel,
+    /// because every reason it is FALSE is invisible in the account's own quota
+    /// numbers. So the ladder is exclusions first, in the order the pre-v4 row
+    /// walks them (`FleetView.swift`'s `rotationPill`), and the claim last:
+    ///
+    ///  - disabled, or ``isParkedByGroup`` — the group's legend and the state
+    ///    pill already say it; a second pill saying "Rotating" beside them is
+    ///    the contradiction.
+    ///  - `health == .needsRelogin` — a dead refresh token. The card used to
+    ///    draw ROTATING beside NEEDS RE-LOGIN, which reads as "traffic is
+    ///    landing here" over an account serving none, and an operator who reads
+    ///    it does not re-login.
+    ///  - ``isRejected`` — Anthropic's verdict. Nothing else on the row says
+    ///    it: `disabled` is false, the status reads active, and the quota bars
+    ///    can look perfectly healthy.
+    ///  - ``servesGroupTrafficOnly`` — reserved, so it serves requests that ask
+    ///    for its group and no pool traffic at all. `"Group only"`, the word
+    ///    the pre-v4 row already uses.
+    ///
+    /// Lives on the model rather than in the card so the two panels cannot
+    /// drift into two different ladders, and so the rule is testable without
+    /// standing up SwiftUI.
+    ///
+    /// A case, not the word: the card suppresses one of the two on a compact
+    /// row, and deciding that by comparing against the string it is about to
+    /// draw would break the moment the word changed.
+    public var rotation: RotationState? {
+        if disabled || isParkedByGroup { return nil }
+        if health == .needsRelogin || isRejected { return nil }
+        if servesGroupTrafficOnly { return .groupOnly }
+        return .rotating
+    }
+
+    /// What the pool-membership pill says, or `nil` when it draws none.
+    public var rotationLabel: String? { rotation?.label }
+
+    /// The sentence behind this account's state pill — what the word means and,
+    /// where there is one, the way out.
+    ///
+    /// A pill has ten characters. `PARKED` names a state without naming WHICH
+    /// group is parked or that `tcr group unpark` puts it back, and the v4 card
+    /// dropped the whole hover layer the pre-v4 row had written these sentences
+    /// for. Lives on the model so the card and the row cannot end up saying two
+    /// different things about one account, and so the remedy is testable
+    /// without SwiftUI.
+    ///
+    /// `nil` where the word is already the whole sentence: `OK` and `NEAR` say
+    /// what they mean and have no action attached.
+    public var stateHelp: String? {
+        if disabled {
+            return "Out of the rotation — `tcr` sends this account no traffic. "
+                + "`tcr enable \(name)` puts it back."
+        }
+        if isParkedByGroup {
+            let groups = parkedGroupNames.joined(separator: ", ")
+            let first = parkedGroupNames.first ?? ""
+            return "Out of the rotation — every member of \(groups) is held back. "
+                + "`tcr group unpark \(first)` puts them back, live."
+        }
+        if health == .needsRelogin {
+            return "This account's refresh token was rejected. Re-login to repair it; "
+                + "no sweep will."
+        }
+        if isRejected {
+            return "Anthropic has rejected this account, so the router will never "
+                + "select it however healthy its quota looks."
+        }
+        if !hasQuotaEvidence {
+            return "Nothing has been measured about this account yet — not a zero "
+                + "reading, no reading at all."
+        }
+        return nil
+    }
+
+    /// The whole card in one sentence — what VoiceOver announces on arriving at
+    /// it: `"alice@example.com, Max 20x, rotating, ok, 5h 12% used, 7d 30% used"`.
+    ///
+    /// The card is an `.accessibilityElement(children: .contain)` container, and
+    /// a container with no label has no accessible name: it cannot take focus,
+    /// and a user stepping through the panel is told nothing about which account
+    /// they have reached. They then had to walk roughly eight stops — name, each
+    /// pill, the plan line, each bar — to learn it.
+    ///
+    /// Built from the same properties the card draws, in the order it draws
+    /// them, so the summary cannot claim something the card does not show.
+    public func cardSummaryLabel(now: Date) -> String {
+        var parts = [name]
+        if let plan, !plan.isEmpty { parts.append(plan) }
+        if let rotation { parts.append(rotation.label.lowercased()) }
+        parts.append(FleetTally.Kind(account: self).phrase)
+        for window in [
+            (label: "5h", value: fiveHour, state: fiveHourState, reset: fiveHourResetAtMs),
+            (label: "7d", value: sevenDay, state: sevenDayState, reset: sevenDayResetAtMs),
+        ] {
+            guard window.value != nil else { continue }
+            parts.append(
+                "\(window.label) "
+                    + QuotaFormat.spokenWindowValue(
+                        value: window.value, state: window.state, resetAtMs: window.reset,
+                        now: now))
+        }
+        if sevenDayOi != nil {
+            parts.append(
+                "fable "
+                    + QuotaFormat.spokenWindowValue(
+                        value: sevenDayOi, state: sevenDayOiState,
+                        resetAtMs: sevenDayOiResetAtMs, now: now))
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    /// ``cardSummaryLabel(now:)`` against the wall clock.
+    public var cardSummaryLabel: String { cardSummaryLabel(now: Date()) }
+
+    /// The sentence behind the pool-membership pill, for the one state that
+    /// needs explaining: `Group only` is not a word an operator meets anywhere
+    /// else.
+    public var rotationHelp: String? {
+        switch rotation {
+        case .groupOnly:
+            let reserved = groupTags.filter(\.isReserved).map(\.name).joined(separator: ", ")
+            return "Reserved for \(reserved): this account serves requests that ask for "
+                + "that group, and no pool traffic at all."
+        case .rotating:
+            return "The pool is sending this account traffic right now."
+        case .none:
+            return nil
+        }
+    }
+}
+
+/// What ``Account/rotation`` found: the two things a pool-membership pill is
+/// ever allowed to claim.
+public enum RotationState: Equatable, Sendable {
+    /// The pool is sending this account traffic right now.
+    case rotating
+    /// Reserved: it serves requests that ask for its group, and no pool
+    /// traffic at all. ``Account/servesGroupTrafficOnly``.
+    case groupOnly
+
+    public var label: String {
+        switch self {
+        case .rotating: return "Rotating"
+        case .groupOnly: return "Group only"
+        }
+    }
 }
 
 /// One entry in ``Account/groupMenuActions``, the row-level context menu
@@ -2000,6 +2221,17 @@ public enum GroupTagColor {
 public enum QuotaBarTintSource: Equatable, Sendable {
     case unmeasured
     case state(QuotaState)
+    /// The window has a reading, and the server sent no state word for it —
+    /// the Fable weekly window against a build that reports the figure but not
+    /// its band (``Account/sevenDayOiState`` `nil`).
+    ///
+    /// Its own case rather than `.state(.unknown(""))` or a fall-through to
+    /// the composite: the bar must DRAW, because something really was
+    /// measured, and it must draw neutral, because borrowing `quotaState` here
+    /// is the exact overclaim ``Account/quotaBarTintSource(for:)`` exists to
+    /// prevent one window over. An empty `.unknown` token would also be spoken
+    /// as an empty word.
+    case measuredWithoutState
 }
 
 /// One bucket of the fleet breakdown line.
@@ -2020,6 +2252,15 @@ public struct FleetTally: Equatable, Sendable {
         /// `.unmeasured` would tell the operator to wait for a sweep that will
         /// never fix a dead credential.
         case needsRelogin
+        /// Anthropic itself has rejected the account — ``Account/isRejected``,
+        /// the server's own `gate == "rejected"`. Its own bucket for the same
+        /// reason ``needsRelogin`` is one: the router will never select this
+        /// account however healthy its quota reads, so counting its last-known
+        /// `.ok` state as capacity is a claim the fleet cannot honour. The
+        /// pre-v4 row has drawn this case since the `gate` key shipped
+        /// (`FleetView.swift`'s rotation pill); the tally had no bucket for it,
+        /// so the v4 card drew a lone green OK over it.
+        case rejected
         /// Enabled, but nothing has ever been measured about it. Its own bucket
         /// because folding it into `ok` is precisely the overclaim this exists
         /// to stop, and folding it into `unknown` would conflate "a quota state
@@ -2034,6 +2275,7 @@ public struct FleetTally: Equatable, Sendable {
             case .spent: return "spent"
             case .unknown: return "unknown"
             case .needsRelogin: return "need re-login"
+            case .rejected: return "rejected"
             case .unmeasured: return "unmeasured"
             case .disabled: return "disabled"
             }
@@ -2055,6 +2297,7 @@ public struct FleetTally: Equatable, Sendable {
             case .spent: return "spent"
             case .unknown: return "unknown"
             case .needsRelogin: return "need re-login"
+            case .rejected: return "rejected by Anthropic"
             case .unmeasured: return "unmeasured"
             case .disabled: return "parked"
             }
@@ -2070,20 +2313,43 @@ public struct FleetTally: Equatable, Sendable {
             }
         }
 
-        /// The bucket an *enabled* account falls into, measurement included.
-        /// An unmeasured account's `quotaState` is a default, so it never
-        /// reaches the quota-state mapping at all. Health is checked BEFORE
-        /// `hasQuotaEvidence` — a broken account has no quota reading either,
-        /// and checking evidence first would land every one of them back in
-        /// `.unmeasured`.
+        /// The bucket ANY account falls into, measurement included.
+        ///
+        /// The ladder is the pre-v4 rotation pill's own branch order
+        /// (`FleetView.swift`'s `rotationPill`), because a card and a row
+        /// looking at one account may not reach two verdicts:
+        ///
+        ///  1. `disabled` — the operator's own decision, and the reason this
+        ///     bucket exists at all: an account held out by hand still has a
+        ///     `quotaState`, and counting it as `ok` inflates the capacity the
+        ///     fleet has.
+        ///  2. ``Account/isParkedByGroup`` — the SERVER holds it out because
+        ///     one of its groups is parked. Same bucket, same word ("parked"),
+        ///     because the operator faces the same fact: nothing lands here.
+        ///     It used to fall through to the quota cases, so inside one box
+        ///     legended PARKED two equally idle accounts read `OK` and
+        ///     `PARKED`, and the headline counted the `OK` one as capacity.
+        ///  3. `health == .needsRelogin` — a dead credential.
+        ///  4. ``Account/isRejected`` — Anthropic's own verdict.
+        ///  5. the quota state, or `.unmeasured` when nothing was ever probed.
+        ///
+        /// 3 and 4 sit ahead of `hasQuotaEvidence` deliberately: a broken or
+        /// rejected account has no quota reading either, and checking evidence
+        /// first would land every one of them back in `.unmeasured` — telling
+        /// the operator to wait for a sweep that will never fix either cause.
+        ///
         /// Public because the v4 account card (`PanelV4/AccountCard.swift`, a
         /// different module) draws its state pill from this and nothing else:
         /// the card's pill and the group's tally are then the same
         /// classification, which is the defect the pre-v4 card had — an OK pill
         /// over a 98% bar.
         public init(account: Account) {
-            if account.health == .needsRelogin {
+            if account.disabled || account.isParkedByGroup {
+                self = .disabled
+            } else if account.health == .needsRelogin {
                 self = .needsRelogin
+            } else if account.isRejected {
+                self = .rejected
             } else {
                 self = account.hasQuotaEvidence ? Kind(quotaState: account.quotaState) : .unmeasured
             }
@@ -2535,6 +2801,13 @@ public struct Fleet: Equatable, Sendable {
     /// Per-bucket counts in fixed severity order, with empty buckets omitted so
     /// a healthy fleet reads just `"12 ok"`.
     ///
+    /// The loop runs over EVERY account and lets ``FleetTally/Kind/init(account:)``
+    /// place it, rather than over `enabledAccounts` with `counts[.disabled]`
+    /// assigned afterwards. That assignment was the group-parked defect's second
+    /// half: it OVERWROTE whatever the loop had put in `.disabled`, so an
+    /// enabled account the server holds out of rotation could not be counted as
+    /// parked however the classifier bucketed it.
+    ///
     /// `.needsRelogin` and `.unmeasured` are excluded from the order: both are
     /// already named by ``capacitySummary`` (`"1 need re-login"`,
     /// `"1 unmeasured"`), and this tally used to name them a second time —
@@ -2543,12 +2816,10 @@ public struct Fleet: Equatable, Sendable {
     /// number folded into `readyCount`, never spelled out on its own, so it
     /// keeps its place here.
     public var breakdown: [FleetTally] {
-        let disabledCount = accounts.count - enabledCount
         var counts: [FleetTally.Kind: Int] = [:]
-        for account in enabledAccounts {
+        for account in accounts {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
-        counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
             .ok, .near, .spent, .unknown, .disabled,
         ]
@@ -2568,15 +2839,18 @@ public struct Fleet: Equatable, Sendable {
     /// same omission silently deletes an account from the count: a fleet of
     /// thirteen read "9 ready · 3 near limit" and the reader was left to notice
     /// the missing one. Two surfaces, two lists, one place each.
+    ///
+    /// `.rejected` is in this order and not in ``breakdown``'s for the same
+    /// reason `.needsRelogin` is: the pre-v4 header names it in
+    /// ``capacitySummary`` one line above, the v4 summary line has no such
+    /// second clause.
     public var sentenceBreakdown: [FleetTally] {
-        let disabledCount = accounts.count - enabledCount
         var counts: [FleetTally.Kind: Int] = [:]
-        for account in enabledAccounts {
+        for account in accounts {
             counts[FleetTally.Kind(account: account), default: 0] += 1
         }
-        counts[.disabled] = disabledCount
         let order: [FleetTally.Kind] = [
-            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .disabled,
+            .ok, .near, .spent, .unknown, .unmeasured, .needsRelogin, .rejected, .disabled,
         ]
         return order.compactMap { kind in
             guard let count = counts[kind], count > 0 else { return nil }

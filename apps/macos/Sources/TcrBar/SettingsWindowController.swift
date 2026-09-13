@@ -100,6 +100,7 @@ struct SettingsDependencies {
     var countsPreference: MenuBarCountsPreference
     var runningToolsPreference: ShowRunningToolsPreference
     var defaultTabPreference: DefaultTabPreference
+    var panelDensityPreference: PanelDensityPreference
     var groupController: GroupController
     var updater: Updater
     var onWhatsNew: () -> Void = {}

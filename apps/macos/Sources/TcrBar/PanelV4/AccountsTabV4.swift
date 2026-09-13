@@ -16,7 +16,7 @@ import TcrBarCore
 /// `MYCELIUM · ACTIVE` — and it is a rule, not a transcription: a box holding
 /// one line is a lid, and a lid between two open boxes reads as the end of the
 /// list.
-struct AccountsTabV4<Menu: View>: View {
+struct AccountsTabV4<Menu: View, Actions: View>: View {
     let fleet: Fleet
     let controlName: String?
     /// Group tokens the operator has opened. Same store the pre-v4 panel used,
@@ -24,11 +24,18 @@ struct AccountsTabV4<Menu: View>: View {
     let expandedGroups: Set<String>
     let onToggleGroup: (String) -> Void
     let now: Date
-    /// The row's own actions, as a context menu. The mockup draws no per-card
-    /// gear (`delta-list.md` #27), so the card carries no visible control — but
-    /// every action the pre-v4 row offered is still on the card itself, by
-    /// right-click, from the one definition in ``AccountRow``.
+    /// The row's own actions, as a context menu — the SECOND route to them,
+    /// from the one definition in ``AccountRow``.
     @ViewBuilder var menu: (Account) -> Menu
+    /// The same actions as visible controls in the card's trailing slot: the
+    /// actions menu, and `Re-login…` on a broken account.
+    ///
+    /// The mockup draws no per-card gear (`delta-list.md` #27) and the
+    /// transcription took that literally, which left `.contextMenu` as the
+    /// card's ONLY interaction: seven per-account actions, two of them
+    /// destructive, reachable by right-click alone and by no keyboard or
+    /// VoiceOver path at all.
+    @ViewBuilder var actions: (Account) -> Actions
 
     /// How many accounts a parked group shows before its "Show N more accounts"
     /// button — the mockup's HENRY-TOKEN group draws three of its five.
@@ -65,8 +72,8 @@ struct AccountsTabV4<Menu: View>: View {
         }
     }
 
-    private func card(_ row: FleetSectionRow, shape: AccountCard.Shape) -> some View {
-        AccountCard(account: row.account, shape: shape, now: now)
+    private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
+        AccountCard(account: row.account, shape: shape, now: now) { actions(row.account) }
             .contextMenu { menu(row.account) }
     }
 
@@ -81,14 +88,13 @@ struct AccountsTabV4<Menu: View>: View {
 
         GroupBox(
             legend: section.legendText,
-            color: section.outlineColor.map(V4.groupColor) ?? Tok.cardLine,
+            color: section.outlineColor.map(V4.groupColor),
             collapsed: summarised
         ) {
             if summarised {
-                // The whole of a collapsed live group: one line, its tally, and
-                // the control that opens it. Every string here is a
-                // ``FleetSection`` property, so what is drawn cannot drift from
-                // what the group holds.
+                // The whole of a collapsed live group: one line and its tally.
+                // Every string here is a ``FleetSection`` property, so what is
+                // drawn cannot drift from what the group holds.
                 V4Row {
                     DimText(text: section.collapsedSummaryLine)
                 } trailing: {
@@ -98,10 +104,6 @@ struct AccountsTabV4<Menu: View>: View {
                         }
                     }
                 }
-                V4Disclosure(
-                    title: section.expandButtonLabel,
-                    help: "Shows every account in this group."
-                ) { onToggleGroup(section.group.token) }
             } else {
                 // `.grp .card{margin:6px 0}` — EVERY card, the first included.
                 // Its top margin does not collapse into the group's own 12 pt
@@ -111,12 +113,15 @@ struct AccountsTabV4<Menu: View>: View {
                     card(row, shape: .compact)
                         .padding(.top, V4.groupCardGap)
                 }
-                if hidden > 0 {
-                    V4Disclosure(
-                        title: "Show \(hidden) more \(hidden == 1 ? "account" : "accounts")",
-                        help: "Shows the rest of this parked group."
-                    ) { onToggleGroup(section.group.token) }
-                }
+            }
+            if isCollapsible(section) {
+                V4Disclosure(
+                    title: disclosureTitle(section, expanded: expanded, hidden: hidden),
+                    expanded: expanded,
+                    help: expanded
+                        ? "Collapses this group again."
+                        : "Shows every account in this group."
+                ) { onToggleGroup(section.group.token) }
             }
         }
         // A group that leads the tab collapses its own 20 pt top margin with the
@@ -127,11 +132,43 @@ struct AccountsTabV4<Menu: View>: View {
         .padding(.top, first ? V4.marginAfterStrip(V4.groupMarginTop) - V4.groupMarginTop : 0)
     }
 
+    /// Whether this group has a disclosure at all — whether it has ever hidden
+    /// anything, in either direction.
+    ///
+    /// Both call sites used to sit behind `if summarised` / `if hidden > 0`, so
+    /// once a group was open BOTH were false and no control rendered. Expanding
+    /// was a one-way door, and the state persists to `UserDefaults` across
+    /// launches: the thing that vanished was the control the user had just
+    /// pressed, which also orphans focus under assistive tech. The pre-v4 panel
+    /// kept the reverse path on the legend button with a "Collapses this group."
+    /// hint.
+    ///
+    /// A wholly-parked group of three or fewer is NOT collapsible: it caps at
+    /// ``parkedVisibleRows`` and so has nothing to hide, and a control that does
+    /// nothing is worse than none.
+    private func isCollapsible(_ section: FleetSection) -> Bool {
+        section.collapsesByDefault
+            || (section.isWhollyParked && section.rows.count > Self.parkedVisibleRows)
+    }
+
+    /// One direction each. ``FleetSection/expandButtonLabel`` says the whole
+    /// count ("Show 6 accounts in this group") because a collapsed group shows
+    /// no cards at all; a capped parked group says the REMAINDER, because some
+    /// are already on screen. Closing says neither number — what it removes is
+    /// whatever is currently open.
+    private func disclosureTitle(
+        _ section: FleetSection, expanded: Bool, hidden: Int
+    ) -> String {
+        if expanded { return "Show fewer accounts" }
+        if isSummarised(section) { return section.expandButtonLabel }
+        return "Show \(hidden) more \(hidden == 1 ? "account" : "accounts")"
+    }
+
     private func pillRole(_ kind: FleetTally.Kind) -> V4Pill.Role {
         switch kind {
         case .ok: return .ok
         case .near: return .warn
-        case .spent, .needsRelogin: return .bad
+        case .spent, .needsRelogin, .rejected: return .bad
         case .unmeasured: return .info
         case .unknown, .disabled: return .neutral
         }
