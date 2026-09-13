@@ -1055,7 +1055,13 @@ enum RenderStates {
                             endedMs: msAgo(36 * 60), seconds: 556.0),
                         ToolCall(
                             tool: "Bash",
-                            commandHead: "./scripts/cargo-q.sh test -p teamclaude --all-features",
+                            // Deliberately longer than the row: the overlap
+                            // this fixture exists to catch only appears once
+                            // the label cannot fit beside the pill, and every
+                            // earlier fixture command fitted.
+                            commandHead:
+                                "cd ~/src/example && ./scripts/cargo-q.sh test -p teamclaude "
+                                + "--all-features 2>&1 | tee test.log",
                             endedMs: msAgo(48 * 60), seconds: 343.0),
                     ],
                     overOneMinute: 5,
