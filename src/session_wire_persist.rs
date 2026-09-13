@@ -266,6 +266,7 @@ mod tests {
             input_tokens: 100,
             output_tokens: 200,
             cache_read_tokens: 50,
+            cache_creation_tokens: 15,
             tools: ToolStats {
                 calls,
                 ..Default::default()

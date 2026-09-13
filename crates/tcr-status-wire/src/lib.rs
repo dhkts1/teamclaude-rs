@@ -279,6 +279,13 @@ pub struct SessionRow {
     pub output_tokens: u64,
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// Cache-write tokens (5-minute plus 1-hour TTL creation), kept apart from `input_tokens`
+    /// — see `crate::session_wire::WireSession::input_tokens`'s doc-comment for why folding
+    /// cache dimensions into `input_tokens` double-counts them against `cache_read_tokens`.
+    /// `#[serde(default)]` so a payload from a server built before this field existed decodes
+    /// as `0` rather than a parse failure.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
     #[serde(default)]
     pub tools: SessionToolsRow,
     /// Requests seen for this session in each of the last 30 wall-clock minutes, oldest
