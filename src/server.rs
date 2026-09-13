@@ -223,8 +223,7 @@ pub struct ServeOptions {
     /// policy: the predecessor gave us its socket, so there is no port to
     /// contest and nothing to signal. The port therefore never goes unbound
     /// across the swap, and a connection arriving mid-handoff waits in the
-    /// kernel's accept queue instead of being refused. `docs/design/
-    /// zero-downtime-restart.md` has the whole sequence.
+    /// kernel's accept queue instead of being refused.
     ///
     /// The caller is responsible for having verified who it took this from.
     /// `serve` cannot: by the time the descriptor is in hand the peer may
