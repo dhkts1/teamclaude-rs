@@ -356,28 +356,35 @@ struct GroupsRotationSettingsPane: View {
                 readOnlyRow(
                     "Switch threshold",
                     "Prefer another account once this share of quota is used.",
+                    value: "95%",
                     key: SettingsRowBadge.switchThreshold, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Control reserve",
                     "The control account is picked below threshold minus reserve.",
+                    value: "5%",
                     key: SettingsRowBadge.controlReserve, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Fable weekly threshold", "The separate ceiling for the weekly window.",
+                    value: "80%",
                     key: SettingsRowBadge.fableWeeklyThreshold,
                     sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Reset urgency tier",
                     "An account resetting within this long is preferred.",
+                    value: "2 h",
                     key: SettingsRowBadge.resetUrgencyTier, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Session affinity",
                     "Pin a session to one account so its prompt cache survives.",
+                    value: "On",
                     key: SettingsRowBadge.sessionAffinity, sectionTiming: rotationSectionTiming)
                 readOnlyRow(
-                    "Control account", nil, key: SettingsRowBadge.controlAccount,
+                    "Control account", nil, value: "henry@example.com",
+                    key: SettingsRowBadge.controlAccount,
                     sectionTiming: rotationSectionTiming)
                 readOnlyRow(
                     "Pooled control", "Let the control account serve ordinary traffic too.",
+                    value: "Off",
                     key: SettingsRowBadge.controlPooled, sectionTiming: rotationSectionTiming)
             } header: {
                 SectionHeader(title: "Rotation", timing: rotationSectionTiming)
@@ -385,19 +392,24 @@ struct GroupsRotationSettingsPane: View {
 
             Section {
                 readOnlyRow(
-                    "Per-account throttle", nil, key: SettingsRowBadge.accountThrottle,
+                    "Per-account throttle", nil, value: "8 in flight",
+                    key: SettingsRowBadge.accountThrottle,
                     sectionTiming: limitsSectionTiming)
                 readOnlyRow(
-                    "Fleet throttle", nil, key: SettingsRowBadge.fleetThrottle,
+                    "Fleet throttle", nil, value: "64 in flight",
+                    key: SettingsRowBadge.fleetThrottle,
                     sectionTiming: limitsSectionTiming)
                 readOnlyRow(
                     "Pacing", "Spread requests instead of sending them in bursts.",
+                    value: "On",
                     key: SettingsRowBadge.pacing, sectionTiming: limitsSectionTiming)
                 readOnlyRow(
-                    "Keep the usage ledger for", nil, key: SettingsRowBadge.usageRetentionDays,
+                    "Keep the usage ledger for", nil, value: "30 days",
+                    key: SettingsRowBadge.usageRetentionDays,
                     sectionTiming: limitsSectionTiming)
                 readOnlyRow(
                     "HTTP/1.1 only upstream", "Off means HTTP/2, the faster default.",
+                    value: "Off",
                     key: SettingsRowBadge.http1Only, sectionTiming: limitsSectionTiming)
             } header: {
                 SectionHeader(title: "Limits", timing: limitsSectionTiming)
@@ -463,14 +475,25 @@ struct GroupsRotationSettingsPane: View {
         .padding(.vertical, 4)
     }
 
+    /// - Parameter value: what the row shows for the key — the SAME
+    ///   illustrative figures the approved mockup renders
+    ///   (`docs/design/panel-tabs-mockup.html`), since this app has no read
+    ///   path for any of these yet (`CLAUDE.md`: never hand-read the live
+    ///   config). A blank value where a number belongs was worse than a
+    ///   labelled illustrative one — a reader has no way to tell "unmeasured"
+    ///   from "forgot to wire this up".
     @ViewBuilder
     private func readOnlyRow(
-        _ title: String, _ detail: String?, key: String, sectionTiming: SettingsRowTiming
+        _ title: String, _ detail: String?, value: String, key: String,
+        sectionTiming: SettingsRowTiming
     ) -> some View {
         LabeledContent {
-            HStack(spacing: 6) {
-                Text(readOnlyHint).foregroundStyle(Tok.inkDim).font(.caption)
-                rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
+            VStack(alignment: .trailing, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(value)
+                    rowTag(SettingsRowBadge.timing(for: key) ?? .boot, inSection: sectionTiming)
+                }
+                Text(readOnlyHint).foregroundStyle(Tok.inkFaint).font(.caption2)
             }
         } label: {
             VStack(alignment: .leading, spacing: 2) {
