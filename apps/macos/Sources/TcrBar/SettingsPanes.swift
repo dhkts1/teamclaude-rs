@@ -242,12 +242,14 @@ struct MenuBarSettingsPane: View {
     @ObservedObject private var countsPreference: MenuBarCountsPreference
     @ObservedObject private var runningToolsPreference: ShowRunningToolsPreference
     @ObservedObject private var defaultTabPreference: DefaultTabPreference
+    @ObservedObject private var panelDensityPreference: PanelDensityPreference
 
     init(dependencies: SettingsDependencies) {
         self.dependencies = dependencies
         self.countsPreference = dependencies.countsPreference
         self.runningToolsPreference = dependencies.runningToolsPreference
         self.defaultTabPreference = dependencies.defaultTabPreference
+        self.panelDensityPreference = dependencies.panelDensityPreference
     }
 
     var body: some View {
@@ -284,6 +286,11 @@ struct MenuBarSettingsPane: View {
                     Text("Accounts").tag("accounts")
                     Text("Sessions").tag("sessions")
                     Text("Tools").tag("tools")
+                }
+                .pickerStyle(.menu)
+                Picker("Panel density", selection: $panelDensityPreference.density) {
+                    Text("Compact").tag(PanelDensity.compact)
+                    Text("Comfortable").tag(PanelDensity.comfortable)
                 }
                 .pickerStyle(.menu)
                 LabeledContent("Text size") {
