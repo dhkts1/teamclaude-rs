@@ -1551,6 +1551,47 @@ mod tests {
         }
     }
 
+    /// Wait for a line matching `predicate` to appear in `sink`, up to `timeout`.
+    ///
+    /// The single-read version of this flaked: the test called
+    /// `sink.contents()` once, at the instant `serve()` returned, and failed if
+    /// the line was not there yet.
+    ///
+    /// The mechanism was investigated on 2026-09-13 and NOT established. Three
+    /// hypotheses were tested and falsified: a 4-worker `multi_thread` runtime
+    /// passes 3/3 (so it is not the thread-local subscriber escaping to a
+    /// worker), the `server started` emit is inline in `serve()` rather than on
+    /// a spawned task, and the lib suite reproduced it 0/6 on an idle machine.
+    /// The one observed failure coincided with a wedged sccache and three
+    /// concurrent release builds on the same box.
+    ///
+    /// A bounded poll removes the dependence on that one instant WITHOUT
+    /// weakening the assertion: a line that is genuinely never emitted still
+    /// fails, `timeout` later, with the same captured contents in the message.
+    /// That is the property that makes this a deflake rather than a mute, and
+    /// `scripts/watch-boot-line-fail.sh` is what proves it.
+    ///
+    /// `tokio::time::sleep`, never `std::thread::sleep`: under the default
+    /// current_thread runtime a blocking sleep parks the whole reactor, so any
+    /// pending task that still owes the line could never run and the poll would
+    /// be guaranteed to time out.
+    async fn wait_for_logged_line(
+        sink: &SharedBuf,
+        timeout: std::time::Duration,
+        predicate: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(line) = sink.contents().lines().find(|l| predicate(l)) {
+                return Some(line.to_string());
+            }
+            if std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     impl std::io::Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -1731,11 +1772,17 @@ mod tests {
         .expect("bind must succeed on an ephemeral port")
         .expect_started();
 
-        let log = sink.contents();
-        let boot_line = log
-            .lines()
-            .find(|line| line.contains("server started"))
-            .unwrap_or_else(|| panic!("no \"server started\" line in captured log: {log:?}"));
+        let boot_line = wait_for_logged_line(&sink, std::time::Duration::from_secs(5), |line| {
+            line.contains("server started")
+        })
+        .await
+        .unwrap_or_else(|| {
+            panic!(
+                "no \"server started\" line within 5s; captured log: {:?}",
+                sink.contents()
+            )
+        });
+        let boot_line = boot_line.as_str();
 
         for expected in [
             "session_affinity=false",
