@@ -66,6 +66,25 @@ struct MuteText: View {
     }
 }
 
+/// `.tool .stat` — the cpu/memory figure on a Tools-tab running row.
+///
+/// `MuteText` in every respect but the size, which is the mockup's own 11 px
+/// for this one element (``V4/toolRowStatSize``). Its own type rather than a
+/// size parameter on `MuteText`: the mockup gives this element its own rule,
+/// and a shared view with a size knob is how one call site quietly restyles a
+/// token for everyone.
+struct StatText: View {
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(V4.font(V4.toolRowStatSize))
+            .foregroundStyle(Tok.mute)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(minHeight: V4.lineHeight(V4.muteSize), alignment: .leading)
+    }
+}
+
 /// `.mono` — a tool call's command head. Ellipsised at the tail, and never
 /// allowed to push the thing beside it off the row.
 ///

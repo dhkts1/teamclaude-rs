@@ -15,19 +15,32 @@ public struct SessionFile: Decodable, Equatable, Sendable {
     /// pattern-matched here beyond ``SessionActivity``'s own mapping.
     public let status: String?
     public let updatedAt: Int64?
+    /// The Claude Code process's own pid — the file is NAMED for it
+    /// (`~/.claude/sessions/31389.json`) and carries it as a field too.
+    ///
+    /// Read for one purpose: the Tools tab matches a running Bash call to the
+    /// shell this pid spawned, and offers a kill for that shell's process
+    /// group (``ProcessMatch/shellChild(ofSessionPid:startedMs:in:tolerance:)``).
+    /// Optional because a harness on the other end of the proxy that is not
+    /// Claude Code writes no such file at all, and an older Claude Code may
+    /// write one without the field: both mean "no process to match", which is
+    /// the case that draws no stats and no button rather than a guess.
+    public let pid: Int32?
 
     public init(
         sessionId: String,
         cwd: String? = nil,
         name: String? = nil,
         status: String? = nil,
-        updatedAt: Int64? = nil
+        updatedAt: Int64? = nil,
+        pid: Int32? = nil
     ) {
         self.sessionId = sessionId
         self.cwd = cwd
         self.name = name
         self.status = status
         self.updatedAt = updatedAt
+        self.pid = pid
     }
 }
 

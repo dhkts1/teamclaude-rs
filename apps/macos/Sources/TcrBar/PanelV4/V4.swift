@@ -232,6 +232,18 @@ enum V4 {
     /// lines are taller than ours, and a ring sized from the stylesheet rather
     /// than from the row it sits in is what made the rows grow around it.
     static var ringSize: CGFloat { compact ? 24 : 28 }
+    /// The ring on a Tools-tab RUNNING NOW row, which is smaller than every
+    /// other ring on the panel — 22, the mockup's own
+    /// `.tool .ring{width:22px}` (`docs/design/panel-tabs-mockup.html:263`),
+    /// which overrides its generic `.ring{width:34px}` for exactly this row.
+    ///
+    /// The app's 28 came from that generic rule, measured down from 34 (Gil,
+    /// 2026-09-13); the per-row override was missed. It matters now because
+    /// this row grew a cpu/memory clause and a ✕: at 28 the line could not
+    /// hold the session name, the figure and the trailing group together, and
+    /// the name or the memory figure clipped. Six points here and two from the
+    /// gap below are what pay for the text (Gil, 2026-09-14).
+    static var toolRowRingSize: CGFloat { compact ? 20 : 22 }
     static let ringStroke: CGFloat = 3.5
     static let ringTrackAlpha: Double = 0.08
     /// The Bash tool's own timeout — the denominator the ring fills toward, and
@@ -241,6 +253,20 @@ enum V4 {
     /// and the row says how long is left (Gil, 2026-09-13: "red plus
     /// `· 20s to timeout` within 60 s of the 600 s limit").
     static let toolTimeoutWarnSeconds: Double = 60
+
+    // MARK: - Kill (`✕`)
+
+    /// The ✕'s hit target. 24, not the 22 pt `docs/design/tools-tab.md` calls
+    /// the minimum: that document's own rule takes the ✕ to 24 because macOS'
+    /// pointer minimum is 24 and this is the one DESTRUCTIVE control on the
+    /// tab. A hit target smaller than the glyph's own confidence is how a
+    /// mis-click kills the wrong command.
+    static let killHitTarget: CGFloat = 24
+    /// The glyph inside that target. Smaller than the box on purpose: the box
+    /// is what the pointer must hit, the glyph is what the eye must not be
+    /// dominated by — a running row is about its command, not about the way
+    /// to end it.
+    static let killGlyph: CGFloat = 10
 
     /// The fixed column every row's trailing content occupies — the ring and
     /// its duration on Tools, the sparkline or the status on Sessions.
@@ -385,6 +411,16 @@ enum V4 {
     static let nameTracking: CGFloat = -0.005 * 15
     static var dimSize: CGFloat { compact ? 12 : 13 }
     static var muteSize: CGFloat { compact ? 11 : 12 }
+    /// The cpu/memory figure on a Tools-tab running row — the mockup's own
+    /// `.tool .stat{font-size:11px}`
+    /// (`docs/design/panel-tabs-mockup.html:264`), a point under the `.who`
+    /// text it sits beside.
+    ///
+    /// Not a taste choice and not a squeeze: it is the size that element is
+    /// specified at, and it was missed when this row was first drawn. Measured
+    /// need, with the name whole and the 22 pt ring: the line has 324.5 pt and
+    /// the figure at `muteSize` wants 325.8, at this size 320.1.
+    static var toolRowStatSize: CGFloat { compact ? 10 : 11 }
     static let monoSize: CGFloat = 12
     static let footerSize: CGFloat = 12.5
 

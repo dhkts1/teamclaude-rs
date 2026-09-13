@@ -24,7 +24,7 @@ final class MachineStatsTests: XCTestCase {
     func testLineMatchesTheMockup() {
         XCTAssertEqual(
             stats(load: 7.1).line,
-            "load 7.1 of 14 · 48 GB of 64 used · 5 compiles · disk 210 GB free")
+            "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free")
     }
 
     /// The clause a view tints and the rest of the line join back into the
@@ -48,8 +48,8 @@ final class MachineStatsTests: XCTestCase {
             used: 17_179_869_184,  // 16 GiB
             total: 68_719_476_736,  // 64 GiB
             free: 210_400_000_000)  // 210 GB
-        XCTAssertTrue(machine.line.contains("16 GB of 64 used"), machine.line)
-        XCTAssertTrue(machine.line.contains("disk 210 GB free"), machine.line)
+        XCTAssertTrue(machine.line.contains("16/64 GB"), machine.line)
+        XCTAssertTrue(machine.line.contains("210 GB free"), machine.line)
     }
 
     /// Gil's own dispatch rule: below one load unit per core says nothing,

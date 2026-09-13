@@ -154,6 +154,29 @@ struct FleetView: View {
     /// ``MachineStats/read()`` walks the process table.
     @State private var machine: MachineStats?
 
+    /// What each RUNNING Bash call's process tree is costing, keyed by
+    /// ``SessionToolEntry/id`` — the row's `640% · 2.1G`, and the pid
+    /// its ✕ would signal. Empty for every call this build could not match a
+    /// process to, which is the state that draws neither figure nor button.
+    ///
+    /// Refreshed on the same poll as ``sessionFiles`` and ``machine``, and
+    /// never per render: it walks the process table. The CPU figure is a rate
+    /// between two of these polls, so the FIRST poll for a call carries none
+    /// (``RunningCallStats/cpuPercent`` is `nil`) and the row prints memory
+    /// alone rather than a 0% nobody measured.
+    @State private var runningProcesses: [String: RunningCallStats] = [:]
+
+    /// The kill a confirm is currently open for, `nil` when none is.
+    ///
+    /// The request holds what the DIALOG needs to name — the command and the
+    /// session — and what the kill needs to RE-MATCH: the session pid and the
+    /// call's start. It deliberately does not hold a pid. A pid is a claim
+    /// about the poll that produced it, and the process it named can exit
+    /// between the poll and the click, with its number handed to something
+    /// else; ``performKill(_:)`` matches again at click time and signals only
+    /// what that match returns.
+    @State private var killRequest: KillRequest?
+
     /// Every stored property above still gets its usual default — this exists
     /// only so ``RenderStates`` can seed ``selectedTab`` deterministically.
     /// `@State`'s wrapped value can only be seeded through
@@ -191,6 +214,11 @@ struct FleetView: View {
         // pixels on any box, at any load), so a fixture hands the machine line
         // its numbers and the live app leaves this `nil` and reads them.
         initialMachineStats: MachineStats? = nil,
+        // Seeded for the same reason the two above are: `snapshotMode` never
+        // reads the live process table, so without this the render harness
+        // draws every running row with no cpu/memory clause and no ✕, and the
+        // fixture reviews a layout the app no longer has.
+        initialRunningProcesses: [String: RunningCallStats] = [:],
         // Which TIMED OUT TODAY classes start open. Seeded for one render
         // scene: the disclosure is the whole point of that card — a count
         // that opens to the commands behind it — and a harness that can only
@@ -214,6 +242,7 @@ struct FleetView: View {
         self._selectedTab = State(initialValue: initialTab)
         self._sessionFiles = State(initialValue: initialSessionFiles)
         self._machine = State(initialValue: initialMachineStats)
+        self._runningProcesses = State(initialValue: initialRunningProcesses)
         self._expandedTimeoutClasses = State(initialValue: initialExpandedTimeoutClasses)
     }
 
@@ -241,13 +270,37 @@ struct FleetView: View {
             if !snapshotMode {
                 sessionFiles = SessionFiles.read()
                 machine = MachineStats.read()
+                refreshRunningProcesses()
             }
         }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode {
                 sessionFiles = SessionFiles.read()
                 machine = MachineStats.read()
+                refreshRunningProcesses()
             }
+        }
+        // The kill confirm. `docs/design/tools-tab.md`: "a destructive control
+        // confirms … kill asks once, names the command it will signal."
+        // EVERY time, with no "don't ask again": the cost of a wrong kill is a
+        // command an operator cannot get back, and the rule that a confirm can
+        // be switched off is how a destructive control becomes a one-click one.
+        //
+        // Attached here rather than inside the Tools list because the list is
+        // rebuilt on every poll — a dialog anchored to a row that re-renders
+        // mid-confirm dismisses itself under the pointer.
+        .confirmationDialog(
+            "Kill this command?",
+            isPresented: Binding(
+                get: { killRequest != nil },
+                set: { presented in if !presented { killRequest = nil } }
+            ),
+            presenting: killRequest
+        ) { request in
+            Button("Kill", role: .destructive) { performKill(request) }
+            Button("Cancel", role: .cancel) { killRequest = nil }
+        } message: { request in
+            Text(request.message)
         }
         // The sheet IS `loginSession != nil` — dismissing by any route (Esc,
         // click-away) runs the same cancel the button does, because a login
@@ -1676,17 +1729,29 @@ struct FleetView: View {
         let capped = entry.call.tool == "Bash"
         let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
         let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
+        // What this call's process tree costs, and the only evidence that
+        // there is a process to kill at all. `nil` — no match this poll —
+        // draws no clause and no ✕: a button that signals nothing, or worse
+        // signals whatever now holds a recycled pid, is the one control this
+        // tab must not offer on a guess.
+        let stats = runningProcesses[entry.id]
         return toolItem(
             entry: entry,
+            meta: ProcessStatsLabel.clause(stats),
+            metaHover: ProcessStatsLabel.hover(stats, tool: entry.call.tool),
             trailing: {
-                HStack(spacing: V4.rowGap) {
+                // `pillGap`, not `rowGap`: the mockup's own
+                // `.tool .tt{gap:6px}` for this row, and two of the points
+                // that pay for the cpu/memory clause beside the session name.
+                HStack(spacing: V4.pillGap) {
                     if capped {
                         ProgressRing(
                             fraction: (elapsed ?? 0) / bashTimeoutSeconds,
                             tint: isNearTimeout ? Tok.spent : Tok.ok,
                             accessibilityText: elapsed.map {
                                 "\(durationLabel($0)) of \(Int(bashTimeoutSeconds))s"
-                            })
+                            },
+                            size: V4.toolRowRingSize)
                     }
                     // Elapsed and "20s left" are ONE reading, so they are one
                     // Text: a call in the warning band is red AND says how
@@ -1699,8 +1764,144 @@ struct FleetView: View {
                     .font(V4.font(V4.dimSize))
                     .foregroundStyle(isNearTimeout ? Tok.spent : Tok.dim)
                     .lineLimit(1)
+                    if stats != nil { killButton(entry) }
                 }
             })
+    }
+
+    /// The ✕ at the trailing end of a running row.
+    ///
+    /// Drawn only for a call this build MATCHED to a process — see
+    /// ``runningToolItem(_:)``. It is not disabled for the unmatched case, it
+    /// is absent: a greyed ✕ says "this command cannot be killed", which is a
+    /// claim about the command, when the truth is that this panel could not
+    /// find its process.
+    ///
+    /// The label names the command rather than the row, because "Kill" alone
+    /// in a list of five running calls is five identical buttons to a screen
+    /// reader.
+    private func killButton(_ entry: SessionToolEntry) -> some View {
+        Button {
+            killRequest = makeKillRequest(for: entry)
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: V4.killGlyph, weight: .semibold))
+                // The hit target is the FRAME, not the glyph, and
+                // `contentShape` is what makes the whole frame clickable
+                // rather than the drawn pixels of the ✕ itself.
+                .frame(width: V4.killHitTarget, height: V4.killHitTarget)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(Tok.inkFaint)
+        .accessibilityLabel(ProcessStatsLabel.killLabel(subject: killSubject(entry)))
+        .accessibilityHint("Asks first. The session gets a tool error and continues.")
+        .help("Kill this command")
+    }
+
+    /// What the button and the dialog CALL this command — its head, or the
+    /// tool's own name for a call whose head this build never had (a head is
+    /// held in memory only, `panel-tabs.md` "Constraints", so a panel that
+    /// started after the call did has none).
+    private func killSubject(_ entry: SessionToolEntry) -> String {
+        guard let head = entry.call.commandHead, !head.isEmpty else { return entry.call.tool }
+        return head
+    }
+
+    /// The confirm's own content, built at CLICK time from the row.
+    private func makeKillRequest(for entry: SessionToolEntry) -> KillRequest? {
+        guard let sessionPid = sessionFiles[entry.sessionId]?.pid,
+            let startedMs = entry.call.startedMs
+        else { return nil }
+        return KillRequest(
+            sessionPid: sessionPid,
+            startedMs: startedMs,
+            subject: killSubject(entry),
+            sessionName: toolCallOwnerName(entry.sessionId))
+    }
+
+    /// A kill the operator has been asked about but has not yet confirmed.
+    struct KillRequest: Equatable {
+        let sessionPid: Int32
+        let startedMs: Int64
+        /// The command head, as the dialog and the log line name it.
+        let subject: String
+        let sessionName: String
+
+        /// "`cargo build --release` in teamclaude-rs-c7. The session gets a
+        /// tool error and continues."
+        ///
+        /// The second sentence is the one that decides the click: an operator
+        /// who does not know whether this ends the SESSION will not press the
+        /// button, and the answer — it does not — is the whole reason this
+        /// control is offerable at all.
+        var message: String {
+            ProcessStatsLabel.killConfirmation(subject: subject, session: sessionName)
+        }
+    }
+
+    /// Confirmed: re-match, then signal — or log why not.
+    ///
+    /// The re-match is not belt-and-braces. Between the poll that drew the ✕
+    /// and this click the shell can exit, and macOS can hand its pid to
+    /// something else; signalling the pid the poll returned would then kill a
+    /// stranger. ``ProcessKill/target(matched:sessionPid:)`` takes the match
+    /// made HERE, and refuses outright when there is none.
+    private func performKill(_ request: KillRequest) {
+        killRequest = nil
+        let matched = ProcessMatch.shellChild(
+            ofSessionPid: request.sessionPid, startedMs: request.startedMs,
+            in: ProcessTable.read())
+        switch ProcessKill.target(matched: matched, sessionPid: request.sessionPid) {
+        case .success(let group):
+            let sent = ProcessKill.signal(processGroup: group)
+            // `NSLog("%@", …)`, never the string as the format itself — a
+            // command head containing a `%` is a format specifier otherwise,
+            // the same reason `MenuBarShell` states for its own logging.
+            NSLog(
+                "%@",
+                sent
+                    ? "TcrBar: killed process group \(group) — \(request.subject)"
+                        + " in \(request.sessionName)"
+                    : "TcrBar: SIGTERM to process group \(group) failed — \(request.subject)"
+                        + " in \(request.sessionName)")
+        case .failure(let refusal):
+            NSLog(
+                "%@",
+                "TcrBar: kill refused (\(refusal)) — \(request.subject)"
+                    + " in \(request.sessionName)")
+        }
+        // The row's stats are now a reading of a process that is ending. One
+        // extra table walk here is cheaper than a row that keeps drawing a
+        // ✕ for the thing it just killed until the next poll lands.
+        refreshRunningProcesses()
+    }
+
+    /// One poll's process reading for every RUNNING Bash call on the tab.
+    ///
+    /// Bash only: `ProcessMatch` matches a SHELL child, and an Agent or Read
+    /// call has no shell to match — `docs/design/tools-tab.md`, "An Agent row
+    /// has nothing to kill". A call whose session file carries no pid, or
+    /// which the wire gave no `startedMs`, is skipped here rather than
+    /// half-matched later.
+    private func refreshRunningProcesses() {
+        guard case .loaded(let fleet) = poller.state, !fleet.toolsRunning.isEmpty else {
+            runningProcesses = [:]
+            return
+        }
+        let calls = fleet.toolsRunning.compactMap { entry -> RunningCallKey? in
+            guard entry.call.tool == "Bash",
+                let pid = sessionFiles[entry.sessionId]?.pid,
+                let startedMs = entry.call.startedMs
+            else { return nil }
+            return RunningCallKey(id: entry.id, sessionPid: pid, startedMs: startedMs)
+        }
+        guard !calls.isEmpty else {
+            runningProcesses = [:]
+            return
+        }
+        runningProcesses = ProcessStats.poll(
+            calls: calls, table: ProcessTable.read(), previous: runningProcesses, now: Date())
     }
 
     /// One of today's slowest calls — the same item, with a pill where the
@@ -1740,19 +1941,47 @@ struct FleetView: View {
     /// must never drift on how a call names itself — the same reason
     /// ``MonoText`` is shared.
     private func toolItem<Trailing: View>(
-        entry: SessionToolEntry, @ViewBuilder trailing: @escaping () -> Trailing
+        entry: SessionToolEntry,
+        meta: String = "",
+        metaHover: String? = nil,
+        @ViewBuilder trailing: @escaping () -> Trailing
     ) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             V4Row {
                 HStack(spacing: 0) {
+                    // The NAME keeps the width, on every row, measurement or
+                    // not (Gil, 2026-09-14, ruling on the first render of this
+                    // row): it is the row's distinguishing text and the one
+                    // string a reader scans for. The first attempt let it
+                    // ellipsise to `teamcla…` so that ` · 640% cpu · 2.1 GB`
+                    // could be drawn whole; the fix was to spend the ~24 pt
+                    // the word `cpu` cost instead — see
+                    // ``ProcessStatsLabel/clause(_:)``.
                     NameText(text: toolCallOwnerName(entry.sessionId))
                         .layoutPriority(1)
-                    // ` · Bash`, and for a Bash row the slot where B1's
-                    // "· 640% cpu · 2.1 GB" lands. Nothing is drawn there
-                    // now: this build reads no process, and inventing a
-                    // figure to fill a slot is the one thing a panel about
-                    // trust cannot do.
-                    MuteText(text: " · \(entry.call.tool)")
+                    // ` · Bash`, REPLACED by ` · 640% · 2.1G` once a process
+                    // is matched. The tool word goes rather than the figure
+                    // because this row's tool is already said by the ring
+                    // (only a Bash call has one), by the ✕ (only a Bash call
+                    // can be killed) and by the hover text, which is
+                    // `pid 48765 · Bash · 640% cpu` — the pid and the unit
+                    // being what you check after deciding, not while scanning.
+                    //
+                    // `meta` is empty for every other row and for a call no
+                    // process matched: this panel draws a figure it measured
+                    // or it draws nothing, and inventing one to fill a slot is
+                    // the one thing a panel about trust cannot do.
+                    // Two types, because the mockup gives the two strings two
+                    // sizes: `.tool .who` at 12 for `· Bash`, `.tool .stat` at
+                    // 11 for the figure. The point that buys is also what made
+                    // the line fit with the session name whole.
+                    if meta.isEmpty {
+                        MuteText(text: " · \(entry.call.tool)")
+                    } else {
+                        StatText(text: meta)
+                            .help(metaHover ?? "")
+                            .accessibilityValue(metaHover ?? "")
+                    }
                 }
             } trailing: {
                 trailing()
@@ -1890,7 +2119,7 @@ struct FleetView: View {
         }
     }
 
-    /// "load 7.1 of 14 · 48 GB of 64 used · 5 compiles · disk 210 GB free" —
+    /// "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free" —
     /// the second question `docs/design/tools-tab.md` records the operator
     /// arriving with ("is the box overloaded?"), which this panel answered
     /// nowhere at all. Drawn under the tools headline, above the tabs, where

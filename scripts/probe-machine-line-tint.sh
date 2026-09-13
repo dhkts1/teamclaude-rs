@@ -50,7 +50,7 @@ PY
 
 echo "--- mutated fixture (load 31 of 14, past 2x cores): expect a few hundred"
 scan "$out/17-tools-tab-auto-dark.png"
-echo "--- CONTROL, shipped fixture (load 7.1 of 14, calm): expect 0"
+echo "--- CONTROL, shipped fixture (load 7.1/14, calm): expect 0"
 scan "${TOOLS_TAB_RENDERS:-/tmp/tools-tab/after}/17-tools-tab-auto-dark.png"
 
 cp "$backup" "$states"
