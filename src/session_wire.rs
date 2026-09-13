@@ -36,12 +36,227 @@ use serde_json::Value;
 pub struct ToolUseEvent {
     pub id: String,
     pub name: Option<String>,
-    /// For a `Bash` tool call, the first 120 characters of `input.command`. For an `Agent` or
-    /// `Task` tool call (a running subagent), `input.description` (Claude Code's 3-5 word
-    /// summary), prefixed with `input.subagent_type` when present (`"henry:coder: F4 subagents
-    /// on the wire"`), same 120-char cap. `None` for any other tool. Held in memory only — see
-    /// the module doc's no-body-content-on-disk rule.
+    /// For a `Bash` tool call, the NORMALIZED first 120 characters of `input.command` — see
+    /// [`normalize_bash_command`]. For an `Agent` or `Task` tool call (a running subagent),
+    /// `input.description` (Claude Code's 3-5 word summary), prefixed with
+    /// `input.subagent_type` when present (`"reviewer: check the wire fixtures"`), same
+    /// 120-char cap. `None` for any other tool. Held in memory only — see the module doc's
+    /// no-body-content-on-disk rule.
     pub command_head: Option<String>,
+    /// A `Bash` tool call's coarse category — see [`CommandClass`]. `None` for any other
+    /// tool, or when `command_head` is `None`.
+    pub command_class: Option<CommandClass>,
+}
+
+/// A Bash command's coarse category, for the Tools tab's per-class rollup — mirrors
+/// the operator harness's own slow-command classifier, so the wire and that harness
+/// hook agree on both the rules and the names. Classified on the REDUCED command (after
+/// env/wrapper/`cd`-clause stripping — see [`normalize_bash_command`]), never the raw one:
+/// the hook's own measurement is that classifying a compound command by its first clause
+/// hid a real defect (a slow `grep`) behind a `git` bucket for four days.
+// `Serialize`/`Deserialize` because a classified command rides the session-wire
+// snapshot (`src/session_wire_persist.rs`, #289): a row restored at boot has to
+// carry the same class it carried while live, or the Tools tab would reclassify
+// half its rows as `other` after every restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CommandClass {
+    /// `wait-for-line`, `merge-when-green`, or a command starting with `until`/`sleep` —
+    /// never a defect, since taking long is the job.
+    Wait,
+    /// Any `;`, `&` or `|` left in the reduced command — a real compound, since a `cd
+    /// <dir> && <clause>` already had its `cd` prefix reduced away before this check runs.
+    Compound,
+    /// `find`, `grep`, `fd`, `rg`, `bfs` or `du`.
+    Search,
+    /// `git fetch`/`push`/`pull`/`clone`/`ls-remote` — a network round trip.
+    GitNet,
+    /// Any other `git` subcommand.
+    GitLocal,
+    /// `cargo`, `pnpm`, `npm`, `yarn`, `uv`, `uvx`, `pytest`, `vitest`, `make`, `tsc`, `bun`
+    /// or `cargo-q.sh`.
+    Build,
+    /// Everything else.
+    Other,
+}
+
+impl CommandClass {
+    /// The wire/panel name — kebab-case, matching `hooks/log-slow-bash.sh`'s own
+    /// `class=` values verbatim, so a person reading both sees the same word.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandClass::Wait => "wait",
+            CommandClass::Compound => "compound",
+            CommandClass::Search => "search",
+            CommandClass::GitNet => "git-net",
+            CommandClass::GitLocal => "git-local",
+            CommandClass::Build => "build",
+            CommandClass::Other => "other",
+        }
+    }
+}
+
+/// Take the first whitespace-delimited token of `s`, requiring at least one whitespace
+/// character AFTER it (a bare trailing token with nothing following is never "wrapped" —
+/// same as the hook's `\s+` after each stripped prefix). Returns `(token, rest trimmed of
+/// its leading whitespace)`.
+fn take_token(s: &str) -> Option<(&str, &str)> {
+    let ws = s.find(char::is_whitespace)?;
+    Some((&s[..ws], s[ws..].trim_start()))
+}
+
+/// Is `token` an `IDENT=value` environment assignment? Generic — any valid shell identifier,
+/// not restricted to one project's own prefix — mirroring the hook's
+/// `^(FOO=bar\s+)+`.
+fn is_env_assignment(token: &str) -> bool {
+    let Some((ident, value)) = token.split_once('=') else {
+        return false;
+    };
+    !ident.is_empty()
+        && !value.is_empty()
+        && ident
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Strip every leading `IDENT=value` token, in order — the hook's `^(FOO=bar\s+)+`.
+fn strip_env_prefix(mut s: &str) -> &str {
+    while let Some((token, rest)) = take_token(s) {
+        if !is_env_assignment(token) {
+            break;
+        }
+        s = rest;
+    }
+    s
+}
+
+/// Strip one leading wrapper (`timeout <n>`, `nice -n<n>` or `time`), or `None` if `s` does
+/// not start with one. Mirrors the hook's `^(timeout\s+\d+\s+|nice\s+-n\d+\s+|time\s+)`.
+fn strip_one_wrapper(s: &str) -> Option<&str> {
+    let (first, rest) = take_token(s)?;
+    match first {
+        "timeout" => {
+            let (arg, rest2) = take_token(rest)?;
+            (!arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit())).then_some(rest2)
+        }
+        "time" => Some(rest),
+        "nice" => {
+            let (flag, rest2) = take_token(rest)?;
+            let digits = flag.strip_prefix("-n")?;
+            (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then_some(rest2)
+        }
+        _ => None,
+    }
+}
+
+/// Strip every leading wrapper, in order — the hook's `(...)+` repetition.
+fn strip_wrappers(mut s: &str) -> &str {
+    while let Some(rest) = strip_one_wrapper(s) {
+        s = rest;
+    }
+    s
+}
+
+/// Reduce `cd <dir> && <clause>` (or `cd <dir>; <clause>`) to just `<clause>`, ONLY when
+/// `<clause>` itself contains no further `;`, `&` or `|` — the hook's own measurement: 18%
+/// of its "compound" rows were exactly this shape, a free `cd` in front of the real work.
+/// `None` when `s` does not start with a standalone `cd`, has no such separator, or the
+/// remainder is still a genuine compound.
+fn reduce_cd_prefix(s: &str) -> Option<String> {
+    let after_cd = s.strip_prefix("cd")?;
+    if !after_cd.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let after_cd = after_cd.trim_start();
+    let dir_end = after_cd.find(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|'))?;
+    if dir_end == 0 {
+        return None;
+    }
+    let after_dir = after_cd[dir_end..].trim_start();
+    let after_sep = after_dir
+        .strip_prefix("&&")
+        .or_else(|| after_dir.strip_prefix(';'))?;
+    let clause = after_sep.trim();
+    if clause.is_empty() || clause.contains([';', '&', '|']) {
+        return None;
+    }
+    Some(clause.to_string())
+}
+
+/// Does `s` start with `word` as a whole word (end of string, or followed by whitespace)?
+fn starts_with_word(s: &str, word: &str) -> bool {
+    s.strip_prefix(word)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
+/// Classify an already-REDUCED command (see [`normalize_bash_command`]) — the hook's own
+/// `elif` chain, same order: `wait` first (never a defect), then `compound` (a genuine one,
+/// since `cd` was already stripped), then by the first word's basename.
+fn classify_command(reduced: &str) -> CommandClass {
+    if reduced.contains("wait-for-line")
+        || reduced.contains("merge-when-green")
+        || starts_with_word(reduced, "until")
+        || starts_with_word(reduced, "sleep")
+    {
+        return CommandClass::Wait;
+    }
+    if reduced.contains([';', '&', '|']) {
+        return CommandClass::Compound;
+    }
+    let mut words = reduced.split_whitespace();
+    let w0 = words.next().unwrap_or("");
+    let w0_base = w0.rsplit('/').next().unwrap_or(w0);
+    let w1 = words.next().unwrap_or("");
+    if matches!(w0_base, "find" | "grep" | "fd" | "rg" | "bfs" | "du") {
+        return CommandClass::Search;
+    }
+    if w0_base == "git" {
+        return if matches!(w1, "fetch" | "push" | "pull" | "clone" | "ls-remote") {
+            CommandClass::GitNet
+        } else {
+            CommandClass::GitLocal
+        };
+    }
+    if matches!(
+        w0_base,
+        "cargo"
+            | "pnpm"
+            | "npm"
+            | "yarn"
+            | "uv"
+            | "uvx"
+            | "pytest"
+            | "vitest"
+            | "make"
+            | "tsc"
+            | "bun"
+            | "cargo-q.sh"
+    ) {
+        return CommandClass::Build;
+    }
+    CommandClass::Other
+}
+
+/// Normalize a raw Bash `input.command` into a `(head, class)` pair for the Tools tab —
+/// ports `hooks/log-slow-bash.sh`'s `jq` normalization verbatim, in order: strip leading
+/// whitespace, strip leading env assignments, strip wrappers, reduce a `cd <dir> &&
+/// <clause>` prefix (only when `<clause>` is itself simple), strip wrappers again (`cd
+/// <dir> && timeout 15 rg ...` is the shape `prefer-fd-rg` itself emits), collapse embedded
+/// newlines to `⏎`, THEN truncate to [`COMMAND_HEAD_MAX`]. The class is read off the reduced
+/// command BEFORE the newline collapse and truncation — display formatting must never change
+/// what a command classifies as.
+pub fn normalize_bash_command(raw: &str) -> (String, CommandClass) {
+    let s = strip_wrappers(strip_env_prefix(raw.trim_start()));
+    let reduced = reduce_cd_prefix(s).unwrap_or_else(|| s.to_string());
+    let reduced = strip_wrappers(&reduced).to_string();
+    let class = classify_command(&reduced);
+    let head = reduced
+        .replace('\n', "⏎")
+        .chars()
+        .take(COMMAND_HEAD_MAX)
+        .collect();
+    (head, class)
 }
 
 /// A `tool_result` block found in a user message.
@@ -163,13 +378,18 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
             match (msg.role.as_str(), b.kind.as_str()) {
                 ("assistant", "tool_use") => {
                     if let Some(id) = b.id {
+                        let mut command_class = None;
                         let command_head = match b.name.as_deref() {
                             Some("Bash") => b
                                 .input
                                 .as_ref()
                                 .and_then(|v| v.get("command"))
                                 .and_then(Value::as_str)
-                                .map(|s| s.chars().take(COMMAND_HEAD_MAX).collect()),
+                                .map(|s| {
+                                    let (head, class) = normalize_bash_command(s);
+                                    command_class = Some(class);
+                                    head
+                                }),
                             Some("Agent") | Some("Task") => b.input.as_ref().and_then(|input| {
                                 let description =
                                     input.get("description").and_then(Value::as_str)?;
@@ -188,6 +408,7 @@ pub fn extract_tool_events(messages: &RawValue) -> (Vec<ToolUseEvent>, Vec<ToolR
                             id,
                             name: b.name,
                             command_head,
+                            command_class,
                         });
                     }
                 }
@@ -221,6 +442,7 @@ pub struct RunningTool {
     pub tool: String,
     pub started_ms: i64,
     pub command_head: Option<String>,
+    pub command_class: Option<CommandClass>,
 }
 
 /// One completed tool call, for the "ten slowest" list.
@@ -229,6 +451,7 @@ pub struct SlowTool {
     pub tool: String,
     pub seconds: f64,
     pub command_head: Option<String>,
+    pub command_class: Option<CommandClass>,
     pub ended_ms: i64,
 }
 
@@ -479,6 +702,7 @@ impl WireSessionTracker {
                     tool: tu.name.clone().unwrap_or_default(),
                     started_ms: previous_response_end_ms,
                     command_head: tu.command_head.clone(),
+                    command_class: tu.command_class,
                 },
             );
         }
@@ -508,6 +732,7 @@ impl WireSessionTracker {
                         tool: running.tool,
                         seconds,
                         command_head: running.command_head,
+                        command_class: running.command_class,
                         ended_ms: now_ms,
                     },
                 );
@@ -609,6 +834,86 @@ impl WireSessionTracker {
 mod tests {
     use super::*;
 
+    /// `cd <dir> && <simple clause>` reduces to just the clause — the hook's own
+    /// measurement: 18% of its "compound" rows were this exact shape, a free `cd` hiding a
+    /// simple command that deserved a real class.
+    #[test]
+    fn cd_and_a_simple_clause_reduces_to_the_clause() {
+        let (head, class) = normalize_bash_command("cd ~/src/example && cargo test -p example");
+        assert_eq!(head, "cargo test -p example");
+        assert_eq!(class, CommandClass::Build);
+    }
+
+    /// A wrapper sitting right after the `cd`'s `&&` — `cd <dir> && timeout 15 rg ...` is the
+    /// shape `prefer-fd-rg` itself emits, and the very reason the hook strips wrappers a
+    /// SECOND time after the `cd` reduction, not just once up front.
+    #[test]
+    fn a_wrapper_in_front_of_the_reduced_clause_is_stripped_too() {
+        let (head, class) = normalize_bash_command("cd ~/src/example && timeout 15 rg -n TODO");
+        assert_eq!(head, "rg -n TODO");
+        assert_eq!(class, CommandClass::Search);
+    }
+
+    /// An env-var prefix in front of the real command is stripped, and the class is read off
+    /// what remains.
+    #[test]
+    fn an_env_prefix_is_stripped_before_classifying() {
+        let (head, class) = normalize_bash_command("CI=1 FOO=bar cargo build --release");
+        assert_eq!(head, "cargo build --release");
+        assert_eq!(class, CommandClass::Build);
+    }
+
+    /// A genuine compound — `cd` reduction only fires when the clause after `&&`/`;` is
+    /// itself simple, so a SECOND `&&` (or `;`, or `|`) anywhere in it must leave the whole
+    /// thing untouched and classified as `compound`.
+    #[test]
+    fn a_genuine_compound_is_not_reduced() {
+        let raw = "cd ~/src/example && cargo build && cargo test";
+        let (head, class) = normalize_bash_command(raw);
+        assert_eq!(
+            head, raw,
+            "no reduction — the clause after && is itself compound"
+        );
+        assert_eq!(class, CommandClass::Compound);
+    }
+
+    /// A multi-line script collapses to one line (`⏎` between lines) for display, and is
+    /// still classified from the reduced text, not by its first line alone. The newline
+    /// here is INTERNAL to the reduced clause (a backslash-continued `cargo` invocation),
+    /// not merely trailing whitespace `cd`'s own trim already strips.
+    #[test]
+    fn a_multiline_script_collapses_to_one_line() {
+        let raw = "cd ~/src/example && cargo test \\\n  -p example";
+        let (head, class) = normalize_bash_command(raw);
+        assert_eq!(head, "cargo test \\⏎  -p example");
+        assert_eq!(class, CommandClass::Build);
+    }
+
+    /// One classification per class name — matches `hooks/log-slow-bash.sh`'s own class
+    /// list, so a wire reader and the harness hook agree on the word.
+    #[test]
+    fn one_classification_per_class_name() {
+        let cases: &[(&str, CommandClass)] = &[
+            ("wait-for-line.sh --until foo", CommandClass::Wait),
+            ("scripts/merge-when-green.sh 123", CommandClass::Wait),
+            (
+                "until grep -q ready log.txt; do sleep 1; done",
+                CommandClass::Wait,
+            ),
+            ("sleep 30", CommandClass::Wait),
+            ("cd ~/src/example && a; b", CommandClass::Compound),
+            ("rg -n TODO ~/src/example", CommandClass::Search),
+            ("git fetch origin main", CommandClass::GitNet),
+            ("git status", CommandClass::GitLocal),
+            ("cargo test -p example", CommandClass::Build),
+            ("echo hello", CommandClass::Other),
+        ];
+        for (raw, expected) in cases {
+            let (_, class) = normalize_bash_command(raw);
+            assert_eq!(class, *expected, "for command {raw:?}");
+        }
+    }
+
     fn tool_use(id: &str, name: &str, command: Option<&str>) -> Value {
         serde_json::json!({
             "type": "tool_use",
@@ -687,8 +992,8 @@ mod tests {
             {"role": "assistant", "content": [agent_tool_use(
                 "tu_agent",
                 "Agent",
-                "F4 subagents on the wire",
-                Some("henry:coder"),
+                "check the wire fixtures",
+                Some("reviewer"),
             )]},
         ]);
         let raw = messages_raw(messages);
@@ -696,7 +1001,7 @@ mod tests {
         assert_eq!(uses.len(), 1);
         assert_eq!(
             uses[0].command_head.as_deref(),
-            Some("henry:coder: F4 subagents on the wire")
+            Some("reviewer: check the wire fixtures")
         );
     }
 
@@ -779,6 +1084,7 @@ mod tests {
             id: "tu_1".into(),
             name: Some("Bash".into()),
             command_head: Some("sleep 5".into()),
+            command_class: None,
         }];
         // First request: the tool_use appears, no result yet.
         tracker.record_request(
@@ -824,6 +1130,7 @@ mod tests {
             id: "tu_orphan".into(),
             name: Some("Read".into()),
             command_head: None,
+            command_class: None,
         }];
         tracker.record_request("sess-b", None, None, 1_000, &uses, &[]);
         let snap = tracker.snapshot(2_000);
@@ -847,6 +1154,7 @@ mod tests {
                 id: format!("tu_{i}"),
                 name: Some("Bash".into()),
                 command_head: None,
+                command_class: None,
             }];
             tracker.record_request("sess-c", None, None, 1_000 + i as i64, &uses, &[]);
         }
@@ -861,6 +1169,7 @@ mod tests {
             id: "tu_overflow".into(),
             name: Some("Bash".into()),
             command_head: None,
+            command_class: None,
         }];
         tracker.record_request("sess-c", None, None, 2_000, &uses, &[]);
         let snap = tracker.snapshot(3_000);
@@ -941,6 +1250,7 @@ mod tests {
             id: "tu_timeout".into(),
             name: Some("Bash".into()),
             command_head: Some("sleep 700".into()),
+            command_class: None,
         }];
         tracker.record_request("sess-f", None, None, 1_000, &uses, &[]);
         let results = vec![ToolResultEvent {
@@ -980,6 +1290,7 @@ mod tests {
                     id: id.clone(),
                     name: Some("Bash".into()),
                     command_head: None,
+                    command_class: None,
                 }],
                 &[],
             );
@@ -1007,6 +1318,7 @@ mod tests {
                 id: "read_0".into(),
                 name: Some("Read".into()),
                 command_head: None,
+                command_class: None,
             }],
             &[],
         );
@@ -1056,6 +1368,7 @@ mod tests {
                 id: "tu_slow".into(),
                 name: Some("Bash".into()),
                 command_head: Some("sleep 90".into()),
+                command_class: None,
             }],
             &[],
         );
