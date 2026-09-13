@@ -231,7 +231,7 @@ pub fn load(path: &Path, now_ms: i64, ttl_ms: i64) -> LoadReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_wire::ToolStats;
+    use crate::session_wire::{RunningTool, SlowTool, ToolStats};
 
     fn tmp(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -286,6 +286,55 @@ mod tests {
         assert_eq!(a.output_tokens, 200);
         assert_eq!(a.cache_read_tokens, 50);
         assert_eq!(a.requests, 3);
+    }
+
+    /// `command_head` never reaches disk — it is a raw shell command / file path / grep
+    /// pattern, exactly the body content this module's doc says stays out of the file — while
+    /// `command_class` (a coarse category) and `seconds` (a plain duration) still round-trip.
+    #[test]
+    fn command_head_does_not_reach_disk() {
+        let path = tmp("no-heads");
+        let now = 1_000_000;
+        let mut sess = session("alice@example.com", now, 1);
+        sess.tools.running.insert(
+            "tool-1".to_string(),
+            RunningTool {
+                tool: "Bash".to_string(),
+                started_ms: now - 500,
+                command_head: Some("rm -rf /secret/customer-data".to_string()),
+                command_class: None,
+            },
+        );
+        sess.tools.slowest.push(SlowTool {
+            tool: "Bash".to_string(),
+            seconds: 12.5,
+            command_head: Some("curl https://internal.example.com/token".to_string()),
+            command_class: None,
+            ended_ms: now,
+        });
+        let mut sessions = HashMap::new();
+        sessions.insert("sess-a".to_string(), sess);
+        save(&path, &sessions, now).expect("save");
+
+        let raw = std::fs::read_to_string(&path).expect("read back the file as a string");
+        assert!(
+            !raw.contains("command_head"),
+            "command_head must not be serialized at all"
+        );
+        assert!(
+            !raw.contains("rm -rf"),
+            "the running tool's head leaked to disk"
+        );
+        assert!(
+            !raw.contains("curl "),
+            "the slowest tool's head leaked to disk"
+        );
+
+        let report = load(&path, now, RESTORE_TTL_MS);
+        let restored = &report.sessions["sess-a"];
+        assert_eq!(restored.tools.slowest.len(), 1);
+        assert!(restored.tools.slowest[0].command_head.is_none());
+        assert_eq!(restored.tools.slowest[0].seconds, 12.5);
     }
 
     /// A session whose last request was longer ago than the TTL is dropped at
