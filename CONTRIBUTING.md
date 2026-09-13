@@ -168,8 +168,11 @@ version that has already been tagged and released. It is self-clearing: bump the
 
 ## Pull requests and CI
 
-`main` is protected. Changes land through a pull request with one approval and passing `ci`, `audit`
-and `macos` checks. An admin bypass exists; using it is a deliberate decision and GitHub records it
+`main` is protected. Changes land through a pull request with four passing checks: `ci`, `audit`,
+`macos` and `plan`. No approving review is required (`required_approving_review_count` is `0`) — the
+checks are the whole gate. `plan` is the easy one to overlook, because it lives in `release.yml`
+(cargo-dist's `dist plan`, triggered on `pull_request`) rather than in `ci.yml`. Protection is
+`strict`, so every merge puts every other open PR behind `main` until it is updated. An admin bypass exists; using it is a deliberate decision and GitHub records it
 as `Bypassed rule violations` in the push output. Read that output, because a push can succeed *and*
 have bypassed the rules.
 
