@@ -275,61 +275,33 @@ struct FleetView: View {
         guard case .loaded(let fleet) = poller.state else { return nil }
         return fleet.accounts.count
     }
-    /// The two facts about WHERE the Accounts tab's numbers come from, on one
-    /// line under the summary: a row `tcr` sent that this build could not read,
-    /// and which account every quota measurement was taken through.
+    /// A row `tcr` sent that this build could not read, on one line under the
+    /// summary. Nothing else shares this line.
     ///
-    /// Review finding 15. Both existed in the model and reached no view:
-    /// `Fleet.unreadableNotice` had four references, all inside
-    /// `StatusPoller`, and `control.current` was read only for ordering. So
+    /// Review finding 15 first put this notice on screen: `Fleet.unreadableNotice`
+    /// had four references, all inside `StatusPoller`, and reached no view — so
     /// thirteen accounts rendered as twelve with no sentence saying one was
-    /// lost — which `Fleet`'s own doc-comment (`FleetStatus.swift:2111-2114`)
-    /// says must never happen — and the only visible consequence of "Use as
-    /// Control Account" was a row moving. Measured before the fix: the
-    /// `05-unreadable-row`, `12-keeping-awake` and `13-control-account` renders
-    /// were byte-identical, three of 27 named states drawing nothing of their
-    /// own.
+    /// lost, which `Fleet`'s own doc-comment (`FleetStatus.swift:2111-2114`)
+    /// says must never happen. The same finding put "which account every
+    /// quota measurement was taken through" on this line too, sharing it with
+    /// the notice above; that clause moved to the control account's own card
+    /// as a `CONTROL` pill (a whole row was a lot of space for one designation
+    /// that a pill says in the same place every other designation already
+    /// lives), so this line is the notice alone now, drawn only when there is
+    /// one.
     ///
-    /// The notice is `Tok.spent`, as the review's After asks. The control
-    /// clause is `Tok.accent` rather than the neutral pill it suggests: this
-    /// panel already has a recorded decision for that exact fact — the row's
-    /// own control marker uses `accent` "not one of the quota/rotation status
-    /// hues … a designation, not a measured state" — and a second colour for
-    /// one fact is how two places start disagreeing.
+    /// The notice is `Tok.spent`, as the review's After asks.
     @ViewBuilder
     private func accountsProvenanceLine(_ fleet: Fleet) -> some View {
-        let notice = fleet.unreadableNotice
-        let controlName = control.current
-        if notice != nil || controlName != nil {
-            HStack(spacing: V4.rowGap) {
-                if let notice {
-                    Text(notice)
-                        .font(V4.font(V4.muteSize))
-                        .foregroundStyle(Tok.spent)
-                        .lineLimit(1)
-                        .fixedSize()
-                }
-                Spacer(minLength: 0)
-                if let controlName {
-                    Text("control account · \(controlName)")
-                        .font(V4.font(V4.muteSize))
-                        .foregroundStyle(Tok.accent)
-                        .lineLimit(1)
-                        // The NAME is what gives way, never the designation:
-                        // middle truncation keeps both ends of an address.
-                        .truncationMode(.middle)
-                        .help("Every quota figure on this panel is measured through \(controlName).")
-                }
-            }
-            .padding(.horizontal, V4.summaryPaddingSide)
-            .padding(.bottom, V4.summaryPaddingBottom)
-            .accessibilityElement(children: .combine)
-            .accessibilityLabel(
-                [
-                    notice.map { "\($0). tcr sent a row this build could not decode." },
-                    controlName.map { "Quotas measured through the control account \($0)." },
-                ]
-                .compactMap { $0 }.joined(separator: " "))
+        if let notice = fleet.unreadableNotice {
+            Text(notice)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(Tok.spent)
+                .lineLimit(1)
+                .fixedSize()
+                .padding(.horizontal, V4.summaryPaddingSide)
+                .padding(.bottom, V4.summaryPaddingBottom)
+                .accessibilityLabel("\(notice). tcr sent a row this build could not decode.")
         }
     }
 

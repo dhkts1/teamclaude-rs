@@ -133,7 +133,14 @@ enum RenderStates {
             // `01-healthy` is left alone: other scenes and tests key off its
             // exact 2-account shape, and this is a dedicated fixture for the
             // parity gate rather than a rewrite of a scene with other jobs.
-            ("19-accounts-tab-parity", .loaded(accountsParityFleet), false, nil),
+            // Pinned so the parity render also proves the `CONTROL` pill in a
+            // full panel: `henry10@example.com` is the first loose card, so
+            // it draws the pill beside its plan without a group's legend
+            // competing for the same row.
+            (
+                "19-accounts-tab-parity", .loaded(accountsParityFleet), false,
+                "henry10@example.com"
+            ),
         ]
     }
 
@@ -301,7 +308,15 @@ enum RenderStates {
     /// other scene renders `.compact` alone: this harness is a review
     /// artifact, and doubling all 24 scenes would be 24 extra PNGs nobody
     /// asked to review.
-    private static let densityVariantScenes: Set<String> = ["19-accounts-tab-parity"]
+    private static let densityVariantScenes: Set<String> = [
+        "19-accounts-tab-parity",
+        // The `CONTROL` pill is new chrome on the card header. `.comfortable`
+        // is the density the shipped default and `.auto` can both resolve
+        // to, so rendering both against this one card shows whether the
+        // pill still fits beside `ROTATING` and the state pill rather than
+        // taking the fit on faith from a single default render.
+        "13-control-account",
+    ]
 
     @MainActor
     private static func render(

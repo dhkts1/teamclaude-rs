@@ -22,8 +22,8 @@ final class PanelV4ControlsTests: XCTestCase {
             "AccountsTabV4 no longer takes a visible-actions slot")
         XCTAssertTrue(
             source.contains(
-                "AccountCard(account: row.account, shape: shape, now: now) "
-                    + "{ actions(row.account) }"),
+                "AccountCard(account: row.account, shape: shape, now: now, "
+                    + "isControl: row.isControl) {"),
             "the card is no longer handed its actions")
         XCTAssertTrue(
             source.contains(".contextMenu { menu(row.account) }"),

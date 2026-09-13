@@ -70,6 +70,26 @@ final class AccountCardAccessibilityTests: XCTestCase {
         XCTAssertTrue(summary.contains("7d 98% used, spent"))
     }
 
+    /// The control account's card says so in the same sentence as its plan,
+    /// before rotation and state — the order its `CONTROL` pill draws in.
+    func testTheSummaryNamesTheControlAccount() {
+        let account = cardAccount(
+            "kate@example.com", plan: "Max 20x", quota: 0.12,
+            fiveHour: 0.12, fiveHourState: .ok, sevenDay: 0.30, sevenDayState: .ok)
+        XCTAssertEqual(
+            account.cardSummaryLabel(now: now, isControl: true),
+            "kate@example.com, Max 20x, control account, rotating, ready, "
+                + "5h 12% used, within limit, 7d 30% used, within limit")
+    }
+
+    /// An account that is not the control says nothing about one — the
+    /// default the existing tests above already exercise, named explicitly so
+    /// a future change to the default cannot slip past unnoticed.
+    func testAnOrdinaryAccountsSummaryOmitsControl() {
+        let account = cardAccount("liam@example.com", quota: 0.5, fiveHour: 0.5, sevenDay: 0.5)
+        XCTAssertFalse(account.cardSummaryLabel(now: now).contains("control"))
+    }
+
     // MARK: - The sentences behind the pills (review #13)
 
     /// A PARKED pill names a state. Without its help it names nothing the

@@ -73,8 +73,10 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     }
 
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
-        AccountCard(account: row.account, shape: shape, now: now) { actions(row.account) }
-            .contextMenu { menu(row.account) }
+        AccountCard(account: row.account, shape: shape, now: now, isControl: row.isControl) {
+            actions(row.account)
+        }
+        .contextMenu { menu(row.account) }
     }
 
     @ViewBuilder
@@ -101,6 +103,16 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
                     HStack(spacing: V4.pillGap) {
                         ForEach(section.breakdown, id: \.kind.token) { tally in
                             V4Pill(text: tally.label, role: pillRole(tally.kind))
+                        }
+                        // The control account can be a member of a group
+                        // small enough to collapse. Its own card is gone —
+                        // the whole point of collapsing — so the one line
+                        // left is where the fact has to live, after the
+                        // tallies it did not change.
+                        if section.containsControl {
+                            V4Pill(
+                                text: "Control",
+                                help: "The control account for this fleet is inside this group.")
                         }
                     }
                 }

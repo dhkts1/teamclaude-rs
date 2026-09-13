@@ -2073,9 +2073,15 @@ public struct Account: Decodable, Equatable, Identifiable, Sendable {
     ///
     /// Built from the same properties the card draws, in the order it draws
     /// them, so the summary cannot claim something the card does not show.
-    public func cardSummaryLabel(now: Date) -> String {
+    ///
+    /// `isControl` is not a stored fact on `Account` — the control account is
+    /// read from `tcr control --show`, a separate call this type never makes
+    /// — so the caller passes it in, the same way ``FleetSectionRow/isControl``
+    /// already does for the list.
+    public func cardSummaryLabel(now: Date, isControl: Bool = false) -> String {
         var parts = [name]
         if let plan, !plan.isEmpty { parts.append(plan) }
+        if isControl { parts.append("control account") }
         if let rotation { parts.append(rotation.label.lowercased()) }
         parts.append(FleetTally.Kind(account: self).phrase)
         for window in [
