@@ -19,14 +19,19 @@ import TcrBarCore
 /// two exceptions below (`trend`, `info`) are roles the palette has no token for
 /// and are named as such.
 enum V4 {
-    /// Which of the two ``PanelDensity`` values the type and box tokens below
-    /// shrink for (Gil, 2026-09-13: "yes the right compact is better" —
-    /// `data/plans/panel-density-bridge.md`). A plain `UserDefaults` read
-    /// through `PanelDensityPreference.current()`, not a stored value: every
-    /// token below is a computed `static var` re-evaluated on each draw, so
-    /// the Settings-window picker takes effect on the panel's next redraw
-    /// with nothing to wire, restart or invalidate.
-    static var compact: Bool { PanelDensityPreference.current() == .compact }
+    /// Whether the type and box tokens below shrink (Gil, 2026-09-13: "yes the
+    /// right compact is better" — `data/plans/panel-density-bridge.md`).
+    ///
+    /// ``PanelDensityPreference/resolved(defaults:accounts:)``, not
+    /// `current() == .compact`: the shipped default is `.auto`, and against
+    /// `.auto` that comparison is false — which would have quietly made
+    /// Comfortable the default for every fleet, whatever its size. The
+    /// resolver is the one place that decides, and it is read rather than
+    /// stored: every token below is a computed `static var` re-evaluated on
+    /// each draw, so the Settings picker AND a fleet that grew past the
+    /// ceiling both take effect on the panel's next redraw with nothing to
+    /// wire, restart or invalidate.
+    static var compact: Bool { PanelDensityPreference.resolved() == .compact }
 
     // MARK: - Panel (`.panel`)
 

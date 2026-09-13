@@ -289,6 +289,10 @@ struct MenuBarSettingsPane: View {
                 }
                 .pickerStyle(.menu)
                 Picker("Panel density", selection: $panelDensityPreference.density) {
+                    Text(
+                        "Automatic (compact above "
+                            + "\(PanelDensityPreference.comfortableCeiling) accounts)"
+                    ).tag(PanelDensity.auto)
                     Text("Compact").tag(PanelDensity.compact)
                     Text("Comfortable").tag(PanelDensity.comfortable)
                 }

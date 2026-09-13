@@ -215,10 +215,20 @@ struct FleetView: View {
             badges: v4Badges,
             onSelect: { selectedTab = $0 },
             onSettings: onSettings,
+            accountCount: v4AccountCount,
             summary: { v4Summary },
             content: { v4Content },
             footer: { v4Footer }
         )
+    }
+
+    /// Every account row the Accounts tab would draw, or `nil` when there is no
+    /// fleet to draw — what `PanelDensity.auto` decides against. Parked and
+    /// disabled rows count: they cost the panel exactly as much height as a
+    /// serving one, and the rule is about how much is in the panel.
+    private var v4AccountCount: Int? {
+        guard case .loaded(let fleet) = poller.state else { return nil }
+        return fleet.accounts.count
     }
 
     /// A badge per tab, from the same counts on EVERY tab — including the one

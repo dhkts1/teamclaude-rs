@@ -194,7 +194,7 @@ enum RenderStates {
         for scene in scenes {
             for appearance in Appearance.allCases {
                 attempted += 1
-                if render(scene, appearance: appearance, density: .compact, into: directory) {
+                if render(scene, appearance: appearance, density: .auto, into: directory) {
                     written += 1
                 }
             }
@@ -202,6 +202,12 @@ enum RenderStates {
             // see `densityVariantScenes` — so the mockup comparison stays
             // possible at both densities `PanelDensityPreference` offers,
             // not only the shipped default.
+            //
+            // The main pass above is `.auto`, the shipped default since Gil's
+            // "make compact the default please above 4 accounts": forcing
+            // `.compact` there would have made every PNG in this set a
+            // picture of a setting nobody has, which is the one thing a
+            // review harness may not be.
             if densityVariantScenes.contains(scene.name) {
                 for appearance in Appearance.allCases {
                     attempted += 1
@@ -229,8 +235,8 @@ enum RenderStates {
         }
     }
 
-    /// Scenes rendered twice — once at `V4`'s shipped `.compact` default,
-    /// once forced to `.comfortable` — so the one fixture compared against
+    /// Scenes rendered twice — once at `V4`'s shipped `.auto` default, once
+    /// forced to `.comfortable` — so the one fixture compared against
     /// the mockup crop (`data/plans/panel-density-bridge.md`) stays
     /// comparable at both densities, not only the one now shipping. Every
     /// other scene renders `.compact` alone: this harness is a review
