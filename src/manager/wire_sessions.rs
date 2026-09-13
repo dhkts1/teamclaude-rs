@@ -39,6 +39,37 @@ impl Manager {
         self.mark_wire_sessions_dirty();
     }
 
+    /// Fold the `tool_use` blocks parsed out of a RESPONSE into the wire-session table, as
+    /// running from `now` (the instant the response finished — stream end, or the JSON body
+    /// being read). A no-op when `session_id` is `None` or the tool list is empty.
+    ///
+    /// Called from both response paths in `proxy.rs`, beside
+    /// [`Self::record_wire_session_usage`], and NOT from the request call site: this is the
+    /// only source that can ever put a tool in `running`, because a Claude Code request body
+    /// carries each `tool_use` together with its `tool_result` — see
+    /// [`crate::session_wire::tool_use_event_from_block`].
+    pub fn record_wire_session_tool_uses(
+        &self,
+        session_id: Option<&str>,
+        now: OffsetDateTime,
+        tool_uses: &[ToolUseEvent],
+    ) {
+        let Some(session_id) = session_id else {
+            return;
+        };
+        if tool_uses.is_empty() {
+            return;
+        }
+        let now_ms = odt_to_ms(now);
+        let mut tracker = self
+            .wire_sessions
+            .lock()
+            .expect("wire sessions lock poisoned");
+        tracker.record_response_tool_uses(session_id, now_ms, tool_uses);
+        drop(tracker);
+        self.mark_wire_sessions_dirty();
+    }
+
     /// Add token counts learned from a response's usage to the wire-session table. Called
     /// beside [`Self::record_usage`] (the per-account ledger) at both of its call sites in
     /// `proxy.rs` — streamed and non-streamed — with the SAME [`crate::usage::UsageRecord`]

@@ -125,10 +125,13 @@ pub struct HeldWindowRow {
 pub struct RunningToolRow {
     pub tool: String,
     pub started_ms: i64,
-    /// A Bash tool's `input.command`, or an `Agent`/`Task` tool's `input.subagent_type:
-    /// input.description` — `None` for any other tool, or when the running call carries
-    /// neither. Held in memory only on the server; never written to a log (see
-    /// `src/session_wire.rs`'s module doc in the main crate).
+    /// What this call is doing, for a panel row that would otherwise print the bare tool
+    /// name: a Bash command, an `Agent`/`Task` subagent description, the task a `TaskOutput`
+    /// waits on, a file path, a search pattern, a fetch HOST or a search query — per tool,
+    /// capped at 120 characters. `None` for a tool with no rule, or when the input carried
+    /// no such field. The full per-tool list is `ToolUseEvent::command_head` in the main
+    /// crate (`src/session_wire.rs`), which builds every one of these. Held in memory only
+    /// on the server; never written to a log (see that module's own doc).
     pub command_head: Option<String>,
     /// A Bash tool's coarse category (`"wait"`, `"compound"`, `"search"`, `"git-net"`,
     /// `"git-local"`, `"build"`, `"other"`) — `None` for any other tool, or when
@@ -145,6 +148,8 @@ pub struct RunningToolRow {
 pub struct SlowToolRow {
     pub tool: String,
     pub seconds: f64,
+    /// Same meaning as [`RunningToolRow::command_head`] — the head the call carried while it
+    /// was running, kept with the completed row.
     pub command_head: Option<String>,
     /// Same meaning and same `#[serde(default)]` reasoning as [`RunningToolRow::command_class`].
     #[serde(default)]

@@ -3015,7 +3015,16 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                         .await
                         .map(|bytes| (Ok::<Bytes, Infallible>(bytes), rx))
                 });
-                let (parsed, stream_error) = parse_sse_usage(byte_stream).await;
+                let (parsed, stream_error, response_tool_uses) = parse_sse_usage(byte_stream).await;
+                // RUNNING NOW: every tool this turn asked for starts HERE — the stream has
+                // just ended, so the client is beginning them as this line runs. Outside the
+                // usage guard below on purpose: a turn that emitted tool calls but reported
+                // no usage still has tools running.
+                manager_side.record_wire_session_tool_uses(
+                    wire_session_id_for_usage.as_deref(),
+                    OffsetDateTime::now_utc(),
+                    &response_tool_uses,
+                );
                 if parsed.input_total > 0 || parsed.output > 0 {
                     let record = usage_record(
                         &parsed,
@@ -3228,6 +3237,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             }
         };
         if status.is_success() {
+            // RUNNING NOW, non-streamed twin of the SSE arm above: the body is complete, so
+            // any `tool_use` in it starts now. Outside the usage guard for the same reason.
+            manager.record_wire_session_tool_uses(
+                wire_session_id.as_deref(),
+                OffsetDateTime::now_utc(),
+                &response_tool_uses_from_json(&bytes),
+            );
             let parsed = usage_from_json(&bytes);
             if parsed.input_total > 0 || parsed.output > 0 {
                 let record = usage_record(&parsed, request_model.clone(), session_key, || {
@@ -3961,9 +3977,57 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
     }
 }
 
+/// Parse the `tool_use` blocks out of a non-streamed messages body — the JSON-path twin of
+/// [`parse_sse_usage`]'s block assembly, feeding the same
+/// [`crate::session_wire::tool_use_event_from_block`].
+///
+/// A second lenient parse of the same bytes [`usage_from_json`] already read, rather than one
+/// pass returning both: `ParsedUsage` is `Copy` on purpose (see its doc) and a `Vec` on it
+/// would end that. The cost lands only on non-streamed 2xx bodies, which are already buffered
+/// and capped by `MAX_BODY_BYTES`; Claude Code itself always streams. A body that is not JSON,
+/// or carries no `content` array, yields no events — [`usage_from_json`] has already logged the
+/// parse failure, so this one stays silent.
+fn response_tool_uses_from_json(bytes: &[u8]) -> Vec<crate::session_wire::ToolUseEvent> {
+    let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
+        return Vec::new();
+    };
+    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter(|b| {
+            b.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "tool_use")
+        })
+        .take(crate::session_wire::PENDING_TOOL_CAP)
+        .filter_map(|b| {
+            let id = b.get("id").and_then(Value::as_str)?.to_string();
+            Some(crate::session_wire::tool_use_event_from_block(
+                id,
+                b.get("name").and_then(Value::as_str).map(str::to_string),
+                b.get("input"),
+            ))
+        })
+        .collect()
+}
+
 /// Parse the total usage breakdown from an SSE messages stream, plus — out of
 /// band, so [`ParsedUsage`] can stay `Copy` — the FIRST in-band `error` event's
-/// `error.type`, if any arrived.
+/// `error.type`, if any arrived, and every COMPLETED `tool_use` block the turn
+/// emitted.
+///
+/// The tool blocks are what the Tools tab's RUNNING NOW section is built from,
+/// and the response is the only place they can come from: a Claude Code request
+/// body carries each `tool_use` alongside its `tool_result`, so the request-side
+/// parse opens and closes a call in the same breath and nothing is ever seen in
+/// flight (measured 2026-09-13: 11 live sessions, `running: 0` in all of them,
+/// three of them mid-tool). A block is assembled from `content_block_start`
+/// (id, name), the `input_json_delta` fragments of its `input` object, and
+/// `content_block_stop`, then turned into an event by the same
+/// [`crate::session_wire::tool_use_event_from_block`] the request side uses —
+/// one head-building rule, two callers.
 ///
 /// `input_total` is taken from `message_start` (base + cache tokens); `output`
 /// is the latest cumulative count from `message_delta` (or `message_start` if
@@ -4004,7 +4068,13 @@ fn usage_from_json(bytes: &[u8]) -> ParsedUsage {
 /// was seen (truncated mid-turn) OR nothing was ever seen (severed before the
 /// first event) — and stays silent only when events arrived that affirmatively
 /// were not `message_start`.
-async fn parse_sse_usage<S, B, E>(stream: S) -> (ParsedUsage, Option<String>)
+async fn parse_sse_usage<S, B, E>(
+    stream: S,
+) -> (
+    ParsedUsage,
+    Option<String>,
+    Vec<crate::session_wire::ToolUseEvent>,
+)
 where
     S: futures::Stream<Item = Result<B, E>>,
     B: AsRef<[u8]>,
@@ -4017,6 +4087,13 @@ where
     let mut saw_any_event = false;
     let mut saw_message_start = false;
     let mut saw_message_stop = false;
+    // `tool_use` blocks under construction, keyed by the stream's own block index. A block
+    // arrives as a `content_block_start` (id + name), then its `input` object one
+    // `input_json_delta` fragment at a time, then `content_block_stop` — so nothing is a
+    // complete event until the stop, and only completed blocks are returned.
+    let mut open_tool_blocks: std::collections::HashMap<u64, OpenToolBlock> =
+        std::collections::HashMap::new();
+    let mut tool_uses: Vec<crate::session_wire::ToolUseEvent> = Vec::new();
     while let Some(item) = events.next().await {
         let Ok(event) = item else {
             break; // malformed/utf8/transport error — stop parsing, keep totals
@@ -4055,6 +4132,74 @@ where
             Some("message_stop") => {
                 saw_message_stop = true;
             }
+            Some("content_block_start") => {
+                let block = value.get("content_block");
+                let is_tool_use = block
+                    .and_then(|b| b.get("type"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "tool_use");
+                let id = block
+                    .and_then(|b| b.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let (true, Some(index), Some(id)) = (is_tool_use, block_index(&value), id) {
+                    // A stream can only carry so many tool blocks before the cap that bounds
+                    // the table itself applies; stop accumulating rather than grow with the
+                    // response.
+                    if open_tool_blocks.len() < crate::session_wire::PENDING_TOOL_CAP {
+                        open_tool_blocks.insert(
+                            index,
+                            OpenToolBlock {
+                                id,
+                                name: block
+                                    .and_then(|b| b.get("name"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string),
+                                input_json: String::new(),
+                                over_cap: false,
+                            },
+                        );
+                    }
+                }
+            }
+            Some("content_block_delta") => {
+                let partial = value
+                    .get("delta")
+                    .filter(|d| {
+                        d.get("type")
+                            .and_then(Value::as_str)
+                            .is_some_and(|t| t == "input_json_delta")
+                    })
+                    .and_then(|d| d.get("partial_json"))
+                    .and_then(Value::as_str);
+                if let (Some(index), Some(partial)) = (block_index(&value), partial) {
+                    if let Some(open) = open_tool_blocks.get_mut(&index) {
+                        // A `Write` tool's input carries a whole file; only the head of one
+                        // field is ever displayed, so an oversized input is dropped rather
+                        // than buffered — the call still shows up, by name, with no head.
+                        if open.input_json.len() + partial.len() > TOOL_INPUT_JSON_CAP {
+                            open.over_cap = true;
+                            open.input_json.clear();
+                        } else if !open.over_cap {
+                            open.input_json.push_str(partial);
+                        }
+                    }
+                }
+            }
+            Some("content_block_stop") => {
+                if let Some(open) = block_index(&value).and_then(|i| open_tool_blocks.remove(&i)) {
+                    let input = if open.over_cap {
+                        None
+                    } else {
+                        serde_json::from_str::<Value>(&open.input_json).ok()
+                    };
+                    tool_uses.push(crate::session_wire::tool_use_event_from_block(
+                        open.id,
+                        open.name,
+                        input.as_ref(),
+                    ));
+                }
+            }
             // First `error` event wins — a later one is ignored (guard skips the
             // arm rather than nesting an `if` inside it, per clippy).
             Some("error") if stream_error.is_none() => {
@@ -4083,7 +4228,29 @@ where
     if !saw_message_stop && stream_error.is_none() && (saw_message_start || !saw_any_event) {
         stream_error = Some(TRUNCATED_STREAM_ERROR_KIND.to_string());
     }
-    (parsed, stream_error)
+    // Blocks still open here never reached `content_block_stop` — the turn was cut off before
+    // the tool call was complete, so the client never ran it and it is not "running".
+    (parsed, stream_error, tool_uses)
+}
+
+/// One `tool_use` content block being assembled across SSE events — see [`parse_sse_usage`].
+struct OpenToolBlock {
+    id: String,
+    name: Option<String>,
+    input_json: String,
+    /// The `input` object exceeded [`TOOL_INPUT_JSON_CAP`], so it was dropped: the event is
+    /// still emitted (the call IS running), just without a command head.
+    over_cap: bool,
+}
+
+/// Most bytes of one streamed `tool_use` input object [`parse_sse_usage`] will buffer. Only a
+/// 120-character head is ever displayed, so this is display slack, not a protocol limit — and
+/// it bounds what a `Write` of a large file can make the parser hold.
+const TOOL_INPUT_JSON_CAP: usize = 64 * 1024;
+
+/// An SSE content-block event's `index`, which keys every block-scoped event to its block.
+fn block_index(event: &Value) -> Option<u64> {
+    event.get("index").and_then(Value::as_u64)
 }
 
 /// A JSON error response in Anthropic's error envelope.
@@ -5148,7 +5315,8 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[..split])),
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&full.as_bytes()[split..])),
         ];
-        let (parsed, stream_error) = parse_sse_usage(futures::stream::iter(chunks)).await;
+        let (parsed, stream_error, _tool_uses) =
+            parse_sse_usage(futures::stream::iter(chunks)).await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -5179,7 +5347,7 @@ mod tests {
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         );
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (parsed, stream_error) = parse_sse_usage(stream).await;
+        let (parsed, stream_error, _tool_uses) = parse_sse_usage(stream).await;
         assert_eq!(
             stream_error, None,
             "a stream that reaches message_stop has no error event"
@@ -5207,7 +5375,7 @@ mod tests {
         // non-Messages endpoint that happens to emit `text/event-stream`.
         let full = concat!("event: heartbeat\n", "data: {\"type\":\"heartbeat\"}\n\n",);
         let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
-        let (parsed, stream_error) = parse_sse_usage(stream).await;
+        let (parsed, stream_error, _tool_uses) = parse_sse_usage(stream).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error, None,
@@ -5232,7 +5400,7 @@ mod tests {
     #[tokio::test]
     async fn sse_stream_severed_before_any_event_records_truncation() {
         let stream = futures::stream::iter(Vec::<Result<Bytes, Infallible>>::new());
-        let (parsed, stream_error) = parse_sse_usage(stream).await;
+        let (parsed, stream_error, _tool_uses) = parse_sse_usage(stream).await;
         assert_eq!(parsed, ParsedUsage::default());
         assert_eq!(
             stream_error.as_deref(),
@@ -5268,7 +5436,8 @@ mod tests {
             Ok::<Bytes, Infallible>(Bytes::from(head)),
             Ok::<Bytes, Infallible>(Bytes::copy_from_slice(&[0xFFu8])),
         ];
-        let (parsed, stream_error) = parse_sse_usage(futures::stream::iter(chunks)).await;
+        let (parsed, stream_error, _tool_uses) =
+            parse_sse_usage(futures::stream::iter(chunks)).await;
         assert_eq!(
             parsed.input_total, 5,
             "usage from message_start is retained even though the stream ends malformed"
@@ -5278,6 +5447,129 @@ mod tests {
             Some(TRUNCATED_STREAM_ERROR_KIND),
             "a confirmed Messages turn that ends on an unresolvable malformed \
              byte must be treated as truncated, not silently abstained"
+        );
+    }
+
+    /// RUNNING NOW's source: a `tool_use` block streamed across three
+    /// `input_json_delta` fragments is reassembled and normalized exactly as the
+    /// request-side parse would have done it (`cd <dir> && timeout 15 rg ...`
+    /// reduces to `rg -n TODO`, class `Search`), because both go through
+    /// `session_wire::tool_use_event_from_block`.
+    #[tokio::test]
+    async fn sse_tool_use_is_reassembled_from_its_input_json_deltas() {
+        let full = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"comm\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"and\\\": \\\"cd ~/src/example && \"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"timeout 15 rg -n TODO\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
+        let (_parsed, stream_error, tool_uses) = parse_sse_usage(stream).await;
+        assert_eq!(stream_error, None);
+        assert_eq!(tool_uses.len(), 1, "one completed tool_use block");
+        assert_eq!(tool_uses[0].id, "toolu_1");
+        assert_eq!(tool_uses[0].name.as_deref(), Some("Bash"));
+        assert_eq!(
+            tool_uses[0].command_head.as_deref(),
+            Some("rg -n TODO"),
+            "the three fragments reassemble into one input object and go through \
+             normalize_bash_command, cd-reduction and wrapper-stripping included"
+        );
+        assert_eq!(
+            tool_uses[0].command_class,
+            Some(crate::session_wire::CommandClass::Search)
+        );
+    }
+
+    /// A turn severed before `content_block_stop` never produced a runnable tool
+    /// call — the client got no complete block, so nothing is "running".
+    #[tokio::test]
+    async fn an_unfinished_tool_use_block_is_not_reported_as_running() {
+        let full = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Bash\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\": \\\"ls\"}}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
+        let (_parsed, stream_error, tool_uses) = parse_sse_usage(stream).await;
+        assert_eq!(
+            stream_error.as_deref(),
+            Some(TRUNCATED_STREAM_ERROR_KIND),
+            "no message_stop — the existing truncation verdict is unchanged"
+        );
+        assert!(tool_uses.is_empty());
+    }
+
+    /// A text block interleaved with a tool block must not be collected, and two
+    /// tool blocks in one turn both are — the index keys each event to its block.
+    #[tokio::test]
+    async fn only_tool_use_blocks_are_collected_and_each_index_keeps_its_own() {
+        let full = concat!(
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"thinking\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"Read\",\"input\":{}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"TaskOutput\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"task_id\\\": \\\"task_9\\\"}\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"file_path\\\": \\\"/tmp/example.rs\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        let stream = futures::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(full))]);
+        let (_parsed, _stream_error, tool_uses) = parse_sse_usage(stream).await;
+        let heads: Vec<(&str, Option<&str>)> = tool_uses
+            .iter()
+            .map(|t| (t.id.as_str(), t.command_head.as_deref()))
+            .collect();
+        assert_eq!(
+            heads,
+            vec![
+                ("toolu_a", Some("Read /tmp/example.rs")),
+                ("toolu_b", Some("TaskOutput · waiting on task task_9")),
+            ],
+            "the text block contributes nothing; interleaved deltas land on their own index"
+        );
+    }
+
+    /// The non-streamed twin: `tool_use` blocks come off the response body's
+    /// `content` array, through the same event builder.
+    #[test]
+    fn non_streamed_response_tool_uses_come_off_the_content_array() {
+        let body = br#"{
+            "id": "msg_1",
+            "type": "message",
+            "content": [
+                {"type": "text", "text": "on it"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Grep", "input": {"pattern": "fn main"}}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 2}
+        }"#;
+        let uses = response_tool_uses_from_json(body);
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].id, "toolu_1");
+        assert_eq!(uses[0].command_head.as_deref(), Some("Grep fn main"));
+        assert!(
+            response_tool_uses_from_json(b"not json at all").is_empty(),
+            "a body that does not parse yields no events, never a panic"
         );
     }
 
