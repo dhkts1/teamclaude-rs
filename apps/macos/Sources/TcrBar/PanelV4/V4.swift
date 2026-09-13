@@ -128,6 +128,11 @@ enum V4 {
     static let barMinWidth: CGFloat = 2
     /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
     static let barCappedWidth: CGFloat = 110
+    /// `DenseQuotaLine`'s own bar: a FIXED 40 pt, not the grid's `1fr` column
+    /// ``QuotaRow`` fills. Three of these plus their labels and percentages
+    /// are what Compact's one-line quota block has to fit in 372 pt; a bar
+    /// that grows with the card would fight the other two windows for it.
+    static let denseBarWidth: CGFloat = 40
 
     // MARK: - Pill (`.pill`)
 
