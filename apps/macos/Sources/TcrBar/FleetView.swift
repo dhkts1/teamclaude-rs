@@ -210,8 +210,8 @@ struct FleetView: View {
     private var v4Body: some View {
         PanelV4(
             freshness: poller.lastPollAt.map { freshnessLabel(since: $0, now: Date()) },
-            tabs: PanelTab.allCases,
-            selected: selectedTab,
+            tabs: v4Tabs,
+            selected: visibleTab,
             badges: v4Badges,
             onSelect: { selectedTab = $0 },
             onSettings: onSettings,
@@ -220,6 +220,37 @@ struct FleetView: View {
             footer: { v4Footer }
         )
     }
+
+    /// Is there a fleet to draw tabs over? `.loaded` with at least one account
+    /// — the exact case ``v4Content`` gives a tab body to. Every other state
+    /// (pending, tool missing, command failed, undecodable, empty fleet) falls
+    /// to one banner that is the same on all three tabs.
+    private var hasFleet: Bool {
+        if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty { return true }
+        return false
+    }
+
+    /// The tabs the strip may offer, and the one that is really on screen.
+    ///
+    /// Review finding 14: with no fleet, two of the three tabs led nowhere.
+    /// Tapping Sessions moved the selected pill and changed nothing else — a
+    /// control reporting a state change that did not happen — and, worse, it
+    /// took Start server, Refresh, Add account and Take over port off the one
+    /// screen whose entire purpose is recovery, because ``v4Footer`` gates
+    /// those on the Accounts tab. Hidden controls, on the state that needs
+    /// them most.
+    ///
+    /// So a panel with no fleet offers the one tab it can actually draw.
+    /// ``selectedTab`` is left untouched rather than reset: it is the
+    /// operator's standing choice (and a persisted preference), and a fleet
+    /// coming back should return them to the tab they were on, not to
+    /// whatever an outage picked for them.
+    private var v4Tabs: [PanelTab] { hasFleet ? PanelTab.allCases : [.accounts] }
+
+    /// The tab whose body, summary, footer text and actions are actually
+    /// drawn. Reading ``selectedTab`` directly is the bug: it can name a tab
+    /// the strip is not offering.
+    private var visibleTab: PanelTab { hasFleet ? selectedTab : .accounts }
 
     /// A badge per tab, from the same counts on EVERY tab — including the one
     /// being looked at, which the pre-v4 strip dropped: it drew zero badge
@@ -237,7 +268,7 @@ struct FleetView: View {
     @ViewBuilder
     private var v4Summary: some View {
         if case .loaded(let fleet) = poller.state, !fleet.accounts.isEmpty {
-            switch selectedTab {
+            switch visibleTab {
             case .accounts:
                 SummaryLine.accounts(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
@@ -271,7 +302,7 @@ struct FleetView: View {
     private var v4Content: some View {
         switch poller.state {
         case .loaded(let fleet) where !fleet.accounts.isEmpty:
-            switch selectedTab {
+            switch visibleTab {
             case .accounts:
                 if fleet.source.countersAreStructural {
                     offlineNotice(fleet.source)
@@ -330,11 +361,11 @@ struct FleetView: View {
     private var v4Footer: some View {
         PanelFooter(
             leading: v4FooterLeading,
-            leadingSystemImage: selectedTab == .sessions ? "shippingbox" : nil,
+            leadingSystemImage: visibleTab == .sessions ? "shippingbox" : nil,
             trailing: v4FooterTrailing
         ) {
             VStack(alignment: .leading, spacing: V4.buttonGap) {
-                if selectedTab == .accounts {
+                if visibleTab == .accounts {
                     v4Actions
                 }
                 if let loginError {
@@ -361,7 +392,7 @@ struct FleetView: View {
     /// Where this tab's numbers come from — the mockup gives each tab its own
     /// provenance line rather than repeating one global block on all three.
     private var v4FooterLeading: String {
-        switch selectedTab {
+        switch visibleTab {
         case .accounts: return AppBuild.label ?? "TcrBar"
         case .sessions: return "proxy + Claude Code session files"
         case .tools: return "from request bodies only · nothing logged"
@@ -369,7 +400,7 @@ struct FleetView: View {
     }
 
     private var v4FooterTrailing: String? {
-        if selectedTab == .sessions { return "sparkline: req/min, 30m" }
+        if visibleTab == .sessions { return "sparkline: req/min, 30m" }
         guard case .loaded(let fleet) = poller.state, let sha = fleet.serverSha else { return nil }
         return "server \(sha)\(fleet.serverDirty ? "-dirty" : "")"
     }
