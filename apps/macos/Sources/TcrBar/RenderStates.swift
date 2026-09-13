@@ -130,6 +130,47 @@ enum RenderStates {
         ]
     }
 
+    /// The sign-in sheet (``LoginSheet``), one PNG per state.
+    ///
+    /// A separate list because a sheet is not a `PollState`: it is presented
+    /// OVER the panel, and `ImageRenderer` draws a view, never a presentation —
+    /// a `.sheet` modifier on the panel would rasterise as the panel alone. So
+    /// the harness draws the sheet's content directly, which is exactly why
+    /// ``LoginSheet`` takes a phase rather than a live ``LoginSession``.
+    ///
+    /// **The spinner is not the spinner.** `ImageRenderer` draws a
+    /// `ProgressView` as a placeholder glyph — the same limitation this file
+    /// already records for a `.checkbox` toggle — so the two waiting scenes
+    /// show a crossed circle where the app shows motion. Everything around it
+    /// (wording, wrapping, the button row) is real; the glyph is not, and is
+    /// not evidence about it either way.
+    ///
+    /// `.failed` is the state this list exists for. It is the one nobody sees
+    /// until it happens to them, it carries the longest string on the sheet
+    /// (`tcr`'s own refusal, unparaphrased), and a wrapping failure line is the
+    /// kind of thing a green build says nothing about.
+    private static var sheetScenes: [(name: String, phase: LoginPhase, url: URL?)] {
+        let authorize = URL(
+            string: "https://claude.ai/oauth/authorize?code=true&state=RENDER-FIXTURE")
+        return [
+            ("20-login-opening", .opening, nil),
+            (
+                "20b-login-waiting", .waitingForBrowser(email: "alice@example.com"),
+                authorize
+            ),
+            ("20c-login-saved", .saved(account: "alice@example.com"), nil),
+            (
+                "20d-login-failed",
+                .failed(
+                    reason:
+                        "the proxy on :3456 rejected the api-key in "
+                        + "~/.config/teamclaude.json while checking whether it could take a "
+                        + "live login — no browser was opened and nothing was changed."),
+                nil
+            ),
+        ]
+    }
+
     /// Which tab a scene opens on — `.accounts` for every scene above scene
     /// 16, so this stays a lookup by name rather than a fifth tuple element
     /// every existing scene would have to grow.
@@ -195,6 +236,12 @@ enum RenderStates {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if render(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        for scene in sheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
 
@@ -297,13 +344,43 @@ enum RenderStates {
             // shown at full height instead of clipped.
             .fixedSize()
 
+        return rasterise(view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+    }
+
+    /// One state of the sign-in sheet, rendered on its own.
+    ///
+    /// Same appearance dance as ``render(_:appearance:into:)`` and the same
+    /// writer, and deliberately NO controller of any kind: a ``LoginSession``
+    /// would spawn `tcr login`. The harness draws a phase, never a login.
+    @MainActor
+    private static func renderSheet(
+        _ scene: (name: String, phase: LoginPhase, url: URL?),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        let previous = NSAppearance.current
+        NSAppearance.current = appearance.nsAppearance
+        defer { NSAppearance.current = previous }
+
+        let view = LoginSheet(phase: scene.phase, authorizeURL: scene.url)
+            .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            .fixedSize()
+        return rasterise(view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+    }
+
+    /// Rasterise one view to a PNG under `directory`. The single writer for
+    /// every scene in this file, so a panel render and a sheet render cannot
+    /// drift onto two different scales.
+    @MainActor
+    private static func rasterise<V: View>(_ view: V, named name: String, into directory: URL)
+        -> Bool
+    {
         let renderer = ImageRenderer(content: view)
         // 2x so the PNG shows what a Retina panel draws — hairlines and 10pt text
         // are exactly where a 1x render would flatter the design.
         renderer.scale = 2
         renderer.proposedSize = .unspecified
 
-        let name = "\(scene.name)-\(appearance.rawValue).png"
         guard let image = renderer.nsImage,
             let tiff = image.tiffRepresentation,
             let rep = NSBitmapImageRep(data: tiff),

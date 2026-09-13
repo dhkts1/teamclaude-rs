@@ -58,6 +58,11 @@ struct FleetView: View {
     /// nothing is worse than one that says why.
     @State private var loginError: String?
 
+    /// The in-app sign-in, while one is running. Non-nil IS the sheet being
+    /// up: one piece of state rather than a session plus a separate
+    /// `isPresented` flag that can disagree with it.
+    @State private var loginSession: LoginSession?
+
     /// Honour the system Reduce Motion setting, the way ``QuotaBar`` does.
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -199,6 +204,29 @@ struct FleetView: View {
         .onAppear { if !snapshotMode { sessionFiles = SessionFiles.read() } }
         .onChange(of: poller.lastPollAt) { _ in
             if !snapshotMode { sessionFiles = SessionFiles.read() }
+        }
+        // The sheet IS `loginSession != nil` — dismissing by any route (Esc,
+        // click-away) runs the same cancel the button does, because a login
+        // left running would keep a loopback listener open for the rest of its
+        // 2-minute timeout, ready to accept a callback for a flow the person
+        // just abandoned.
+        .sheet(
+            isPresented: Binding(
+                get: { loginSession != nil },
+                set: { presented in if !presented { endLogin(cancelling: true) } }
+            )
+        ) {
+            if let loginSession {
+                LoginSheetHost(
+                    session: loginSession,
+                    onCopyLink: { url in
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+                    },
+                    onCancel: { endLogin(cancelling: true) },
+                    onDone: { endLogin(cancelling: false) }
+                )
+            }
         }
     }
 
@@ -380,10 +408,12 @@ struct FleetView: View {
                     V4Button(title: "Start server") { server.start() }
                 }
                 V4Button(title: "Refresh") { Task { await poller.pollOnce() } }
-                V4Button(
-                    title: "Add account…",
-                    help: "Opens `tcr login` in a Terminal window."
-                ) { addAccount() }
+                if !fleetIsEmpty {
+                    V4Button(
+                        title: "Add account…",
+                        help: Self.addAccountHelp
+                    ) { addAccount() }
+                }
                 Spacer(minLength: 0)
             }
             // Disabled rather than silently no-op: the spawn path refuses a
@@ -690,12 +720,22 @@ struct FleetView: View {
             .help(message)
         case .loaded(let fleet):
             if fleet.accounts.isEmpty {
-                banner(
-                    icon: Tok.unreadableGlyph,
-                    title: "No accounts configured",
-                    detail: "tcr answered, and the fleet is empty. Run `tcr login` in a terminal to add one.",
-                    tint: Tok.unknown
-                )
+                // The remedy is a button now, not an instruction: signing in
+                // runs in the app (``beginLogin(reloggingIn:)``), and telling
+                // someone to go and type a command is the worst version of an
+                // empty state — it names work the panel can do for them.
+                VStack(alignment: .leading, spacing: V4.buttonGap) {
+                    banner(
+                        icon: Tok.unreadableGlyph,
+                        title: "No accounts configured",
+                        detail: "tcr answered, and the fleet is empty. Add one to start serving.",
+                        tint: Tok.unknown
+                    )
+                    V4Button(
+                        title: "Add account…",
+                        help: Self.addAccountHelp
+                    ) { addAccount() }
+                }
             } else {
                 fleetRows(fleet)
             }
@@ -2270,23 +2310,43 @@ struct FleetView: View {
             // than an occasional refusal from an older `tcr`.
             //
             // An older proxy still refuses, but it does so BEFORE any browser
-            // opens, and its message names the remedy — which is useful only
-            // if a human can read it, which is exactly what the Terminal
-            // hand-off gives them.
-            Button("Add account…") { addAccount() }
-                .help(
-                    "Opens `tcr login` in a Terminal window. It needs one: it "
-                        + "prompts for a name and may ask for a pasted code. A "
-                        + "modern proxy takes the login live even while serving; "
-                        + "an older one refuses before any browser opens and "
-                        + "prints how to recover."
-                )
+            // opens, and its refusal is now the sheet's failure line
+            // (`LoginSheet`), where the person who clicked can read it —
+            // rather than in a Terminal window they have to go and find.
+            if !fleetIsEmpty {
+                Button("Add account…") { addAccount() }
+                    .help(Self.addAccountHelp)
+            }
             Spacer(minLength: 0)
         }
         .buttonStyle(.bordered)
     }
 
-    /// One message for all four `LoginLauncher` hand-offs below.
+    /// Whether the poll came back with a fleet and that fleet has no accounts
+    /// in it — the ONE state that draws its own "Add account…" button, in the
+    /// empty banner where the eye already is.
+    ///
+    /// The action row hides its copy in that state rather than drawing a
+    /// second identical button 8 pt below the first. `--render-states` is what
+    /// showed that: `07-empty-fleet` had two of them stacked, which a green
+    /// build and every test said nothing about.
+    private var fleetIsEmpty: Bool {
+        guard case .loaded(let fleet) = poller.state else { return false }
+        return fleet.accounts.isEmpty
+    }
+
+    /// What the "Add account…" button does, said once. Three buttons draw this
+    /// tooltip — the v4 action row, the legacy action row and the empty-fleet
+    /// state — and it used to be three separate strings, two of which still
+    /// promised a Terminal window after the flow stopped using one.
+    static let addAccountHelp =
+        "Signs in through your browser, in this app. The account is written only when "
+        + "the browser comes back; an older tcr with no --non-interactive flag falls back "
+        + "to a Terminal window."
+
+    /// One message for every `LoginLauncher` hand-off below — the two `tcr
+    /// mint` ones, and the login fallback for a `tcr` too old to have
+    /// `--non-interactive`.
     ///
     /// They carried four identical copies of the same two-case switch, and the
     /// `toolMissing` copy named the problem with no way out of it — while the
@@ -2302,30 +2362,64 @@ struct FleetView: View {
         }
     }
 
-    /// Hand `tcr login` to a Terminal window.
+    /// Sign in, in the app.
     ///
-    /// Deliberately a hand-off, not an in-app flow. `tcr login` refuses while a
-    /// proxy holds the port and prompts on stdin, so a background spawn would
-    /// usually fail and would hide its own prompts when it did not. The ellipsis
-    /// in the label is doing real work: this opens something.
+    /// This used to be a Terminal hand-off with no alternative, because
+    /// `tcr login` prompted on stdin. `--non-interactive` removed the prompts
+    /// (`src/oauth.rs`'s `LoginUi`), so the panel runs the login itself and
+    /// shows a sheet — see ``beginLogin(reloggingIn:)`` for what happens when
+    /// the `tcr` on this machine predates that flag. The ellipsis in the label
+    /// is still doing real work: this opens a browser window.
     private func addAccount() {
-        if case .failure(let why) = LoginLauncher.launch() {
-            loginError = Self.loginFailureMessage(why)
-        } else {
-            loginError = nil
+        beginLogin(reloggingIn: nil)
+    }
+
+    /// Same sign-in, aimed at one existing row: `tcr login --account <name>`
+    /// requests that identity and refuses to write anything if the browser
+    /// hands back a different one.
+    private func reloginAccount(_ account: AccountRef) {
+        beginLogin(reloggingIn: account.name)
+    }
+
+    /// Start an in-app login, or fall back to the Terminal window.
+    ///
+    /// The fallback is not a nicety. TcrBar and `tcr` update independently, so
+    /// the binary this app resolves can be older than the app itself; without
+    /// the probe, a person on an older `tcr` would get a child that exits
+    /// immediately on an unknown argument where they used to get a Terminal
+    /// window that worked. ``LoginCapability/probe(executable:)`` asks that
+    /// binary once and remembers the answer.
+    private func beginLogin(reloggingIn name: String?) {
+        loginError = nil
+        guard !snapshotMode else { return }
+
+        switch TcrTool.resolve() {
+        case .failure(let missing):
+            loginError = Self.loginFailureMessage(.toolMissing(searched: missing.searched))
+        case .success(let executable):
+            guard LoginCapability.probe(executable: executable) else {
+                if case .failure(let why) = LoginLauncher.launch(reloggingIn: name) {
+                    loginError = Self.loginFailureMessage(why)
+                }
+                return
+            }
+            let session = LoginSession(account: name)
+            loginSession = session
+            session.start()
         }
     }
 
-    /// Same hand-off as ``addAccount()``, with the account name threaded
-    /// through so the Terminal script can name it. Surfaces a failure the same
-    /// way — a button that silently does nothing is worse than one that says
-    /// why.
-    private func reloginAccount(_ account: AccountRef) {
-        if case .failure(let why) = LoginLauncher.launch(reloggingIn: account.name) {
-            loginError = Self.loginFailureMessage(why)
-        } else {
-            loginError = nil
-        }
+    /// Close the sheet, and re-poll when something actually changed. A saved
+    /// account serves immediately through the running proxy, so the fleet is
+    /// one poll away from showing it — the row list itself only fills in fully
+    /// after the proxy restarts (`CLAUDE.md`'s config-reload rule), which the
+    /// sheet says out loud.
+    private func endLogin(cancelling: Bool) {
+        if cancelling { loginSession?.cancel() }
+        let saved: Bool
+        if case .saved = loginSession?.phase { saved = true } else { saved = false }
+        loginSession = nil
+        if saved { Task { await poller.pollOnce() } }
     }
 
     /// Hand `tcr mint --account <name>` to a Terminal window for one row.
@@ -2595,8 +2689,8 @@ struct AccountRow: View {
     /// computed against — reading the poller's published `state` afterwards could
     /// pick up a different, later poll.
     let onChanged: () async -> PollState
-    /// Hands `tcr login` to a Terminal window for THIS account. Drawn on
-    /// every row's context menu, and additionally as the standalone
+    /// Signs THIS account in again, in the app (``FleetView/reloginAccount(_:)``).
+    /// Drawn on every row's context menu, and additionally as the standalone
     /// ``AccountRow/reloginButton`` on a `.needsRelogin` row.
     let onRelogin: () -> Void
     /// Hands `tcr mint --account <this row's name>` to a Terminal window. See
@@ -3316,11 +3410,11 @@ struct AccountRow: View {
         .disabled(accounts.isPending(account.ref))
         Button("Re-login…") { onRelogin() }
             .help(
-                "Opens `tcr login --account` in a Terminal window, requesting "
-                    + "this exact account. `tcr` refuses to save if the browser "
-                    + "hands back a different one. The login it starts now mints "
-                    + "a credential good for a year, so running it on a healthy "
-                    + "row is a safe way to get ahead of the old one expiring."
+                "Signs in through your browser, requesting this exact account. "
+                    + "`tcr` refuses to save if the browser hands back a different "
+                    + "one. The login it starts now mints a credential good for a "
+                    + "year, so running it on a healthy row is a safe way to get "
+                    + "ahead of the old one expiring."
             )
         Divider()
         // Hidden entirely while `control` cannot answer the question at all
@@ -4158,9 +4252,8 @@ struct AccountRow: View {
         }
     }
 
-    /// Hands `tcr login --account <name>` to a Terminal window, targeting THIS
-    /// row's account. Drawn on a `.needsRelogin` row only, beside
-    /// ``toggleButton``.
+    /// Runs `tcr login --account <name>` in the app, targeting THIS row's
+    /// account. Drawn on a `.needsRelogin` row only, beside ``toggleButton``.
     ///
     /// `--account` (`src/main.rs` / `src/oauth.rs`'s `login_hint`) requests
     /// that specific identity and refuses to write anything if the browser
@@ -4176,9 +4269,8 @@ struct AccountRow: View {
             .font(Tok.detailFont).lineSpacing(Tok.detailLineSpacing)
             .accessibilityLabel("Re-login \(account.name)")
             .help(
-                "Opens `tcr login --account` in a Terminal window, requesting "
-                    + "this exact account. `tcr` refuses to save if the browser "
-                    + "hands back a different one."
+                "Signs in through your browser, requesting this exact account. "
+                    + "`tcr` refuses to save if the browser hands back a different one."
             )
     }
 
