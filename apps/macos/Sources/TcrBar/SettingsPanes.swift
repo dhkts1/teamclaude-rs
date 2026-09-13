@@ -58,6 +58,11 @@ private struct RowTag: View {
 /// live config, which holds real credentials (`CLAUDE.md`).
 private let readOnlyHint = "Edit in ~/.config/teamclaude.json"
 
+/// `"1 account"` / `"2 accounts"` — this window's one plural count.
+private func pluralizedAccounts(_ count: Int) -> String {
+    "\(count) account\(count == 1 ? "" : "s")"
+}
+
 extension View {
     /// `.contentMargins(.top, _, for: .scrollContent)` is macOS 14+; this
     /// package's floor is macOS 13 (`Package.swift`). Same availability-guard
@@ -374,7 +379,7 @@ struct GroupsRotationSettingsPane: View {
             HStack {
                 Text(group.name).font(.headline)
                 Spacer()
-                Text("\(group.memberCount) accounts").foregroundStyle(Tok.inkDim)
+                Text(pluralizedAccounts(group.memberCount)).foregroundStyle(Tok.inkDim)
             }
             HStack(spacing: 6) {
                 Toggle(
