@@ -2420,44 +2420,206 @@ public struct Fleet: Equatable, Sendable {
     public let unreadable: [UnreadableRow]
 
     /// Every session the proxy has seen in the last hour (F2 + F3).
-    /// **Never populated by
-    /// ``decode(_:)``** — see this property's own placement, a stored field
-    /// rather than something read off ``accounts``.
+    /// **Never populated by ``decode(_:)``** — see this property's own
+    /// placement, a stored field rather than something read off ``accounts``.
     ///
-    /// The bridge this build was written against said the wire would grow a
-    /// top-level `sessions` array on `tcr status --json`'s existing bare
-    /// array. The merged F1 work (`teamclaude-rs#232`) put it somewhere else
-    /// instead: `SessionRow`/`StatusPayload.sessions` live on the PROXY's own
-    /// `/_tcr/status` HTTP response, which `fetch_live_status` (`src/cli.rs`)
-    /// reads with the proxy's api-key — and `tcr status --json` (`status()`,
-    /// same file) discards `sessions` entirely when it turns that payload
-    /// back into the bare array `Fleet.decode` reads. This app never touches
-    /// `~/.config/teamclaude.json` or the proxy's api-key from Swift — see
-    /// `CLAUDE.md`'s "No credentials, ever" and every `TcrBarCore` file that
-    /// says "this app never writes/reads the tcr config" — so there is
-    /// currently no channel this build may safely use to populate this field
-    /// against a live server. It exists, tested, so the Sessions and Tools
-    /// tabs are ready the moment a safe one exists (a `tcr` CLI subcommand
-    /// that shells out the way every other fact in this app already does),
-    /// and so ``RenderStates``'s fixtures can review the tabs' design today.
+    /// `sessions` does not ride `tcr status --json`, which is a bare array of
+    /// accounts and has clients that depend on being exactly that. The merged
+    /// F1 work (`teamclaude-rs#232`) put the rows on the PROXY's own
+    /// `/_tcr/status` HTTP response, behind the proxy api-key, and this app
+    /// may never read that key or `~/.config/teamclaude.json` — see
+    /// `CLAUDE.md`'s "No credentials, ever". So the channel is a second
+    /// SHELL-OUT, the way every other fact in this app arrives: `tcr sessions
+    /// --json` (`sessions()`, `src/cli.rs`) prints `{"supported", "sessions"}`
+    /// and ``StatusPoller`` folds it onto the fleet with ``withSessions(_:)``.
     public let sessions: [Session]
 
-    /// Whether the CURRENT read populated ``sessions`` at all — distinct from
-    /// an empty ``sessions``, which is also true of a server with nothing
-    /// live right now. `false` from every call to ``decode(_:)``, for the
-    /// reason ``sessions`` documents; a future safe channel sets it `true`.
-    public let sessionsSupported: Bool
+    /// Where this read's ``sessions`` came from — or, when it has none, the
+    /// reason, because the panel draws a different sentence for each. Not a
+    /// bare `Bool`: "the bundled tcr is too old to ask", "the running server
+    /// is too old to answer" and "the server answered, nothing is live" are
+    /// three different things to tell an operator, and a `false` collapses
+    /// them into one wrong one.
+    public let sessionsChannel: SessionsChannel
 
+    /// Whether the CURRENT read populated ``sessions`` at all — distinct from
+    /// an empty ``sessions``, which is also true of a server with nothing live
+    /// right now. Derived from ``sessionsChannel`` rather than stored beside
+    /// it: two fields saying one thing is two fields that can disagree.
+    public var sessionsSupported: Bool { sessionsChannel == .live }
+
+    /// The fixture/decode-shaped initializer, kept for every caller written
+    /// before the channel existed. `sessionsSupported: true` means ``live``;
+    /// `false` means nothing was asked (``notAttempted``), which is the truth
+    /// for a `Fleet` built straight from ``decode(_:)`` or from a fixture.
     public init(
         accounts: [Account],
         unreadable: [UnreadableRow] = [],
         sessions: [Session] = [],
         sessionsSupported: Bool = false
     ) {
+        self.init(
+            accounts: accounts,
+            unreadable: unreadable,
+            sessions: sessions,
+            sessionsChannel: sessionsSupported ? .live : .notAttempted)
+    }
+
+    public init(
+        accounts: [Account],
+        unreadable: [UnreadableRow] = [],
+        sessions: [Session] = [],
+        sessionsChannel: SessionsChannel
+    ) {
         self.accounts = accounts
         self.unreadable = unreadable
         self.sessions = sessions
-        self.sessionsSupported = sessionsSupported
+        self.sessionsChannel = sessionsChannel
+    }
+
+    /// What the `tcr sessions --json` half of a poll produced.
+    ///
+    /// Every case but ``live`` leaves ``sessions`` empty and
+    /// ``sessionsSupported`` `false`, which is what keeps a failure of the
+    /// SECOND call from ever poisoning the first: the fleet renders exactly as
+    /// it did before this channel existed. The cases differ only in what the
+    /// tab banner is allowed to SAY, and that is the point — the one sentence
+    /// on screen used to blame the server for every one of them, including the
+    /// case where the server is fine and the bundled `tcr` is the old half.
+    public enum SessionsChannel: Equatable, Sendable {
+        /// Nothing asked. A `Fleet` straight out of ``decode(_:)``, or a
+        /// fixture.
+        case notAttempted
+        /// The bundled `tcr` has no `sessions` subcommand — clap refused the
+        /// argument. The app is the old half here, not the proxy.
+        case toolPredatesSessions
+        /// `tcr sessions` ran and failed for some other reason (no server on
+        /// the port, a rejected api-key, a wedged proxy). Carries the CLI's
+        /// own stderr so an operator sees the real cause.
+        case commandFailed(String)
+        /// It exited 0 and printed something this build could not decode.
+        case unreadable(String)
+        /// It answered, and the running server's payload carried no `sessions`
+        /// key at all — a proxy built before F1.
+        case serverPredatesSessions
+        /// A live read. ``sessions`` may still be empty: that is an idle
+        /// proxy, and it gets its own sentence.
+        case live
+    }
+
+    /// One `tcr sessions --json` read, decoded.
+    public struct SessionsRead: Equatable, Sendable {
+        public let sessions: [Session]
+        public let channel: SessionsChannel
+        /// Rows that would not decode, same rule ``decode(_:)`` follows for
+        /// accounts: one bad row costs one row, never the tab.
+        public let unreadable: [UnreadableRow]
+
+        public init(
+            sessions: [Session] = [],
+            channel: SessionsChannel,
+            unreadable: [UnreadableRow] = []
+        ) {
+            self.sessions = sessions
+            self.channel = channel
+            self.unreadable = unreadable
+        }
+    }
+
+    /// Fold a sessions read onto this fleet. The accounts half is untouched by
+    /// construction — the second call can only ever ADD.
+    public func withSessions(_ read: SessionsRead) -> Fleet {
+        Fleet(
+            accounts: accounts,
+            unreadable: unreadable + read.unreadable,
+            sessions: read.sessions,
+            sessionsChannel: read.channel)
+    }
+
+    /// Decode `{"supported": Bool, "sessions": [...]}` — `tcr sessions
+    /// --json`'s document.
+    ///
+    /// Row-at-a-time for the same reason ``decode(_:)`` is: a single
+    /// unexpected null in one session must not cost the other twenty-one.
+    /// A body that is not that object throws, so the caller can say
+    /// "unreadable" rather than draw an empty tab that reads as "nothing is
+    /// running".
+    public static func decodeSessions(_ data: Data) throws -> SessionsRead {
+        let top = try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+        guard let object = top as? [String: Any] else {
+            throw DecodingError.typeMismatch(
+                [String: Any].self,
+                DecodingError.Context(
+                    codingPath: [],
+                    debugDescription:
+                        "tcr sessions --json emits a JSON object; got \(type(of: top))"
+                )
+            )
+        }
+        guard let supported = object["supported"] as? Bool else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.supported,
+                DecodingError.Context(
+                    codingPath: [],
+                    debugDescription: "no boolean `supported` key"
+                )
+            )
+        }
+        guard supported else {
+            return SessionsRead(channel: .serverPredatesSessions)
+        }
+
+        let rows = object["sessions"] as? [Any] ?? []
+        let decoder = JSONDecoder()
+        var sessions: [Session] = []
+        var unreadable: [UnreadableRow] = []
+        for (index, row) in rows.enumerated() {
+            // Same guard ``decode(_:)`` carries: `data(withJSONObject:)`
+            // raises an Objective-C exception on a fragment, which Swift
+            // cannot catch.
+            guard JSONSerialization.isValidJSONObject(row) else {
+                unreadable.append(
+                    UnreadableRow(index: index, message: "session row is not a JSON object"))
+                continue
+            }
+            do {
+                let rowData = try JSONSerialization.data(withJSONObject: row, options: [])
+                sessions.append(try decoder.decode(Session.self, from: rowData))
+            } catch {
+                unreadable.append(UnreadableRow(index: index, message: "\(error)"))
+            }
+        }
+        return SessionsRead(sessions: sessions, channel: .live, unreadable: unreadable)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case supported
+    }
+
+    /// The sentence the Sessions and Tools tabs show when there is no session
+    /// data — one per ``SessionsChannel`` case, because the old single string
+    /// ("This server predates sessions — update tcr.") was a guess that was
+    /// wrong for three of the five.
+    ///
+    /// `nil` on ``live``: there is nothing to apologise for, and the tab
+    /// either lists rows or draws its own idle sentence.
+    public var sessionsUnavailableDetail: String? {
+        switch sessionsChannel {
+        case .live:
+            return nil
+        case .notAttempted, .serverPredatesSessions:
+            return "This server predates sessions — update tcr."
+        case .toolPredatesSessions:
+            return "This copy of tcr predates sessions — update the app."
+        case .commandFailed(let why):
+            let trimmed = why.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return "tcr sessions failed." }
+            return "tcr sessions failed: \(trimmed)"
+        case .unreadable(let why):
+            let trimmed = why.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return "tcr sessions printed something unreadable." }
+            return "tcr sessions printed something unreadable: \(trimmed)"
+        }
     }
 
     /// Decode the array **one row at a time**.

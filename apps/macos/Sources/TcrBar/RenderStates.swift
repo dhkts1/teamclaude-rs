@@ -128,6 +128,16 @@ enum RenderStates {
             // predates sessions — update tcr." (finding 9). A scene nobody
             // renders is a claim nobody can check.
             ("18b-tools-tab-old-server", .loaded(fleet(healthyJSON)), false, nil),
+            // The case the single old sentence got WRONG: the proxy is fine
+            // and the BUNDLED `tcr` is the stale half, so it has no `sessions`
+            // subcommand to ask with. Telling an operator to restart a healthy
+            // proxy here is worse than saying nothing.
+            ("18c-sessions-tab-old-tcr", .loaded(oldToolFleet), false, nil),
+            ("18d-tools-tab-old-tcr", .loaded(oldToolFleet), false, nil),
+            // The longest sentence either banner can draw — the CLI's own
+            // stderr, inlined. Its own scene because a wrapping failure is
+            // only ever visible in pixels.
+            ("18e-sessions-tab-command-failed", .loaded(sessionsFailedFleet), false, nil),
             // The Accounts tab's structure, matching
             // the mockup's Accounts panel —
             // 2 solo cards, a 3-member parked group, a 6-member active
@@ -198,9 +208,10 @@ enum RenderStates {
     /// every existing scene would have to grow.
     private static func initialTab(for sceneName: String) -> PanelTab {
         switch sceneName {
-        case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server":
+        case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
+            "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed":
             return .sessions
-        case "17-tools-tab", "18b-tools-tab-old-server": return .tools
+        case "17-tools-tab", "18b-tools-tab-old-server", "18d-tools-tab-old-tcr": return .tools
         default: return .accounts
         }
     }
@@ -469,7 +480,8 @@ enum RenderStates {
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             .fixedSize()
 
-        let view = panel
+        let view =
+            panel
             .overlay {
                 ZStack {
                     Color.black.opacity(sheetScrimAlpha)
@@ -1191,6 +1203,25 @@ enum RenderStates {
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable,
             sessions: sessionsFixture + quiet, sessionsSupported: true)
+    }
+
+    /// A healthy fleet whose sessions channel failed because the BUNDLED `tcr`
+    /// has no `sessions` subcommand — see ``Fleet/SessionsChannel``.
+    private static var oldToolFleet: Fleet {
+        let base = fleet(healthyJSON)
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable,
+            sessionsChannel: .toolPredatesSessions)
+    }
+
+    /// The same fleet with the channel's longest sentence: `tcr sessions`
+    /// exited non-zero and its stderr rides into the banner.
+    private static var sessionsFailedFleet: Fleet {
+        let base = fleet(healthyJSON)
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable,
+            sessionsChannel: .commandFailed(
+                "could not read live status from the proxy on :3456 (connection refused)"))
     }
 
     private static var sessionsTabFleet: Fleet {

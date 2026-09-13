@@ -213,6 +213,32 @@ else
   ok "pre-commit carries no second copy of the checks"
 fi
 
+# The scaffolding pattern must match a word-boundary token through THIS
+# machine's git, not merely through GNU grep.
+#
+# `\b` is a GNU extension, absent from POSIX ERE, and Apple's git silently
+# matches nothing for it. The three word-boundary tokens were therefore inert
+# on every macOS checkout while working in CI on glibc, so a local scan came
+# back clean and the same tree failed the moment it reached Linux. That is how
+# a tree scan shipped and turned main red on its first run, and how two real
+# citations sat unnoticed in src/cli.rs.
+#
+# Asserting through `git grep` specifically is the point: `grep -E` on this
+# machine is GNU and would pass either way, which is exactly the false comfort
+# that hid the bug.
+probe_dir="$(mktemp -d)"
+printf 'a swarm state file\nnot-a-swarmy-word\n' > "$probe_dir/probe.txt"
+(
+  cd "$probe_dir" && git init -q . && git add probe.txt
+  git -c user.email=fixture@example.com -c user.name=fixture commit -q -m p
+)
+if git -C "$probe_dir" grep -q -I -i -E "$TCR_SCAFFOLDING_PATTERN" -- probe.txt; then
+  ok "the scaffolding pattern matches a word token through git's own regex engine"
+else
+  fail "the scaffolding pattern is INERT in this git: word-boundary tokens match nothing locally while CI sees them"
+fi
+rm -rf "$probe_dir"
+
 if [ "$FAILED" -ne 0 ]; then
   echo "test-disclosure-scan: FAILED"
   exit 1

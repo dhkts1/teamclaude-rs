@@ -25,7 +25,21 @@
 # `scripts/check-public-disclosure.sh`'s tracked-tree / PR-title-and-body
 # check (the CI-side gate, for forks that never run our hooks) scan for
 # EXACTLY the same tokens rather than two lists that can drift apart.
-TCR_SCAFFOLDING_PATTERN='data/plans/|-bridge\.md|\bcoordinator\b|\blane [abc]\b|\bswarm\b'
+# `\b` is a GNU extension and is NOT in POSIX ERE. Apple's git (2.50.1,
+# Apple Git-155) silently matches nothing for it, so on macOS the three
+# word-boundary tokens below were inert: `git grep -E '\bswarm\b'` finds zero
+# hits in a .gitignore that GNU grep matches twice. Every macOS developer got a
+# clean local scan while CI, on glibc, saw the hits. That is how #267 shipped a
+# tree scan that turned main red on its first run: its author could not have
+# seen it locally.
+#
+# `(^|[^[:alnum:]_])tok([^[:alnum:]_]|$)` is the portable spelling. `-P` also
+# works here but depends on git being built with PCRE, which is not guaranteed
+# on a contributor's machine.
+_w_pre='(^|[^[:alnum:]_])'
+_w_post='([^[:alnum:]_]|$)'
+TCR_SCAFFOLDING_PATTERN="data/plans/|-bridge\\.md|${_w_pre}coordinator${_w_post}|${_w_pre}lane [abc]${_w_post}|${_w_pre}swarm${_w_post}"
+unset _w_pre _w_post
 
 # The list is local-only and gitignored, so no clone or worktree carries it: a
 # committed list of the real names would itself be the disclosure this gate
