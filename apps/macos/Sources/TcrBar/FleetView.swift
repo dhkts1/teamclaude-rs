@@ -116,6 +116,23 @@ struct FleetView: View {
     @State private var usageLineHeight: CGFloat = 0
     @State private var usageLineBaseline: CGFloat = 0
 
+    /// The v4 Accounts tab's content height, as ONE measurement.
+    ///
+    /// The pre-v4 list publishes a height per child and `visibleRowsHeight(for:)`
+    /// sums them; `AccountsTabV4` is a single subtree that owns its own sections,
+    /// boxes, cards and gaps, so its height arrives whole. Nothing under
+    /// `PanelV4/` emits `RowHeightsKey` — which is exactly why the v4 panel was
+    /// pinned at the cap on every fleet (interface review finding 11) — and
+    /// adding an emitter to `AccountCard` would only have the view re-derive
+    /// gaps this subtree already knows.
+    ///
+    /// Published raw and folded through `PanelHeight.settled`, the same dead
+    /// band the row measurements use, for the reason that function's own
+    /// doc-comment gives: this number sizes the frame around the very content
+    /// being measured, and sub-pixel drift there is an `onPreferenceChange`
+    /// loop with a pass budget rather than a convergence test.
+    @State private var v4ContentHeight: CGFloat = 0
+
     /// Accounts / Sessions / Tools (F2 + F3, `panel-tabs-bridge.md`).
     /// `.accounts` selected by default, per the bridge.
     @State private var selectedTab: PanelTab = .accounts
@@ -369,8 +386,24 @@ struct FleetView: View {
                 if snapshotMode {
                     accountsTabV4(fleet)
                 } else {
-                    ScrollView { accountsTabV4(fleet) }
-                        .frame(height: visibleRowsHeight(for: fleet))
+                    ScrollView {
+                        accountsTabV4(fleet)
+                            // On the CONTENT, never on the `ScrollView`: a
+                            // reader attached outside the frame reports the
+                            // frame back to itself, which is a measurement of
+                            // this line rather than of the fleet.
+                            .background(
+                                GeometryReader { proxy in
+                                    Color.clear.preference(
+                                        key: V4ContentHeightKey.self,
+                                        value: proxy.size.height)
+                                }
+                            )
+                    }
+                    .frame(height: v4ListHeight(for: fleet))
+                    .onPreferenceChange(V4ContentHeightKey.self) {
+                        v4ContentHeight = PanelHeight.settled(v4ContentHeight, $0)
+                    }
                 }
             case .sessions:
                 sessionsTab(fleet)
@@ -2237,16 +2270,50 @@ struct FleetView: View {
             // list drew under a globally pinned control row; sectioning removed
             // both the pin and the separator, so charging for it here would
             // hand the viewport 8.5pt of empty space under the last card.
-            budget: PanelHeight.listBudget(
-                cap: Tok.panelMaxHeight,
-                headerOverflow: PanelHeight.headerOverflow(
-                    lineHeight: usageLineHeight,
-                    oneLineHeight: usageLineBaseline,
-                    // The line's own render condition, read from the fleet
-                    // rather than from the last measurement: a measurement
-                    // taken while the line existed does not expire on its own.
-                    lineIsDrawn: fleet.usageSummaryLine != nil),
-                minimum: Tok.panelMinListHeight))
+            budget: listBudget(for: fleet))
+    }
+
+    /// What the account list may occupy: the cap, less whatever the header grew
+    /// past one line. Shared by both viewports so the v4 tab and the legacy
+    /// list can never disagree about the budget itself — only about how each
+    /// one measures the content inside it.
+    private func listBudget(for fleet: Fleet) -> CGFloat {
+        PanelHeight.listBudget(
+            cap: Tok.panelMaxHeight,
+            headerOverflow: PanelHeight.headerOverflow(
+                lineHeight: usageLineHeight,
+                oneLineHeight: usageLineBaseline,
+                // The line's own render condition, read from the fleet
+                // rather than from the last measurement: a measurement
+                // taken while the line existed does not expire on its own.
+                lineIsDrawn: fleet.usageSummaryLine != nil),
+            minimum: Tok.panelMinListHeight)
+    }
+
+    /// The v4 Accounts viewport: the tab's own measured content, clamped to
+    /// that budget.
+    ///
+    /// Review finding 11. The v4 tab was calling ``visibleRowsHeight(for:)``,
+    /// whose dictionary NOTHING under `PanelV4/` has ever populated, so it took
+    /// its empty-dictionary branch on every frame and returned the budget
+    /// itself: a two-account fleet was drawn in a 520 pt viewport, the same as
+    /// a thirteen-account one, with the remainder painted as panel fill under
+    /// the last card.
+    ///
+    /// One measurement rather than a dictionary because `AccountsTabV4` is one
+    /// subtree that already owns its sections, boxes, cards and the gaps
+    /// between them: there is nothing here to sum, and an emitter per card
+    /// would make the view re-derive spacing the subtree knows exactly.
+    ///
+    /// What this does NOT subtract is a wrapped v4 summary. `headerOverflow`
+    /// reads the two preferences the LEGACY header emits, which the v4 header
+    /// does not, so a summary that wraps adds its second line on top of the cap
+    /// rather than spending it. Bounded, and deliberately left: the unbounded
+    /// spend line that made overflow worth measuring is drawn by the legacy
+    /// header only, and the v4 summary is at most three short lines.
+    private func v4ListHeight(for fleet: Fleet) -> CGFloat {
+        PanelHeight.viewportHeight(
+            contentHeight: v4ContentHeight, budget: listBudget(for: fleet))
     }
 
     /// Every child `accountList` draws, in draw order, as its height key.
@@ -2651,6 +2718,20 @@ struct RowHeightsKey: PreferenceKey {
 /// preference-key pattern the rows use, for the same reason: the wrap point
 /// depends on the font, the panel width and the string, so it is measured, not
 /// computed.
+/// The v4 Accounts tab's whole content height — ONE number, not a dictionary.
+///
+/// `AccountsTabV4` is a single subtree that owns its sections, its group boxes,
+/// its cards and every gap between them, so unlike the pre-v4 list there is
+/// nothing to sum and no gap count to infer. `max` for the same reason the two
+/// usage keys use it: sibling subtrees in the same reader contribute and the
+/// tallest is the one the viewport has to hold.
+struct V4ContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
 struct UsageLineHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
