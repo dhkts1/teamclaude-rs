@@ -164,26 +164,26 @@ public enum Tok {
     // in greyscale and to a viewer who cannot separate red from green.
 
     /// In rotation with headroom.
-    public static let ok = dyn(dark: "#66d081", light: "#00873c")
+    public static let ok = dyn(dark: "#66d081", light: "#06652d")
     /// Close to a gating limit.
-    public static let near = dyn(dark: "#ffd16b", light: "#ba7702")
+    public static let near = dyn(dark: "#ffd16b", light: "#925d0b")
     /// `near`, as an `NSColor` — same reason ``awakeNSColor`` exists beside
     /// ``awake``: the menu-bar mark's running-tools count is drawn into an
     /// `NSAttributedString`, not a SwiftUI view, and it tints amber with the
     /// identical hex this token already carries, so no new value needs the
     /// palette script's gate.
-    public static let nearNSColor = dynNS(dark: "#ffd16b", light: "#ba7702")
+    public static let nearNSColor = dynNS(dark: "#ffd16b", light: "#925d0b")
     /// Spent on a gating window until it resets.
-    public static let spent = dyn(dark: "#ea5a56", light: "#c0041f")
+    public static let spent = dyn(dark: "#ea5a56", light: "#940015")
     /// Enabled, but nothing has ever been measured about it.
     ///
     /// Its own hue for the same reason `FleetTally.Kind.unmeasured` is its own
     /// bucket: `ok` would overclaim capacity, `spent` would claim an exhaustion
     /// nobody observed. Low chroma on purpose — an absent reading is not an
     /// alarm, so it must not sit on the traffic-light scale at all.
-    public static let unmeasured = dyn(dark: "#82bad5", light: "#4c829c")
+    public static let unmeasured = dyn(dark: "#82bad5", light: "#0a7196")
     /// Operator-disabled: a decision, not an alarm.
-    public static let disabled = dyn(dark: "#909295", light: "#7f8083")
+    public static let disabled = dyn(dark: "#909295", light: "#67696b")
     /// A value this build cannot classify. Distinct from `unmeasured`: "a state
     /// I cannot name" is not "no state at all".
     public static let unknown = dyn(dark: "#c69bdd", light: "#7d4d96")
@@ -212,7 +212,7 @@ public enum Tok {
     /// guaranteed against anything — which is exactly why the menu bar carries
     /// this state as a glyph that is *present or absent* and uses colour only as
     /// a second channel. See `KeepAwakeGlyph`.
-    public static let awakeNSColor = dynNS(dark: "#51dfdf", light: "#017272")
+    public static let awakeNSColor = dynNS(dark: "#51dfdf", light: "#005f5f")
     public static let awake = Color(nsColor: awakeNSColor)
 
     /// The tint behind a status pill, and the hairline around it.
