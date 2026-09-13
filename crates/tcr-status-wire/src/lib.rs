@@ -142,8 +142,8 @@ pub struct SlowToolRow {
     pub ended_ms: i64,
 }
 
-/// One tool's aggregate call stats, for a session's (or the fleet's) "BY TOOL" breakdown
-/// (wire 2, `data/plans/wire-2-bridge.md`). `tool` is the wire's `tool_use.name` verbatim —
+/// One tool's aggregate call stats, for a session's (or the fleet's) "BY TOOL" breakdown.
+/// `tool` is the wire's `tool_use.name` verbatim —
 /// `Read`, `Grep`, `Glob` and `Edit` are deliberately NOT merged server-side; a panel groups
 /// them if it wants to.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -200,7 +200,7 @@ pub struct SessionToolsRow {
 
 /// Fleet-wide tool-call totals, summed server-side across every live session — so a panel's
 /// headline and "BY TOOL" bars read from the SAME numbers as the per-session rows and cannot
-/// disagree with them by re-summing client-side (wire 2, `data/plans/wire-2-bridge.md`).
+/// disagree with them by re-summing client-side.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionsSummary {

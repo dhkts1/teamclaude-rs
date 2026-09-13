@@ -576,8 +576,7 @@ pub fn remove_from_group(
 
 /// `tcr group reserve <group>` — mark `group` reserved: from the next
 /// restart, an account carrying it is off-limits to traffic that did not ask
-/// for one of its groups (`docs/plans/reserved-groups-bridge.md`'s
-/// "Semantics" section has the exact rule).
+/// for one of its groups.
 ///
 /// The safety rail runs BEFORE any write: reserving shrinks the general pool,
 /// so this refuses outright — leaving the config byte-identical — if the

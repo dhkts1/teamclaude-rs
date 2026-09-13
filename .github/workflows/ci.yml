@@ -61,6 +61,28 @@ jobs:
       - name: PanelV4 writes no sizes of its own
         run: scripts/check-panel-v4.sh
 
+      # This repository is public and takes pull requests from forks, which
+      # never run `.githooks/pre-commit` — so a fork's branch can carry a
+      # dangling citation of an internal planning path, or internal process
+      # vocabulary, straight past every local gate (see the token list in
+      # .githooks/lib/disclosure-scan.sh). This is the same check the hook
+      # runs on a staged diff, run here over the whole tracked tree instead.
+      - name: No internal-scaffolding citations in the tree
+        run: scripts/check-public-disclosure.sh
+
+      # The same check, over the PR's own title and body: a description that
+      # names internal scaffolding is exactly as public as a comment that
+      # does. Skipped on a plain push to `main`, where there is no PR text to
+      # check.
+      - name: No internal-scaffolding citations in the PR title/body
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n' "$PR_TITLE" | scripts/check-public-disclosure.sh --stdin "PR title"
+          printf '%s\n' "$PR_BODY" | scripts/check-public-disclosure.sh --stdin "PR body"
+
       # The disclosure gate's own fixtures. The hooks themselves are local and a
       # fork may not have them wired, so CI runs the suite that proves the scan
       # still refuses what it exists to refuse — a name, a home path, a real

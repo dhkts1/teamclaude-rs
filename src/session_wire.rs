@@ -1,7 +1,6 @@
 //! F1: session + tool-call tracking for `tcr status --json`'s `sessions` array.
 //!
-//! Design and measurements: `docs/design/panel-tabs.md`; the bridge that specced this is
-//! `data/plans/sessions-wire-bridge.md`.
+//! Design and measurements: `docs/design/panel-tabs.md`.
 //!
 //! Two halves, deliberately separate:
 //!
