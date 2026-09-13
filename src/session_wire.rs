@@ -32,11 +32,12 @@
 //! `command_head` (capped to 120 chars; the per-tool shape is on
 //! [`ToolUseEvent::command_head`]) is held in this in-memory table — never written to
 //! `~/.cache/teamclaude/logs` or any other log file. That is the same
-//! body-content-never-hits-disk rule `src/proxy.rs` states for the request log. NOTE, measured
-//! 2026-09-13: the affinity-style snapshot in [`crate::session_wire_persist`] round-trips
-//! `WireSession` verbatim, heads included, so `~/.cache/teamclaude/session-wire.json` does
-//! hold them today (23 `command_head` strings in the live file) — that predates the wider
-//! heads above and is a policy call, not something this parser decides.
+//! body-content-never-hits-disk rule `src/proxy.rs` states for the request log. The
+//! affinity-style snapshot in [`crate::session_wire_persist`] round-trips [`WireSession`]
+//! to `~/.cache/teamclaude/session-wire.json`, but [`RunningTool::command_head`] and
+//! [`SlowTool::command_head`] carry `#[serde(skip_serializing)]`, so that file never holds
+//! one: `command_class` (a coarse category, not a command) is the only per-tool shape that
+//! reaches disk.
 
 use serde_json::value::RawValue;
 use serde_json::Value;
@@ -508,6 +509,7 @@ fn url_host(raw: &str) -> &str {
 pub struct RunningTool {
     pub tool: String,
     pub started_ms: i64,
+    #[serde(skip_serializing, default)]
     pub command_head: Option<String>,
     pub command_class: Option<CommandClass>,
 }
@@ -517,6 +519,7 @@ pub struct RunningTool {
 pub struct SlowTool {
     pub tool: String,
     pub seconds: f64,
+    #[serde(skip_serializing, default)]
     pub command_head: Option<String>,
     pub command_class: Option<CommandClass>,
     pub ended_ms: i64,
