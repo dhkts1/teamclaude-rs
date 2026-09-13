@@ -534,6 +534,7 @@ mod tests {
                 input_tokens: 400,
                 output_tokens: 100,
                 cache_read_tokens: 200,
+                cache_creation_tokens: 30,
                 tools: tcr_status_wire::SessionToolsRow {
                     calls: 2,
                     errors: 0,
