@@ -399,7 +399,20 @@ release_is_assetless() {
   esac
 }
 
-# Marks $tag prerelease so `latest` falls back to the previous good release.
+# Marks $tag prerelease. That does make a FRESH request to `latest`, and to
+# `latest/download/<asset>`, fall back to the previous good release — measured
+# directly against a scratch repo, 2026-08-21. It is not the whole story, and
+# this comment used to claim it was: GitHub caches the redirect TARGET for a
+# given download URL at the edge, keyed by the URL rather than by the release's
+# live flags, so a request served while an assetless release was briefly
+# `latest` can keep resolving to it for minutes after the flag is corrected.
+#
+# Which is survivable here only because the Sparkle feed no longer lives at
+# `/releases/latest/download/appcast.xml` at all. It is a fixed file on
+# gh-pages (see publish-appcast-feed.sh), written by nothing but this app's own
+# release, so a CLI-only release cannot become `latest` and orphan it. This
+# mitigation is the belt to that braces; do not re-derive the feed URL from
+# `latest` on the strength of it.
 # Idempotent — `gh release edit` succeeds whether or not it was already
 # prerelease — so calling this repeatedly from a poll loop is safe. Failure
 # is swallowed rather than fatal for the same "must not abort a release over
