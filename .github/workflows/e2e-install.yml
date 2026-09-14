@@ -1,0 +1,83 @@
+name: e2e-install
+
+# The README's install line and the first-run behaviours, on machines that have
+# never seen tcr: GitHub's own macOS and Linux runners. Two jobs:
+#
+#   readme-install  runs the README one-liner VERBATIM against the live release
+#                   assets (so it proves what a user gets today, not what main
+#                   would give them), and on macOS asserts TcrBar landed in
+#                   /Applications and launches.
+#   first-run       builds `tcr` from this ref and runs scripts/e2e-first-run.sh:
+#                   no config -> created; a Claude Code login file -> imported at
+#                   server boot; second run -> idempotent.
+#
+# On demand, and on any PR that touches the installer or the first-run paths.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - install.sh
+      - scripts/install-tcrbar-from-dmg.sh
+      - scripts/e2e-first-run.sh
+      - src/claude_code_login.rs
+      - src/config.rs
+      - .github/workflows/e2e-install.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  readme-install:
+    name: readme-install (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      # No checkout on purpose: a user running the README line has none. The
+      # only difference from the README is WHICH install.sh: on a PR it is the
+      # PR's own, so a fix to the installer is proven before it merges; on
+      # demand it is main's, exactly what a user gets.
+      - name: The README line, verbatim
+        env:
+          TEAMCLAUDE_RS_INSTALL_DIR: ${{ github.workspace }}/tcr-bin
+          INSTALL_SH_REF: ${{ github.head_ref || 'main' }}
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf "https://raw.githubusercontent.com/dhkts1/teamclaude-rs/${INSTALL_SH_REF}/install.sh" | sh
+
+      - name: tcr is on the machine
+        run: |
+          "${{ github.workspace }}/tcr-bin/bin/tcr" --version
+
+      - name: TcrBar is installed and launches (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          test -d /Applications/TcrBar.app || { echo "FAIL: /Applications/TcrBar.app missing"; exit 1; }
+          codesign --verify --deep --strict /Applications/TcrBar.app
+          open -b io.github.dhkts1.tcrbar
+          for i in $(seq 1 30); do pgrep -x TcrBar >/dev/null && break; sleep 1; done
+          pgrep -x TcrBar >/dev/null || { echo "FAIL: TcrBar did not start"; exit 1; }
+          echo "PASS: TcrBar installed, signature valid, process running"
+
+  first-run:
+    name: first-run (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build tcr from this ref
+        run: cargo build --release
+      - name: First-run cases on an empty HOME
+        run: scripts/e2e-first-run.sh target/release/tcr
