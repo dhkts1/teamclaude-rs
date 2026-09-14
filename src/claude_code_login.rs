@@ -24,6 +24,7 @@
 //! test says "this machine has no Claude Code login".
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use anyhow::Context;
@@ -42,6 +43,7 @@ pub const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// on the Keychain item's ACL. A dialog the user ignores must not wedge
 /// `tcr status` (TcrBar polls it), so the read is bounded and a timeout is
 /// simply "no login found" — the same outcome as denying the dialog.
+#[cfg(target_os = "macos")]
 const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The Claude Code login, as much of it as tcr can use.
