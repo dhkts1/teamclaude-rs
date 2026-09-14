@@ -403,6 +403,20 @@ struct LoginArgs {
     /// cannot be evaluated must fail closed.
     #[arg(long)]
     token: bool,
+    /// Add an account from the login the `claude` CLI on this machine already
+    /// holds, instead of the browser flow — no value here. The credential is
+    /// read from the login Keychain (item `Claude Code-credentials`) on macOS,
+    /// else from `~/.claude/.credentials.json`; `TCR_CLAUDE_CODE_CREDENTIALS`
+    /// overrides both with a file path. It carries a refresh token and a real
+    /// expiry, so the account keeps working the same way a browser login's
+    /// does. The cost, printed on import: refresh tokens are single-use, so the
+    /// first time tcr refreshes this one, the `claude` CLI's own copy dies and
+    /// `claude` asks for a browser login once. Refuses to combine with
+    /// `--token`, which is a different credential from a different place.
+    /// A first run does this by itself when it finds no accounts — this flag is
+    /// the explicit redo (after `tcr remove`, or onto a second config).
+    #[arg(long, conflicts_with = "token")]
+    from_claude_code: bool,
     /// Drive the login from another program instead of a terminal: stdin is
     /// never read, the browser is never opened here, and progress goes to
     /// stdout as one JSON object per line — `{"event":"browser","url":…}`,
@@ -1227,6 +1241,18 @@ fn apply_capability_defaults(cmd: &mut std::process::Command) {
 /// config path and reports.
 async fn run_login(args: LoginArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
+    if args.from_claude_code {
+        let name = oauth::login_from_claude_code(
+            &config_path,
+            args.force,
+            args.name.as_deref(),
+            args.account.as_deref(),
+        )
+        .await
+        .context("importing the Claude Code login failed")?;
+        println!("Logged in as '{name}'.");
+        return Ok(());
+    }
     if args.token {
         let name = oauth::login_with_token(
             &config_path,
@@ -1343,6 +1369,24 @@ fn stand_down_exit_code(liveness: &cli::Liveness, verdict: build_info::StandDown
 async fn run_server(args: ServerArgs) -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(config::default_path);
     let (config, persist_path) = load_config(&config_path)?;
+
+    // A first boot with an empty fleet imports this machine's Claude Code
+    // login, if it has one — here, BEFORE the manager and the fleet are built
+    // from `config`, so the very first request already has an account to serve
+    // it rather than a 429 until someone runs `tcr login`. Never on a config
+    // that already has accounts (see `auto_import_claude_code_login`), and
+    // never fatal: the failure paths all warn and boot with zero accounts,
+    // exactly as this line did before.
+    let config = if config.accounts.is_empty() {
+        match oauth::auto_import_claude_code_login(&config_path).await {
+            // Re-read: the import wrote the file, and re-reading is what makes
+            // the running fleet the one on disk.
+            Some(_) => load_config(&config_path).map_or(config, |(fresh, _)| fresh),
+            None => config,
+        }
+    } else {
+        config
+    };
 
     init_tracing(args.headless);
 
@@ -2210,6 +2254,47 @@ mod tests {
             rendered.contains("--no-replace") && rendered.contains("--replace"),
             "the message must name BOTH flags so the operator knows what to remove: {rendered}"
         );
+    }
+
+    /// `--token` and `--from-claude-code` are two different credentials from
+    /// two different places; asking for both is a contradiction, not a
+    /// precedence puzzle. clap must reject it by name rather than let one
+    /// silently win.
+    #[test]
+    fn token_and_from_claude_code_together_are_a_usage_error() {
+        // `let Err(..) else`, not `expect_err`: the Ok side is `Cli`, which
+        // does not implement Debug (nor should it — it would print the config
+        // path).
+        let Err(err) = Cli::try_parse_from(["tcr", "login", "--token", "--from-claude-code"])
+        else {
+            panic!("--token with --from-claude-code must not parse");
+        };
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "it must fail as a conflict, not as some other parse error: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("--token") && rendered.contains("--from-claude-code"),
+            "the message must name BOTH flags so the operator knows what to remove: {rendered}"
+        );
+    }
+
+    /// Each alone still parses, and `--from-claude-code` combines with the
+    /// flags a browser login combines with — `--account` especially, which
+    /// `--token` has to refuse (an inference-only credential has no identity
+    /// to confirm; this one does).
+    #[test]
+    fn from_claude_code_parses_alone_and_with_account_and_name() {
+        for args in [
+            vec!["tcr", "login", "--from-claude-code"],
+            vec!["tcr", "login", "--from-claude-code", "--account", "work"],
+            vec!["tcr", "login", "--from-claude-code", "--name", "work"],
+            vec!["tcr", "login", "--from-claude-code", "--force"],
+        ] {
+            Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} must parse: {e}"));
+        }
     }
 
     /// Each flag alone still parses — the deprecated one is accepted, as promised

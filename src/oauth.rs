@@ -1681,6 +1681,175 @@ pub async fn login_with_token(
     result
 }
 
+/// What importing the `claude` CLI's own login costs the user, in the words
+/// they are told it in — printed by BOTH the explicit `--from-claude-code`
+/// verb and the first-run auto-import, from this one constant so the two can
+/// never drift into telling the user two different things.
+///
+/// It is a real cost, and it is stated rather than hidden: refresh tokens
+/// rotate on every use (measured 2026-09-12, `docs/design/long-lived-tokens.md`),
+/// so the first time tcr refreshes the imported credential, the copy the
+/// `claude` CLI is still holding becomes dead and `claude` asks for a browser
+/// login once.
+pub const CLAUDE_CODE_IMPORT_CONSEQUENCE: &str =
+    "this copies the login the `claude` CLI itself uses, and each refresh token is single-use, \
+     so the next time tcr refreshes it, `claude` will ask you to log in again in the browser, \
+     once. Sessions started with `tcr run` are not affected.";
+
+/// `" (max)"` for a known subscription, `""` for none — the plan is shown back
+/// to the user as confirmation of WHICH login was taken, never acted on.
+fn plan_suffix(subscription_type: Option<&str>) -> String {
+    match subscription_type {
+        Some(plan) if !plan.trim().is_empty() => format!(" ({plan})"),
+        _ => String::new(),
+    }
+}
+
+/// The Claude Code credential as a [`Tokens`], the shape every write path in
+/// this module already takes.
+///
+/// A credential with no `expiresAt` is stamped as expiring NOW, so the very
+/// first use refreshes it — correct here, because this credential carries a
+/// refresh token. Deliberately NOT the year-long assumption
+/// [`login_with_token`] stamps: that one has no refresh token and no way to
+/// find out when it dies, and this one has both.
+fn tokens_from_claude_code_login(login: crate::claude_code_login::ClaudeCodeLogin) -> Tokens {
+    Tokens {
+        access_token: login.access_token,
+        refresh_token: login.refresh_token,
+        expires_at_ms: login
+            .expires_at
+            .map_or_else(crate::now_ms, normalize_expires_at),
+    }
+}
+
+/// `tcr login --from-claude-code` — import the login this machine's `claude`
+/// CLI already holds, instead of opening a browser.
+///
+/// The explicit redo of what [`auto_import_claude_code_login`] does by itself
+/// on a first run: same read, same write path, and it is the way back in after
+/// a deliberate `tcr remove` (the auto path refuses to re-import a fleet the
+/// user emptied on purpose).
+pub async fn login_from_claude_code(
+    config_path: &Path,
+    force: bool,
+    name: Option<&str>,
+    account: Option<&str>,
+) -> anyhow::Result<String> {
+    let Some(login) = crate::claude_code_login::read_claude_code_login()? else {
+        bail!(
+            "no Claude Code login found on this machine — nothing was written. Log in with the \
+             `claude` CLI first, or use `tcr login` for the browser flow."
+        );
+    };
+    let subscription_type = login.subscription_type.clone();
+    let saved =
+        import_claude_code_login(config_path, force, name, account, login, LoginUi::Terminal)
+            .await?;
+    eprintln!(
+        "[tcr] imported as '{saved}'{}; {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
+        plan_suffix(subscription_type.as_deref())
+    );
+    Ok(saved)
+}
+
+/// Import this machine's Claude Code login on a first run, if there is one.
+///
+/// Called by the verbs that read the config when the fleet is EMPTY — the
+/// config was just created, or it exists with no accounts in it. Returns the
+/// account name on success and `None` every other way, and it is `None` that
+/// makes the caller print the ordinary `no accounts configured` hint.
+///
+/// Best-effort by construction: a machine with no Claude Code login, a
+/// Keychain read that fails, a profile fetch that fails, a live proxy that
+/// refuses the add route — each is ONE warning line on stderr and the verb
+/// carries on with zero accounts. None of them is an error worth failing
+/// `tcr status` over, which TcrBar renders as a failed poll. One attempt per
+/// process, no retry loop.
+///
+/// The caller is responsible for only calling this on an empty fleet: an
+/// import must never run over a config that already has accounts, or a user
+/// who removed their account on purpose would find it back. `--from-claude-code`
+/// is the explicit way to redo it.
+pub async fn auto_import_claude_code_login(config_path: &Path) -> Option<String> {
+    let login = match crate::claude_code_login::read_claude_code_login() {
+        Ok(Some(login)) => login,
+        Ok(None) => return None,
+        Err(err) => {
+            eprintln!(
+                "[tcr] warning: could not read this machine's Claude Code login ({err:#}) — \
+                 continuing with no accounts"
+            );
+            return None;
+        }
+    };
+    let subscription_type = login.subscription_type.clone();
+    // `LoginUi::Machine`: no prompt (nobody typed `tcr login` here) and no
+    // prose on STDOUT — `tcr status --json` and `tcr accounts --json` are piped
+    // into `jq` and decoded by TcrBar, so everything this path says goes to
+    // stderr.
+    match import_claude_code_login(config_path, false, None, None, login, LoginUi::Machine).await {
+        Ok(saved) => {
+            eprintln!(
+                "[tcr] imported '{saved}'{} from your Claude Code login; \
+                 {CLAUDE_CODE_IMPORT_CONSEQUENCE}",
+                plan_suffix(subscription_type.as_deref())
+            );
+            Some(saved)
+        }
+        Err(err) => {
+            eprintln!(
+                "[tcr] warning: could not import this machine's Claude Code login ({err:#}) — \
+                 continuing with no accounts"
+            );
+            None
+        }
+    }
+}
+
+/// The write both Claude Code import paths share: the SAME route probe, name
+/// mint and finishing path a browser login uses ([`login`]), so account-name
+/// collision, the live-proxy add route and `--force` behave identically. The
+/// only thing that differs is where the credential came from.
+///
+/// `--account` is honoured, unlike [`login_with_token`]'s refusal of it: this
+/// credential carries the full `user:profile` scope, so `fetch_profile` returns
+/// a real identity for [`assert_requested_identity`] to confirm the requested
+/// row against. There is nothing here that cannot be evaluated.
+async fn import_claude_code_login(
+    config_path: &Path,
+    force: bool,
+    name: Option<&str>,
+    account: Option<&str>,
+    login: crate::claude_code_login::ClaudeCodeLogin,
+    ui: LoginUi,
+) -> anyhow::Result<String> {
+    ui.install();
+    let port = login_target_port(config_path);
+    let incumbent = singleton::live_proxy_server(port);
+    let route = login_route(config_path, incumbent, port, force).await?;
+    if let LoginRoute::Refuse(msg) = route {
+        bail!("{}", msg);
+    }
+
+    let tokens = tokens_from_claude_code_login(login);
+
+    let mut config = load_or_default(config_path)?;
+    let profile = fetch_profile(&tokens.access_token).await;
+    let resolved_name = mint_login_name(&config, &profile, account, name, ui)?;
+
+    finish_login_checked(
+        config_path,
+        route,
+        &mut config,
+        &resolved_name,
+        &tokens,
+        profile,
+        account,
+    )
+    .await
+}
+
 /// Whether `s` is plausibly an email address — no whitespace, and exactly one
 /// `@` with at least one character on each side. Deliberately not a full RFC
 /// 5322 validator: this only ever gates whether a value is safe to hand to
@@ -5029,5 +5198,120 @@ mod tests {
     fn unnamed_fallback_fills_a_gap_left_by_a_removed_account() {
         let accounts = [named_account("unnamed"), named_account("unnamed-3")];
         assert_eq!(unnamed_fallback(&accounts), "unnamed-2");
+    }
+    // --- the Claude Code import ----------------------------------------------
+
+    /// A fake Claude Code credentials document, values invented.
+    const FAKE_CLAUDE_CODE_JSON: &str = r#"{
+      "claudeAiOauth": {
+        "accessToken": "at-imported-FAKE",
+        "refreshToken": "rt-imported-FAKE",
+        "expiresAt": 1789000000000,
+        "subscriptionType": "max"
+      }
+    }"#;
+
+    /// The whole point of importing this credential rather than a
+    /// `setup-token` one: it carries a refresh token and a real expiry, so the
+    /// row lands able to refresh itself. Mutation note: drop `refresh_token`
+    /// in `tokens_from_claude_code_login` (the shape `login_with_token` has to
+    /// use) and the `has_refresh` assertion fails; stamp
+    /// `SETUP_TOKEN_ASSUMED_LIFETIME_MS` instead of the document's own
+    /// `expiresAt` and the expiry assertion fails.
+    #[tokio::test]
+    async fn an_imported_claude_code_login_lands_with_its_refresh_token_and_expiry() {
+        let path = std::env::temp_dir().join(format!(
+            "tcr-oauth-claude-code-import-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, r#"{ "accounts": [] }"#).unwrap();
+        let mut config = load_or_default(&path).unwrap();
+
+        let login = crate::claude_code_login::parse(FAKE_CLAUDE_CODE_JSON)
+            .expect("the fake document parses")
+            .expect("it carries a login");
+        let tokens = tokens_from_claude_code_login(login);
+
+        let name = finish_login(
+            &path,
+            LoginRoute::File,
+            &mut config,
+            "imported@example.com",
+            &tokens,
+            profile_named("imported@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(name, "imported@example.com");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let row = &doc["accounts"][0];
+        assert_eq!(row["name"], serde_json::json!("imported@example.com"));
+        assert!(
+            row["refreshToken"].is_string(),
+            "an imported Claude Code login must land WITH its refresh token"
+        );
+        assert_eq!(
+            row["expiresAt"],
+            serde_json::json!(1_789_000_000_000i64),
+            "the row's expiry must be the document's own `expiresAt`, in ms"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A credential with no `expiresAt` is stamped as already expired, so the
+    /// first use refreshes it — never the year-long `--token` assumption,
+    /// which would leave a dead credential looking healthy for months.
+    #[test]
+    fn a_claude_code_login_with_no_expiry_is_stamped_as_due_a_refresh() {
+        let login = crate::claude_code_login::parse(
+            r#"{"claudeAiOauth": {"accessToken": "at-FAKE", "refreshToken": "rt-FAKE"}}"#,
+        )
+        .expect("parses")
+        .expect("has a login");
+        let before = crate::now_ms();
+        let tokens = tokens_from_claude_code_login(login);
+        assert!(
+            tokens.expires_at_ms >= before && tokens.expires_at_ms <= crate::now_ms(),
+            "an unknown expiry must stamp NOW (got {}), not a year out",
+            tokens.expires_at_ms
+        );
+    }
+
+    /// Seconds-vs-milliseconds is the classic way an imported expiry lands
+    /// wrong; the same `normalize_expires_at` every other path uses guards it.
+    #[test]
+    fn a_seconds_expiry_is_normalized_to_milliseconds() {
+        let login = crate::claude_code_login::parse(
+            r#"{"claudeAiOauth": {"accessToken": "at-FAKE", "expiresAt": 1789000000}}"#,
+        )
+        .expect("parses")
+        .expect("has a login");
+        assert_eq!(
+            tokens_from_claude_code_login(login).expires_at_ms,
+            1_789_000_000_000
+        );
+    }
+
+    /// The plan is shown back as confirmation of WHICH login was taken, and an
+    /// absent one must not render as `()` or `(None)`.
+    #[test]
+    fn the_plan_suffix_is_empty_when_there_is_no_plan() {
+        assert_eq!(plan_suffix(Some("max")), " (max)");
+        assert_eq!(plan_suffix(None), "");
+        assert_eq!(plan_suffix(Some("  ")), "");
+    }
+
+    /// The consequence is stated, not hidden — and stated once, from one
+    /// constant, so the explicit verb and the auto-import cannot drift.
+    #[test]
+    fn the_import_consequence_names_the_re_login_cost() {
+        assert!(
+            CLAUDE_CODE_IMPORT_CONSEQUENCE.contains("log in again")
+                && CLAUDE_CODE_IMPORT_CONSEQUENCE.contains("single-use"),
+            "the user must be told the `claude` CLI will need one browser login: \
+             {CLAUDE_CODE_IMPORT_CONSEQUENCE}"
+        );
     }
 }
