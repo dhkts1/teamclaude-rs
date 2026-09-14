@@ -196,6 +196,16 @@ jobs:
         working-directory: apps/macos
         run: swift test
 
+      # install.sh's TcrBar step (step 2) needs hdiutil and codesign, so this
+      # is the only runner that can prove it: runs install.sh through `sh` on
+      # stdin from an empty directory, the exact shape of the README's
+      # `curl … | sh`, with a local http server standing in for
+      # github.com/api.github.com/raw.githubusercontent.com. See the script's
+      # own header for why that shape matters — `bash install.sh` cannot
+      # reproduce the bug it guards against.
+      - name: Test (install.sh)
+        run: scripts/test-install-sh.sh
+
   audit:
     name: audit
     runs-on: ubuntu-latest
