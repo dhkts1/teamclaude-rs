@@ -114,6 +114,13 @@ tcr                # start the proxy with the live TUI (q quits)
 tcr run -- <args>  # launch Claude Code already pointed at the proxy
 ```
 
+If you already use the `claude` CLI on this machine, the first run needs no `tcr login` at
+all: `tcr status`, `tcr accounts` and the server's own boot import that existing login when
+they find no accounts configured, and `tcr login --from-claude-code` is the explicit way to
+redo it. Refresh tokens are single-use, so the first time tcr refreshes the imported
+credential, `claude` asks for a browser login once — stated on every import, and detailed in
+[`docs/cli.md`](docs/cli.md).
+
 To point a client yourself instead of using `tcr run`:
 
 ```sh

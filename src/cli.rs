@@ -118,6 +118,36 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// A first run's one chance to arrive with an account already in it: when the
+/// fleet is empty, import the login this machine's `claude` CLI already holds.
+///
+/// Takes the just-loaded `config` and hands back the one the verb should go on
+/// to render — re-read from disk after a successful import, so the verb shows
+/// the account it just wrote rather than the empty fleet it loaded a moment
+/// ago. Everything about "is there a login, did the write work" lives in
+/// [`crate::oauth::auto_import_claude_code_login`]; what lives HERE is the one
+/// rule that keeps it idempotent: a config with accounts in it is never
+/// touched, so an account removed on purpose stays removed.
+///
+/// Best-effort in both directions: no login found, or an import that failed,
+/// leaves `config` exactly as it came in and the caller prints the ordinary
+/// empty-fleet hint.
+async fn import_claude_code_login_if_empty(config_path: &Path, config: Config) -> Config {
+    if !config.accounts.is_empty() {
+        return config;
+    }
+    if crate::oauth::auto_import_claude_code_login(config_path)
+        .await
+        .is_none()
+    {
+        return config;
+    }
+    // Re-read rather than reconstruct: the import may have gone through the
+    // running proxy's add route, and the config on disk is the only place that
+    // knows what actually landed.
+    load_config(config_path).unwrap_or(config)
+}
+
 /// Print the first-run hint when the fleet is empty, on STDERR.
 ///
 /// STDERR deliberately: `tcr status --json` and `tcr accounts --json` are piped
@@ -2348,6 +2378,7 @@ fn gate_reason_token(gate: crate::stats::GateReason) -> String {
 pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = load_config(config_path)?;
+    let config = import_claude_code_login_if_empty(config_path, config).await;
     warn_if_no_accounts(&config);
     let snapshot = snapshot_offline(
         config,
@@ -2670,6 +2701,7 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
     let config = load_config(config_path)?;
+    let config = import_claude_code_login_if_empty(config_path, config).await;
     warn_if_no_accounts(&config);
 
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =

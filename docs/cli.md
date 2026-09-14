@@ -136,6 +136,7 @@ Runs the browser OAuth flow and adds the resulting account to the pool.
 | `--force` | bool | `false` | override a refusal and write the config file anyway — never overrides a confirmed live route or a rejected api-key |
 | `--account <name>` | string | none | re-login a specific existing account, and refuse to write anything unless the identity that comes back resolves to it |
 | `--token` | bool | `false` | add an account from a `claude setup-token` credential instead of the browser flow — see below |
+| `--from-claude-code` | bool | `false` | add an account from the login the `claude` CLI on this machine already holds, instead of the browser flow — see below. A first run does this by itself |
 | `--name <name>` | string | none | name this account explicitly instead of letting `login` mint a name for it; refused when another account already has that name |
 | `--non-interactive` | bool | `false` | drive the login from another program: never reads stdin, never opens the browser, reports progress as JSON lines — see below |
 
@@ -327,6 +328,49 @@ proxy now closes the other half too — a 401 on an account with no refresh toke
 credential that dies later shows as `error` in `tcr status` after its first failed request
 instead of never.
 
+### `--from-claude-code`: importing the login `claude` already has
+
+If you use the `claude` CLI on this machine, you are already logged in to the account you
+were about to log in to again. `tcr login --from-claude-code` copies that credential into
+the pool instead of opening a browser:
+
+```bash
+tcr login --from-claude-code
+```
+
+It reads the same store the CLI does — the login Keychain item `Claude Code-credentials`
+on macOS, otherwise `~/.claude/.credentials.json`. Set `TCR_CLAUDE_CODE_CREDENTIALS` to a
+file path to read that instead of both; a path that does not exist means "no Claude Code
+login on this machine", which is how this crate's own tests stay off the real Keychain.
+Nothing here ever prints or logs a token.
+
+Unlike `--token`, this credential is a full login: it carries a refresh token, a real
+expiry and the `user:profile` scope, so the account renews itself like any browser login,
+its email names the row, and `--account` works with it (there is an identity to confirm
+against). `--name`, `--force` and the live-proxy add route all behave exactly as they do
+for the browser flow, because it is the same finishing path.
+
+**The cost, and it is stated on every import: refresh tokens are single-use.** The first
+time tcr refreshes the imported credential, the copy the `claude` CLI is still holding
+stops working, and `claude` asks you to log in again in the browser — once. Sessions
+started with `tcr run` are unaffected, because `tcr run` never hands `claude` a key of its
+own.
+
+**A first run does this by itself.** Any of `tcr status`, `tcr accounts` and the server's
+own boot, finding a config with no accounts in it, imports this login before doing its own
+work and says so on stderr:
+
+```
+[tcr] imported 'you@example.com' (max) from your Claude Code login; this copies the login
+the `claude` CLI itself uses, and each refresh token is single-use, …
+```
+
+Only when no login is found does the usual `no accounts configured — run \`tcr login\`` line
+print instead. It never runs against a config that already has accounts, so an account
+removed on purpose stays removed — `--from-claude-code` is the explicit way to redo it. A
+Keychain read or profile fetch that fails is one warning line and the verb carries on with
+zero accounts: never a non-zero exit, never a retry, and `--json` output is unchanged.
+
 ---
 
 ## `tcr accounts`
@@ -476,7 +520,9 @@ It asks the running proxy where there is one and falls back to an offline read w
 is not; the output labels which it got, so a fallback is never silently presented as a live
 measurement.
 
-With no accounts configured, it prints the line `no accounts configured — run \`tcr login\` to
+With no accounts configured, it first tries to import this machine's Claude Code login
+(see `tcr login --from-claude-code`). When there is none to import, it prints the line
+`no accounts configured — run \`tcr login\` to
 add one` on stderr and exits **0**: stdout stays the ordinary empty table (`[]` under `--json`), so a
 caller piping it into `jq` — TcrBar's panel among them — decodes an empty fleet rather than a
 failure. The same line and the same exit code come from `tcr accounts`.

@@ -34,6 +34,17 @@ fn run_tcr(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
     let out = Command::new(bin)
         .args(args)
         .env("HOME", home)
+        // A scratch HOME does not scratch the login Keychain: the first-run
+        // path now imports this machine's Claude Code login when it finds one,
+        // and on a developer's mac that is a REAL credential. Pointing the
+        // override at a path that does not exist is how a test says "this
+        // machine has no Claude Code login", which is the first run these
+        // assertions are about. `tests/claude_code_import.rs` covers the other
+        // first run, the one that finds a login.
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.join("no-such-claude-code-credentials.json"),
+        )
         .env_remove("XDG_CACHE_HOME")
         .output()
         .unwrap_or_else(|err| panic!("spawning the built tcr binary ({bin}) failed: {err}"));

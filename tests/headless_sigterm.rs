@@ -178,6 +178,16 @@ fn a_supervised_sigterm_drains_before_the_process_exits() {
         // cache dir all at once — every one of them resolves off `HOME`
         // (`config::default_path`, `mitm::config_dir`, `affinity::default_path`).
         .env("HOME", home.path())
+        // The server's first boot on an empty fleet imports this machine's
+        // Claude Code login when it finds one, and a scratch HOME does not
+        // scratch the login Keychain — on a developer's mac that read would
+        // find a REAL credential and try to write it into this tempdir's
+        // config. An override path that does not exist is how a test says
+        // "this machine has no Claude Code login".
+        .env(
+            "TCR_CLAUDE_CODE_CREDENTIALS",
+            home.path().join("no-such-claude-code-credentials.json"),
+        )
         .env_remove("XDG_CACHE_HOME")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
