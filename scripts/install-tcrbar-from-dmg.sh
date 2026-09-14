@@ -26,7 +26,8 @@ fi
 
 DMG="$1"
 APP_NAME="TcrBar"
-DEST="/Applications/${APP_NAME}.app"
+APPLICATIONS_DIR="${TCR_APPLICATIONS_DIR:-/Applications}"
+DEST="${APPLICATIONS_DIR}/${APP_NAME}.app"
 
 if [ ! -f "$DMG" ]; then
   echo "no dmg at $DMG" >&2
@@ -51,7 +52,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM HUP
 
 MOUNT_DIR="$(mktemp -d)"
-echo "==> Mounting $DMG…"
+echo "==> Mounting ${DMG}…"
 hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_DIR" "$DMG" >/dev/null
 
 SRC="$MOUNT_DIR/${APP_NAME}.app"
