@@ -36,16 +36,15 @@ struct SegmentedTabs: View {
 
     private func item(_ tab: PanelTab) -> some View {
         let isOn = tab == selected
+        // The switch itself is NOT wrapped in `withAnimation`: a broad
+        // transaction here animated every layout change in the panel (the
+        // content swap, the list height, each row sliding to its new place),
+        // which read as "everything moves" (Gil, 2026-09-14). Only the
+        // selected pill's fill and the label colour ease, scoped to `isOn`,
+        // the same way `Tokens.swift` scopes every other animation in this
+        // panel. The content swaps in one frame, like a native segmented control.
         return Button {
-            if reduceMotion {
-                onSelect(tab)
-            } else {
-                withAnimation(
-                    .spring(response: V4.springResponse, dampingFraction: V4.springDamping)
-                ) {
-                    onSelect(tab)
-                }
-            }
+            onSelect(tab)
         } label: {
             HStack(spacing: V4.tabGap) {
                 Image(systemName: tab.systemImage)
@@ -76,6 +75,7 @@ struct SegmentedTabs: View {
                         color: isOn ? Color.black.opacity(0.4) : .clear,
                         radius: 1, x: 0, y: 1)
             )
+            .animation(reduceMotion ? nil : .easeOut(duration: V4.hoverDuration), value: isOn)
             .contentShape(Rectangle())
         }
         .buttonStyle(V4PressStyle(cornerRadius: V4.tabRadius))

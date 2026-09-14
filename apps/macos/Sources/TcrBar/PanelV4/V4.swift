@@ -438,8 +438,6 @@ enum V4 {
     /// sheet's `@media (prefers-reduced-motion:no-preference)` block, which is
     /// why Reduce Motion drops the transition and keeps the hover.
     static let hoverDuration: Double = 0.15
-    static let springResponse: Double = 0.3
-    static let springDamping: Double = 1.0
 
     // MARK: - The two colours the gated palette has no name for
 
