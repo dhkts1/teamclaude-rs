@@ -1635,6 +1635,41 @@ pub fn save(path: &Path, config: &Config) -> Result<(), ConfigError> {
     write_atomic(path, &serde_json::to_string_pretty(config)?)
 }
 
+/// [`load`], except that a config file which does not exist yet is CREATED on
+/// disk with the defaults and then returned. The `bool` is whether this call
+/// created it.
+///
+/// The single entry point for a first run. Before this existed, a missing file
+/// meant two different things depending on which verb you typed: `tcr server`
+/// booted on in-memory defaults and never wrote them, and every other verb died
+/// with `config i/o error: No such file or directory` and exit 1 — which TcrBar
+/// renders as a failed status poll, so a fresh install off the dmg showed an
+/// error in the menu bar while the proxy behind it was perfectly healthy. There
+/// is no first-run state worth preserving in "the file is absent": writing the
+/// defaults is what every verb wanted anyway.
+///
+/// The defaults come from parsing `{}` so the file gets this struct's own
+/// `#[serde(default)]` values (`upstream`, `switchThreshold`, an empty
+/// `accounts`), and it is written through [`save`] so the key order, the atomic
+/// temp+rename and the `0600` permissions are byte-for-byte what any later save
+/// produces — a first-run file is not a special shape.
+///
+/// Only [`std::io::ErrorKind::NotFound`] is treated this way. A parse error, a
+/// permission error, an unwritable parent directory: all stay errors, and a
+/// corrupt file is never overwritten by a default.
+pub fn load_or_init(path: &Path) -> Result<(Config, bool), ConfigError> {
+    match load(path) {
+        Ok(config) => Ok((config, false)),
+        Err(ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            let config: Config = serde_json::from_str("{}")?;
+            save(path, &config)?;
+            eprintln!("[tcr] created {} with no accounts", path.display());
+            Ok((config, true))
+        }
+        Err(err) => Err(err),
+    }
+}
+
 /// The atomic 0600 write itself, shared by [`save`], [`save_tokens`] and the
 /// session-affinity pin file ([`crate::affinity::save`]) so every path gets the
 /// same durability and permission guarantees. One implementation deliberately:
@@ -4557,6 +4592,103 @@ mod tests {
             json.get("controlAccount").is_none(),
             "an absent control account must not serialize at all: {json}"
         );
+    }
+
+    #[test]
+    fn load_or_init_creates_the_file_and_its_parent_dir() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        // Two levels down: a fresh box has no `~/.config` at all.
+        let path = dir.path().join("config").join("teamclaude.json");
+        assert!(!path.exists(), "the test must start with no file");
+
+        let (config, created) = load_or_init(&path).expect("a missing config must be created");
+        assert!(
+            created,
+            "the first call must report that it created the file"
+        );
+        assert!(
+            config.accounts.is_empty(),
+            "a created config has no accounts"
+        );
+        assert_eq!(
+            config.upstream, "https://api.anthropic.com",
+            "the created config carries this struct's own serde defaults"
+        );
+
+        // On disk, and readable by the ordinary `load` — a first-run file is
+        // not a special shape.
+        let reloaded = load(&path).expect("the created file loads like any other");
+        assert!(reloaded.accounts.is_empty());
+        assert_eq!(
+            read_json(&path)["accounts"],
+            json!([]),
+            "the created file spells out an empty accounts array"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("stat the created config")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "a created config is 0600 like every other save — it will hold tokens"
+        );
+    }
+
+    #[test]
+    fn load_or_init_leaves_an_existing_file_byte_for_byte() {
+        let path = tmp_path("load-or-init-existing");
+        fs::write(&path, SAMPLE).expect("write the fixture");
+        let before = fs::read(&path).expect("read the fixture back");
+
+        let (config, created) = load_or_init(&path).expect("an existing config loads");
+        assert!(!created, "an existing file was not created by this call");
+        assert_eq!(config.accounts.len(), 1, "the existing fleet is what loads");
+        assert_eq!(
+            fs::read(&path).expect("the file is still there"),
+            before,
+            "loading must never rewrite the file it read"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_or_init_still_refuses_a_corrupt_file() {
+        let path = tmp_path("load-or-init-corrupt");
+        fs::write(&path, "{ not json").expect("write the broken fixture");
+
+        let err = load_or_init(&path).expect_err("a corrupt config must stay an error");
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "a corrupt file is a parse error, never a silent default: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&path).expect("the file is still there"),
+            "{ not json",
+            "a corrupt file must never be overwritten by the defaults"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn load_or_init_errors_rather_than_panics_when_the_parent_is_unwritable() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).expect("create the parent");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500))
+            .expect("make the parent unwritable");
+
+        let err = load_or_init(&locked.join("teamclaude.json"))
+            .expect_err("an unwritable parent must be an error");
+        assert!(
+            matches!(err, ConfigError::Io(_)),
+            "an unwritable parent surfaces as an i/o error: {err}"
+        );
+
+        // Restore so the TempDir can clean itself up.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).expect("restore");
     }
 
     /// A unique temp path per test — the suite runs tests in parallel threads of

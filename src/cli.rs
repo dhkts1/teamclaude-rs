@@ -102,6 +102,35 @@ fn warn_if_server_running(config: &Config) {
     }
 }
 
+/// Every CLI verb's read of the user's config file: [`config::load_or_init`],
+/// so a first run on a box with no `~/.config/teamclaude.json` creates the file
+/// and continues instead of exiting 1 with `No such file or directory`. A
+/// missing config is not an error condition for any verb here — `tcr status` on
+/// a fresh install is the FIRST thing a new user runs, and it is what TcrBar's
+/// panel polls.
+///
+/// One helper rather than the `load` + `with_context` pair repeated at a dozen
+/// call sites: the next verb that needs the config gets the first-run behaviour
+/// by construction, not by remembering.
+fn load_config(config_path: &Path) -> anyhow::Result<Config> {
+    let (config, _created) = config::load_or_init(config_path)
+        .with_context(|| format!("load config at {}", config_path.display()))?;
+    Ok(config)
+}
+
+/// Print the first-run hint when the fleet is empty, on STDERR.
+///
+/// STDERR deliberately: `tcr status --json` and `tcr accounts --json` are piped
+/// into `jq`, and TcrBar decodes the stdout of `tcr status --json` — an empty
+/// fleet must stay a well-formed empty fleet there, with the human-facing
+/// nudge on the other channel. The verb still exits 0: no accounts is a state,
+/// not a failure.
+fn warn_if_no_accounts(config: &Config) {
+    if config.accounts.is_empty() {
+        eprintln!("no accounts configured — run `tcr login` to add one");
+    }
+}
+
 /// Load the config for a management verb, warning if a server is live.
 ///
 /// Refuses when [`Config::quarantined_accounts`] is non-empty. The server's
@@ -124,8 +153,7 @@ fn warn_if_server_running(config: &Config) {
 /// under those names would attach the change to a row no one else can find.
 /// The server has no such choice — it must boot — so it logs and continues.
 fn load_for_edit(config_path: &Path) -> anyhow::Result<Config> {
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     if let Some(why) = &config.rename_write_error {
         bail!(
             "config at {} holds accounts sharing a name, and the rename that would fix it could \
@@ -351,8 +379,7 @@ pub fn set_priority(config_path: &Path, query: &str, priority: PriorityArg) -> a
 /// write itself. Read-only: a non-matching query errors with the file
 /// untouched, and nothing is logged — the token goes to stdout only.
 pub fn print_access_token(config_path: &Path, query: &str) -> anyhow::Result<()> {
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     let idx = resolve_account(&config.accounts, query)?;
     println!("{}", config.accounts[idx].access_token);
     Ok(())
@@ -442,8 +469,7 @@ pub fn add_to_group(config_path: &Path, group: &str, account: &str) -> anyhow::R
     // warning would be false on every ordinary run, and TcrBar calls this
     // command with the proxy always up, which is exactly the case that makes
     // a false-but-constant warning turn into wallpaper.
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     let idx = find_account_by_name(&config.accounts, account)?;
     let target = &config.accounts[idx];
     // The label itself is real and the write below is correct — but on the
@@ -509,8 +535,7 @@ pub fn remove_from_group(
     // Same reasoning as `add_to_group`: no `load_for_edit` warning here either
     // — `save_group_membership`'s surgical write survives the proxy's
     // shutdown flush (`persist_now` -> `save_tokens`) for the same reason.
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
 
     if all {
         let mut removed_from: Vec<String> = Vec::new();
@@ -592,8 +617,7 @@ pub fn reserve_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
 
     let mut reserved_after = config.reserved_group_names();
     reserved_after.insert(group.to_string());
@@ -678,8 +702,7 @@ pub fn park_group(config_path: &Path, group: &str) -> anyhow::Result<()> {
     if let Err(reason) = validate_group_label_chars(group) {
         bail!("group {group:?}: invalid group label — {reason}");
     }
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     let members = config
         .accounts
         .iter()
@@ -817,8 +840,7 @@ pub fn set_group_color(config_path: &Path, group: &str, hex: Option<&str>) -> an
         })
         .transpose()?;
 
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     let existing = config.all_group_names();
     if !existing.contains(group) {
         if existing.is_empty() {
@@ -897,8 +919,7 @@ fn low_contrast_color_warning(resolved: &str, group: &str) -> Option<String> {
 /// Text output is greppable, one line per group; an account in several groups
 /// appears under each — same on both paths.
 pub fn list_groups(config_path: &Path, json: bool) -> anyhow::Result<()> {
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     if json {
         println!("{}", render_groups_json(&config)?);
     } else {
@@ -1541,8 +1562,7 @@ pub async fn set_control(config_path: &Path, query: Option<&str>) -> anyhow::Res
 /// LIVE server's answer (it may differ from the file if the server has not
 /// been restarted since a config edit) and falling back to the file.
 pub async fn show_control(config_path: &Path) -> anyhow::Result<()> {
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
     let control = match fetch_live_status(&config).await {
         Ok(payload) => payload.control,
         Err(_) => config
@@ -2327,8 +2347,8 @@ fn gate_reason_token(gate: crate::stats::GateReason) -> String {
 /// `--probe`, first refresh every account's live quota (never persisted).
 pub async fn list_accounts(config_path: &Path, probe: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
+    warn_if_no_accounts(&config);
     let snapshot = snapshot_offline(
         config,
         Arc::new(NoRefresh),
@@ -2588,8 +2608,7 @@ fn render_sessions_json(supported: bool, sessions: &[tcr_status_wire::SessionRow
 /// never a second request, which could see a different server.
 pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
 
     let body = match fetch_live_status_body(&config).await {
         Ok(body) => body,
@@ -2650,8 +2669,8 @@ pub async fn sessions(config_path: &Path, json: bool) -> anyhow::Result<()> {
 
 pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     // Read-only verb: plain load, no clobber-warning (we never save).
-    let config = config::load(config_path)
-        .with_context(|| format!("load config at {}", config_path.display()))?;
+    let config = load_config(config_path)?;
+    warn_if_no_accounts(&config);
 
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
         match fetch_live_status(&config).await {
