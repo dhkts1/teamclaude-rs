@@ -2133,17 +2133,15 @@ async fn finish_login(
     }
 }
 
-/// Load the config, treating a missing file as an empty default (so the very
-/// first login creates it) while surfacing genuine parse/permission errors so
-/// a corrupt file is never overwritten.
+/// Load the config for a login, creating the file with defaults when it does
+/// not exist yet (the very first login on a fresh box) while surfacing genuine
+/// parse/permission errors so a corrupt file is never overwritten.
+///
+/// Shares [`config::load_or_init`] with every other verb rather than keeping a
+/// second copy of the missing-file rule here.
 fn load_or_default(config_path: &Path) -> anyhow::Result<Config> {
-    match config::load(config_path) {
-        Ok(config) => Ok(config),
-        Err(config::ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
-            Ok(serde_json::from_str("{}").expect("empty object is a valid default config"))
-        }
-        Err(err) => Err(err).context("load config for login"),
-    }
+    let (config, _created) = config::load_or_init(config_path).context("load config for login")?;
+    Ok(config)
 }
 
 #[cfg(test)]

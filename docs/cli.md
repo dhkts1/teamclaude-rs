@@ -16,6 +16,13 @@ and each one was derived from the source, so start from `src/main.rs` to check a
 `--config <path>` appears on every subcommand except `update`, `demo` and `ui`. Unset, it
 resolves to `~/.config/teamclaude.json`.
 
+**A config file that does not exist yet is created, not an error.** The first command you run
+on a new machine writes the defaults to that path (`0600`, an empty `accounts` array), prints
+`[tcr] created <path> with no accounts` on stderr, and then does its job. That holds for the
+server and for every other verb, so `tcr status` on a fresh install answers with an empty
+fleet instead of `config i/o error: No such file or directory`. A file that exists but cannot
+be parsed is still an error and is never overwritten.
+
 `tcr` and a subcommand cannot be mixed: the parser sets
 `args_conflicts_with_subcommands = true`, so `tcr --port 9000 status` is a usage error
 rather than a port override on `status`.
@@ -468,6 +475,11 @@ Probes every account's live quota and prints the fleet.
 It asks the running proxy where there is one and falls back to an offline read where there
 is not; the output labels which it got, so a fallback is never silently presented as a live
 measurement.
+
+With no accounts configured, it prints the line `no accounts configured — run \`tcr login\` to
+add one` on stderr and exits **0**: stdout stays the ordinary empty table (`[]` under `--json`), so a
+caller piping it into `jq` — TcrBar's panel among them — decodes an empty fleet rather than a
+failure. The same line and the same exit code come from `tcr accounts`.
 
 ### The weekly quota pair on `--json`
 

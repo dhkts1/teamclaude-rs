@@ -1636,8 +1636,10 @@ fn migration_persist_target<'a>(
 }
 
 /// Load the config, deciding what may be written back:
-/// - missing file → in-memory defaults, keep the path so the first refresh
-///   creates it;
+/// - missing file → [`config::load_or_init`] writes the defaults out before
+///   returning them, so the server's own first boot leaves a real file on disk
+///   (what every other verb now also sees) instead of running on a default the
+///   next `tcr status` cannot find;
 /// - corrupt/unreadable existing file → **refuse to start**. This used to fall
 ///   back to in-memory defaults (a zero-account fleet) and boot anyway — a
 ///   proxy that binds its port and answers every request with 429 while
@@ -1648,11 +1650,16 @@ fn migration_persist_target<'a>(
 ///   fails to parse is now the operator's problem to fix, not something this
 ///   binary papers over.
 fn load_config(path: &Path) -> anyhow::Result<(Config, Option<PathBuf>)> {
-    match config::load(path) {
-        Ok(config) => Ok((config, Some(path.to_path_buf()))),
+    match config::load_or_init(path) {
+        Ok((config, _created)) => Ok((config, Some(path.to_path_buf()))),
         Err(ConfigError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            // `load_or_init` only hands back NotFound when the CREATE itself
+            // could not find its way (an unwritable/absent parent that
+            // `create_dir_all` refused); the read's own NotFound is handled
+            // there. Booting on defaults keeps that case serving, exactly as a
+            // missing file used to.
             eprintln!(
-                "[tcr] no config at {} — starting with defaults",
+                "[tcr] no config at {} and it could not be created ({err}) — starting with defaults",
                 path.display()
             );
             Ok((default_config(), Some(path.to_path_buf())))
@@ -2821,12 +2828,21 @@ mod tests {
     /// still boot on in-memory defaults, keeping the persist path so the first
     /// refresh creates the file.
     #[test]
-    fn load_config_boots_on_defaults_when_file_is_missing() {
+    fn load_config_creates_the_file_when_it_is_missing() {
         let path = unique_config_path("missing");
         let (config, persist_path) =
             load_config(&path).expect("a missing config file must not refuse to boot");
         assert!(config.accounts.is_empty());
-        assert_eq!(persist_path, Some(path));
+        assert_eq!(persist_path, Some(path.clone()));
+        // The server's first boot now LEAVES the file behind, so the `tcr
+        // status` a user runs next finds the same config the server booted from
+        // rather than nothing at all (`config::load_or_init`).
+        assert!(
+            path.exists(),
+            "booting with no config must create {}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The behaviour this task changed: a config that exists and fails to

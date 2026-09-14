@@ -370,7 +370,7 @@ pub async fn run_mint(
     account: Option<&str>,
     group: Option<&str>,
 ) -> anyhow::Result<bool> {
-    let cfg = config::load(config_path).context("load config for mint")?;
+    let (cfg, _created) = config::load_or_init(config_path).context("load config for mint")?;
 
     let targets: Vec<&Account> = match (account, group) {
         (Some(query), None) => {
