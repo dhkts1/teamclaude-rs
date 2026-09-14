@@ -123,7 +123,7 @@ if ! curl -fsSL -o "$dmg_path" "$dmg_url"; then
   exit 0
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
 dmg_install_script="$script_dir/scripts/install-tcrbar-from-dmg.sh"
 if [ ! -f "$dmg_install_script" ]; then
   # `curl | sh` has no checkout: ${BASH_SOURCE[0]} resolves under the pipe's
