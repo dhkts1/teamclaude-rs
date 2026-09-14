@@ -7,12 +7,15 @@
 # macOS, install TcrBar too, so the default install gets both halves of the
 # system instead of leaving the app as a manual dmg download.
 #
-# `set -e` is deliberately NOT used past the curl|sh pipe: that pipe's exit
-# status is judged explicitly (PIPESTATUS[0] is the curl leg, PIPESTATUS[1]
-# is `sh` running the installer) so a curl failure and an installer failure
-# are told apart, and one bad step 2 does not retroactively make step 1 look
-# like it failed.
-set -uo pipefail
+# POSIX sh, not bash: the README pipes this into `sh`, and on Debian and
+# Ubuntu that is dash, which has no `pipefail`, no PIPESTATUS and no
+# BASH_SOURCE. The first version used all three and died on line 15 of every
+# Linux install ("set: Illegal option -o pipefail", 2026-09-14). So the dist
+# installer is downloaded to a file and run from it (two exit codes, no pipe
+# to judge), and the sibling-script lookup goes through $0. `set -e` is
+# deliberately NOT used: one bad step 2 must not retroactively make step 1
+# look like it failed.
+set -u
 
 DIST_INSTALLER_URL="https://github.com/dhkts1/teamclaude-rs/releases/latest/download/teamclaude-rs-installer.sh"
 LATEST_RELEASE_API_URL="${TCR_LATEST_RELEASE_API_URL:-https://api.github.com/repos/dhkts1/teamclaude-rs/releases/latest}"
@@ -54,13 +57,19 @@ case "${1:-}" in
     ;;
 esac
 
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "$tmp_dir"' EXIT
+
 if [ "${TCR_SKIP_CLI:-0}" = "1" ]; then
   echo "==> TCR_SKIP_CLI=1 — skipping the tcr CLI install (test-only)."
 else
   echo "==> Installing the tcr CLI…"
-  curl --proto '=https' --tlsv1.2 -LsSf "$DIST_INSTALLER_URL" | sh
-  dist_rc="${PIPESTATUS[1]:-1}"
-  if [ "$dist_rc" -ne 0 ]; then
+  if ! curl --proto '=https' --tlsv1.2 -LsSf -o "$tmp_dir/teamclaude-rs-installer.sh" "$DIST_INSTALLER_URL"; then
+    echo "could not download $DIST_INSTALLER_URL" >&2
+    exit 1
+  fi
+  if ! sh "$tmp_dir/teamclaude-rs-installer.sh"; then
+    dist_rc=$?
     echo "tcr CLI install failed (exit $dist_rc)" >&2
     exit "$dist_rc"
   fi
@@ -87,12 +96,11 @@ fi
 # inside dhkts1/teamclaude-rs: see update.rs's own doc-comment for the
 # concrete escape it blocks.
 validate_release_tag() {
-  local t="$1"
-  [ -n "$t" ] || return 1
-  case "$t" in
+  [ -n "$1" ] || return 1
+  case "$1" in
     *[!0-9A-Za-z.+_-]*) return 1 ;;
   esac
-  case "$t" in
+  case "$1" in
     [0-9A-Za-z]*) return 0 ;;
     *) return 1 ;;
   esac
@@ -113,8 +121,6 @@ fi
 version="${tag#v}"
 dmg_url="${DMG_URL_BASE}/${tag}/${APP_NAME}-${version}.dmg"
 
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
 dmg_path="$tmp_dir/${APP_NAME}.dmg"
 
 echo "==> Downloading ${APP_NAME} ${tag}…"
@@ -123,14 +129,17 @@ if ! curl -fsSL -o "$dmg_path" "$dmg_url"; then
   exit 0
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
-dmg_install_script="$script_dir/scripts/install-tcrbar-from-dmg.sh"
+# Run from a checkout, $0 is this file's path and the sibling script sits
+# beside it. Under `curl | sh` there is no file: $0 is "sh" (no slash), so
+# there is no checkout to look in. Then fetch the one canonical copy (see the
+# script's own header — it is shared with `tcr ui` via include_str! and must
+# stay one copy, not two that drift) instead of re-implementing the mount/swap.
+case "${0:-}" in
+  */*) script_dir="$(cd "$(dirname "$0")" && pwd)" ;;
+  *) script_dir="" ;;
+esac
+dmg_install_script="${script_dir:-/nonexistent}/scripts/install-tcrbar-from-dmg.sh"
 if [ ! -f "$dmg_install_script" ]; then
-  # `curl | sh` has no checkout: ${BASH_SOURCE[0]} resolves under the pipe's
-  # cwd, not this repo, so the sibling script this file used to assume is
-  # simply not there. Fetch the one canonical copy (see the script's own
-  # header — it is shared with `tcr ui` via include_str! and must stay one
-  # copy, not two that drift) instead of re-implementing the mount/swap here.
   dmg_install_script="$tmp_dir/install-tcrbar-from-dmg.sh"
   echo "==> No local install-tcrbar-from-dmg.sh — fetching it…"
   if ! curl -fsSL -o "$dmg_install_script" "$DMG_INSTALL_SCRIPT_URL"; then

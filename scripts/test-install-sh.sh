@@ -139,7 +139,7 @@ export PATH="$FAKEBIN:$PATH"
 
 echo "==> running install.sh piped through sh, from an empty directory ($RUN_DIR)…"
 cd "$RUN_DIR" || exit 1
-cat "$INSTALL_SH" | sh
+cat "$INSTALL_SH" | "${TCR_TEST_SHELL:-sh}"
 install_rc=$?
 echo "install.sh exit: $install_rc"
 

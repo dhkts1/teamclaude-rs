@@ -40,16 +40,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      # No checkout on purpose: a user running the README line has none.
+      # No checkout on purpose: a user running the README line has none. The
+      # only difference from the README is WHICH install.sh: on a PR it is the
+      # PR's own, so a fix to the installer is proven before it merges; on
+      # demand it is main's, exactly what a user gets.
       - name: The README line, verbatim
         env:
           TEAMCLAUDE_RS_INSTALL_DIR: ${{ github.workspace }}/tcr-bin
+          INSTALL_SH_REF: ${{ github.head_ref || 'main' }}
         run: |
-          curl --proto '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/dhkts1/teamclaude-rs/main/install.sh | sh
+          curl --proto '=https' --tlsv1.2 -LsSf "https://raw.githubusercontent.com/dhkts1/teamclaude-rs/${INSTALL_SH_REF}/install.sh" | sh
 
       - name: tcr is on the machine
         run: |
-          "${{ github.workspace }}/tcr-bin/tcr" --version
+          "${{ github.workspace }}/tcr-bin/bin/tcr" --version
 
       - name: TcrBar is installed and launches (macOS)
         if: runner.os == 'macOS'
