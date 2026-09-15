@@ -1067,16 +1067,19 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
         // Anthropic's own verdict, read from `anthropic-ratelimit-unified-status`
-        // (`Quota::update_from_headers`). Red-bold like LOGIN, but for a different
-        // reason than the one this comment used to give: it is not that upstream
-        // demands a human, it is that nothing here re-asks. `select` skips a
-        // rejected account, so it never receives another served response to refresh
-        // the status from, and the background quota probe folds its reading through
-        // `Quota::apply_usage`, which moves the bars and leaves `status` untouched.
-        // In the default configuration that leaves three ways out: a restart (quota
-        // is runtime state and is never persisted), a keep-warm request
-        // (`warmupSeconds`, off by default, whose response does refresh the status),
-        // or a human. No timer among them.
+        // (`Quota::update_from_headers`). Red-bold like LOGIN because it is not a
+        // countdown: no single instant is known at which this account returns, which
+        // is why `account_gate` reports `free_at = None` here.
+        //
+        // It is no longer permanent, though, and this comment twice said otherwise.
+        // The trap was that `update_from_headers` needs a SERVED response while
+        // `account_terminal_gate` skips a rejected account, so nothing ever re-asked
+        // and the rejection outlived its own window. The background probe now closes
+        // that loop in `Quota::drop_rejection_if_a_window_rolled`: a probed
+        // utilization strictly below the stored one means upstream started a new
+        // window, so the rejection recorded against the old one is dropped and the
+        // account re-enters rotation on its next probe. Still red while it stands,
+        // because until that evidence arrives there is nothing to count down to.
         //
         // The countdown now shown in this row's 5h and 7d cells is each WINDOW's own
         // reset. That is a fact about the window and makes no claim about when this
