@@ -473,11 +473,13 @@ const FULL_COLUMNS: [&str; 14] = [
 /// non-obvious one is what it is:
 ///
 /// * `Gate` (15) — the widest gate chip, `FABLE-7D 47h30m`.
-/// * `5h`/`Fable` (15) — a learned bar is `[########] 100%`; 14 clipped the `%`.
-/// * `7d` (20) — the same bar plus a `near`/`full` quota label.
+/// * `Fable` (15) — a learned bar is `[########] 100%`; 14 clipped the `%`.
+/// * `5h` (22) — the bar plus a right-aligned `{:>6}` reset countdown from
+///   [`bar_with_reset`] (`[########] 100%` + 1 separator + 6).
+/// * `7d` (27) — the same bar+countdown plus a `near`/`full` quota label.
 /// * `Cache` (7) — the hit ratio as a percentage, or `-` before any input.
 /// * `Err` (4) — the decayed in-band SSE error count, or `-`.
-const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 15, 20, 15, 6, 8, 7, 8, 6, 4];
+const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 22, 27, 15, 6, 8, 7, 8, 6, 4];
 
 /// The narrowest terminal width that still fits the full 14-column table without
 /// the constraint solver clipping a column. Kept a literal with the arithmetic
@@ -485,10 +487,10 @@ const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 15, 20, 15, 6, 8, 7, 8,
 /// silently re-introducing the squeeze it exists to prevent:
 ///
 /// ```text
-///   145  Σ FULL_COLUMN_WIDTHS: 18+3+9+15+11+15+20+15+6+8+7+8+6+4
+///   159  Σ FULL_COLUMN_WIDTHS: 18+3+9+15+11+22+27+15+6+8+7+8+6+4
 /// +  13  column_spacing (1 cell × 13 inter-column gaps)
 /// +   2  the block's left + right borders
-/// = 160
+/// = 174
 /// ```
 ///
 /// The arithmetic is not taken on faith: `full_layout_min_width_fits_every_column`
@@ -496,7 +498,9 @@ const FULL_COLUMN_WIDTHS: [u16; 14] = [18, 3, 9, 15, 11, 15, 20, 15, 6, 8, 7, 8,
 /// from the buffer. It was 155 while the table had 13 columns; the `Err` column
 /// landed without it, and at 155 the solver silently took `Gate` down to 11 —
 /// truncating exactly the `FABLE-7D 47h30m` label that column exists to show.
-const FULL_LAYOUT_MIN_WIDTH: u16 = 160;
+/// It went 160 → 174 when the `5h`/`7d` cells grew a reset countdown
+/// ([`bar_with_reset`]), +7 each (1 separator + 6 countdown chars).
+const FULL_LAYOUT_MIN_WIDTH: u16 = 174;
 
 /// Pick the accounts-table layout for a pane `width` — the pure, rendering-free
 /// core of the responsive table, so the breakpoint is unit-testable without a
@@ -589,9 +593,16 @@ fn render_accounts(
                         status,
                         gate,
                         Cell::from(probe_label).style(probe_style),
-                        Cell::from(bar(account.five_hour)),
-                        Cell::from(format!("{}{quota_label}", bar(account.seven_day)))
-                            .style(quota_style),
+                        Cell::from(bar_with_reset(
+                            account.five_hour,
+                            account.five_hour_reset,
+                            now,
+                        )),
+                        Cell::from(format!(
+                            "{}{quota_label}",
+                            bar_with_reset(account.seven_day, account.seven_day_reset, now)
+                        ))
+                        .style(quota_style),
                         // Model-scoped weekly (the Fable `7d_oi` bucket). Visibility
                         // only: it never gates shared rotation (`eligible` ignores
                         // it), so no quota label — the gate chip already reads
@@ -960,6 +971,20 @@ fn bar(util: Option<f64>) -> String {
             bar
         }
     }
+}
+
+/// [`bar`] plus a right-aligned "time until reset" suffix — the 5h/7d cells in
+/// [`AccountsLayout::Full`] only (`Compact` drops the countdown, see
+/// [`AccountsLayout`]). `-` when `reset` was never learned or has already
+/// elapsed, never a negative countdown. Uses [`rel`] as-is rather than a wider
+/// day+hour form: `rel` is shared with the gate chip and the fleet banner, and
+/// widening its multi-day output would silently change both of those too.
+fn bar_with_reset(util: Option<f64>, reset: Option<OffsetDateTime>, now: OffsetDateTime) -> String {
+    let countdown = match reset {
+        Some(reset) if reset > now => rel(reset - now),
+        _ => "-".to_string(),
+    };
+    format!("{} {countdown:>6}", bar(util))
 }
 
 /// The bar-less quota cell used in [`AccountsLayout::Compact`]: the SAME
@@ -1781,6 +1806,34 @@ mod tests {
     }
 
     #[test]
+    fn bar_with_reset_shows_countdown_or_dash() {
+        let now = anchor();
+        // A future reset appends its compact countdown after the bar.
+        let future = now + TimeDuration::hours(2) + TimeDuration::minutes(39);
+        let with_reset = bar_with_reset(Some(0.53), Some(future), now);
+        assert!(
+            with_reset.ends_with(" 2h39m"),
+            "expected a right-aligned 2h39m countdown, got {with_reset:?}"
+        );
+
+        // Never learned: a dash, never an invented number.
+        let never_learned = bar_with_reset(Some(0.0), None, now);
+        assert!(
+            never_learned.ends_with("     -"),
+            "no reset learned must render a dash, got {never_learned:?}"
+        );
+
+        // Already elapsed: the same dash as never-learned, never a negative
+        // countdown.
+        let past = now - TimeDuration::minutes(5);
+        let elapsed = bar_with_reset(Some(0.9), Some(past), now);
+        assert!(
+            elapsed.ends_with("     -"),
+            "an elapsed reset must render a dash, not a negative countdown, got {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn pct_renders_percentage_or_dash() {
         // The same number `bar` prints, minus the bar; `—` when never learned.
         assert_eq!(pct(Some(0.47)), " 47%");
@@ -1792,7 +1845,10 @@ mod tests {
     fn render_wide_keeps_full_columns_and_bars() {
         // A pane at/above the threshold gets every column and the 8-cell bars.
         let snapshot = util_snapshot(QuotaState::Normal);
-        let backend = TestBackend::new(170, 12);
+        // 10 cells above FULL_LAYOUT_MIN_WIDTH, same margin as before the 5h/7d
+        // cells grew a reset countdown (160 -> 174) — a literal `170` here would
+        // have silently dropped below the new threshold and rendered Compact.
+        let backend = TestBackend::new(FULL_LAYOUT_MIN_WIDTH + 10, 12);
         let mut terminal = Terminal::new(backend).expect("test backend builds a terminal");
         terminal
             .draw(|frame| render_accounts(frame, frame.area(), &snapshot, 0, anchor()))
