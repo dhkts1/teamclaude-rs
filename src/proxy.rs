@@ -51,8 +51,8 @@ use time::OffsetDateTime;
 
 use crate::config;
 use crate::manager::{
-    AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, InFlightGuard,
-    Manager, SetControlOutcome, SetDisabledOutcome,
+    AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
+    InFlightGuard, Manager, SetControlOutcome, SetDisabledOutcome,
 };
 use crate::quota::{quota_rejections, UnifiedRejectionKind};
 use crate::stats::{GateReason, RequestLogEntry, SessionKind};
@@ -125,6 +125,40 @@ const EXHAUSTION_SOFT_WAIT_MAX_SECS: i64 = NO_GUIDANCE_HOLD_SECS + NO_GUIDANCE_J
 const _: () = assert!(
     EXHAUSTION_SOFT_WAIT_MAX_SECS < 60,
     "soft-wait cap must stay below retry_after_hint's None=>60 sentinel"
+);
+/// Ceiling on the `retry-after` this proxy ADVERTISES on a synthetic exhausted
+/// 429. NOT a ceiling on the wait itself — the body keeps reporting the real
+/// figure and the real free-at instant.
+///
+/// Claude Code refuses anything above 60. Measured 2026-09-15 against a stub
+/// endpoint, client 2.1.272: an advertised `60` is honoured (the client sleeps
+/// and retries at 60.006s, then succeeds), `61` and every value above it —
+/// 65, 75, 90, 120, 300, 57950 — make it give up immediately with
+/// `API Error: Request rejected (429)` and exit 1 in about a second. With
+/// `CLAUDE_CODE_RETRY_WATCHDOG=1` the same over-ceiling number is worse, not
+/// better: the client sleeps it out, so a 16h window-reset figure became a
+/// silent multi-hour stall. `exhaustion_hint` times `retry_after` against a
+/// quota window's reset instant, which in a real incident was 57,950 to 59,975
+/// seconds — i.e. every such 429 was unretryable by construction.
+///
+/// Why 59 and not the measured 60: `Manager::exhaustion_hint` already uses
+/// exactly `60` as its "NO account advertises a reset" sentinel, and the proxy
+/// leans on that meaning (see the assertion above). Clamping a measured wait TO
+/// 60 would put the sentinel's value on the wire for a known 16-hour window,
+/// and nothing downstream — a log line, an operator, a tcr chained behind
+/// another tcr through [`parse_retry_after`] — could then tell "we know of no
+/// reset" from "we measured a very long one". At 59 the two stay distinct: any
+/// advertised value at or below this cap was derived from a real free-at
+/// instant, and exactly `60` still means only the sentinel. The cost is one
+/// second on a wait whose real length is in the body anyway.
+const CLIENT_RETRY_AFTER_MAX_SECS: i64 = 59;
+// The advertised cap sits strictly between the soft-wait ceiling and the
+// sentinel: above the soft-wait cap, because anything at/below that is absorbed
+// in-process and never reaches this header; below 60, for the reason above.
+const _: () = assert!(
+    EXHAUSTION_SOFT_WAIT_MAX_SECS < CLIENT_RETRY_AFTER_MAX_SECS && CLIENT_RETRY_AFTER_MAX_SECS < 60,
+    "advertised retry-after cap must sit between the soft-wait ceiling and the \
+     None=>60 sentinel"
 );
 
 /// Anthropic's non-standard `529 Overloaded`. Not in [`StatusCode`]'s constants
@@ -4319,7 +4353,10 @@ fn error_response(
 /// The `retry-after` figure is computed live from when an account actually
 /// frees, never a constant — the only fixed number here is the 60 the hint falls
 /// back to when NO account advertises a reset, and the message says so rather
-/// than printing it as if it had been measured.
+/// than printing it as if it had been measured. What goes on the HEADER is that
+/// figure capped at [`CLIENT_RETRY_AFTER_MAX_SECS`] (see
+/// [`advertised_retry_after`]): the client refuses a longer one outright. The
+/// body keeps the uncapped figure and the real instant for a human reader.
 fn exhausted_response(
     manager: &Manager,
     now: OffsetDateTime,
@@ -4329,6 +4366,7 @@ fn exhausted_response(
 ) -> Response {
     let hint = manager.exhaustion_hint(now, is_fable, strict_group);
     let retry_after = hint.retry_after;
+    let advertised_retry_after = advertised_retry_after(&hint);
     let causes = describe_gates(&hint.gated);
     let when = match hint.free_at {
         Some(at) => format!(
@@ -4347,6 +4385,7 @@ fn exhausted_response(
     tracing::warn!(
         account_count,
         retry_after,
+        advertised_retry_after,
         binding = ?hint.binding,
         group = strict_group.unwrap_or("-"),
         "returning exhausted 429 to client"
@@ -4355,7 +4394,7 @@ fn exhausted_response(
         StatusCode::TOO_MANY_REQUESTS,
         "rate_limit_error",
         &detail,
-        Some(retry_after),
+        Some(advertised_retry_after),
     );
     if let (Some(claim), Some(at)) = (hint.binding.and_then(unified_claim_for), hint.free_at) {
         let headers = response.headers_mut();
@@ -4372,6 +4411,21 @@ fn exhausted_response(
         }
     }
     response
+}
+
+/// The `retry-after` seconds an exhausted 429 puts on the wire.
+///
+/// A MEASURED wait (`free_at` is `Some`) is capped at
+/// [`CLIENT_RETRY_AFTER_MAX_SECS`], because the client refuses anything longer.
+/// The unknown-reset sentinel (`free_at` is `None`, `retry_after` is `60`) passes
+/// through untouched: 60 is exactly the client's accepted ceiling, and keeping it
+/// the only way a `60` reaches the wire is what keeps it distinguishable from a
+/// capped measurement.
+fn advertised_retry_after(hint: &ExhaustionHint) -> i64 {
+    match hint.free_at {
+        Some(_) => hint.retry_after.min(CLIENT_RETRY_AFTER_MAX_SECS),
+        None => hint.retry_after,
+    }
 }
 
 /// The `anthropic-ratelimit-unified-representative-claim` value for a gate, or
@@ -11670,15 +11724,122 @@ mod tests {
             Some(reset.to_string().as_str()),
             "the reset is the window's own instant, not a synthesized one"
         );
+        // The window is 900s out, which the client would refuse outright (it gives
+        // up on anything above 60), so the HEADER is capped. This assertion used to
+        // pin the raw 895..=900; that was the bug, not the contract.
         let retry_after: i64 = h("retry-after").unwrap().parse().unwrap();
-        assert!(
-            (895..=900).contains(&retry_after),
-            "retry-after is the live distance to that reset, got {retry_after}"
+        assert_eq!(
+            retry_after, CLIENT_RETRY_AFTER_MAX_SECS,
+            "a 900s wait is advertised at the client's accepted cap, got {retry_after}"
         );
         assert!(
             body.contains("All 2 accounts exhausted: 2 in the 5-hour window.")
                 && body.contains("soonest account frees at"),
             "the body names the cause and the instant: {body}"
+        );
+        let body_secs: i64 = body
+            .split("Retry in ")
+            .nth(1)
+            .and_then(|rest| rest.split('s').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("body carries a `Retry in Ns` figure: {body}"));
+        assert!(
+            (895..=900).contains(&body_secs),
+            "the body keeps the REAL, uncapped distance to the reset, got {body_secs}"
+        );
+    }
+
+    /// A hold whose soonest free is hours away still ships a `retry-after` the
+    /// client will honour. Before the cap this header was 3600 and the client gave
+    /// up on the request in a second (or, in watchdog mode, slept an hour).
+    #[tokio::test]
+    async fn exhausted_429_caps_an_hours_long_retry_after_at_the_client_ceiling() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+        for idx in 0..2 {
+            manager.mark_rate_limited(idx, 3_600);
+        }
+        let hint = manager.exhaustion_hint(OffsetDateTime::now_utc(), false, None);
+        assert!(
+            hint.retry_after > 3_500 && hint.free_at.is_some(),
+            "fixture must be a MEASURED wait far above the cap: {hint:?}"
+        );
+        let (status, headers, body) = post_one_full(manager).await;
+        assert_eq!(status, 429, "body: {body}");
+        let retry_after: i64 = headers
+            .get("retry-after")
+            .expect("retry-after ships")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            retry_after <= 60,
+            "the client refuses a retry-after above 60, got {retry_after}"
+        );
+        assert_ne!(
+            retry_after, 60,
+            "60 is the unknown-reset sentinel; a measured wait must not wear it"
+        );
+    }
+
+    /// A measured wait already inside the cap is advertised as-is: the cap only
+    /// ever shortens what the client could not use.
+    #[tokio::test]
+    async fn exhausted_429_passes_a_retry_after_inside_the_cap_through_unchanged() {
+        let up_addr = spawn_scripted_upstream(vec![Some(raw_200())]).await;
+        let manager = fleet(up_addr, &["a", "b"]);
+        // 40s: above the 20s soft-wait ceiling (so the request hard-fails instead
+        // of sleeping) and below the cap.
+        for idx in 0..2 {
+            manager.mark_rate_limited(idx, 40);
+        }
+        let (status, headers, body) = post_one_full(manager).await;
+        assert_eq!(status, 429, "body: {body}");
+        let retry_after: i64 = headers
+            .get("retry-after")
+            .expect("retry-after ships")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (38..=40).contains(&retry_after),
+            "a 40s wait is inside the cap and must ship unchanged, got {retry_after}"
+        );
+    }
+
+    /// The pure rule, at its three edges. A measured wait above the cap is capped,
+    /// a measured wait of EXACTLY 60 is capped too (so a `60` on the wire can only
+    /// ever be the sentinel), and the unknown-reset sentinel passes through as the
+    /// 60 `exhaustion_hint_reports_an_unknown_reset_as_unknown_not_as_sixty_seconds`
+    /// pins in the manager.
+    #[test]
+    fn advertised_retry_after_caps_measured_waits_and_keeps_the_sentinel_distinct() {
+        let now = OffsetDateTime::now_utc();
+        let hint = |retry_after: i64, free_at: Option<OffsetDateTime>| ExhaustionHint {
+            retry_after,
+            free_at,
+            binding: None,
+            gated: std::collections::BTreeMap::new(),
+        };
+        let measured = |secs: i64| hint(secs, Some(now + time::Duration::seconds(secs)));
+
+        assert_eq!(advertised_retry_after(&measured(57_950)), 59);
+        assert_eq!(advertised_retry_after(&measured(61)), 59);
+        assert_eq!(
+            advertised_retry_after(&measured(60)),
+            59,
+            "a measured 60 must not collide with the sentinel on the wire"
+        );
+        assert_eq!(advertised_retry_after(&measured(59)), 59);
+        assert_eq!(advertised_retry_after(&measured(30)), 30);
+        assert_eq!(advertised_retry_after(&measured(1)), 1);
+        assert_eq!(
+            advertised_retry_after(&hint(60, None)),
+            60,
+            "the unknown-reset sentinel reaches the client unchanged — and 60 is \
+             exactly the ceiling it honours"
         );
     }
 
