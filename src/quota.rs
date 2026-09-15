@@ -352,6 +352,11 @@ impl Quota {
     ///    "We could not read this" is not "this is at 0%", and a fabricated `0.0`
     ///    is byte-identical to a genuine one. See [`apply_bucket`].
     pub fn apply_usage(&mut self, usage: &crate::probe::Usage) {
+        // MUST run before the merges below. It compares the probe's fresh
+        // utilization against the one still stored, and those merges overwrite
+        // exactly that value.
+        self.drop_rejection_if_a_window_rolled(usage);
+
         apply_bucket(&mut self.five_hour, usage.five_hour, FIVE_HOUR);
         apply_bucket(&mut self.seven_day, usage.seven_day, SEVEN_DAY);
         apply_bucket(&mut self.seven_day_oi, usage.seven_day_oi, SEVEN_DAY);
@@ -361,6 +366,64 @@ impl Quota {
         if let Some(extra) = usage.extra_usage_usd {
             self.extra_usage_usd = Some(extra);
         }
+    }
+
+    /// Drop a `rejected` status whose window has since rolled.
+    ///
+    /// Without this, a rejection outlives its cause and benches the account until
+    /// the process restarts. [`Quota::update_from_headers`] is the only writer of
+    /// `status`, and it reads a SERVED response's
+    /// `anthropic-ratelimit-unified-status`. But
+    /// [`crate::manager::Manager::account_terminal_gate`] skips an account carrying
+    /// `rejected`, so no further served response ever arrives to refresh it, and
+    /// this probe path used to move the windows while leaving `status` alone.
+    /// Nothing else clears it: `Quota` is runtime state, never serialized, so only
+    /// a restart, a keep-warm response (`warmupSeconds`, off by default) or a human
+    /// ended a rejection.
+    ///
+    /// **The signal is a utilization that FELL.** A shared window's utilization only
+    /// rises while that window is running, so a probed value strictly below the one
+    /// still stored is upstream telling us a new window started. Deliberately NOT
+    /// the reset instant: [`apply_bucket`] synthesizes a reset for a high
+    /// utilization reported without one, so a "the reset moved later" test could
+    /// fire on a value we invented rather than one upstream reported.
+    ///
+    /// Only the two SHARED windows are consulted. A Fable-only rejection never
+    /// reaches `status` at all (see [`Quota::update_from_headers`]), so
+    /// `seven_day_oi` cannot be the cause of one.
+    ///
+    /// `None` rather than `Some("allowed")`: a rolled window is evidence the old
+    /// verdict is stale, not evidence of a new one. The two readers both test
+    /// `== Some("rejected")`, so `None` un-gates without asserting anything we did
+    /// not observe.
+    ///
+    /// Clearing wrongly is cheap and self-correcting. EVERY upstream response
+    /// including a 429 is folded through [`Quota::update_from_headers`]
+    /// (`proxy.rs`, immediately after the "upstream response" log line), so an
+    /// account that really is still rejected is marked again on its very next
+    /// attempt, at a cost of one request. Clearing too late is the old behaviour: a
+    /// permanently benched account.
+    fn drop_rejection_if_a_window_rolled(&mut self, usage: &crate::probe::Usage) {
+        if self.status.as_deref() != Some("rejected") {
+            return;
+        }
+        if window_rolled(self.five_hour, usage.five_hour)
+            || window_rolled(self.seven_day, usage.seven_day)
+        {
+            self.status = None;
+        }
+    }
+}
+
+/// Did this window roll between the stored reading and the probed one?
+///
+/// True only when BOTH utilizations are known and the fresh one is strictly lower.
+/// An unknown on either side is not evidence of a roll, so it answers `false` and
+/// the rejection stands.
+fn window_rolled(stored: Option<QuotaWindow>, probed: Option<crate::probe::UsageBucket>) -> bool {
+    match (stored, probed.and_then(|b| b.utilization)) {
+        (Some(stored), Some(probed)) => probed < stored.utilization,
+        _ => false,
     }
 }
 
@@ -691,6 +754,162 @@ mod tests {
         assert!(
             !quota.is_near(0.90, after_window),
             "resetless window must clear after its bounded lifetime, never pin forever"
+        );
+    }
+
+    /// Build a quota that a served 429 left carrying `rejected`, with `util`
+    /// already spent on the shared window named by `on_seven_day`.
+    fn rejected_with(on_seven_day: bool, util: f64) -> Quota {
+        let window = Some(QuotaWindow {
+            utilization: util,
+            reset: Some(OffsetDateTime::now_utc() + time::Duration::hours(3)),
+        });
+        Quota {
+            five_hour: if on_seven_day { None } else { window },
+            seven_day: if on_seven_day { window } else { None },
+            status: Some("rejected".to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn bucket(util: f64) -> Option<crate::probe::UsageBucket> {
+        Some(crate::probe::UsageBucket {
+            utilization: Some(util),
+            reset_at_ms: None,
+        })
+    }
+
+    /// The bug this exists to end: `rejected` outliving the window that caused it.
+    ///
+    /// `update_from_headers` is the only writer of `status` and it needs a SERVED
+    /// response, but `account_terminal_gate` skips a rejected account, so no served
+    /// response ever arrives. Before this, the probe moved the bars and left
+    /// `status` alone, and the account stayed benched until a restart.
+    #[test]
+    fn probed_drop_in_utilization_clears_a_stale_rejection() {
+        for on_seven_day in [false, true] {
+            let mut quota = rejected_with(on_seven_day, 0.99);
+            let usage = if on_seven_day {
+                crate::probe::Usage {
+                    seven_day: bucket(0.04),
+                    ..Default::default()
+                }
+            } else {
+                crate::probe::Usage {
+                    five_hour: bucket(0.04),
+                    ..Default::default()
+                }
+            };
+
+            quota.apply_usage(&usage);
+
+            assert_eq!(
+                quota.status, None,
+                "a utilization that FELL is upstream starting a new window, so the \
+                 rejection recorded against the old one is stale (seven_day={on_seven_day})"
+            );
+        }
+    }
+
+    /// The other side of the same rule: a rejection that is still current must
+    /// survive the probe, or every probe cadence would put a genuinely blocked
+    /// account back into rotation to earn another 429.
+    #[test]
+    fn probe_leaves_a_live_rejection_alone() {
+        // Utilization climbing within the same window.
+        let mut climbing = rejected_with(false, 0.97);
+        climbing.apply_usage(&crate::probe::Usage {
+            five_hour: bucket(0.99),
+            ..Default::default()
+        });
+        assert_eq!(
+            climbing.status.as_deref(),
+            Some("rejected"),
+            "a RISING utilization is the same window still running"
+        );
+
+        // Identical reading: no evidence of anything.
+        let mut flat = rejected_with(false, 0.99);
+        flat.apply_usage(&crate::probe::Usage {
+            five_hour: bucket(0.99),
+            ..Default::default()
+        });
+        assert_eq!(
+            flat.status.as_deref(),
+            Some("rejected"),
+            "an unchanged utilization is not evidence of a roll"
+        );
+
+        // The probe read nothing for this window.
+        let mut silent = rejected_with(false, 0.99);
+        silent.apply_usage(&crate::probe::Usage::default());
+        assert_eq!(
+            silent.status.as_deref(),
+            Some("rejected"),
+            "silence is not evidence of a roll"
+        );
+
+        // We never stored a prior reading, so there is nothing to compare against.
+        let mut unknown = Quota {
+            status: Some("rejected".to_string()),
+            ..Default::default()
+        };
+        unknown.apply_usage(&crate::probe::Usage {
+            five_hour: bucket(0.01),
+            ..Default::default()
+        });
+        assert_eq!(
+            unknown.status.as_deref(),
+            Some("rejected"),
+            "with no stored utilization a low reading proves nothing"
+        );
+    }
+
+    /// `seven_day_oi` is the model-scoped (Fable) weekly. A Fable-only rejection
+    /// never reaches `status` in the first place (`update_from_headers`), so a roll
+    /// on that window is not evidence about an account-wide rejection and must not
+    /// clear one.
+    #[test]
+    fn a_fable_weekly_roll_does_not_clear_an_account_wide_rejection() {
+        let mut quota = Quota {
+            seven_day_oi: Some(QuotaWindow {
+                utilization: 0.99,
+                reset: Some(OffsetDateTime::now_utc() + time::Duration::hours(3)),
+            }),
+            status: Some("rejected".to_string()),
+            ..Default::default()
+        };
+
+        quota.apply_usage(&crate::probe::Usage {
+            seven_day_oi: bucket(0.02),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            quota.status.as_deref(),
+            Some("rejected"),
+            "the model-scoped weekly cannot be the cause of an account-wide rejection"
+        );
+    }
+
+    /// The clear is scoped to `rejected`. `allowed_warning` carries the near-limit
+    /// signal the TUI colours on, and a rolled window must not silently erase it.
+    #[test]
+    fn a_rolled_window_does_not_erase_a_non_rejected_status() {
+        let mut quota = Quota {
+            status: Some("allowed_warning".to_string()),
+            ..rejected_with(false, 0.99)
+        };
+
+        quota.apply_usage(&crate::probe::Usage {
+            five_hour: bucket(0.01),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            quota.status.as_deref(),
+            Some("allowed_warning"),
+            "only a rejection is dropped here"
         );
     }
 
