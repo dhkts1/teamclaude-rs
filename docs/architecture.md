@@ -94,3 +94,38 @@ off by default: it really does post messages, and spends quota to do it.
 The distributions, the bounds each draw actually produces, and the generator behind them
 are in [Both cadences are random per account, not a fleet
 sweep](configuration.md#both-cadences-are-random-per-account-not-a-fleet-sweep).
+
+## When every account is out
+
+If the rotation loop finds nothing eligible, `tcr` answers the client with a 429 carrying a
+`retry-after`. The number on that header is deliberately **not** the real wait. A quota
+window can be sixteen hours from resetting, and a real incident produced advertised waits of
+57,950 to 59,975 seconds, but Claude Code ignores any `retry-after` above 60 seconds and
+exits instead of sleeping. Advertising the true figure therefore killed the run outright. The
+header is capped at 59 seconds; the real wait is still stated in the response body, and both
+values are logged.
+
+The cap is 59 rather than 60 because `exhaustion_hint` already uses exactly 60 to mean "no
+account advertises a reset at all". Keeping the cap one second below that leaves the two
+readable apart: anything at or under 59 came from a measured reset instant, and 60 on the
+wire can only be the sentinel. This matters to a log reader, to an operator, and to a `tcr`
+chained behind another `tcr`.
+
+Measured against a stub endpoint on 2026-09-15 with client 2.1.272, two runs per value:
+
+| advertised `retry-after` | what the client does |
+|---|---|
+| 30s | sleeps 30s, retries, exits 0 |
+| 59s | sleeps 59s, retries, exits 0 |
+| 60s | sleeps 60s, retries, exits 0 |
+| 61s and above | never retries, exits 1 in about a second |
+
+The cap holds across repeated refusals, which is what makes it a fix rather than a delay.
+Against an endpoint that answered every single request with the same 59, the client kept
+sleeping and re-asking on an exact 59.0-second cadence for seven attempts across six minutes,
+and was still going when the test harness timed out. It never gave up on its own. So a
+genuinely hours-long window no longer ends the run at the first refusal: the client waits
+until some account frees, which is what the body text always claimed would happen.
+
+Raising the cap above 60 would restore the immediate death. Lowering it only costs extra
+round trips.
