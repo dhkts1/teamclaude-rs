@@ -12,6 +12,52 @@ const CONN_AFFINITY_CAP: usize = 256;
 /// reconnect the way [`Manager::affinity`] does.
 const CONN_AFFINITY_TTL_MS: i64 = 5 * 60 * 1000;
 
+/// How long a [`Manager::affinity`] pin keeps counting as **load** on its
+/// account: **60 minutes** since its last touch. Past this a pin is still
+/// honoured — it is not dropped, not expired, and a returning session gets its
+/// account back — it simply stops making that account look busy to the
+/// load-balancing migration in [`Manager::select_with_group`].
+///
+/// This is NOT [`CONN_AFFINITY_TTL_MS`]: that one guards a different map
+/// (`conn_affinity`), bounds the life of ONE connection, and genuinely expires
+/// its entries. It is also not an age TTL on the pin map. An expiring pin costs
+/// a cold prompt prefix on the session's next request, the most expensive event
+/// in this system; a pin excluded from a COUNT costs nothing, because the count
+/// only ever decides whether some other session should be moved.
+///
+/// Why 60 minutes and not the 5 of [`CACHE_WARM_HOLD_SECS`] or
+/// the 15 of [`crate::affinity::PIN_TTL_MS`]: the count is a guess at how many
+/// live sessions an account is carrying, and the two ways of guessing wrong are
+/// not symmetric. Counting a dead pin makes the emptiest account on the fleet
+/// read as one of the busiest and bounces every session that lands on it back
+/// off again; NOT counting a session that is merely thinking under-reads a real
+/// account and stacks a second session onto it, which is paid later in a
+/// migration and a cold prefix. So take the widest window that still fixes the
+/// first failure. 60 minutes is that: it is the ceiling of every cache window
+/// this crate already believes in — [`crate::affinity::EXTENDED_PIN_TTL_MS`] is
+/// 55 minutes, derived from 52,951 real `request usage` records where a 15-60
+/// minute gap still hit Anthropic's cache 73-88% of the time and only past 60
+/// minutes fell to 12%. Past an hour no prefix is warm under any
+/// `cache_control` setting, so such a pin is a preference, never a load.
+///
+/// Measured against the report this constant exists to fix: a live
+/// `session-affinity.json` held 100 pins with exactly ONE touched inside the
+/// last hour and individual pins 5 days 15 hours stale. 5, 15 and 60 minutes
+/// all collapse that account's count from 8 to at most 2 (the requesting session
+/// plus that one fresh pin), and migration needs the target to hold zero; 60
+/// minutes is the one that does it while still counting every session that
+/// could plausibly come back to a warm prefix.
+const PIN_LOAD_IDLE_MS: i64 = 60 * 60 * 1000;
+
+/// Does a pin count as live load on its account? See [`PIN_LOAD_IDLE_MS`].
+///
+/// `is_self` is the requesting session's own pin: that session is demonstrably
+/// alive — it is making this very request — so its own last-touch stamp (which
+/// still names its PREVIOUS request) never disqualifies it.
+fn pin_counts_as_load(is_self: bool, touched_ms: i64, now_ms: i64) -> bool {
+    is_self || now_ms.saturating_sub(touched_ms) <= PIN_LOAD_IDLE_MS
+}
+
 /// The three-way split of an UNPINNED request (control account, part 2 — see
 /// the module doc and `docs/plans/control-routing-bridge-coder.md`). Classified
 /// from `path` alone (the caller's already query-stripped request path), never
@@ -428,9 +474,13 @@ impl Manager {
             let (pinned, counts) = {
                 let pins = self.affinity.lock().expect("affinity lock poisoned");
                 let pinned = pins.get(&key).map(|&(idx, touched_ms)| (idx, touched_ms));
+                // Only pins that are plausibly LIVE count as load — a days-dead pin
+                // must not make its account read as busy. See `PIN_LOAD_IDLE_MS`.
                 let mut counts: HashMap<usize, usize> = HashMap::new();
-                for &(idx, _) in pins.values() {
-                    *counts.entry(idx).or_insert(0) += 1;
+                for (&pin_key, &(idx, touched_ms)) in pins.iter() {
+                    if pin_counts_as_load(pin_key == key, touched_ms, now_ms) {
+                        *counts.entry(idx).or_insert(0) += 1;
+                    }
                 }
                 (pinned, counts)
             };
@@ -780,7 +830,12 @@ impl Manager {
                             let still_pinned_x = pins.get(&key).map(|&(i, _)| i) == Some(idx);
                             let mut count_x_now = 0usize;
                             let mut count_t_now = 0usize;
-                            for &(i, _) in pins.values() {
+                            // Same live-load filter as section (1), so the re-check
+                            // cannot disagree with the decision it re-validates.
+                            for (&pin_key, &(i, touched_ms)) in pins.iter() {
+                                if !pin_counts_as_load(pin_key == key, touched_ms, now_ms) {
+                                    continue;
+                                }
                                 if i == idx {
                                     count_x_now += 1;
                                 }
@@ -792,10 +847,11 @@ impl Manager {
                             if still_pinned_x && count_t_now + 1 < count_x_now {
                                 if let Some((x_name, y_name)) = migrate_names {
                                     tracing::info!(
-                                        "affinity: migrate session off {} (n={}) -> {}",
+                                        "affinity: migrate session off {} (live_pins={}) -> {} (live_pins={})",
                                         x_name,
                                         count_x_now,
-                                        y_name
+                                        y_name,
+                                        count_t_now
                                     );
                                 }
                             } else {
@@ -4019,5 +4075,210 @@ mod fable_last_resort_tests {
             "a reserved group's own request must refuse rather than spill to \
              the whole pool's last resort"
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_pin_load_tests {
+    //! A pin's last-touch decides whether it counts as LOAD on its account
+    //! ([`PIN_LOAD_IDLE_MS`]), never whether it is honoured. Field report: 100
+    //! pins with one touched in the last hour made the emptiest account read as
+    //! carrying eight sessions, and every session that landed on it was
+    //! migrated straight back off.
+    use super::*;
+    use crate::config::{Account, ProxyConfig};
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::warmer::LiveWarmer;
+    use std::collections::HashSet;
+
+    fn account(name: &str) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: None,
+            groups: None,
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    /// Two accounts, `loadBalanceMigration` ON (the only mode that counts pins).
+    fn build_manager() -> Arc<Manager> {
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "loadBalanceMigration".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let config = Config {
+            quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
+            proxy: ProxyConfig::default(),
+            upstream: "https://api.anthropic.com".to_string(),
+            switch_threshold: 0.90,
+            fable_weekly_threshold: None,
+            pacing: PacingConfig::default(),
+            account_throttle: ThrottleConfig::default(),
+            fleet_throttle: ThrottleConfig::default(),
+            lock_account: None,
+            control_account: None,
+            control_reserve: 0.05,
+            control_pooled: false,
+            reset_urgency_tier_hours: 24,
+            http1_only: false,
+            accounts: vec![account("alice@example.com"), account("bob@example.com")],
+            group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
+            extra,
+        };
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .insert(key, (idx, touched_ms));
+    }
+
+    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx)
+    }
+
+    /// Five days stale, the shape of the field report.
+    const DAYS_STALE_MS: i64 = 5 * 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn the_window_boundary_and_the_requesting_session() {
+        let now_ms = 10 * PIN_LOAD_IDLE_MS;
+        assert!(pin_counts_as_load(false, now_ms, now_ms), "just touched");
+        assert!(
+            pin_counts_as_load(false, now_ms - PIN_LOAD_IDLE_MS, now_ms),
+            "exactly at the window still counts"
+        );
+        assert!(
+            !pin_counts_as_load(false, now_ms - PIN_LOAD_IDLE_MS - 1, now_ms),
+            "one millisecond past the window does not"
+        );
+        assert!(
+            pin_counts_as_load(true, now_ms - DAYS_STALE_MS, now_ms),
+            "the requesting session is live however old its previous touch"
+        );
+    }
+
+    /// Brief test 1. Account 0 carries six days-dead pins plus the requesting
+    /// session; account 1 carries one fresh pin. Counting raw pins reads 7 vs 1
+    /// and migrates; counting live load reads 1 vs 1 and must not.
+    #[test]
+    fn stale_pins_do_not_make_an_account_read_as_busy() {
+        let manager = build_manager();
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        for key in 1..=6 {
+            pin(&manager, key, 0, now_ms - DAYS_STALE_MS);
+        }
+        pin(&manager, 100, 1, now_ms - 60_000);
+        pin(&manager, 50, 0, now_ms - 60_000);
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(50), "/v1/messages", None),
+            Some(0),
+            "days-dead pins must not make account 0 look busier than account 1"
+        );
+        assert_eq!(
+            pin_of(&manager, 50),
+            Some(0),
+            "the session was not migrated"
+        );
+    }
+
+    /// Brief test 2. The same shape with the other pins FRESH is real load:
+    /// 3 live on account 0 vs 0 on account 1 still migrates.
+    #[test]
+    fn fresh_pins_still_count_as_load() {
+        let manager = build_manager();
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        pin(&manager, 1, 0, now_ms - 60_000);
+        pin(&manager, 2, 0, now_ms - (PIN_LOAD_IDLE_MS - 60_000));
+        pin(&manager, 50, 0, now_ms - 60_000);
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(50), "/v1/messages", None),
+            Some(1),
+            "pins inside the window are live load, so the stacked session moves"
+        );
+        assert_eq!(pin_of(&manager, 50), Some(1));
+    }
+
+    /// The re-check under the commit lock must use the same filter as the
+    /// decision. Account 1 carries five days-dead pins: the decision reads it
+    /// empty and picks it, and an unfiltered re-check (5+1 < 3 is false) would
+    /// silently abort the move the decision correctly made.
+    #[test]
+    fn stale_pins_on_the_target_do_not_abort_a_migration() {
+        let manager = build_manager();
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        pin(&manager, 1, 0, now_ms - 60_000);
+        pin(&manager, 2, 0, now_ms - 60_000);
+        pin(&manager, 50, 0, now_ms - 60_000);
+        for key in 11..=15 {
+            pin(&manager, key, 1, now_ms - DAYS_STALE_MS);
+        }
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(50), "/v1/messages", None),
+            Some(1),
+            "the commit-time re-check must not count the target's dead pins"
+        );
+        assert_eq!(pin_of(&manager, 50), Some(1));
+    }
+
+    /// A count filter, not a TTL: a session returning after days still gets
+    /// its own pin back, and no stale pin is removed from the map.
+    #[test]
+    fn a_stale_pin_is_still_honoured_and_never_dropped() {
+        let manager = build_manager();
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        for key in 1..=6 {
+            pin(&manager, key, 1, now_ms - DAYS_STALE_MS);
+        }
+        pin(&manager, 50, 1, now_ms - DAYS_STALE_MS);
+
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, Some(50), "/v1/messages", None),
+            Some(1),
+            "the returning session is served on its own pinned account"
+        );
+        let pins = manager.affinity.lock().expect("affinity lock poisoned");
+        assert_eq!(pins.len(), 7, "no stale pin was evicted by the filter");
+        assert!((1..=6).all(|k| pins.get(&k).map(|&(i, _)| i) == Some(1)));
     }
 }
