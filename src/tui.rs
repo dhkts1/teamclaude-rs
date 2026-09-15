@@ -1066,8 +1066,22 @@ fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) 
             "LOGIN".to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        // Upstream's own verdict, with no reset to wait on — red-bold like LOGIN
-        // because only a human clears it, never a timer.
+        // Anthropic's own verdict, read from `anthropic-ratelimit-unified-status`
+        // (`Quota::update_from_headers`). Red-bold like LOGIN, but for a different
+        // reason than the one this comment used to give: it is not that upstream
+        // demands a human, it is that nothing here re-asks. `select` skips a
+        // rejected account, so it never receives another served response to refresh
+        // the status from, and the background quota probe folds its reading through
+        // `Quota::apply_usage`, which moves the bars and leaves `status` untouched.
+        // In the default configuration that leaves three ways out: a restart (quota
+        // is runtime state and is never persisted), a keep-warm request
+        // (`warmupSeconds`, off by default, whose response does refresh the status),
+        // or a human. No timer among them.
+        //
+        // The countdown now shown in this row's 5h and 7d cells is each WINDOW's own
+        // reset. That is a fact about the window and makes no claim about when this
+        // account returns, which is why `account_gate` still reports `free_at = None`
+        // here.
         GateReason::Rejected => (
             "REJECTED".to_string(),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
