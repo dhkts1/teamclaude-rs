@@ -21,6 +21,21 @@ impl Manager {
     }
 
     /// Returns `true` iff [`Self::apply_refresh`] ran (a new token was applied).
+    ///
+    /// The upstream POST runs on a task of its OWN, not inside the caller's future.
+    /// A refresh token is single-use: once the POST leaves this box upstream may
+    /// rotate it whether or not anyone is still listening. A caller that goes away
+    /// mid-refresh — an axum request future dropped because the client hung up — used
+    /// to take the in-flight refresh down with it, so the rotated token was lost, the
+    /// next attempt re-POSTed a token upstream had already spent, and the `400` that
+    /// came back marked a HEALTHY account `Error`, which is terminal. Live proof
+    /// (2026-09-16 proxy log): an account logged `refreshing OAuth token` at
+    /// 19:07:00.191, never logged an outcome, and its next attempt 57s later was
+    /// rejected.
+    ///
+    /// The caller still awaits the answer; it just no longer owns it. Everything from
+    /// the coalescing lock inward moved into [`Self::refresh_locked`] so the lock is
+    /// held by the task doing the work, never by a caller that may vanish.
     async fn ensure_fresh_inner(&self, idx: usize, force: bool) -> bool {
         // Decide whether to refresh and snapshot the access token we intend to
         // replace — all before taking the (async) coalescing lock.
@@ -38,6 +53,40 @@ impl Manager {
             Some(account) => account.refresh_lock.clone(),
             None => return false,
         };
+
+        // Detached when we can be: a live `Arc` to ourselves AND a runtime to spawn
+        // on. Either missing (a manager built outside `assemble`, a caller on no
+        // runtime) falls back to the inline path — same work, same result, just as
+        // cancellable as it always was.
+        match (
+            self.me.get().and_then(std::sync::Weak::upgrade),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            (Some(me), Ok(_)) => tokio::spawn(async move {
+                me.refresh_locked(idx, force, refresh_token, access_before, lock)
+                    .await
+            })
+            .await
+            .unwrap_or(false),
+            _ => {
+                self.refresh_locked(idx, force, refresh_token, access_before, lock)
+                    .await
+            }
+        }
+    }
+
+    /// The coalescing lock and everything under it. Split out of
+    /// [`Self::ensure_fresh_inner`] so it can run on its own task; the lock is
+    /// acquired HERE, inside that task, so a cancelled caller cannot release it
+    /// while the refresh it started is still in flight.
+    async fn refresh_locked(
+        &self,
+        idx: usize,
+        force: bool,
+        refresh_token: String,
+        access_before: String,
+        lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> bool {
         let _guard = lock.lock().await;
 
         // Coalesce ALL concurrent callers, the force path included (bug #10): a
