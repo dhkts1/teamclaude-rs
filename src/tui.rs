@@ -1081,8 +1081,12 @@ fn quota_cell(state: QuotaState) -> (&'static str, Style) {
 /// The per-row gate chip: WHY this account is out of rotation and WHEN it
 /// returns, mirroring the [`GateReason`] the manager computed and formatting the
 /// `free_at` clear-instant as a compact back-when. `OK`/`OFF` are dim (not a
-/// problem); the gates only a human clears — a dead credential's `LOGIN` and an
-/// upstream-`REJECTED` account — are red-bold; every quota/hold gate is red. An
+/// problem); the two gates that can show no countdown at all — a dead
+/// credential's `LOGIN` and an upstream-`REJECTED` account — are red-bold; every
+/// quota/hold gate is red. Red-bold is about the missing countdown and NOT about
+/// needing a person: this line used to say "the gates only a human clears",
+/// which is true of `LOGIN` and false of `REJECTED` (see the `REJECTED` arm
+/// below, and `Quota::drop_rejection_if_a_window_rolled`). An
 /// unknown clear-instant drops the back-when (a bare
 /// `5H`) — the display never invents a time the manager could not promise.
 fn gate_chip(account: &AccountSnapshot, now: OffsetDateTime) -> (String, Style) {
