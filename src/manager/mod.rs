@@ -869,6 +869,16 @@ pub struct DivertEpisode {
 
 /// Owns all rotation state and the machinery to refresh tokens and reach upstream.
 pub struct Manager {
+    /// This manager's own `Arc`, so a method holding `&self` can hand work to a
+    /// task that OUTLIVES its caller. Exactly one such user today: a token refresh
+    /// must not die with the request that asked for it (see
+    /// [`Self::ensure_fresh_inner`]) — the refresh token is already spent upstream
+    /// by then, and losing the answer condemns a healthy account.
+    ///
+    /// `Weak`, so the manager's own field cannot keep it alive; `OnceLock`, set by
+    /// [`Self::assemble`] the moment the `Arc` exists. Unset means "built some other
+    /// way": the refresh then runs inline, exactly as it did before.
+    me: std::sync::OnceLock<std::sync::Weak<Manager>>,
     accounts: RwLock<Vec<AccountRuntime>>,
     refresher: Arc<dyn TokenRefresher>,
     /// Reads each account's quota from the zero-spend usage endpoint on a timer.
@@ -1401,6 +1411,7 @@ impl Manager {
         );
 
         let manager = Arc::new(Self {
+            me: std::sync::OnceLock::new(),
             accounts: RwLock::new(accounts),
             usage,
             refresher,
@@ -1447,6 +1458,9 @@ impl Manager {
             control_pooled,
             reset_urgency_tier_ms,
         });
+        // Hand the manager its own `Arc` (weakly) now that one exists — see the
+        // `me` field. Infallible: this is the only write, on a just-built value.
+        let _ = manager.me.set(Arc::downgrade(&manager));
 
         if let (Some(i), Some(name)) = (locked_idx, locked_name) {
             tracing::warn!(
@@ -6536,6 +6550,77 @@ mod tests {
 
     /// Refresh coalescing: N concurrent `ensure_fresh` calls on the SAME
     /// hard-expired account trigger exactly ONE upstream refresh.
+    /// A refresher that reports when the upstream POST has begun and then waits to
+    /// be released — the shape of a real refresh that is in flight when the client
+    /// hangs up.
+    struct BlockingRefresher {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl TokenRefresher for BlockingRefresher {
+        fn refresh(&self, _refresh_token: String) -> RefreshFuture {
+            let started = self.started.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                started.notify_one();
+                release.notified().await;
+                Ok::<Tokens, OAuthError>(Tokens {
+                    access_token: "fresh-access".to_string(),
+                    refresh_token: Some("fresh-refresh".to_string()),
+                    expires_at_ms: crate::now_ms() + 3_600_000,
+                })
+            })
+        }
+    }
+
+    /// A refresh token is single-use: the moment the POST leaves this box, upstream
+    /// may rotate it whether or not we are still listening. So the refresh must not
+    /// live inside the request future that asked for it — a client that hangs up
+    /// mid-refresh would drop it, and the next attempt would re-POST a token
+    /// upstream had already spent, get `400`, and mark a HEALTHY account `Error`,
+    /// which is terminal.
+    ///
+    /// Live proof this is not hypothetical (2026-09-16 proxy log): an account logged
+    /// `refreshing OAuth token` at 19:07:00.191 and never logged an outcome; the next
+    /// attempt, 57s later, was rejected, and the account was condemned.
+    #[tokio::test]
+    async fn a_cancelled_caller_does_not_abandon_its_refresh() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let refresher = Arc::new(BlockingRefresher {
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let mut acct = account("expired", 0);
+        acct.expires_at = Some(crate::now_ms() - 60_000);
+        let manager = build_manager(config_with(vec![acct]), refresher);
+
+        let m = manager.clone();
+        let caller = tokio::spawn(async move { m.ensure_fresh_force(0).await });
+        started.notified().await; // the POST is in flight upstream
+        caller.abort(); // the client hung up
+        let _ = caller.await;
+        release.notify_one(); // upstream answers, as it would have anyway
+
+        // The answer must still be applied. Polled, because the refresh now runs on
+        // its own task and finishes a moment after the release.
+        let mut applied = None;
+        for _ in 0..200 {
+            if manager.access_token(0).as_deref() == Some("fresh-access") {
+                applied = manager.access_token(0);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            applied.as_deref(),
+            Some("fresh-access"),
+            "a refresh whose caller was cancelled must still apply its answer — \
+             otherwise the rotated token is lost and the next attempt burns the account"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_ensure_fresh_coalesces_to_single_refresh() {
         let calls = Arc::new(AtomicUsize::new(0));
