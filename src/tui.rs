@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::{self};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,17 +65,57 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Install a panic hook (once) that restores the terminal before the previous
-/// hook prints the panic — otherwise a panic mid-render leaves a corrupt screen.
+/// Set by the panic hook when a panic happened on some OTHER thread and the
+/// screen was left alone. The draw loop consumes it with a full repaint, because
+/// whatever the default hook printed is now sitting in cells ratatui believes it
+/// already owns.
+static SCREEN_DIRTIED_BY_PANIC: AtomicBool = AtomicBool::new(false);
+
+/// Does a panic on this thread mean the process is going down, so the terminal
+/// must be handed back?
+///
+/// Only the thread running the TUI — `main`, under `#[tokio::main]` — takes the
+/// process with it. A panicking background task does not: tokio catches it, the
+/// task dies alone, and the dashboard keeps running.
+///
+/// Issue #323 is what the always-restore answer costs. A background task panicked,
+/// the hook left the alternate screen, the TUI kept drawing, and ratatui's diff
+/// repainted only the cells it believed had changed — so its output landed as
+/// isolated characters scattered across whatever was on the screen, and no later
+/// frame could repair it because ratatui thought every other cell was already
+/// right. Reproduced at the reporter's 154x31 with `examples/tui_garble_repro.rs`:
+/// the panic message came back as `a background task die15` and
+/// `RUST_15CKTRACE`, single characters replaced by digits from another widget,
+/// which is the report almost word for word.
+fn panic_takes_the_process_down(thread_name: Option<&str>) -> bool {
+    thread_name == Some("main")
+}
+
+/// Install a panic hook (once). A panic on the TUI's own thread restores the
+/// terminal before the previous hook prints — otherwise a panic mid-render leaves
+/// a corrupt screen. A panic anywhere else leaves the screen alone (see
+/// [`panic_takes_the_process_down`]), records it in the log the TUI has redirected
+/// to a file, and asks the draw loop for a full repaint.
 fn install_panic_hook() {
     use std::sync::Once;
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
-            previous(info);
+            let thread = std::thread::current();
+            if panic_takes_the_process_down(thread.name()) {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableBracketedPaste);
+                previous(info);
+                return;
+            }
+            // Not ours to print. The default hook would write onto the dashboard.
+            tracing::error!(
+                thread = thread.name().unwrap_or("<unnamed>"),
+                panic = %info,
+                "a background task panicked"
+            );
+            SCREEN_DIRTIED_BY_PANIC.store(true, Ordering::SeqCst);
         }));
     });
 }
@@ -186,6 +227,13 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                     std::time::Instant::now(),
                     snapshot.accounts.get(selected).map(|a| a.name.as_str()),
                 );
+                // A panic elsewhere printed over us (or would have). ratatui believes
+                // those cells are already correct, so only a full clear repairs them.
+                if SCREEN_DIRTIED_BY_PANIC.swap(false, Ordering::SeqCst) {
+                    if let Err(err) = terminal.clear() {
+                        tracing::warn!(error = %err, "could not clear after a background panic");
+                    }
+                }
                 // A single failed repaint must not crash the process.
                 if let Err(err) = terminal.draw(|frame| render(frame, &snapshot, selected, live)) {
                     tracing::warn!(error = %err, "tui repaint failed");
@@ -1191,6 +1239,36 @@ fn truncate(text: &str, max: usize) -> String {
     } else {
         let head: String = text.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod panic_policy_tests {
+    use super::panic_takes_the_process_down;
+
+    /// The TUI's own thread. A panic here ends the process, so the terminal must be
+    /// handed back or the user's shell is left in raw mode on the alternate screen.
+    #[test]
+    fn a_panic_on_the_tui_thread_restores_the_terminal() {
+        assert!(panic_takes_the_process_down(Some("main")));
+    }
+
+    /// Every other thread. Issue #323: a background task's panic used to drop the
+    /// alternate screen while the dashboard kept drawing, and ratatui's diff then
+    /// painted single characters over whatever was on the screen forever.
+    #[test]
+    fn a_panic_on_any_other_thread_leaves_the_screen_alone() {
+        for name in [
+            Some("tokio-runtime-worker"),
+            Some("tokio-rt-work15"),
+            Some("probe-loop"),
+            None,
+        ] {
+            assert!(
+                !panic_takes_the_process_down(name),
+                "{name:?} does not end the process, so it must not take the screen"
+            );
+        }
     }
 }
 
