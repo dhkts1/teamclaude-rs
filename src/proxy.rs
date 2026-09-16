@@ -800,15 +800,28 @@ const LOCAL_PREFIX: &str = "/_tcr";
 /// `not_found_error: "Server not found"`; served by the client's own identity, every
 /// one connected. That is why this reads as intermittent — it tracks rotation.
 ///
+/// `/api/oauth/organizations/<org uuid>/…` (marketplaces, plugin list, skill
+/// download) names the CLIENT's own organization in the path, so a pooled account
+/// from any other org answers 401 or 403. That was not a lost request, it was an
+/// account killer: the 401 branch of [`handle`] force-refreshes the serving account
+/// on every 401, each of these calls walked the whole pool, and refresh tokens are
+/// single-use, so the refreshes piled up until one was rejected and the account went
+/// `Error` for good. Measured on the live log on 2026-09-16, the first day Claude
+/// Code made these calls: 428 of the 445 401/403 responses after a restart were on
+/// this prefix, and six freshly re-logged accounts went `Error` between 7 and 30
+/// minutes after the first one, while the tokens they had last refreshed were still
+/// valid on disk.
+///
 /// Written WITHOUT trailing slashes and matched by [`path_is_under`] — an entry
 /// matches the exact path or that path followed by `/`, never a longer identifier.
 /// Both edges of a raw `starts_with` were live defects: `"/api/oauth/file_upload"`
 /// (no terminator) also relayed `/api/oauth/file_upload_v2`, and `"/v1/code/"`
 /// (with one) missed the bare `/v1/code`.
-const CLIENT_CREDENTIAL_PREFIXES: [&str; 5] = [
+const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
     "/v1/code",
     "/api/oauth/files",
     "/api/oauth/file_upload",
+    "/api/oauth/organizations",
     "/v1/mcp_servers",
     "/v1/sessions",
 ];
@@ -8356,6 +8369,33 @@ mod tests {
                 "{method} {path} must take the normal rotation path"
             );
         }
+    }
+
+    /// Claude Code's org-scoped calls name the CLIENT's own organization in the path, so
+    /// only the client's own credential can answer them. Rotated onto a pooled account
+    /// from another org they 401/403, and every 401 force-refreshes that account — the
+    /// loop that condemned six healthy accounts in 15 minutes (see
+    /// [`CLIENT_CREDENTIAL_PREFIXES`]). The uuid is fake.
+    #[test]
+    fn org_scoped_oauth_paths_relay_with_the_client_credential() {
+        const ORG: &str = "11111111-2222-3333-4444-555555555555";
+        for path in [
+            format!("/api/oauth/organizations/{ORG}/marketplaces"),
+            format!("/api/oauth/organizations/{ORG}/plugins/list-plugins"),
+            format!("/api/oauth/organizations/{ORG}/skills/skill_0123/download"),
+            "/api/oauth/organizations".to_string(),
+        ] {
+            assert_eq!(
+                relay_mode(&Method::GET, &path),
+                Some(RelayMode::ClientCredential),
+                "{path} is bound to the client's own org"
+            );
+        }
+        assert_eq!(
+            relay_mode(&Method::GET, "/api/oauth/organizations_v2"),
+            None,
+            "a longer identifier sharing the prefix is a different route"
+        );
     }
 
     /// The segment-boundary rule, at both edges. Every entry that reads as a prefix
