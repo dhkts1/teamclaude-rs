@@ -1918,10 +1918,19 @@ pub fn render_accounts(snapshot: &StatsSnapshot, source: StatusSource) -> String
         // promises a return the weekly cap will not honour.
         //
         // Omitted (not `n/a`) when there is no instant to name, matching the
-        // `fable=`/`last_stream_error=` idiom: a terminal gate (REJECTED / LOGIN /
-        // disabled) is cleared only by a human, and a gate whose reset upstream
-        // never reported has no time to give. Absent means "no time can be
-        // promised" — printing `free_in=0s` there would read as "returns now".
+        // `fable=`/`last_stream_error=` idiom: a terminal gate carries no
+        // clear-instant, and neither does a gate whose reset upstream never
+        // reported. Absent means "no time can be promised" — printing
+        // `free_in=0s` there would read as "returns now".
+        //
+        // Terminal does NOT mean "only a human clears it", which this comment
+        // used to say. LOGIN and `disabled` do need a person. REJECTED does not:
+        // `Quota::drop_rejection_if_a_window_rolled` (`src/quota.rs`) drops it as
+        // soon as a probe reads a shared window's utilization strictly below the
+        // stored one, which is upstream reporting a new window. It is still
+        // omitted here, because what that clears on is the next PROBE after the
+        // roll, not the reset instant itself — an interval this code cannot name
+        // in advance, and the whole reason `account_gate` reports `None`.
         let free_in = match a.free_at {
             Some(f) if f > now => format!(" free_in={}s", (f - now).whole_seconds().max(1)),
             _ => String::new(),
@@ -2253,10 +2262,19 @@ fn render_accounts_json(
                 // would promise a return the weekly cap will not honour.
                 //
                 // Null is honest and load-bearing: `account_gate` reports no
-                // instant for a terminal state (REJECTED / LOGIN / disabled —
-                // only a human clears those) and for a gate whose reset upstream
-                // never reported. Absent means "no time can be promised", never
-                // "returns now".
+                // instant for a terminal state (REJECTED / LOGIN / disabled) and
+                // none for a gate whose reset upstream never reported. Absent
+                // means "no time can be promised", never "returns now".
+                //
+                // A REJECTED row is null for a different reason than the other
+                // two, and this comment used to flatten them into "only a human
+                // clears those". LOGIN and `disabled` do wait on a person. A
+                // rejection clears itself, in
+                // `Quota::drop_rejection_if_a_window_rolled` (`src/quota.rs`), on
+                // the first probe that reads a shared window below its stored
+                // utilization. Null because that instant depends on the probe
+                // schedule rather than on the window's reset, so no field here
+                // can name it — not because nothing will ever clear it.
                 free_at_ms: a
                     .free_at
                     .map(|f| (f.unix_timestamp_nanos() / 1_000_000) as i64),
