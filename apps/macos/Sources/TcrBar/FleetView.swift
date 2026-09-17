@@ -1359,13 +1359,13 @@ struct FleetView: View {
                         Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
                             .lineLimit(1).layoutPriority(1)
                     }
-                    if let cache = cacheHitPercent(row.session) {
-                        Text(" · cache \(cache)%").monospacedDigit()
-                            .lineLimit(1).layoutPriority(1)
-                    }
-                    // Zero, not the row gap: the pair fits across the block's
-                    // 312 pt with nothing to spare, and 8 pt of enforced gap is
-                    // what pushed `· cache 97%` onto a second line.
+                    // `cache %` is GONE (`docs/design/panel-tabs.md` §3):
+                    // measured across all ten live sessions at the time this
+                    // rewrite was made, it carried exactly one distinct value
+                    // (100) — a field with one value across every row is not
+                    // information, and the pt it cost is better spent letting
+                    // the trailing duration column (``sessionStatusLine(_:now:)``)
+                    // breathe.
                     Spacer(minLength: 0)
                     // A rolling digit transition here would need this string's
                     // VALUE, not its rendered text, to drive `.animation(value:)`
@@ -1406,16 +1406,6 @@ struct FleetView: View {
     private func sessionSubtitle(_ row: JoinedSession, showProject: Bool) -> String {
         [showProject ? row.project : nil, row.session.model.map(QuotaFormat.modelLabel)]
             .compactMap { $0 }.joined(separator: " · ")
-    }
-
-    /// `cacheReadTokens / (inputTokens + cacheReadTokens)`, the same ratio
-    /// the account-level cache figure already uses elsewhere in this build.
-    /// `nil` when the session has recorded no tokens at all yet, rather than
-    /// a divide-by-zero "0%" that would claim a measured cold cache.
-    private func cacheHitPercent(_ session: Session) -> Int? {
-        let total = session.inputTokens + session.cacheReadTokens
-        guard total > 0 else { return nil }
-        return Int((Double(session.cacheReadTokens) / Double(total) * 100).rounded())
     }
 
     /// `docs/design/panel-tabs-review.md` finding 2: a session with a tool
