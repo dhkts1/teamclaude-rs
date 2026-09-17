@@ -3327,7 +3327,12 @@ enum PanelTab: Equatable, CaseIterable {
 
     var title: String {
         switch self {
-        case .accounts: return "Accounts"
+        // Shortened from "Accounts" (`docs/design/panel-tabs.md` §0): at
+        // four tabs (this case plus the yet-to-land `feat/peers-panel`
+        // fourth tab) each segment gets ~85pt, and "Accounts" plus its own
+        // count badge is the one that overflows it; "Sessions" and "Tools"
+        // fit already.
+        case .accounts: return "Accts"
         case .sessions: return "Sessions"
         case .tools: return "Tools"
         }
