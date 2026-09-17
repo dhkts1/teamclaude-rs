@@ -473,7 +473,7 @@ final class FleetSectionsTests: XCTestCase {
 
 /// A row with everything but the group/state fields fixed — the same shape
 /// `GroupTagTests` uses, so the two files' fixtures cannot drift.
-// MARK: - Collapse (the mockup's MYCELIUM group)
+// MARK: - Collapse (the mockup's ORCHARD group)
 
 extension FleetSectionsTests {
 
@@ -482,7 +482,7 @@ extension FleetSectionsTests {
     func testLiveGroupOfSixCollapsesByDefault() {
         let fleet = Fleet(
             accounts: (1...6).map {
-                sectionAccount("m\($0)@example.com", groups: ["mycelium"])
+                sectionAccount("m\($0)@example.com", groups: ["orchard"])
             })
         let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
 
@@ -497,9 +497,9 @@ extension FleetSectionsTests {
     /// account is NAMED by the tally rather than hidden by it, so collapsing
     /// costs the operator nothing they could act on.
     func testNearRowDoesNotBlockCollapseAndIsNamedInTheTally() {
-        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["orchard"]) }
         accounts.append(
-            sectionAccount("m6@example.com", groups: ["mycelium"], quotaState: .near, quota: 0.6))
+            sectionAccount("m6@example.com", groups: ["orchard"], quotaState: .near, quota: 0.6))
         let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
 
         XCTAssertTrue(section.collapsesByDefault)
@@ -512,9 +512,9 @@ extension FleetSectionsTests {
     /// spent account it is INSIDE this section, and a summary line would hide
     /// the one row whose remedy is a click.
     func testNeedsReloginKeepsTheGroupOpen() {
-        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["orchard"]) }
         accounts.append(
-            sectionAccount("m6@example.com", groups: ["mycelium"], status: "error"))
+            sectionAccount("m6@example.com", groups: ["orchard"], status: "error"))
         let section = try! XCTUnwrap(
             Fleet(accounts: accounts).sectionsInDisplayOrder().first { $0.band == .live })
 
@@ -533,9 +533,9 @@ extension FleetSectionsTests {
     /// deleted: it costs nothing and it is what makes the rule true on its
     /// own terms rather than by a second file's behaviour.
     func testSpentRowLeavesTheLiveSectionEntirely() {
-        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["orchard"]) }
         accounts.append(
-            sectionAccount("m6@example.com", groups: ["mycelium"], quotaState: .spent, quota: 1))
+            sectionAccount("m6@example.com", groups: ["orchard"], quotaState: .spent, quota: 1))
         let sections = Fleet(accounts: accounts).sectionsInDisplayOrder()
         let live = try! XCTUnwrap(sections.first { $0.band == .live })
 
@@ -549,7 +549,7 @@ extension FleetSectionsTests {
     func testGroupOfThreeStaysOpen() {
         let fleet = Fleet(
             accounts: (1...3).map {
-                sectionAccount("m\($0)@example.com", groups: ["mycelium"])
+                sectionAccount("m\($0)@example.com", groups: ["orchard"])
             })
         let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
 
@@ -583,9 +583,9 @@ extension FleetSectionsTests {
     /// rows rather than carried as a string.
     func testCollapsedSummaryLineSumsTodaysSpend() {
         var accounts = (1...5).map {
-            sectionAccount("m\($0)@example.com", groups: ["mycelium"], todayCost: 1.40)
+            sectionAccount("m\($0)@example.com", groups: ["orchard"], todayCost: 1.40)
         }
-        accounts.append(sectionAccount("m6@example.com", groups: ["mycelium"], todayCost: 1.42))
+        accounts.append(sectionAccount("m6@example.com", groups: ["orchard"], todayCost: 1.42))
         let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
 
         XCTAssertEqual(section.collapsedSummaryLine, "6 accounts · $8.42 today")
@@ -596,7 +596,7 @@ extension FleetSectionsTests {
     func testCollapsedSummaryLineOmitsSpendWhenNothingIsPriced() {
         let fleet = Fleet(
             accounts: (1...6).map {
-                sectionAccount("m\($0)@example.com", groups: ["mycelium"])
+                sectionAccount("m\($0)@example.com", groups: ["orchard"])
             })
         let section = try! XCTUnwrap(fleet.sectionsInDisplayOrder().first)
 
@@ -607,8 +607,8 @@ extension FleetSectionsTests {
     /// One priced row among five unpriced ones reports what WAS priced —
     /// `UsageTotals.addCost`'s own rule, not a second summing convention.
     func testCollapsedSummaryLineReportsThePricedSubset() {
-        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["mycelium"]) }
-        accounts.append(sectionAccount("m6@example.com", groups: ["mycelium"], todayCost: 2.50))
+        var accounts = (1...5).map { sectionAccount("m\($0)@example.com", groups: ["orchard"]) }
+        accounts.append(sectionAccount("m6@example.com", groups: ["orchard"], todayCost: 2.50))
         let section = try! XCTUnwrap(Fleet(accounts: accounts).sectionsInDisplayOrder().first)
 
         XCTAssertEqual(section.collapsedSummaryLine, "6 accounts · $2.50 today")

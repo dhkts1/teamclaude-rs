@@ -2313,7 +2313,7 @@ struct FleetView: View {
         // A LIVE group of four or more whose rows all still serve traffic
         // (``FleetSection/collapsesByDefault``) renders NO cards at all: one
         // summary line, its state tally, and a button. That is the mockup's
-        // MYCELIUM group, and it is a real state rather than a clipped list —
+        // ORCHARD group, and it is a real state rather than a clipped list —
         // `snapshotMode` draws it exactly as the live panel does.
         let expanded = expandedGroups.contains(section.group.token)
         let summarised = section.collapsesByDefault && !expanded

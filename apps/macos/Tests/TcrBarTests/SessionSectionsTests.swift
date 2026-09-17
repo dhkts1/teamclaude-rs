@@ -78,10 +78,10 @@ final class SessionSectionsTests: XCTestCase {
     func testHeaderSummaryNamesCountSpendAndErrors() {
         let sessions = [
             joined(id: "s1", cwd: "/Users/alice/token", costUsd: 500, errors: 100),
-            joined(id: "s2", cwd: "/Users/alice/token", costUsd: 476, errors: 66),
+            joined(id: "s2", cwd: "/Users/alice/token", costUsd: 480, errors: 66),
         ]
         let sections = SessionSections.byProject(sessions)
-        XCTAssertEqual(sections[0].headerSummary, "2 · $976 · 166 err")
+        XCTAssertEqual(sections[0].headerSummary, "2 · $980 · 166 err")
     }
 
     /// Zero errors drops the clause entirely rather than printing "0 err".

@@ -139,13 +139,13 @@ final class ToolsTabDataTests: XCTestCase {
     /// `docs/design/tools-tab.md` writes it.
     func testSummaryLine() {
         let categories = [
-            ToolCategory(name: "Bash", calls: 19_913, medianSeconds: nil),
-            ToolCategory(name: "Agent", calls: 412, medianSeconds: nil),
-            ToolCategory(name: "Read/Grep/Edit", calls: 4_352, medianSeconds: nil),
+            ToolCategory(name: "Bash", calls: 20_000, medianSeconds: nil),
+            ToolCategory(name: "Agent", calls: 410, medianSeconds: nil),
+            ToolCategory(name: "Read/Grep/Edit", calls: 4_400, medianSeconds: nil),
         ]
         XCTAssertEqual(
             ToolCategory.summaryLine(categories, medianSeconds: 2.1),
-            "Bash 19,913 · Agent 412 · Read/Grep/Edit 4,352 · median 2.1s")
+            "Bash 20,000 · Agent 410 · Read/Grep/Edit 4,400 · median 2.1s")
     }
 
     /// No p50 anywhere means no median clause — the same silence-over-a-guess
@@ -162,9 +162,9 @@ final class ToolsTabDataTests: XCTestCase {
     func testMedianIsTheBucketTheMedianCallFallsIn() {
         let fleet = self.fleet([
             SessionTools(byTool: [
-                ToolBucketRow(tool: "Bash", calls: 19_913, secondsP50: 2.1),
-                ToolBucketRow(tool: "Agent", calls: 412, secondsP50: 400),
-                ToolBucketRow(tool: "Read", calls: 4_352, secondsP50: 0.2),
+                ToolBucketRow(tool: "Bash", calls: 20_000, secondsP50: 2.1),
+                ToolBucketRow(tool: "Agent", calls: 410, secondsP50: 400),
+                ToolBucketRow(tool: "Read", calls: 4_400, secondsP50: 0.2),
             ])
         ])
         XCTAssertEqual(fleet.toolsMedianSeconds, 2.1)
