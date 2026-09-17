@@ -76,6 +76,39 @@ MAIL_FIXTURE="some""one""@real""company.io"
 scan "see $HOME_FIXTURE" \
   && fail "an absolute home path passed the scan" \
   || ok "an absolute home path is refused"
+# Check 5, operational figures. 2026-09-17: a fixture filled in from the live
+# proxy put per-session cost, request counts and token volumes into this public
+# repository while checks 1 to 4 passed on every commit, because none of them
+# looks at a number. The rule keys on ROUNDNESS: an invented figure is round by
+# construction, a measured one is not.
+#
+# Every value below is invented. The real ones are not written here for the same
+# reason the two fixtures above are assembled at runtime: a gate's test file is
+# the one place the thing it refuses must not appear.
+for fig in 'costUsd: 777.77' 'requests: 1_234' 'cacheReadTokens: 123_456_789' 'inputTokens = 456789'; do
+  scan "  $fig" \
+    && fail "an operational figure passed the scan: $fig" \
+    || ok "refused a cost or volume read off a running system: $fig"
+done
+
+# The controls. A gate that refuses every number would make fixtures impossible,
+# so the round values a fixture is SUPPOSED to use must still pass.
+for ok_fig in 'costUsd: 300.00' 'requests: 1_500' 'cacheReadTokens: 300_000_000' 'requests: 0' 'calls: 4_100'; do
+  scan "  $ok_fig" \
+    && ok "a round fixture value still passes: $ok_fig" \
+    || fail "a round fixture value was refused: $ok_fig"
+done
+
+# A precise number on a field this check does not claim is not its business.
+scan "  let timeoutMillis = 1_234" \
+  && ok "an unrelated precise number is not an operational figure" \
+  || fail "check 5 fired on a field it does not name"
+
+# The escape hatch, for the case where a precise figure is genuinely public.
+scan "  requests: 1_234 // disclosure-ok: from the published rate-limit doc" \
+  && ok "the disclosure-ok escape hatch is honoured" \
+  || fail "the disclosure-ok escape hatch did not suppress the hit"
+
 scan "mail me at $MAIL_FIXTURE" \
   && fail "a real-looking email passed the scan" \
   || ok "a real-looking email is refused"
