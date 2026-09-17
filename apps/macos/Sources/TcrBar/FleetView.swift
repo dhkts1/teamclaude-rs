@@ -1770,7 +1770,12 @@ struct FleetView: View {
         // left" beside a call with no ring.
         let capped = entry.call.capped
         let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
-        let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
+        // The ONE expression this row and the tab's own summary line
+        // (``toolsSummaryLine``, via ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)``)
+        // both read — see ``SessionToolEntry/isNearTimeout(now:timeoutSeconds:warnWithinSeconds:)``'s
+        // own doc-comment for the mockup defect this sharing exists to prevent.
+        let isNearTimeout = entry.isNearTimeout(
+            now: now, timeoutSeconds: bashTimeoutSeconds, warnWithinSeconds: V4.toolTimeoutWarnSeconds)
         // What this call's process tree costs, and the only evidence that
         // there is a process to kill at all. `nil` — no match this poll —
         // draws no clause and no ✕: a button that signals nothing, or worse
@@ -2104,86 +2109,118 @@ struct FleetView: View {
         return "updated \(Int((elapsed / 86400).rounded()))d ago"
     }
 
-    /// Sessions tab summary — "12 sessions · 7 busy · 1 waiting · 4 idle",
-    /// `docs/design/panel-tabs-mockup.html`'s Sessions panel. Joined with
-    /// ``sessionFiles`` the same way ``sessionsList(_:)`` does, so the two
-    /// counts on this tab (the summary and the rows below it) can never
-    /// disagree about what "busy" means for a given session.
+    /// Sessions tab summary — two lines, top to bottom: a state sentence with
+    /// a right-aligned "waiting on you" count, then the numbers line.
+    /// `docs/design/panel-tabs-mockup.html`'s Sessions panel: "10 live, 4
+    /// working" / "0 waiting on you" over "$143/h · $2,995 today · $1,582
+    /// live · 10/18 accounts · 303 err".
+    ///
+    /// Joined with ``sessionFiles`` the same way ``sessionsList(_:)`` does,
+    /// through the identical ``JoinedSession/activity`` reading — so the
+    /// state line's "working"/"waiting on you" counts and the row-level dot
+    /// colour and trailing word (``activityColor(_:)``, ``trailingStatus(_:now:)``)
+    /// can never name a different session busy or waiting than the other does.
     private func sessionsSummaryLine(_ fleet: Fleet) -> some View {
         let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
-        let busy = joined.filter { $0.activity == .busy }.count
+        let working = joined.filter { $0.activity == .busy }.count
         let waiting = joined.filter { $0.activity == .waiting }.count
-        let idle = joined.count - busy - waiting
-        var line = Text("\(joined.count) sessions").font(.subheadline.weight(.semibold))
-        line =
-            line + Text(" · ").foregroundColor(Tok.inkFaint)
-            + Text("\(busy) busy").foregroundColor(Tok.ok)
-        line =
-            line + Text(" · ").foregroundColor(Tok.inkFaint)
-            + Text("\(waiting) waiting").foregroundColor(Tok.near)
-        line =
-            line + Text(" · ").foregroundColor(Tok.inkFaint)
-            + Text("\(idle) idle").foregroundColor(Tok.inkDim)
-        return
-            line
-            .font(Tok.secondaryDigitFont)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.top, Tok.tightSpacing)
-            .lineSpacing(Tok.secondaryLineSpacing)
-    }
-
-    /// Tools tab summary — "24,677 tool calls today · 405 ran over 1m · 31 hit
-    /// the 600s timeout", `docs/design/panel-tabs-mockup.html`'s Tools panel.
-    /// `toolsTotalTimeouts` IS "hit the 600s timeout": the only tool this
-    /// build tracks a timeout for is Bash, and its timeout is 600s
-    /// (``bashTimeoutSeconds``), so a counted timeout and a 600s hit are the
-    /// same event, not two facts that happen to agree.
-    private func toolsSummaryLine(_ fleet: Fleet) -> some View {
-        var line =
-            Text("\(fleet.toolsTotalCalls) tool calls today").fontWeight(.semibold)
-        if let overOneMinute = fleet.toolsOverOneMinute {
-            line =
-                line + Text(" · ").foregroundColor(Tok.inkFaint)
-                + Text("\(overOneMinute) ran over 1m").foregroundColor(Tok.inkDim)
+        var numbers: [Text] = []
+        if let hourly = fleet.burnRateSegment {
+            numbers.append(Text(hourly))
         }
-        if fleet.toolsTotalTimeouts > 0 {
-            line =
-                line + Text(" · ").foregroundColor(Tok.inkFaint)
-                + Text("\(fleet.toolsTotalTimeouts) hit the 600s timeout").foregroundColor(Tok.spent)
+        if let today = fleet.todayCost {
+            numbers.append(Text("\(QuotaFormat.usd(today)) today"))
         }
-        return VStack(alignment: .leading, spacing: 0) {
-            line
-                .font(Tok.secondaryDigitFont)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, Tok.tightSpacing)
-                .lineSpacing(Tok.secondaryLineSpacing)
-            machineLine
+        if let live = fleet.sessionsLiveCost {
+            numbers.append(Text("\(QuotaFormat.usd(live)) live"))
         }
-    }
-
-    /// "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free" —
-    /// the second question `docs/design/tools-tab.md` records the operator
-    /// arriving with ("is the box overloaded?"), which this panel answered
-    /// nowhere at all. Drawn under the tools headline, above the tabs, where
-    /// the mockup puts it.
-    ///
-    /// Only the LOAD is tinted, and it is tinted by Gil's own dispatch rule:
-    /// amber from one load unit per core, red past two, at which point the
-    /// answer to "can I start another coder" is no. Nothing is drawn until
-    /// the first reading lands — a line of zeroes would be a measurement
-    /// nobody made.
-    @ViewBuilder
-    private var machineLine: some View {
-        if let machine {
-            (Text(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint))
-                + Text(" · ").foregroundColor(Tok.inkFaint)
-                + Text(machine.restClause).foregroundColor(Tok.mute))
+        if !fleet.accounts.isEmpty {
+            numbers.append(
+                Text("\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
+        }
+        if fleet.toolsTotalErrors > 0 {
+            numbers.append(Text("\(fleet.toolsTotalErrors) err"))
+        }
+        return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            HStack(alignment: .firstTextBaseline) {
+                (Text("\(joined.count) live, ").fontWeight(.semibold)
+                    + Text("\(working) working").fontWeight(.semibold).foregroundColor(Tok.ok))
+                    .font(Tok.secondaryDigitFont)
+                Spacer(minLength: V4.buttonGap)
+                Text("\(waiting) waiting on you")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundColor(waiting > 0 ? Tok.near : Tok.mute)
+            }
+            joinedBySeparator(numbers)
                 .font(V4.font(V4.muteSize))
+                .foregroundColor(Tok.mute)
                 .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel(machine.line)
+                .lineSpacing(Tok.secondaryLineSpacing)
         }
     }
 
+    /// Tools tab summary — two lines: a state sentence ("3 running, 1 near
+    /// timeout") with a right-aligned "N in warning" account count, then the
+    /// machine/error numbers line.
+    ///
+    /// The "near timeout" count is
+    /// ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)`` —
+    /// the exact predicate RUNNING NOW's own rows colour by
+    /// (``runningToolItem(_:)``) — so this sentence cannot say "1 near
+    /// timeout" over rows that disagree with it, which is the bug in the
+    /// bridge's own mockup this rewrite exists to rule out. "N in warning" is
+    /// ``Fleet/accountsNearLimitCount``, the same count the Accounts tab's own
+    /// summary sentence already uses.
+    private func toolsSummaryLine(_ fleet: Fleet) -> some View {
+        let now = Date()
+        let running = fleet.toolsRunning.count
+        let nearTimeout = fleet.toolsNearTimeoutCount(
+            now: now, timeoutSeconds: bashTimeoutSeconds, warnWithinSeconds: V4.toolTimeoutWarnSeconds)
+        var numbers: [Text] = []
+        if let machine {
+            numbers.append(Text(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
+            numbers.append(Text(machine.restClause))
+        }
+        if fleet.toolsTotalErrors > 0 {
+            numbers.append(Text("\(fleet.toolsTotalErrors) err today"))
+        }
+        numbers.append(Text("\(fleet.toolsTotalTimeouts) timed out"))
+        return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("\(running) running, \(nearTimeout) near timeout")
+                    .font(Tok.secondaryDigitFont)
+                    .fontWeight(.semibold)
+                    .foregroundColor(nearTimeout > 0 ? Tok.spent : Tok.ink)
+                Spacer(minLength: V4.buttonGap)
+                Text("\(fleet.accountsNearLimitCount) in warning")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundColor(fleet.accountsNearLimitCount > 0 ? Tok.near : Tok.mute)
+            }
+            joinedBySeparator(numbers)
+                .font(V4.font(V4.muteSize))
+                .foregroundColor(Tok.mute)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineSpacing(Tok.secondaryLineSpacing)
+        }
+    }
+
+    /// `[Text]` joined by a dimmed " · ", the one place both summary numbers
+    /// lines build their trailing clause list — so a future third summary line
+    /// reaches for this instead of writing a fourth copy of the same
+    /// `reduce`.
+    private func joinedBySeparator(_ parts: [Text]) -> Text {
+        parts.enumerated().reduce(Text("")) { acc, entry in
+            let (index, part) = entry
+            return index == 0 ? part : acc + Text(" · ").foregroundColor(Tok.inkFaint) + part
+        }
+    }
+
+    /// Only the LOAD clause of the Tools numbers line is tinted, by Gil's own
+    /// dispatch rule: amber from one load unit per core, red past two, at
+    /// which point the answer to "can I start another coder" is no. The rest
+    /// of that line (memory, compiles, disk, errors, timeouts) is never
+    /// tinted — one coloured clause on a line is a signal, several are
+    /// decoration.
     private func machineLoadTint(_ tint: MachineStats.LoadTint) -> Color {
         switch tint {
         case .calm: return Tok.mute

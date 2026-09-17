@@ -1368,6 +1368,28 @@ public struct SessionToolEntry: Identifiable, Equatable, Sendable {
         self.sessionId = sessionId
         self.call = call
     }
+
+    /// Is this RUNNING call, as of `now`, inside the timeout warning band?
+    ///
+    /// The ONE expression both the Tools tab summary's "N near timeout" count
+    /// (``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)``)
+    /// and the RUNNING NOW row's own ring/tint read (`FleetView.runningToolItem`)
+    /// — hoisted here after a defect in the panel's own mockup printed "3
+    /// running, none near timeout" above three rows the mockup itself drew red,
+    /// because the summary sentence recomputed the count by hand instead of
+    /// reading what coloured the rows. A summary line that can disagree with the
+    /// rows beneath it is worse than no summary line.
+    ///
+    /// `false` for any call this build knows no cap for — ``ToolCall/capped``
+    /// is `Bash`-only, so an `Agent` or a `Read` can never be "near" a timeout
+    /// it does not have — and `false` for a call with no ``ToolCall/startedMs``,
+    /// which has no elapsed time to compare against a deadline at all.
+    public func isNearTimeout(now: Date, timeoutSeconds: Double, warnWithinSeconds: Double) -> Bool {
+        guard call.capped, let startedMs = call.startedMs else { return false }
+        let elapsed = max(
+            0, now.timeIntervalSince(Date(timeIntervalSince1970: Double(startedMs) / 1000)))
+        return (timeoutSeconds - elapsed) <= warnWithinSeconds
+    }
 }
 
 public struct Account: Decodable, Equatable, Identifiable, Sendable {
@@ -2817,6 +2839,25 @@ public struct Fleet: Equatable, Sendable {
     public var toolsTotalErrors: Int { sessions.reduce(0) { $0 + $1.tools.errors } }
     public var toolsTotalTimeouts: Int { sessions.reduce(0) { $0 + $1.tools.timeouts } }
 
+    /// What every currently-live session has cost, summed — the Sessions
+    /// summary's "$1,582 live" clause. Distinct from ``todayCost``: that sums
+    /// every ACCOUNT's `usage.today`, including traffic from sessions that have
+    /// already aged out of ``sessions``; this sums only the sessions the proxy
+    /// still has open right now. `nil` only when not one live session could be
+    /// priced — the same "never a fabricated zero" rule ``todayCost`` follows.
+    public var sessionsLiveCost: Double? {
+        sessions.reduce(nil) { UsageTotals.addCost($0, $1.costUsd) }
+    }
+
+    /// How many distinct accounts the live sessions are attributed to, over how
+    /// many accounts exist at all — the Sessions summary's "10/18 accounts".
+    /// A session with no attributed account (``Session/account`` `nil`) does
+    /// not count toward the numerator: it is not evidence that some particular
+    /// account is active.
+    public var sessionsDistinctAccountCount: Int {
+        Set(sessions.compactMap(\.account)).count
+    }
+
     /// `nil`, not `0`, when not one session reports ``SessionTools/overOneMinute``
     /// — against today's server, that is every session, and the Tools tab
     /// summary line drops its own clause rather than claim a measured zero.
@@ -2936,6 +2977,20 @@ public struct Fleet: Equatable, Sendable {
         }
     }
 
+    /// How many of ``toolsRunning`` are inside the timeout warning band right
+    /// now — the Tools tab summary's "N near timeout" clause, read through
+    /// ``SessionToolEntry/isNearTimeout(now:timeoutSeconds:warnWithinSeconds:)``,
+    /// the same predicate the RUNNING NOW row itself colours by. See that
+    /// method's own doc-comment for the defect this sharing exists to prevent.
+    public func toolsNearTimeoutCount(now: Date, timeoutSeconds: Double, warnWithinSeconds: Double)
+        -> Int
+    {
+        toolsRunning.filter {
+            $0.isNearTimeout(
+                now: now, timeoutSeconds: timeoutSeconds, warnWithinSeconds: warnWithinSeconds)
+        }.count
+    }
+
     /// The ten slowest calls across every session, longest first. Each
     /// session already reports its own ten slowest, so pooling `N` sessions' lists and re-sorting before taking the
     /// top ten is correct without asking the server for more than ten per
@@ -3051,6 +3106,16 @@ public struct Fleet: Equatable, Sendable {
     /// The denominator of the headline: accounts that *could* serve.
     public var enabledCount: Int { enabledAccounts.count }
 
+    /// Enabled accounts near their quota threshold — the same test
+    /// ``capacityGlyphState`` and ``countsSentence`` both need, hoisted here so
+    /// a future third caller (the Tools/Sessions tab's own "N in warning"
+    /// clause) cannot spell it a third way.
+    public var accountsNearLimitCount: Int {
+        enabledAccounts.filter {
+            $0.hasQuotaEvidence && $0.quotaState == .near && $0.health != .needsRelogin
+        }.count
+    }
+
     /// The soonest reset among the enabled accounts that are not ready — i.e.
     /// when the fleet next gets capacity back. `nil` when nothing is held.
     public var soonestRecovery: HeldWindow? {
@@ -3164,11 +3229,8 @@ public struct Fleet: Equatable, Sendable {
         let readyNoun = enabledCount == 1 ? "account" : "accounts"
         var clauses = ["\(readyCount) of \(enabledCount) \(readyNoun) ready"]
 
-        let nearLimitCount = enabledAccounts.filter {
-            $0.hasQuotaEvidence && $0.quotaState == .near && $0.health != .needsRelogin
-        }.count
-        if nearLimitCount > 0 {
-            clauses.append("\(nearLimitCount) near their limit")
+        if accountsNearLimitCount > 0 {
+            clauses.append("\(accountsNearLimitCount) near their limit")
         }
 
         if unmeasuredCount > 0 {
