@@ -74,11 +74,27 @@
 name: Appcast feed guard
 
 on:
+  # DEAD ON ARRIVAL, kept as documentation. GitHub does not raise events for
+  # actions taken with the default GITHUB_TOKEN, and `release.yml` (cargo-dist)
+  # creates the Release with `secrets.GITHUB_TOKEN`. Measured 2026-09-17 over
+  # this workflow's entire history: 100 runs, 100 of them `workflow_run`, ZERO
+  # `release`. The trigger that names the exact fact this job guards has never
+  # once fired and cannot, so the two below are what actually runs it.
   release:
     types: [published]
+  # Prompt but EARLY: this fires when a workflow finishes, which is not the same
+  # fact as "a Release now serves the feed". On 2026-09-17 it fired nine seconds
+  # into the v1.1.7 tag build, minutes before cargo-dist had created anything.
+  # The job now waits for the Release rather than asserting about its absence.
   workflow_run:
     workflows: ["Release", "Release app"]
     types: [completed]
+  # The backstop, and the only trigger no token policy and no race can suppress.
+  # It reads the live feed URL instead of reasoning about events, so a release
+  # that orphaned the feed is repaired within the interval even if every other
+  # trigger missed it. Off-the-hour on purpose.
+  schedule:
+    - cron: '17 */6 * * *'
   # Manual repair hatch: if a release is already orphaning the feed, run this
   # against it rather than uploading by hand.
   workflow_dispatch:
@@ -122,6 +138,8 @@ jobs:
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push' &&
        startsWith(github.event.workflow_run.head_branch, 'v'))
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -135,6 +153,7 @@ jobs:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           DISPATCH_TAG: ${{ inputs.tag }}
           RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -142,6 +161,18 @@ jobs:
             tag="${RELEASE_TAG}"
           elif [ -n "${DISPATCH_TAG}" ]; then
             tag="${DISPATCH_TAG}"
+          elif [ "${EVENT_NAME}" = "schedule" ]; then
+            # The sweep has no tag to be handed one. It asks the same question
+            # the failure class is about: which release is /releases/latest/
+            # serving right now? An empty answer means the repository has no
+            # published release at all, which is not a fault.
+            tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+            if [ -z "${tag}" ]; then
+              echo "no published release in this repository — nothing is serving the feed."
+              echo "tag=" >>"${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "sweep: /releases/latest/ currently serves ${tag}"
           elif [ -n "${RUN_SHA}" ]; then
             tag="$(git tag --points-at "${RUN_SHA}" | head -1)"
             if [ -z "${tag}" ]; then
@@ -158,22 +189,56 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.resolve.outputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
           if [ -z "${TAG}" ]; then
+            # The scheduled sweep resolves an empty tag when the repository has
+            # no published release. That is a legitimate state, not a fault.
+            if [ "${EVENT_NAME}" = "schedule" ]; then
+              echo "no release to check."
+              exit 0
+            fi
             echo "::error::no tag resolved from the event or input"
             exit 1
           fi
 
-          # A draft release is not yet served by /releases/latest/, so there is
-          # nothing to protect and uploading would publish nothing useful.
-          if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = "true" ]; then
+          # ONE read, classified THREE ways. The previous version asked twice and
+          # had two branches for three states, so a Release that did not exist
+          # fell through both: `gh release view` writes "release not found" to
+          # stderr and nothing to stdout, so `"" = "true"` was false, and the
+          # assets test read GREP's exit status rather than gh's. Control then
+          # reached the upload and announced that a Release which was not there
+          # "has no appcast.xml and is serving the Sparkle feed". Measured on
+          # the v1.1.7 tag, 2026-09-17.
+          #
+          # The absent case is also the EXPECTED one on a workflow_run trigger:
+          # that fires when a workflow finishes, which can be minutes before
+          # cargo-dist has created anything. So absence gets a bounded wait
+          # rather than an immediate verdict, and a verdict of "still nothing"
+          # is a clean exit, because nothing that does not exist can serve a
+          # feed.
+          deadline=$(( $(date +%s) + 600 ))
+          rel=""
+          while :; do
+            if rel="$(gh release view "$TAG" --json isDraft,assets 2>/dev/null)"; then
+              break
+            fi
+            if [ "${EVENT_NAME}" != "workflow_run" ] || [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "no Release exists for $TAG — nothing is serving the feed, nothing to protect."
+              exit 0
+            fi
+            echo "waiting for the Release for $TAG to be created…"
+            sleep 20
+          done
+
+          if [ "$(printf '%s' "$rel" | jq -r .isDraft)" = "true" ]; then
             echo "$TAG is a draft — /releases/latest/ does not point at it yet; nothing to do."
             exit 0
           fi
 
-          if gh release view "$TAG" --json assets --jq '.assets[].name' | grep -qx 'appcast.xml'; then
+          if printf '%s' "$rel" | jq -e '.assets[] | select(.name == "appcast.xml")' >/dev/null; then
             echo "$TAG already carries appcast.xml — leaving it alone."
             echo "(A real TcrBar release uploads its own; this must never overwrite it.)"
             exit 0
