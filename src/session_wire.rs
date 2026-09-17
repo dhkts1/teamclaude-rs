@@ -3179,93 +3179,91 @@ mod tests {
         );
     }
 
-    /// Split a golden-fixture TSV into `(raw, expected)` pairs. Almost every row is one
-    /// physical line, but a handful of `expected` columns hold a genuine embedded newline
-    /// (the reference reduction can retain ONE inside a quote, and the file's own escaping
-    /// only escapes a raw command's newlines for column 1 — column 2 is written verbatim). A
-    /// continuation line (no tab at all) is folded into the PREVIOUS record's `expected`
-    /// field with the real newline it was split on put back.
-    fn parse_golden_tsv(contents: &str) -> Vec<(String, String)> {
-        let mut records: Vec<(String, String)> = Vec::new();
-        for line in contents.lines() {
-            match line.split_once('\t') {
-                Some((raw, expected)) => records.push((raw.to_string(), expected.to_string())),
-                None => {
-                    if let Some((_, expected)) = records.last_mut() {
-                        expected.push('\n');
-                        expected.push_str(line);
-                    }
-                }
-            }
-        }
-        records
-    }
-
-    /// Undo the golden file's escaping of a raw command's embedded newlines (`\n`, two literal
-    /// characters) back to a real newline character, so the reconstructed raw text is what
-    /// [`identity::identity`] actually runs on. This is LOSSY in one direction the golden file
-    /// itself cannot avoid: a command whose ORIGINAL text already contained a literal 2-char
-    /// `\n` sequence (a regex escape inside a `sed`/`perl`/`rg` pattern, say) is indistinguishable
-    /// in column 1 from an escaped real newline — both are the same two characters once
-    /// written to the TSV. `golden_corpus_agreement`'s mismatch count is dominated by exactly
-    /// this: proven by feeding the reference Python port itself the same reconstruction (see
-    /// the FINAL-REPORT), which reproduces the identical mismatch set — so it is the fixture's
-    /// own round-trip, not a port defect.
-    fn unescape_golden_command(raw_escaped: &str) -> String {
-        raw_escaped.replace("\\n", "\n")
-    }
-
-    /// The number of golden rows whose reconstructed raw command is genuinely ambiguous (see
-    /// [`unescape_golden_command`]) — the reference Python port itself disagrees with the
-    /// golden file on exactly this many rows when fed the identical reconstruction, so this is
-    /// the fixture's own irreducible ceiling, not a budget for new Rust-vs-Python drift. A rise
-    /// above this number is a real regression; report it.
-    const KNOWN_GOLDEN_ROUND_TRIP_AMBIGUITIES: usize = 141;
-
-    /// Agreement check against the 40,589-row golden fixture (real Bash commands harvested
-    /// from `~/.claude/projects/`, paired with the reference Python port's expected identity —
-    /// see `docs/design/tools-tab.md`). `#[ignore]`d and the fixture is never committed to this
-    /// PUBLIC repo: the corpus is one person's real command history (live paths, customer
-    /// UUIDs turn up in it), and a test that panics when an external, non-repo file is absent
-    /// would break `cargo test --all` for everyone else. Run explicitly:
-    /// `cargo test --lib -- --ignored golden_corpus_agreement`, optionally with
-    /// `GOLDEN_TSV_PATH` pointing elsewhere.
+    /// Every shape the identity reducer has to survive, one row each, with the reason it is
+    /// here. Each case is drawn from a corpus of 40,589 real Bash commands, rewritten with
+    /// `alice`-style paths because this repository is public.
+    ///
+    /// This replaces an `#[ignore]`d check that read a 40,589-row fixture out of `/tmp`. That
+    /// one could not fail for the right reason and could fail for a wrong one: CI never ran
+    /// it, it returned early (passing) whenever the file was absent, and it asserted an EXACT
+    /// mismatch count, so handing it a cleaner fixture made it go red. A table that always
+    /// runs beats a corpus that never does.
     #[test]
-    #[ignore = "reads an external, non-repo fixture of real command history — see doc comment"]
-    fn golden_corpus_agreement() {
-        let path = std::env::var("GOLDEN_TSV_PATH")
-            .unwrap_or_else(|_| "/tmp/tcr-ghosts/GOLDEN.tsv".to_string());
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            eprintln!("golden_corpus_agreement: {path} not present, skipping");
-            return;
-        };
-        let records = parse_golden_tsv(&contents);
-        assert!(!records.is_empty(), "parsed zero rows out of {path}");
-
-        let mut mismatches: Vec<(usize, String, String, String)> = Vec::new();
-        for (i, (raw_escaped, expected)) in records.iter().enumerate() {
-            let raw = unescape_golden_command(raw_escaped);
-            let got = identity::identity(&raw);
-            if &got != expected {
-                mismatches.push((i, raw_escaped.clone(), expected.clone(), got));
-            }
+    fn identity_reduces_every_shape_the_corpus_contains() {
+        // (raw command, expected identity, why this row exists)
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "W=/Users/alice/wt/job-1612; git -C $W status --short | head",
+                "git -C $W status --short",
+                "a bare assignment is not a command; taking its name yielded `W` 1,177 times",
+            ),
+            (
+                "/opt/homebrew/bin/bash /tmp/hand.sh JOB-1 2>&1 | tail -6",
+                "bash hand.sh JOB-1",
+                "slicing by verb length cut into the path and yielded `bash bash` 413 times",
+            ),
+            (
+                "cd /Users/alice/git/x || exit; rg -n foo src/",
+                "rg -n foo src/",
+                "the right side of || is an error handler, never the identity",
+            ),
+            (
+                "sed -i 's|aaa|bbb|' file.py",
+                "sed -i 's|aaa|bbb|' file.py",
+                "separators INSIDE quotes must not split; a regex split yielded `sed -i 's`",
+            ),
+            (
+                "cd X && (make build > /tmp/a.log 2>&1; echo done)",
+                "make build ; echo done",
+                "a subshell's closing paren must not survive as an orphan",
+            ),
+            (
+                "python3 -c \"import json\" 2>/dev/null",
+                "python3 -c \u{2039}script\u{203a}",
+                "an inline script is not a filename",
+            ),
+            (
+                "CARGO_TARGET_DIR=/x/y timeout 590 cargo check --manifest-path Cargo.toml",
+                "cargo check --manifest-path Cargo.toml",
+                "env prefix and wrapper both strip before the verb is read",
+            ),
+            (
+                "cat > /tmp/out.txt <<EOF\nhi\nEOF",
+                "cat > /tmp/out.txt",
+                "for a heredoc that writes a file, the file IS the point",
+            ),
+            (
+                "for i in 1 2 3; do echo $i; done",
+                "for i in 1 2 3",
+                "a control structure keeps its own opening clause",
+            ),
+            (
+                "printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'",
+                "printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\u{2026}'",
+                "one long quoted token must be cut and REPAIRED, not trimmed back to the bare verb",
+            ),
+        ];
+        for (raw, expected, why) in cases {
+            assert_eq!(&identity::identity(raw), expected, "{why}\n  raw: {raw:?}");
         }
+    }
 
-        let total = records.len();
-        let agree = total - mismatches.len();
-        eprintln!(
-            "golden_corpus_agreement: {agree}/{total} exact matches, {} mismatches",
-            mismatches.len()
+    /// The repair is forward, never backward. Trimming back to the last balanced position is
+    /// what produced a bare `rg -n` for 532 commands: the argument was thrown away to keep the
+    /// result well-formed. Closing the quote keeps both.
+    #[test]
+    fn an_unterminated_cut_is_closed_rather_than_discarded() {
+        let raw =
+            "rg -n \"enum PanelTab|case sessions|case tools|case accounts|case activity\" src/";
+        let got = identity::identity(raw);
+        assert!(
+            got.len() > 20,
+            "a repair that keeps only the flags has discarded the argument: {got:?}"
         );
-        for (i, raw, expected, got) in mismatches.iter().take(5) {
-            eprintln!("  row {i}: raw={raw:?}\n    expected={expected:?}\n    got={got:?}");
-        }
-
         assert_eq!(
-            mismatches.len(),
-            KNOWN_GOLDEN_ROUND_TRIP_AMBIGUITIES,
-            "mismatch count moved off the known fixture-ambiguity ceiling — see \
-             KNOWN_GOLDEN_ROUND_TRIP_AMBIGUITIES's doc comment"
+            got.matches('"').count() % 2,
+            0,
+            "the identity must not end inside a quote: {got:?}"
         );
     }
 }
