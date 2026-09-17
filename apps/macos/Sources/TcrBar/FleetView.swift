@@ -1723,10 +1723,12 @@ struct FleetView: View {
         }
         // Only a Bash call HAS a timeout to be near: an Agent or a Read has no
         // cap this build knows, so it draws no ring and can never be "20s
-        // from" anything. ONE expression decides that, and the ring, the tint
-        // and the label all read it — the first draft decided it per site and
-        // printed "17s left" beside a call with no ring.
-        let capped = entry.call.tool == "Bash"
+        // from" anything. `ToolCall.capped` is the ONE place that decides
+        // that — the running list's own sort (`Fleet.toolsRunning`) reads the
+        // same property — and the ring, the tint and the label all read it
+        // here too; the first draft decided it per site and printed "17s
+        // left" beside a call with no ring.
+        let capped = entry.call.capped
         let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
         let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
         // What this call's process tree costs, and the only evidence that

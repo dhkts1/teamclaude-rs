@@ -75,7 +75,8 @@ final class ToolsTabDataTests: XCTestCase {
 
     // MARK: - RUNNING NOW
 
-    /// Longest-running first: the call nearest its timeout is the one the
+    /// Among calls that share the same cappedness, oldest first: the call
+    /// nearest its timeout (or simply the longest-standing) is the one the
     /// operator came to the tab for.
     func testRunningCallsSortOldestFirst() {
         let running = fleet([
@@ -86,6 +87,50 @@ final class ToolsTabDataTests: XCTestCase {
             ])
         ]).toolsRunning
         XCTAssertEqual(running.map(\.call.commandHead), ["old", "young", "no start time"])
+    }
+
+    /// A capped call (`Bash`) outranks an uncapped one (`Agent`) even when it
+    /// started far more recently — only the capped call can be near a
+    /// timeout, so it must not be buried under an Agent that has simply run
+    /// longer. Watched failing before the fix: pre-fix `toolsRunning` sorted
+    /// purely on `startedMs`, so the 2-hour Agent (older `startedMs`) sorted
+    /// FIRST and the near-timeout Bash call sorted second — the assertion
+    /// below failed with `["long-running agent", "near timeout"]`.
+    func testCappedCallsOutrankUncappedRegardlessOfAge() {
+        let twoHoursAgoMs: Int64 = 5_000
+        let nineMinutesAgoMs: Int64 = 4_000_000
+        let running = fleet([
+            SessionTools(running: [
+                ToolCall(tool: "Agent", commandHead: "long-running agent", startedMs: twoHoursAgoMs),
+                ToolCall(tool: "Bash", commandHead: "near timeout", startedMs: nineMinutesAgoMs),
+            ])
+        ]).toolsRunning
+        XCTAssertEqual(running.map(\.call.commandHead), ["near timeout", "long-running agent"])
+    }
+
+    /// Ties among capped calls still break oldest-first.
+    func testCappedTiesStayOldestFirst() {
+        let running = fleet([
+            SessionTools(running: [
+                ToolCall(tool: "Bash", commandHead: "younger bash", startedMs: 5_000),
+                ToolCall(tool: "Agent", commandHead: "an agent", startedMs: 1_000),
+                ToolCall(tool: "Bash", commandHead: "older bash", startedMs: 2_000),
+            ])
+        ]).toolsRunning
+        XCTAssertEqual(running.map(\.call.commandHead), ["older bash", "younger bash", "an agent"])
+    }
+
+    /// A call with no `startedMs` still sorts last, capped or not.
+    func testCallWithNoStartTimeStillSortsLast() {
+        let running = fleet([
+            SessionTools(running: [
+                ToolCall(tool: "Bash", commandHead: "no start time"),
+                ToolCall(tool: "Agent", commandHead: "an agent", startedMs: 9_000),
+                ToolCall(tool: "Bash", commandHead: "a bash call", startedMs: 1_000),
+            ])
+        ]).toolsRunning
+        XCTAssertEqual(
+            running.map(\.call.commandHead), ["a bash call", "an agent", "no start time"])
     }
 
     // MARK: - BY TOOL
