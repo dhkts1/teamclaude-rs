@@ -1214,55 +1214,62 @@ struct FleetView: View {
         }
     }
 
+    /// Grouped by PROJECT, not account — `docs/design/panel-tabs.md` §3:
+    /// account is already the Accounts tab's whole job, and on the live fleet
+    /// the biggest account bucket holds 90% of sessions while the biggest
+    /// project bucket holds 50%. ``SessionSections/byProject(_:)`` does the
+    /// grouping and the ordering; nothing here re-derives either.
     private func sessionsList(_ sessions: [JoinedSession]) -> some View {
-        let byAccount = Dictionary(grouping: sessions) { $0.session.account ?? "" }
-        // Unassigned (`""`) sorts last; named accounts sort by name so the
-        // list order does not reshuffle between two polls that carry
-        // identical data.
-        let order = byAccount.keys.sorted { lhs, rhs in
-            if lhs.isEmpty != rhs.isEmpty { return rhs.isEmpty }
-            return lhs < rhs
-        }
-        // The cap is across the WHOLE tab, not per account — the mockup's own
+        let sections = SessionSections.byProject(sessions)
+        // The cap is across the WHOLE tab, not per project — the mockup's own
         // button counts that way ("Show 7 more sessions") — so the budget is
-        // spent walking the accounts in display order and stops mid-account if
-        // that is where the fifth session falls.
+        // spent walking sections in their own (spend) order and stops
+        // mid-section if that is where the fifth session falls.
         let limit = sessionsExpanded ? Int.max : Self.sessionsVisibleRows
         var remaining = limit
-        var visible: [(key: String, rows: [JoinedSession])] = []
-        for key in order {
+        var visible: [SessionProjectSection] = []
+        for section in sections {
             guard remaining > 0 else { break }
-            let rows = Array((byAccount[key] ?? []).prefix(remaining))
+            let rows = Array(section.rows.prefix(remaining))
             remaining -= rows.count
-            visible.append((key, rows))
+            visible.append(SessionProjectSection(key: section.key, rows: rows))
         }
         let hidden = sessions.count - visible.reduce(0) { $0 + $1.rows.count }
         // `Tok.cardGap` — the same gap the Accounts tab's own list uses.
         return VStack(alignment: .leading, spacing: Tok.cardGap) {
-            ForEach(visible, id: \.key) { entry in
-                // v4-spec: each account's session block is a card, with the
-                // account name as its first row and the sessions indented
-                // under a 2px left rule.
-                V4Card {
-                    V4Row {
-                        NameText(text: entry.key.isEmpty ? "Unassigned" : entry.key)
-                            .layoutPriority(1)
-                    } trailing: {
-                        DimText(text: sessionBlockSummary(entry.rows)).fixedSize()
-                    }
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(entry.rows) { row in
-                            sessionRow(row)
-                                .padding(.vertical, V4.sessRowPaddingV)
+            ForEach(visible) { section in
+                if section.hasHeader {
+                    // v4-spec: each project's session block is a card, with
+                    // the project name as its first row and the sessions
+                    // indented under a 2px left rule.
+                    V4Card {
+                        V4Row {
+                            NameText(text: section.key.title).layoutPriority(1)
+                        } trailing: {
+                            DimText(text: section.headerSummary).fixedSize()
+                        }
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(section.rows) { row in
+                                sessionRow(row, showProjectTag: false)
+                                    .padding(.vertical, V4.sessRowPaddingV)
+                            }
+                        }
+                        // `.sess{margin:8px 0 2px;padding-left:10px;
+                        // border-left:2px solid var(--line)}`.
+                        .padding(.top, V4.sessMarginTop)
+                        .padding(.bottom, V4.sessMarginBottom)
+                        .padding(.leading, V4.sessPaddingLeft)
+                        .overlay(alignment: .leading) {
+                            Rectangle().fill(Tok.cardLine).frame(width: V4.sessRuleWidth)
                         }
                     }
-                    // `.sess{margin:8px 0 2px;padding-left:10px;
-                    // border-left:2px solid var(--line)}`.
-                    .padding(.top, V4.sessMarginTop)
-                    .padding(.bottom, V4.sessMarginBottom)
-                    .padding(.leading, V4.sessPaddingLeft)
-                    .overlay(alignment: .leading) {
-                        Rectangle().fill(Tok.cardLine).frame(width: V4.sessRuleWidth)
+                } else {
+                    // A project with fewer than two sessions draws no header
+                    // (``SessionProjectSection/hasHeader``): its one session
+                    // is an ordinary row, tagged with its own dim project
+                    // name instead of sitting under a one-row card.
+                    ForEach(section.rows) { row in
+                        sessionRow(row, showProjectTag: true)
                     }
                 }
             }
@@ -1273,22 +1280,6 @@ struct FleetView: View {
                 ) { toggleSessionsExpansion() }
             }
         }
-    }
-
-    /// "3 sessions · $9.41" — the trailing half of a session card's first row.
-    ///
-    /// The spend clause is dropped when not one session in the block was
-    /// priced (``Session/costUsd`` is absent on any server built before wire
-    /// 2), never printed as `$0.00`: the same rule the account cards' own
-    /// spend line follows, through the same ``UsageTotals/addCost(_:_:)``.
-    private func sessionBlockSummary(_ rows: [JoinedSession]) -> String {
-        var spend: Double?
-        for row in rows {
-            spend = UsageTotals.addCost(spend, row.session.costUsd)
-        }
-        let noun = rows.count == 1 ? "session" : "sessions"
-        guard let spend else { return "\(rows.count) \(noun)" }
-        return "\(rows.count) \(noun) · \(QuotaFormat.usd(spend))"
     }
 
     /// An idle (or unknown-state) session draws ONE line — dot, name,
@@ -1303,14 +1294,21 @@ struct FleetView: View {
         { $0 == .idle || $0 == .unknown }
     }
 
+    /// `showProjectTag` is true only for a row drawn WITHOUT a project header
+    /// above it — ``SessionProjectSection/hasHeader`` false, the "fewer than
+    /// two sessions" case — so its own project name has nowhere else to
+    /// appear on screen. A row already sitting under a project header omits
+    /// it: the header already said which project, and repeating it on every
+    /// row is the exact restatement `docs/design/panel-tabs.md` §3 exists to
+    /// avoid.
     @ViewBuilder
-    private func sessionRow(_ row: JoinedSession) -> some View {
+    private func sessionRow(_ row: JoinedSession, showProjectTag: Bool) -> some View {
         if isCompactRow(row.activity) {
             V4Row {
                 HStack(spacing: V4.dotTrailingGap) {
                     StatusDot(activity: row.activity)
                     NameText(text: row.displayName)
-                    DimText(text: sessionSubtitle(row))
+                    DimText(text: sessionSubtitle(row, showProject: showProjectTag))
                 }
                 .layoutPriority(1)
             } trailing: {
@@ -1340,7 +1338,7 @@ struct FleetView: View {
                 // the right of the row, as the mockup wraps it. Kept
                 // inline, it competes with a 64 pt sparkline for the same width
                 // and the SESSION NAME is what loses — "teamclau…".
-                DimText(text: sessionSubtitle(row))
+                DimText(text: sessionSubtitle(row, showProject: showProjectTag))
                 HStack(spacing: 0) {
                     Text("\(row.session.requests) req")
                         .monospacedDigit()
@@ -1361,13 +1359,13 @@ struct FleetView: View {
                         Text(" · \(QuotaFormat.usd(cost))").monospacedDigit()
                             .lineLimit(1).layoutPriority(1)
                     }
-                    if let cache = cacheHitPercent(row.session) {
-                        Text(" · cache \(cache)%").monospacedDigit()
-                            .lineLimit(1).layoutPriority(1)
-                    }
-                    // Zero, not the row gap: the pair fits across the block's
-                    // 312 pt with nothing to spare, and 8 pt of enforced gap is
-                    // what pushed `· cache 97%` onto a second line.
+                    // `cache %` is GONE (`docs/design/panel-tabs.md` §3):
+                    // measured across all ten live sessions at the time this
+                    // rewrite was made, it carried exactly one distinct value
+                    // (100) — a field with one value across every row is not
+                    // information, and the pt it cost is better spent letting
+                    // the trailing duration column (``sessionStatusLine(_:now:)``)
+                    // breathe.
                     Spacer(minLength: 0)
                     // A rolling digit transition here would need this string's
                     // VALUE, not its rendered text, to drive `.animation(value:)`
@@ -1400,19 +1398,14 @@ struct FleetView: View {
     /// this row reads "opus-5", not the wire's "claude-opus-5", matching the
     /// mockup exactly instead of growing a second, subtly different
     /// shortener.
-    private func sessionSubtitle(_ row: JoinedSession) -> String {
-        [row.project, row.session.model.map(QuotaFormat.modelLabel)]
+    ///
+    /// `showProject` is false for a row sitting under a project header
+    /// (``sessionsList(_:)``'s headed branch): the header already names the
+    /// project, and stating it again on every row under it is exactly the
+    /// restatement the project-header rewrite exists to remove.
+    private func sessionSubtitle(_ row: JoinedSession, showProject: Bool) -> String {
+        [showProject ? row.project : nil, row.session.model.map(QuotaFormat.modelLabel)]
             .compactMap { $0 }.joined(separator: " · ")
-    }
-
-    /// `cacheReadTokens / (inputTokens + cacheReadTokens)`, the same ratio
-    /// the account-level cache figure already uses elsewhere in this build.
-    /// `nil` when the session has recorded no tokens at all yet, rather than
-    /// a divide-by-zero "0%" that would claim a measured cold cache.
-    private func cacheHitPercent(_ session: Session) -> Int? {
-        let total = session.inputTokens + session.cacheReadTokens
-        guard total > 0 else { return nil }
-        return Int((Double(session.cacheReadTokens) / Double(total) * 100).rounded())
     }
 
     /// `docs/design/panel-tabs-review.md` finding 2: a session with a tool
@@ -1770,7 +1763,12 @@ struct FleetView: View {
         // left" beside a call with no ring.
         let capped = entry.call.capped
         let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
-        let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
+        // The ONE expression this row and the tab's own summary line
+        // (``toolsSummaryLine``, via ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)``)
+        // both read — see ``SessionToolEntry/isNearTimeout(now:timeoutSeconds:warnWithinSeconds:)``'s
+        // own doc-comment for the mockup defect this sharing exists to prevent.
+        let isNearTimeout = entry.isNearTimeout(
+            now: now, timeoutSeconds: bashTimeoutSeconds, warnWithinSeconds: V4.toolTimeoutWarnSeconds)
         // What this call's process tree costs, and the only evidence that
         // there is a process to kill at all. `nil` — no match this poll —
         // draws no clause and no ✕: a button that signals nothing, or worse
@@ -2104,86 +2102,118 @@ struct FleetView: View {
         return "updated \(Int((elapsed / 86400).rounded()))d ago"
     }
 
-    /// Sessions tab summary — "12 sessions · 7 busy · 1 waiting · 4 idle",
-    /// `docs/design/panel-tabs-mockup.html`'s Sessions panel. Joined with
-    /// ``sessionFiles`` the same way ``sessionsList(_:)`` does, so the two
-    /// counts on this tab (the summary and the rows below it) can never
-    /// disagree about what "busy" means for a given session.
+    /// Sessions tab summary — two lines, top to bottom: a state sentence with
+    /// a right-aligned "waiting on you" count, then the numbers line.
+    /// `docs/design/panel-tabs-mockup.html`'s Sessions panel: "10 live, 4
+    /// working" / "0 waiting on you" over "$143/h · $2,995 today · $1,582
+    /// live · 10/18 accounts · 303 err".
+    ///
+    /// Joined with ``sessionFiles`` the same way ``sessionsList(_:)`` does,
+    /// through the identical ``JoinedSession/activity`` reading — so the
+    /// state line's "working"/"waiting on you" counts and the row-level dot
+    /// colour and trailing word (``activityColor(_:)``, ``trailingStatus(_:now:)``)
+    /// can never name a different session busy or waiting than the other does.
     private func sessionsSummaryLine(_ fleet: Fleet) -> some View {
         let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
-        let busy = joined.filter { $0.activity == .busy }.count
+        let working = joined.filter { $0.activity == .busy }.count
         let waiting = joined.filter { $0.activity == .waiting }.count
-        let idle = joined.count - busy - waiting
-        var line = Text("\(joined.count) sessions").font(.subheadline.weight(.semibold))
-        line =
-            line + Text(" · ").foregroundColor(Tok.inkFaint)
-            + Text("\(busy) busy").foregroundColor(Tok.ok)
-        line =
-            line + Text(" · ").foregroundColor(Tok.inkFaint)
-            + Text("\(waiting) waiting").foregroundColor(Tok.near)
-        line =
-            line + Text(" · ").foregroundColor(Tok.inkFaint)
-            + Text("\(idle) idle").foregroundColor(Tok.inkDim)
-        return
-            line
-            .font(Tok.secondaryDigitFont)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.top, Tok.tightSpacing)
-            .lineSpacing(Tok.secondaryLineSpacing)
-    }
-
-    /// Tools tab summary — "24,677 tool calls today · 405 ran over 1m · 31 hit
-    /// the 600s timeout", `docs/design/panel-tabs-mockup.html`'s Tools panel.
-    /// `toolsTotalTimeouts` IS "hit the 600s timeout": the only tool this
-    /// build tracks a timeout for is Bash, and its timeout is 600s
-    /// (``bashTimeoutSeconds``), so a counted timeout and a 600s hit are the
-    /// same event, not two facts that happen to agree.
-    private func toolsSummaryLine(_ fleet: Fleet) -> some View {
-        var line =
-            Text("\(fleet.toolsTotalCalls) tool calls today").fontWeight(.semibold)
-        if let overOneMinute = fleet.toolsOverOneMinute {
-            line =
-                line + Text(" · ").foregroundColor(Tok.inkFaint)
-                + Text("\(overOneMinute) ran over 1m").foregroundColor(Tok.inkDim)
+        var numbers: [Text] = []
+        if let hourly = fleet.burnRateSegment {
+            numbers.append(Text(hourly))
         }
-        if fleet.toolsTotalTimeouts > 0 {
-            line =
-                line + Text(" · ").foregroundColor(Tok.inkFaint)
-                + Text("\(fleet.toolsTotalTimeouts) hit the 600s timeout").foregroundColor(Tok.spent)
+        if let today = fleet.todayCost {
+            numbers.append(Text("\(QuotaFormat.usd(today)) today"))
         }
-        return VStack(alignment: .leading, spacing: 0) {
-            line
-                .font(Tok.secondaryDigitFont)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, Tok.tightSpacing)
-                .lineSpacing(Tok.secondaryLineSpacing)
-            machineLine
+        if let live = fleet.sessionsLiveCost {
+            numbers.append(Text("\(QuotaFormat.usd(live)) live"))
         }
-    }
-
-    /// "load 7.1/14 · 48/64 GB · 5 compiles · 210 GB free" —
-    /// the second question `docs/design/tools-tab.md` records the operator
-    /// arriving with ("is the box overloaded?"), which this panel answered
-    /// nowhere at all. Drawn under the tools headline, above the tabs, where
-    /// the mockup puts it.
-    ///
-    /// Only the LOAD is tinted, and it is tinted by Gil's own dispatch rule:
-    /// amber from one load unit per core, red past two, at which point the
-    /// answer to "can I start another coder" is no. Nothing is drawn until
-    /// the first reading lands — a line of zeroes would be a measurement
-    /// nobody made.
-    @ViewBuilder
-    private var machineLine: some View {
-        if let machine {
-            (Text(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint))
-                + Text(" · ").foregroundColor(Tok.inkFaint)
-                + Text(machine.restClause).foregroundColor(Tok.mute))
+        if !fleet.accounts.isEmpty {
+            numbers.append(
+                Text("\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
+        }
+        if fleet.toolsTotalErrors > 0 {
+            numbers.append(Text("\(fleet.toolsTotalErrors) err"))
+        }
+        return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            HStack(alignment: .firstTextBaseline) {
+                (Text("\(joined.count) live, ").fontWeight(.semibold)
+                    + Text("\(working) working").fontWeight(.semibold).foregroundColor(Tok.ok))
+                    .font(Tok.secondaryDigitFont)
+                Spacer(minLength: V4.buttonGap)
+                Text("\(waiting) waiting on you")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundColor(waiting > 0 ? Tok.near : Tok.mute)
+            }
+            joinedBySeparator(numbers)
                 .font(V4.font(V4.muteSize))
+                .foregroundColor(Tok.mute)
                 .fixedSize(horizontal: false, vertical: true)
-                .accessibilityLabel(machine.line)
+                .lineSpacing(Tok.secondaryLineSpacing)
         }
     }
 
+    /// Tools tab summary — two lines: a state sentence ("3 running, 1 near
+    /// timeout") with a right-aligned "N in warning" account count, then the
+    /// machine/error numbers line.
+    ///
+    /// The "near timeout" count is
+    /// ``Fleet/toolsNearTimeoutCount(now:timeoutSeconds:warnWithinSeconds:)`` —
+    /// the exact predicate RUNNING NOW's own rows colour by
+    /// (``runningToolItem(_:)``) — so this sentence cannot say "1 near
+    /// timeout" over rows that disagree with it, which is the bug in the
+    /// bridge's own mockup this rewrite exists to rule out. "N in warning" is
+    /// ``Fleet/accountsNearLimitCount``, the same count the Accounts tab's own
+    /// summary sentence already uses.
+    private func toolsSummaryLine(_ fleet: Fleet) -> some View {
+        let now = Date()
+        let running = fleet.toolsRunning.count
+        let nearTimeout = fleet.toolsNearTimeoutCount(
+            now: now, timeoutSeconds: bashTimeoutSeconds, warnWithinSeconds: V4.toolTimeoutWarnSeconds)
+        var numbers: [Text] = []
+        if let machine {
+            numbers.append(Text(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
+            numbers.append(Text(machine.restClause))
+        }
+        if fleet.toolsTotalErrors > 0 {
+            numbers.append(Text("\(fleet.toolsTotalErrors) err today"))
+        }
+        numbers.append(Text("\(fleet.toolsTotalTimeouts) timed out"))
+        return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("\(running) running, \(nearTimeout) near timeout")
+                    .font(Tok.secondaryDigitFont)
+                    .fontWeight(.semibold)
+                    .foregroundColor(nearTimeout > 0 ? Tok.spent : Tok.ink)
+                Spacer(minLength: V4.buttonGap)
+                Text("\(fleet.accountsNearLimitCount) in warning")
+                    .font(V4.font(V4.muteSize))
+                    .foregroundColor(fleet.accountsNearLimitCount > 0 ? Tok.near : Tok.mute)
+            }
+            joinedBySeparator(numbers)
+                .font(V4.font(V4.muteSize))
+                .foregroundColor(Tok.mute)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineSpacing(Tok.secondaryLineSpacing)
+        }
+    }
+
+    /// `[Text]` joined by a dimmed " · ", the one place both summary numbers
+    /// lines build their trailing clause list — so a future third summary line
+    /// reaches for this instead of writing a fourth copy of the same
+    /// `reduce`.
+    private func joinedBySeparator(_ parts: [Text]) -> Text {
+        parts.enumerated().reduce(Text("")) { acc, entry in
+            let (index, part) = entry
+            return index == 0 ? part : acc + Text(" · ").foregroundColor(Tok.inkFaint) + part
+        }
+    }
+
+    /// Only the LOAD clause of the Tools numbers line is tinted, by Gil's own
+    /// dispatch rule: amber from one load unit per core, red past two, at
+    /// which point the answer to "can I start another coder" is no. The rest
+    /// of that line (memory, compiles, disk, errors, timeouts) is never
+    /// tinted — one coloured clause on a line is a signal, several are
+    /// decoration.
     private func machineLoadTint(_ tint: MachineStats.LoadTint) -> Color {
         switch tint {
         case .calm: return Tok.mute
@@ -3297,7 +3327,12 @@ enum PanelTab: Equatable, CaseIterable {
 
     var title: String {
         switch self {
-        case .accounts: return "Accounts"
+        // Shortened from "Accounts" (`docs/design/panel-tabs.md` §0): at
+        // four tabs (this case plus the yet-to-land `feat/peers-panel`
+        // fourth tab) each segment gets ~85pt, and "Accounts" plus its own
+        // count badge is the one that overflows it; "Sessions" and "Tools"
+        // fit already.
+        case .accounts: return "Accts"
         case .sessions: return "Sessions"
         case .tools: return "Tools"
         }
