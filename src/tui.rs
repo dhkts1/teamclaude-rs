@@ -113,7 +113,7 @@ fn repaint<B: ratatui::backend::Backend>(
     render_frame: impl FnOnce(&mut Frame),
 ) {
     if dirty.swap(false, Ordering::SeqCst) {
-        if let Err(err) = terminal.clear() {
+        if let Err(err) = repair_screen(terminal) {
             // The repair did not land either. Stay dirty and retry on the next tick
             // rather than dropping it on the floor.
             tracing::warn!(error = %err, "could not clear a dirty screen");
@@ -124,6 +124,40 @@ fn repaint<B: ratatui::backend::Backend>(
         tracing::warn!(error = %err, "tui repaint failed; forcing a full redraw");
         dirty.store(true, Ordering::SeqCst);
     }
+}
+
+/// Clear the screen and force the next draw to repaint every cell, WITHOUT asking
+/// the terminal where the cursor is.
+///
+/// `Terminal::clear` cannot be used here. Its first statement is
+/// `self.backend.get_cursor_position()?` (`ratatui_core::terminal::buffers`), and
+/// crossterm answers that by writing `ESC [ 6 n` to stdout and then waiting up to
+/// 2000 ms to read the terminal's reply back off stdin
+/// (`crossterm::cursor::sys::unix::read_position_raw`).
+///
+/// This TUI holds an `EventStream`, which is draining stdin the whole time. The
+/// reply is delivered to whichever reader takes it first, so on a terminal where
+/// the `EventStream` wins, `position()` never sees its answer, the clear fails
+/// before clearing anything, and the tick blocks for two seconds losing it.
+/// Reported on 1.1.3 against issue #323, once the screen-repair path this guards
+/// actually started running:
+///
+/// ```text
+/// WARN could not clear a dirty screen error=The cursor position could not be
+///      read within a normal duration
+/// ```
+///
+/// one line every two seconds, forever, because the retry re-armed a repair that
+/// could never succeed.
+///
+/// `Terminal::resize` reaches the same end state by the path that does not ask.
+/// For a fullscreen viewport it clears the whole region and resets the back
+/// buffer, so the next diff is against an empty frame and every cell is rewritten
+/// — and it reads the cursor only for an inline viewport, which this is not.
+/// `Backend::size` is an ioctl, not a terminal round trip.
+fn repair_screen<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    let area = terminal.size()?.into();
+    terminal.resize(area)
 }
 
 /// Does a panic on this thread mean the process is going down, so the terminal
@@ -1439,6 +1473,10 @@ mod tests {
         pending: Vec<(u16, u16, char)>,
         fail_flush: bool,
         fail_clear: bool,
+        /// Models a terminal whose `ESC [ 6 n` reply never comes back, because
+        /// something else (here, the real TUI's `EventStream`) drained stdin first.
+        fail_cursor_read: bool,
+        cursor_reads: usize,
     }
 
     impl PendingBackend {
@@ -1450,6 +1488,8 @@ mod tests {
                 pending: Vec::new(),
                 fail_flush: false,
                 fail_clear: false,
+                fail_cursor_read: false,
+                cursor_reads: 0,
             }
         }
         fn row(&self, y: usize) -> String {
@@ -1480,6 +1520,10 @@ mod tests {
             Ok(())
         }
         fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            self.cursor_reads += 1;
+            if self.fail_cursor_read {
+                return Err(FlushFailure);
+            }
             Ok(ratatui::layout::Position::new(0, 0))
         }
         fn set_cursor_position<P: Into<ratatui::layout::Position>>(
@@ -1611,6 +1655,61 @@ mod tests {
             !dirty.load(Ordering::SeqCst),
             "a successful repair must consume the flag, not leave the dashboard \
              clearing on every tick"
+        );
+    }
+
+    /// The repair must not ask the terminal where the cursor is.
+    ///
+    /// `Terminal::clear` does, and crossterm answers by writing `ESC [ 6 n` and
+    /// reading the reply off stdin — which this TUI's `EventStream` is already
+    /// draining. On a terminal where the EventStream wins that race the read times
+    /// out after two seconds and the clear fails having cleared nothing, so the
+    /// repair re-arms and blocks the tick every time. That is issue #323's tail on
+    /// 1.1.3: `could not clear a dirty screen error=The cursor position could not
+    /// be read within a normal duration`, one line every two seconds, forever.
+    ///
+    /// Swap `repair_screen` back to `terminal.clear()` and this test fails.
+    #[test]
+    fn the_repair_never_reads_the_cursor_position() {
+        let dirty = AtomicBool::new(false);
+        let mut terminal = Terminal::new(PendingBackend::new(20, 1)).unwrap();
+
+        // Put a frame up, then desync by losing one to a failed flush.
+        repaint(&mut terminal, &dirty, |f| {
+            f.render_widget(Paragraph::new("FRAME-ONE"), f.area());
+        });
+        terminal.backend_mut().fail_flush = true;
+        repaint(&mut terminal, &dirty, |f| {
+            f.render_widget(Paragraph::new("FRAME-TWO"), f.area());
+        });
+        terminal.backend_mut().fail_flush = false;
+        assert!(
+            dirty.load(Ordering::SeqCst),
+            "the failed draw must arm the repair"
+        );
+
+        // From here the terminal will not answer a cursor query, like the reporter's.
+        terminal.backend_mut().fail_cursor_read = true;
+        let before = terminal.backend().cursor_reads;
+
+        repaint(&mut terminal, &dirty, |f| {
+            f.render_widget(Paragraph::new("FRAME-TWO"), f.area());
+        });
+
+        assert_eq!(
+            terminal.backend().cursor_reads,
+            before,
+            "the repair asked the terminal for the cursor position; on a terminal \
+             that cannot answer, that costs a 2s timeout per tick and repairs nothing"
+        );
+        assert_eq!(
+            terminal.backend().row(0),
+            "FRAME-TWO",
+            "the repair must still have repainted the screen"
+        );
+        assert!(
+            !dirty.load(Ordering::SeqCst),
+            "a successful repair must consume the flag"
         );
     }
 
