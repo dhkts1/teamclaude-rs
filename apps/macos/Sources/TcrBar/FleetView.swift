@@ -1214,55 +1214,62 @@ struct FleetView: View {
         }
     }
 
+    /// Grouped by PROJECT, not account — `docs/design/panel-tabs.md` §3:
+    /// account is already the Accounts tab's whole job, and on the live fleet
+    /// the biggest account bucket holds 90% of sessions while the biggest
+    /// project bucket holds 50%. ``SessionSections/byProject(_:)`` does the
+    /// grouping and the ordering; nothing here re-derives either.
     private func sessionsList(_ sessions: [JoinedSession]) -> some View {
-        let byAccount = Dictionary(grouping: sessions) { $0.session.account ?? "" }
-        // Unassigned (`""`) sorts last; named accounts sort by name so the
-        // list order does not reshuffle between two polls that carry
-        // identical data.
-        let order = byAccount.keys.sorted { lhs, rhs in
-            if lhs.isEmpty != rhs.isEmpty { return rhs.isEmpty }
-            return lhs < rhs
-        }
-        // The cap is across the WHOLE tab, not per account — the mockup's own
+        let sections = SessionSections.byProject(sessions)
+        // The cap is across the WHOLE tab, not per project — the mockup's own
         // button counts that way ("Show 7 more sessions") — so the budget is
-        // spent walking the accounts in display order and stops mid-account if
-        // that is where the fifth session falls.
+        // spent walking sections in their own (spend) order and stops
+        // mid-section if that is where the fifth session falls.
         let limit = sessionsExpanded ? Int.max : Self.sessionsVisibleRows
         var remaining = limit
-        var visible: [(key: String, rows: [JoinedSession])] = []
-        for key in order {
+        var visible: [SessionProjectSection] = []
+        for section in sections {
             guard remaining > 0 else { break }
-            let rows = Array((byAccount[key] ?? []).prefix(remaining))
+            let rows = Array(section.rows.prefix(remaining))
             remaining -= rows.count
-            visible.append((key, rows))
+            visible.append(SessionProjectSection(key: section.key, rows: rows))
         }
         let hidden = sessions.count - visible.reduce(0) { $0 + $1.rows.count }
         // `Tok.cardGap` — the same gap the Accounts tab's own list uses.
         return VStack(alignment: .leading, spacing: Tok.cardGap) {
-            ForEach(visible, id: \.key) { entry in
-                // v4-spec: each account's session block is a card, with the
-                // account name as its first row and the sessions indented
-                // under a 2px left rule.
-                V4Card {
-                    V4Row {
-                        NameText(text: entry.key.isEmpty ? "Unassigned" : entry.key)
-                            .layoutPriority(1)
-                    } trailing: {
-                        DimText(text: sessionBlockSummary(entry.rows)).fixedSize()
-                    }
-                    VStack(alignment: .leading, spacing: 0) {
-                        ForEach(entry.rows) { row in
-                            sessionRow(row)
-                                .padding(.vertical, V4.sessRowPaddingV)
+            ForEach(visible) { section in
+                if section.hasHeader {
+                    // v4-spec: each project's session block is a card, with
+                    // the project name as its first row and the sessions
+                    // indented under a 2px left rule.
+                    V4Card {
+                        V4Row {
+                            NameText(text: section.key.title).layoutPriority(1)
+                        } trailing: {
+                            DimText(text: section.headerSummary).fixedSize()
+                        }
+                        VStack(alignment: .leading, spacing: 0) {
+                            ForEach(section.rows) { row in
+                                sessionRow(row, showProjectTag: false)
+                                    .padding(.vertical, V4.sessRowPaddingV)
+                            }
+                        }
+                        // `.sess{margin:8px 0 2px;padding-left:10px;
+                        // border-left:2px solid var(--line)}`.
+                        .padding(.top, V4.sessMarginTop)
+                        .padding(.bottom, V4.sessMarginBottom)
+                        .padding(.leading, V4.sessPaddingLeft)
+                        .overlay(alignment: .leading) {
+                            Rectangle().fill(Tok.cardLine).frame(width: V4.sessRuleWidth)
                         }
                     }
-                    // `.sess{margin:8px 0 2px;padding-left:10px;
-                    // border-left:2px solid var(--line)}`.
-                    .padding(.top, V4.sessMarginTop)
-                    .padding(.bottom, V4.sessMarginBottom)
-                    .padding(.leading, V4.sessPaddingLeft)
-                    .overlay(alignment: .leading) {
-                        Rectangle().fill(Tok.cardLine).frame(width: V4.sessRuleWidth)
+                } else {
+                    // A project with fewer than two sessions draws no header
+                    // (``SessionProjectSection/hasHeader``): its one session
+                    // is an ordinary row, tagged with its own dim project
+                    // name instead of sitting under a one-row card.
+                    ForEach(section.rows) { row in
+                        sessionRow(row, showProjectTag: true)
                     }
                 }
             }
@@ -1273,22 +1280,6 @@ struct FleetView: View {
                 ) { toggleSessionsExpansion() }
             }
         }
-    }
-
-    /// "3 sessions · $9.41" — the trailing half of a session card's first row.
-    ///
-    /// The spend clause is dropped when not one session in the block was
-    /// priced (``Session/costUsd`` is absent on any server built before wire
-    /// 2), never printed as `$0.00`: the same rule the account cards' own
-    /// spend line follows, through the same ``UsageTotals/addCost(_:_:)``.
-    private func sessionBlockSummary(_ rows: [JoinedSession]) -> String {
-        var spend: Double?
-        for row in rows {
-            spend = UsageTotals.addCost(spend, row.session.costUsd)
-        }
-        let noun = rows.count == 1 ? "session" : "sessions"
-        guard let spend else { return "\(rows.count) \(noun)" }
-        return "\(rows.count) \(noun) · \(QuotaFormat.usd(spend))"
     }
 
     /// An idle (or unknown-state) session draws ONE line — dot, name,
@@ -1303,14 +1294,21 @@ struct FleetView: View {
         { $0 == .idle || $0 == .unknown }
     }
 
+    /// `showProjectTag` is true only for a row drawn WITHOUT a project header
+    /// above it — ``SessionProjectSection/hasHeader`` false, the "fewer than
+    /// two sessions" case — so its own project name has nowhere else to
+    /// appear on screen. A row already sitting under a project header omits
+    /// it: the header already said which project, and repeating it on every
+    /// row is the exact restatement `docs/design/panel-tabs.md` §3 exists to
+    /// avoid.
     @ViewBuilder
-    private func sessionRow(_ row: JoinedSession) -> some View {
+    private func sessionRow(_ row: JoinedSession, showProjectTag: Bool) -> some View {
         if isCompactRow(row.activity) {
             V4Row {
                 HStack(spacing: V4.dotTrailingGap) {
                     StatusDot(activity: row.activity)
                     NameText(text: row.displayName)
-                    DimText(text: sessionSubtitle(row))
+                    DimText(text: sessionSubtitle(row, showProject: showProjectTag))
                 }
                 .layoutPriority(1)
             } trailing: {
@@ -1340,7 +1338,7 @@ struct FleetView: View {
                 // the right of the row, as the mockup wraps it. Kept
                 // inline, it competes with a 64 pt sparkline for the same width
                 // and the SESSION NAME is what loses — "teamclau…".
-                DimText(text: sessionSubtitle(row))
+                DimText(text: sessionSubtitle(row, showProject: showProjectTag))
                 HStack(spacing: 0) {
                     Text("\(row.session.requests) req")
                         .monospacedDigit()
@@ -1400,8 +1398,13 @@ struct FleetView: View {
     /// this row reads "opus-5", not the wire's "claude-opus-5", matching the
     /// mockup exactly instead of growing a second, subtly different
     /// shortener.
-    private func sessionSubtitle(_ row: JoinedSession) -> String {
-        [row.project, row.session.model.map(QuotaFormat.modelLabel)]
+    ///
+    /// `showProject` is false for a row sitting under a project header
+    /// (``sessionsList(_:)``'s headed branch): the header already names the
+    /// project, and stating it again on every row under it is exactly the
+    /// restatement the project-header rewrite exists to remove.
+    private func sessionSubtitle(_ row: JoinedSession, showProject: Bool) -> String {
+        [showProject ? row.project : nil, row.session.model.map(QuotaFormat.modelLabel)]
             .compactMap { $0 }.joined(separator: " · ")
     }
 
