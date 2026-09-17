@@ -278,20 +278,889 @@ fn classify_command(reduced: &str) -> CommandClass {
     CommandClass::Other
 }
 
+/// Reduce a Bash command to its IDENTITY — the one clause that says what it is — so the
+/// 120-char cap in [`normalize_bash_command`] truncates a short, meaningful string instead of
+/// cutting the raw command mid-token. Ports the identity-reduction spec worked out and
+/// validated against 40,589 real commands harvested from `~/.claude/projects/` (see
+/// `docs/design/tools-tab.md`); the Python prototype's `identity()` is the line-by-line source
+/// of truth this module mirrors.
+///
+/// In order: split on `;`, `&&`, `||`, `|` and newline, but ONLY where unquoted and at bracket
+/// depth zero ([`shell_scan`] walks the string once, tracking quote/depth state, because a
+/// regex cannot do this — `sed -i 's|a|b|'` carries a `|` inside its own quotes); drop a
+/// segment that is only an env assignment and unwrap `T=$(...)`; drop `|| exit` / `|| true`
+/// error handlers; strip env prefixes, wrappers and redirections per segment; skip trivial
+/// verbs unless every segment is trivial; give an interpreter its script's basename; shorten
+/// long absolute paths; and cut at a quote/bracket-aware boundary that is repaired FORWARD
+/// (closing the quote, closing brackets, marking with `…`) rather than trimmed backward — a
+/// backward trim is what produced a bare `rg -n` for 532 commands in the prototype's own
+/// history, so [`balance_identity`] never does that.
+mod identity {
+    /// One position from [`shell_scan`]: the character, its bracket depth, and whether it
+    /// sits inside an unescaped quote. Mirrors the Python prototype's `scan()` generator,
+    /// including its quirk that an ESCAPED character's `quoted` flag reflects whatever quote
+    /// state was already active, not the escape itself — a backslash only suppresses the next
+    /// character from opening/closing a quote or bracket, it does not itself put that
+    /// character inside a quote.
+    struct ScanPos {
+        ch: char,
+        depth: usize,
+        quoted: bool,
+    }
+
+    /// Walk `s` once, character by character, tracking bash quoting (`'...'` disables
+    /// backslash escapes; `"..."` does not) and bracket depth (`(`, `[`, `{`). Every caller
+    /// that needs to know "is this character inside quotes, or inside brackets" reads it from
+    /// here rather than re-deriving it — see the module doc for why a regex cannot replace
+    /// this walk.
+    fn shell_scan(s: &str) -> Vec<ScanPos> {
+        let mut out = Vec::with_capacity(s.len());
+        let mut q: Option<char> = None;
+        let mut depth: usize = 0;
+        let mut esc = false;
+        for ch in s.chars() {
+            if esc {
+                esc = false;
+                out.push(ScanPos {
+                    ch,
+                    depth,
+                    quoted: q.is_some(),
+                });
+                continue;
+            }
+            if ch == '\\' && q != Some('\'') {
+                esc = true;
+                out.push(ScanPos {
+                    ch,
+                    depth,
+                    quoted: q.is_some(),
+                });
+                continue;
+            }
+            if let Some(qc) = q {
+                if ch == qc {
+                    q = None;
+                }
+                out.push(ScanPos {
+                    ch,
+                    depth,
+                    quoted: true,
+                });
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                q = Some(ch);
+                out.push(ScanPos {
+                    ch,
+                    depth,
+                    quoted: true,
+                });
+                continue;
+            }
+            match ch {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            out.push(ScanPos {
+                ch,
+                depth,
+                quoted: false,
+            });
+        }
+        out
+    }
+
+    /// Split `cmd` on `;`, `&&`, `||`, `|` and newline, only where unquoted and at bracket
+    /// depth zero. Blank segments (after trimming) are dropped, matching the prototype's own
+    /// `[s for s in out if s.strip()]`.
+    fn split_segments(cmd: &str) -> Vec<String> {
+        let chars: Vec<char> = cmd.chars().collect();
+        let state = shell_scan(cmd);
+        let n = chars.len();
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        let mut i = 0usize;
+        while i < n {
+            let pos = &state[i];
+            if !pos.quoted && pos.depth == 0 {
+                if i + 1 < n {
+                    let two = (chars[i], chars[i + 1]);
+                    if two == ('&', '&') || two == ('|', '|') {
+                        out.push(chars[start..i].iter().collect::<String>());
+                        start = i + 2;
+                        i += 2;
+                        continue;
+                    }
+                }
+                if matches!(chars[i], ';' | '\n' | '|') {
+                    out.push(chars[start..i].iter().collect::<String>());
+                    start = i + 1;
+                    i += 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out.push(chars[start..].iter().collect::<String>());
+        out.into_iter().filter(|s| !s.trim().is_empty()).collect()
+    }
+
+    /// Trailing characters `safe_cut` and `balance` strip after a cut — the prototype's
+    /// `rstrip(' \\|&<>=-\t')`.
+    fn rstrip_cut_junk(s: &str) -> String {
+        s.trim_end_matches(|c| " \\|&<>=-\t".contains(c))
+            .to_string()
+    }
+
+    /// Cut `s` to at most `n` characters at a quote/bracket-aware boundary — the last
+    /// unquoted, depth-zero space at or before `n` — but only when that boundary keeps at
+    /// least 60% of the budget. A boundary that throws away more than that is lossy, not
+    /// safe: `rg -n "a|b|c" path` has its last unquoted space at index 5, so cutting there
+    /// yields a bare `rg -n`. Below that threshold, cut at the budget itself and let
+    /// [`balance_identity`] repair whatever it lands inside.
+    fn safe_cut(s: &str, n: usize) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= n {
+            return rstrip_cut_junk(s);
+        }
+        let state = shell_scan(s);
+        let mut last = 0usize;
+        for (i, pos) in state.iter().enumerate() {
+            if i > n {
+                break;
+            }
+            if pos.ch == ' ' && !pos.quoted && pos.depth == 0 {
+                last = i;
+            }
+        }
+        let cut: String = if last > 0 && last >= (n * 6) / 10 {
+            chars[..last].iter().collect()
+        } else {
+            chars[..n].iter().collect()
+        };
+        rstrip_cut_junk(&cut)
+    }
+
+    /// Remove `2>&1`/`>&1`, process substitution (`<(...)`/`>(...)`, replaced with a `‹sub›`
+    /// marker so it is never left an eaten orphan `)`), and any other `N< `/`N> ` redirection —
+    /// all only where unquoted and at bracket depth zero.
+    fn strip_redirects(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let state = shell_scan(s);
+        let n = chars.len();
+        let mut keep = String::new();
+        let mut i = 0usize;
+        while i < n {
+            let pos = &state[i];
+            if !pos.quoted && pos.depth == 0 {
+                if chars_eq(&chars, i, "2>&1") {
+                    i += 4;
+                    continue;
+                }
+                if chars_eq(&chars, i, ">&1") {
+                    i += 3;
+                    continue;
+                }
+                if matches!(chars[i], '<' | '>') && i + 1 < n && chars[i + 1] == '(' {
+                    let mut d = 0i32;
+                    let mut j = i + 1;
+                    while j < n {
+                        if chars[j] == '(' {
+                            d += 1;
+                        } else if chars[j] == ')' {
+                            d -= 1;
+                            if d == 0 {
+                                j += 1;
+                                break;
+                            }
+                        }
+                        j += 1;
+                    }
+                    keep.push_str("\u{2039}sub\u{203a}");
+                    i = j;
+                    continue;
+                }
+                if chars[i].is_ascii_digit() && i + 1 < n && matches!(chars[i + 1], '<' | '>') {
+                    i += 1;
+                    continue;
+                }
+                if matches!(chars[i], '<' | '>') {
+                    let mut j = i;
+                    while j < n && matches!(chars[j], '<' | '>' | '&') {
+                        j += 1;
+                    }
+                    while j < n && chars[j] == ' ' {
+                        j += 1;
+                    }
+                    while j < n && !matches!(chars[j], ' ' | '\t') {
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
+            }
+            keep.push(chars[i]);
+            i += 1;
+        }
+        keep.trim().to_string()
+    }
+
+    fn chars_eq(chars: &[char], i: usize, pat: &str) -> bool {
+        let pat: Vec<char> = pat.chars().collect();
+        i + pat.len() <= chars.len() && chars[i..i + pat.len()] == pat[..]
+    }
+
+    /// Make a cut identity well-formed WITHOUT throwing its content away: drop a dangling
+    /// escape, close an open quote, close any open brackets, and mark the repair with `…`.
+    /// Trimming BACKWARD to the last safe point instead is what produced a bare `rg -n` for
+    /// 532 commands in the prototype's own history — a command whose whole payload is one
+    /// long quoted token (`printf '...'`, `jq '{...}'`) has no safe cut point before the width
+    /// budget, so trimming back gives the bare verb, which says nothing.
+    fn balance_identity(s: &str) -> String {
+        let mut q: Option<char> = None;
+        let mut esc = false;
+        let mut stack: Vec<char> = Vec::new();
+        for ch in s.chars() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            if ch == '\\' && q != Some('\'') {
+                esc = true;
+                continue;
+            }
+            if let Some(qc) = q {
+                if ch == qc {
+                    q = None;
+                }
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                q = Some(ch);
+                continue;
+            }
+            match ch {
+                '(' | '[' | '{' => stack.push(ch),
+                ')' | ']' | '}' if !stack.is_empty() => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        if q.is_none() && stack.is_empty() {
+            return s.to_string();
+        }
+        let mut out = s.trim_end_matches(['\\', ' ']).to_string();
+        if !out.is_empty() && (q.is_some() || !stack.is_empty()) {
+            out.push('\u{2026}');
+        }
+        if let Some(qc) = q {
+            out.push(qc);
+        }
+        for c in stack.iter().rev() {
+            out.push(match c {
+                '(' => ')',
+                '[' => ']',
+                '{' => '}',
+                _ => unreachable!("stack only ever holds an open bracket"),
+            });
+        }
+        out
+    }
+
+    fn is_path_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '_' | '.' | '@' | '+' | '-')
+    }
+
+    /// Shorten every run of 3+ absolute-path components (`/a/b/c/d` -> `.../c/d`) — a long
+    /// path cannot widen the panel row any more than a long command can.
+    fn shorten_paths(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < n {
+            if chars[i] == '/' {
+                let mut j = i;
+                let mut components: Vec<String> = Vec::new();
+                while j < n && chars[j] == '/' {
+                    let seg_start = j + 1;
+                    let mut k = seg_start;
+                    while k < n && is_path_char(chars[k]) {
+                        k += 1;
+                    }
+                    if k == seg_start {
+                        break;
+                    }
+                    components.push(chars[seg_start..k].iter().collect());
+                    j = k;
+                }
+                if components.len() >= 3 {
+                    let last_two = &components[components.len() - 2..];
+                    out.push_str(".../");
+                    out.push_str(&last_two.join("/"));
+                    i = j;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Collapse a run of 2+ whitespace characters to a single space. A single embedded
+    /// whitespace character (one real newline, from a quoted multi-line string that
+    /// [`split_segments`] never split on) is left exactly as it is — [`normalize_bash_command`]
+    /// turns that one into `⏎` afterward.
+    fn collapse_ws(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < n {
+            if chars[i].is_whitespace() {
+                let mut j = i;
+                while j < n && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                out.push(if j - i >= 2 { ' ' } else { chars[i] });
+                i = j;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Finish an identity candidate: collapse whitespace, shorten paths, cut to `maxlen`, then
+    /// repair. The prototype's `_fin`.
+    fn finish(s: &str, maxlen: usize) -> String {
+        let collapsed = collapse_ws(s);
+        let trimmed = collapsed.trim();
+        let shortened = shorten_paths(trimmed);
+        let cut = safe_cut(&shortened, maxlen);
+        balance_identity(&cut).trim().to_string()
+    }
+
+    /// Every leading `IDENT=value` env assignment, in order — `value` is a double-quoted
+    /// string, a single-quoted string, or a run of non-whitespace (the prototype's `ENV`).
+    fn strip_env(s: &str) -> String {
+        let mut cur = s.trim_start();
+        while let Some(rest) = strip_one_env(cur) {
+            cur = rest;
+        }
+        cur.to_string()
+    }
+
+    /// End positions (char count from the string start) that `(?:"[^"]*"|'[^']*'|\S*)` could
+    /// land on, starting at `i`, tried in the regex's own left-to-right alternative order — the
+    /// quoted alternative first (if `chars[i]` opens one), then the always-available `\S*` run.
+    /// A caller whose own trailing requirement rejects the first candidate must fall through to
+    /// the next one, exactly as the Python reference's regex engine backtracks into the next
+    /// alternative when the first one's local match cannot be extended to satisfy what follows
+    /// it — e.g. `PATH="$(echo "$PATH" | ...)"` has its first `"..."` alternative close at the
+    /// FIRST embedded quote (regex has no idea the value contains nested quoting), which is not
+    /// followed by whitespace, so the real match falls through to the bare `\S*` run instead.
+    fn env_value_ends(chars: &[char], i: usize) -> Vec<usize> {
+        let n = chars.len();
+        let mut ends = Vec::new();
+        if i < n && (chars[i] == '"' || chars[i] == '\'') {
+            let q = chars[i];
+            if let Some(close) = (i + 1..n).find(|&j| chars[j] == q) {
+                ends.push(close + 1);
+            }
+        }
+        let mut j = i;
+        while j < n && !chars[j].is_whitespace() {
+            j += 1;
+        }
+        ends.push(j);
+        ends
+    }
+
+    fn strip_one_env(s: &str) -> Option<&str> {
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+        if i >= n || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            return None;
+        }
+        i += 1;
+        while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if i >= n || chars[i] != '=' {
+            return None;
+        }
+        i += 1;
+        for end in env_value_ends(&chars, i) {
+            if end < n && chars[end].is_whitespace() {
+                let byte_off = s.char_indices().nth(end).map(|(b, _)| b)?;
+                return Some(s[byte_off..].trim_start());
+            }
+        }
+        None
+    }
+
+    /// Is `seg` (once trimmed) JUST one `IDENT=value` assignment and nothing else? The
+    /// prototype's `ASSIGN_ONLY`.
+    fn is_assign_only(seg: &str) -> bool {
+        let s = seg.trim_start();
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+        if i >= n || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            return false;
+        }
+        i += 1;
+        while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if i >= n || chars[i] != '=' {
+            return false;
+        }
+        i += 1;
+        env_value_ends(&chars, i)
+            .into_iter()
+            .any(|end| chars[end..].iter().all(|c| c.is_whitespace()))
+    }
+
+    /// Every leading wrapper (`timeout N`, `nice`, `env`, `command`, `exec`,
+    /// `henry-unthrottled`, `stdbuf ARG`, `caffeinate`, `sudo`), in order — the prototype's
+    /// `WRAP`.
+    fn strip_wrap(s: &str) -> String {
+        let mut cur = s.trim_start();
+        while let Some(rest) = strip_one_wrap(cur) {
+            cur = rest;
+        }
+        cur.to_string()
+    }
+
+    /// Take the first whitespace-delimited token of `s`, requiring at least one whitespace
+    /// character after it, returning `(token, rest trimmed of its leading whitespace)`.
+    fn take_ws_token(s: &str) -> Option<(&str, &str)> {
+        let ws = s.find(char::is_whitespace)?;
+        Some((&s[..ws], s[ws..].trim_start()))
+    }
+
+    fn is_timeout_duration(tok: &str) -> bool {
+        let core = tok.strip_suffix(['s', 'm', 'h']).unwrap_or(tok);
+        !core.is_empty() && core.chars().all(|c| c.is_ascii_digit())
+    }
+
+    fn strip_one_wrap(s: &str) -> Option<&str> {
+        let (first, rest) = take_ws_token(s)?;
+        match first {
+            "env" | "command" | "exec" | "henry-unthrottled" | "sudo" => Some(rest),
+            "timeout" => {
+                if let Some((tok, after)) = take_ws_token(rest) {
+                    if let Some(stripped) = tok.strip_prefix('-') {
+                        let _ = stripped;
+                        if let Some((tok2, after2)) = take_ws_token(after) {
+                            if is_timeout_duration(tok2) {
+                                return Some(after2);
+                            }
+                        }
+                        return None;
+                    }
+                    if is_timeout_duration(tok) {
+                        return Some(after);
+                    }
+                }
+                None
+            }
+            "nice" => {
+                if let Some((tok, after)) = take_ws_token(rest) {
+                    if let Some(numpart) = tok.strip_prefix("-n") {
+                        if !numpart.is_empty() {
+                            let d = numpart.strip_prefix('-').unwrap_or(numpart);
+                            if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
+                                return Some(after);
+                            }
+                        } else if let Some((tok2, after2)) = take_ws_token(after) {
+                            let d = tok2.strip_prefix('-').unwrap_or(tok2);
+                            if !d.is_empty() && d.chars().all(|c| c.is_ascii_digit()) {
+                                return Some(after2);
+                            }
+                        }
+                    }
+                }
+                Some(rest)
+            }
+            "stdbuf" => {
+                let (_, after) = take_ws_token(rest)?;
+                Some(after)
+            }
+            "caffeinate" => {
+                if let Some((tok, after)) = take_ws_token(rest) {
+                    if tok.starts_with('-') {
+                        return Some(after);
+                    }
+                }
+                Some(rest)
+            }
+            _ => None,
+        }
+    }
+
+    /// Alternate env/wrap stripping until stable — a wrapper can reveal a new env prefix and
+    /// vice versa (`timeout 5 FOO=1 cargo test`). The prototype's `_strip`.
+    fn strip_env_and_wrap(s: &str) -> String {
+        let mut cur = s.to_string();
+        loop {
+            let before = cur.clone();
+            cur = strip_env(&cur);
+            cur = strip_wrap(&cur);
+            if cur == before {
+                break;
+            }
+        }
+        cur.trim().to_string()
+    }
+
+    /// Does `seg` (trimmed) match `IDENT=$(...)` with nothing else? Returns the inside of the
+    /// `$( )`. The prototype's inline `re.match(r'^\s*[A-Za-z_]\w*=\$\((.*)\)\s*$', ..., re.S)`.
+    fn match_assign_dollar_paren(seg: &str) -> Option<String> {
+        let s = seg.trim_start();
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len();
+        let mut i = 0usize;
+        if i >= n || !(chars[i].is_ascii_alphabetic() || chars[i] == '_') {
+            return None;
+        }
+        i += 1;
+        while i < n && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+            i += 1;
+        }
+        if i >= n || chars[i] != '=' {
+            return None;
+        }
+        i += 1;
+        if !(i + 1 < n && chars[i] == '$' && chars[i + 1] == '(') {
+            return None;
+        }
+        let open = i + 2;
+        let last_close = chars.iter().rposition(|&c| c == ')')?;
+        if last_close < open || !chars[last_close + 1..].iter().all(|c| c.is_whitespace()) {
+            return None;
+        }
+        Some(chars[open..last_close].iter().collect())
+    }
+
+    /// First occurrence anywhere in `s` of `>` (optionally followed by whitespace) then 1+
+    /// path-like characters — the prototype's `re.search(r'>\s*([\w./@+\-]+)', s)`.
+    fn find_redirect_target(s: &str) -> Option<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let n = chars.len();
+        for i in 0..n {
+            if chars[i] == '>' {
+                let mut j = i + 1;
+                while j < n && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                let start = j;
+                while j < n && is_target_char(chars[j]) {
+                    j += 1;
+                }
+                if j > start {
+                    return Some(chars[start..j].iter().collect());
+                }
+            }
+        }
+        None
+    }
+
+    fn is_target_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '@' | '+' | '-')
+    }
+
+    /// The leading run of `[\w./+-]` characters — the prototype's `LEAD`.
+    fn lead_match(s: &str) -> Option<String> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() && is_lead_char(chars[i]) {
+            i += 1;
+        }
+        if i == 0 {
+            None
+        } else {
+            Some(chars[..i].iter().collect())
+        }
+    }
+
+    fn is_lead_char(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '+' | '-')
+    }
+
+    fn basename(s: &str) -> &str {
+        s.rsplit('/').next().unwrap_or(s)
+    }
+
+    /// `\s*\|\|\s*(exit|true|false|return)\b[^;&\n]*`, removed globally (not quote/depth
+    /// aware — the prototype's own sub runs over the whole raw string, quotes and all, so this
+    /// mirrors that exactly rather than "fixing" it).
+    fn strip_error_handlers(c: &str) -> String {
+        let chars: Vec<char> = c.chars().collect();
+        let n = chars.len();
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < n {
+            if let Some(end) = match_error_handler(&chars, i) {
+                i = end;
+            } else {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    fn match_error_handler(chars: &[char], i: usize) -> Option<usize> {
+        let n = chars.len();
+        let mut j = i;
+        while j < n && chars[j].is_whitespace() {
+            j += 1;
+        }
+        if j + 1 >= n || chars[j] != '|' || chars[j + 1] != '|' {
+            return None;
+        }
+        let mut k = j + 2;
+        while k < n && chars[k].is_whitespace() {
+            k += 1;
+        }
+        for kw in ["exit", "true", "false", "return"] {
+            let kwlen = kw.chars().count();
+            if k + kwlen <= n {
+                let slice: String = chars[k..k + kwlen].iter().collect();
+                if slice == kw {
+                    let after = k + kwlen;
+                    let boundary_ok = after >= n
+                        || !(chars[after].is_ascii_alphanumeric() || chars[after] == '_');
+                    if boundary_ok {
+                        let mut e = after;
+                        while e < n && !matches!(chars[e], ';' | '&' | '\n') {
+                            e += 1;
+                        }
+                        return Some(e);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// `re.findall(r'\$\(([^()]{4,})\)', c)` — every non-overlapping `$( )` whose inside has
+    /// 4+ characters that are not `(` or `)`.
+    fn find_dollar_paren_candidates(c: &str) -> Vec<String> {
+        let chars: Vec<char> = c.chars().collect();
+        let n = chars.len();
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < n {
+            if i + 1 < n && chars[i] == '$' && chars[i + 1] == '(' {
+                let mut j = i + 2;
+                while j < n && chars[j] != '(' && chars[j] != ')' {
+                    j += 1;
+                }
+                if j - (i + 2) >= 4 && j < n && chars[j] == ')' {
+                    out.push(chars[i + 2..j].iter().collect());
+                    i = j + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// `-[a-z]*[ce][a-z]*(\s|$)` anchored at the start of `rest` — equivalent to "a `-` then a
+    /// nonempty run of lowercase letters that contains a `c` or an `e`, then a boundary",
+    /// since the whole run either side of the required `[ce]` is itself `[a-z]*`.
+    fn matches_dash_ce(rest: &str) -> bool {
+        let chars: Vec<char> = rest.chars().collect();
+        let n = chars.len();
+        if n == 0 || chars[0] != '-' {
+            return false;
+        }
+        let mut i = 1;
+        while i < n && chars[i].is_ascii_lowercase() {
+            i += 1;
+        }
+        if i == 1 {
+            return false;
+        }
+        if !chars[1..i].iter().any(|&c| c == 'c' || c == 'e') {
+            return false;
+        }
+        i == n || chars[i].is_whitespace()
+    }
+
+    const TRIV: &[&str] = &[
+        "echo", "cd", "mkdir", "export", "set", "true", "false", ":", "printf", "touch", "source",
+        ".", "pushd", "popd", "umask", "unset", "wait", "sleep", "exit", "return", "pwd", "clear",
+    ];
+    const INTERP: &[&str] = &[
+        "bash", "sh", "zsh", "python", "python3", "node", "bun", "uv", "uvx", "ruby", "perl",
+        "deno", "npx",
+    ];
+
+    const MAXLEN: usize = 62;
+
+    fn starts_with_control_keyword(c: &str) -> bool {
+        ["for", "while", "until", "if", "case"]
+            .iter()
+            .any(|kw| starts_with_word_boundary(c, kw))
+    }
+
+    fn starts_with_word_boundary(s: &str, word: &str) -> bool {
+        s.strip_prefix(word)
+            .is_some_and(|rest| match rest.chars().next() {
+                None => true,
+                Some(c) => !(c.is_alphanumeric() || c == '_'),
+            })
+    }
+
+    /// The prototype's `identity(cmd, maxlen=62)`, recursive calls included.
+    pub(super) fn identity(cmd: &str) -> String {
+        identity_at(cmd, MAXLEN)
+    }
+
+    fn identity_at(cmd: &str, maxlen: usize) -> String {
+        if cmd.trim().is_empty() {
+            return String::new();
+        }
+        let c = cmd.trim().to_string();
+        if starts_with_control_keyword(&c) {
+            let segs = split_segments(&c);
+            let first = segs.into_iter().next().unwrap_or_else(|| c.clone());
+            return finish(&strip_env_and_wrap(&first), maxlen);
+        }
+        let c = strip_error_handlers(&c);
+        let mut fallback = String::new();
+        for seg in split_segments(&c) {
+            if is_assign_only(&seg) {
+                continue;
+            }
+            let seg = match_assign_dollar_paren(&seg).unwrap_or(seg);
+            let mut s = strip_env_and_wrap(&seg);
+            s = s.trim_start_matches('(').trim().to_string();
+            loop {
+                if s.ends_with(')') && s.matches('(').count() < s.matches(')').count() {
+                    s.pop();
+                    while s.ends_with(|c: char| c.is_whitespace()) {
+                        s.pop();
+                    }
+                } else {
+                    break;
+                }
+            }
+            let opens = s.matches('(').count();
+            let closes = s.matches(')').count();
+            if closes > opens {
+                let mut to_remove = closes - opens;
+                let mut result = String::with_capacity(s.len());
+                for ch in s.chars() {
+                    if ch == ')' && to_remove > 0 {
+                        to_remove -= 1;
+                        continue;
+                    }
+                    result.push(ch);
+                }
+                s = result;
+            }
+            if s.is_empty() {
+                continue;
+            }
+            let heredoc = s.contains("<<");
+            let tgt = find_redirect_target(&s);
+            s = strip_redirects(&s);
+            if s.is_empty() {
+                continue;
+            }
+            let Some(lead) = lead_match(&s) else {
+                continue;
+            };
+            let verb = basename(&lead).to_string();
+            if verb.is_empty() {
+                continue;
+            }
+            let lead_char_len = lead.chars().count();
+            let rest: String = s.chars().skip(lead_char_len).collect::<String>();
+            let rest = rest.trim().to_string();
+            if TRIV.contains(&verb.as_str()) {
+                if fallback.is_empty() {
+                    fallback = finish(&s, maxlen);
+                }
+                continue;
+            }
+            if heredoc {
+                return match &tgt {
+                    Some(t) => finish(&format!("{verb} > {t}"), maxlen),
+                    None => format!("{} \u{2039}heredoc\u{203a}", finish(&verb, maxlen)),
+                };
+            }
+            if INTERP.contains(&verb.as_str()) {
+                if matches_dash_ce(&rest) || rest.starts_with("- ") {
+                    return format!(
+                        "{} \u{2039}script\u{203a}",
+                        finish(&format!("{verb} -c"), maxlen)
+                    );
+                }
+                for tk in rest.split_whitespace() {
+                    let bare = tk.trim_matches(|c| c == '"' || c == '\'');
+                    if bare.contains("$(") || bare.contains('`') {
+                        return finish(&format!("{verb} {rest}"), maxlen);
+                    }
+                    if bare.starts_with('-') || (bare.contains('=') && !bare.starts_with('/')) {
+                        continue;
+                    }
+                    let basename_tk = basename(bare);
+                    if let Some(idx) = rest.find(tk) {
+                        let tail = &rest[idx..];
+                        let replaced = format!("{basename_tk}{}", &tail[tk.len()..]);
+                        return finish(&format!("{verb} {replaced}"), maxlen);
+                    }
+                }
+                return verb;
+            }
+            return finish(&format!("{verb} {rest}"), maxlen);
+        }
+        for cand in find_dollar_paren_candidates(&c) {
+            let got = identity_at(&cand, maxlen);
+            if !got.is_empty() {
+                let first_word = got.split_whitespace().next().unwrap_or("");
+                if !TRIV.contains(&first_word) {
+                    return got;
+                }
+            }
+        }
+        if !fallback.is_empty() {
+            fallback
+        } else {
+            finish(&strip_env_and_wrap(&c), maxlen)
+        }
+    }
+}
+
 /// Normalize a raw Bash `input.command` into a `(head, class)` pair for the Tools tab —
 /// ports `hooks/log-slow-bash.sh`'s `jq` normalization verbatim, in order: strip leading
 /// whitespace, strip leading env assignments, strip wrappers, reduce a `cd <dir> &&
 /// <clause>` prefix (only when `<clause>` is itself simple), strip wrappers again (`cd
-/// <dir> && timeout 15 rg ...` is the shape `prefer-fd-rg` itself emits), collapse embedded
-/// newlines to `⏎`, THEN truncate to [`COMMAND_HEAD_MAX`]. The class is read off the reduced
-/// command BEFORE the newline collapse and truncation — display formatting must never change
-/// what a command classifies as.
+/// <dir> && timeout 15 rg ...` is the shape `prefer-fd-rg` itself emits) — THEN reduce the
+/// result to its [`identity::identity`] (the one clause that says what the command is) before
+/// truncating to [`COMMAND_HEAD_MAX`], so the cap trims a short meaningful string instead of a
+/// long one mid-token. The class is read off the REDUCED command, before either the identity
+/// step or the truncation — display formatting must never change what a command classifies as
+/// (#289's own rule, unchanged by #336's identity reduction).
 pub fn normalize_bash_command(raw: &str) -> (String, CommandClass) {
     let s = strip_wrappers(strip_env_prefix(raw.trim_start()));
     let reduced = reduce_cd_prefix(s).unwrap_or_else(|| s.to_string());
     let reduced = strip_wrappers(&reduced).to_string();
     let class = classify_command(&reduced);
-    let head = reduced
+    let head = identity::identity(&reduced)
         .replace('\n', "⏎")
         .chars()
         .take(COMMAND_HEAD_MAX)
@@ -1134,31 +2003,44 @@ mod tests {
     /// That is exactly what put `cd ~/src/example/st…` on three RUNNING NOW rows
     /// (2026-09-13): a path where the row's one line should carry a verb. The class is read
     /// off the remainder and is unchanged by the drop, which is why dropping it is safe.
+    ///
+    /// The head assertion below was updated again for the identity reduction (`identity`
+    /// module): a compound's head used to be the WHOLE reduced text; now it is that text's
+    /// IDENTITY — the first non-trivial clause — which is `cargo build` here, not `cargo
+    /// build && cargo test`. `class` is untouched, since it still reads the `&&` off the
+    /// reduced text before identity ever runs.
     #[test]
     fn a_genuine_compound_loses_its_cd_and_stays_compound() {
         let (head, class) = normalize_bash_command("cd ~/src/example && cargo build && cargo test");
-        assert_eq!(head, "cargo build && cargo test");
+        assert_eq!(head, "cargo build");
         assert_eq!(class, CommandClass::Compound);
     }
 
     /// The live shape from finding 3: a `cd` in front of a PIPELINE. The row must say what
     /// the pipeline starts with, not which directory it ran in.
+    ///
+    /// The head is the pipeline's IDENTITY (its first clause, `rg -n TODO`) since the
+    /// identity reduction landed, not the whole pipeline text; `class` still reads `Compound`
+    /// off the pre-identity reduced text.
     #[test]
     fn a_cd_in_front_of_a_pipeline_is_reduced() {
         let (head, class) = normalize_bash_command("cd ~/src/example && rg -n TODO | head -20");
-        assert_eq!(head, "rg -n TODO | head -20");
+        assert_eq!(head, "rg -n TODO");
         assert_eq!(class, CommandClass::Compound);
     }
 
-    /// `;` as the separator, with a compound remainder — the same rule as `&&`.
+    /// `;` as the separator, with a compound remainder — the same rule as `&&`. Head is the
+    /// identity of the first clause (`cargo build`), not the whole `a; b` text, since the
+    /// identity reduction landed.
     #[test]
     fn a_cd_with_a_semicolon_separator_is_reduced() {
         let (head, _) = normalize_bash_command("cd ~/src/example; cargo build; cargo test");
-        assert_eq!(head, "cargo build; cargo test");
+        assert_eq!(head, "cargo build");
     }
 
     /// A bare `cd X` has no clause to reduce TO, so it is left alone — dropping it would
-    /// leave the row with an empty head.
+    /// leave the row with an empty head. `cd` is a trivial verb, so identity falls back to
+    /// showing the bare `cd` clause itself rather than reducing further.
     #[test]
     fn a_bare_cd_is_left_alone() {
         let (head, _) = normalize_bash_command("cd ~/src/example");
@@ -1166,23 +2048,41 @@ mod tests {
     }
 
     /// `cd` is matched as a whole word: `cdx` is somebody's own command, not a directory
-    /// change, and its first token is what the class is read off.
+    /// change, and its first token is what the class is read off. The head is `cdx`'s
+    /// identity (its own clause, dropping `&& cargo build`) since the identity reduction
+    /// landed — `cdx` is not a trivial verb, so it is not itself reduced further.
     #[test]
     fn a_command_merely_starting_with_cd_is_left_alone() {
         let (head, _) = normalize_bash_command("cdx ~/src/example && cargo build");
-        assert_eq!(head, "cdx ~/src/example && cargo build");
+        assert_eq!(head, "cdx ~/src/example");
     }
 
-    /// A multi-line script collapses to one line (`⏎` between lines) for display, and is
-    /// still classified from the reduced text, not by its first line alone. The newline
-    /// here is INTERNAL to the reduced clause (a backslash-continued `cargo` invocation),
-    /// not merely trailing whitespace `cd`'s own trim already strips.
+    /// A backslash-continued line is, to the identity reducer, an UNQUOTED newline: it splits
+    /// there just as it would on `;`, so the identity is just `cargo test`, dropping the
+    /// continuation entirely. `class` is still read off the whole reduced text (still
+    /// contains the raw newline, still `Build`) before identity ever runs.
+    ///
+    /// This assertion used to read `"cargo test \\⏎  -p example"` — the WHOLE reduced text
+    /// with its newline swapped for `⏎` for display. That was the pre-identity behavior; see
+    /// `an_embedded_quoted_newline_still_becomes_the_display_marker` below for where `⏎` is
+    /// still reachable now (a newline INSIDE quotes, which the identity reducer never splits
+    /// on).
     #[test]
-    fn a_multiline_script_collapses_to_one_line() {
+    fn a_backslash_continued_line_splits_at_the_unquoted_newline() {
         let raw = "cd ~/src/example && cargo test \\\n  -p example";
         let (head, class) = normalize_bash_command(raw);
-        assert_eq!(head, "cargo test \\⏎  -p example");
+        assert_eq!(head, "cargo test");
         assert_eq!(class, CommandClass::Build);
+    }
+
+    /// A real newline INSIDE quotes is never a split point (only unquoted separators are), so
+    /// it survives identity reduction — and [`normalize_bash_command`] still swaps it for `⏎`
+    /// before the display cap, exactly as it did for the whole reduced text before the
+    /// identity step existed.
+    #[test]
+    fn an_embedded_quoted_newline_still_becomes_the_display_marker() {
+        let (head, _) = normalize_bash_command("printf 'a\nb'");
+        assert_eq!(head, "printf 'a⏎b'");
     }
 
     /// One classification per class name — matches `hooks/log-slow-bash.sh`'s own class
@@ -2040,9 +2940,12 @@ mod tests {
             Some(CommandClass::GitNet)
         );
         assert_eq!(session.tools.timed_out[0].ended_ms, 661_000);
+        // `until` is a control-flow keyword, so identity reduction keeps only its first
+        // clause (up to the `;`), dropping `do sleep 5; done` — the loop's OWN condition is
+        // what says what it's waiting on, not its body.
         assert_eq!(
             session.tools.timed_out[1].command_head.as_deref(),
-            Some("until grep -q ready build.log; do sleep 5; done")
+            Some("until grep -q ready build.log")
         );
     }
 
@@ -2273,6 +3176,96 @@ mod tests {
             projected,
             vec![0u16; REQ_PER_MINUTE_LEN],
             "35 idle minutes is more than the 30-minute window, so every bucket is zero"
+        );
+    }
+
+    /// Split a golden-fixture TSV into `(raw, expected)` pairs. Almost every row is one
+    /// physical line, but a handful of `expected` columns hold a genuine embedded newline
+    /// (the reference reduction can retain ONE inside a quote, and the file's own escaping
+    /// only escapes a raw command's newlines for column 1 — column 2 is written verbatim). A
+    /// continuation line (no tab at all) is folded into the PREVIOUS record's `expected`
+    /// field with the real newline it was split on put back.
+    fn parse_golden_tsv(contents: &str) -> Vec<(String, String)> {
+        let mut records: Vec<(String, String)> = Vec::new();
+        for line in contents.lines() {
+            match line.split_once('\t') {
+                Some((raw, expected)) => records.push((raw.to_string(), expected.to_string())),
+                None => {
+                    if let Some((_, expected)) = records.last_mut() {
+                        expected.push('\n');
+                        expected.push_str(line);
+                    }
+                }
+            }
+        }
+        records
+    }
+
+    /// Undo the golden file's escaping of a raw command's embedded newlines (`\n`, two literal
+    /// characters) back to a real newline character, so the reconstructed raw text is what
+    /// [`identity::identity`] actually runs on. This is LOSSY in one direction the golden file
+    /// itself cannot avoid: a command whose ORIGINAL text already contained a literal 2-char
+    /// `\n` sequence (a regex escape inside a `sed`/`perl`/`rg` pattern, say) is indistinguishable
+    /// in column 1 from an escaped real newline — both are the same two characters once
+    /// written to the TSV. `golden_corpus_agreement`'s mismatch count is dominated by exactly
+    /// this: proven by feeding the reference Python port itself the same reconstruction (see
+    /// the FINAL-REPORT), which reproduces the identical mismatch set — so it is the fixture's
+    /// own round-trip, not a port defect.
+    fn unescape_golden_command(raw_escaped: &str) -> String {
+        raw_escaped.replace("\\n", "\n")
+    }
+
+    /// The number of golden rows whose reconstructed raw command is genuinely ambiguous (see
+    /// [`unescape_golden_command`]) — the reference Python port itself disagrees with the
+    /// golden file on exactly this many rows when fed the identical reconstruction, so this is
+    /// the fixture's own irreducible ceiling, not a budget for new Rust-vs-Python drift. A rise
+    /// above this number is a real regression; report it.
+    const KNOWN_GOLDEN_ROUND_TRIP_AMBIGUITIES: usize = 141;
+
+    /// Agreement check against the 40,589-row golden fixture (real Bash commands harvested
+    /// from `~/.claude/projects/`, paired with the reference Python port's expected identity —
+    /// see `docs/design/tools-tab.md`). `#[ignore]`d and the fixture is never committed to this
+    /// PUBLIC repo: the corpus is one person's real command history (live paths, customer
+    /// UUIDs turn up in it), and a test that panics when an external, non-repo file is absent
+    /// would break `cargo test --all` for everyone else. Run explicitly:
+    /// `cargo test --lib -- --ignored golden_corpus_agreement`, optionally with
+    /// `GOLDEN_TSV_PATH` pointing elsewhere.
+    #[test]
+    #[ignore = "reads an external, non-repo fixture of real command history — see doc comment"]
+    fn golden_corpus_agreement() {
+        let path = std::env::var("GOLDEN_TSV_PATH")
+            .unwrap_or_else(|_| "/tmp/tcr-ghosts/GOLDEN.tsv".to_string());
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            eprintln!("golden_corpus_agreement: {path} not present, skipping");
+            return;
+        };
+        let records = parse_golden_tsv(&contents);
+        assert!(!records.is_empty(), "parsed zero rows out of {path}");
+
+        let mut mismatches: Vec<(usize, String, String, String)> = Vec::new();
+        for (i, (raw_escaped, expected)) in records.iter().enumerate() {
+            let raw = unescape_golden_command(raw_escaped);
+            let got = identity::identity(&raw);
+            if &got != expected {
+                mismatches.push((i, raw_escaped.clone(), expected.clone(), got));
+            }
+        }
+
+        let total = records.len();
+        let agree = total - mismatches.len();
+        eprintln!(
+            "golden_corpus_agreement: {agree}/{total} exact matches, {} mismatches",
+            mismatches.len()
+        );
+        for (i, raw, expected, got) in mismatches.iter().take(5) {
+            eprintln!("  row {i}: raw={raw:?}\n    expected={expected:?}\n    got={got:?}");
+        }
+
+        assert_eq!(
+            mismatches.len(),
+            KNOWN_GOLDEN_ROUND_TRIP_AMBIGUITIES,
+            "mismatch count moved off the known fixture-ambiguity ceiling — see \
+             KNOWN_GOLDEN_ROUND_TRIP_AMBIGUITIES's doc comment"
         );
     }
 }
