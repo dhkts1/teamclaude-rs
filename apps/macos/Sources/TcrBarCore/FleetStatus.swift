@@ -309,6 +309,19 @@ extension ProbeState: Decodable {
 /// encodes — an absent measurement never renders as a number — is a property of
 /// the data, and a view-private formatter cannot be tested.
 public enum QuotaFormat {
+    /// One summary-line phrase with its internal spaces made non-breaking, so
+    /// a numbers line that overflows the panel wraps BETWEEN phrases and never
+    /// inside one.
+    ///
+    /// Without it the line breaks at whichever space sits at the panel edge.
+    /// The Tools tab rendered "... 5 err" on one line and "today - 31 timed
+    /// out" on the next, which reads as if "today" qualified the timeouts.
+    /// Only the " - " separator between phrases keeps ordinary spaces: that is
+    /// the one place a break is wanted.
+    public static func unbreakable(_ phrase: String) -> String {
+        phrase.replacingOccurrences(of: " ", with: "\u{00A0}")
+    }
+
     /// The label for a not-measured value. Matches what the CLI prints for the
     /// same case, and what `cacheHitRatio` has always rendered here.
     public static let notMeasured = "n/a"

@@ -2119,20 +2119,20 @@ struct FleetView: View {
         let waiting = joined.filter { $0.activity == .waiting }.count
         var numbers: [Text] = []
         if let hourly = fleet.burnRateSegment {
-            numbers.append(Text(hourly))
+            numbers.append(summaryPhrase(hourly))
         }
         if let today = fleet.todayCost {
-            numbers.append(Text("\(QuotaFormat.usd(today)) today"))
+            numbers.append(summaryPhrase("\(QuotaFormat.usd(today)) today"))
         }
         if let live = fleet.sessionsLiveCost {
-            numbers.append(Text("\(QuotaFormat.usd(live)) live"))
+            numbers.append(summaryPhrase("\(QuotaFormat.usd(live)) live"))
         }
         if !fleet.accounts.isEmpty {
             numbers.append(
-                Text("\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
+                summaryPhrase("\(fleet.sessionsDistinctAccountCount)/\(fleet.accounts.count) accounts"))
         }
         if fleet.toolsTotalErrors > 0 {
-            numbers.append(Text("\(fleet.toolsTotalErrors) err"))
+            numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err"))
         }
         return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack(alignment: .firstTextBaseline) {
@@ -2171,13 +2171,14 @@ struct FleetView: View {
             now: now, timeoutSeconds: bashTimeoutSeconds, warnWithinSeconds: V4.toolTimeoutWarnSeconds)
         var numbers: [Text] = []
         if let machine {
-            numbers.append(Text(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
-            numbers.append(Text(machine.restClause))
+            numbers.append(
+                summaryPhrase(machine.loadClause).foregroundColor(machineLoadTint(machine.loadTint)))
+            numbers.append(summaryPhrase(machine.restClause))
         }
         if fleet.toolsTotalErrors > 0 {
-            numbers.append(Text("\(fleet.toolsTotalErrors) err today"))
+            numbers.append(summaryPhrase("\(fleet.toolsTotalErrors) err today"))
         }
-        numbers.append(Text("\(fleet.toolsTotalTimeouts) timed out"))
+        numbers.append(summaryPhrase("\(fleet.toolsTotalTimeouts) timed out"))
         return VStack(alignment: .leading, spacing: Tok.tightSpacing) {
             HStack(alignment: .firstTextBaseline) {
                 Text("\(running) running, \(nearTimeout) near timeout")
@@ -2201,6 +2202,14 @@ struct FleetView: View {
     /// lines build their trailing clause list — so a future third summary line
     /// reaches for this instead of writing a fourth copy of the same
     /// `reduce`.
+    /// One phrase of a summary numbers line, with its internal spaces made
+    /// non-breaking by ``QuotaFormat/unbreakable(_:)``. Every part handed to
+    /// ``joinedBySeparator(_:)`` is built here, so no caller can pass a phrase
+    /// the layout is free to split down the middle.
+    private func summaryPhrase(_ phrase: String) -> Text {
+        Text(QuotaFormat.unbreakable(phrase))
+    }
+
     private func joinedBySeparator(_ parts: [Text]) -> Text {
         parts.enumerated().reduce(Text("")) { acc, entry in
             let (index, part) = entry
