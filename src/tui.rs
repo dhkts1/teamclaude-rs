@@ -65,11 +65,66 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Set by the panic hook when a panic happened on some OTHER thread and the
-/// screen was left alone. The draw loop consumes it with a full repaint, because
-/// whatever the default hook printed is now sitting in cells ratatui believes it
-/// already owns.
-static SCREEN_DIRTIED_BY_PANIC: AtomicBool = AtomicBool::new(false);
+/// Set whenever the screen may no longer match what ratatui believes is on it.
+/// The draw loop consumes it with a full clear and repaint.
+///
+/// ratatui writes only the cells that differ between its previous and current
+/// buffers, so ANY divergence between that previous buffer and the real screen is
+/// permanent: every later frame computes an empty diff for the damaged cells and
+/// writes nothing at all. That is why issue #323 never recovered on its own and
+/// why a restart was the only cure — an expensive one here, since every account
+/// comes back with a cold prompt cache.
+///
+/// Three things open that gap, and all three set this flag:
+///
+/// - a panic on some OTHER thread, whose message lands in cells ratatui believes
+///   it already owns (issue #323, first report);
+/// - a `draw` that failed at its final `Backend::flush`. ratatui swaps its
+///   buffers BEFORE that flush — `swap_buffers()` then `self.backend.flush()?` in
+///   `ratatui_core::terminal::render::apply_buffer_with_cursor` — so a frame that
+///   never left the process is recorded as though it had reached the screen
+///   (issue #323, second report, on a build that already had the panic fix);
+/// - a resize, which repaints from a different geometry over the old frame's
+///   cells.
+///
+/// `r` sets it too. Whatever we failed to anticipate, the user gets the screen
+/// back with one keystroke instead of a restart.
+static SCREEN_DIRTY: AtomicBool = AtomicBool::new(false);
+
+/// One repaint, with the screen repair that has to go with it.
+///
+/// Repairs first when something dirtied the screen, then draws — and treats a
+/// failed draw as fresh damage rather than as nothing.
+///
+/// That last part is the whole point. Neither failure may crash the dashboard, and
+/// neither may be forgotten. By the time a backend flush fails, ratatui has already
+/// swapped its buffers (`swap_buffers()` precedes `self.backend.flush()?` in
+/// `ratatui_core::terminal::render::apply_buffer_with_cursor`), so it now records a
+/// frame that never left the process as the one on screen. Every later diff against
+/// that record comes out empty, and the damaged cells stay damaged until something
+/// clears. Re-arming `dirty` is what makes the next tick that something.
+///
+/// `dirty` is a parameter rather than a direct read of [`SCREEN_DIRTY`] so a test
+/// can drive this with a flag of its own, instead of racing every other test in the
+/// binary for one global.
+fn repaint<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    dirty: &AtomicBool,
+    render_frame: impl FnOnce(&mut Frame),
+) {
+    if dirty.swap(false, Ordering::SeqCst) {
+        if let Err(err) = terminal.clear() {
+            // The repair did not land either. Stay dirty and retry on the next tick
+            // rather than dropping it on the floor.
+            tracing::warn!(error = %err, "could not clear a dirty screen");
+            dirty.store(true, Ordering::SeqCst);
+        }
+    }
+    if let Err(err) = terminal.draw(render_frame) {
+        tracing::warn!(error = %err, "tui repaint failed; forcing a full redraw");
+        dirty.store(true, Ordering::SeqCst);
+    }
+}
 
 /// Does a panic on this thread mean the process is going down, so the terminal
 /// must be handed back?
@@ -115,7 +170,7 @@ fn install_panic_hook() {
                 panic = %info,
                 "a background task panicked"
             );
-            SCREEN_DIRTIED_BY_PANIC.store(true, Ordering::SeqCst);
+            SCREEN_DIRTY.store(true, Ordering::SeqCst);
         }));
     });
 }
@@ -129,6 +184,9 @@ enum Action {
     Down,
     Disable,
     Enable,
+    /// Repaint the whole screen from scratch. The escape hatch for a screen that
+    /// something outside ratatui has written over: see [`SCREEN_DIRTY`].
+    Redraw,
 }
 
 /// How long a [`Notice`] stays on screen. Long enough to read a full line without
@@ -201,7 +259,7 @@ fn next_selection(selected: usize, count: usize, action: Action) -> usize {
     match action {
         Action::Up => selected.saturating_sub(1),
         Action::Down => selected.saturating_add(1),
-        Action::None | Action::Quit | Action::Disable | Action::Enable => selected,
+        Action::None | Action::Quit | Action::Disable | Action::Enable | Action::Redraw => selected,
     }
 }
 
@@ -227,17 +285,9 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                     std::time::Instant::now(),
                     snapshot.accounts.get(selected).map(|a| a.name.as_str()),
                 );
-                // A panic elsewhere printed over us (or would have). ratatui believes
-                // those cells are already correct, so only a full clear repairs them.
-                if SCREEN_DIRTIED_BY_PANIC.swap(false, Ordering::SeqCst) {
-                    if let Err(err) = terminal.clear() {
-                        tracing::warn!(error = %err, "could not clear after a background panic");
-                    }
-                }
-                // A single failed repaint must not crash the process.
-                if let Err(err) = terminal.draw(|frame| render(frame, &snapshot, selected, live)) {
-                    tracing::warn!(error = %err, "tui repaint failed");
-                }
+                repaint(&mut terminal, &SCREEN_DIRTY, |frame| {
+                    render(frame, &snapshot, selected, live);
+                });
             }
             maybe_event = events.next() => {
                 match maybe_event {
@@ -266,11 +316,22 @@ pub async fn run(manager: Arc<Manager>) -> io::Result<()> {
                                     .warning(disabled)
                                     .map(|text| Notice::new(text, account));
                             }
+                            // Asked for by hand: the user can see damage we could
+                            // not detect. Consumed by the next tick.
+                            Action::Redraw => SCREEN_DIRTY.store(true, Ordering::SeqCst),
                             Action::None => {}
                         }
                     }
-                    // Paste / resize / focus / mouse are non-fatal; a multi-char
-                    // paste can never crash the loop.
+                    // A resize repaints from a different geometry, with the old
+                    // frame's cells still underneath. ratatui clears inside `draw`
+                    // when it notices the new size, but that clear is a write like
+                    // any other and can fail; marking the screen dirty puts the
+                    // repair on the tick, which retries.
+                    Some(Ok(Event::Resize(_, _))) => {
+                        SCREEN_DIRTY.store(true, Ordering::SeqCst);
+                    }
+                    // Paste / focus / mouse are non-fatal; a multi-char paste can
+                    // never crash the loop.
                     Some(Ok(_)) => {}
                     Some(Err(err)) => tracing::warn!(error = %err, "tui input error"),
                     None => break, // input stream closed
@@ -294,6 +355,14 @@ fn key_action(key: &KeyEvent) -> Action {
         {
             Action::Quit
         }
+        // `r` for redraw, plus the Ctrl-L every other full-screen program answers
+        // to. Either one repairs a screen some other writer has corrupted.
+        KeyCode::Char('l') | KeyCode::Char('L')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            Action::Redraw
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => Action::Redraw,
         KeyCode::Up | KeyCode::Char('k') => Action::Up,
         KeyCode::Down | KeyCode::Char('j') => Action::Down,
         KeyCode::Char('d') | KeyCode::Char('D') => Action::Disable,
@@ -995,7 +1064,7 @@ fn render_log(frame: &mut Frame, area: Rect, snapshot: &StatsSnapshot, now: Offs
     let log = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" recent · q quit · ↑↓/jk select · d/e disable/enable "),
+            .title(" recent · q quit · ↑↓/jk select · d/e disable/enable · r redraw "),
     );
     frame.render_widget(log, area);
 }
@@ -1312,6 +1381,274 @@ mod tests {
     #[test]
     fn accounts_title_flags_clip() {
         assert_eq!(accounts_title(5, 7), " teamclaude-rs · accounts (5/7 ▼) ");
+    }
+
+    #[test]
+    fn redraw_is_bound_to_r_and_ctrl_l() {
+        let plain = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        assert_eq!(key_action(&plain('r')), Action::Redraw);
+        assert_eq!(key_action(&plain('R')), Action::Redraw);
+        assert_eq!(key_action(&ctrl('l')), Action::Redraw);
+        assert_eq!(key_action(&ctrl('L')), Action::Redraw);
+        // Ctrl-C still quits: the new Ctrl- arm must not have shadowed it.
+        assert_eq!(key_action(&ctrl('c')), Action::Quit);
+        // A bare `l` is not a redraw, so a stray keypress cannot force a repaint.
+        assert_eq!(key_action(&plain('l')), Action::None);
+    }
+
+    #[test]
+    fn redraw_does_not_move_the_selection() {
+        assert_eq!(next_selection(2, 5, Action::Redraw), 2);
+    }
+
+    #[test]
+    fn the_log_pane_advertises_the_redraw_key() {
+        // The key is only an escape hatch if a user staring at a broken screen can
+        // find it. If the title is re-worded, re-word this with it.
+        let snapshot = util_snapshot(QuotaState::Normal);
+        let mut terminal =
+            Terminal::new(TestBackend::new(120, 6)).expect("test backend builds a terminal");
+        terminal
+            .draw(|frame| render_log(frame, frame.area(), &snapshot, anchor()))
+            .expect("render succeeds");
+        let painted = buffer_rows(terminal.backend().buffer()).join("\n");
+        assert!(
+            painted.contains("r redraw"),
+            "redraw key missing from the log pane title:\n{painted}"
+        );
+    }
+
+    /// A backend that models a buffered writer over a real tty: cells handed to
+    /// `draw` sit in a pending queue and only reach the screen when `flush`
+    /// succeeds. A failing flush drops them, exactly as a `BufWriter` over a tty
+    /// that returns `EAGAIN` does.
+    #[derive(Debug)]
+    struct FlushFailure;
+    impl std::fmt::Display for FlushFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "flush failed")
+        }
+    }
+    impl std::error::Error for FlushFailure {}
+
+    struct PendingBackend {
+        width: u16,
+        height: u16,
+        screen: Vec<Vec<char>>,
+        pending: Vec<(u16, u16, char)>,
+        fail_flush: bool,
+        fail_clear: bool,
+    }
+
+    impl PendingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                width,
+                height,
+                screen: vec![vec![' '; width as usize]; height as usize],
+                pending: Vec::new(),
+                fail_flush: false,
+                fail_clear: false,
+            }
+        }
+        fn row(&self, y: usize) -> String {
+            self.screen[y]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        }
+    }
+
+    impl ratatui::backend::Backend for PendingBackend {
+        type Error = FlushFailure;
+        fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            for (x, y, cell) in content {
+                self.pending
+                    .push((x, y, cell.symbol().chars().next().unwrap_or(' ')));
+            }
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn show_cursor(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+            Ok(ratatui::layout::Position::new(0, 0))
+        }
+        fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+            &mut self,
+            _position: P,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn clear(&mut self) -> Result<(), Self::Error> {
+            if self.fail_clear {
+                return Err(FlushFailure);
+            }
+            self.screen = vec![vec![' '; self.width as usize]; self.height as usize];
+            Ok(())
+        }
+        fn clear_region(
+            &mut self,
+            _clear_type: ratatui::backend::ClearType,
+        ) -> Result<(), Self::Error> {
+            ratatui::backend::Backend::clear(self)
+        }
+        fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+            Ok(ratatui::layout::Size::new(self.width, self.height))
+        }
+        fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+            Ok(ratatui::backend::WindowSize {
+                columns_rows: ratatui::layout::Size::new(self.width, self.height),
+                pixels: ratatui::layout::Size::new(0, 0),
+            })
+        }
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            if self.fail_flush {
+                // The bytes never left the process.
+                self.pending.clear();
+                return Err(FlushFailure);
+            }
+            for (x, y, ch) in self.pending.drain(..) {
+                if (y as usize) < self.screen.len() && (x as usize) < self.screen[0].len() {
+                    self.screen[y as usize][x as usize] = ch;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn paint(
+        terminal: &mut Terminal<PendingBackend>,
+        text: &'static str,
+    ) -> Result<(), FlushFailure> {
+        terminal.draw(|frame| {
+            let area = frame.area();
+            frame.render_widget(Paragraph::new(text), area);
+        })?;
+        Ok(())
+    }
+
+    /// Why a failed repaint MUST mark the screen dirty (issue #323, second report).
+    ///
+    /// ratatui calls `swap_buffers()` before the final `Backend::flush`, so a frame
+    /// that never reached the terminal is still recorded as the previous frame.
+    /// Every later diff against that record is empty and nothing repaints — the
+    /// reporter's "it never recovers, only a restart clears it", exactly.
+    #[test]
+    fn a_failed_flush_desyncs_ratatui_from_the_screen_forever() {
+        let mut terminal = Terminal::new(PendingBackend::new(20, 1)).unwrap();
+        paint(&mut terminal, "FRAME-ONE").unwrap();
+        assert_eq!(terminal.backend().row(0), "FRAME-ONE");
+
+        terminal.backend_mut().fail_flush = true;
+        assert!(
+            paint(&mut terminal, "FRAME-TWO").is_err(),
+            "the failing flush must surface as an error"
+        );
+        terminal.backend_mut().fail_flush = false;
+
+        // Four healthy frames, all rendering what the app wants on screen.
+        for _ in 0..4 {
+            paint(&mut terminal, "FRAME-TWO").unwrap();
+        }
+        assert_eq!(
+            terminal.backend().row(0),
+            "FRAME-ONE",
+            "if this now recovers on its own, ratatui changed its swap/flush order              and the SCREEN_DIRTY handling in `run` can be simplified"
+        );
+    }
+
+    /// THE gate for issue #323's second report: the draw loop itself recovers.
+    ///
+    /// Drives `repaint` — the real policy the tick runs — across six ticks with one
+    /// failing flush in the middle, on a backend that drops writes exactly as a
+    /// buffered writer over a tty does. Delete the `dirty.store(true, ..)` in
+    /// `repaint`'s draw-error arm and this test fails with the screen frozen on the
+    /// pre-failure frame, which is the bug as reported.
+    #[test]
+    fn repaint_recovers_the_screen_after_a_failed_flush() {
+        let dirty = AtomicBool::new(false);
+        let mut terminal = Terminal::new(PendingBackend::new(20, 1)).unwrap();
+
+        let tick = |terminal: &mut Terminal<PendingBackend>, text: &'static str| {
+            repaint(terminal, &dirty, |frame| {
+                frame.render_widget(Paragraph::new(text), frame.area());
+            });
+        };
+
+        tick(&mut terminal, "FRAME-ONE");
+        assert_eq!(terminal.backend().row(0), "FRAME-ONE");
+
+        // One tick's frame never leaves the process.
+        terminal.backend_mut().fail_flush = true;
+        tick(&mut terminal, "FRAME-TWO");
+        terminal.backend_mut().fail_flush = false;
+        assert_eq!(
+            terminal.backend().row(0),
+            "FRAME-ONE",
+            "the failed tick must not have reached the screen — otherwise this test \
+             is not modelling the failure it claims to"
+        );
+
+        // The very next tick repairs it.
+        tick(&mut terminal, "FRAME-TWO");
+        assert_eq!(
+            terminal.backend().row(0),
+            "FRAME-TWO",
+            "the tick after a failed repaint must clear and fully redraw; without \
+             that, ratatui diffs against a frame that never landed and the screen \
+             stays broken until the process restarts (issue #323)"
+        );
+        assert!(
+            !dirty.load(Ordering::SeqCst),
+            "a successful repair must consume the flag, not leave the dashboard \
+             clearing on every tick"
+        );
+    }
+
+    /// A clear that fails too must stay armed, or the one tick that tried to repair
+    /// the screen is also the tick that gave up on it.
+    #[test]
+    fn a_failed_clear_stays_armed_for_the_next_tick() {
+        let dirty = AtomicBool::new(true);
+        let mut terminal = Terminal::new(PendingBackend::new(20, 1)).unwrap();
+        terminal.backend_mut().fail_clear = true;
+
+        repaint(&mut terminal, &dirty, |frame| {
+            frame.render_widget(Paragraph::new("X"), frame.area());
+        });
+
+        assert!(
+            dirty.load(Ordering::SeqCst),
+            "a clear that failed must leave the screen marked dirty"
+        );
+    }
+
+    /// And why a clear is the repair: the same sequence, with the invalidation the
+    /// draw loop now performs.
+    #[test]
+    fn a_clear_repairs_a_desynced_screen() {
+        let mut terminal = Terminal::new(PendingBackend::new(20, 1)).unwrap();
+        paint(&mut terminal, "FRAME-ONE").unwrap();
+
+        terminal.backend_mut().fail_flush = true;
+        let failed = paint(&mut terminal, "FRAME-TWO").is_err();
+        terminal.backend_mut().fail_flush = false;
+        assert!(failed);
+
+        // What the tick does when SCREEN_DIRTY is set.
+        terminal.clear().unwrap();
+        paint(&mut terminal, "FRAME-TWO").unwrap();
+
+        assert_eq!(terminal.backend().row(0), "FRAME-TWO");
     }
 
     #[test]

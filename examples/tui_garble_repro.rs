@@ -5,15 +5,25 @@
 //! BACKGROUND task panics, as any task in the server may. The screen is captured
 //! before and after by the caller (`scripts/repro-323.sh` under tmux).
 //!
-//! Run: cargo run --example tui_garble_repro -- [panic|clean|fixed]
-//!   panic — the hook as it shipped: a background panic drops the screen (issue #323)
-//!   fixed — the hook as it stands now: the screen survives and repaints
-//!   clean — the same loop, no panic at all (control)
+//! Run: cargo run --example tui_garble_repro -- [panic|clean|fixed|desync|desync-fixed]
+//!   panic  — the hook as it shipped: a background panic drops the screen (issue #323)
+//!   fixed  — the hook as it stands now: the screen survives and repaints
+//!   clean  — the same loop, no panic at all (control)
+//!
+//! The two `desync` modes are issue #323's SECOND report, on a build that already
+//! had the panic fix. Something writes over the alternate screen with nothing
+//! in-band for the loop to notice — a frame lost at `Backend::flush`, a stray
+//! write, a scroll. ratatui's previous buffer still describes the frame it believes
+//! is up, so its diff comes out empty and the damage is permanent.
+//!
+//!   desync       — no way out: the dashboard stays broken until the process dies
+//!   desync-fixed — `r` clears and fully repaints, the escape hatch this adds
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -26,6 +36,24 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Terminal;
 
 static SCREEN_DIRTIED_BY_PANIC: AtomicBool = AtomicBool::new(false);
+
+/// Junk straight onto the alternate screen, behind ratatui's back. Stands in for
+/// every writer the loop cannot see: a frame dropped at `Backend::flush`, another
+/// thread's `println!`, a scroll. The observable result is the same either way —
+/// ratatui's previous buffer stops matching the screen, and only a clear repairs it.
+fn scribble_over_the_screen() {
+    use std::io::Write as _;
+    let mut out = io::stdout();
+    for line in [
+        "thread 'tokio-runtime-worker' something wrote here",
+        "  and here, four rows of it",
+        "  none of which ratatui knows about",
+        "  so none of which it will ever repaint",
+    ] {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = out.flush();
+}
 
 /// `broken` is the hook as it shipped: restore on ANY thread's panic.
 /// `fixed` is the hook this repro drove us to: only the TUI's own thread ends the
@@ -58,6 +86,12 @@ async fn main() -> io::Result<()> {
     execute!(io::stdout(), EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
 
+    if mode.starts_with("desync") {
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            scribble_over_the_screen();
+        });
+    }
     if mode == "panic" || mode == "fixed" {
         // A background task dies, as one in the server may. Nothing here touches
         // the terminal; the hook does it for us.
@@ -67,7 +101,16 @@ async fn main() -> io::Result<()> {
         });
     }
 
-    for tick in 0..30u32 {
+    for tick in 0..60u32 {
+        // `r` is the escape hatch `desync-fixed` demonstrates and `desync` lacks.
+        while event::poll(Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                let redraw = matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'));
+                if redraw && mode == "desync-fixed" {
+                    SCREEN_DIRTIED_BY_PANIC.store(true, Ordering::SeqCst);
+                }
+            }
+        }
         if SCREEN_DIRTIED_BY_PANIC.swap(false, Ordering::SeqCst) {
             let _ = terminal.clear();
         }
@@ -99,7 +142,7 @@ async fn main() -> io::Result<()> {
                 Paragraph::new(log).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" recent · q quit · ↑↓/jk select "),
+                        .title(" recent · q quit · ↑↓/jk select · r redraw "),
                 ),
                 chunks[1],
             );
