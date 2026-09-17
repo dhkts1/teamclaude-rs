@@ -573,11 +573,30 @@ final class MenuBarShell {
         // Without activation the panel opens without key focus, and
         // `.textSelection(.enabled)` on the account name (`FleetView.swift:537`)
         // stops working.
-        if #available(macOS 14.0, *) {
-            NSApp.activate()
-        } else {
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        //
+        // `ignoringOtherApps: true`, the same as `WhatsNewWindow.present()` and
+        // `Updater.checkForUpdates()`. This used to take the cooperative
+        // `NSApp.activate()` on macOS 14+, on the reasoning — written down in
+        // `WhatsNewWindow` — that cooperative activation is enough here because
+        // a click opened the popover. That is the assumption this call got wrong.
+        //
+        // Cooperative activation only succeeds while the system still credits
+        // this app with a recent interaction, and the status-item click does not
+        // reliably earn that once another app holds activation. Measured on a
+        // stuck panel: popover OPEN, `ApplicationType=UIElement` (so the policy
+        // was fine), and the frontmost app was a different one entirely. The
+        // popover draws but never becomes key, so every control in it is dead
+        // while `.transient`'s own monitors keep Escape and click-outside
+        // working — which is what made it look like a rendering bug rather than
+        // a focus one.
+        //
+        // Re-login is the reliable way in: it hands focus to the browser, the
+        // transient popover closes itself, and the reopen afterwards is the one
+        // that cannot take focus back.
+        //
+        // Deprecated on macOS 14+ and used deliberately anyway: the cooperative
+        // replacement has no way to express "the user asked for this window".
+        NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
     }
 

@@ -84,11 +84,15 @@ final class Updater: NSObject, ObservableObject {
     /// has to ask for the foreground every time it wants to be seen; this path
     /// simply never did.
     func checkForUpdates() {
-        if #available(macOS 14.0, *) {
-            NSApp.activate()
-        } else {
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        // `ignoringOtherApps: true` unconditionally. The cooperative
+        // `NSApp.activate()` only takes focus while the system still credits this
+        // app with a recent interaction, and by this point it does not: the
+        // caller is a control inside the popover, the popover closed on that
+        // click, and the app is no longer frontmost — the very situation the
+        // comment above describes. `MenuBarShell.openPanel()` was measured
+        // failing this way on a live stuck panel and forces activation for the
+        // same reason.
+        NSApp.activate(ignoringOtherApps: true)
         controller.updater.checkForUpdates()
     }
 }
