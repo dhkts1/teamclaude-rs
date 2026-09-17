@@ -98,9 +98,30 @@ concurrency:
 jobs:
   ensure-appcast:
     runs-on: ubuntu-24.04
-    # workflow_run fires on every conclusion (failure, cancelled, success); a
+    # `workflow_run` fires on every conclusion (failure, cancelled, success); a
     # release that never finished building has no appcast to protect yet.
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    #
+    # It also fires for runs that are not releases at all. `Release` runs on
+    # `pull_request` too — cargo-dist's `plan` job is one of main's required
+    # checks — so every PR reached the resolve step, found no tag pointing at a
+    # PR commit, and failed. Measured over this workflow's whole history: 16 of
+    # 20 runs failed that way, and the 4 that passed were the 4 real releases.
+    # A guard that is red four times in five cannot raise an alarm anyone reads,
+    # and this one exists for a failure class that orphaned the Sparkle feed
+    # five times.
+    #
+    # The discriminator is measured, not assumed. For a tag build `workflow_run`
+    # reports `event=push` with `head_branch` set to the tag itself (`v1.1.5`);
+    # for a PR build it reports `event=pull_request` with the branch name. So a
+    # non-release run is filtered out HERE, before the job starts, rather than
+    # being turned into a passing no-op inside it — the resolve step keeps
+    # failing loudly when a run that really is a tag build has no tag, because
+    # that is a genuine anomaly and the alarm has to stay believable.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
       - uses: actions/checkout@v7
         with:
