@@ -133,6 +133,45 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
   internal-scaffolding reference in $what:
 $(printf '%s\n' "$found" | sed 's/^/      /')"
 
+  # 5. Operational figures — an operator's own cost and volume, which is the
+  #    half that anonymising NAMES does not protect.
+  #
+  #    2026-09-17: a render fixture was filled in by reading the live proxy.
+  #    Emails, UUIDs and home paths were all faked, and checks 1 to 4 passed on
+  #    every commit, because none of them looks at a number. What went public
+  #    was per-session cost ($308.38, $126.66), request counts (1,654 and 837),
+  #    token volumes (328,915,843 cache-read) and error counts. Repairing it
+  #    took a history rewrite of `main`.
+  #
+  #    The rule keys on ROUNDNESS, not on magnitude. A fixture needs a figure of
+  #    the right SIZE and never a real one, so an invented value is round by
+  #    construction (1_500, 300.00, 300_000_000) and a measured one is not
+  #    (1_654, 308.38, 328_915_843). More than two significant digits on a money
+  #    or volume field is therefore a value somebody read off a running system.
+  #
+  #    It is a tripwire and not a proof: 4_100 and 96 were also real and both
+  #    have two significant digits, so they pass. That is acceptable, because
+  #    any single hit blocks the commit and puts a human in front of the whole
+  #    fixture, which is all this needed to have done.
+  #
+  #    Escape hatch: end the line with `disclosure-ok:` and a reason.
+  found="$(printf '%s\n' "$text" \
+           | grep -v -- 'disclosure-ok:' \
+           | awk '
+      match($0, /(costUsd|spendUsd|totalUsd|requests|calls|errors|timeouts|inputTokens|outputTokens|cacheReadTokens|cacheCreationTokens)[[:space:]]*[:=][[:space:]]*[0-9][0-9_.]*/) {
+        frag = substr($0, RSTART, RLENGTH)
+        val = frag
+        sub(/^[A-Za-z]+[[:space:]]*[:=][[:space:]]*/, "", val)
+        gsub(/[_.]/, "", val)
+        sub(/^0+/, "", val)
+        sub(/0+$/, "", val)
+        if (length(val) > 2) { print; hits++ }
+        if (hits >= 3) exit
+      }' || true)"
+  [ -n "$found" ] && hits="$hits
+  operational figure (cost or volume read off a running system) in $what:
+$(printf '%s\n' "$found" | sed 's/^/      /')"
+
   if [ -n "$hits" ]; then
     printf '%s\n' "$hits"
     return 1

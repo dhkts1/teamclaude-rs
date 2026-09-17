@@ -32,6 +32,7 @@ import argparse
 import json
 import re
 import sys
+import math
 import time
 import urllib.request
 from collections import Counter
@@ -139,6 +140,34 @@ def self_check():
     return 0
 
 
+def coarsen(value):
+    """Round a figure to two significant digits before it is ever printed.
+
+    This script exists to report the SHAPE of a fleet, and a shape is a
+    magnitude: whether a panel renders correctly at 1,600 requests does not
+    depend on the number being 1,654. Exact values are the operator's own
+    business volume and spend.
+
+    The original version guarded its output with a regex for emails, UUIDs and
+    absolute paths, and had a self-check proving that regex fires. Not one of
+    those looks at a number, so on 2026-09-17 the figures this script prints,
+    and per-session values read past it by hand, went into a public repository
+    wearing fake names. A detector only ever catches the class you thought of.
+    Rounding makes the precise value impossible to emit instead of detectable,
+    which is the difference between a guard and a property.
+
+    Rounds toward the nearest, never truncates, so a magnitude stays honest.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if value == 0:
+        return 0
+    magnitude = math.floor(math.log10(abs(value)))
+    step = 10 ** (magnitude - 1)
+    rounded = round(value / step) * step
+    return int(rounded) if isinstance(value, int) or float(rounded).is_integer() else round(rounded, 2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=DEFAULT_URL)
@@ -158,7 +187,7 @@ def main():
         print("fleet-shape: is the proxy running? try: tcr status", file=sys.stderr)
         return 2
 
-    lines = [f"{key}: {value}" for key, value in shape(doc, time.time() * 1000)]
+    lines = [f"{key}: {coarsen(value)}" for key, value in shape(doc, time.time() * 1000)]
     leaked = [line for line in lines if LEAK.search(line)]
     if leaked:
         print(f"fleet-shape: REFUSING to print, an identity reached the output: {leaked[0]}", file=sys.stderr)
