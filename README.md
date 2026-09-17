@@ -258,6 +258,29 @@ what you stage, and `--no-verify` exists.
 Found a security issue? Please open a private report through GitHub's security advisories
 rather than a public issue.
 
+## It does not phone home
+
+`tcr` has no telemetry and no crash reporting. Your config, logs, session pins and OAuth tokens are
+files on your own disk. It makes two kinds of outbound call: Anthropic, on your behalf, and GitHub,
+to check for a newer version.
+
+The cost lands on whoever hits a bug. There is no error stream to grep and no session to replay, so
+a good bug report is worth more here than in a project that watches its users. #323 was diagnosed
+from a screenshot and four log lines someone pasted.
+
+What it does instead of watching you is sign things. The app is codesigned with a Developer ID
+certificate, notarized by Apple and stapled, and every update is signed again with a Sparkle EdDSA
+key that your installed copy checks before it will run anything. Counting the cast: seven signing
+secrets for the release, all of which were deliberately removed from this repository on 2026-08-09
+and now live on one Mac and in one 1Password item, plus a local CA on your machine that mints a
+fresh leaf certificate on every boot, plus your per-account OAuth tokens, plus the proxy's own API
+key.
+
+It is an absurd number of keys for a thing that rotates Claude accounts. The reasoning is in
+[docs/RELEASING.md](docs/RELEASING.md): this repository is public, collaborators have push, and
+Sparkle's private key does not protect a build artifact, it decides what every already-installed
+copy will execute. Nothing stored is nothing stolen.
+
 ## Credits and license
 
 PolyForm Noncommercial 1.0.0, see [`LICENSE`](LICENSE). This is a from-scratch Rust rewrite
