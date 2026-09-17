@@ -22,6 +22,18 @@ final class ToolCallLabelTests: XCTestCase {
         XCTAssertEqual(ToolCallLabel.duration(600), "10m 0s")
     }
 
+    /// The tier that only an UNCAPPED call can reach. A three hour `Agent` is
+    /// ordinary in RUNNING NOW, and the two-tier form printed it `180m 3s`,
+    /// which truncated to `180m…` in the Sessions tab's "oldest" column.
+    func testDurationTiersAgainAtOneHour() {
+        XCTAssertEqual(ToolCallLabel.duration(3600), "1h 0m")
+        XCTAssertEqual(ToolCallLabel.duration(10803), "3h 0m")
+        XCTAssertEqual(ToolCallLabel.duration(11100), "3h 5m")
+        // The boundary belongs to the minute tier on its low side: 3599s is
+        // still under an hour and must not round up into "1h 0m".
+        XCTAssertEqual(ToolCallLabel.duration(3599), "59m 59s")
+    }
+
     func testACallAtTheTimeoutSaysSoInWords() {
         XCTAssertEqual(ToolCallLabel.pill(seconds: 600, timeout: 600), "timed out")
         // Past the deadline — a kill lands a hair after the figure it was

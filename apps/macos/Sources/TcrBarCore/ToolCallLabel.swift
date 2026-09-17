@@ -13,10 +13,33 @@
 /// colour alone, and the state in question is the most actionable fact on the
 /// tab.
 public enum ToolCallLabel {
-    /// `"45s"`, `"4m 12s"` — no day tier: the longest call this tab shows is
-    /// the Bash tool's own timeout, six orders of magnitude under a day.
+    /// `"45s"`, `"4m 12s"`, `"3h 0m"`.
+    ///
+    /// The hour tier exists because the premise this function shipped with was
+    /// wrong. It used to read "no day tier: the longest call this tab shows is
+    /// the Bash tool's own timeout, six orders of magnitude under a day", and
+    /// that is only true of a CAPPED call. RUNNING NOW also lists uncapped
+    /// ones — an `Agent`, a `TaskOutput` — which have no deadline at all and
+    /// routinely run for hours. Rendered by the old two-tier form, a three
+    /// hour subagent printed `180m 3s`, which a reader has to divide to
+    /// understand, and on the Sessions tab's narrower "oldest" column it did
+    /// not even fit: it truncated to `180m…`, losing the unit.
+    ///
+    /// Nothing under an hour changes, which is every capped call this tab can
+    /// show. Above it the seconds are dropped rather than carried, the same
+    /// choice ``HeldWindow/duration(minutes:)`` already makes at its own scale
+    /// (`4d 12h`, never `4d 12h 30m`): at three hours a second is not a fact
+    /// anyone reads, and the column is 96pt.
+    ///
+    /// Still no DAY tier, and now for a reason that survives: a call running
+    /// past 24 hours is older than ``SESSION_TTL_MS`` and older than the
+    /// six-hour lost-result backstop, so the wire has dropped it long before
+    /// it could reach this formatter.
     public static func duration(_ seconds: Double) -> String {
         let total = Int(seconds.rounded())
+        if total >= 3600 {
+            return "\(total / 3600)h \((total % 3600) / 60)m"
+        }
         let minutes = total / 60
         let rest = total % 60
         return minutes > 0 ? "\(minutes)m \(rest)s" : "\(rest)s"
