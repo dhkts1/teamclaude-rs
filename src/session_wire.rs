@@ -740,6 +740,37 @@ pub struct WireSession {
     pub by_model: std::collections::HashMap<String, ModelTokenTally>,
 }
 
+/// Tools whose `tool_use` block is the LAST content block of a turn, so the client never sends
+/// another API request off the back of it: the proxy sees the `tool_use`, but nothing after it
+/// carries the matching `tool_result`, and it sits in `running` until [`RUNNING_UNBOUNDED_LOST_MS`]
+/// calls it lost. Measured against the live proxy, 2026-09-17: 51 of 57 `running` entries were
+/// `StructuredOutput` (the Agent SDK's terminal tool), ages 2.6 to 246 minutes.
+///
+/// A `tool_result` for one of these DOES arrive occasionally (the live `sessions_summary.byTool`
+/// row that day: `{'tool': 'StructuredOutput', 'calls': 15, 'errors': 15}`, 15 of 66 seen) — the
+/// close path itself is not broken, the tool is simply terminal most of the time. Since
+/// [`WireSessionTracker::insert_running`] never puts these in `running`, that rare late
+/// `tool_result` has nothing to remove and is silently NOT counted into `calls`/`errors`/`by_tool`
+/// either: the whole completion pipeline is gated on a `running` entry existing, so skipping the
+/// insert also skips the count. That is the trade this constant makes — no ghost row, at the cost
+/// of the already-rare (23%) completion count for exactly these tools.
+///
+/// A set, not a single name, so the next terminal tool is one line here.
+///
+/// A name list, not a shortened backstop for every uncapped tool: measured live across the
+/// whole fleet the same day, stuck-vs-completed by tool was `StructuredOutput` 59/(59+15) =
+/// 79.7%, against `Bash` 5/4846 = 0.1%, `Edit` 1/176 = 0.6%, `Write` 1/225 = 0.4%, and
+/// `AskUserQuestion` 1/8 = 12.5% (n=8, and that tool genuinely blocks on a human, so its one
+/// stuck entry is most likely real work, not a ghost). `StructuredOutput` sits two orders of
+/// magnitude above every ordinary tool — categorically different, not a straggler — which is
+/// what makes a name list proportionate here; shortening [`RUNNING_UNBOUNDED_LOST_MS`] for
+/// every uncapped tool would misclassify the `Bash`/`Edit`/`Write`/`AskUserQuestion` rows above,
+/// which are ordinary in-flight calls, exactly what `running` exists to show. The ghost count
+/// was still climbing on the unpatched proxy while this was measured (51 at 19:31, 59 by
+/// 20:0x, one unchanged process) — roughly one new ghost per four minutes of fleet activity,
+/// capped only by [`PENDING_TOOL_CAP`] (64) per session.
+pub const TERMINAL_TOOLS: &[&str] = &["StructuredOutput"];
+
 /// Cap on pending (running) tool-use ids per session — see the bridge.
 pub const PENDING_TOOL_CAP: usize = 64;
 /// Cap on tracked sessions — see the bridge.
@@ -961,6 +992,16 @@ impl WireSessionTracker {
     /// block must not reset the clock.
     fn insert_running(tools: &mut ToolStats, tu: &ToolUseEvent, started_ms: i64) {
         if tools.running.contains_key(&tu.id) {
+            return;
+        }
+        // A terminal tool (see [`TERMINAL_TOOLS`]) never gets a `tool_result`, so it must never
+        // enter `running` in the first place — every caller of this function crosses this one
+        // gate, rather than each of them filtering before calling in.
+        if tu
+            .name
+            .as_deref()
+            .is_some_and(|name| TERMINAL_TOOLS.contains(&name))
+        {
             return;
         }
         if tools.running.len() >= PENDING_TOOL_CAP {
@@ -1571,6 +1612,63 @@ mod tests {
         assert_eq!(session.tools.calls, 0);
         assert_eq!(session.tools.running.len(), 1);
         assert!(session.tools.running.contains_key("tu_orphan"));
+    }
+
+    /// A terminal tool's `tool_use` (parsed from a response) must never enter `running` — it
+    /// will never get a `tool_result`, so an entry here is a ghost that only the six-hour
+    /// backstop would ever clear.
+    #[test]
+    fn a_terminal_tool_use_never_enters_running() {
+        let mut tracker = WireSessionTracker::new();
+        let uses = vec![ToolUseEvent {
+            id: "tu_structured".into(),
+            name: Some("StructuredOutput".into()),
+            command_head: None,
+            command_class: None,
+        }];
+        // `record_response_tool_uses` is the path the live ghosts actually took (a response's
+        // own tool_use, inserted at stream-end) — exercise the gate through it directly, on a
+        // session `record_request` has already created.
+        tracker.record_request("sess-terminal", None, None, 500, &[], &[]);
+        tracker.record_response_tool_uses("sess-terminal", 1_000, &uses);
+        let snap = tracker.snapshot(2_000);
+        let (_, session) = &snap[0];
+        assert_eq!(session.tools.running.len(), 0);
+    }
+
+    /// The positive control: a real long-running tool (`Agent`) and an ordinary `Bash` call in
+    /// the SAME batch as a terminal tool must still land in `running` — proving the gate is
+    /// selective to [`TERMINAL_TOOLS`], not a blanket off-switch on `insert_running`.
+    #[test]
+    fn a_bash_and_agent_tool_use_still_land_in_running_beside_a_terminal_tool() {
+        let mut tracker = WireSessionTracker::new();
+        let uses = vec![
+            ToolUseEvent {
+                id: "tu_bash".into(),
+                name: Some("Bash".into()),
+                command_head: None,
+                command_class: None,
+            },
+            ToolUseEvent {
+                id: "tu_agent".into(),
+                name: Some("Agent".into()),
+                command_head: None,
+                command_class: None,
+            },
+            ToolUseEvent {
+                id: "tu_structured".into(),
+                name: Some("StructuredOutput".into()),
+                command_head: None,
+                command_class: None,
+            },
+        ];
+        tracker.record_request("sess-mixed", None, None, 1_000, &uses, &[]);
+        let snap = tracker.snapshot(2_000);
+        let (_, session) = &snap[0];
+        assert_eq!(session.tools.running.len(), 2);
+        assert!(session.tools.running.contains_key("tu_bash"));
+        assert!(session.tools.running.contains_key("tu_agent"));
+        assert!(!session.tools.running.contains_key("tu_structured"));
     }
 
     #[test]

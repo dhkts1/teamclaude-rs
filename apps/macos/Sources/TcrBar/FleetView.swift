@@ -1165,12 +1165,52 @@ struct FleetView: View {
                 tint: Tok.inkDim)
         } else {
             let joined = SessionJoin.join(sessions: fleet.sessions, files: sessionFiles)
+            // Half this tab can be cache-warm stubs — two requests, no tool
+            // call, then silence (``SessionWarmup``, measured 2026-09-17: 14
+            // of 28 live sessions, $2.06). Folded below the real rows rather
+            // than dropped: `warmupsExpanded` un-folds them back to full rows,
+            // the same "nothing destroyed, only grouped" rule the tab's own
+            // "Show N more sessions" button already follows.
+            let fold = SessionsFold(joined, now: Date())
+            let displayed = warmupsExpanded ? joined : fold.visible
             if snapshotMode {
-                sessionsList(joined)
+                sessionsTabBody(displayed: displayed, fold: fold)
             } else {
-                ScrollView { sessionsList(joined) }
+                ScrollView { sessionsTabBody(displayed: displayed, fold: fold) }
                     .frame(height: visibleRowsHeight(for: fleet))
             }
+        }
+    }
+
+    private func sessionsTabBody(displayed: [JoinedSession], fold: SessionsFold) -> some View {
+        VStack(alignment: .leading, spacing: Tok.cardGap) {
+            sessionsList(displayed)
+            warmupFoldLine(fold)
+        }
+    }
+
+    /// "`14 warm-ups · $2.06`", muted like ``byToolLine(_:)`` — a fact worth a
+    /// glance, not worth the vertical space or visual weight of a real
+    /// session row. Tapping it is the SAME toggle ``sessionsExpanded``'s own
+    /// "Show N more sessions" button uses elsewhere on this tab: nothing here
+    /// is a second interaction pattern, only a second thing to fold.
+    @ViewBuilder
+    private func warmupFoldLine(_ fold: SessionsFold) -> some View {
+        if let label = fold.foldLabel {
+            Button(action: { warmupsExpanded.toggle() }) {
+                HStack(spacing: Tok.space1) {
+                    Image(systemName: warmupsExpanded ? "chevron.up" : "chevron.down")
+                    Text(label)
+                }
+                .font(V4.font(V4.byToolLineSize))
+                .foregroundStyle(Tok.mute)
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, V4.sectionHeadMarginSide)
+            .accessibilityHint(
+                warmupsExpanded
+                    ? "Folds the warm-up sessions back into this line."
+                    : "Shows every warm-up session folded into this line.")
         }
     }
 
@@ -1723,10 +1763,12 @@ struct FleetView: View {
         }
         // Only a Bash call HAS a timeout to be near: an Agent or a Read has no
         // cap this build knows, so it draws no ring and can never be "20s
-        // from" anything. ONE expression decides that, and the ring, the tint
-        // and the label all read it — the first draft decided it per site and
-        // printed "17s left" beside a call with no ring.
-        let capped = entry.call.tool == "Bash"
+        // from" anything. `ToolCall.capped` is the ONE place that decides
+        // that — the running list's own sort (`Fleet.toolsRunning`) reads the
+        // same property — and the ring, the tint and the label all read it
+        // here too; the first draft decided it per site and printed "17s
+        // left" beside a call with no ring.
+        let capped = entry.call.capped
         let remaining = capped ? elapsed.map { bashTimeoutSeconds - $0 } : nil
         let isNearTimeout = (remaining ?? .infinity) <= V4.toolTimeoutWarnSeconds
         // What this call's process tree costs, and the only evidence that
@@ -2665,6 +2707,12 @@ struct FleetView: View {
         sessionsExpanded.toggle()
         UserDefaults.standard.set(sessionsExpanded, forKey: Self.sessionsExpandedKey)
     }
+
+    /// Whether the Sessions tab's warm-up fold (``SessionWarmup``) is
+    /// expanded back to full rows. Not persisted, unlike ``sessionsExpanded``:
+    /// which fourteen sessions are warm-ups changes with every poll, so
+    /// yesterday's choice says nothing about today's fold.
+    @State private var warmupsExpanded = false
 
     /// Whether RUNNING NOW and SLOWEST TODAY are showing every item or the
     /// first few. Not persisted, unlike the Sessions tab's own flag: those

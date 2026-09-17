@@ -123,6 +123,14 @@ enum RenderStates {
             // the commands behind it) and a harness that can only draw it
             // closed reviews half the section.
             ("17b-tools-tab-timeout-class-open", .loaded(sessionsTabFleet), false, nil),
+            // The same two tabs at the LIVE fleet's measured dimensions
+            // instead of the mockup's — see `realShapeFleet`. These are the
+            // only scenes where TIMED OUT TODAY is absent (the real fleet
+            // reports no timeout class, so the card does not draw) and the
+            // only ones where the Sessions tab's warm-up fold has anything
+            // to fold.
+            ("22-tools-tab-real-fleet", .loaded(realShapeFleet), false, nil),
+            ("22b-sessions-tab-real-fleet", .loaded(realShapeFleet), false, nil),
             // The forward-compat case both tabs must show as one sentence,
             // never an empty list: `healthyJSON` carries no `sessions` key at
             // all, the shape every server shipped before F1.
@@ -237,10 +245,11 @@ enum RenderStates {
     private static func initialTab(for sceneName: String) -> PanelTab {
         switch sceneName {
         case "12b-keeping-awake-sessions-tab", "16-sessions-tab", "18-sessions-tab-old-server",
-            "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed":
+            "18c-sessions-tab-old-tcr", "18e-sessions-tab-command-failed",
+            "22b-sessions-tab-real-fleet":
             return .sessions
         case "17-tools-tab", "17b-tools-tab-timeout-class-open", "18b-tools-tab-old-server",
-            "18d-tools-tab-old-tcr":
+            "18d-tools-tab-old-tcr", "22-tools-tab-real-fleet":
             return .tools
         default: return .accounts
         }
@@ -258,6 +267,23 @@ enum RenderStates {
     /// mockup this fixture is modelled on, `cccccccc` is the idle,
     /// unassigned control case.
     private static func sessionFilesFixture(for sceneName: String) -> [String: SessionFile] {
+        // `realShapeFleet`'s two working sessions need files for the same
+        // reason the mockup fixture's do: without one a session reads
+        // `.unknown` and renders "idle", which on the real-shape scenes would
+        // draw a tab where NOTHING is busy and quietly libel the fold. Its 18
+        // warm-ups are deliberately given no file — a cache-warm stub really
+        // does have no Claude Code session behind it, so `.unknown` is the
+        // honest read there, not a gap in the fixture.
+        if sceneName == "22-tools-tab-real-fleet" || sceneName == "22b-sessions-tab-real-fleet" {
+            return [
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa": SessionFile(
+                    sessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                    cwd: "/Users/alice/git/demo", name: "demo-a1", status: "busy"),
+                "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb": SessionFile(
+                    sessionId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    cwd: "/Users/bob/git/demo-ui", name: "demo-ui-b2", status: "busy"),
+            ]
+        }
         guard
             sceneName == "16-sessions-tab" || sceneName == "17-tools-tab"
                 || sceneName == "17b-tools-tab-timeout-class-open"
@@ -1411,6 +1437,135 @@ enum RenderStates {
         return Fleet(
             accounts: base.accounts, unreadable: base.unreadable, sessions: sessionsFixture,
             sessionsSupported: true)
+    }
+
+    /// A fleet at the LIVE fleet's measured dimensions rather than the
+    /// mockup's, with every identity invented.
+    ///
+    /// Why a SECOND Tools/Sessions fixture exists. ``sessionsTabFleet`` is the
+    /// MOCKUP's fleet, and until now it was the only reader this panel's
+    /// design ever had. Measured against the live proxy on 2026-09-17 with
+    /// `scripts/fleet-shape.py`, the two had drifted this far apart:
+    ///
+    ///     dimension          mockup fixture     live
+    ///     running calls                   3       68
+    ///     sessions                        5       31
+    ///     warm-up sessions                0       18
+    ///     timeouts today                 31        0
+    ///
+    /// The last row hid an entire card. TIMED OUT TODAY draws only when the
+    /// server reports a timeout class, so on the real fleet it does not draw
+    /// at all, and nobody reviewing the mockup fixture had ever seen the tab
+    /// without it. This scene has no timeouts for exactly that reason: it is
+    /// the Tools tab as the operator actually meets it.
+    ///
+    /// It also pins the running list's ORDER. `busy-1` below holds a three
+    /// hour `Agent` and a `Bash` call fifty seconds from the 600s timeout;
+    /// ``Fleet/toolsRunning`` must put the `Bash` on top, because only a
+    /// ``ToolCall/capped`` call has a deadline to be near. Sorted by age
+    /// alone, the `Agent` would lead and the call about to be killed would sit
+    /// under the five-row fold.
+    ///
+    /// Everything here is SHAPE, never DATA. This repository is public, so the
+    /// accounts, session ids, project names and commands are all invented;
+    /// only the COUNTS come from the measurement. When the fleet changes,
+    /// re-run `scripts/fleet-shape.py` and compare it against the table above
+    /// rather than trusting that this still resembles anything.
+    /// Every figure below is INVENTED and deliberately round. This fixture
+    /// exists to render the panel at the MAGNITUDES a busy fleet produces, and
+    /// a magnitude is all it needs: whether a cost fits its column does not
+    /// depend on the cost being anyone's real one.
+    ///
+    /// The first version of this fixture was filled in by reading the live
+    /// proxy, which put an operator's session costs, request counts and token
+    /// volumes into a public repository wearing fake names. Names, emails,
+    /// UUIDs and paths were anonymised; the economics were not, and an
+    /// operator's spend is the more sensitive half. If a future change wants
+    /// these numbers to look more realistic, invent more realistic numbers.
+    /// Do not read them off a running fleet.
+    private static var realShapeFleet: Fleet {
+        func msAgo(_ seconds: TimeInterval) -> Int64 {
+            Int64(Date().addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
+        }
+        let base = fleet(
+            "[\(account("alice@example.com", quota: "0.95", state: "near", plan: "Max 20x", orgUuid: "33333333-3333-3333-3333-333333333333")),"
+                + "\(account("bob@example.com", quota: "0.40", state: "ok", plan: "Max 20x", orgUuid: "44444444-4444-4444-4444-444444444444"))]"
+        )
+        // The four running calls whose ORDER is the point. Declared here
+        // oldest-first on purpose: if the sort ever regresses to age, this
+        // fixture renders in exactly this order and the scene shows it.
+        let busy = Session(
+            sessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", account: "alice@example.com",
+            model: "claude-opus-5", firstSeenMs: msAgo(5 * 3600), lastSeenMs: msAgo(20),
+            requests: 1_500, inputTokens: 250_000, outputTokens: 175_000,
+            cacheReadTokens: 300_000_000,
+            tools: SessionTools(
+                calls: 4_000, errors: 90, timeouts: 0,
+                running: [
+                    ToolCall(
+                        tool: "Agent", commandHead: "explorer: map the retry paths",
+                        startedMs: msAgo(3 * 3600)),
+                    ToolCall(
+                        tool: "Write", commandHead: "Write /Users/alice/git/demo/report.md",
+                        startedMs: msAgo(40 * 60)),
+                    ToolCall(
+                        tool: "Bash", commandHead: "cargo test --all --release > suite.log",
+                        commandClass: "build", startedMs: msAgo(9 * 60 + 50)),
+                    ToolCall(
+                        tool: "Bash", commandHead: "git -C ~/src/demo fetch --all",
+                        commandClass: "git-net", startedMs: msAgo(4 * 60 + 12)),
+                ],
+                slowest: [
+                    ToolCall(
+                        tool: "Bash", commandHead: "swift build -c release", commandClass: "build",
+                        endedMs: msAgo(11 * 60), seconds: 90.0)
+                ],
+                overOneMinute: 25,
+                byTool: [
+                    ToolBucketRow(tool: "Bash", calls: 3_300, secondsP50: 3.0),
+                    ToolBucketRow(tool: "Read", calls: 320, secondsP50: 2.0),
+                    ToolBucketRow(tool: "Write", calls: 220, secondsP50: 1.0),
+                    ToolBucketRow(tool: "Edit", calls: 160, secondsP50: 1.5),
+                ]),
+            costUsd: 300.00)
+        let second = Session(
+            sessionId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", account: "bob@example.com",
+            model: "claude-sonnet-5", firstSeenMs: msAgo(2 * 3600), lastSeenMs: msAgo(45),
+            requests: 800, inputTokens: 20_000, outputTokens: 90_000,
+            cacheReadTokens: 200_000_000,
+            tools: SessionTools(
+                calls: 1_400, errors: 20, timeouts: 0,
+                running: [
+                    ToolCall(
+                        tool: "Bash", commandHead: "rg -n \"retry\" src/ > hits.log",
+                        commandClass: "search", startedMs: msAgo(52))
+                ],
+                slowest: [
+                    ToolCall(
+                        tool: "Bash", commandHead: "bun test --coverage", commandClass: "build",
+                        endedMs: msAgo(6 * 60), seconds: 60.0)
+                ],
+                overOneMinute: 15,
+                byTool: [
+                    ToolBucketRow(tool: "Bash", calls: 1_400, secondsP50: 1.5)
+                ]),
+            costUsd: 125.00)
+        // The 18 the fold exists for: two requests, no tool call, then
+        // silence. Idle spread 10 to 50 minutes, matching the live spread, so
+        // not one of them is near the five-minute boundary and the scene
+        // cannot pass by accident.
+        let warmups = (1...18).map { index in
+            Session(
+                sessionId: String(format: "cccccccc-cccc-cccc-cccc-%012d", index),
+                account: index.isMultiple(of: 2) ? "alice@example.com" : "bob@example.com",
+                model: "claude-sonnet-5", firstSeenMs: msAgo(3_600 + Double(index) * 120),
+                lastSeenMs: msAgo(600 + Double(index) * 140),
+                requests: 2, inputTokens: 1_000, outputTokens: 30, cacheReadTokens: 10_000,
+                costUsd: 0.10)
+        }
+        return Fleet(
+            accounts: base.accounts, unreadable: base.unreadable,
+            sessions: [busy, second] + warmups, sessionsSupported: true)
     }
 
     /// The three plan labels a real fleet produces, side by side — `Max 20x`,

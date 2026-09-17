@@ -1010,6 +1010,18 @@ public struct ToolCall: Decodable, Equatable, Sendable {
     public let endedMs: Int64?
     public let seconds: Double?
 
+    /// Does this call have a KNOWN cap it can run out of? Only a `Bash` call
+    /// does (`bashTimeoutSeconds`, 600s) — an `Agent` or a `Read` has no
+    /// deadline this build knows about, so it can never be "near" one.
+    ///
+    /// The ONE expression both the running list's sort (``Fleet/toolsRunning``)
+    /// and the row that draws its ring (`FleetView.runningToolItem`) read,
+    /// so the two cannot re-derive the string compare and disagree. Before
+    /// this was hoisted here, `FleetView.swift:1729` was the only place that
+    /// spelled `tool == "Bash"`, and the running list's own sort was a second
+    /// place that would have needed the identical string.
+    public var capped: Bool { tool == "Bash" }
+
     public init(
         tool: String,
         commandHead: String? = nil,
@@ -2895,17 +2907,33 @@ public struct Fleet: Equatable, Sendable {
             }
     }
 
-    /// Every tool call currently running, pooled across every session,
-    /// LONGEST FIRST — `docs/design/tools-tab.md`'s first question is "is
-    /// something stuck or about to time out", so the call nearest its timeout
-    /// is the one that must be on top rather than the one whose session
-    /// happened to sort first. A call with no `startedMs` has no elapsed time
-    /// to rank and sorts last.
+    /// Every tool call currently running, pooled across every session.
+    /// `docs/design/tools-tab.md`'s first question is "is something stuck or
+    /// about to time out" — but age alone answers a different question, since
+    /// only a ``ToolCall/capped`` call (`Bash`) HAS a timeout to be near. An
+    /// `Agent` running two legitimate hours would otherwise outrank a `Bash`
+    /// call thirty seconds from being killed and push it under the fold.
+    ///
+    /// So: capped calls first, oldest first among themselves (oldest is
+    /// nearest its timeout); uncapped calls with a known age follow, oldest
+    /// first; a call with no `startedMs` has no elapsed time to rank at all
+    /// and sorts LAST of all, capped or not — three tiers, not two, because a
+    /// capped-but-ageless call is no more actionable than an uncapped one.
     public var toolsRunning: [SessionToolEntry] {
-        sessions.flatMap { session in
+        // 0 = capped with a known age, 1 = uncapped with a known age,
+        // 2 = age unknown.
+        func tier(_ entry: SessionToolEntry) -> Int {
+            guard entry.call.startedMs != nil else { return 2 }
+            return entry.call.capped ? 0 : 1
+        }
+        return sessions.flatMap { session in
             session.tools.running.map { SessionToolEntry(sessionId: session.sessionId, call: $0) }
         }
-        .sorted { ($0.call.startedMs ?? .max) < ($1.call.startedMs ?? .max) }
+        .sorted { lhs, rhs in
+            let (lt, rt) = (tier(lhs), tier(rhs))
+            if lt != rt { return lt < rt }
+            return (lhs.call.startedMs ?? .max) < (rhs.call.startedMs ?? .max)
+        }
     }
 
     /// The ten slowest calls across every session, longest first. Each
