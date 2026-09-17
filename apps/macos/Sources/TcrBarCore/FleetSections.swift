@@ -284,7 +284,7 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     ///
     /// A LIVE named group takes `· ACTIVE` in the same slot `· PARKED`
     /// occupies, per `docs/design/panel-tabs-mockup.html`'s own two legends
-    /// ("HENRY-TOKEN · PARKED · 5", "MYCELIUM · ACTIVE · 6"). The word earns
+    /// ("HENRY-TOKEN · PARKED · 5", "ORCHARD · ACTIVE · 6"). The word earns
     /// its line once a group can be COLLAPSED: a one-line summary hides
     /// whether the accounts behind it are serving traffic or held out of
     /// rotation, and that is the first thing an operator reads a group for.
@@ -338,7 +338,7 @@ public struct FleetSection: Identifiable, Equatable, Sendable {
     }
 
     /// "6 accounts · $8.42 today" — the one line a collapsed group draws in
-    /// place of its cards (`docs/design/panel-tabs-mockup.html`, the MYCELIUM
+    /// place of its cards (`docs/design/panel-tabs-mockup.html`, the ORCHARD
     /// group). The spend clause is dropped entirely when ``todaySpend`` is
     /// `nil`; an unpriced group reads "6 accounts", never "$0.00 today".
     public var collapsedSummaryLine: String {

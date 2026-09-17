@@ -807,7 +807,7 @@ const LOCAL_PREFIX: &str = "/_tcr";
 /// on every 401, each of these calls walked the whole pool, and refresh tokens are
 /// single-use, so the refreshes piled up until one was rejected and the account went
 /// `Error` for good. Measured on the live log on 2026-09-16, the first day Claude
-/// Code made these calls: 428 of the 445 401/403 responses after a restart were on
+/// Code made these requests. 428 of the 445 401/403 responses after a restart were on
 /// this prefix, and six freshly re-logged accounts went `Error` between 7 and 30
 /// minutes after the first one, while the tokens they had last refreshed were still
 /// valid on disk.

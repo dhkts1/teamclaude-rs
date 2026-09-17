@@ -397,6 +397,7 @@ final class UsageStatsTests: XCTestCase {
     /// three times faster than it is.
     func testADayFigureNeverWearsTheWindowsLabel() throws {
         let day = UsageRow(
+            // disclosure-ok: invented; the exact value is what this asserts
             today: totals(cost: 9.4102, output: 32_000, requests: 102),
             window: nil,
             lastHour: totals(cost: 1.1021, requests: 12),
@@ -418,6 +419,7 @@ final class UsageStatsTests: XCTestCase {
     /// partially unpriced in an otherwise-priced fleet got no warning at all.
     func testAPartiallyPricedWindowSaysItIsAFloor() throws {
         let partial = UsageRow(
+            // disclosure-ok: invented; the exact value is what this asserts
             today: totals(cost: 12.84, output: 31_860, unpriced: 12, requests: 102),
             window: totals(cost: 5.6141, output: 12_476, unpriced: 12, requests: 40),
             lastHour: totals(cost: 1.6413, requests: 12),
@@ -437,16 +439,19 @@ final class UsageStatsTests: XCTestCase {
         }
         let priced = try label(
             UsageRow(
+                // disclosure-ok: invented; the exact value is what this asserts
                 today: totals(cost: 14.0, requests: 102),
                 window: totals(cost: 5.6141, output: 12_476, requests: 40),
                 lastHour: totals(cost: 1.0), todayByModel: [:]))
         let unpriceable = try label(
             UsageRow(
+                // disclosure-ok: invented; the exact value is what this asserts
                 today: totals(cost: nil, unpriced: 102, requests: 102),
                 window: totals(cost: nil, output: 12_476, unpriced: 40, requests: 40),
                 lastHour: totals(cost: nil, unpriced: 12, requests: 12), todayByModel: [:]))
         let day = try label(
             UsageRow(
+                // disclosure-ok: invented; the exact value is what this asserts
                 today: totals(cost: 9.4102, output: 32_000, requests: 102),
                 window: nil, lastHour: totals(cost: 1.1021), todayByModel: [:]))
         XCTAssertEqual(priced, "$5.61 · 12k out")
@@ -470,6 +475,7 @@ final class UsageStatsTests: XCTestCase {
             row(
                 name: "alice@example.com",
                 usage: UsageRow(
+                    // disclosure-ok: invented; the exact value is what this asserts
                     today: totals(cost: 12.0, input: 100, unpriced: 32, requests: 132),
                     window: nil,
                     lastHour: totals(cost: 1.0),
@@ -573,6 +579,7 @@ final class UsageStatsTests: XCTestCase {
             row(
                 name: "alice@example.com",
                 usage: UsageRow(
+                    // disclosure-ok: invented; the exact value is what this asserts
                     today: totals(cost: 12.0, input: 100, unpriced: 32, requests: 132),
                     window: nil,
                     lastHour: totals(cost: 1.0),
@@ -625,9 +632,11 @@ final class UsageStatsTests: XCTestCase {
             row(
                 name: "alice@example.com",
                 usage: UsageRow(
+                    // disclosure-ok: invented; the exact value is what this asserts
                     today: totals(cost: 14.0, input: 100, unpriced: 102, requests: 204),
                     window: nil,
                     lastHour: totals(cost: nil, unpriced: 12, requests: 12),
+                    // disclosure-ok: invented; the exact value is what this asserts
                     todayByModel: ["claude-opus-5": totals(cost: 14.0, requests: 102)]))
         ])
         let line = try XCTUnwrap(fleet.usageSummaryLine)

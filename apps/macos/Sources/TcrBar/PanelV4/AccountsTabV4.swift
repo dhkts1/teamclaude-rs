@@ -13,7 +13,7 @@ import TcrBarCore
 /// (unchanged, still unit-tested there) but with the ones that are drawn as a
 /// single summary line LAST. That is the mockup's own order —
 /// `HENRY-TOKEN · PARKED` with its member cards, then the collapsed
-/// `MYCELIUM · ACTIVE` — and it is a rule, not a transcription: a box holding
+/// `ORCHARD · ACTIVE` — and it is a rule, not a transcription: a box holding
 /// one line is a lid, and a lid between two open boxes reads as the end of the
 /// list.
 struct AccountsTabV4<Menu: View, Actions: View>: View {

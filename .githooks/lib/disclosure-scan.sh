@@ -154,9 +154,16 @@ $(printf '%s\n' "$found" | sed 's/^/      /')"
   #    any single hit blocks the commit and puts a human in front of the whole
   #    fixture, which is all this needed to have done.
   #
-  #    Escape hatch: end the line with `disclosure-ok:` and a reason.
+  #    Escape hatch: `disclosure-ok:` and a reason, either at the end of the
+  #    line or on the line directly above it. The line-above form exists because
+  #    swift-format refuses an end-of-line comment that overruns the line length,
+  #    so on an already-long fixture line a trailing marker cannot be written at
+  #    all — found while sweeping the older fixtures, 2026-09-18.
   found="$(printf '%s\n' "$text" \
-           | grep -v -- 'disclosure-ok:' \
+           | awk '
+      /disclosure-ok:/ { exempt_next = 1; next }
+      { if (exempt_next) { exempt_next = 0; next } }
+      { print }' \
            | awk '
       match($0, /(costUsd|spendUsd|totalUsd|requests|calls|errors|timeouts|inputTokens|outputTokens|cacheReadTokens|cacheCreationTokens)[[:space:]]*[:=][[:space:]]*[0-9][0-9_.]*/) {
         frag = substr($0, RSTART, RLENGTH)

@@ -106,7 +106,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     let mut alice = base("alice", 0);
     alice.quota.five_hour = Some(five_hour(0.45));
     alice.quota.seven_day = Some(seven_day(0.20));
-    alice.requests = 1240;
+    alice.requests = 1200;
     alice.input_tokens = 4_200_000;
     alice.output_tokens = 310_000;
     alice.last_used_ms = Some(ago_ms(3));
@@ -126,7 +126,7 @@ fn demo_accounts() -> Vec<AccountRuntime> {
     carol.switch_threshold = Some(0.85);
     carol.quota.five_hour = Some(five_hour(0.88));
     carol.quota.seven_day = Some(seven_day(0.76));
-    carol.requests = 2130;
+    carol.requests = 2100;
     carol.input_tokens = 7_800_000;
     carol.output_tokens = 540_000;
     carol.last_used_ms = Some(ago_ms(3600));

@@ -295,15 +295,15 @@ enum RenderStates {
                 status: "busy"),
             "bbbbbbbb-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444",
-                cwd: "/Users/alice/git/mycelium", name: "mycelium-c2",
+                cwd: "/Users/alice/git/orchard", name: "orchard-c2",
                 status: "waiting"),
             "cccccccc-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "cccccccc-1111-2222-3333-444444444444",
-                cwd: "/Users/alice/git/mycelium coder", name: "m-075377",
+                cwd: "/Users/alice/git/orchard coder", name: "m-075377",
                 status: "idle"),
             "dddddddd-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "dddddddd-1111-2222-3333-444444444444",
-                cwd: "/Users/bob/git/henry-plugin", name: "henry-plugin-c1",
+                cwd: "/Users/bob/git/toolkit", name: "toolkit-c1",
                 status: "busy"),
             "eeeeeeee-1111-2222-3333-444444444444": SessionFile(
                 sessionId: "eeeeeeee-1111-2222-3333-444444444444",
@@ -1084,8 +1084,8 @@ enum RenderStates {
     /// The mockup's own five sessions (`docs/design/panel-tabs-mockup.html`'s
     /// Sessions panel), verbatim: `teamclaude-rs-c7` (busy, two running
     /// tools — a Bash call and the Agent call that is 20s from the 600s
-    /// timeout) and `mycelium-c2` (waiting 12m) under `henry10@example.com`;
-    /// `m-075377` (idle 40m) rounds out that account's three; `henry-plugin-c1`
+    /// timeout) and `orchard-c2` (waiting 12m) under `henry10@example.com`;
+    /// `m-075377` (idle 40m) rounds out that account's three; `toolkit-c1`
     /// (busy, one running Bash call) and `token-b4` (idle 2h) are
     /// `henry1@example.com`'s two. Panel-parity round: previously this
     /// fixture held 3 sessions on 1 account, none matching the mockup's
@@ -1123,7 +1123,7 @@ enum RenderStates {
             Session(
                 sessionId: "aaaaaaaa-1111-2222-3333-444444444444", account: "henry10@example.com",
                 model: "claude-fable-5", firstSeenMs: msAgo(3 * 3600), lastSeenMs: msAgo(3 * 60),
-                requests: 412, inputTokens: 30_000, outputTokens: 41_000, cacheReadTokens: 970_000,
+                requests: 410, inputTokens: 30_000, outputTokens: 41_000, cacheReadTokens: 970_000,
                 tools: SessionTools(
                     // `calls` is the sum of `byTool` below (15,000 + 200 +
                     // 2,000) — the two must agree, per `panel-tabs-review.md`
@@ -1135,7 +1135,7 @@ enum RenderStates {
                     // own total. The two numbers are the same fact; a fixture
                     // that let them disagree would render a panel contradicting
                     // itself two lines apart.
-                    calls: 17_200, errors: 1, timeouts: 23,
+                    calls: 17_000, errors: 1, timeouts: 23,
                     running: [
                         ToolCall(
                             tool: "Bash", commandHead: "cargo test --release > test.log",
@@ -1186,15 +1186,15 @@ enum RenderStates {
                     2, 3, 2, 4, 3, 5, 4, 6, 5, 7, 6, 8, 7, 9, 8,
                     10, 9, 11, 10, 12, 11, 13, 12, 14, 13, 15, 14, 16, 15, 17,
                 ],
-                costUsd: 4.12),
+                costUsd: 4.10),
             // "5,756 req · cache 94% · waiting 12m".
             Session(
                 sessionId: "bbbbbbbb-1111-2222-3333-444444444444", account: "henry10@example.com",
                 model: "claude-opus-5", firstSeenMs: msAgo(6 * 3600), lastSeenMs: msAgo(12 * 60),
-                requests: 5756, inputTokens: 60_000, outputTokens: 88_000, cacheReadTokens: 940_000,
+                requests: 5800, inputTokens: 60_000, outputTokens: 88_000, cacheReadTokens: 940_000,
                 tools: SessionTools(
                     // 8 = `wait` 4 + `git-net` 4 below.
-                    calls: 7_477, errors: 4, timeouts: 8,
+                    calls: 7_500, errors: 4, timeouts: 8,
                     // Five, the mockup's own count for SLOWEST TODAY — and the
                     // reason there are five: `Fleet.toolsSlowest` pools ten
                     // across every session and the tab draws the top five, so a
@@ -1227,9 +1227,9 @@ enum RenderStates {
                     ],
                     overOneMinute: 5,
                     byTool: [
-                        ToolBucketRow(tool: "Bash", calls: 4_913, secondsP50: 2.3),
-                        ToolBucketRow(tool: "Agent", calls: 212, secondsP50: 400),
-                        ToolBucketRow(tool: "Grep", calls: 2_352, secondsP50: 0.2),
+                        ToolBucketRow(tool: "Bash", calls: 4_900, secondsP50: 2.3),
+                        ToolBucketRow(tool: "Agent", calls: 210, secondsP50: 400),
+                        ToolBucketRow(tool: "Grep", calls: 2_400, secondsP50: 0.2),
                     ],
                     // The other four of the mockup's `wait` twelve, and its
                     // `git-net` four. A class with a count and no commands is
@@ -1250,7 +1250,7 @@ enum RenderStates {
                     15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 5, 4, 4, 3,
                     3, 3, 2, 2, 2, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0,
                 ],
-                costUsd: 5.29),
+                costUsd: 5.30),
             // "idle 40m" — no metrics line at all in the mockup, and
             // `FleetView.sessionRow`'s compact idle layout now matches that.
             Session(
@@ -1261,14 +1261,14 @@ enum RenderStates {
             Session(
                 sessionId: "dddddddd-1111-2222-3333-444444444444", account: "henry1@example.com",
                 model: "claude-opus-5", firstSeenMs: msAgo(4 * 3600), lastSeenMs: msAgo(63),
-                requests: 6479, inputTokens: 50_000, outputTokens: 63_000, cacheReadTokens: 950_000,
+                requests: 6500, inputTokens: 50_000, outputTokens: 63_000, cacheReadTokens: 950_000,
                 // `calls` (and `byTool`) deliberately left at their zero
                 // default: this session's requests (6,479) are a wire fact
                 // independent of tool-call volume, and the Tools tab's
                 // headline is the sum of every session's `tools.calls` —
                 // `panel-tabs-review.md` finding 3's own bug, reproduced
                 // here once already this round by a first draft that set
-                // `calls: 6_479` with no matching `byTool` entries and
+                // `calls: 6_500` with no matching `byTool` entries and
                 // pushed the headline to 31,156 against a BY TOOL section
                 // still summing to the mockup's 24,677. Only the running
                 // call below is this session's contribution to the Tools
@@ -1302,7 +1302,7 @@ enum RenderStates {
     }
 
     /// 2 solo cards + a 5-member parked group (`henry-token`) + a 6-member
-    /// active group (`mycelium`) — the mockup's own account count and group
+    /// active group (`orchard`) — the mockup's own account count and group
     /// shape (`docs/design/panel-tabs-mockup.html`'s Accounts panel), built
     /// entirely from the existing `account()`/group machinery.
     ///
@@ -1345,7 +1345,7 @@ enum RenderStates {
             usage: measuredUsage(
                 todayCost: 1_190.4, windowCost: 1_190.4, windowOutputTokens: 3_100_000),
             plan: "Max 20x", orgUuid: "22222222-2222-2222-2222-222222222222")
-        let tokenColors = ["henry-token": "#92d188", "mycelium": "#c79ae8"]
+        let tokenColors = ["henry-token": "#92d188", "orchard": "#c79ae8"]
         // Five parked members — three drawn, two behind the button.
         let parkedPlans = ["Team 5x", "Team Standard", "Team 5x", "Team Standard", "Team 5x"]
         // Row two is the UNMEASURED case, and unmeasured means NO READING —
@@ -1369,17 +1369,17 @@ enum RenderStates {
                 plan: parkedPlans[i], orgUuid: "33333333-3333-3333-3333-333333333333")
         }
         // 5 x $1.40 + $1.42 = $8.42, the mockup's own collapsed-group total.
-        let myceliumRows = (1...6).map { i in
+        let orchardRows = (1...6).map { i in
             account(
-                "mycelium\(i)@example.com", quota: i == 6 ? "0.60" : "0.15",
+                "orchard\(i)@example.com", quota: i == 6 ? "0.60" : "0.15",
                 state: i == 6 ? "near" : "ok",
                 usage: measuredUsage(
                     todayCost: i == 6 ? 1.42 : 1.40, windowCost: 0.9,
                     windowOutputTokens: 12_476),
-                groups: ["mycelium"], groupColors: tokenColors,
+                groups: ["orchard"], groupColors: tokenColors,
                 plan: "Team Standard", orgUuid: "44444444-4444-4444-4444-444444444444")
         }
-        let all = [solo1, solo2] + tokenRows + myceliumRows
+        let all = [solo1, solo2] + tokenRows + orchardRows
         return "[\(all.joined(separator: ","))]"
     }
 
@@ -1497,7 +1497,7 @@ enum RenderStates {
         let busy = Session(
             sessionId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", account: "alice@example.com",
             model: "claude-opus-5", firstSeenMs: msAgo(5 * 3600), lastSeenMs: msAgo(20),
-            requests: 1_500, inputTokens: 250_000, outputTokens: 175_000,
+            requests: 1_500, inputTokens: 250_000, outputTokens: 180_000,
             cacheReadTokens: 300_000_000,
             tools: SessionTools(
                 calls: 4_000, errors: 90, timeouts: 0,
@@ -1549,7 +1549,7 @@ enum RenderStates {
                 byTool: [
                     ToolBucketRow(tool: "Bash", calls: 1_400, secondsP50: 1.5)
                 ]),
-            costUsd: 125.00)
+            costUsd: 120.00)
         // The 18 the fold exists for: two requests, no tool call, then
         // silence. Idle spread 10 to 50 minutes, matching the live spread, so
         // not one of them is near the five-minute boundary and the scene
