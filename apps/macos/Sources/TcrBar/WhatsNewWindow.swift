@@ -34,8 +34,10 @@ final class WhatsNewWindow {
         // `ignoringOtherApps: true` on purpose, and `orderFrontRegardless()` on
         // top of `makeKeyAndOrderFront`. On macOS 14 a bare `NSApp.activate()`
         // is cooperative — it only takes focus when the user just interacted
-        // with this app, which is true for the popover (a click opened it)
-        // and false here: this fires from a launch, seconds after a Sparkle
+        // with this app, and that is not reliable even for the popover, whose
+        // own call site now forces activation for the same reason (see
+        // `MenuBarShell.openPanel()`). It is doubly false here: this fires from
+        // a launch, seconds after a Sparkle
         // relaunch, with the operator looking at something else. Shipped that
         // way in 0.2.35 the window came up BEHIND the frontmost window.
         NSApp.activate(ignoringOtherApps: true)
