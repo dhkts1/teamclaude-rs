@@ -146,3 +146,7 @@ pub mod reach_upnp;
 
 /// What each path to a peer costs: RTT and loss, measured on a live session.
 pub mod probe;
+
+/// Where two Macs that both moved leave each other an address: the per-pair
+/// name and the sealed record. Crypto and naming only, called by nothing yet.
+pub mod drop;
