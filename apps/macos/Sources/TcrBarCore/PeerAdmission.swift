@@ -248,6 +248,28 @@ public enum PeerAdmission {
         return "\(name) (\(knock.addr)) wants to pair"
     }
 
+    /// ``knockTitle`` without the address folded in: `loft-mini wants to
+    /// pair`, or the address alone when no name was proposed. Every renderer
+    /// of the knock CARD (as opposed to a spoken hint, where one line is
+    /// fine) draws this beside ``knockAddressLine`` rather than
+    /// ``knockTitle`` directly, because a one-line control truncating
+    /// `"loft-mini (10.0.1.24) wants to pair"` cuts the address mid-digit,
+    /// which is the one part of the sentence an operator is meant to check.
+    public static func knockNameLine(_ knock: PeerKnock) -> String {
+        guard let name = knock.proposedName, !name.isEmpty else {
+            return "\(knock.addr) wants to pair"
+        }
+        return "\(name) wants to pair"
+    }
+
+    /// The address on its own line beside ``knockNameLine``, or `nil` when
+    /// ``knockNameLine`` already IS the address (no name was proposed, so
+    /// there is nothing left to show on a second line).
+    public static func knockAddressLine(_ knock: PeerKnock) -> String? {
+        guard let name = knock.proposedName, !name.isEmpty else { return nil }
+        return knock.addr
+    }
+
     /// What Accept buys, under the title. Decision row 10 in one line:
     /// approval comes first and nothing is shared until Trust.
     public static let knockDetail =

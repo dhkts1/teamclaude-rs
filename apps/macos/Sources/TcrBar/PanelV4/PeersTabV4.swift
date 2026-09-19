@@ -415,6 +415,29 @@ enum PeersSnapshotBuilder {
     private static func pills(
         _ entry: PeerListDocument.PeerEntry, awake: Bool, ended: Bool
     ) -> [(text: String, role: PeerPill.Role)] {
+        // The first pill says `trusted`, never `awake`. There was no ruling on
+        // this before; here is one, and why.
+        //
+        // `trusted` measures PAIRING: a static fact this build reads off
+        // `entry.trusted`, true from the moment both sides pressed Trust
+        // until Forget, independent of whether that Mac is reachable right
+        // now. `awake` measures the LAST PROBE: whether `tcr status --json`
+        // heard back inside the freshness window (`seen.awake`, passed in
+        // below). `wave12-ui-mockup.html`'s per-Mac sheet header draws
+        // `studio-mac awake` as its own pill and states pairing in the
+        // subtitle instead (`tcr-4b8we1r0zp · trusted since 12 September`), a
+        // sheet with room for a second line can afford to make freshness
+        // the headline and pairing the footnote. This row has one line and
+        // no footnote, and pairing is the fact an operator reaches for first:
+        // it is what decides whether Trust or Forget is even offered, while
+        // asleep already gets its own pill a few lines down when it is the
+        // whole story. So the WORD stays `awake` for freshness on both
+        // surfaces (the row states it in the freshness readout beside the
+        // pill, `seen.awake ? "awake" : "last seen …"`, line 397) and `trusted`
+        // for pairing on both (this pill here, the sheet's subtitle there);
+        // only which one gets the pill differs, and that follows from which
+        // fact the surface has room to lead with.
+        //
         // TWO pills, never three, and that is a layout rule rather than a
         // taste one. `V4Row` gives its trailing column `layoutPriority(1)` and
         // clips the leading label (its own doc-comment says so), so a third
@@ -1492,6 +1515,10 @@ struct PeersTabV4: View {
         // in-flight check watching the command it used to run, so a button
         // could be enabled on one argv and press another. Two spellings of
         // one decision, and the one that drifts is the one nobody reads.
+        // Block goes LAST: it is the destructive one, and a row that leads
+        // with the destructive verb reads as a warning before an operator has
+        // even read who is asking. Ignore and Accept are the two ordinary
+        // answers to "wants to pair" and sit together first.
         let verbs: [(title: String, argv: [String], help: String, destructive: Bool)] = [
             (
                 "Ignore", PeerCommand.ignore(instance: knock.instanceId),
@@ -1500,23 +1527,34 @@ struct PeersTabV4: View {
                 false
             ),
             (
-                "Block", PeerCommand.block(instance: knock.instanceId),
-                "Never hear from that Mac again: its address, and its key too once this Mac "
-                    + "has learned one. Lift it in Settings > Peers > Advanced.",
-                true
-            ),
-            (
                 "Accept", PeerCommand.accept(instance: knock.instanceId),
                 "Opens a two-minute window for this one Mac. Both screens then show six "
                     + "digits and nothing is shared until you press Trust on both.",
                 false
+            ),
+            (
+                "Block", PeerCommand.block(instance: knock.instanceId),
+                "Never hear from that Mac again: its address, and its key too once this Mac "
+                    + "has learned one. Lift it in Settings > Peers > Advanced.",
+                true
             ),
         ]
         return V4Card {
             VStack(alignment: .leading, spacing: 3) {
                 V4Row {
                     VStack(alignment: .leading, spacing: 2) {
-                        NameText(text: PeerAdmission.knockTitle(knock))
+                        // The proposed name (or the address, when no name was
+                        // sent) on its own line, and the address ALWAYS on a
+                        // second line rather than folded into one via
+                        // `knockTitle`: a `NameText` is one line by design
+                        // (`V4Text.swift`), and "loft-mini (10.0.1.24) wants
+                        // to pair" truncated to "loft-mini (10.0.1…" mid
+                        // address, which is exactly the part an operator is
+                        // meant to be able to check.
+                        NameText(text: PeerAdmission.knockNameLine(knock))
+                        if let address = PeerAdmission.knockAddressLine(knock) {
+                            MuteText(text: address, lineLimit: 1)
+                        }
                         MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)
                     }
                 } trailing: {

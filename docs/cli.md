@@ -1046,13 +1046,30 @@ this is the per-Mac sheet's **Lend from** list.
 | `--scope <scope>` | string | `all` | what this lease draws from: `all`, `group:<name>` (one `tcr group` group, pooled), or `account:<label>[,<label>]` (one or more accounts, by the sanitized label `tcr status` prints, never an email or a uuid) |
 | `--for <duration>` | string | no end | lend for a duration (`2h`, `90m`, `3d`), after which this Mac stops renewing the lease. `none` clears an end |
 | `--until <time>` | string | no end | lend until a time of day (`18:00`), today or tomorrow, whichever comes next |
-| `--between <HH:MM-HH:MM>` (arriving) | string | no restriction | only open the lease inside this daily window, in this Mac's local time. `22:00-08:00` crosses midnight and is charged to the day it starts, so a Friday-only schedule with that window is open Friday 22:00 through Saturday 08:00 |
-| `--days <mon,tue,...>` (arriving) | string | every day | only open the lease on these days of the week, read against the day the window starts |
+| `--between <HH:MM-HH:MM>` | string | no restriction | only open the lease inside this daily window, in this Mac's local time. `22:00-08:00` crosses midnight and is charged to the day it starts, so a Friday-only schedule with that window is open Friday 22:00 through Saturday 08:00 |
+| `--days <mon,tue,...>` | string | every day | only open the lease on these days of the week, read against the day the window starts |
+| `--mode <serve\|hand>` | enum | keeps the replaced grant's mode, or `serve` for a new one | `serve` sends the borrower's requests over this Mac and out on this Mac's IP; this Mac reads them. `hand` gives the borrower a short-lived access token instead, over the paired session, so the borrower sends the request on its own IP and this Mac never reads it. Omitted on a replace keeps the mode already in force, so editing a hand grant's fraction cannot quietly turn it back into `serve` |
 | `--list` | bool | `false` | list this peer's leases instead of changing them, one greppable line each, with the lease id `--revoke` and `--relend` take |
 | `--revoke <lease-id>` | string | none | take one lease away, by the id `--list` printed. The other leases this Mac holds are untouched |
 | `--relend <lease-id>` | string | none | put an ended lease back to work, with a new `--for`/`--until` or with no end at all |
 
-A lease asked for outside its own `--between`/`--days` window is refused (arriving): the borrower gets `OutsideSchedule` back instead of a grant, and nothing is served. A lease with no schedule set behaves exactly as it does today, open at every hour.
+A lease asked for outside its own `--between`/`--days` window is refused: the borrower gets
+`OutsideSchedule` back instead of a grant, and nothing is served. A lease with no schedule set
+behaves exactly as it does today, open at every hour.
+
+**What `--mode hand` changes.** A `serve` grant is a proxy: Mac B's request travels to Mac A,
+Mac A sends it to the account's real destination and hands the reply back, so Mac A's `tcr`
+sees every prompt. A `hand` grant is different in kind: Mac A mints the account's own
+short-lived access token and sends it to Mac B once, over the already-paired, already-encrypted
+session. From then on Mac B talks to the account directly, on Mac B's own IP, and Mac A reads
+nothing. Mac A still holds the refresh token and still decides when the lease ends; letting it
+expire, or `--revoke`, is the only way to take a hand grant back, since there is no request
+passing through Mac A to refuse.
+
+A `hand` grant is refused outright, before anything is written, when every account the scope
+covers has `egressStrict` on: that pin says the account's requests leave through one named Mac
+or not at all, and a borrower sending on its OWN IP can never be that Mac. Lend it as
+`--mode serve` instead, or clear the pin on an account the scope covers first.
 
 ### `tcr peer status`
 
@@ -1160,7 +1177,7 @@ invite` as the headless alternative instead.
 | `--invite` | bool | `false` | also mint a one-use join key and carry it in the link, so opening it also completes pairing. **Turns the link into a live bearer secret with ten minutes on it**: without this flag it carries only the network key |
 | `--label <name>` | string | none | a name for the joining Mac, when `--invite` is given |
 
-### `tcr peer reach` (arriving)
+### `tcr peer reach`
 
 Prints what this Mac can be reached on from off the local network. Read-only: nothing here
 dials a peer or touches the running proxy.
@@ -1177,7 +1194,7 @@ NAT-PMP answer, meaning the gateway found, the external address, and the mapping
 the current time-derived port slot; and, per pinned peer, that peer's derived port for this
 slot. A refusal from the router, or a peer row with no derived port yet, still exits 0.
 
-### `tcr peer graph <--json\|--serve>` (arriving)
+### `tcr peer graph <--json\|--serve>`
 
 Prints, or serves, the mesh as this Mac currently sees it: pinned peers, the paths to each,
 and each path's RTT and loss. Read-only, same as `tcr peer reach`.

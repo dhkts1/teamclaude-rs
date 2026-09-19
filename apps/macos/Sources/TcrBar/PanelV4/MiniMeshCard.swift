@@ -32,7 +32,7 @@ struct MiniMeshCard: View {
                     .foregroundStyle(Tok.mute)
                     .multilineTextAlignment(.center)
                     .frame(maxWidth: .infinity, alignment: .center)
-                    .padding(.vertical, 18)
+                    .padding(.vertical, V4.meshEmptyPaddingV)
             } else {
                 GeometryReader { proxy in
                     let layout = PeerMeshLayout.layout(
@@ -77,7 +77,7 @@ struct MiniMeshCard: View {
                 .help("Serves the whole mesh as a page on this Mac and opens it.")
             }
         }
-        .padding(8)
+        .padding(V4.meshCardPadding)
         .background(RoundedRectangle(cornerRadius: 8).fill(Tok.cardFill))
         .overlay(
             RoundedRectangle(cornerRadius: 8).strokeBorder(Tok.cardLine, lineWidth: 0.5)
@@ -183,7 +183,7 @@ struct MiniMeshCard: View {
             }
         }
         .lineLimit(1)
-        .frame(width: pill.frame.width - 20, alignment: .leading)
+        .frame(width: pill.frame.width - V4.meshPillLabelInset, alignment: .leading)
         .position(x: pill.frame.midX + 8, y: pill.frame.midY)
     }
 

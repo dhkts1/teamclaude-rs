@@ -1888,7 +1888,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                             peer_window_name(window)
                         );
                     }
-                    let mut grant = peer_lend_grant(window, a.fraction, a.ttl, a.max_inflight);
+                    let mut grant = peer_lend_grant(window, a.fraction, a.ttl, a.max_inflight)?;
                     grant.scope = scope.clone();
                     for row in &mut file.peers {
                         row.allow.inspect = true;
@@ -1941,7 +1941,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     let mut default = grant.clone();
                     default.id = 0;
                     file.default_lend = Some(default);
+                    // Sharing means those Macs reach this one, which needs a
+                    // port. On this arm only: the removal above and the `off`
+                    // arm below are not opt-ins and must open nothing.
+                    let listen_written = ensure_listen_for_opt_in(&mut file);
                     peer::config::save(&peers_path, &file)?;
+                    if let Some(chosen) = listen_written {
+                        print_listen_written(chosen, &peers_path);
+                    }
                     println!(
                         "peer share: on peers={} scope={} window={} fraction={} ttl_s={} \
                          max_inflight={}",
@@ -2511,7 +2518,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            let mut grant = peer_lend_grant(window, a.fraction, a.ttl, a.max_inflight);
+            let mut grant = peer_lend_grant(window, a.fraction, a.ttl, a.max_inflight)?;
             grant.mode = mode;
             grant.scope = scope;
             grant.until = end;
@@ -2847,6 +2854,31 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
         PeerAction::Internet(a) => {
             let peers_path = a.peers.unwrap_or_else(peer::config::default_path);
             let on = matches!(a.state, peer_cli::Switch::On);
+            // A port first, because what `internet on` asks the router for is a
+            // mapping TO the listener's port, and with none it used to write
+            // the flag, print "no listener is configured" and leave the
+            // operator with a switch that does nothing.
+            //
+            // In its own scope: `reach::set_internet` takes the peers-file lock
+            // itself, and the lock is a lockfile, not a reentrant one, so a
+            // hold still open here would make the whole verb wait out
+            // `LOCK_WAIT_MS` and then refuse.
+            if on {
+                let written = {
+                    let _lock = peer::config::FileLock::acquire(&peers_path)?;
+                    let mut file = peer::config::read_or_default(&peers_path)?;
+                    match ensure_listen_for_opt_in(&mut file) {
+                        Some(chosen) => {
+                            peer::config::save(&peers_path, &file)?;
+                            Some(chosen)
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(chosen) = written {
+                    print_listen_written(chosen, &peers_path);
+                }
+            }
             // The whole verb. The flag, the mapping delete and the refusal
             // wording live in `peer::reach`, so this arm is argv and nothing
             // else; see `reach::set_internet`.
@@ -2857,9 +2889,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     "peer.internet: on (the listener on port {port} is mapped at boot and \
                      renewed every 30 minutes)"
                 ),
+                // Unreachable through this arm now, since the block above gives
+                // this Mac a port before the switch is written. Kept because
+                // the type says it can happen and a caller of `set_internet`
+                // that is not this arm may still see it; it no longer tells
+                // anybody to go and hand-edit a file.
                 peer::reach::InternetSwitch::On { listen_port: None } => println!(
-                    "peer.internet: on, but no listener is configured, so there is no port \
-                     to map yet; set \"listen\" in the peers file"
+                    "peer.internet: on, but this Mac has no peer port, so there is nothing \
+                     to map yet"
                 ),
                 peer::reach::InternetSwitch::Off { deleted: Some(_) } => {
                     println!("peer.internet: off (the router mapping was deleted)")
@@ -3517,19 +3554,86 @@ fn peer_lend_grant(
     fraction: f64,
     ttl_s: u32,
     max_inflight: u8,
-) -> teamclaude_rs::peer::config::LendGrant {
-    let clamped = fraction.clamp(0.0, MAX_LEND_FRACTION);
+) -> anyhow::Result<teamclaude_rs::peer::config::LendGrant> {
+    // REFUSED, not clamped, and this is the only fraction that is. `NaN`
+    // compares false against both of `clamp`'s bounds, so it passed through the
+    // clamp below unchanged and printed nothing; `serde_json` then writes a
+    // non-finite float as `null`, and `null` is not an `f64`, so the peers file
+    // this command had just written would not load again on any build.
+    if !fraction.is_finite() {
+        anyhow::bail!(
+            "peer lend: --fraction {fraction} is not a number this can lend; give a fraction \
+             of the window between 0 and {MAX_LEND_FRACTION}"
+        );
+    }
+    let clamped = teamclaude_rs::peer::config::lend_fraction(fraction);
     if (clamped - fraction).abs() > f64::EPSILON {
         println!(
             "peer lend: clamped fraction {fraction} to {clamped} (the ceiling on one lease is \
              {MAX_LEND_FRACTION}, the same clamp the main config applies to its own reserve)"
         );
     }
-    teamclaude_rs::peer::config::LendGrant::new(window, clamped, ttl_s, max_inflight)
+    Ok(teamclaude_rs::peer::config::LendGrant::new(
+        window,
+        clamped,
+        ttl_s,
+        max_inflight,
+    ))
 }
 
-/// The ceiling on one lease's fraction. See [`peer_lend_grant`].
-const MAX_LEND_FRACTION: f64 = 0.5;
+/// The ceiling on one lease's fraction, and it is the LIBRARY's constant: the
+/// flag that accepts a fraction and the reader that parses one off disk answer
+/// to one number, or a hand-edited file carries what this flag would have
+/// refused.
+const MAX_LEND_FRACTION: f64 = teamclaude_rs::peer::config::MAX_LEND_FRACTION;
+
+#[cfg(test)]
+mod peer_lend_fraction_tests {
+    use super::{peer_lend_grant, MAX_LEND_FRACTION};
+    use teamclaude_rs::peer::config::LendGrant;
+
+    /// **A fraction that is not a number is refused at the flag**, and the
+    /// ordinary over-large one is still clamped and still written.
+    ///
+    /// `--fraction nan` passed the clamp in silence, because `NaN` compares
+    /// false against both bounds and `(NaN - NaN).abs() > EPSILON` is false
+    /// too, so nothing was printed and nothing was capped. The second half
+    /// below is what that cost: `serde_json` writes a non-finite float as
+    /// `null`, `LendGrant::fraction` is not an `Option`, so the peers file the
+    /// command had just written would not load again, on this build or any
+    /// other.
+    ///
+    /// Watch it fail by deleting the `is_finite` refusal in `peer_lend_grant`.
+    #[test]
+    fn a_fraction_that_is_not_a_number_is_refused_at_the_flag() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                peer_lend_grant(tcr_peer_wire::Window::SevenDay, bad, 300, 2).is_err(),
+                "--fraction {bad} has to be refused, not written"
+            );
+        }
+
+        let clamped = peer_lend_grant(tcr_peer_wire::Window::SevenDay, 0.9, 300, 2)
+            .expect("an over-large fraction is an ordinary clamp and not a refusal");
+        assert_eq!(clamped.fraction, MAX_LEND_FRACTION);
+
+        // What the refusal above prevents, measured rather than asserted from
+        // the documentation.
+        let planted = LendGrant {
+            fraction: f64::NAN,
+            ..LendGrant::new(tcr_peer_wire::Window::SevenDay, 0.2, 300, 2)
+        };
+        let written = serde_json::to_string(&planted).expect("a grant serializes");
+        assert!(
+            written.contains("\"fraction\":null"),
+            "a non-finite fraction lands on disk as null: {written}"
+        );
+        assert!(
+            serde_json::from_str::<LendGrant>(&written).is_err(),
+            "and a file carrying it does not load again: {written}"
+        );
+    }
+}
 
 /// The wire's own name for a window, so a printed line and a JSON field cannot
 /// disagree about what `7d` is called.
@@ -3623,6 +3727,46 @@ impl PeerFinder for RealPeerFinder {
     }
 }
 
+/// Give this Mac a peer port when the operator turns one of the three features
+/// on and there is none yet. Returns the address written, or `None` when
+/// `listen` was already set, which this never touches.
+///
+/// The caller writes the file and then prints [`print_listen_written`]: the
+/// three verbs that call this already hold the peers-file lock and already have
+/// a save of their own, and a second write here would be a second writer for
+/// one key.
+///
+/// It is called on the ON arm only. Turning something OFF, or removing a grant,
+/// is not an opt-in and must not open a port.
+fn ensure_listen_for_opt_in(file: &mut peer::config::PeerFile) -> Option<std::net::SocketAddr> {
+    if file.listen.is_some() {
+        return None;
+    }
+    let chosen = peer::config::default_listen();
+    file.listen = Some(chosen);
+    Some(chosen)
+}
+
+/// What every verb that just wrote a peer port says, in one place so the three
+/// of them say the same thing.
+///
+/// The second line is the honest half. The peer socket is bound once, at boot,
+/// from the file as it was then (`src/server.rs`, the `file.listen` read before
+/// `listener::bind`); `PeerStore::reload_if_changed` re-reads the policy half
+/// of this file whenever its mtime moves but nothing re-binds a socket, so a
+/// port written now is a port that opens at the next start and not before.
+fn print_listen_written(addr: std::net::SocketAddr, peers_path: &std::path::Path) {
+    println!(
+        "peer.listen: {addr} written into {} (this Mac had no peer port, and turning this on \
+         needs one)",
+        peers_path.display()
+    );
+    println!(
+        "peer.listen: nothing is listening on it yet. The port opens the next time the proxy \
+         starts, so quit TcrBar and open it again to finish turning this on"
+    );
+}
+
 async fn run_peer_find_with(
     args: peer_cli::PeerFindArgs,
     finder: &impl PeerFinder,
@@ -3640,6 +3784,11 @@ async fn run_peer_find_with(
         file.announce_name = matches!(state, peer_cli::Switch::On);
     }
 
+    // What this run wrote into `listen`, if anything. Said after the save and
+    // not before it, because a scan that fails exits non-zero having written
+    // nothing, and a line promising a port in that case would be a lie.
+    let mut listen_written = None;
+
     match args.state {
         peer_cli::Switch::Off => {
             file.discovery = false;
@@ -3652,23 +3801,32 @@ async fn run_peer_find_with(
         peer_cli::Switch::On => {
             file.discovery = true;
 
-            let Some(_listen) = file.listen else {
-                anyhow::bail!(
-                    "peer.find needs a listener port; set \"listen\" in {} first",
-                    peers_path.display()
-                );
-            };
+            // This used to refuse here and send the operator to a text editor
+            // for a key no walkthrough names, which stopped a first-time
+            // reader at their very first command. Finding peers needs a port
+            // to announce, so the verb provides one instead of asking for it.
+            listen_written = ensure_listen_for_opt_in(&mut file);
 
             let store = peer::config::PeerStore::open(&peers_path)?;
             // One scan, so `find on` reports what is already on the LAN. The
             // ANNOUNCING half is the server's: see [`PeerFinder`].
             finder.start_browse(&store).await?;
             println!("peer.find: on (announceName={})", file.announce_name);
-            println!("a running server starts announcing within a minute");
+            // Only when there was already a port. A server that is running
+            // right now has no peer socket for one this command just wrote, so
+            // promising it would announce within a minute is exactly the claim
+            // `print_listen_written` exists to correct.
+            if listen_written.is_none() {
+                println!("a running server starts announcing within a minute");
+            }
         }
     }
 
-    peer::config::save(&peers_path, &file)
+    peer::config::save(&peers_path, &file)?;
+    if let Some(chosen) = listen_written {
+        print_listen_written(chosen, &peers_path);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

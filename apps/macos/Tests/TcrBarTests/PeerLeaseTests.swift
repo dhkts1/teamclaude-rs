@@ -385,4 +385,56 @@ final class PeerLeaseTests: XCTestCase {
             "the readout no longer follows LeaseTerms.standard, so the row and the sheet can "
                 + "print two different defaults")
     }
+
+    // MARK: - Editing an end on a different day keeps the date
+
+    /// An end still due TODAY round-trips through the clock spelling
+    /// unchanged, the one the sheet already showed the operator.
+    func testEditingAnEndDueTodayKeepsTheClockSpelling() {
+        let calendar = Calendar(identifier: .gregorian)
+        let now = calendar.date(from: DateComponents(year: 2026, month: 9, day: 19, hour: 10))!
+        let today18 = calendar.date(
+            from: DateComponents(year: 2026, month: 9, day: 19, hour: 18))!
+        let end = LeaseEnd.editing(
+            until: Int64(today18.timeIntervalSince1970), now: now, calendar: calendar)
+        XCTAssertEqual(end, .until("18:00"))
+    }
+
+    /// An end due TOMORROW must not collapse to today's clock: that used to
+    /// round-trip as `.until("18:00")` regardless of which day 18:00 fell on,
+    /// silently moving the lease's real end backward by a whole day the
+    /// moment the sheet was opened and Save was pressed without touching the
+    /// end at all.
+    func testEditingAnEndDueTomorrowKeepsTheDateAsARemainingSpan() {
+        let calendar = Calendar(identifier: .gregorian)
+        let now = calendar.date(from: DateComponents(year: 2026, month: 9, day: 19, hour: 10))!
+        let tomorrow18 = calendar.date(
+            from: DateComponents(year: 2026, month: 9, day: 20, hour: 18))!
+        let end = LeaseEnd.editing(
+            until: Int64(tomorrow18.timeIntervalSince1970), now: now, calendar: calendar)
+        guard case .after(let span) = end else {
+            XCTFail("an end on a different day must not be the bare clock spelling: \(end)")
+            return
+        }
+        XCTAssertTrue(span.hasSuffix("s"), "a seconds span round-trips exactly: \(span)")
+        let seconds = Int(span.dropLast())
+        XCTAssertEqual(
+            seconds, Int(tomorrow18.timeIntervalSince(now)),
+            "the remaining span must name the SAME absolute end the grant stored")
+    }
+
+    /// `LeaseDraft(editing:)` itself, not just the helper, keeps the date.
+    func testLeaseDraftEditingATomorrowEndDoesNotCollapseToTodaysClock() {
+        let calendar = Calendar(identifier: .gregorian)
+        let now = calendar.date(from: DateComponents(year: 2026, month: 9, day: 19, hour: 10))!
+        let tomorrow18 = calendar.date(
+            from: DateComponents(year: 2026, month: 9, day: 20, hour: 18))!
+        let grant = PeerLendGrant(
+            leaseId: "ls-4b1f", scope: .all, window: .week, fraction: 0.2,
+            until: Int64(tomorrow18.timeIntervalSince1970))
+        let draft = LeaseDraft(editing: grant, peer: "studio-mac", now: now, calendar: calendar)
+        XCTAssertNotEqual(
+            draft.end, .until("18:00"),
+            "a lease ending tomorrow at 18:00 must not read as ending at 18:00 today")
+    }
 }

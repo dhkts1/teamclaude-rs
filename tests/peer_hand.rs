@@ -215,6 +215,7 @@ fn ask<'a>(body: &'a bytes::Bytes) -> Ask<'a> {
     }
     Ask {
         path: "/v1/messages",
+        query: None,
         method: "POST",
         model: None,
         group: None,

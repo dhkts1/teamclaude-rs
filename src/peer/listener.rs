@@ -62,7 +62,7 @@
 //! A build with no [`LeaseServing`] REFUSES a SERVE rather than accepting a
 //! stream it cannot answer, which is the same shape every ungranted kind has.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -214,6 +214,26 @@ pub fn unauthenticated_allowance(file: &PeerFile) -> (usize, usize) {
 /// trip is milliseconds, and a socket opened and left silent is the cheapest
 /// thing a stranger can do.
 pub const MESSAGE_1_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an authenticated session has to deliver its stream header.
+///
+/// The pre-authentication socket slot is released the moment the handshake
+/// completes, so before this deadline existed a session that finished its
+/// handshake and then said nothing held a task and a socket with nothing
+/// counting it. A replayed `IK` message 1 reaches exactly that state without
+/// the far side having to keep anything alive.
+///
+/// The same number as [`HANDSHAKE_TIMEOUT`], for the same reason: the header
+/// is one frame a caller already has in hand when it dials.
+pub const STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many authenticated sessions one peer may hold that have not delivered a
+/// stream header yet.
+///
+/// The deadline above bounds how long each one lives; this bounds how many a
+/// peer can open inside it. Per peer rather than node-wide, so one pinned Mac
+/// that reconnects in a loop cannot close the door on the others.
+pub const MAX_HEADERLESS_PER_PEER: usize = 4;
 
 /// The largest knock frame this node will read. A knock is an instance id, a
 /// short name and a version number; 512 bytes is generous for that and far
@@ -659,6 +679,8 @@ pub struct Admission {
     live_total: usize,
     unauthenticated_refusals: RefusalLog,
     authenticated_refusals: RefusalLog,
+    punching: HashSet<PeerId>,
+    headerless: HashMap<PeerId, usize>,
 }
 
 impl Admission {
@@ -712,6 +734,22 @@ impl Admission {
     /// How many connections across all addresses have not authenticated yet.
     pub fn live_unauthenticated_total(&self) -> usize {
         self.live_total
+    }
+
+    /// How many authenticated sessions `peer` holds that have not delivered a
+    /// stream header. For a gate to assert on, the same way
+    /// [`Self::live_unauthenticated`] is.
+    pub fn headerless_sessions(&self, peer: &PeerId) -> usize {
+        self.headerless.get(peer).copied().unwrap_or(0)
+    }
+
+    /// How many peers hold an in-flight punch right now.
+    ///
+    /// Read by a gate, the same way [`Self::live_unauthenticated`] is: the cap
+    /// is enforced by [`PunchInFlight::acquire`] against this set, so a test
+    /// that inferred the count from timing would be measuring the scheduler.
+    pub fn punches_in_flight(&self) -> usize {
+        self.punching.len()
     }
 
     /// How many knock tokens `addr` has left. For a gate to assert on, and for
@@ -789,6 +827,96 @@ impl Drop for SocketSlot {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 guard.live_per_address.remove(&self.addr);
+            }
+        }
+    }
+}
+
+/// One peer's in-flight punch, released on drop.
+///
+/// A `PunchAt` frame spawns a task that sleeps to the next slot boundary, up
+/// to [`crate::peer::reach::slot_window`], and only then binds sockets.
+/// Nothing counted those tasks, so a pinned peer could send the frame in a
+/// loop and hold as many sleeping tasks and, at the boundary, as many socket
+/// binds as it managed to send. One per peer is the natural bound: a peer
+/// cannot be punching two slots at once, and the punch it is asking for
+/// replaces nothing it already has in flight.
+///
+/// RAII for the reason [`SocketSlot`] is: the spawned task ends on a punch
+/// that connected, on a punch that timed out and on a panic, and a set entry
+/// that leaked on any of those would lock that peer out of punching for the
+/// life of the process.
+pub struct PunchInFlight {
+    admission: Arc<Mutex<Admission>>,
+    peer: PeerId,
+}
+
+impl PunchInFlight {
+    /// Take `peer`'s one slot, or `None` when it already holds it.
+    ///
+    /// `pub` so a gate can drive the cap without a real punch: binding sockets
+    /// and waiting out a slot boundary would measure the network rather than
+    /// the bound.
+    pub fn acquire(admission: &Arc<Mutex<Admission>>, peer: PeerId) -> Option<Self> {
+        let mut guard = lock_admission(admission);
+        if !guard.punching.insert(peer) {
+            return None;
+        }
+        drop(guard);
+        Some(Self {
+            admission: Arc::clone(admission),
+            peer,
+        })
+    }
+}
+
+impl Drop for PunchInFlight {
+    fn drop(&mut self) {
+        lock_admission(&self.admission).punching.remove(&self.peer);
+    }
+}
+
+/// One authenticated session that has not sent its stream header yet,
+/// released on drop.
+///
+/// The counterpart to [`SocketSlot`] on the other side of the handshake: that
+/// slot is given back the instant a session authenticates, and nothing counted
+/// what happened next. [`MAX_HEADERLESS_PER_PEER`] is the cap and the same
+/// RAII reason applies, since the header read has a deadline, a decode failure
+/// and a dropped socket as its three endings.
+pub struct HeaderlessSession {
+    admission: Arc<Mutex<Admission>>,
+    peer: PeerId,
+}
+
+impl HeaderlessSession {
+    /// Take one of `peer`'s slots, or report how many it already holds.
+    ///
+    /// `pub` for the same reason [`PunchInFlight::acquire`] is: a gate can
+    /// drive the cap without opening [`MAX_HEADERLESS_PER_PEER`] real
+    /// handshakes.
+    pub fn acquire(admission: &Arc<Mutex<Admission>>, peer: PeerId) -> Result<Self, usize> {
+        let mut guard = lock_admission(admission);
+        let live = guard.headerless.get(&peer).copied().unwrap_or(0);
+        if live >= MAX_HEADERLESS_PER_PEER {
+            return Err(live);
+        }
+        *guard.headerless.entry(peer).or_insert(0) += 1;
+        drop(guard);
+        Ok(Self {
+            admission: Arc::clone(admission),
+            peer,
+        })
+    }
+}
+
+impl Drop for HeaderlessSession {
+    fn drop(&mut self) {
+        let mut guard = lock_admission(&self.admission);
+        if let Some(count) = guard.headerless.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                guard.headerless.remove(&self.peer);
             }
         }
     }
@@ -1060,17 +1188,27 @@ pub enum InternetAdmission {
 /// answered at all.
 ///
 /// The rule is: "over the internet only the `IK` handshake against a
-/// pinned key is answered, never a knock". The bind scope decides whether
-/// that row applies at all: `bind` is the address THIS listener is bound to,
-/// and a source outside LAN scope only meets row 14 when the listener itself
-/// is reachable from outside the LAN, i.e. when `bind` is not itself LAN
-/// scope (`0.0.0.0`, a public interface address, or a routed IPv6 address,
-/// never `127.0.0.1` or a private prefix). In that case a knock (`NN`,
-/// `NNpsk0`) and a first pairing (`XX`) from off the LAN get nothing back,
-/// and `IK` proceeds to the pin check that has always decided it. A stranger
-/// on the internet therefore cannot reach the operator's pairing queue at
-/// all, and the one thing it can reach refuses every key that is not already
-/// pinned.
+/// pinned key is answered, never a knock". The bind decides whether that row
+/// applies at all: `bind` is the address THIS listener is bound to, and a
+/// source outside LAN scope only meets row 14 when the listener itself can be
+/// reached from outside the LAN. On a bind that is not loopback a knock
+/// (`NN`, `NNpsk0`) and a first pairing (`XX`) from off the LAN get nothing
+/// back, and `IK` proceeds to the pin check that has always decided it. A
+/// stranger on the internet therefore cannot reach the operator's pairing
+/// queue at all, and the one thing it can reach refuses every key that is not
+/// already pinned.
+///
+/// # Only loopback short-circuits, and a private bind does not
+///
+/// This test used to be `is_lan_scope(bind)`, on the reasoning that "nothing
+/// off the LAN can reach a private bind without a mapping this node did not
+/// make". This node makes exactly that mapping:
+/// [`crate::peer::reach::mapping_boot`] asks the router for one on ANY
+/// non-loopback bind, so `listen: 10.0.0.5:7755` with `internet on` is a
+/// world-reachable socket and the short-circuit answered a knock and a first
+/// pairing from the internet on it. Loopback is the one bind class that
+/// carries no such mapping and cannot acquire one, so it is the only one that
+/// keeps the short-circuit.
 ///
 /// # The switch is read for ONE case, and it is the narrow one
 ///
@@ -1112,7 +1250,7 @@ pub fn internet_admission(
     internet: bool,
     own_global_v6: &[Ipv6Addr],
 ) -> InternetAdmission {
-    if is_lan_scope(from) || is_lan_scope(bind) {
+    if is_lan_scope(from) || is_loopback_bind(bind) {
         return InternetAdmission::Answer;
     }
     match pattern {
@@ -1128,6 +1266,22 @@ pub fn internet_admission(
                 InternetAdmission::Refuse
             }
         }
+    }
+}
+
+/// Is this listener bound to an address nothing off this machine can dial?
+///
+/// The one bind class [`internet_admission`] answers unconditionally. An
+/// IPv4-mapped form is unwrapped first, because a dual-stack listener reports
+/// `::ffff:127.0.0.1` for a socket bound to `127.0.0.1` and reading that as a
+/// global address would refuse the machine's own traffic.
+fn is_loopback_bind(bind: IpAddr) -> bool {
+    match bind {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
     }
 }
 
@@ -2095,13 +2249,27 @@ where
             // Enrolment's authorization is the PSK, and it was proved inside
             // message 1 before this line ran. The row is written by
             // `crate::peer::pair`, which owns both halves of enrolment.
-            let session = noise::finish_responder(stream, read.state, Handshake::Enrol, |remote| {
-                match <[u8; KEY_BYTES]>::try_from(remote) {
-                    Ok(key) => Ok(PeerId(key)),
-                    Err(_) => Err(PinRefusal::Malformed { len: remote.len() }),
-                }
-            })
-            .await?;
+            //
+            // A banned KEY is still refused here. The Pair arm and the Return
+            // arm both do it and this one did not, so a blocked key that
+            // dialled from an address the ban does not name, holding a live
+            // invite, enrolled: a ban that an invite silently lifts is not a
+            // ban. The address half fires earlier and catches the rest.
+            let banned = peer_state.banned.clone();
+            let session =
+                noise::finish_responder(stream, read.state, Handshake::Enrol, move |remote| {
+                    let joiner = match <[u8; KEY_BYTES]>::try_from(remote) {
+                        Ok(key) => PeerId(key),
+                        Err(_) => return Err(PinRefusal::Malformed { len: remote.len() }),
+                    };
+                    if banned.iter().any(|ban| ban.key.as_ref() == Some(&joiner)) {
+                        return Err(PinRefusal::NotPinned {
+                            offered: joiner.display(),
+                        });
+                    }
+                    Ok(joiner)
+                })
+                .await?;
             Ok(AcceptedSession {
                 session,
                 enrol_secret: read.psk,
@@ -2205,7 +2373,36 @@ where
         enrol_secret,
     } = accepted;
     let mut dedup = RequestDedup::new();
-    let frame = noise::recv_encrypted(&mut stream, &mut session.transport).await?;
+    // **The header is the second thing counted, and the first was given back.**
+    //
+    // The pre-authentication socket slot is released as soon as the handshake
+    // completes, so an authenticated session that never says anything else was
+    // held by nothing at all: the task parked on this read forever. A replayed
+    // `IK` message 1 reaches this point without the far side keeping anything
+    // alive, so "authenticated" is not the same as "somebody is still there".
+    // The deadline ends one such session and the slot bounds how many a peer
+    // can have waiting at once.
+    let headerless =
+        HeaderlessSession::acquire(context.admission(), session.peer).map_err(|live| {
+            anyhow::anyhow!(
+                "peer stream: this peer holds {live} authenticated sessions that have not sent \
+                 a stream header and the allowance is {MAX_HEADERLESS_PER_PEER} \
+                 (MAX_HEADERLESS_PER_PEER); closed"
+            )
+        })?;
+    let frame = match tokio::time::timeout(
+        STREAM_HEADER_TIMEOUT,
+        noise::recv_encrypted(&mut stream, &mut session.transport),
+    )
+    .await
+    {
+        Ok(frame) => frame?,
+        Err(_elapsed) => bail!(
+            "peer stream: no stream header within {} s of the handshake completing; closed",
+            STREAM_HEADER_TIMEOUT.as_secs()
+        ),
+    };
+    drop(headerless);
     let header: StreamHeader =
         serde_json::from_slice(&frame).context("peer stream: the first frame is not a header")?;
 
@@ -2850,9 +3047,25 @@ where
             Control::PunchAt { slot, public_addr } => {
                 match crate::peer::reach::punch_request(session.peer, slot, &public_addr) {
                     Ok((peer_ip, plan)) => {
+                        let Some(in_flight) =
+                            PunchInFlight::acquire(context.admission(), session.peer)
+                        else {
+                            tracing::info!(
+                                peer = %session.peer.display(),
+                                peer_addr = %from,
+                                "peer punch: this peer already has a punch in flight, so this \
+                                 frame is dropped; one punch at a time is all a peer can be \
+                                 waiting on"
+                            );
+                            continue;
+                        };
                         let context = context.clone();
                         let peer = session.peer;
                         tokio::spawn(async move {
+                            // Held for the whole task, not just the punch: the
+                            // slot is free again once this peer's punch has
+                            // either connected and been served or given up.
+                            let _in_flight = in_flight;
                             let outcome = crate::peer::reach::punch(
                                 &crate::peer::reach::KernelPunchNet,
                                 &plan,

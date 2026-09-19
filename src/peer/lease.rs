@@ -356,16 +356,35 @@ fn seconds_of(now_ms: i64) -> u64 {
 /// - `none` or an empty string: no end. Named rather than implied, so an
 ///   operator can clear an end with the same flag they set it with.
 /// - a duration: `30s`, `90m`, `2h`, `3d`, which is `--for`;
-/// - a wall clock: `18:00` or `18:00:30`, which is `--until`, resolved in
-///   `now`'s own UTC OFFSET and rolled to TOMORROW when that time has already
-///   passed today. An operator who types `--until 09:00` at 18:00 means
-///   tomorrow morning; answering "that is in the past" would be technically
-///   true and useless.
+/// - a wall clock: `18:00` or `18:00:30`, which is `--until`, resolved in the
+///   OPERATOR's local offset (`UtcOffset::local_offset_at`, the same
+///   fallback-to-UTC pattern [`crate::peer::schedule::Schedule::contains`]
+///   uses, since the lookup refuses in a multithreaded process). A clock that
+///   has already passed today is REFUSED, never rolled to tomorrow: rolling
+///   silently is what let a lease edited through the panel at 18:00 for
+///   "tomorrow at 18:00" round-trip as an end later THIS minute instead,
+///   because the panel's own refusal (`LeaseDraft.refusal`) and this
+///   function disagreed about which clock a bare `18:00` resolves against.
+///   The refusal names the time it resolved to, so `--for 24h` or an
+///   absolute end is the way forward, not a second bare clock.
 ///
 /// A bare number is REFUSED rather than read as seconds or as an hour: `2` is
 /// two hours to one reader and two seconds to another, and a lease is not
 /// something to guess a unit on.
 pub fn parse_lend_end(spec: &str, now: time::OffsetDateTime) -> Result<Option<u64>> {
+    let offset = time::UtcOffset::local_offset_at(now).unwrap_or(time::UtcOffset::UTC);
+    parse_lend_end_at_local(spec, now.to_offset(offset))
+}
+
+/// [`parse_lend_end`]'s decision, given `local_now` already resolved to the
+/// operator's own offset.
+///
+/// Split out for the reason [`crate::peer::schedule::Schedule::contains_at_local`]
+/// is: this is what the unit tests below exercise directly, so they assert
+/// this function's arithmetic and never the host machine's timezone, and
+/// `local_offset_at` is not called a second time somewhere that would refuse
+/// it in a multithreaded process.
+fn parse_lend_end_at_local(spec: &str, local_now: time::OffsetDateTime) -> Result<Option<u64>> {
     let spec = spec.trim();
     if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
         return Ok(None);
@@ -375,14 +394,24 @@ pub fn parse_lend_end(spec: &str, now: time::OffsetDateTime) -> Result<Option<u6
         let wanted = time::Time::from_hms(hours, minutes, seconds).with_context(|| {
             format!("peer lend: {spec} is not a time of day (00:00:00 to 23:59:59)")
         })?;
-        let mut at = now.replace_time(wanted);
-        if at <= now {
-            at += time::Duration::days(1);
+        let at = local_now.replace_time(wanted);
+        if at <= local_now {
+            anyhow::bail!(
+                "peer lend: {spec} has already passed today (it resolved to {}), so that end \
+                 is in the past; give a clock time still ahead today, or an absolute end \
+                 instead of a bare `--until`",
+                at.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| spec.to_string())
+            );
         }
         return Ok(Some(u64::try_from(at.unix_timestamp()).unwrap_or(0)));
     }
 
-    let (digits, unit) = spec.split_at(spec.len() - 1);
+    let split_at = spec
+        .char_indices()
+        .next_back()
+        .map_or(0, |(byte_index, _)| byte_index);
+    let (digits, unit) = spec.split_at(split_at);
     let multiplier = match unit {
         "s" => 1_i64,
         "m" => 60,
@@ -402,15 +431,24 @@ pub fn parse_lend_end(spec: &str, now: time::OffsetDateTime) -> Result<Option<u6
              lease is lent with no end"
         );
     }
-    let end = now.unix_timestamp() + count * multiplier;
+    let offset = count.checked_mul(multiplier).with_context(|| {
+        format!("peer lend: {spec:?} is too large a duration to compute an end from")
+    })?;
+    let end = local_now
+        .unix_timestamp()
+        .checked_add(offset)
+        .with_context(|| {
+            format!("peer lend: {spec:?} is too large a duration to compute an end from")
+        })?;
     Ok(Some(u64::try_from(end).unwrap_or(0)))
 }
 
 /// `HH:MM` or `HH:MM:SS` as its three numbers, or `None` for anything else.
 ///
-/// Split out so [`parse_lend_end`] reads as the three spellings it accepts
-/// rather than as a parser: the interesting decision in that function is the
-/// roll to tomorrow, and it is invisible inside a `split(':')` chain.
+/// Split out so [`parse_lend_end_at_local`] reads as the three spellings it
+/// accepts rather than as a parser: the interesting decision in that function
+/// is refusing a clock already behind local now, and it is invisible inside a
+/// `split(':')` chain.
 fn parse_clock(spec: &str) -> Option<(u8, u8, u8)> {
     let mut parts = spec.split(':');
     let hours: u8 = parts.next()?.parse().ok()?;
@@ -514,8 +552,23 @@ pub struct HandedTokens {
 }
 
 impl HandedTokens {
-    /// An empty store. Every test builds its own rather than reaching for
-    /// [`handed_tokens`], so no test can observe another test's bearer.
+    /// An empty store, for a test about this type and nothing else.
+    ///
+    /// **A store built here is not the store the request path reads, and a
+    /// test that mixes the two reads it as a broken static.**
+    /// [`PeerLeaseProvider::try_serve`]'s hand arm can only ask
+    /// [`handed_tokens`], the one store this process has, and no seam hands it
+    /// another. So a test that puts a bearer into its OWN `HandedTokens` and
+    /// then drives the provider sees `len 1` in front of it and an empty store
+    /// inside the library, microseconds apart, for the same lease id: two
+    /// stores by construction, which looks exactly like one store compiled
+    /// twice and is not.
+    ///
+    /// A test that drives the PATH therefore puts into [`handed_tokens`] and
+    /// calls [`Self::forget`] on the way out, so the next test in the same
+    /// binary does not inherit the bearer; `tests/peer_hand.rs` and
+    /// `tests/peer_lease.rs` both do that. A test about the type itself builds
+    /// one here.
     pub fn new() -> Self {
         Self::default()
     }
@@ -989,6 +1042,7 @@ pub async fn serve_on_handed_bearer(
     let mut url =
         reqwest::Url::parse(upstream_base).context("peer hand: the upstream base is not a URL")?;
     url.set_path(ask.path);
+    url.set_query(ask.query);
 
     let mut send = client.request(
         reqwest::Method::from_bytes(ask.method.as_bytes())
@@ -1100,6 +1154,24 @@ fn scopes_overlap(wanted: &LendScope, held: &LendScope) -> bool {
     }
 }
 
+/// One relayed request this ledger remembers, and everything it knows about it.
+///
+/// The `charged` flag is why this is a struct and not the `(request_id, at_ms)`
+/// tuple it replaced: the serve half and the charge half used to keep separate
+/// maps of separate pairs, and a pair could be forgotten by one while the other
+/// still held it. See [`Ledger::pairs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RelayedPair {
+    request_id: u128,
+    /// The millisecond this pair was admitted for relay, on the clock
+    /// [`Ledger::enter_relay`]'s caller passed. Every entry here is stamped by
+    /// that one caller, so [`Ledger::admit_pair`]'s expiry and eviction compare
+    /// readings of the same clock.
+    at_ms: i64,
+    /// Whether [`Ledger::debit`] has already charged this pair.
+    charged: bool,
+}
+
 /// The lender's ledger: every lease it has granted, with absolute deadlines.
 ///
 /// Persisted and restored at boot, TTL-bounded, and it logs how many rows it
@@ -1166,32 +1238,34 @@ pub struct Ledger {
     /// security label, which is the bar `RefusalLog` and `RequestDedup` next
     /// door already hold themselves to.
     inflight: HashMap<u128, u8>,
-    /// `(lease_id, request_id)` pairs already SERVED here, newest last, with
-    /// the millisecond each was admitted.
+    /// Every `(lease_id, request_id)` pair this ledger remembers, newest last,
+    /// each carrying whether the charge for it has landed yet.
     ///
-    /// Two defects in one field. The review's **H2**: this was the `debited`
-    /// set, consulted only by [`Self::debit`], so a replayed `request_id` was
-    /// served again for free, [`Self::enter_relay`] now refuses the pair, so
-    /// the ceiling binds. And the review's **M4**: it was an unbounded
-    /// `HashSet` that grew one entry per relayed request for the life of the
-    /// process, on input a peer chooses. Bounded by [`SERVED_CAPACITY`] and
-    /// [`SERVED_TTL_MS`], exactly the way
+    /// Three defects in one field. The review's **H2**: the memory was the
+    /// charge's alone, consulted only by [`Self::debit`], so a replayed
+    /// `request_id` was served again for free; [`Self::enter_relay`] now
+    /// refuses the pair, so the ceiling binds. The review's **M4**: it was an
+    /// unbounded `HashSet` that grew one entry per relayed request for the life
+    /// of the process, on input a peer chooses. Bounded by [`SERVED_CAPACITY`]
+    /// and [`SERVED_TTL_MS`], exactly the way
     /// [`crate::peer::listener::RequestDedup`] already is, the `VecDeque` is
-    /// what makes "drop the oldest" possible at all.
+    /// what makes "drop the oldest" possible at all. **Keyed by lease**, the
+    /// second half of the M4 fix: one FIFO for the whole process meant a
+    /// borrower sending its own [`SERVED_CAPACITY`] requests evicted every
+    /// other borrower's pairs, and its own older ones, which it could then
+    /// replay for free. See [`SERVED_PER_LEASE_CAPACITY`].
     ///
-    /// **Keyed by lease**, which is the second half of the M4 fix: one FIFO for
-    /// the whole process meant a borrower sending its own [`SERVED_CAPACITY`]
-    /// requests evicted every other borrower's pairs, and its own older ones,
-    /// which it could then replay for free. See [`SERVED_PER_LEASE_CAPACITY`].
-    served: HashMap<u128, VecDeque<(u128, i64)>>,
-    /// `(lease_id, request_id)` pairs already CHARGED, newest last.
-    ///
-    /// Separate from [`Self::served`] because the two answer different
-    /// questions at different layers, "has this been relayed" gates the serve,
-    /// "has this been charged" gates the arithmetic, and a single set would
-    /// make one of them a side effect of the other. Bounded the same way, for
-    /// the same reason (the review's M4).
-    debited: HashMap<u128, VecDeque<(u128, i64)>>,
+    /// **And it is ONE map rather than two.** "Served here" and "charged here"
+    /// lived in separate maps, filled by different callers on different clocks:
+    /// every admitted relay entered the first, only the ones that reached the
+    /// charge entered the second, and the two FIFOs therefore evicted different
+    /// pairs at different moments. A pair that had left the serve map while
+    /// still sitting in the charge map was admitted again (new to one) and
+    /// charged nothing (old to the other), which is a relay bought on the
+    /// lender's own account for free. One map with a state per pair makes
+    /// forgetting a pair forget both facts about it at once, so the two answers
+    /// cannot disagree.
+    pairs: HashMap<u128, VecDeque<RelayedPair>>,
     /// What each lease draws from, on the LENDER and only on the lender.
     ///
     /// A side map rather than a field on [`Lease`], because `Lease` is the wire
@@ -1792,9 +1866,9 @@ impl Ledger {
     ///
     /// `false` means this exact request has already been admitted for relay
     /// here. Bounded by [`SERVED_CAPACITY`] and [`SERVED_TTL_MS`]. See
-    /// [`Self::served`], which carries both defects this closes.
+    /// [`Self::pairs`], which carries every defect this closes.
     fn admit_served(&mut self, lease_id: u128, request_id: u128, now_ms: i64) -> bool {
-        Self::admit_pair(&mut self.served, lease_id, request_id, now_ms)
+        Self::admit_pair(&mut self.pairs, lease_id, request_id, now_ms)
     }
 
     /// One admission into one of the two per-lease caches: expire, refuse a
@@ -1817,19 +1891,19 @@ impl Ledger {
     /// [`SERVED_TTL_MS`], so this is a ceiling rather than the working
     /// mechanism.
     fn admit_pair(
-        cache: &mut HashMap<u128, VecDeque<(u128, i64)>>,
+        cache: &mut HashMap<u128, VecDeque<RelayedPair>>,
         lease_id: u128,
         request_id: u128,
         now_ms: i64,
     ) -> bool {
         cache.retain(|_, ids| {
-            ids.retain(|(_, at)| now_ms.saturating_sub(*at) < SERVED_TTL_MS);
+            ids.retain(|pair| now_ms.saturating_sub(pair.at_ms) < SERVED_TTL_MS);
             !ids.is_empty()
         });
         while cache.values().map(VecDeque::len).sum::<usize>() >= SERVED_CAPACITY {
             let Some(oldest) = cache
                 .iter()
-                .filter_map(|(lease, ids)| ids.front().map(|(_, at)| (*lease, *at)))
+                .filter_map(|(lease, ids)| ids.front().map(|pair| (*lease, pair.at_ms)))
                 .min_by_key(|(_, at)| *at)
                 .map(|(lease, _)| lease)
             else {
@@ -1843,13 +1917,17 @@ impl Ledger {
             }
         }
         let ids = cache.entry(lease_id).or_default();
-        if ids.iter().any(|(seen, _)| *seen == request_id) {
+        if ids.iter().any(|pair| pair.request_id == request_id) {
             return false;
         }
         while ids.len() >= SERVED_PER_LEASE_CAPACITY {
             ids.pop_front();
         }
-        ids.push_back((request_id, now_ms));
+        ids.push_back(RelayedPair {
+            request_id,
+            at_ms: now_ms,
+            charged: false,
+        });
         true
     }
 
@@ -1857,25 +1935,63 @@ impl Ledger {
     /// gate can read the bound off the ledger the relay decided on rather than
     /// off a copy.
     pub fn served_len(&self) -> usize {
-        self.served.values().map(VecDeque::len).sum()
+        self.pairs.values().map(VecDeque::len).sum()
     }
 
     /// How many request ids are remembered for ONE lease, so a gate can read
     /// the per-lease bound off the ledger rather than off a copy of it.
     pub fn served_len_for(&self, lease_id: u128) -> usize {
-        self.served.get(&lease_id).map_or(0, VecDeque::len)
+        self.pairs.get(&lease_id).map_or(0, VecDeque::len)
     }
 
-    /// [`Self::admit_served`] for the CHARGE. Same bound, same shape, separate
-    /// cache. See [`Self::debited`].
-    fn admit_debited(&mut self, lease_id: u128, request_id: u128, now_ms: i64) -> bool {
-        Self::admit_pair(&mut self.debited, lease_id, request_id, now_ms)
+    /// Mark one remembered pair CHARGED, and report whether this call is the
+    /// one that charged it.
+    ///
+    /// `false` means the charge for this pair has already landed, which is what
+    /// makes a retried or diamond-delivered relay debit once.
+    ///
+    /// A pair this ledger does not remember is CHARGED and recorded as charged,
+    /// which is the only way the idempotence survives an
+    /// eviction that two separate maps used to break. An absent pair means one of two things and both
+    /// want the same answer: the relay was admitted and its entry has since
+    /// aged out (so nobody has charged it, and answering `false` would be the
+    /// free relay one map exists to prevent), or nothing admitted it at all (so
+    /// this is the first charge). Recording it is what makes the SECOND call
+    /// for the same pair answer `false`.
+    fn mark_charged(&mut self, lease_id: u128, request_id: u128) -> bool {
+        if let Some(pair) = self
+            .pairs
+            .get_mut(&lease_id)
+            .and_then(|ids| ids.iter_mut().find(|pair| pair.request_id == request_id))
+        {
+            if pair.charged {
+                return false;
+            }
+            pair.charged = true;
+            return true;
+        }
+        // The same bounded insert [`Self::admit_served`] uses, so a pair that
+        // arrives here alone cannot grow this map past its own ceiling. The
+        // clock is this process's wall clock, the one every production caller
+        // of [`Self::enter_relay`] stamps its entries with.
+        Self::admit_pair(&mut self.pairs, lease_id, request_id, crate::now_ms());
+        if let Some(pair) = self
+            .pairs
+            .get_mut(&lease_id)
+            .and_then(|ids| ids.iter_mut().find(|pair| pair.request_id == request_id))
+        {
+            pair.charged = true;
+        }
+        true
     }
 
-    /// How many charged pairs are remembered right now. See
-    /// [`Self::served_len`].
+    /// How many remembered pairs have been charged. See [`Self::served_len`].
     pub fn debited_len(&self) -> usize {
-        self.debited.values().map(VecDeque::len).sum()
+        self.pairs
+            .values()
+            .flat_map(VecDeque::iter)
+            .filter(|pair| pair.charged)
+            .count()
     }
 
     /// Release one slot taken by [`Self::enter_relay`].
@@ -2018,14 +2134,22 @@ impl Ledger {
         // once, keyed on the request id"). What CHANGED for the review's H2 is
         // that this is no longer the only place the pair is looked at:
         // `enter_relay` refuses a replayed pair before the request is served, so
-        // "debited once" and "served once" are now two facts instead of one
-        // sentence covering for the other. Both are kept, a replay cannot reach
+        // "debited once" and "served once" are now two facts about one
+        // remembered pair instead of one sentence covering for the other. Both are kept, a replay cannot reach
         // here any more, and an accounting key that only one layer enforces is
         // an accounting key that stops being enforced the day that layer moves.
         //
         // Bounded, unlike the `HashSet` this was (the review's M4): a peer grew
         // it one entry per relayed request for the life of the process.
-        if !self.admit_debited(lease_id, _request_id, crate::now_ms()) {
+        //
+        // And it reads the SAME map `enter_relay` wrote. The charge used to
+        // keep a map of its own, filled only by the
+        // relays that got this far and swept on the wall clock rather than on
+        // the caller's, so the two evicted different pairs at different
+        // moments and a pair the serve half had forgotten was served again for
+        // nothing. There is no clock here any more because there is nothing
+        // here to expire.
+        if !self.mark_charged(lease_id, _request_id) {
             return 0.0;
         }
         let charge = if observed_rise > MIN_DEBIT {
@@ -3075,14 +3199,22 @@ impl FallbackProvider for PeerLeaseProvider {
 /// is a fact about their own file, and a figure that needed a reachable peer
 /// would render as blank on a sleeping laptop.
 ///
-/// [`Self::peer`] is the peer's LABEL and not its [`tcr_peer_wire::PeerId`]: the
-/// panel's click target is a Mac's sheet, which the label names, and a 32-byte
-/// key in a JSON payload the panel renders is a key in a screenshot.
+/// [`Self::peer`] is what a person reads and [`Self::peer_id`] is what a
+/// program joins on. The line carried only the label, which is the operator's
+/// own display string: two Macs may be labelled the same, a label is renamed
+/// whenever its owner feels like it, and every other cross-surface join in this
+/// tree moved to the wire id ([`crate::status::PeerStatusRow::id`]), so a panel
+/// merging this line with a peer row had nothing to merge on.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LentTo {
-    /// The trusted Mac's label, already sanitized in the peers file.
+    /// The trusted Mac's label, already sanitized in the peers file. For the
+    /// screen; [`Self::peer_id`] is what a row is joined on.
     pub peer: String,
+    /// The same Mac's pinned key in its WIRE form, the spelling
+    /// `tcr peer ls --json` writes as a row's `node` and the only one
+    /// [`tcr_peer_wire::PeerId::parse`] reads back.
+    pub peer_id: String,
     /// The lease id, as hex, the handle `tcr peer lend --revoke` takes, so the
     /// panel's click target on this line can revoke or re-lend exactly the
     /// lease the operator is looking at. A string and not a number: see
@@ -3156,6 +3288,7 @@ pub fn lent_to(
                 }
                 out.entry(name.clone()).or_default().push(LentTo {
                     peer: row.label.clone(),
+                    peer_id: row.node.to_wire(),
                     id: crate::peer::config::lease_id_string(grant.id),
                     scope: grant.scope.clone(),
                     window: grant.window,
@@ -3488,6 +3621,118 @@ mod tests {
             handed_baseline(&lender, Some(0.30)).ok(),
             Some(0.30),
             "and a figure that is one is taken as it stands"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parse_lend_end_tests {
+    use super::*;
+    use time::macros::datetime;
+
+    /// A fixed LOCAL reading, `+02:00`, chosen off the machine this suite
+    /// happens to run on: 2023-11-14 22:13:20 local. Every clock-time
+    /// assertion below goes through [`parse_lend_end_at_local`] rather than
+    /// [`parse_lend_end`] for the reason
+    /// [`crate::peer::schedule::Schedule::contains_at_local`]'s own tests do
+    /// the same split: `UtcOffset::local_offset_at` is real and
+    /// host-dependent, and a test asserting against it would pass or fail
+    /// depending on which machine ran the suite rather than on the code.
+    fn local_now() -> time::OffsetDateTime {
+        datetime!(2023-11-14 22:13:20 +02:00)
+    }
+
+    #[test]
+    fn a_clock_still_ahead_today_resolves_to_today() {
+        let local = local_now();
+        let end = parse_lend_end_at_local("23:00", local)
+            .expect("23:00 parses")
+            .expect("a clock time is an end");
+        let at = time::OffsetDateTime::from_unix_timestamp(i64::try_from(end).expect("in range"))
+            .expect("a valid instant")
+            .to_offset(local.offset());
+        assert_eq!((at.hour(), at.minute()), (23, 0));
+        assert_eq!(at.date(), local.date(), "later today stays today");
+    }
+
+    #[test]
+    fn a_clock_already_passed_today_is_refused_not_rolled_to_tomorrow() {
+        let local = local_now(); // 22:13:20
+        let err =
+            parse_lend_end_at_local("09:00", local).expect_err("a past clock must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("09:00"),
+            "names the spelling refused: {message}"
+        );
+        assert!(
+            message.contains("already passed") && message.contains("past"),
+            "says the end is in the past rather than silently rolling: {message}"
+        );
+    }
+
+    #[test]
+    fn a_duration_and_none_are_resolved_against_the_same_instant_regardless_of_offset() {
+        let local = local_now();
+        assert_eq!(
+            parse_lend_end_at_local("2h", local).expect("2h parses"),
+            Some(u64::try_from(local.unix_timestamp() + 7_200).expect("positive"))
+        );
+        assert_eq!(
+            parse_lend_end_at_local("none", local).expect("none parses"),
+            None
+        );
+        assert_eq!(
+            parse_lend_end_at_local("", local).expect("empty parses"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_bare_number_is_still_refused() {
+        for refused in ["2", "2w", "0h", "-1h", "25:00", "18:60", "18:00:00:00"] {
+            assert!(
+                parse_lend_end_at_local(refused, local_now()).is_err(),
+                "{refused:?} is not an end and must be refused rather than guessed at"
+            );
+        }
+    }
+
+    /// A smoke test on the public wrapper: it must actually convert `now`
+    /// into SOME offset and delegate rather than panic, on the one input
+    /// (`none`) whose answer cannot depend on which offset that was.
+    #[test]
+    fn the_public_wrapper_resolves_an_offset_and_delegates() {
+        let now = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+            .expect("a literal unix timestamp is a valid instant");
+        assert_eq!(parse_lend_end("none", now).expect("none parses"), None);
+    }
+
+    /// `split_at(spec.len() - 1)` splits by byte, not by character: a
+    /// trailing multibyte character (`--for 2é`) lands mid-character and
+    /// panics rather than being refused. `é` is not a real duration unit
+    /// either way, so this must be a clean refusal, never a panic.
+    #[test]
+    fn a_multibyte_trailing_unit_is_refused_not_a_panic() {
+        let err = parse_lend_end_at_local("2é", local_now())
+            .expect_err("a multibyte unit is not a duration and must be refused");
+        assert!(
+            err.to_string().contains("2é"),
+            "names the spelling refused: {err}"
+        );
+    }
+
+    /// `count * multiplier` overflowing used to go through `unwrap_or(0)`
+    /// and hand back `until = 0`: a lease dead on arrival, with no sign
+    /// anything went wrong. An overflow must be a refusal an operator can
+    /// read instead.
+    #[test]
+    fn an_overflowing_duration_is_refused_not_a_dead_on_arrival_zero() {
+        let err = parse_lend_end_at_local(&format!("{}d", i64::MAX), local_now())
+            .expect_err("a duration whose arithmetic overflows must be refused");
+        assert!(
+            err.to_string().contains("too large"),
+            "names why the duration was refused: {err}"
         );
     }
 }

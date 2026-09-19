@@ -338,6 +338,42 @@ pub fn discovered_row(
     })
 }
 
+/// Every address a resolved beacon announced that this node could dial, as
+/// text.
+///
+/// # Both families, minus the one that needs a zone
+///
+/// The browse used to read `get_addresses_v4` only, so a Mac that announced
+/// nothing but IPv6 was resolved and then dropped for having no address at
+/// all: on a home LAN with ISP-delegated IPv6 that is a neighbour this node
+/// cannot see, and the admission gate has a whole narrowing case for exactly
+/// that pair ([`crate::peer::listener::internet_admission`]).
+///
+/// An IPv6 link-local address is the one that does not survive the trip: it is
+/// meaningful only with the interface it was heard on, mDNS hands over the
+/// address without that zone, and `SocketAddr::new` would build `fe80::1:7755`,
+/// which no connect can use. Dropped here rather than dialled and failed, so a
+/// row that reaches an operator is a row this Mac could try.
+fn announced_addrs(announced: &std::collections::HashSet<mdns_sd::ScopedIp>) -> Vec<String> {
+    announced
+        .iter()
+        .map(mdns_sd::ScopedIp::to_ip_addr)
+        .filter(dialable_from_here)
+        .map(|ip| ip.to_string())
+        .collect()
+}
+
+/// Can this node dial `ip` as the beacon announced it? [`announced_addrs`]'s
+/// one rule, named so a gate can drive it.
+fn dialable_from_here(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(_) => true,
+        std::net::IpAddr::V6(v6) => {
+            !matches!(v6.segments().first(), Some(first) if first & 0xffc0 == 0xfe80)
+        }
+    }
+}
+
 /// Browse `SERVICE_TYPE` on `daemon` for [`BROWSE_WINDOW`] and return every
 /// resolved row seen, sanitized, with malformed rows dropped. The seam
 /// [`browse`] delegates to, for the same reason [`register_beacon`] exists.
@@ -358,11 +394,7 @@ fn browse_once(
         }
         match receiver.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(resolved)) => {
-                let addrs = resolved
-                    .get_addresses_v4()
-                    .into_iter()
-                    .map(|ip| ip.to_string())
-                    .collect::<Vec<_>>();
+                let addrs = announced_addrs(resolved.get_addresses());
                 if let Some(row) = discovered_row(
                     resolved.get_property_val_str(TXT_INSTANCE_KEY),
                     resolved.get_property_val_str(TXT_TAG_KEY),
@@ -932,9 +964,20 @@ fn admissible_brief_endpoints(row: &PeerRow, learned: &[Endpoint]) -> Vec<Endpoi
 /// [`Self::not_shown`], at most [`MAX_FOUND_PER_ADDRESS`] rows per source
 /// address, and a row dropped [`FOUND_TTL_MS`] after its last announcement.
 ///
+/// # What is HELD is not what is SHOWN, and only one of the three bounds it
+///
+/// [`MAX_FOUND_ROWS`] is a display cap: every row is kept and the twelfth is
+/// simply where the list stops, which is deliberate and is what
+/// [`Self::not_shown`] counts. So the memory a flood costs is bounded by the
+/// other two together, at `MAX_FOUND_PER_ADDRESS` rows per distinct source
+/// address inside one `FOUND_TTL_MS` window, and by nothing else. Reading the
+/// three as one total cap of twelve rows is the mistake this paragraph exists
+/// to prevent: the number a reader should have in mind is "two per address
+/// that announced in the last minute".
+///
 /// **Nothing an announcement says is written to disk.** This type is process
 /// state, held by whatever is rendering; there is no found-list file, which is
-/// why a flood costs memory bounded by the caps above and nothing else.
+/// why a flood costs memory bounded by the two caps above and nothing else.
 #[derive(Debug, Clone, Default)]
 pub struct FoundList {
     rows: Vec<(Discovered, i64)>,
@@ -1099,6 +1142,55 @@ mod tests {
     use tcr_peer_wire::PeerId;
 
     use super::*;
+
+    /// **A Mac that announces only IPv6 is still a Mac this node can see.**
+    ///
+    /// The browse read `get_addresses_v4`, so an IPv6-only announcer resolved
+    /// to a row with no addresses at all and was dropped: on a home LAN with
+    /// ISP-delegated IPv6, that is a neighbour sitting on the same desk. Both
+    /// families are taken now, minus IPv6 link-local, which arrives without the
+    /// interface zone that makes it dialable.
+    ///
+    /// Watch it fail by filtering to `IpAddr::V4` again: the IPv6-only case
+    /// comes back empty.
+    #[test]
+    fn a_browse_takes_both_address_families_and_drops_a_zoneless_link_local() {
+        use std::collections::HashSet;
+        use std::net::IpAddr;
+
+        let announced = |addrs: &[&str]| -> HashSet<mdns_sd::ScopedIp> {
+            addrs
+                .iter()
+                .map(|addr| {
+                    mdns_sd::ScopedIp::from(
+                        addr.parse::<IpAddr>().expect("a fixture address parses"),
+                    )
+                })
+                .collect()
+        };
+
+        let v6_only = announced_addrs(&announced(&["2001:db8::7"]));
+        assert_eq!(
+            v6_only,
+            vec!["2001:db8::7".to_string()],
+            "an announcer with nothing but IPv6 must still produce a row"
+        );
+
+        let ula = announced_addrs(&announced(&["fd00::7"]));
+        assert_eq!(
+            ula,
+            vec!["fd00::7".to_string()],
+            "and a unique-local address is a LAN address, which is the usual case"
+        );
+
+        let mut both = announced_addrs(&announced(&["192.0.2.7", "2001:db8::7", "fe80::7"]));
+        both.sort();
+        assert_eq!(
+            both,
+            vec!["192.0.2.7".to_string(), "2001:db8::7".to_string()],
+            "both families are kept; the link-local one arrives with no interface zone, so              nothing could dial it"
+        );
+    }
 
     #[test]
     fn sanitize_name_rejects_email_and_uuid_shape() {

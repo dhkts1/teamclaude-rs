@@ -109,8 +109,8 @@ struct AccountExitRow: View {
                 .font(.system(size: V4.muteSize - 2, weight: .semibold))
                 .foregroundStyle(Tok.mute)
         }
-        .padding(.horizontal, 7)
-        .padding(.vertical, 2)
+        .padding(.horizontal, V4.pillPaddingH)
+        .padding(.vertical, V4.pillPaddingV)
         .background(
             RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.06))
         )
@@ -135,12 +135,12 @@ struct MustSwitch: View {
         Button(action: press) {
             Capsule()
                 .fill(on ? Tok.ok : Tok.track)
-                .frame(width: 30, height: 18)
+                .frame(width: V4.switchWidth, height: V4.switchHeight)
                 .overlay(alignment: on ? .trailing : .leading) {
                     Circle()
                         .fill(.white)
-                        .frame(width: 14, height: 14)
-                        .padding(2)
+                        .frame(width: V4.switchKnobSize, height: V4.switchKnobSize)
+                        .padding(V4.switchKnobInset)
                 }
         }
         .buttonStyle(.plain)

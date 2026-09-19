@@ -972,9 +972,12 @@ struct PeersSettingsPane: View {
     /// not silently drop it. One write per lease means every flag goes, and a
     /// missing `--for` is what "no end" means to the CLI, so re-sending the
     /// lease without its end would END the end.
+    ///
+    /// ``LeaseEnd/editing(until:now:calendar:)``, shared with
+    /// `LeaseDraft.init(editing:peer:calendar:)` so this pane and that sheet
+    /// keep the DATE of a lease ending some other day the same way.
     private func endFor(_ grant: PeerLendGrant) -> LeaseEnd {
-        guard let until = grant.until else { return .none }
-        return .until(PeerLease.clock(unixSeconds: until))
+        LeaseEnd.editing(until: grant.until, now: Date())
     }
 
     /// The scope popup, shared by both sheets.

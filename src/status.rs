@@ -1031,8 +1031,12 @@ pub enum GraphEdgeDetail {
     /// the arrow points the way the quota flows and a reader never has to
     /// consult a direction field to know which Mac is paying.
     Lease {
-        /// The ledger's own id, hex, so a reader can line an edge up against
-        /// `tcr peer lease ls`.
+        /// The ledger's own id, in the 32-character hex form every CLI surface
+        /// prints and `--revoke` reads back
+        /// ([`crate::peer::config::lease_id_string`]). Zero-padded, because
+        /// unpadded is a DIFFERENT string for any id with a leading zero
+        /// nibble, and a reader lining this edge up against a lease list or
+        /// building a command from it would match nothing.
         lease_id: String,
         /// Fraction of the window drawn so far, 0 to 1.
         spent: f64,
@@ -1155,7 +1159,7 @@ fn lease_edge(from: &str, to: &str, lease: &tcr_peer_wire::Lease) -> GraphEdge {
         from: from.to_string(),
         to: to.to_string(),
         detail: GraphEdgeDetail::Lease {
-            lease_id: format!("{:x}", lease.lease_id),
+            lease_id: crate::peer::config::lease_id_string(lease.lease_id),
             spent: lease.spent,
             expires_at_ms: lease.expires_at_ms,
             until: lease.until,

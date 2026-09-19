@@ -1427,3 +1427,42 @@ fn the_two_documents_name_a_mac_the_same_way() {
         "the display form is the wire form's first ten characters and nothing else"
     );
 }
+
+/// **A lease edge names the lease in the same 32 characters every other
+/// surface prints.**
+///
+/// The graph rendered it with a bare hex format, so any id with a leading zero
+/// nibble came out shorter than the handle `tcr peer lend --revoke` takes and
+/// than the one `lentTo` and `tcr peer ls --json` carry. A reader lining an
+/// edge up against a lease list matched nothing, and a command built from the
+/// edge named a lease nobody minted.
+///
+/// The fixture's lease id is `0x2a`, which is 30 leading zeroes and the reason
+/// this is observable at all.
+///
+/// Watch it fail by putting `format!("{:x}", lease.lease_id)` back in
+/// `lease_edge`.
+#[test]
+fn a_lease_edge_names_the_lease_the_way_every_other_surface_does() {
+    let graph = graph_fixture(1_700_000_000_000);
+    let wire = serde_json::to_value(&graph).expect("the graph serializes");
+
+    let ids: Vec<&str> = wire["edges"]
+        .as_array()
+        .expect("the graph carries edges")
+        .iter()
+        .filter_map(|edge| edge["leaseId"].as_str())
+        .collect();
+    assert!(
+        !ids.is_empty(),
+        "the fixture has to carry a lease edge, or this measures nothing: {wire}"
+    );
+    for id in ids {
+        assert_eq!(
+            id,
+            teamclaude_rs::peer::config::lease_id_string(0x2a),
+            "an edge names its lease in the form the CLI prints and reads back"
+        );
+        assert_eq!(id.len(), 32, "32 characters, padded: {id}");
+    }
+}

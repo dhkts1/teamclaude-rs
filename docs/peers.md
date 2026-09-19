@@ -159,10 +159,10 @@ A lease can work one of two ways:
 
 - **`serve`** (today): the borrower's request goes over the owner's Mac and out on the owner's
   IP. The owner's `tcr` reads it, prompts included.
-- **`hand`** (arriving): the owner hands the borrower a short-lived access token over the
-  paired, authenticated session. The borrower sends the request on its own IP, so the owner
-  never reads it. The owner keeps the refresh token and renews it; to revoke, the owner just
-  stops renewing.
+- **`hand`** (`tcr peer lend <peer> --mode hand`): the owner hands the borrower a short-lived
+  access token over the paired, authenticated session. The borrower sends the request on its
+  own IP, so the owner never reads it. The owner keeps the refresh token and renews it; to
+  revoke, the owner just stops renewing.
 
 Only one machine ever holds the refresh token, whichever mode is in use.
 
@@ -176,17 +176,23 @@ lets this Mac fall back to a trusted, willing Mac when its own connection to the
 down. `tcr peer via off` turns that off; `tcr peer via <peer>` pins one specific Mac instead
 of picking automatically.
 
-## Exit lock: keeping an account on one IP (arriving)
+## Exit lock: keeping an account on one IP
 
-Each account can be set to `egress: local` or `egress: via <peer>`. Local is today's
-behaviour: the account's requests leave from this Mac. `via <peer>` sends them out through one
-pinned peer instead, always the same one, so that account's traffic keeps a single IP no
-matter which Mac in the mesh happens to be running it. This matters because some accounts need
-to look like they always come from the same place.
+```
+tcr peer account <account> --exits-from local|<peer>
+```
+
+sets the account to `egress: local` or `egress: via <peer>`. Local is today's behaviour: the
+account's requests leave from this Mac. `via <peer>` sends them out through one pinned peer
+instead, always the same one, so that account's traffic keeps a single IP no matter which Mac
+in the mesh happens to be running it. This matters because some accounts need to look like they
+always come from the same place. `--must` (or `--no-must`) sets `egressStrict`: with it on, a
+request is refused by name rather than falling back to this Mac when the pinned peer cannot be
+reached.
 
 The peer carrying the traffic sees only where the bytes are going, never what is inside them:
-it carries them blind. The exit lock itself lives only in the local peers file and is never
-sent over the wire.
+it carries them blind. The exit lock itself lives on the account, in the main config file, and
+is never sent over the wire.
 
 ## The network key: an opt-in password for the mesh
 
@@ -254,16 +260,16 @@ Reaching it tries a few things, in order:
 
 - **IPv6 first.** If both Macs have a public IPv6 address, they reach each other directly,
   with nothing in between.
-- **A stable router mapping (arriving).** If not, and the internet switch (`tcr peer internet
-  on`) is on, `tcr` asks your router to open one fixed port for the peer listener (NAT-PMP;
-  UPnP is arriving) and keeps it open: the mapping is renewed every 30 minutes on a 2-hour
-  lifetime, so a single missed renewal does not drop it, and it is deleted both when the
-  switch goes off and at shutdown, so nothing is left holding a port open on your router.
-  Like `find`, the switch is a setting rather than an act: the running `tcr` re-reads it every
-  few seconds, so turning it on asks the router within that and turning it off deletes the
-  mapping, neither needing a restart.
-  `tcr peer reach` (arriving) prints what your router agreed to.
-- **A fallback port that changes with the clock, for the dialling side only (arriving).** If
+- **A stable router mapping.** If not, and the internet switch (`tcr peer internet on`) is on,
+  `tcr` asks your router to open one fixed port for the peer listener, over NAT-PMP or, for a
+  router that only speaks the older protocol, UPnP, and keeps it open: the mapping is renewed
+  every 30 minutes on a 2-hour lifetime, so a single missed renewal does not drop it, and it is
+  deleted both when the switch goes off and at shutdown, so nothing is left holding a port open
+  on your router. Like `find`, the switch is a setting rather than an act: the running `tcr`
+  re-reads it every few seconds, so turning it on asks the router within that and turning it
+  off deletes the mapping, neither needing a restart.
+  `tcr peer reach` prints what your router agreed to.
+- **A fallback port that changes with the clock, for the dialling side only.** If
   the address this Mac last saw the peer at stops answering, both sides already know, without
   saying so to each other, a small set of ports that are "accepted" for right now: they are
   computed from the pair's own Noise handshake and the current half-minute, the same idea
@@ -329,3 +335,185 @@ is still a slice of a window, so it does not put a token number on a path either
 Nothing above is sent before the matching switch is turned on, and every one of them can be
 undone: `tcr peer find off` stops announcing, `tcr peer share off` (or `tcr peer lend <peer>
 --fraction 0`) stops lending, and `tcr peer forget <peer>` removes a pin entirely.
+
+## Trying it on two Macs
+
+This is the page to type from with a friend, one command at a time, nobody to ask. Every
+line below says which Mac types it. Mac A and Mac B stand for the two machines; swap in
+your own names.
+
+Both Macs need a peer port: `listen`, a `host:port` in `tcr-peers.json` (see
+[configuration.md](configuration.md) for the key). The first opt-in command below writes it
+for you, `0.0.0.0:7755`, if nothing has set it already; it only takes effect the next time the
+proxy starts, so quit and reopen it once after that first command, before going any further.
+
+### On one LAN
+
+1. Both Macs, same network:
+
+   ```
+   tcr peer find on
+   ```
+
+   If this Mac had no peer port yet, it prints `peer.listen: 0.0.0.0:7755 written into <path>
+   (this Mac had no peer port, and turning this on needs one)` followed by `peer.listen:
+   nothing is listening on it yet. The port opens the next time the proxy starts, so quit
+   TcrBar and open it again to finish turning this on`. Do that before the next step. On a Mac
+   that already had `listen` set, neither line prints and `peer.find: on` takes effect right
+   away, followed by `a running server starts announcing within a minute`.
+
+2. Mac A asks to pair with Mac B:
+
+   ```
+   tcr peer pair <Mac B's address>
+   ```
+
+   Mac A's screen shows `peer pair: this Mac shows` followed by six digits.
+
+3. Mac B sees the request and opens the window:
+
+   ```
+   tcr peer pending
+   ```
+
+   lists a row containing `wants to pair`.
+
+   ```
+   tcr peer accept <target>
+   ```
+
+   (`<target>` is the instance id or address `tcr peer pending` printed.) Mac B's screen shows
+   `peer accept: ok` followed by the instance id, address and the window's end time.
+
+4. Compare the six digits on both screens. If they match, both operators confirm, each typing
+   the address of the OTHER Mac:
+
+   ```
+   tcr peer pair <Mac B's address> <the six digits>     # on Mac A
+   tcr peer pair <Mac A's address> <the six digits>     # on Mac B
+   ```
+
+   Full details of this exchange, including why the digits cannot be steered, are in
+   [Trust: pairing with a Mac](#trust-pairing-with-a-mac) above; the four commands above are
+   the whole of what to type.
+
+5. Either Mac:
+
+   ```
+   tcr peer ls
+   ```
+
+   prints a row for the other Mac's peer id and name once both sides confirmed, followed by a
+   line `peer ls: pending=0 blocked=0 muted=0`.
+
+6. Mac A lends Mac B one hour of account access. `tcr peer lend` takes the peer id in its
+   full wire form, not the short `tcr-…` one `tcr peer ls` just printed, so read it off:
+
+   ```
+   tcr peer ls --json
+   ```
+
+   and take Mac B's `node` field from there. Then, on Mac A:
+
+   ```
+   tcr peer lend <Mac B's node id> --for 1h
+   ```
+
+   prints `peer lend: ok lease=` followed by the lease id, peer, scope, window, fraction,
+   ttl, max-inflight and end time.
+
+7. Mac B borrows once. There is no separate "borrow" command: once Mac A has lent, a normal
+   request Mac B sends through its own `tcr` is served on Mac A's account whenever Mac B needs
+   it (see [Share: letting a trusted Mac use your accounts](#share-letting-a-trusted-mac-use-your-accounts)
+   above for what that means for who reads the request).
+
+8. See the borrow. The plain `tcr peer status` line only carries the peer's name, address,
+   last-seen time and whether it is trusted, not lease detail, so ask for the JSON on Mac A:
+
+   ```
+   tcr peer status --json
+   ```
+
+   Mac B's row there carries `inFlight`, `leaseSpent` and `leaseTtlSeconds` for the request
+   just served.
+
+### Off the LAN
+
+1. On both Macs:
+
+   ```
+   tcr peer internet on
+   ```
+
+   If this Mac had no peer port yet, it first writes one the same way `tcr peer find on` does
+   above (the same two `peer.listen:` lines; quit and reopen once for it to take effect), then
+   prints `peer.internet: on (the listener on port 7755 is mapped at boot and renewed every 30
+   minutes)`. On a Mac that already had `listen` set, only that last line prints, with
+   whichever port it was already set to.
+
+2. If both Macs have a public IPv6 address, they reach each other directly and the same four
+   pairing commands from "On one LAN" above work unchanged, typed against the address each Mac
+   last saw the other at (see [Reaching a Mac off your network](#reaching-a-mac-off-your-network)
+   above). Either Mac checks whether it has one first:
+
+   ```
+   tcr peer reach
+   ```
+
+   prints `reach: ipv6: <addr>` for each global address it has, or `reach: ipv6: none: this
+   Mac has no globally routable IPv6 address, so a peer cannot reach it over IPv6` if it has
+   none.
+
+3. If neither Mac has IPv6, the router mapping from step 1 is the fallback: it opens a fixed
+   external port on your router pointing at the peer listener, so the four pairing commands
+   work against `<your router's external address>:<that port>` instead. `tcr peer reach` shows
+   what your router agreed to:
+
+   ```
+   tcr peer reach
+   ```
+
+   prints `reach: gateway: <addr>`, `reach: external-address: <addr>`, `reach: mapping: not
+   asked for (pass --map)` unless `--map` is given, and `reach: listen-port: <port>`, or
+   `reach: listen-port: none (the peer listener is off)`. `tcr peer reach --map` asks the
+   router directly instead of reading what a running `tcr` already holds.
+
+   The same command also prints the current clock-derived fallback slot: `reach: slot: <n>
+   (30s each, the slot before and after also accepted)`. That slot is the port both sides
+   already fall back to dialling, without telling each other, if the address they last saw
+   each other at stops answering. A standalone `tcr peer reach` cannot show you the derived
+   port itself, because it has not run the pair's Noise handshake and has nothing to derive
+   one from, so it prints `derived-port: unavailable: the pair's handshake secret is not
+   stored, and deriving a port from public key material instead would give every scanner the
+   same number` for every pinned peer. The fallback itself runs inside the already-paired
+   `tcr` process, not from this command.
+
+### A hand-mode lend
+
+Mac A lends Mac B the same hour of account access as step 6 in "On one LAN" above, but with
+`--mode hand`:
+
+```
+tcr peer lend <Mac B's node id> --for 1h --mode hand
+```
+
+prints the same `peer lend: ok lease=` line as that step, unchanged in shape; the mode itself
+is not one of the printed fields. From here, a request Mac B sends is served by Mac B's own
+`tcr`, on a short-lived access token Mac A handed over the paired session: Mac A never reads
+it (see [Sharing modes](#sharing-modes) above).
+
+If every account the scope covers has `--must` set (an exit lock that refuses rather than
+falls back), this refuses instead of lending, before anything is written:
+
+```
+peer lend: every account this scope covers has egressStrict on, so a hand-mode grant would
+hand over a bearer the exit lock refuses to send with: the borrower sends from ITS own Mac,
+which a strict pin forbids whether it names this Mac or another. Lend it as `--mode serve`,
+or clear the pin on an account in <scope> first
+```
+
+Seeing the borrow is different from a `serve` lease: no request passes through Mac A's proxy,
+so `tcr peer status --json` on Mac A will not show `inFlight` for it. Mac B's own `tcr` still
+reports what it spent back to Mac A over the paired session, which is what keeps the lease's
+remaining balance accurate (see [Seeing the mesh's paths](#seeing-the-meshs-paths-not-in-this-release)
+above for what that report can and cannot say about it).

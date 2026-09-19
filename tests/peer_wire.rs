@@ -1262,3 +1262,95 @@ fn every_wire_type_serializes_only_allowlisted_keys() {
         );
     }
 }
+
+/// **A refusal names what is actually wrong with the id that was pasted.**
+///
+/// Every failure of the base32 decoder came back as `Alphabet(char)`, however
+/// legal every character in the input was. An id one character short, and an id
+/// whose last character carries bits an encoder would never have set, are both
+/// refused for their SHAPE, and naming a character in them sends the reader
+/// hunting a typo that is not there.
+///
+/// Watch it fail by mapping every `DecodeKind` back to
+/// `PeerIdError::Alphabet`.
+#[test]
+fn a_peer_id_refusal_separates_a_bad_character_from_a_bad_shape() {
+    use tcr_peer_wire::{PeerId, PeerIdError};
+
+    let whole = PeerId([7_u8; 32]).to_wire();
+
+    // TOO SHORT: every character is legal Crockford, there are not enough of
+    // them.
+    let short = &whole[..whole.len() - 1];
+    let refusal = PeerId::parse(short).expect_err("a truncated id is refused");
+    assert!(
+        matches!(refusal, PeerIdError::Malformed { length } if length == short.chars().count()),
+        "a truncated id is refused for its length, not for a character: {refusal}"
+    );
+    assert!(
+        format!("{refusal}").contains("52"),
+        "and the line says how many characters a whole one has: {refusal}"
+    );
+
+    // THE RIGHT LENGTH, EVERY CHARACTER LEGAL, and still not an id: 52 symbols
+    // carry 260 bits and an id is 256, so the last symbol's four spare bits are
+    // zero in anything an encoder produced. `1` sets one of them.
+    let bad_tail = format!("{}1", &whole[..whole.len() - 1]);
+    let refusal = PeerId::parse(&bad_tail).expect_err("spare bits that are set are refused");
+    assert!(
+        matches!(refusal, PeerIdError::Malformed { .. }),
+        "an id whose trailing bits are set is refused for its shape, and every character \
+         in it is a Crockford character: {refusal}"
+    );
+
+    // A BAD CHARACTER, and the one named is the one that is bad. `U` is
+    // excluded from the Crockford alphabet on purpose, so it cannot be
+    // confused with `V`.
+    let mistyped = format!("{}U{}", &whole[..7], &whole[8..]);
+    assert_eq!(
+        PeerId::parse(&mistyped).expect_err("a character outside the alphabet is refused"),
+        PeerIdError::Alphabet('U'),
+    );
+}
+
+/// **The two files that state the no-credential invariant both name its one
+/// exemption.**
+///
+/// They said no credential field exists here or may ever exist, while
+/// `Control::Handoff` carries the owner's bearer and the gate above holds an
+/// exemption for it by name. A reader who believes the sentence writes code
+/// that assumes a peer stream can never disclose a token, and one who reads it
+/// while grading this tree marks the exemption as the bug.
+///
+/// Prose is checked here rather than trusted because these two paragraphs are
+/// the ones a reader reaches first, and they are the ones that were wrong.
+#[test]
+fn the_no_credential_invariant_names_the_one_exemption() {
+    let module_docs = |source: &str| -> String {
+        source
+            .lines()
+            .filter(|line| line.trim_start().starts_with("//!"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let wire = module_docs(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/tcr-peer-wire/src/lib.rs"
+    )));
+    let module = module_docs(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/peer/mod.rs"
+    )));
+
+    for (name, docs) in [("the wire crate", &wire), ("src/peer/mod.rs", &module)] {
+        assert!(
+            docs.contains("Handoff"),
+            "{name}'s own doc states the no-credential invariant and has to state the \
+             exemption with it, or the sentence is false where it is read first"
+        );
+        assert!(
+            !docs.contains("no credential field anywhere"),
+            "{name} still claims no credential field exists anywhere in these types"
+        );
+    }
+}

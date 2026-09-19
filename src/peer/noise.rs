@@ -384,6 +384,25 @@ impl Handshake {
         }
     }
 
+    /// The longest message 1 this pattern can accept, which is the most a
+    /// reader may allocate for one before anything is authenticated.
+    ///
+    /// Per PATTERN and not the fleet-wide [`MAX_MESSAGE_1_BYTES`], because the
+    /// pattern is already known where this is asked: an `XX` responder has no
+    /// reason to size a buffer for the 96 bytes an `IK` message 1 has.
+    pub fn max_message_1_len(self) -> usize {
+        match self {
+            Self::Pair => {
+                if XX_MESSAGE_1_LEN > XX_MESSAGE_1_LEN_V1 {
+                    XX_MESSAGE_1_LEN
+                } else {
+                    XX_MESSAGE_1_LEN_V1
+                }
+            }
+            other => other.message_1_len(),
+        }
+    }
+
     /// How long this pattern's message 1 is, with the payload this design
     /// requires of it, empty everywhere except [`Self::Pair`], which carries
     /// the instance id (see [`XX_MESSAGE_1_LEN`]).
@@ -1036,7 +1055,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     A: Fn(&[u8]) -> Result<PeerId, PinRefusal>,
 {
-    let message_1 = read_frame(stream).await?;
+    // BOUNDED by the pattern's own message 1, not by the Noise transport
+    // limit. This is the first frame of a connection a stranger can open, and
+    // the plain reader sizes its buffer from the peer's own two-byte prefix: a
+    // `0xFFFF` prefix and then silence made this node allocate 65 535 bytes per
+    // connection before the length check below could refuse it. The listener's
+    // own path already read through the bounded reader, which is why this was
+    // latent rather than reachable, and a second caller of this function is one
+    // nobody would think to check.
+    let message_1 = read_frame_bounded(stream, handshake.max_message_1_len()).await?;
     if !handshake.accepts_message_1_len(message_1.len()) {
         bail!(
             "peer handshake: {} bytes are not a {} message 1 ({} expected)",

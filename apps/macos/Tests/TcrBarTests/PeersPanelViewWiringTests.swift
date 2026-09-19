@@ -129,10 +129,20 @@ final class PeersPanelViewWiringTests: XCTestCase {
                 card.contains("PeerCommand.\(verb)(instance: knock.instanceId)"),
                 "the \(verb) control on a pairing row is not handed the instance id")
         }
-        XCTAssertTrue(
-            card.contains("PeerAdmission.knockTitle(knock)"),
-            "the row writes its own title again, so the tab and the pane can phrase one "
-                + "request two ways")
+        // The knock title is split into a name line and an address line:
+        // ``PeerAdmission/knockTitle(_:)`` (one line, truncates the address
+        // mid-digit at this card's width) is replaced by
+        // ``PeerAdmission/knockNameLine(_:)`` and
+        // ``PeerAdmission/knockAddressLine(_:)``, drawn on two lines so
+        // neither the name nor the address is the one a single-line control
+        // truncates. Both still come from `PeerAdmission`, so the card still
+        // cannot phrase the request on its own.
+        for helper in ["knockNameLine(knock)", "knockAddressLine(knock)"] {
+            XCTAssertTrue(
+                card.contains("PeerAdmission.\(helper)"),
+                "the row writes its own title again, so the tab and the pane can phrase one "
+                    + "request two ways: missing PeerAdmission.\(helper)")
+        }
     }
 
     /// The footer is drawn, and from the snapshot's own derivation rather than

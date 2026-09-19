@@ -426,21 +426,38 @@ impl Mac {
             "{}: could not read a loopback proxy address out of {listening:?}",
             self.label
         );
-        let (which, peer_line) =
-            self.wait_for_one_of(&["peer listener up", "could not bind the peer socket"]);
-        if which == 1 {
-            // The port went to somebody else between `free_loopback_port` and
-            // this child's own bind. Stop the child and let `boot` try again on
-            // a fresh number; the line is printed so a run that hit the race
-            // says so in its output rather than only in a timing difference.
-            println!(
-                "         {}: lost peer port {} to another process, retrying: {peer_line}",
-                self.label, self.peer_port
+        // Re-read rather than assert while `peer_listen` is missing: the
+        // waiters now skip a line the child has not finished writing, and a
+        // line that arrives without the field would otherwise be read as a
+        // listener on the wrong port. Bounded by the same deadline as every
+        // other wait here, so a line that never grows the field still fails,
+        // and fails saying which line it was.
+        let deadline = Instant::now() + LINE_TIMEOUT;
+        let announced = loop {
+            let (which, peer_line) =
+                self.wait_for_one_of(&["peer listener up", "could not bind the peer socket"]);
+            if which == 1 {
+                // The port went to somebody else between `free_loopback_port` and
+                // this child's own bind. Stop the child and let `boot` try again on
+                // a fresh number; the line is printed so a run that hit the race
+                // says so in its output rather than only in a timing difference.
+                println!(
+                    "         {}: lost peer port {} to another process, retrying: {peer_line}",
+                    self.label, self.peer_port
+                );
+                self.shutdown();
+                return false;
+            }
+            if let Some(announced) = field(&peer_line, "peer_listen") {
+                break announced;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: the peer listener line never carried peer_listen within {LINE_TIMEOUT:?}: {peer_line:?}",
+                self.label
             );
-            self.shutdown();
-            return false;
-        }
-        let announced = field(&peer_line, "peer_listen").unwrap_or_default();
+            std::thread::sleep(Duration::from_millis(50));
+        };
         assert_eq!(
             announced,
             format!("127.0.0.1:{}", self.peer_port),
@@ -470,7 +487,7 @@ impl Mac {
         let deadline = Instant::now() + LINE_TIMEOUT;
         loop {
             let body = self.log();
-            for line in body.lines().rev() {
+            for line in complete_lines(&body).rev() {
                 if let Some(which) = needles.iter().position(|needle| line.contains(needle)) {
                     return (which, line.to_string());
                 }
@@ -489,7 +506,10 @@ impl Mac {
         let deadline = Instant::now() + LINE_TIMEOUT;
         loop {
             let body = self.log();
-            if let Some(line) = body.lines().rev().find(|line| line.contains(needle)) {
+            if let Some(line) = complete_lines(&body)
+                .rev()
+                .find(|line| line.contains(needle))
+            {
                 return line.to_string();
             }
             assert!(
@@ -634,6 +654,54 @@ impl Drop for Mac {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+/// The lines of `body` the writer has FINISHED: everything up to its last
+/// newline. Whatever follows that newline is still being written, so it is not
+/// a line yet and no waiter here may match on it.
+///
+/// A tracing event reaches these logs as its message first and its fields
+/// behind it, so a reader that catches one in flight sees
+/// `peer listener up (a second socket; ...)` with no `peer_listen=` after it.
+/// That half line is what the macOS CI job matched on 2026-09-19: all twelve
+/// tests in this file panicked at the same assertion, every one of them
+/// `left: ""` against the port its peers file names, while the same code
+/// passed locally because a 50 ms poll never lands inside the write on an idle
+/// machine. The emitters are not at fault: both `src/server.rs` and
+/// `src/peer/listener.rs` carry `peer_listen` on that event, so a matched line
+/// without it was never a whole line. How the write came apart is not measured
+/// here: polling a live boot log on a fast machine caught no mid-line read in
+/// 8346 of them, which is why the waiters stop trusting the tail rather than
+/// the writer.
+fn complete_lines(body: &str) -> std::str::Lines<'_> {
+    let finished = body.rfind('\n').map_or(0, |at| at + 1);
+    body[..finished].lines()
+}
+
+#[test]
+fn a_half_written_line_is_not_a_line() {
+    let whole = "INFO server: peer listener up (a second socket) peer_listen=127.0.0.1:49894\n";
+    let half = "INFO server: peer listener up (a second socket)";
+    let body = format!("{whole}{half}");
+    assert_eq!(
+        complete_lines(&body).next_back(),
+        Some(whole.trim_end()),
+        "the last finished line is the one carrying peer_listen, not the half line under it"
+    );
+    assert_eq!(
+        complete_lines(half).next(),
+        None,
+        "a body with no newline in it holds no finished line at all"
+    );
+    let announced = complete_lines(&body)
+        .rev()
+        .find(|line| line.contains("peer listener up"))
+        .and_then(|line| field(line, "peer_listen"));
+    assert_eq!(
+        announced.as_deref(),
+        Some("127.0.0.1:49894"),
+        "a waiter that skips the half line reads the address the emitter announced"
+    );
 }
 
 /// `key=value` out of one tracing line, where the value runs to the next space.
@@ -1182,7 +1250,10 @@ fn wait_for_file(path: &Path, needle: &str, mac: &Mac) -> String {
     let deadline = Instant::now() + LINE_TIMEOUT;
     loop {
         let body = std::fs::read_to_string(path).unwrap_or_default();
-        if let Some(line) = body.lines().rev().find(|line| line.contains(needle)) {
+        if let Some(line) = complete_lines(&body)
+            .rev()
+            .find(|line| line.contains(needle))
+        {
             return line.to_string();
         }
         assert!(

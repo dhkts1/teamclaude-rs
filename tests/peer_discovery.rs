@@ -1056,3 +1056,45 @@ fn a_beacon_is_restamped_every_minute_it_keeps_announcing() {
         "the tag is minute-keyed, which is why a beacon has to be re-stamped at all"
     );
 }
+
+/// **What a flood can actually make this node hold.**
+///
+/// The found list's doc named three caps, and a reader could take them for one
+/// total bound of twelve rows. Only two of the three bound MEMORY:
+/// `MAX_FOUND_ROWS` is where the display stops, every row is kept, and what a
+/// flooder can hold is `MAX_FOUND_PER_ADDRESS` rows per distinct source address
+/// inside one `FOUND_TTL_MS` window. This is that number, measured, so the
+/// sentence in the doc is a claim somebody checked.
+///
+/// Watch it fail by truncating `FoundList::observe` to `MAX_FOUND_ROWS`, which
+/// is the total cap the old wording implied: the held count drops to twelve.
+#[test]
+fn a_flood_holds_two_rows_per_address_and_nothing_survives_the_ttl() {
+    let addresses = 30_u8;
+    let mut found = FoundList::new();
+
+    // Three announcements per address, each under its own instance id: the
+    // third is the one the per-address cap refuses.
+    let mut scan = Vec::new();
+    for host in 0..addresses {
+        for nth in 0..3_u8 {
+            scan.push(row(host * 3 + nth, &format!("192.0.2.{host}")));
+        }
+    }
+    found.observe(scan, 1_000);
+
+    assert_eq!(
+        found.len(),
+        usize::from(addresses) * discovery::MAX_FOUND_PER_ADDRESS,
+        "the memory a flood costs is two rows per distinct source address, not a total of {}",
+        discovery::MAX_FOUND_ROWS
+    );
+
+    // And the other half of the real bound: the window.
+    found.observe(Vec::new(), 1_000 + discovery::FOUND_TTL_MS);
+    assert_eq!(
+        found.len(),
+        0,
+        "a flooder that stops announcing holds nothing a minute later"
+    );
+}

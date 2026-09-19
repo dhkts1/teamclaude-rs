@@ -2355,3 +2355,165 @@ async fn a_frame_split_across_the_poll_tick_survives() {
         "both frames, in order, decrypted under a transport whose nonce never skipped"
     );
 }
+
+/// **This node's key file never exists half-written.**
+///
+/// It was created and then written, two steps, so a crash, a full disk or a
+/// SIGKILL between them left a 0-byte `tcr-node.key`. That file is not
+/// repairable by this program: `load_or_mint` refuses it ("holds 0 bytes,
+/// expected exactly 32") on every boot afterwards, and minting refuses a path
+/// that already exists, by design, so the Mac has no identity and no way to
+/// mint one until somebody deletes a file nothing told them about.
+///
+/// The instrument is a reader spinning on the path while the key is minted,
+/// which is the same thing a boot on the next start is: it records the length
+/// of the FIRST version of the file it manages to see. Run over many mints so
+/// the window, which is microseconds wide, is actually sampled.
+///
+/// Watched red by restoring the create-then-write writer: the reader sees a
+/// 0-byte key file.
+#[test]
+fn a_node_key_file_is_never_visible_before_its_bytes() {
+    const MINTS: usize = 200;
+    let mut seen_empty = 0_usize;
+    let mut sampled = 0_usize;
+
+    for _ in 0..MINTS {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let key_path = teamclaude_rs::peer::id::private_key_path(dir.path());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let watcher_start = start.clone();
+        let watched = key_path.clone();
+        // The first length this reader manages to see, and whether it saw the
+        // file at all: a run that never sampled proves nothing, so it is
+        // counted separately.
+        let watcher = std::thread::spawn(move || {
+            watcher_start.wait();
+            for _ in 0..200_000 {
+                if let Ok(meta) = std::fs::metadata(&watched) {
+                    return Some(meta.len());
+                }
+            }
+            None
+        });
+
+        start.wait();
+        teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
+        if let Some(first) = watcher.join().expect("the watching thread finishes") {
+            sampled += 1;
+            if first != 32 {
+                seen_empty += 1;
+            }
+        }
+        assert_eq!(
+            std::fs::read(&key_path).expect("the key file reads").len(),
+            32,
+            "the key that was minted is 32 bytes whatever the reader saw"
+        );
+    }
+
+    assert!(
+        sampled > 0,
+        "the reader never caught the file at all, so this run measured nothing"
+    );
+    assert_eq!(
+        seen_empty, 0,
+        "a reader caught the key file at {seen_empty} of {sampled} sampled mints holding \
+         something other than the 32 bytes: that file is refused on every later boot and \
+         nothing overwrites it"
+    );
+}
+
+/// Nothing is left beside the key files when minting succeeds.
+///
+/// Staging the bytes elsewhere and publishing them is how the write above
+/// became atomic, and the failure that fix brings with it is an orphan: a file
+/// holding this node's private static key, under a name nobody looks at, with
+/// no owner to clean it up.
+#[test]
+fn minting_leaves_only_the_two_key_files() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    teamclaude_rs::peer::id::NodeKey::load_or_mint(dir.path()).expect("a keypair is minted");
+
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .expect("the config dir reads")
+        .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().to_string()))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["tcr-node.key", "tcr-node.pub"],
+        "a staged copy of the private key is still a copy of the private key"
+    );
+}
+
+/// **A responder sizes its first read by the pattern it is running, not by the
+/// Noise transport limit.**
+///
+/// `accept_handshake` read message 1 through the unbounded reader, which sizes
+/// its buffer from the peer's own two-byte prefix: a stranger who writes
+/// `0xFFFF` and then nothing made this node allocate 65 535 bytes for a frame
+/// it was about to refuse. It was latent because the production listener reads
+/// its own first frame through the bounded reader; this function is the one a
+/// second caller would reach for.
+///
+/// The instrument is the REFUSAL's own wording, which says where it happened:
+/// before the allocation, on the length prefix, rather than after a frame was
+/// read and measured.
+///
+/// Watched red by putting `read_frame(stream)` back: the oversized prefix is
+/// accepted, 65 535 bytes are allocated, and the refusal that follows is the
+/// pattern check, which says "are not a Noise_XX… message 1".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_responders_first_read_is_bounded_by_its_own_pattern() {
+    use tokio::io::AsyncWriteExt as _;
+    let refusal_for = |promised: usize, handshake: Handshake| async move {
+        let (mut responder, mut caller) = tokio::io::duplex(8192);
+        let mut framed = u16::try_from(promised)
+            .expect("the prefix fits")
+            .to_be_bytes()
+            .to_vec();
+        // The prefix PROMISES more than the body carries, which is the whole
+        // attack: two bytes and then nothing.
+        framed.resize(2 + 8, 0);
+        caller.write_all(&framed).await.expect("write the prefix");
+        caller.flush().await.expect("flush");
+        drop(caller);
+
+        let err =
+            noise::accept_handshake(&mut responder, &[9_u8; 32], handshake, &[], |_offered| {
+                Err(PinRefusal::NotPinned {
+                    offered: "no pinned key in this test".to_string(),
+                })
+            })
+            .await
+            .expect_err("a first frame that promises more than the pattern has is refused");
+        format!("{err:#}")
+    };
+
+    let refusal = refusal_for(65_535, Handshake::Pair).await;
+    assert!(
+        refusal.contains("refused BEFORE allocating"),
+        "the refusal has to happen on the length prefix, which is the only place it costs \
+         nothing: {refusal}"
+    );
+
+    // An `IK` message 1 is 96 bytes and an `XX` one is not: a responder running
+    // `XX` will not size a buffer for the longest pattern this node speaks
+    // either.
+    let refusal = refusal_for(noise::IK_MESSAGE_1_LEN, Handshake::Pair).await;
+    assert!(
+        refusal.contains("refused BEFORE allocating"),
+        "the bound is this pattern's own message 1, not the largest any pattern has: \
+         {refusal}"
+    );
+
+    // The positive control: the length this pattern DOES accept gets past the
+    // bound and is refused for what it is, not for how long it is.
+    let refusal = refusal_for(noise::IK_MESSAGE_1_LEN, Handshake::Return).await;
+    assert!(
+        !refusal.contains("refused BEFORE allocating"),
+        "a message 1 of exactly this pattern's length is read, so the refusal above is the \
+         bound and not a reader that refuses everything: {refusal}"
+    );
+}

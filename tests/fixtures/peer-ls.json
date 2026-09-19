@@ -139,6 +139,7 @@
     "alice@example.com": [
       {
         "peer": "studio-mac",
+        "peerId": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
         "id": "0000000000000000000000000000002a",
         "scope": "all",
         "window": "7d",
@@ -148,6 +149,7 @@
       },
       {
         "peer": "studio-mac",
+        "peerId": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
         "id": "0000000000000000000000000000002b",
         "scope": {
           "group": "work"
@@ -158,6 +160,7 @@
       },
       {
         "peer": "attic-nuc",
+        "peerId": "144GJ289144GJ289144GJ289144GJ289144GJ289144GJ289144G",
         "id": "0000000000000000000000000000002c",
         "scope": "all",
         "window": "5h",

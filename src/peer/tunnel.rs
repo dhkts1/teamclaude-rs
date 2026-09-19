@@ -163,6 +163,17 @@ pub const MAX_CLIENT_HELLO_BYTES: usize = 16 * 1024;
 /// else's Mac, and being pinned does not make that free.
 pub const FIRST_RECORD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long the peer's direction is still pumped after the local end has
+/// closed its own.
+///
+/// A request whose client has read what it wanted and gone away is the ordinary
+/// case, and the reply the far end is still writing was being thrown away: the
+/// pump ended on the FIRST direction to finish. Half-closing instead means the
+/// other direction has to end on something, and a peer that never closes is the
+/// same task-holding shape [`FIRST_RECORD_TIMEOUT`] exists for, so it ends on
+/// this.
+pub const HALF_CLOSE_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
 // ---------------------------------------------------------------------------
 // The Noise session as a byte stream
 // ---------------------------------------------------------------------------
@@ -221,6 +232,10 @@ impl NoiseStream {
 
             let mut plain = theirs;
             let mut from_local = vec![0_u8; CHUNK_BYTES];
+            // Set when the LOCAL end closes its half. From then on the local
+            // read arm is off and what is still coming back from the peer is
+            // pumped until the peer closes too or this deadline passes.
+            let mut draining_until: Option<tokio::time::Instant> = None;
             let outcome = loop {
                 tokio::select! {
                     frame = frames_rx.recv() => {
@@ -240,9 +255,27 @@ impl NoiseStream {
                             break Ok(());
                         }
                     }
-                    read = plain.read(&mut from_local) => {
+                    read = plain.read(&mut from_local), if draining_until.is_none() => {
                         match read {
-                            Ok(0) => break Ok(()),
+                            // **Half-close, not close.** The local end going
+                            // away says nothing about the other direction, and
+                            // ending the whole pump here dropped whatever the
+                            // peer was still sending: on a gateway carry that
+                            // is the origin's reply, thrown away because the
+                            // client hung up a moment early.
+                            Ok(0) => {
+                                // A local end that is GONE, rather than one
+                                // that closed its write half, has nobody left
+                                // to hand the drained bytes to: an empty write
+                                // is how that is asked, and it is what keeps
+                                // `NoiseStream::finish` returning at once.
+                                if plain.write(&[]).await.is_err() {
+                                    break Ok(());
+                                }
+                                let _shutdown = write_half.shutdown().await;
+                                draining_until =
+                                    Some(tokio::time::Instant::now() + HALF_CLOSE_DRAIN);
+                            }
                             Ok(n) => {
                                 if let Err(err) = noise::send_encrypted(
                                     &mut write_half,
@@ -259,6 +292,9 @@ impl NoiseStream {
                             Err(err) => break Err(anyhow::Error::new(err)
                                 .context("peer tunnel: the local end of the carry failed")),
                         }
+                    }
+                    () = sleep_or_never(draining_until) => {
+                        break Ok(());
                     }
                 }
             };
@@ -277,8 +313,20 @@ impl NoiseStream {
     /// Wait for the pump to stop and surface whatever ended it.
     ///
     /// The one place a carried stream's failure becomes visible. A caller that
-    /// drops a [`NoiseStream`] instead gets the pump's log line and nothing
-    /// else, which is why the splice callers here all call this.
+    /// drops a [`NoiseStream`] instead sees a clean end of stream, because the
+    /// splice copies the PLAINTEXT half: a frame that did not decrypt under
+    /// the session key, and a write to the peer that failed, both end the pump
+    /// and leave the splice's own count looking like an ordinary finish.
+    ///
+    /// # It had no production caller, and the doc here used to claim it did
+    ///
+    /// Two tests called it and nothing in `src/` did, so a carry that died
+    /// inside the pump was logged as "carried". Kept and wired rather than
+    /// removed: the fact it reports exists nowhere else, and a gateway's log
+    /// line is the whole record of a stream nobody may read. Both splice
+    /// callers in this module now await it before they claim anything.
+    /// [`crate::peer::egress`]'s requester-side splice still drops its stream
+    /// and is the remaining site.
     pub async fn finish(self) -> Result<()> {
         // Dropping our half first is what tells the pump to stop; without it a
         // pump whose peer is silent would be joined forever.
@@ -346,6 +394,13 @@ impl<S> Metered<S> {
     /// is left after the splice returns.
     pub fn remaining(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.remaining)
+    }
+
+    /// The wrapped stream back, for a caller that has to end it rather than
+    /// drop it: a [`NoiseStream`] dropped after a splice loses whatever ended
+    /// its pump, which is what [`NoiseStream::finish`] exists to surface.
+    pub fn into_inner(self) -> S {
+        self.inner
     }
 
     /// Spend `n` bytes, reporting whether the allowance covered them.
@@ -420,6 +475,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for Metered<S> {
 // ---------------------------------------------------------------------------
 // The splice
 // ---------------------------------------------------------------------------
+
+/// Sleep until `at`, or never when there is nothing to wait for.
+///
+/// The half-close drain's timer, written as one future so the pump's `select!`
+/// has an arm that is simply never ready while both directions are open.
+async fn sleep_or_never(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// Splice two streams until either closes, returning `(bytes_a_to_b,
 /// bytes_b_to_a)`, the two figures the gateway meters and the only two it has.
@@ -1018,6 +1084,57 @@ impl Drop for CarryReservation<'_> {
     }
 }
 
+/// The origin this gateway will carry to, or the refusal, decided before a
+/// socket to it exists.
+///
+/// # The port is half the allow-list, and the gateway used to check only the
+/// host
+///
+/// A blind hop can enforce host-and-port and nothing else: the bytes after the
+/// ClientHello are the requester's. Checking the name alone handed a pinned
+/// peer every service on an allow-listed name, and the port check lived only on
+/// the asking node ([`crate::peer::egress::host_allowed`]), which is the side a
+/// peer that wants to reach something else is not running.
+///
+/// The host is matched against the gateway's own list rather than the
+/// constant, because that list is what the caller configured this gateway
+/// with. The port is the constant: it is not a field anybody sets, it is the
+/// other half of the same decision, and
+/// [`crate::peer::egress::PEER_EGRESS_PORT`] is where it is written down once.
+pub fn allowed_origin<'a>(
+    target: &'a TunnelTarget,
+    hosts: &[&str],
+    peer: PeerId,
+) -> Result<(&'a str, u16)> {
+    let TunnelTarget::Origin { host, port } = target else {
+        bail!(
+            "peer tunnel: {} asked this Mac to relay to another peer, and this entry point holds \
+             no peers file, so it can check neither the relay grant nor the pin; closing (a \
+             forward is handle_forward_on's)",
+            peer.display()
+        );
+    };
+    if !hosts
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    {
+        bail!(
+            "peer tunnel: {} asked for {host}:{port}, which is not on this gateway's origin \
+             allow-list; refused before anything was dialled",
+            peer.display()
+        );
+    }
+    if *port != crate::peer::egress::PEER_EGRESS_PORT {
+        bail!(
+            "peer tunnel: {} asked for {host}:{port}, and this gateway carries that name on \
+             port {} only; refused before anything was dialled",
+            peer.display(),
+            crate::peer::egress::PEER_EGRESS_PORT
+        );
+    }
+    Ok((host, *port))
+}
+
 /// Carry one TUNNEL stream: the gateway's half of blind egress.
 ///
 /// The order of the four checks is the design. The allow-list and the byte cap
@@ -1042,25 +1159,7 @@ pub async fn handle_tunnel_on<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let TunnelTarget::Origin { host, port } = carry.target else {
-        bail!(
-            "peer tunnel: {} asked this Mac to relay to another peer, and this entry point holds \
-             no peers file, so it can check neither the relay grant nor the pin; closing (a \
-             forward is handle_forward_on's)",
-            carry.peer.display()
-        );
-    };
-    if !carry
-        .hosts
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(host))
-    {
-        bail!(
-            "peer tunnel: {} asked for {host}:{port}, which is not on this gateway's origin \
-             allow-list; refused before anything was dialled",
-            carry.peer.display()
-        );
-    }
+    let (host, port) = allowed_origin(carry.target, carry.hosts, carry.peer)?;
 
     let (allowance, open) = reserve_for(&carry)?;
 
@@ -1120,7 +1219,7 @@ where
 
     let started = std::time::Instant::now();
     let mut origin = match carry.route {
-        OriginRoute::Resolve => TcpStream::connect((host.as_str(), *port)).await,
+        OriginRoute::Resolve => TcpStream::connect((host, port)).await,
         OriginRoute::Fixed(addr) => TcpStream::connect(addr).await,
         // An origin target with a peer route is a caller that mixed the two
         // paths up. Refused rather than resolved: the route is the half that
@@ -1141,9 +1240,9 @@ where
     // The peer half is the metered one: it is the peer's allowance being
     // spent, and metering the origin half would charge a peer for bytes the
     // origin chose to send after the allowance ran out.
-    let metered = Metered::new(peer_side, allowance);
+    let mut metered = Metered::new(peer_side, allowance);
     let remaining = metered.remaining();
-    let spliced = splice(metered, origin).await;
+    let spliced = splice(&mut metered, &mut origin).await;
     let spent = allowance.saturating_sub(remaining.load(Ordering::Acquire));
     let carried = u64::try_from(hello.len()).unwrap_or(u64::MAX);
     // What the reservation turns into when it is released, which happens on
@@ -1151,6 +1250,11 @@ where
     reservation.spent = spent.saturating_add(carried);
 
     let (up, down) = spliced?;
+    // The pump's own ending, which the splice cannot see: it copies the
+    // PLAINTEXT half, so a frame that failed to decrypt or a write to the peer
+    // that failed reaches it as a clean end of stream. Awaited before the line
+    // below, because "carried" is a claim and a carry that died is not one.
+    metered.into_inner().finish().await?;
     let up = up.saturating_add(carried);
     // The gateway's whole record of a carried stream: who, where, how much,
     // how long. Nothing derived from the bytes themselves, because there is
@@ -1158,7 +1262,7 @@ where
     tracing::info!(
         peer = %carry.peer.display(),
         host = %host,
-        port = *port,
+        port,
         bytes_up = up,
         bytes_down = down,
         ms = started.elapsed().as_millis(),
@@ -1214,7 +1318,8 @@ pub struct ForwardPlan {
     /// The target's own row, whose addresses are the only ones that will be
     /// dialled.
     pub target: PeerRow,
-    /// `hops_remaining - 1`, clamped by this Mac's own
+    /// `hops_remaining - 1`, on a frame whose `hops_remaining`
+    /// [`authorize_forward`] has already refused if it was over this Mac's own
     /// [`crate::peer::config::PeerFile::max_hops`].
     ///
     /// # It is enforced here and it does not travel, and that is stated rather than implied
@@ -1313,6 +1418,21 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
              closing"
         );
     }
+    // **`hops_remaining` is the requester's number, so this Mac's own is what
+    // bounds it.** The clamp used to be applied to the onward count, which is
+    // a log field and rides on nothing (see [`ForwardPlan::onward_hops`]), so a
+    // requester that wrote 255 had its budget accepted whole and only the log
+    // line said otherwise. Refused on arrival instead: a frame asking for more
+    // hops than this Mac grants is refused here, before a socket to the target
+    // exists, which is where every other over-ask on this path is answered.
+    if forward.hops_remaining > max_hops {
+        bail!(
+            "peer forward: {} sent a frame carrying {} hops and this Mac's `maxHops` is \
+             {max_hops}; closing rather than forwarding on a budget it wrote for itself",
+            carry.peer.display(),
+            forward.hops_remaining
+        );
+    }
     let Some(onward_hops) = forward.hops_remaining.checked_sub(1) else {
         bail!(
             "peer forward: this frame has no hops left, so {} is asking for one forward past \
@@ -1320,9 +1440,12 @@ pub fn authorize_forward(carry: &Carry<'_>, forward: &Forward<'_>) -> Result<For
             carry.peer.display()
         );
     };
+    // No second clamp: the refusal above leaves `hops_remaining` at or under
+    // `max_hops`, so this is already inside the Mac's own budget, and a clamp
+    // that can never fire is a reader's second answer to a settled question.
     Ok(ForwardPlan {
         target: row,
-        onward_hops: onward_hops.min(max_hops.saturating_sub(1)),
+        onward_hops,
     })
 }
 
@@ -1434,15 +1557,19 @@ where
     // that half: it is the requester's allowance being spent, and metering the
     // onward half would charge it for bytes the TARGET chose to send after the
     // allowance ran out.
-    let metered = Metered::new(peer_side, allowance);
+    let mut metered = Metered::new(peer_side, allowance);
     let remaining = metered.remaining();
-    let spliced = splice(metered, onward).await;
+    let spliced = splice(&mut metered, &mut onward).await;
     let carried = u64::try_from(first.len()).unwrap_or(u64::MAX);
     reservation.spent = allowance
         .saturating_sub(remaining.load(Ordering::Acquire))
         .saturating_add(carried);
 
     let (up, down) = spliced?;
+    // The requester-side pump's ending, for the reason the gateway awaits its
+    // own: a forward that died inside the pump must not be reported as one
+    // that finished.
+    metered.into_inner().finish().await?;
     let up = up.saturating_add(carried);
     // The per-path half of the meter, and it is keyed on the TARGET and the
     // address that answered, not on the requester, who is already charged by

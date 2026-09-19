@@ -68,8 +68,11 @@
 //! `unknown_outcome_transport_failure` itself.
 //!
 //! Neither existing classification is widened and no existing test needs a new
-//! expectation: the broader "this machine has no path" predicate is
-//! [`EgressState`], fed by both entry points' outcomes.
+//! expectation. There used to be a broader "this machine has no path" belief
+//! here, a process-wide cell that went cold for thirty seconds on a direct
+//! failure; nothing ever read it and nothing ever cleared it, so it was removed
+//! rather than wired up. The decision is per request, where the candidate set
+//! and the failure are both in hand.
 //!
 //! # A second hunk, which is about an account and not about a failure
 //!
@@ -78,15 +81,14 @@
 //! ("we need to be able to lock where accounts go out from which server
 //! sometimes it might be important for saving the same ip") adds
 //! [`pinned_egress`], called from one more hunk in `proxy.rs`, ABOVE the direct
-//! attempt rather than inside its failure arm. It reads one account's pin, it
-//! never touches [`EgressState`], and it never asks whether a transport failed,
-//! because on that path nothing has been attempted yet. The two hunks cannot
+//! attempt rather than inside its failure arm. It reads one account's pin and
+//! never asks whether a transport failed, because on that path nothing has been
+//! attempted yet. The two hunks cannot
 //! both run for one request: a pinned account is answered or refused before the
 //! direct attempt exists to fail.
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context as _, Result};
@@ -129,77 +131,12 @@ pub const PEER_EGRESS_PORT: u16 = 443;
 /// answer streams for as long as it streams. See [`axum_response_from`].
 pub const CARRY_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the direct path is left alone after it failed.
-pub const COLD_MS: i64 = 30_000;
-
 /// Whether `host` and `port` are carried at all.
 pub fn host_allowed(host: &str, port: u16) -> bool {
     port == PEER_EGRESS_PORT
         && PEER_EGRESS_HOSTS
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(host))
-}
-
-// ---------------------------------------------------------------------------
-// What this node believes about its own path out
-// ---------------------------------------------------------------------------
-
-/// What this node currently believes about its own path to the internet.
-///
-/// A cached belief, not a measurement per request, and deliberately NOT a
-/// widening of `is_offline_error`: that function keeps meaning "the resolver is
-/// dead", and this is the broader question.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EgressState {
-    /// Direct works. Rung one of the ladder, and the only rung on a healthy
-    /// machine.
-    Healthy,
-    /// Direct failed; do not retry it until this instant, in Unix
-    /// milliseconds.
-    Cold {
-        /// When to try direct again.
-        until_ms: i64,
-    },
-}
-
-impl EgressState {
-    /// Whether the direct path is worth trying at `now_ms`.
-    pub fn direct_is_worth_trying(self, now_ms: i64) -> bool {
-        match self {
-            Self::Healthy => true,
-            Self::Cold { until_ms } => now_ms >= until_ms,
-        }
-    }
-}
-
-/// This process's belief about its own egress, shared by every request.
-///
-/// A process-wide cell rather than a field on `Manager`: `Manager` is the
-/// account fleet and this is a fact about the machine's network, and the one
-/// thing this feature must never do is make a fact about the LAN look like a
-/// fact about an account. Nothing here is persisted, a belief with a
-/// thirty-second horizon that outlived a restart would be a stale belief.
-static STATE: Mutex<EgressState> = Mutex::new(EgressState::Healthy);
-
-/// This node's belief right now.
-pub fn state() -> EgressState {
-    STATE.lock().map_or(EgressState::Healthy, |state| *state)
-}
-
-/// Record that the direct path just failed with nothing having left the box.
-pub fn note_direct_failure(now_ms: i64) {
-    if let Ok(mut state) = STATE.lock() {
-        *state = EgressState::Cold {
-            until_ms: now_ms + COLD_MS,
-        };
-    }
-}
-
-/// Record that the direct path worked.
-pub fn note_direct_success() {
-    if let Ok(mut state) = STATE.lock() {
-        *state = EgressState::Healthy;
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -446,24 +383,6 @@ pub fn resolve_via(setting: &ViaSetting, candidates: &[GatewayCandidate]) -> Vec
     chosen
 }
 
-/// Pick a path out: direct when healthy, else a peer that advertises egress,
-/// else nothing, and then today's 503/502 ladder fires exactly as it does now.
-///
-/// **This signature cannot pick a peer, and that is reported rather than worked
-/// around**, the same shape `src/peer/serve.rs:599`'s `handle_serve` is in.
-/// Picking needs a candidate set, and a function with only a cached belief and
-/// a clock has none, so what it can answer is the half it has the inputs for:
-/// whether the direct path is still worth trying, which is the question that
-/// decides whether a peer is consulted at all. The whole answer is
-/// [`resolve_via`] over [`GatewayCandidate`]s, and [`retry_through_peer`] is
-/// the caller that has both.
-pub fn pick_egress(state: EgressState, now_ms: i64) -> Option<PeerId> {
-    if state.direct_is_worth_trying(now_ms) {
-        return None;
-    }
-    None
-}
-
 /// Every pinned Mac this node may ask to carry, with what the runtime state
 /// knows about when it was last heard from.
 ///
@@ -639,10 +558,19 @@ pub async fn accept_once_splice(
                 return;
             }
         };
-        let peer_side = NoiseStream::start(stream, session);
+        let mut peer_side = NoiseStream::start(stream, session);
         let started = std::time::Instant::now();
-        match tunnel::splice(local_stream, peer_side).await {
-            Ok((up, down)) => tracing::info!(
+        // `&mut`, so the stream is still here afterwards: a `NoiseStream`
+        // dropped after a splice takes the pump's own ending with it, and the
+        // pump is where a frame that failed to decrypt or a write to the peer
+        // that failed shows up. The splice copies the PLAINTEXT half, so both
+        // of those reach it as a clean end of stream and a carry that died is
+        // logged as one that worked. This was the last of the three splices
+        // still dropping it.
+        let spliced = tunnel::splice(local_stream, &mut peer_side).await;
+        let ended = peer_side.finish().await;
+        match (spliced, ended) {
+            (Ok((up, down)), Ok(())) => tracing::info!(
                 gateway = %label,
                 host = %host_for_log,
                 bytes_up = up,
@@ -650,10 +578,24 @@ pub async fn accept_once_splice(
                 ms = started.elapsed().as_millis(),
                 "peer egress: carried"
             ),
-            Err(err) => tracing::warn!(
+            // The counts are real and the stream still died: say both, because
+            // "carried 40 KB" and "the carry failed" are each half the story
+            // and the operator reading this line has no other record.
+            (Ok((up, down)), Err(err)) => tracing::warn!(
+                gateway = %label,
+                host = %host_for_log,
+                bytes_up = up,
+                bytes_down = down,
+                ms = started.elapsed().as_millis(),
+                error = %err,
+                "peer egress: the carry ended inside the peer stream, so what crossed is \
+                 what is counted here and no more"
+            ),
+            (Err(err), ended) => tracing::warn!(
                 gateway = %label,
                 host = %host_for_log,
                 error = %err,
+                pump_error = ended.err().map(|err| err.to_string()).unwrap_or_default(),
                 "peer egress: the carry failed mid-stream"
             ),
         }
@@ -1278,16 +1220,13 @@ pub struct PinnedAttempt<'a> {
 /// false for half its callers, which is the thing decisions row 15 asks for the
 /// opposite of.
 ///
-/// # It does not touch [`EgressState`] and does not read a transport failure
+/// # It does not read a transport failure
 ///
-/// Both are deliberate and both are the reason this is a separate hunk in
-/// `proxy.rs` rather than a widening of the existing one. [`EgressState`] is
-/// this MACHINE's belief about its own path out, and a pinned account that
-/// never tried the direct path has learned nothing about it: flipping it
-/// `Cold` here would take the whole fleet's direct path out of service for
-/// thirty seconds on the strength of one account's pin. `every_attempt_transport_failed`
-/// is the other half of the same mistake, a fact about a request that has
-/// already been attempted, which this one has not.
+/// Deliberate, and the reason this is a separate hunk in `proxy.rs` rather than
+/// a widening of the existing one. `every_attempt_transport_failed` is a fact
+/// about a request that has already been attempted, and this one has not: a
+/// pinned account is answered or refused before the direct attempt exists to
+/// fail, so it has learned nothing about this machine's path out.
 ///
 /// # A pin is honoured on every request, including the ones that would have
 /// worked
@@ -1751,6 +1690,22 @@ pub async fn record_carried(manager: &crate::manager::Manager, record: CarriedRe
 /// still validates the real hostname against the real certificate: the gateway
 /// is a router, not a party to the TLS session. `.no_proxy()` for the reason
 /// every other client in this tree has it, we ARE the proxy.
+///
+/// # The client is built per request because the ROUTE is per request
+///
+/// A reading of this function as "a fresh client each time, so no connection is
+/// reused across carries" filed it as a cost to cache away. Caching it would
+/// not buy the reuse and would leak: `splice_port` is
+/// [`accept_once_splice`]'s freshly bound ephemeral port (`local.port()` on a
+/// new listener per call), and that splice accepts ONE connection and then
+/// ends. So a client keyed on the port could never be handed a second request,
+/// and a map of them would grow one dead entry per carried request, which is
+/// the shape this module has already had to fix elsewhere.
+///
+/// The reuse a pool would give is unavailable for the same reason the port is
+/// new: every carry is its own tunnel through its own gateway session. What
+/// building the client costs is a rustls config, once, against a Noise
+/// handshake and a full TLS handshake to the origin on the same request.
 async fn send_through(
     request: &CarriedRequest<'_>,
     host: &str,
@@ -1817,7 +1772,13 @@ pub fn axum_response_from(response: reqwest::Response) -> axum::response::Respon
             if crate::proxy::is_account_scoped(name.as_str()) {
                 continue;
             }
-            headers.insert(name.clone(), value.clone());
+            // `append`, the way `src/proxy.rs` builds the direct path's
+            // response. `insert` REPLACES, so a header a response legitimately
+            // repeats (`set-cookie` is the everyday one, and `warning` and
+            // `link` are the others) arrived at the client as its LAST value
+            // only, and a carried answer quietly carried less than the direct
+            // one did.
+            headers.append(name.clone(), value.clone());
         }
     }
     match out.body(axum::body::Body::from_stream(response.bytes_stream())) {

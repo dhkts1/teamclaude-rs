@@ -188,10 +188,10 @@ proptest! {
 // ---------------------------------------------------------------------------
 
 /// `f` must stay bound by `MAX_LEND_FRACTION` "(read the
-/// constant)". That constant (`src/main.rs`, value `0.5`) is private to the
-/// BINARY crate (`main.rs`, not `lib.rs`) and clamps the fraction only where a
-/// `LendGrant` is built from an operator's `--fraction` (`peer_lend_grant`,
-/// `src/main.rs`): a different call site from the one this property tests.
+/// constant)". That constant (`peer::config`, value `0.5`) is the ceiling on
+/// ONE GRANT's fraction, applied where a grant is written and where one is read
+/// back off disk (the property at the end of this file): a different quantity
+/// from the one this property tests.
 /// `lendable_fraction` itself is not clamped to it, it folds
 /// `(guard - utilization).max(0.0)` over eligible accounts, where
 /// `guard = (switch_threshold - control_reserve).max(0.0)`
@@ -658,5 +658,57 @@ fn schedule_refusal_uses_this_hosts_own_clock() {
     assert_eq!(
         schedule_refusal(Some(&shut), now_utc),
         Some(LeaseRefusal::OutsideSchedule)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A grant's fraction is inside the ceiling WHEREVER it came from
+// ---------------------------------------------------------------------------
+
+// Every fraction that comes off disk is inside `[0, MAX_LEND_FRACTION]`.
+//
+// The ceiling used to be enforced in one place only, `tcr peer lend`'s own argv
+// handling, so it held for a file this build had just written and for nothing
+// else: a grant written by an older build, edited by hand, or copied from
+// another Mac reached `clamp_to_grant`'s
+// `wanted.min(grant.fraction).min(lendable)` with any value at all, and the
+// field's own doc said "Clamped" while nothing on the read path clamped it.
+//
+// Watched red by deleting the `deserialize_with` on `LendGrant::fraction`:
+// `0.9` reads back as `0.9`.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(cases()))]
+
+    #[test]
+    fn a_fraction_read_off_disk_is_inside_the_ceiling(raw in -1000.0_f64..1000.0) {
+        let grant: teamclaude_rs::peer::config::LendGrant = serde_json::from_str(&format!(
+            r#"{{"window":"7d","fraction":{raw},"ttlS":300,"maxInflight":2}}"#
+        ))
+        .expect("a grant with a finite fraction parses");
+        prop_assert!(
+            (0.0..=teamclaude_rs::peer::config::MAX_LEND_FRACTION).contains(&grant.fraction),
+            "a hand-written {raw} reached the sizing arithmetic as {}",
+            grant.fraction
+        );
+    }
+}
+
+/// The two ends of the same rule, spelled out: what an operator's own
+/// over-large grant reads back as, and that an ordinary one is untouched.
+#[test]
+fn an_over_large_fraction_reads_back_at_the_ceiling() {
+    let read = |raw: &str| -> f64 {
+        serde_json::from_str::<teamclaude_rs::peer::config::LendGrant>(&format!(
+            r#"{{"window":"7d","fraction":{raw},"ttlS":300,"maxInflight":2}}"#
+        ))
+        .expect("the grant parses")
+        .fraction
+    };
+    assert_eq!(read("0.9"), teamclaude_rs::peer::config::MAX_LEND_FRACTION);
+    assert_eq!(read("-0.5"), 0.0);
+    assert_eq!(
+        read("0.2"),
+        0.2,
+        "a fraction inside the ceiling is untouched"
     );
 }

@@ -3601,3 +3601,202 @@ fn a_concurrent_revoke_and_enrolment_never_resurrect_or_drop_a_row() {
         let _ = std::fs::remove_dir_all(&node.dir);
     }
 }
+
+// ---------------------------------------------------------------------------
+// A fresh install can opt in with one command
+// ---------------------------------------------------------------------------
+
+/// The line a verb prints when it gave this Mac a port, in the two halves the
+/// three tests below check: what was written, and when it opens.
+///
+/// Spelled out here rather than read from `config::default_listen()`: a test
+/// that asserts a value against the very constant that produced it agrees with
+/// any change to it, including a change nobody meant. Written this way, moving
+/// the port reds these three, which is the conversation that move deserves.
+const LISTEN_WRITTEN: &str = "peer.listen: 0.0.0.0:7755 written into";
+const LISTEN_RESTART: &str = "quit TcrBar and open it again";
+
+/// The address the three verbs must write, as an operator would read it off
+/// the screen and type it into the other Mac.
+fn the_default_port() -> SocketAddr {
+    "0.0.0.0:7755".parse().expect("a literal address")
+}
+
+/// A peers file that exists, is well formed, and names no listener: a fresh
+/// install, which is the case every one of these is about.
+fn peers_file_with_no_listener(tag: &str) -> std::path::PathBuf {
+    let dir = scratch(tag);
+    let peers = dir.join("tcr-peers.json");
+    let fresh = PeerFile::default();
+    assert!(
+        fresh.listen.is_none(),
+        "the default must still be no listener at all; that default is the privacy promise \
+         these three verbs are allowed to break only on an explicit opt-in"
+    );
+    config::save(&peers, &fresh).expect("seed a peers file with no listener");
+    peers
+}
+
+/// One pinned Mac, so `peer share on` has somebody to share with. Fake key,
+/// fake label: this repository is public.
+fn pin_one_peer(peers: &std::path::Path) {
+    let mut file = config::read_or_default(peers).expect("the seeded peers file reads back");
+    file.peers.push(config::PeerRow {
+        node: PeerId([0x5a; 32]),
+        label: "laptop-2".to_string(),
+        endpoints: Vec::new(),
+        added_at: 0,
+        rendezvous_secret: None,
+        sees_us_at: None,
+        allow: config::Allow::default(),
+        lend: Vec::new(),
+    });
+    config::save(peers, &file).expect("pin one peer");
+}
+
+/// **`tcr peer find on` gives this Mac a port instead of refusing.**
+///
+/// It used to bail with "peer.find needs a listener port; set \"listen\" in
+/// ... first", which is the first command of the walkthrough and a dead end: no
+/// other verb writes that key, so the only way on was a text editor.
+///
+/// Watch it fail on the base: `find on` exits non-zero with that refusal, the
+/// seeded file still has no `listen`, and neither printed line appears.
+#[test]
+fn find_on_gives_this_mac_a_port_when_it_has_none() {
+    let peers = peers_file_with_no_listener("listen-find");
+
+    let (stdout, stderr, ok) = run_tcr(&peers, &["find", "on"]);
+    assert!(
+        ok,
+        "`tcr peer find on` must no longer refuse a Mac with no listener.\n\
+         stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(LISTEN_WRITTEN),
+        "it must say what it wrote: {stdout}"
+    );
+    assert!(
+        stdout.contains(LISTEN_RESTART),
+        "and that the port opens at the next start: {stdout}"
+    );
+    assert_eq!(
+        config::read_or_default(&peers)
+            .expect("the peers file reads back")
+            .listen,
+        Some(the_default_port()),
+        "the chosen port must be on disk, not only in the message"
+    );
+
+    // A port the operator chose is the operator's: a second run changes
+    // nothing and says nothing about it.
+    let mut file = config::read_or_default(&peers).expect("the peers file reads back");
+    let chosen: SocketAddr = "127.0.0.1:19000".parse().expect("a literal address");
+    file.listen = Some(chosen);
+    config::save(&peers, &file).expect("write a hand-chosen port");
+
+    let (stdout, stderr, ok) = run_tcr(&peers, &["find", "on"]);
+    assert!(
+        ok,
+        "`tcr peer find on` again.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("peer.listen:"),
+        "a listener that is already set must not be mentioned, let alone moved: {stdout}"
+    );
+    assert_eq!(
+        config::read_or_default(&peers)
+            .expect("the peers file reads back")
+            .listen,
+        Some(chosen),
+        "the hand-chosen port must survive untouched"
+    );
+}
+
+/// **`tcr peer share on` gives this Mac a port too.** Sharing means those Macs
+/// reach this one, and it used to turn on with nothing listening and no word
+/// about it.
+///
+/// Watch it fail on the base: the command exits 0, prints no `peer.listen:`
+/// line and leaves `listen` absent, so `peer share on` reports success for a
+/// Mac nobody can reach.
+#[test]
+fn share_on_gives_this_mac_a_port_when_it_has_none() {
+    let peers = peers_file_with_no_listener("listen-share");
+    pin_one_peer(&peers);
+
+    let (stdout, stderr, ok) = run_tcr(&peers, &["share", "on"]);
+    assert!(
+        ok,
+        "`tcr peer share on`.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(LISTEN_WRITTEN) && stdout.contains(LISTEN_RESTART),
+        "it must say what it wrote and when the port opens: {stdout}"
+    );
+    assert_eq!(
+        config::read_or_default(&peers)
+            .expect("the peers file reads back")
+            .listen,
+        Some(the_default_port()),
+        "the chosen port must be on disk"
+    );
+
+    // Turning sharing OFF is not an opt-in, so it opens nothing: the port
+    // written above stays, and a file that never had one never gets one here.
+    let untouched = peers_file_with_no_listener("listen-share-off");
+    pin_one_peer(&untouched);
+    let (stdout, stderr, ok) = run_tcr(&untouched, &["share", "off"]);
+    assert!(
+        ok,
+        "`tcr peer share off`.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        config::read_or_default(&untouched)
+            .expect("the peers file reads back")
+            .listen
+            .is_none(),
+        "turning something off must never open a port: {stdout}"
+    );
+}
+
+/// **`tcr peer internet on` gives this Mac a port too.** What it asks the
+/// router for is a mapping TO the listener's port, so with none it wrote the
+/// flag and printed "no listener is configured", which is a switch that does
+/// nothing dressed as one that worked.
+///
+/// Watch it fail on the base: the command exits 0, says "no listener is
+/// configured, so there is no port to map yet; set \"listen\" in the peers
+/// file", and leaves `listen` absent.
+#[test]
+fn internet_on_gives_this_mac_a_port_when_it_has_none() {
+    let peers = peers_file_with_no_listener("listen-internet");
+
+    let (stdout, stderr, ok) = run_tcr(&peers, &["internet", "on"]);
+    assert!(
+        ok,
+        "`tcr peer internet on`.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains(LISTEN_WRITTEN) && stdout.contains(LISTEN_RESTART),
+        "it must say what it wrote and when the port opens: {stdout}"
+    );
+    assert!(
+        !stdout.contains("to map yet"),
+        "and must not still report that there is nothing to map: {stdout}"
+    );
+    let written = config::read_or_default(&peers).expect("the peers file reads back");
+    assert_eq!(
+        written.listen,
+        Some(the_default_port()),
+        "the chosen port must be on disk"
+    );
+    assert!(
+        written.internet,
+        "and the switch this verb is actually about must still be written"
+    );
+    assert!(
+        stdout.contains("port 7755"),
+        "the verb must now name the port it maps: {stdout}"
+    );
+}

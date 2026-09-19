@@ -59,6 +59,20 @@ pub struct PeerFile {
     /// Where the peer listener binds. **Absent means the feature is off**, and
     /// that is the default: a fresh install discloses nothing, opens no port
     /// and answers nobody. Boot-time.
+    ///
+    /// **Three verbs write it, and only on an explicit opt-in.** `tcr peer find
+    /// on`, `tcr peer share on` and `tcr peer internet on` each need a port for
+    /// their answer to mean anything, and each used to leave the operator to
+    /// hand-edit this key: `find on` refused outright, and no walkthrough could
+    /// get past its first command. When one of those verbs runs and this is
+    /// absent, that verb writes [`default_listen`] and prints the line saying
+    /// it did.
+    ///
+    /// The default itself is unchanged and stays [`None`]: a fresh install that
+    /// runs no peer command still discloses nothing, opens no port and answers
+    /// nobody, and a value the operator already chose is never overwritten.
+    /// What moved is only that the opt-in is now one act instead of two, one of
+    /// them undocumented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<SocketAddr>,
     /// Multicast discovery. Off unless the operator turns finding on.
@@ -182,6 +196,38 @@ pub struct PeerFile {
     /// reading this never has to ask which of the two wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_lend: Option<LendGrant>,
+}
+
+/// What the three opt-in verbs write into [`PeerFile::listen`] when it is
+/// absent: `0.0.0.0:7755`. Not a serde default and not [`Default`], so a file
+/// nobody opted in on still has no listener at all.
+///
+/// # A named port, and not `0` for an OS-assigned one
+///
+/// The other shape available was `0`, letting the kernel pick and persisting
+/// the port once the socket is bound. It loses twice. Nothing writes a chosen
+/// port back: the bind happens in the serving process (`src/server.rs`), the
+/// write happens in a `tcr peer` process that has already exited, and building
+/// that round trip would add a second writer for one number. And the port has
+/// to be SAYABLE: the other Mac is paired with `tcr peer pair <host:port>`,
+/// typed by a person reading the address off this one, so a port that is not
+/// known until the proxy next boots cannot be printed by the verb that just
+/// turned the feature on. A fixed port is known at the moment it is written,
+/// which is the moment it has to be said out loud.
+///
+/// # `0.0.0.0`, and why the bind is not the admission decision
+///
+/// A peer on the same LAN arrives on a LAN interface, so loopback cannot be
+/// the default, and this Mac's own address moves with its DHCP lease. What
+/// keeps a stranger out is not the bind but
+/// [`crate::peer::listener::internet_admission`], which refuses a knock and a
+/// first pairing from off the LAN precisely BECAUSE a wide bind is not LAN
+/// scope; the listener also logs one line at boot saying the socket is wide,
+/// so an operator learns it from the running program and not from this file.
+///
+/// `7755` is the port this tree's own examples already write.
+pub fn default_listen() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 7755))
 }
 
 fn default_max_hops() -> u8 {
@@ -1088,10 +1134,15 @@ pub struct LendGrant {
     #[serde(default)]
     pub scope: LendScope,
     pub window: Window,
-    /// The ceiling on any one lease, as a fraction of the window. Clamped, and
-    /// the clamp mirrors the one the main config already applies to its own
-    /// reserve (`src/config.rs:855-856`) rather than inventing a second
-    /// number.
+    /// The ceiling on any one lease, as a fraction of the window.
+    ///
+    /// **Clamped where it is READ, by [`lend_fraction`], so the ceiling is a
+    /// property of this field and not of the one command that happened to
+    /// write it.** It used to be clamped only in `tcr peer lend`'s own argv
+    /// handling, so a file written by an older build, or edited by hand, or
+    /// copied between Macs, reached the sizing arithmetic with any value at all
+    /// and this sentence was simply untrue of it.
+    #[serde(deserialize_with = "deserialize_lend_fraction")]
     pub fraction: f64,
     /// How long a granted lease lives, in seconds.
     pub ttl_s: u32,
@@ -1204,6 +1255,38 @@ mod secret32_hex {
 
 /// A `u128` lease id as lower-case hex. See [`LendGrant::id`] for why it is
 /// not a JSON number.
+/// The ceiling on one lease's [`LendGrant::fraction`].
+///
+/// It mirrors the clamp the main config applies to its own control reserve
+/// rather than inventing a second number. Public and read by both ends of the
+/// field's life, the `--fraction` flag that accepts one and
+/// [`lend_fraction`] that parses one off disk, because a ceiling the writer
+/// enforces and the reader does not is a ceiling only for files this build
+/// wrote.
+pub const MAX_LEND_FRACTION: f64 = 0.5;
+
+/// `raw` as a lend fraction: inside the ceiling, and a number the sizing
+/// arithmetic can use.
+///
+/// A non-finite value answers 0.0, a grant that lends nothing, rather than
+/// propagating: `NaN` compares false against both clamp bounds, so it survives
+/// a bare `clamp` untouched and then makes every comparison downstream of it
+/// answer false, which is a grant that is neither refused nor enforced.
+pub fn lend_fraction(raw: f64) -> f64 {
+    if !raw.is_finite() {
+        return 0.0;
+    }
+    raw.clamp(0.0, MAX_LEND_FRACTION)
+}
+
+/// Read [`LendGrant::fraction`] with the ceiling already applied.
+fn deserialize_lend_fraction<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<f64, D::Error> {
+    use serde::Deserialize as _;
+    Ok(lend_fraction(f64::deserialize(deserializer)?))
+}
+
 mod lease_id_hex {
     use serde::de::Error as _;
     use serde::{Deserialize as _, Deserializer, Serializer};

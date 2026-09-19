@@ -23,7 +23,7 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -174,28 +174,135 @@ pub fn default_config_dir() -> PathBuf {
 pub fn boot_instance_id() -> tcr_peer_wire::InstanceId {
     static INSTANCE: std::sync::OnceLock<tcr_peer_wire::InstanceId> = std::sync::OnceLock::new();
     *INSTANCE.get_or_init(|| {
-        let mut bytes = [0_u8; tcr_peer_wire::INSTANCE_ID_BYTES];
         // The same CSPRNG every other random value in this module comes from.
         // A failure here is not recoverable into something weaker: an instance
         // id that fell back to a counter or a clock would be a stable name for
         // this machine, which is the one thing it must not be, so the fallback
         // is a fresh keypair's public half, which is random by construction and
         // discarded immediately.
-        match getrandom::fill(&mut bytes) {
-            Ok(()) => {}
+        let mut bytes = [0_u8; tcr_peer_wire::INSTANCE_ID_BYTES];
+        let primary = match getrandom::fill(&mut bytes) {
+            Ok(()) => Some(bytes),
             Err(err) => {
                 tracing::warn!(
                     error = %err,
                     "peer instance id: the CSPRNG failed; falling back to a discarded \
                      keypair's public half, which is random by construction"
                 );
-                if let Ok((_secret, public)) = generate_keypair() {
-                    bytes.copy_from_slice(&public[..tcr_peer_wire::INSTANCE_ID_BYTES]);
-                }
+                None
             }
-        }
-        tcr_peer_wire::InstanceId(bytes)
+        };
+        let fallback = || generate_keypair().ok().map(|(_secret, public)| public);
+        // PANICS on a double failure, and that is the whole of this change.
+        // The array was left as it was found, all zeroes, and became this
+        // process's stable instance id: every node in the same state announces
+        // the same one, so their beacons, knocks and message 1 payloads all
+        // name one machine and the windows they open for each other land on the
+        // wrong dial. A machine whose CSPRNG has failed twice cannot complete a
+        // Noise handshake either, both patterns need the same randomness, so
+        // there is nothing this process could go on to do that would work.
+        mint_instance_id(primary, fallback()).expect(
+            "peer instance id: this Mac's randomness failed twice, so no peer handshake on \
+             it can succeed either",
+        )
     })
+}
+
+/// The instance id two random sources produced, or `None` when neither
+/// answered.
+///
+/// Split out from [`boot_instance_id`] because neither source can be made to
+/// fail on a working machine, and the branch that matters is the one where both
+/// did: an id of all zeroes is the same name on every machine in that state,
+/// and it is minted once and held for the life of the process.
+fn mint_instance_id(
+    primary: Option<[u8; tcr_peer_wire::INSTANCE_ID_BYTES]>,
+    fallback: Option<[u8; 32]>,
+) -> Option<tcr_peer_wire::InstanceId> {
+    if let Some(bytes) = primary {
+        return Some(tcr_peer_wire::InstanceId(bytes));
+    }
+    let public = fallback?;
+    let mut bytes = [0_u8; tcr_peer_wire::INSTANCE_ID_BYTES];
+    bytes.copy_from_slice(&public[..tcr_peer_wire::INSTANCE_ID_BYTES]);
+    Some(tcr_peer_wire::InstanceId(bytes))
+}
+
+/// The public half of an X25519 static key, derived from its secret.
+fn public_from_secret(secret: &[u8; 32]) -> Result<[u8; 32]> {
+    let mut dh = DefaultResolver
+        .resolve_dh(&DHChoice::Curve25519)
+        .ok_or_else(|| anyhow::anyhow!("no curve25519 DH implementation available"))?;
+    dh.set(secret);
+    dh.pubkey()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("unexpected public key length"))
+}
+
+/// Write a 32-byte key file at `mode`, refusing to follow a pre-existing
+/// symlink the way [`crate::config::write_atomic`] does for the main config.
+///
+/// `create_new` (`O_EXCL`) is what makes that sentence true, and it became
+/// true late: the previous `create(true)` FOLLOWED a symlink on
+/// a fully predictable path, so anything able to create a file in the config
+/// dir could plant `tcr-node.key` as a link and have this node write its
+/// private static key wherever it chose. (`load_or_mint` reaches this function
+/// only when the path does not exist, so refusing an existing one costs
+/// nothing.) `open(2)` applies `mode` only on creation, which is the second
+/// thing `O_EXCL` buys: without a guaranteed fresh inode, the 0600 below is
+/// silently ignored for a pre-existing file.
+fn write_key_file(path: &Path, bytes: &[u8; 32], mode: u32) -> Result<()> {
+    // STAGED beside the destination, then linked into place, because the path
+    // appearing is what `load_or_mint` treats as "this node already has a key".
+    // Creating the file and then writing it is two steps, and a crash, a full
+    // disk or a SIGKILL between them leaves a 0-byte `tcr-node.key`: a file
+    // `load_or_mint` refuses for the rest of that machine's life ("holds 0
+    // bytes, expected exactly 32") and that nothing will ever overwrite,
+    // because minting refuses an existing path by design. This node then has no
+    // identity and no way to mint one until an operator deletes a file nobody
+    // told them about.
+    //
+    // In the destination's own directory, never the system temp dir: `link(2)`
+    // across filesystems fails with `EXDEV`, which would cost exactly the
+    // atomicity this exists for.
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let prefix = match path.file_name() {
+        Some(name) => format!(".{}.tcr-", name.to_string_lossy()),
+        None => ".tcr-".to_string(),
+    };
+    let mut staged = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(mode))
+        .prefix(prefix.as_str())
+        .suffix(".tmp")
+        .tempfile_in(dir)
+        .with_context(|| format!("staging {}", path.display()))?;
+    staged
+        .write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    // Durable BEFORE it is published: a rename or a link that outlives its own
+    // data is the same 0-byte file by a slower route.
+    staged
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("flushing {}", path.display()))?;
+
+    // `link(2)` and never `rename(2)`. A rename REPLACES the destination, and
+    // this writer must refuse one that already exists: that refusal is the
+    // symlink defence (`create_new`'s `O_EXCL` used to be what made it true)
+    // and it is what stops a second mint overwriting the identity this Mac is
+    // already pinned by on every other Mac. `link` fails with `AlreadyExists`
+    // for a regular file and for a planted symlink alike, and it does not
+    // follow one.
+    //
+    // The staged copy is dropped either way: on success the destination holds
+    // the same inode and one link is enough, on failure an orphan beside a key
+    // file is a file holding this node's private key.
+    let staged = staged.into_temp_path();
+    std::fs::hard_link(&staged, path).with_context(|| format!("creating {}", path.display()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -238,39 +345,38 @@ fn generate_keypair() -> Result<([u8; 32], [u8; 32])> {
     Ok((secret, public))
 }
 
-/// The public half of an X25519 static key, derived from its secret.
-fn public_from_secret(secret: &[u8; 32]) -> Result<[u8; 32]> {
-    let mut dh = DefaultResolver
-        .resolve_dh(&DHChoice::Curve25519)
-        .ok_or_else(|| anyhow::anyhow!("no curve25519 DH implementation available"))?;
-    dh.set(secret);
-    dh.pubkey()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("unexpected public key length"))
-}
+#[cfg(test)]
+mod instance_id_tests {
+    use super::mint_instance_id;
 
-/// Write a 32-byte key file at `mode`, refusing to follow a pre-existing
-/// symlink the way [`crate::config::write_atomic`] does for the main config.
-///
-/// `create_new` (`O_EXCL`) is what makes that sentence true, and it became
-/// true late: the previous `create(true)` FOLLOWED a symlink on
-/// a fully predictable path, so anything able to create a file in the config
-/// dir could plant `tcr-node.key` as a link and have this node write its
-/// private static key wherever it chose. (`load_or_mint` reaches this function
-/// only when the path does not exist, so refusing an existing one costs
-/// nothing.) `open(2)` applies `mode` only on creation, which is the second
-/// thing `O_EXCL` buys: without a guaranteed fresh inode, the 0600 below is
-/// silently ignored for a pre-existing file.
-fn write_key_file(path: &Path, bytes: &[u8; 32], mode: u32) -> Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .open(path)
-        .with_context(|| format!("creating {}", path.display()))?;
-    file.set_permissions(std::fs::Permissions::from_mode(mode))
-        .with_context(|| format!("setting permissions on {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+    /// **Two failed random sources produce no instance id at all.**
+    ///
+    /// The second failure used to leave the array as it was found, all zeroes,
+    /// and that value became this process's stable instance id: every machine
+    /// in the same state announces the same one.
+    ///
+    /// Watch it fail by returning `Some(InstanceId([0; _]))` from the last
+    /// branch instead of `None`.
+    #[test]
+    fn a_double_failure_is_not_an_id_of_zeroes() {
+        assert!(
+            mint_instance_id(None, None).is_none(),
+            "a machine whose randomness failed twice has no instance id to announce"
+        );
+
+        // The two ways there IS one, so the refusal above is the double failure
+        // and not a function that refuses everything.
+        assert_eq!(
+            mint_instance_id(Some([3_u8; tcr_peer_wire::INSTANCE_ID_BYTES]), None)
+                .expect("the CSPRNG answered")
+                .0,
+            [3_u8; tcr_peer_wire::INSTANCE_ID_BYTES],
+        );
+        assert_eq!(
+            mint_instance_id(None, Some([5_u8; 32]))
+                .expect("the fallback keypair answered")
+                .0,
+            [5_u8; tcr_peer_wire::INSTANCE_ID_BYTES],
+        );
+    }
 }

@@ -403,6 +403,22 @@ enum V4 {
     static let footerGap: CGFloat = 10
     static let footerGlyph: CGFloat = 12
 
+    // MARK: - Mini mesh card (`MiniMeshCard`)
+
+    static let meshEmptyPaddingV: CGFloat = 18
+    static let meshCardPadding: CGFloat = 8
+    /// `pillLabel` draws inside `pill.frame`, narrowed by this on the leading
+    /// and trailing edges combined so the reading and via-line never touch
+    /// the pill's own rounded border.
+    static let meshPillLabelInset: CGFloat = 20
+
+    // MARK: - Must switch (`.sw2.small`)
+
+    static let switchWidth: CGFloat = 30
+    static let switchHeight: CGFloat = 18
+    static let switchKnobSize: CGFloat = 14
+    static let switchKnobInset: CGFloat = 2
+
     // MARK: - Type
 
     static let titleSize: CGFloat = 17

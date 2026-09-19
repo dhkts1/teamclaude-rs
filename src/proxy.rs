@@ -93,6 +93,29 @@ pub const GROUP_HEADER_NAME: &str = "x-tcr-group";
 /// that names no live account ends in the same honest 429 an exhausted fleet
 /// produces.
 pub const ACCOUNTS_HEADER_NAME: &str = "x-tcr-accounts";
+/// The marker a lender puts on a relayed request as it posts it into its OWN
+/// proxy, so that proxy knows the request has already crossed one Mac.
+///
+/// # What it stops
+///
+/// A relayed request is served by re-posting it onto the lender's own loopback
+/// proxy, which is what makes the lender's picker, its Bearer and its bucket
+/// the ones that serve it. That proxy is a full proxy: if the lender's own
+/// fleet is dry the request walks to the dry-fleet terminal, and that terminal
+/// consults a fallback provider of its own. So a borrowed request could be
+/// borrowed onward, to a third Mac or back to the Mac that sent it, on a mesh
+/// where everyone is dry: each hop looks locally reasonable and the cycle is
+/// only visible from outside.
+///
+/// One hop is the rule, and this marker is how the proxy knows which request it
+/// is looking at. Presence is the whole signal; the value is written for a
+/// human reading a capture and is never parsed.
+///
+/// **A client that forges it can only refuse itself a borrow**, which is the
+/// safe direction: it turns its own fallback off and gets the honest exhausted
+/// answer. That is why this is a marker rather than a counter a peer could
+/// decrement.
+pub const RELAYED_HEADER_NAME: &str = "x-tcr-relayed";
 /// Depth of the SSE tee side-channel. A fast upstream feeding a slow parser task
 /// can retain at most this many chunks; beyond it, `try_send` drops chunks for
 /// the parser (usage counting becomes best-effort) rather than letting the buffer
@@ -1285,6 +1308,14 @@ async fn status_handler(
     // believes right now, and a cached peers block would be the stale-panel bug
     // the whole payload exists to end. Both reads are read-only and neither
     // takes the file lock.
+    //
+    // Re-examined and kept. The cost was raised again because the panel polls
+    // this endpoint every three seconds, which is two reads of two small files
+    // out of the page cache per poll; what a cache would buy is smaller than
+    // the failure it would reintroduce, and this repository has already lost an
+    // evening to a panel rendering a config the server had not re-read. A
+    // reader who wants this cheaper should make the panel poll less often
+    // rather than make the answer older than the question.
     payload.peers = crate::status::peers_block(
         &crate::peer::egress::peers_path(),
         (now.unix_timestamp_nanos() / 1_000_000) as i64,
@@ -1988,6 +2019,10 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // on. Matching them against `path_and_query` would let a query string decide
     // routing, and a path is what these rules are actually about.
     let path = parts.uri.path().to_string();
+    // And the query on its own, for the one consumer that needs the two apart:
+    // a request handed to a fallback provider is rebuilt on another Mac, and it
+    // used to be rebuilt from the path alone. See `fallback::Ask::query`.
+    let parts_query = parts.uri.query().map(str::to_string);
     let req_headers = parts.headers;
 
     // 1. Auth: when a proxy key is configured, `x-api-key` must match it — EXCEPT
@@ -2241,6 +2276,13 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // account-set scope, as the header the lender's own serving leg wrote onto
     // this loopback request (see [`ACCOUNTS_HEADER_NAME`]).
     //
+    // "Nothing else reaches it" is ENFORCED by the relay marker beside it, not
+    // asserted. This block used to read the header off any inbound request, so
+    // any local client could bench accounts by sending it; the sentence above
+    // was the whole of the defence and nothing held it up. A request that has
+    // not crossed a Mac has no lease and therefore no account-set scope, so
+    // its copy of this header is ignored rather than honoured.
+    //
     // Applied by BENCHING every account outside the set, seeding `tried`,
     // which every selection call below already honours, rather than by a new
     // argument on the picker. Three properties follow from that, and they are
@@ -2263,6 +2305,7 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // enforcement point.
     if let Some(labels) = req_headers
         .get(ACCOUNTS_HEADER_NAME)
+        .filter(|_| req_headers.contains_key(RELAYED_HEADER_NAME))
         .and_then(|value| value.to_str().ok())
         .map(|value| {
             value
@@ -2486,10 +2529,20 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // boundary; refusing here means a non-POST this fleet
                     // cannot serve gets the SAME answer it got before any of
                     // this existed, from `exhausted_or_fallback`'s terminal.
+                    // `RELAYED_HEADER_NAME` is the one-hop rule: a request
+                    // that has already crossed one Mac is served here or
+                    // refused here, never borrowed onward. See that constant.
                     let fallback_ask = (method == axum::http::Method::POST
-                        && crate::peer::serve::serve_is_allowed_for_path(&path))
+                        && crate::peer::serve::serve_is_allowed_for_path(&path)
+                        && !req_headers.contains_key(RELAYED_HEADER_NAME))
                     .then(|| fallback::Ask {
                         path: &path,
+                        // The query alongside the query-stripped path, never
+                        // folded into it: the classifiers above match on the
+                        // path, and a borrowed request that arrived upstream
+                        // with its parameters dropped answered a different
+                        // question from the one the client asked.
+                        query: parts_query.as_deref(),
                         method: method.as_str(),
                         model: request_model.as_deref(),
                         group: request_group.as_deref(),
@@ -2705,9 +2758,9 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
         // arm.** An account the operator locked to one Mac leaves from that Mac
         // on EVERY request, working direct path or not: the whole point is that
         // the origin sees one address for it. So this is consulted here rather
-        // than beside the blind-carry offer far below, it never touches
-        // `EgressState`, and it never reads a transport failure, because on
-        // this line nothing has been attempted yet.
+        // than beside the blind-carry offer far below, and it never reads a
+        // transport failure, because on this line nothing has been attempted
+        // yet.
         //
         // It sits just BELOW `access_token` and not above it because a carried
         // request is the same request on the same credential, and this
@@ -2867,7 +2920,6 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 let rotation_is_spent = machine_level || tried.len() + 1 >= account_count;
                 if !peer_egress_tried && nothing_ever_left_this_box && rotation_is_spent {
                     peer_egress_tried = true;
-                    crate::peer::egress::note_direct_failure(crate::peer::pair::now_ms());
                     // The body is rebuilt here rather than shared with the
                     // direct attempt's `out_body` above, because the two hunks
                     // are built separately. The
@@ -3834,12 +3886,19 @@ fn log_upstream_error_body(
 fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in req_headers.iter() {
-        let lower = name.as_str();
-        if lower.starts_with(':')
-            || is_request_hop_by_hop(lower)
-            || lower == "x-api-key"
-            || lower == "authorization"
-            || lower == "accept-encoding"
+        // `as_str`, and named for what it is. It was called `lower`, which
+        // claimed a lowercasing this line does not do: it holds only because
+        // `HeaderName` is already lowercase, so the name promised a property
+        // the code was relying on someone else for.
+        let name_str = name.as_str();
+        if name_str.starts_with(':')
+            || is_request_hop_by_hop(name_str)
+            || name_str == "x-api-key"
+            || name_str == "authorization"
+            || name_str == "accept-encoding"
+            // This Mac's own routing marker, which upstream has no use for and
+            // which describes the mesh rather than the request.
+            || name_str == RELAYED_HEADER_NAME
         {
             continue;
         }
@@ -3896,11 +3955,16 @@ pub(crate) fn build_handed_bearer_headers(
 fn build_passthrough_headers(req_headers: &HeaderMap, proxy_key: Option<&str>) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in req_headers.iter() {
-        let lower = name.as_str();
-        if lower.starts_with(':') || is_request_hop_by_hop(lower) || lower == "accept-encoding" {
+        // Named for what it is, not for a lowercasing this line does not do.
+        // See `build_upstream_headers`.
+        let name_str = name.as_str();
+        if name_str.starts_with(':')
+            || is_request_hop_by_hop(name_str)
+            || name_str == "accept-encoding"
+        {
             continue;
         }
-        if lower == "x-api-key"
+        if name_str == "x-api-key"
             && proxy_key.is_some_and(|expected| key_matches(value.to_str().ok(), expected))
         {
             continue;
@@ -4105,21 +4169,36 @@ pub(crate) fn is_request_hop_by_hop(name: &str) -> bool {
 /// `src/peer/serve.rs` strips exactly what this handler strips. A relayed
 /// response that kept its `content-length` would mis-frame the body the same way
 /// here as it does there.
+///
+/// **Compared case-insensitively, because two of its callers are fed arbitrary
+/// strings off a peer's wire** (`peer::serve::response_from` and the hand arm
+/// in `peer::lease`), not `HeaderName`s this process built. It used to be an
+/// exact lowercase match, which held only because every lender in this fleet
+/// writes `HeaderName::as_str()`: a peer that spelled one `Content-Length`
+/// walked past the gate and mis-framed the body in its borrower's client. A
+/// header name is case-insensitive per the HTTP grammar, so trusting a peer for
+/// the case was trusting it for the rule.
 pub(crate) fn is_response_skip(name: &str) -> bool {
-    matches!(
-        name,
-        "connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "upgrade"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "trailers"
-            | "content-length"
-            | "content-encoding"
-    )
+    RESPONSE_SKIP
+        .iter()
+        .any(|skip| name.eq_ignore_ascii_case(skip))
 }
+
+/// The names [`is_response_skip`] answers `true` to, as data rather than as a
+/// `matches!` arm, so the comparison above can be the case-insensitive one the
+/// HTTP grammar asks for.
+const RESPONSE_SKIP: [&str; 10] = [
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "trailers",
+    "content-length",
+    "content-encoding",
+];
 
 /// Upstream headers that describe the ACCOUNT that served a request rather than
 /// the request itself, and so are only meaningful to a client that owns that
@@ -4775,9 +4854,19 @@ fn error_response(
 /// revalidation serve both run first, so a recovery this machine could have
 /// made on its own is never pre-empted by a remote one.
 ///
-/// Inert until a phase returns a provider from
-/// [`fallback::configured_provider`], which is `None` today, so this is
-/// byte-for-byte [`exhausted_response`] on this branch.
+/// **The provider arm is LIVE, and every claim about this handler has to be
+/// read that way.** This doc used to say the opposite: that
+/// [`fallback::configured_provider`] answers `None` on this branch, so the
+/// whole terminal was the old exhaustion answer and nothing past it could run.
+/// The boot sequence installs one (`fallback::install_peer_lease_provider`,
+/// from the peers file, as soon as a row says this node may borrow) and
+/// `src/server.rs` then asks for it back and `expect`s it. So a dry fleet here
+/// really does reach another Mac's account, and reasoning that treats the code
+/// below as dead reaches the wrong answer.
+///
+/// [`exhausted_response`] is still what a request gets when there is no
+/// provider, when the guards below refuse one, or when the provider declines:
+/// that half is unchanged.
 ///
 /// A **reserved group** never reaches a provider. A reserved group means "one of
 /// these accounts or nothing", and a peer's account is not one of them; the
@@ -5127,6 +5216,86 @@ fn credential_refused_response(refused: &[(usize, Option<String>)]) -> Response 
 mod tests {
     use super::*;
     use crate::config::{Account, Config, ProxyConfig};
+
+    /// **This Mac's own routing marker never leaves it.**
+    ///
+    /// `RELAYED_HEADER_NAME` is written onto a relayed request as it goes into
+    /// this Mac's own proxy, so the dry-fleet terminal knows the request has
+    /// already crossed one Mac. It describes the mesh, not the request, and
+    /// upstream has no use for it, so the upstream header build drops it the
+    /// way it drops the client's own credential.
+    ///
+    /// The control is an ordinary header in the same map: a strip that took
+    /// everything would pass this test with its subject deleted.
+    ///
+    /// Watched red: delete the `RELAYED_HEADER_NAME` arm from
+    /// `build_upstream_headers` and the first assertion finds it upstream.
+    #[test]
+    fn the_relay_marker_is_not_carried_upstream() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::HeaderName::from_static(RELAYED_HEADER_NAME),
+            HeaderValue::from_static("1"),
+        );
+        headers.insert(
+            axum::http::HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        let upstream = build_upstream_headers(&headers, "not-a-real-token");
+        assert!(
+            !upstream.contains_key(RELAYED_HEADER_NAME),
+            "a header that describes this mesh may not be sent to the API"
+        );
+        assert_eq!(
+            upstream
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01"),
+            "and the client's own headers still cross: this strip is one name, not a filter"
+        );
+    }
+
+    /// **A peer's own spelling of a hop-by-hop header does not decide whether
+    /// it is stripped.**
+    ///
+    /// Two callers of `is_response_skip` are fed arbitrary strings off a peer's
+    /// wire rather than `HeaderName`s this process built: the SERVE reply
+    /// rebuild in `peer::serve` and the hand arm in `peer::lease`. The match
+    /// was exact and lowercase, which held only because every lender in this
+    /// fleet writes `HeaderName::as_str()`. A peer that spelled one
+    /// `Content-Length` had it survive into its borrower's client and
+    /// mis-frame the body, which is the same defect the strip exists to
+    /// prevent, reintroduced by a peer choosing a capital letter.
+    ///
+    /// The lowercase leg is here too, so a fix that answered `true` to
+    /// everything would not pass: `x-request-id` is a header a borrowed reply
+    /// legitimately carries through.
+    ///
+    /// Watched red: put the `matches!` back and every capitalized spelling
+    /// below answers `false`.
+    #[test]
+    fn a_hop_by_hop_response_header_is_skipped_whatever_its_case() {
+        for name in [
+            "content-length",
+            "Content-Length",
+            "CONTENT-LENGTH",
+            "Transfer-Encoding",
+            "Connection",
+            "Content-Encoding",
+        ] {
+            assert!(
+                is_response_skip(name),
+                "{name} frames the peer's connection, not the client's, so it may never \
+                 reach the client whatever the peer capitalized"
+            );
+        }
+        for name in ["x-request-id", "X-Request-Id", "content-type"] {
+            assert!(
+                !is_response_skip(name),
+                "{name} is a header a relayed answer legitimately carries through"
+            );
+        }
+    }
 
     /// The server login route carries the plan. This is a SEAM, not a
     /// formality: `AddAccountRequest` only MIRRORS `config::Account`'s wire

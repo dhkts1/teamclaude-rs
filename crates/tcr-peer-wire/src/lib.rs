@@ -3,14 +3,26 @@
 //!
 //! # The invariant this crate exists to hold
 //!
-//! **There is no credential field anywhere in these types, and there must never
-//! be one.** A peer stream carries one of three things: opaque bytes it cannot
-//! read (TUNNEL), an HTTP request the receiving node re-signs with its OWN
-//! account (SERVE), or control messages about identity, capability and leases
-//! (CONTROL). None of the three needs a token on the wire, and a token on the
-//! wire would make every forwarding hop a disclosure boundary. The gate is
-//! `wire_has_no_credential_field` in `tests/peer_wire.rs`: a source grep with a
-//! positive control, so it fails if the grep itself stops working.
+//! **One type here carries a credential, `Control::Handoff`, and nothing else
+//! may gain one.** A peer stream carries opaque bytes it cannot read (TUNNEL),
+//! an HTTP request the receiving node re-signs with its OWN account (SERVE), or
+//! control messages about identity, capability and leases (CONTROL). None of
+//! those needs a token on the wire, and a token on the wire makes every
+//! forwarding hop a disclosure boundary.
+//!
+//! The exemption is `hand` mode and it is the whole of that mode: the owner
+//! lends its quota by handing the borrower a bearer so the borrowed request
+//! leaves the BORROWER's machine, which is the one thing a lender cannot
+//! achieve without putting a credential on the wire. What crosses is the
+//! SHORT-LIVED access token and never the refresh token, which is the
+//! difference between lending an account for a while and giving it away, and it
+//! is why revocation is "stop renewing" ([`HandoffToken`]). It crosses a
+//! CONTROL stream, which nests end to end inside a TUNNEL, so a forwarding hop
+//! holds ciphertext for a session it has no key to.
+//!
+//! The gate is `wire_has_no_credential_field` in `tests/peer_wire.rs`: a source
+//! grep with a positive control, so it fails if the grep itself stops working,
+//! and it exempts that one variant's declaration by name and nothing else.
 //!
 //! # Forward compatibility is not optional here
 //!
@@ -317,13 +329,29 @@ fn crockford_encode(bytes: &[u8]) -> String {
 }
 
 fn crockford_decode(s: &str) -> Result<Vec<u8>, PeerIdError> {
-    crockford_encoding().decode(s.as_bytes()).map_err(|err| {
-        // `data-encoding` reports the offending byte's position; the hand-rolled
-        // decoder it replaces reported the offending character, which is what
-        // every existing caller of `PeerIdError::Alphabet` still expects.
-        let bad_char = s.chars().nth(err.position).unwrap_or('\u{fffd}');
-        PeerIdError::Alphabet(bad_char)
-    })
+    crockford_encoding()
+        .decode(s.as_bytes())
+        .map_err(|err| match err.kind {
+            // The one refusal that is about a CHARACTER. `err.position` is a
+            // BYTE offset into the input and is read as one: a character index
+            // happens to agree here, because every symbol this alphabet accepts
+            // is one byte and so the first byte the decoder refuses is the first
+            // byte of the character it refused, but the two indices are
+            // different quantities and only one of them is what was reported.
+            data_encoding::DecodeKind::Symbol => PeerIdError::Alphabet(
+                s.get(err.position..)
+                    .and_then(|rest| rest.chars().next())
+                    .unwrap_or('\u{fffd}'),
+            ),
+            // Everything else is about the input's SIZE or its last symbol's
+            // spare bits, and every one of them used to be reported as a bad
+            // character: a truncated id named whatever happened to sit at the
+            // failure's position, which sent the reader looking for a typo in
+            // a string whose characters were all fine.
+            _ => PeerIdError::Malformed {
+                length: s.chars().count(),
+            },
+        })
 }
 
 impl From<PeerId> for String {
@@ -352,6 +380,15 @@ pub enum PeerIdError {
         /// How many bytes the input decoded to.
         got: usize,
     },
+    /// The input is not a whole peer id: its length is not a whole number of
+    /// base32 symbols, or its last symbol carries bits an encoder would never
+    /// have set. Distinct from [`Self::Alphabet`] because every character in it
+    /// may be perfectly legal, and a refusal that names one of them sends the
+    /// reader hunting a typo that is not there.
+    Malformed {
+        /// How many characters the input held.
+        length: usize,
+    },
 }
 
 impl std::fmt::Display for PeerIdError {
@@ -364,6 +401,11 @@ impl std::fmt::Display for PeerIdError {
                 f,
                 "peer id: decoded {got} bytes, need exactly 32 (the short `tcr-…` \
                  display form is not an identity and cannot be parsed back)"
+            ),
+            Self::Malformed { length } => write!(
+                f,
+                "peer id: {length} characters is not a whole peer id; paste all 52 of \
+                 them, as `tcr peer ls` prints them"
             ),
         }
     }

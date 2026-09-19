@@ -924,6 +924,7 @@ fn a_built_serve_frame_carries_no_client_credential() {
 #[test]
 fn a_frame_is_refused_for_a_forbidden_path_and_an_oversized_body() {
     let credential_path = Ask {
+        query: None,
         path: "/v1/code",
         model: None,
         group: None,
@@ -941,6 +942,7 @@ fn a_frame_is_refused_for_a_forbidden_path_and_an_oversized_body() {
     // request that size is the routine shape of a long conversation, and
     // refusing it declined exactly the traffic this mesh exists for.
     let over_one_frame = Ask {
+        query: None,
         path: "/v1/messages",
         model: None,
         group: None,
@@ -961,6 +963,7 @@ fn a_frame_is_refused_for_a_forbidden_path_and_an_oversized_body() {
 
     // What is still refused is a body over what the whole stream carries.
     let huge = Ask {
+        query: None,
         path: "/v1/messages",
         model: None,
         group: None,
@@ -1640,6 +1643,7 @@ fn token_lease_at(lease_id: u128, tokens: u64, now_ms: i64) -> Lease {
 fn ask_for(path: &str) -> Ask<'_> {
     Ask {
         path,
+        query: None,
         method: "POST",
         model: Some("claude-sonnet-4-5"),
         group: None,
@@ -2005,6 +2009,10 @@ mod fleet {
         pub token: String,
         /// Every header name and value, lower-cased names.
         pub headers: Vec<(String, String)>,
+        /// The request target as it arrived, path and query together. A
+        /// recorder that kept only the headers could not answer whether a
+        /// borrowed request still carried the parameters its client sent.
+        pub uri: String,
     }
 
     impl SeenRequest {
@@ -2056,6 +2064,7 @@ mod fleet {
                 // `tests/tools/api_contract.rs`.
                 let refusal =
                     super::api_contract::refuse_if_incomplete(req.method(), req.headers());
+                let uri = req.uri().to_string();
                 let headers = req
                     .headers()
                     .iter()
@@ -2068,10 +2077,11 @@ mod fleet {
                     .collect();
                 let _ = axum::body::to_bytes(req.into_body(), 1024 * 1024).await;
                 counter.fetch_add(1, Ordering::SeqCst);
-                recorder
-                    .lock()
-                    .expect("served-by lock")
-                    .push(SeenRequest { token, headers });
+                recorder.lock().expect("served-by lock").push(SeenRequest {
+                    token,
+                    headers,
+                    uri,
+                });
                 if let Some(refusal) = refusal {
                     return refusal;
                 }
@@ -2835,6 +2845,54 @@ async fn a_dry_fleet_reaches_the_configured_provider() {
         "the locked account really did try and really was refused, which is the \
          condition this arm is about"
     );
+
+    // ---------------------------------------------------------------------
+    // **A REQUEST THAT HAS ALREADY CROSSED ONE MAC IS NEVER BORROWED ONWARD.**
+    //
+    // A relayed request is served by re-posting it onto the lender's own
+    // loopback proxy, and that proxy is this one: a dry fleet there walks to
+    // the same terminal and consults the same provider. So on a mesh where
+    // everyone is dry, a borrow could be borrowed onward, to a third Mac or
+    // back to the Mac that sent it, each hop locally reasonable and the cycle
+    // visible only from outside. The lender marks the request it re-posts
+    // (`peer::serve::serve_on_own_account`), and the seam refuses to build an
+    // `Ask` for a marked one.
+    //
+    // The instrument is the same provider that says yes to anything, which is
+    // the only thing that can tell "the seam refused" from "the provider
+    // refused", and it is why this leg lives in the one test allowed to
+    // install one.
+    //
+    // Watch it fail by dropping the `RELAYED_HEADER_NAME` conjunct from the
+    // `.then()` in `src/proxy.rs`: the body is the sentinel and `asked` goes
+    // to 2.
+    // ---------------------------------------------------------------------
+    let relayed = client
+        .post(format!("{proxy}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header(teamclaude_rs::proxy::RELAYED_HEADER_NAME, "1")
+        .body(r#"{"model":"claude-sonnet-4-5","messages":[]}"#)
+        .send()
+        .await
+        .expect("the proxy answered");
+    let relayed_status = relayed.status().as_u16();
+    assert_ne!(
+        relayed.bytes().await.expect("read the body").as_ref(),
+        SENTINEL,
+        "a request that had already crossed one Mac was borrowed onward: one hop is the \
+         rule, and a mesh of dry Macs would otherwise pass it around"
+    );
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the provider is still at one ask: a relayed request builds no `Ask` at all"
+    );
+    assert_eq!(
+        relayed_status, 429,
+        "and it gets the honest exhausted answer this handler has always given, which is \
+         what the borrower's own lender then reports"
+    );
 }
 
 /// **The two-process gate, on the REAL listener: a borrowed request is served
@@ -3205,6 +3263,7 @@ async fn a_lender_forwards_only_the_allowlisted_headers() {
             request_id: 1,
             method: "POST".to_string(),
             path: "/v1/messages".to_string(),
+            query: None,
             headers: hostile,
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
@@ -3315,6 +3374,7 @@ async fn a_non_post_relayed_request_is_refused() {
             request_id: 1,
             method: "GET".to_string(),
             path: "/v1/messages".to_string(),
+            query: None,
             headers: Vec::new(),
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
@@ -4038,6 +4098,7 @@ async fn a_lender_refuses_a_local_control_path_in_a_frame() {
             request_id: 1,
             method: "POST".to_string(),
             path: "/_tcr/accounts".to_string(),
+            query: None,
             headers: Vec::new(),
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
@@ -4104,6 +4165,7 @@ async fn a_borrower_on_the_older_serve_flow_is_refused_and_nothing_is_served() {
                 request_id: u128::from(flow) + 1,
                 method: "POST".to_string(),
                 path: "/v1/messages".to_string(),
+                query: None,
                 headers: Vec::new(),
                 body_bytes: 2,
                 proto: tcr_peer_wire::PROTO_VERSION,
@@ -4191,6 +4253,7 @@ async fn an_answer_that_cannot_be_carried_back_is_never_retryable() {
             request_id: 1,
             method: "POST".to_string(),
             path: "/v1/messages".to_string(),
+            query: None,
             headers: Vec::new(),
             body_bytes: 2,
             proto: tcr_peer_wire::PROTO_VERSION,
@@ -4474,45 +4537,81 @@ fn a_grant_past_its_end_mints_nothing_and_one_ahead_carries_it() {
     );
 }
 
-/// **`--for 2h` writes an end two hours ahead, and `--until 18:00` writes
-/// today's 18:00: or tomorrow's, when 18:00 has gone.**
+/// **`--for 2h` writes an end two hours ahead, `--until 18:00` writes today's
+/// 18:00 in the operator's own offset, and a clock that has already passed is
+/// REFUSED.**
 ///
 /// The clock is injected, which is what makes this a measurement rather than an
 /// approximation: a function reading the wall clock could only be asserted
 /// about to within the time the assertion took.
 ///
-/// The roll to tomorrow is the decision worth a test of its own. An operator
-/// who types `--until 09:00` at 18:00 means tomorrow morning; answering "that
-/// is in the past" would be technically true and useless.
+/// # Why the injected instant is built rather than written down
+///
+/// A bare `18:00` resolves in the operator's own offset, so a fixed unix
+/// timestamp would assert a different wall clock on every machine: this file
+/// used to inject `1_700_000_000` and read `23:00` where the resolution is UTC
+/// and `21:00` where it is `+02:00`. The instant here is built AT noon in
+/// whatever offset the resolution uses, so `18:00` is always still ahead and
+/// `09:00` always already gone, in every zone, and the hour is asserted in that
+/// same offset.
+///
+/// # The refusal is the behaviour, not an edge
+///
+/// A clock that has gone used to roll to tomorrow. It does not any more, and
+/// that is the fix rather than a regression: the panel's own refusal and this
+/// function disagreed about which day a bare `18:00` meant, so a lease edited
+/// at 18:00 for "tomorrow at 18:00" round-tripped as an end later the same
+/// minute. Refusing names the instant it resolved to and leaves `--for 24h` as
+/// the way to say tomorrow.
 ///
 /// A bare number is REFUSED rather than read as seconds or as an hour: `2` is
 /// two hours to one reader and two seconds to another, and a lease is not
 /// something to guess a unit on.
 ///
 /// Watch it fail by making the duration arm default to seconds for a bare
-/// number: `"2"` then parses and the last assertion goes green.
+/// number: `"2"` then parses and the last assertion goes green; or by rolling a
+/// passed clock to tomorrow again, which turns the refusal below into an end
+/// this test then reads as `Some`.
 #[test]
 fn a_lend_end_is_parsed_from_a_duration_or_a_clock_against_an_injected_now() {
-    // A fixed instant with a known wall-clock time, in UTC so the assertion
-    // does not depend on the machine's zone: 2023-11-14 22:13:20 UTC.
-    let now = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
-        .expect("a literal unix timestamp is a valid instant");
+    // The offset the resolution will use, asked for exactly as `parse_lend_end`
+    // asks for it, including the fallback: the lookup refuses in a
+    // multithreaded process and both callers then mean UTC, so the two agree
+    // whichever answer the host gives.
+    //
+    // Asked AT the injected date and not at today's: a zone with summer time is
+    // a different offset in November than in September, and building a November
+    // noon with September's offset puts the resolution and the read-back an
+    // hour apart, which is exactly what the first version of this test did.
+    let date = time::Date::from_calendar_date(2023, time::Month::November, 14)
+        .expect("a literal calendar date");
+    let noon = time::Time::from_hms(12, 0, 0).expect("a literal time of day");
+    let probe = time::OffsetDateTime::new_in_offset(date, noon, time::UtcOffset::UTC);
+    let offset = time::UtcOffset::local_offset_at(probe).unwrap_or(time::UtcOffset::UTC);
+    // Noon on that date, IN that offset. Noon is the whole trick: 18:00 is
+    // ahead of it and 09:00 behind it in every zone, so neither assertion below
+    // depends on where this machine is.
+    let now = time::OffsetDateTime::new_in_offset(date, noon, offset);
+    let now_unix = now.unix_timestamp();
 
+    // A duration is offset-free: it is arithmetic on the instant, and the same
+    // number of seconds wherever the machine is.
+    let ahead = |seconds: i64| Some(u64::try_from(now_unix + seconds).expect("in range"));
     assert_eq!(
         lease::parse_lend_end("2h", now).expect("2h parses"),
-        Some(1_700_000_000 + 7_200)
+        ahead(7_200)
     );
     assert_eq!(
         lease::parse_lend_end("90m", now).expect("90m parses"),
-        Some(1_700_000_000 + 5_400)
+        ahead(5_400)
     );
     assert_eq!(
         lease::parse_lend_end("30s", now).expect("30s parses"),
-        Some(1_700_000_000 + 30)
+        ahead(30)
     );
     assert_eq!(
         lease::parse_lend_end("3d", now).expect("3d parses"),
-        Some(1_700_000_000 + 3 * 86_400)
+        ahead(3 * 86_400)
     );
 
     // No end, named rather than implied, so an operator can clear an end with
@@ -4523,27 +4622,35 @@ fn a_lend_end_is_parsed_from_a_duration_or_a_clock_against_an_injected_now() {
     );
     assert_eq!(lease::parse_lend_end("", now).expect("empty parses"), None);
 
-    // A clock time LATER today: 23:00 against a 22:13:20 now.
-    let today = lease::parse_lend_end("23:00", now)
-        .expect("23:00 parses")
-        .expect("a clock time is an end");
+    // A clock time still AHEAD: 18:00 against a noon now. Read back in the same
+    // offset it was resolved in, which is what makes 18:00 mean 18:00 rather
+    // than whatever 18:00 elsewhere looks like from here.
+    let today = lease::parse_lend_end("18:00", now)
+        .expect("18:00 parses")
+        .expect("a clock time still ahead is an end");
     let today = time::OffsetDateTime::from_unix_timestamp(i64::try_from(today).expect("in range"))
-        .expect("a valid instant");
-    assert_eq!((today.hour(), today.minute()), (23, 0));
-    assert_eq!(today.date(), now.date(), "later today is today");
-
-    // And one that has GONE today rolls to tomorrow.
-    let tomorrow = lease::parse_lend_end("09:00", now)
-        .expect("09:00 parses")
-        .expect("a clock time is an end");
-    let tomorrow =
-        time::OffsetDateTime::from_unix_timestamp(i64::try_from(tomorrow).expect("in range"))
-            .expect("a valid instant");
-    assert_eq!((tomorrow.hour(), tomorrow.minute()), (9, 0));
+        .expect("a valid instant")
+        .to_offset(offset);
     assert_eq!(
-        tomorrow.date(),
-        now.date().next_day().expect("there is a tomorrow"),
-        "09:00 has gone today, so the operator means tomorrow morning"
+        (today.hour(), today.minute()),
+        (18, 0),
+        "the end is the operator's own 18:00, not 18:00 somewhere else"
+    );
+    assert_eq!(today.date(), now.date(), "still ahead today is today");
+
+    // And one that has already GONE is refused, naming what it resolved to,
+    // rather than rolled into tomorrow where nobody asked for it.
+    let refusal = lease::parse_lend_end("09:00", now)
+        .expect_err("09:00 has passed at noon, so it is not an end this build will write");
+    let refusal = format!("{refusal}");
+    assert!(
+        refusal.contains("already passed today"),
+        "the refusal says the clock has gone, or an operator reads it as a parse error: \
+         {refusal}"
+    );
+    assert!(
+        refusal.contains("09:00"),
+        "and names the time it was given, so the operator can see what was read: {refusal}"
     );
 
     // Refusals: a bare number, a unit this build does not know, a duration
@@ -5262,6 +5369,11 @@ fn lend_list_prints_ids_and_revoke_removes_exactly_one_lease() {
 /// re-lending is one command rather than deleting and re-creating the lease
 /// (which would change the id every surface is holding).
 ///
+/// A clock time that has already gone is REFUSED here, and the grant keeps the
+/// end it had. That is the retired roll-to-tomorrow: an operator who types a
+/// time that has passed is told so rather than lent another day they did not
+/// ask for.
+///
 /// Watch it fail by dropping `grant.until = end` from the `Lend` arm: the file
 /// then has no end and the `ended` assertion below never fires.
 #[test]
@@ -5294,16 +5406,36 @@ fn lend_for_a_duration_writes_an_end_and_relend_clears_it() {
     assert!(!grant.ended, "two hours ahead has not passed");
     let id = teamclaude_rs::peer::config::lease_id_string(grant.id);
 
-    // An end in the past reads as ended, through the same CLI.
-    let (out, _, ok) = run_tcr_peer(
+    // A clock that has gone is REFUSED through the same CLI, and the end the
+    // grant already had is left alone. It used to roll to tomorrow, which is
+    // the behaviour this build retired: an operator who types a time that has
+    // passed gets told so rather than silently lent another day.
+    //
+    // `00:00:01` has gone at every instant of the day but its first second,
+    // which is the same window any bare clock has and the reason the refusal
+    // names what it resolved to.
+    let (out, err, ok) = run_tcr_peer(
         &peers,
         &["lend", &node, "--relend", &id, "--until", "00:00:01"],
     );
-    assert!(ok, "relend to a clock time: {out}");
+    assert!(
+        !ok,
+        "a clock that has passed is not an end this build will write: {out}{err}"
+    );
+    assert!(
+        err.contains("already passed today"),
+        "and the refusal says why, naming what it resolved to: {out}{err}"
+    );
+    let file = teamclaude_rs::peer::config::read_or_default(&peers).expect("the file reads");
+    assert_eq!(
+        file.peers[0].lend[0].until,
+        Some(until),
+        "a refused relend changes nothing: the two-hour end is still the one on disk"
+    );
     let (out, _, _) = run_tcr_peer(&peers, &["lend", &node, "--list"]);
     assert!(
         out.contains("ended=false"),
-        "00:00:01 rolls to tomorrow: {out}"
+        "two hours ahead still has not passed: {out}"
     );
 
     // And `--relend` with no end at all clears it: "re-lend with
@@ -7503,5 +7635,667 @@ fn a_leases_tokens_are_charged_to_the_path_it_was_noted_on() {
     assert!(
         rows.iter().all(|row| row.locator == path),
         "and on no other path: {rows:?}"
+    );
+}
+
+/// **A hand-mode grant is served from the BORROWER, end to end, through the
+/// production provider.** The one path this file could not drive.
+///
+/// Every other hand-mode gate lives in `tests/peer_hand.rs` and calls
+/// `serve_on_handed_bearer` directly, so the whole of the borrower's own
+/// decision, does this lease have a live bearer and which of the two modes does
+/// that make it, was covered by nothing. This test starts at the real listener:
+/// the lender grants a `hand` lease, pushes its bearer on the same control
+/// session, and `PeerLeaseProvider::try_serve` then answers its client from
+/// this Mac.
+///
+/// # Why it waits on `handed_tokens` rather than on a sleep
+///
+/// The bearer arrives on the session AFTER the grant frame, and the reader task
+/// stores it, so a borrow can legitimately reach the fork before its own bearer
+/// does and fall through to the serve path. Waiting for the store is what makes
+/// the assertion below about the MODE rather than about who won a race.
+///
+/// The store it waits on is the process-wide `lease::handed_tokens()`, which is
+/// the store the provider reads and the only one it can read; a bearer put into
+/// a `HandedTokens` the test built is invisible to this path. The bearer is
+/// forgotten at the end so no later test in this binary inherits it.
+///
+/// Watch it fail by making `try_serve`'s fork unconditional (`if false`): the
+/// request crosses to the owner, `borrower_hits` reads 0 and the lender's own
+/// upstream answers it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hand_grant_is_served_from_the_borrower_through_the_provider() {
+    let (owner_upstream, owner_hits, _owner_served) = fleet::spawn_upstream().await;
+    let manager = fleet::lending_manager(&owner_upstream, Default::default());
+    // A bearer is handed over only for an account whose window this Mac has
+    // MEASURED: the frame carries the baseline the borrower's own rises are
+    // counted against, so an unmeasured account has no handoff to make.
+    let mut measured = reqwest::header::HeaderMap::new();
+    measured.insert(
+        "anthropic-ratelimit-unified-7d-utilization",
+        "0.10".parse().expect("a header value"),
+    );
+    manager.update_quota(0, &measured);
+    let owner_proxy = fleet::spawn_proxy(manager.clone()).await;
+
+    let lender_home = tempfile::tempdir().expect("the lender's temp home");
+    let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
+    let lender_peers = lender_home.path().join("tcr-peers.json");
+    let borrower_peers = borrower_home.path().join("tcr-peers.json");
+
+    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+        .expect("the lender's key")
+        .id();
+    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+        .expect("the borrower's key")
+        .id();
+
+    write_peers(
+        &lender_peers,
+        vec![lender_row_for(
+            borrower_id,
+            vec![LendGrant {
+                mode: teamclaude_rs::peer::config::LendMode::Hand,
+                ..LendGrant::new(Window::SevenDay, 0.20, 300, 2)
+            }],
+        )],
+    );
+
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::new()));
+    {
+        let mut held = ledger.lock().expect("ledger lock");
+        held.note_owner_headroom(Window::SevenDay, 0.30);
+    }
+    let peer_addr = mesh::spawn_lender(
+        lender_home.path().to_path_buf(),
+        lender_peers.clone(),
+        ledger.clone(),
+        owner_proxy.clone(),
+        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        manager.clone(),
+    )
+    .await;
+
+    write_peers(
+        &borrower_peers,
+        vec![borrower_row_for(
+            lender_id,
+            true,
+            vec![peer_addr.to_string()],
+        )],
+    );
+
+    // The borrower's OWN origin, on its own port. Which origin received the
+    // request is the whole instrument: hand mode means these bytes never touch
+    // the owner's Mac.
+    let (borrower_origin, borrower_hits, borrower_served) = fleet::spawn_upstream().await;
+    let provider = PeerLeaseProvider::new(borrower_peers.clone())
+        .with_hand_egress(borrower_origin, reqwest::Client::new());
+
+    // The first ask is what mints the lease and opens the session the bearer
+    // arrives on, so it is also the one that may reach the fork early. Its
+    // outcome is not asserted; the lease it leaves behind is what the second
+    // one borrows on.
+    let _first = provider.try_serve(&ask_for("/v1/messages")).await;
+
+    // The lease the provider is holding, read off the borrower's own state
+    // file, which is where it writes the borrowed rows. Its id is what the
+    // bearer is keyed by and what this test forgets on the way out.
+    let borrower_state = teamclaude_rs::peer::serve::peer_state_path(&borrower_peers);
+    let handed = teamclaude_rs::peer::state::load(&borrower_state, teamclaude_rs::now_ms())
+        .expect("the borrower's state file reads")
+        .borrowed
+        .first()
+        .expect("the first ask left a borrowed lease behind")
+        .lease
+        .lease_id;
+
+    let store = lease::handed_tokens();
+    let mut arrived = false;
+    for _ in 0..200 {
+        arrived = store
+            .lock()
+            .expect("the handed-token store")
+            .bearer(handed, teamclaude_rs::now_ms())
+            .is_some();
+        if arrived {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        arrived,
+        "the owner hands a bearer over for a hand-mode grant, on the session that granted it"
+    );
+
+    let before = borrower_hits.load(std::sync::atomic::Ordering::SeqCst);
+    let owner_before = owner_hits.load(std::sync::atomic::Ordering::SeqCst);
+    let response = provider
+        .try_serve(&ask_for("/v1/messages"))
+        .await
+        .expect("a lease with a live handed bearer is served");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the borrower answers its client with what its own origin said"
+    );
+    assert_eq!(
+        borrower_hits.load(std::sync::atomic::Ordering::SeqCst),
+        before + 1,
+        "the hand-mode request leaves from the BORROWER"
+    );
+    assert_eq!(
+        owner_hits.load(std::sync::atomic::Ordering::SeqCst),
+        owner_before,
+        "and nothing about it reaches the owner's own upstream"
+    );
+
+    let seen = borrower_served.lock().expect("served lock").clone();
+    let last = seen
+        .last()
+        .expect("the borrower's origin recorded the request");
+    assert_eq!(
+        last.token,
+        fleet::LENDER_TOKEN,
+        "spent on the OWNER's handed bearer, which is what makes it a borrow"
+    );
+    for required in ["anthropic-version", "content-type"] {
+        assert!(
+            last.header(required).is_some(),
+            "a hand-mode request the API would refuse is not a served answer: {:?}",
+            last.headers
+        );
+    }
+    assert!(
+        !last
+            .values()
+            .iter()
+            .any(|value| value.contains("not-a-real-client-token")),
+        "and the client's own credential is not on it: {:?}",
+        last.headers
+    );
+
+    // The store is this process's, shared with every other test in this
+    // binary, so what this one put in it goes out with it.
+    store.lock().expect("the handed-token store").forget(handed);
+}
+
+/// **A `lentTo` row names its Mac by the wire id as well as by the label**, so
+/// a reader can join the line to the peer row it is about.
+///
+/// It carried the label alone. A label is the operator's display string: two
+/// Macs can wear the same one, it is renamed whenever its owner feels like it,
+/// and every other cross-surface join in this tree moved to the wire id, so a
+/// panel merging an account card's line with a peers row had nothing to merge
+/// on and drew the line beside the wrong Mac whenever two labels matched.
+///
+/// The assertion is the VALUE and not the key: the id is compared against the
+/// one the peers row itself carries, so writing the label into the new field
+/// fails here.
+///
+/// Watch it fail by putting `row.label.clone()` back in `lent_to`'s `peer_id`.
+#[test]
+fn a_lent_to_row_carries_the_wire_id_of_the_mac_it_names() {
+    let dir = tempfile::tempdir().expect("a temp home");
+    let peers = dir.path().join("tcr-peers.json");
+
+    // Two Macs wearing ONE label, which is the case the label alone cannot
+    // tell apart and the case an operator reaches by pairing a replacement Mac
+    // before retiring the old one.
+    let first = PeerId([21_u8; 32]);
+    let second = PeerId([22_u8; 32]);
+    let grant = |fraction: f64| LendGrant::new(Window::SevenDay, fraction, 300, 2);
+    let mut one = lender_row_for(first, vec![grant(0.20)]);
+    one.label = "studio-mac".to_string();
+    let mut two = lender_row_for(second, vec![grant(0.30)]);
+    two.label = "studio-mac".to_string();
+    write_peers(&peers, vec![one, two]);
+
+    let store = PeerStore::open(&peers).expect("the peers file");
+    let lent = lease::lent_to(&store, &[("lender-fake".to_string(), Vec::new())]);
+    let rows = lent
+        .get("lender-fake")
+        .expect("an `all` grant covers every local account");
+
+    let ids: Vec<&str> = rows.iter().map(|row| row.peer_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        [first.to_wire(), second.to_wire()],
+        "each row names the Mac whose grant it came from, in the wire form the \
+         peers rows are keyed by: {rows:?}"
+    );
+    assert!(
+        rows.iter().all(|row| row.peer == "studio-mac"),
+        "the label stays what it was, for the screen: {rows:?}"
+    );
+
+    let json = serde_json::to_string(&lent).expect("the lentTo map serializes");
+    assert!(
+        json.contains(&format!("\"peerId\":\"{}\"", first.to_wire())),
+        "and the panel reads it under `peerId`: {json}"
+    );
+}
+
+/// **A pair the serve cache has forgotten is charged when it is served again.**
+///
+/// The serve cache and the charge cache were two maps evicted independently, on
+/// two different clocks: the serve side recorded at the caller's `now_ms`, the
+/// charge side at the wall clock, and only the requests that reached the charge
+/// ever entered the second one. So the two FIFOs drifted, and a pair that had
+/// left the serve cache while still sitting in the charge cache was admitted
+/// again (new to the serve side) and charged nothing (old to the charge side):
+/// a relay served on the lender's own account for free, repeatable for as long
+/// as the borrower kept the charge entry alive.
+///
+/// One cache with a state per pair is what closes it: forgetting a pair forgets
+/// both facts about it at once, so "admitted again" and "charged again" can no
+/// longer disagree.
+///
+/// Watched red: give the charge its own map again and the final assertion reads
+/// `0`.
+#[test]
+fn a_pair_the_serve_cache_forgot_is_charged_when_it_is_served_again() {
+    let peer = PeerId([9_u8; 32]);
+    let now = teamclaude_rs::now_ms();
+    let mut ledger = Ledger::new();
+    ledger.record_scoped(
+        Lease {
+            lease_id: LEASE,
+            window: Window::SevenDay,
+            unit: LeaseUnit::Fraction(0.50),
+            granted_at_ms: now,
+            expires_at_ms: now + 600_000,
+            spent: 0.0,
+            max_inflight: 64,
+            until: None,
+        },
+        peer,
+        tcr_peer_wire::LendScope::All,
+    );
+    ledger.note_owner_headroom(Window::SevenDay, 0.90);
+
+    // One relay that reaches the charge, so the pair is in both halves of the
+    // accounting at once. This is the only request in the test that does.
+    ledger
+        .enter_relay(LEASE, &peer, REQUEST, now)
+        .expect("the first relay of a fresh id is admitted");
+    ledger.leave_relay(LEASE);
+    assert!(
+        ledger.debit(LEASE, REQUEST, 0.0) > 0.0,
+        "and it is charged, or the pair never enters the charge half and this test has no \
+         subject"
+    );
+
+    // Then the borrower pushes that pair out of the serve cache with its own
+    // traffic: every one of these is admitted and none of them reaches the
+    // charge, which is exactly the shape a borrower whose relays fail upstream
+    // produces.
+    for nth in 0..(lease::SERVED_PER_LEASE_CAPACITY as u128 + 8) {
+        ledger
+            .enter_relay(LEASE, &peer, REQUEST + 1 + nth, now)
+            .expect("each fresh id is admitted");
+        ledger.leave_relay(LEASE);
+    }
+
+    // The original pair is old news to this ledger now, so it is served again.
+    assert_eq!(
+        ledger.enter_relay(LEASE, &peer, REQUEST, now),
+        Ok(()),
+        "a pair this ledger no longer remembers is admitted again, which is the honest \
+         answer once it has been forgotten"
+    );
+    ledger.leave_relay(LEASE);
+    assert!(
+        ledger.debit(LEASE, REQUEST, 0.0) > 0.0,
+        "and a relay this ledger admitted is CHARGED: a pair forgotten by one half of the \
+         accounting and remembered by the other is a request served on the lender's own \
+         account for nothing"
+    );
+}
+
+/// An [`Ask`] whose client sent a query string, which is the shape both borrow
+/// arms used to drop.
+fn ask_with_query<'a>(path: &'a str, query: &'a str) -> Ask<'a> {
+    Ask {
+        query: Some(query),
+        ..ask_for(path)
+    }
+}
+
+/// **A borrowed request reaches the lender's upstream with its query string.**
+///
+/// The seam split the client's URI into a query-stripped path and a query, and
+/// then carried only the path: the relay frame had nowhere to put the second
+/// half and the lender rebuilt the URL from the first. So a client that asked
+/// for `/v1/messages?beta=true` had `/v1/messages` answered on somebody else's
+/// account, and whether its parameters were honoured depended on which account
+/// happened to serve it: the direct path and the carry path both keep them.
+///
+/// The path stays query-stripped on purpose, because every refusal the borrow
+/// owes the client matches on the path and a query string must not be able to
+/// decide one of those. So the query travels as its own field and is put back
+/// on the URL the lender builds.
+///
+/// Watched red: drop the `set_query` from `serve_on_own_account`
+/// (`src/peer/serve.rs`) and the upstream sees a bare `/v1/messages`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_borrowed_request_carries_its_query_string_to_the_lenders_upstream() {
+    let (upstream, hits, served) = fleet::spawn_upstream().await;
+    let lender_proxy =
+        fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
+
+    let lender_home = tempfile::tempdir().expect("the lender's temp home");
+    let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
+    let lender_peers = lender_home.path().join("tcr-peers.json");
+    let borrower_peers = borrower_home.path().join("tcr-peers.json");
+
+    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+        .expect("the lender's key")
+        .id();
+    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+        .expect("the borrower's key")
+        .id();
+
+    write_peers(
+        &lender_peers,
+        vec![lender_row_for(
+            borrower_id,
+            vec![LendGrant::new(Window::SevenDay, 0.20, 300, 2)],
+        )],
+    );
+
+    let now = teamclaude_rs::now_ms();
+    let lease = Lease {
+        lease_id: LEASE,
+        window: Window::SevenDay,
+        unit: LeaseUnit::Fraction(0.20),
+        granted_at_ms: now,
+        expires_at_ms: now + 300_000,
+        spent: 0.0,
+        max_inflight: 2,
+        until: None,
+    };
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::new()));
+    {
+        let mut held = ledger.lock().expect("ledger lock");
+        held.record_scoped(lease, borrower_id, tcr_peer_wire::LendScope::All);
+        held.note_owner_headroom(Window::SevenDay, 0.30);
+    }
+
+    let peer_addr = mesh::spawn_lender(
+        lender_home.path().to_path_buf(),
+        lender_peers.clone(),
+        ledger.clone(),
+        lender_proxy.clone(),
+        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        fleet::dry_manager(),
+    )
+    .await;
+
+    write_peers(
+        &borrower_peers,
+        vec![borrower_row_for(
+            lender_id,
+            true,
+            vec![peer_addr.to_string()],
+        )],
+    );
+    let borrower_store = PeerStore::open(&borrower_peers).expect("the borrower's peers file");
+
+    let headers = borrower_credentials();
+    let ask = ask_with_query("/v1/messages", "beta=true");
+    let response = serve::open_serve(&lender_id, &lease, &ask, &headers, &borrower_store)
+        .await
+        .expect("the SERVE stream ran")
+        .served()
+        .expect("the lender served it");
+    assert_eq!(response.status().as_u16(), 200);
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one arrival, or the assertion below is reading somebody else's request"
+    );
+    let seen = served.lock().expect("served lock").clone();
+    assert_eq!(
+        seen[0].uri, "/v1/messages?beta=true",
+        "the lender's upstream has to be asked the question the borrower's client asked, \
+         parameters included"
+    );
+}
+
+/// **A hand-mode borrow carries its query string too.**
+///
+/// The same defect in the other arm, and the reason both are one change: a
+/// hand-mode request is built on the BORROWER's Mac against the owner's bearer,
+/// by a second URL builder that also set only the path. Fixing the relayed arm
+/// alone would leave a client's parameters honoured or dropped depending on
+/// which kind of lease it happened to hold, which is the harder failure to see.
+///
+/// Watched red: drop the `set_query` from `serve_on_handed_bearer`
+/// (`src/peer/lease.rs`) and the upstream sees a bare `/v1/messages`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_handed_request_carries_its_query_string_to_the_owners_upstream() {
+    let (upstream, hits, served) = fleet::spawn_upstream().await;
+    // A lease id of this test's own, because the handed-token store is one
+    // process-wide map and every test in this binary shares it.
+    let lease_id = 0xc0ff_ee00_u128;
+    let now = teamclaude_rs::now_ms();
+    lease::handed_tokens()
+        .lock()
+        .expect("the handed-token store")
+        .put(lease_id, "not-a-real-owner-token".to_string(), now + 60_000);
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a client");
+    let ask = ask_with_query("/v1/messages", "beta=true");
+    let response =
+        lease::serve_on_handed_bearer(&upstream, &client, &ask, lease_id, Window::SevenDay, now)
+            .await
+            .expect("the handed request reached the fake upstream")
+            .expect("a lease with a live handed bearer is served from here");
+    assert_eq!(response.status().as_u16(), 200);
+
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one arrival, or the assertion below is reading somebody else's request"
+    );
+    let seen = served.lock().expect("served lock").clone();
+    assert_eq!(
+        seen[0].uri, "/v1/messages?beta=true",
+        "a handed borrow asks the owner's upstream the question the client asked, \
+         parameters included"
+    );
+}
+
+/// **A lease stops serving when its lending hours close, not when its TTL
+/// runs out.**
+///
+/// The `--between` / `--days` schedule was consulted once, at the mint, and
+/// never again. A lease minted a minute before the window closed then kept
+/// serving on the owner's account until its own TTL or its `until` said
+/// otherwise, which for a week-long grant is days outside the hours the
+/// operator lent. An operator who writes "22:00-08:00" means the requests, not
+/// the paperwork.
+///
+/// The fixture's grant names every weekday EXCEPT today's, so it is closed
+/// whatever hour the suite runs at and whatever the host's timezone is. The
+/// lease itself is live on every other axis, a fresh TTL, budget untouched,
+/// headroom noted, so a refusal here can only be the schedule.
+///
+/// Watched red: delete the schedule block from `handle_serve_on`
+/// (`src/peer/serve.rs`) and the lender serves it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_outside_the_grants_hours_is_refused_rather_than_served() {
+    let (upstream, hits, _served) = fleet::spawn_upstream().await;
+    let lender_proxy =
+        fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
+
+    let lender_home = tempfile::tempdir().expect("the lender's temp home");
+    let borrower_home = tempfile::tempdir().expect("the borrower's temp home");
+    let lender_peers = lender_home.path().join("tcr-peers.json");
+    let borrower_peers = borrower_home.path().join("tcr-peers.json");
+
+    let lender_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(lender_home.path())
+        .expect("the lender's key")
+        .id();
+    let borrower_id = teamclaude_rs::peer::id::NodeKey::load_or_mint(borrower_home.path())
+        .expect("the borrower's key")
+        .id();
+
+    // Every day but today's, read off the same local clock `Schedule::contains`
+    // converts to, so this fixture is closed on every host and at every hour.
+    let today = time::OffsetDateTime::now_utc()
+        .to_offset(
+            time::UtcOffset::local_offset_at(time::OffsetDateTime::now_utc())
+                .unwrap_or(time::UtcOffset::UTC),
+        )
+        .weekday();
+    let every_other_day: Vec<&str> = [
+        ("mon", time::Weekday::Monday),
+        ("tue", time::Weekday::Tuesday),
+        ("wed", time::Weekday::Wednesday),
+        ("thu", time::Weekday::Thursday),
+        ("fri", time::Weekday::Friday),
+        ("sat", time::Weekday::Saturday),
+        ("sun", time::Weekday::Sunday),
+    ]
+    .into_iter()
+    .filter(|(_, day)| *day != today)
+    .map(|(name, _)| name)
+    .collect();
+    let mut closed_now = LendGrant::new(Window::SevenDay, 0.20, 300, 2);
+    closed_now.days = Some(
+        teamclaude_rs::peer::schedule::Days::try_from(every_other_day.join(","))
+            .expect("a day list this test built"),
+    );
+
+    write_peers(
+        &lender_peers,
+        vec![lender_row_for(borrower_id, vec![closed_now])],
+    );
+
+    let now = teamclaude_rs::now_ms();
+    let lease = Lease {
+        lease_id: LEASE,
+        window: Window::SevenDay,
+        unit: LeaseUnit::Fraction(0.20),
+        granted_at_ms: now,
+        // Live on every axis the lease itself carries, so the refusal below can
+        // only be about the hours.
+        expires_at_ms: now + 300_000,
+        spent: 0.0,
+        max_inflight: 2,
+        until: None,
+    };
+    let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::new()));
+    {
+        let mut held = ledger.lock().expect("ledger lock");
+        held.record_scoped(lease, borrower_id, tcr_peer_wire::LendScope::All);
+        held.note_owner_headroom(Window::SevenDay, 0.30);
+    }
+
+    let peer_addr = mesh::spawn_lender(
+        lender_home.path().to_path_buf(),
+        lender_peers.clone(),
+        ledger.clone(),
+        lender_proxy.clone(),
+        std::sync::Arc::new(teamclaude_rs::peer::serve::NoFleetUtilization),
+        fleet::dry_manager(),
+    )
+    .await;
+
+    write_peers(
+        &borrower_peers,
+        vec![borrower_row_for(
+            lender_id,
+            true,
+            vec![peer_addr.to_string()],
+        )],
+    );
+    let borrower_store = PeerStore::open(&borrower_peers).expect("the borrower's peers file");
+
+    let headers = borrower_credentials();
+    let ask = ask_for("/v1/messages");
+    let outcome = serve::open_serve(&lender_id, &lease, &ask, &headers, &borrower_store)
+        .await
+        .expect("the SERVE stream ran");
+
+    assert!(
+        outcome.served().is_none(),
+        "a lease whose lending hours are closed may not be served, whatever is left on its \
+         TTL or its budget"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "and nothing reached the owner's upstream: the hours are enforced before the \
+         request is sent, not after it has been paid for"
+    );
+    assert_eq!(
+        ledger.lock().expect("ledger lock").inflight(LEASE),
+        0,
+        "a refusal takes no in-flight slot, or one closed window strands the lease for its \
+         whole TTL"
+    );
+}
+
+/// **A local client cannot bench this Mac's accounts by sending the
+/// account-set header.**
+///
+/// `x-tcr-accounts` is how a lender's own serving leg tells its picker which of
+/// its accounts a lease's scope allows. The picker read it off any inbound
+/// request, and the only thing saying that could not happen was a comment
+/// claiming the borrowed path was the only one that reached it. So any process
+/// that could talk to the proxy could bench accounts by name: a set naming no
+/// account leaves the whole fleet benched and the client gets the exhausted
+/// 429, which is a local denial of service spelled in one header.
+///
+/// The marker the relaying leg already writes is what makes the comment true: a
+/// request that has not crossed a Mac holds no lease, so it has no account-set
+/// scope and its copy of the header is ignored.
+///
+/// The fleet here is healthy and its one account is NOT the one the header
+/// names, so a honoured header benches everything and produces a 429. A served
+/// 200 is the header having been ignored.
+///
+/// Watched red: drop the `RELAYED_HEADER_NAME` filter from the account-set
+/// block in `src/proxy.rs` and this answers 429.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_account_set_header_is_ignored_on_a_request_that_crossed_no_mac() {
+    let (upstream, hits, _served) = fleet::spawn_upstream().await;
+    let proxy = fleet::spawn_proxy(fleet::lending_manager(&upstream, Default::default())).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("a loopback client");
+
+    let forged = client
+        .post(format!("{proxy}/v1/messages"))
+        .header("content-type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .header(
+            teamclaude_rs::proxy::ACCOUNTS_HEADER_NAME,
+            "no-such-account-on-this-mac",
+        )
+        .body(r#"{"model":"claude-sonnet-4-5","messages":[]}"#)
+        .send()
+        .await
+        .expect("the proxy answered");
+
+    assert_eq!(
+        forged.status().as_u16(),
+        200,
+        "a local client benched this Mac's whole fleet with one header it had no lease for"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "and the request really was served upstream, so the 200 above is a serve rather \
+         than something short-circuited before the picker"
     );
 }

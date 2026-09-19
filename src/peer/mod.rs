@@ -25,10 +25,16 @@
 //!
 //! # The four invariants every file here inherits
 //!
-//! 1. **No credential on the wire.** `tcr_peer_wire` has no token field and
-//!    must never gain one. A lender attaches its OWN Bearer locally; a borrower
-//!    scrubs its own `authorization` and `x-api-key` BEFORE a SERVE frame is
-//!    written ([`serve`]) and refuses the client-credential paths outright.
+//! 1. **No credential on the wire, with one named exemption.** A lender
+//!    attaches its OWN Bearer locally; a borrower scrubs its own
+//!    `authorization` and `x-api-key` BEFORE a SERVE frame is written
+//!    ([`serve`]) and refuses the client-credential paths outright. The
+//!    exemption is `Control::Handoff`, which IS `hand` mode: the owner hands
+//!    over its short-lived access token, never the refresh token, on a CONTROL
+//!    stream that nests end to end, so the borrowed request can leave the
+//!    borrower's own machine. No other type may gain a token field, and the
+//!    gate that holds that line names this one variant and nothing else
+//!    (`tests/peer_wire.rs`).
 //! 2. **Pin before you answer.** `snow` has no pin store: an `IK` responder
 //!    learns the initiator's static key after reading message 1, and if the
 //!    comparison against the pinned set is missing, the handshake completes and

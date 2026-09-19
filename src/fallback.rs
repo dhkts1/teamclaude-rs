@@ -74,6 +74,21 @@ pub struct Ask<'a> {
     /// client-credential paths on this value before opening anything. See
     /// `src/peer/serve.rs`.
     pub path: &'a str,
+    /// The request's query string, without its `?`, when it had one.
+    ///
+    /// Separate from [`Ask::path`] rather than folded into it, because the two
+    /// are read by different rules: every refusal a provider owes the client
+    /// (the credential paths, the local-control routes) matches on the PATH,
+    /// and a query string that could decide one of those is a query string that
+    /// decides routing. So the path stays query-stripped and this field is what
+    /// a provider puts back on the URL it builds.
+    ///
+    /// It used to be dropped entirely: a borrowed `POST /v1/messages?beta=x`
+    /// arrived upstream as `POST /v1/messages`, silently answering a different
+    /// question from the one the client asked, on somebody else's account. The
+    /// direct path and the carry path both kept it, so a client saw the
+    /// parameter honoured or ignored depending on which account served it.
+    pub query: Option<&'a str>,
     /// The HTTP method the client's own request carried.
     ///
     /// # Why an `Ask` carries one at all

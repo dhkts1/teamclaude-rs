@@ -155,8 +155,8 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `priority` | i64 | absent → `0` | no | rotation order, **lower value = preferred** |
 | `switchThreshold` | float | absent → the global value | no | per-account override of the top-level threshold |
 | `disabled` | bool | absent → `false` | no | held out of rotation; this is the key `tcr disable` writes |
-| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | (arriving) pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Local to this file, never sent over the wire |
-| `egressStrict` | bool | `false` | no | (arriving) what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
+| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Local to this file, never sent over the wire |
+| `egressStrict` | bool | `false` | no | what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
 
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
 keep-warm; any other value is treated as a static key.
@@ -630,8 +630,8 @@ cache.
 | `announceName` | bool | `false` | hot | whether the discovery beacon includes `name`. Off leaves the beacon as presence and a port only; it never carries a key or a peer id either way |
 | `networkKey` | string (52-char base32) | absent | boot-time for the beacon, hot for a pairing request | the opt-in office password (`tcr peer network-key`); an admission ticket to the beacon layer, not an identity |
 | `maxHops` | int | `1` | boot-time | how many times a frame of this Mac's may be forwarded; `0` disables forwarding entirely, which is also what makes `tcr peer forget` mesh-wide again |
-| `internet` | bool | `false` | boot-time | (arriving) whether this Mac tries to be reached from off its own network at all (`tcr peer internet on\|off`). On: at boot and every 30 minutes, asks the router for a mapping on the listener's port and renews it before its 2-hour lifetime is up; the mapping is deleted both when this is turned off and at shutdown. Off leaves this Mac reachable on its LAN only |
-| `paths` | object | absent | hot | (arriving) policy for choosing which endpoint to dial: `paths.prefer` (`"direct"` or `"via"`), `paths.maxLossPct` (default `5`), `paths.viaAllow` (which peers may carry when `via` is preferred). Absent means the built-in order, direct first, newest endpoint first |
+| `internet` | bool | `false` | hot | whether this Mac tries to be reached from off its own network at all (`tcr peer internet on\|off`). A running `tcr` re-reads this switch on its own, so turning it on asks the router for a mapping on the listener's port within a few seconds and turning it off deletes the mapping the same way, neither needing a restart. While on, the mapping is renewed every 30 minutes, ahead of its 2-hour lifetime; it is also deleted at shutdown. Off leaves this Mac reachable on its LAN only |
+| `paths` | object | absent | hot | policy for choosing which endpoint to dial: `paths.prefer` (`"direct"` or `"via"`), `paths.maxLossPct` (default `5`), `paths.viaAllow` (which peers may carry when `via` is preferred). Absent means the built-in order, direct first, newest endpoint first |
 | `peers` | array of peer rows | `[]` | hot | one row per pinned peer, see below |
 | `pendingInvites` | array of invites | `[]` | hot | one-use join keys minted by `tcr peer invite` that have not been spent yet |
 

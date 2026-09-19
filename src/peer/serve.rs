@@ -587,6 +587,19 @@ pub struct ServeRequest {
     pub method: String,
     /// The already query-stripped request path.
     pub path: String,
+    /// The query string the borrower's client sent, without its `?`, when it
+    /// sent one.
+    ///
+    /// Apart from [`Self::path`] because the lender's own path gates match on
+    /// the path, and a query string that could decide one of those is a query
+    /// string that decides routing. The two are put back together only on the
+    /// URL the lender builds for its own proxy.
+    ///
+    /// `#[serde(default)]` so a frame from a build written before this field
+    /// existed still parses, and reads as the client having sent no query,
+    /// which is exactly what that build meant.
+    #[serde(default)]
+    pub query: Option<String>,
     /// Header names and values, **after the borrower's scrub**. Pairs rather
     /// than a map because a request may legitimately repeat a name.
     pub headers: Vec<(String, String)>,
@@ -730,6 +743,7 @@ pub fn serve_request_from(
         // build that relays a second method has one place to widen.
         method: ask.method.to_string(),
         path: ask.path.to_string(),
+        query: ask.query.map(str::to_string),
         headers,
         body_bytes: ask.body.len(),
         proto: PROTO_VERSION,
@@ -1273,6 +1287,56 @@ where
             held.scope_of(request.lease_id),
         )
     };
+    // THE LENDING HOURS, RE-READ PER RELAY and not only at the mint.
+    //
+    // The `--between` / `--days` schedule was consulted once, by `Ledger::grant`,
+    // and never again. A lease minted a minute before the window closed then
+    // kept serving on the owner's account until its own TTL or its `until`
+    // said otherwise, which for a `--for 7d` grant is days outside the hours
+    // the operator lent. An operator who writes "22:00-08:00" means the
+    // requests, not the paperwork.
+    //
+    // Here rather than in `Ledger::may_relay`: the schedule lives on the
+    // operator's own `LendGrant` in the peers file and the ledger holds no copy
+    // of it, so this is the first point on the serving path that can read the
+    // grant at all. Read fresh every relay, which is also what makes an
+    // operator's edit to the hours take effect on the next request rather than
+    // on the next mint.
+    //
+    // Before `enter_relay`, so a refusal takes no in-flight slot, and answered
+    // with the ack frame: nothing has been sent upstream, so the borrower still
+    // holds its body and may ask the next lender.
+    if let Some(window) = window {
+        let outside = store
+            .row(&session.peer)
+            .and_then(|row| {
+                row.grant_for(
+                    window,
+                    u64::try_from(now_ms / 1_000).unwrap_or(0),
+                    &|scope| {
+                        utilization.scope_restriction(scope) != ScopeRestriction::Unenforceable
+                    },
+                )
+                .and_then(crate::peer::config::LendGrant::schedule)
+            })
+            .and_then(|schedule| {
+                crate::peer::lease::schedule_refusal(
+                    Some(&schedule),
+                    time::OffsetDateTime::now_utc(),
+                )
+            });
+        if let Some(refusal) = outside {
+            tracing::info!(
+                peer = %session.peer.display(),
+                window = ?window,
+                "peer serve: this relay arrived outside the hours its grant was lent for, so \
+                 it is refused rather than served"
+            );
+            send_json(stream, session, &ServeAck::Refused { refusal }).await?;
+            return Ok(());
+        }
+    }
+
     // The owner's guard on THIS SCOPE's accounts, measured now, before
     // `enter_relay` reads it. A measurement found nothing in production wrote a
     // per-scope figure, so `may_relay` decided a group-scoped relay against the
@@ -1300,6 +1364,18 @@ where
         send_json(stream, session, &ack).await?;
         return Ok(());
     }
+    // THE SLOT, IN A GUARD FROM HERE ON. `enter_relay` took one and every path
+    // out of this function owes it back; they were three hand-placed
+    // `leave_relay` calls, and the `?` on the ack write below sat between two
+    // of them. A write failure there, or a poisoned ledger lock on either of
+    // the later releases, stranded the lease's in-flight count for its whole
+    // TTL: the borrower could not use the lease again and nothing on this Mac
+    // would ever put the slot back.
+    let mut slot = RelaySlot {
+        ledger,
+        lease_id: request.lease_id,
+        returned: false,
+    };
 
     // THE PICKER RESTRICTION, decided before anything is sent: a
     // lease scoped to a group or to named accounts may only ever be served by
@@ -1309,10 +1385,6 @@ where
     // strand the lease for its whole TTL.
     let restriction = utilization.scope_restriction(&scope);
     if restriction == ScopeRestriction::Unenforceable {
-        {
-            let mut held = ledger.lock().map_err(|_| anyhow!("ledger lock poisoned"))?;
-            held.leave_relay(request.lease_id);
-        }
         tracing::warn!(
             peer = %session.peer.display(),
             scope = %scope,
@@ -1345,10 +1417,6 @@ where
         // sent upstream, so this is still "not this lender" rather than an
         // outcome it has to treat as unknown.
         outcome => {
-            {
-                let mut held = ledger.lock().map_err(|_| anyhow!("ledger lock poisoned"))?;
-                held.leave_relay(request.lease_id);
-            }
             tracing::warn!(
                 peer = %session.peer.display(),
                 promised = request.body_bytes,
@@ -1394,7 +1462,12 @@ where
     // the lease this line is about to describe.
     let debited = {
         let mut held = ledger.lock().map_err(|_| anyhow!("ledger lock poisoned"))?;
+        // Under the SAME lock as the debit below, which is why this one release
+        // is still written by hand: nothing between them may move the lease the
+        // debit is about to describe. The guard is told so it does not give the
+        // slot back a second time.
         held.leave_relay(request.lease_id);
+        slot.returned = true;
         // Before the debit, so this request's tokens land on the path it
         // actually arrived over: `debit` is what charges the meter, and a note
         // written after it would credit the hour's first borrow to nowhere and
@@ -1471,6 +1544,53 @@ where
     Ok(())
 }
 
+/// The in-flight slot [`Ledger::enter_relay`] took, given back when it goes out
+/// of scope.
+///
+/// Every `Ok` from `enter_relay` owes exactly one `leave_relay`, and the pairing
+/// used to be three hand-placed calls on the three paths anybody had thought of.
+/// The `?` on the ack write sat between two of them, so a borrower that hung up
+/// while the ack was being written left the slot held, and a poisoned ledger
+/// lock on either of the later releases did the same. A lease whose in-flight
+/// count never comes down is refused `InFlightFull` for the rest of its TTL and
+/// nothing on this Mac puts it back.
+///
+/// A guard cannot be forgotten by a path added later, which is the whole reason
+/// it is one: the failure this replaces was not a wrong release, it was a
+/// release nobody wrote.
+struct RelaySlot<'a> {
+    ledger: &'a std::sync::Mutex<Ledger>,
+    lease_id: u128,
+    /// Set by the one caller that gives the slot back itself, under a lock it
+    /// is already holding for the debit. Without it the guard would release a
+    /// second slot that was never taken, and `leave_relay` saturates at zero,
+    /// so the double release would be silent.
+    returned: bool,
+}
+
+impl Drop for RelaySlot<'_> {
+    fn drop(&mut self) {
+        if self.returned {
+            return;
+        }
+        // A POISONED LOCK STILL GIVES THE SLOT BACK. `into_inner` on the
+        // poisoned guard is the honest call here: the alternative is the leak
+        // this type exists to stop, and a panic in a `Drop` during an unwind
+        // aborts the process. The ledger's other readers keep seeing the
+        // poison, so nothing is being hidden.
+        let mut held = match self.ledger.lock() {
+            Ok(held) => held,
+            Err(poisoned) => {
+                tracing::error!(
+                    "peer serve: the ledger lock is poisoned, so this relay's in-flight slot                      is being given back through it rather than left held for the lease's                      whole life"
+                );
+                poisoned.into_inner()
+            }
+        };
+        held.leave_relay(self.lease_id);
+    }
+}
+
 /// What the lender's own proxy answered.
 struct ServedResponse {
     status: u16,
@@ -1527,6 +1647,11 @@ async fn serve_on_own_account(
     let mut url = reqwest::Url::parse(upstream)
         .context("peer serve: this Mac's own proxy base is not a URL")?;
     url.set_path(&request.path);
+    // The client's own query, put back on AFTER the path gates have had the
+    // path alone. Dropping it sent the lender's own account a different
+    // question from the one the borrower's client asked, and answered that one
+    // instead; the direct path and the carry path both keep it.
+    url.set_query(request.query.as_deref());
     // And then the reading is checked against the base, but NOT because it is
     // the thing that stops a borrower-named host. This comment used to claim
     // that: "delete the `relay_path_is_routable` refusal above and feed this
@@ -1559,7 +1684,18 @@ async fn serve_on_own_account(
             url
         );
     }
-    let mut send = client.post(url).body(body);
+    // ONE HOP, AND THIS IS HOW THE NEXT PROXY KNOWS. The request below goes
+    // into this Mac's own proxy, which is a full proxy: if this fleet is dry it
+    // walks to the dry-fleet terminal and consults a fallback provider of its
+    // own, so a borrowed request could be borrowed onward, to a third Mac or
+    // back to the Mac that sent it. Each hop looks locally reasonable and the
+    // cycle is only visible from outside. See
+    // [`crate::proxy::RELAYED_HEADER_NAME`] for why presence is the whole
+    // signal and why a borrower that forges it can only refuse itself.
+    let mut send = client
+        .post(url)
+        .header(crate::proxy::RELAYED_HEADER_NAME, "1")
+        .body(body);
     for (name, value) in request
         .headers
         .iter()
@@ -2588,4 +2724,165 @@ async fn announce_punch(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tcr_peer_wire::{Lease, LeaseUnit};
+
+    /// A live lease this Mac has granted, with room for one relay.
+    fn lent(ledger: &mut Ledger, lease_id: u128, grantee: PeerId) {
+        let now = crate::now_ms();
+        ledger.record_scoped(
+            Lease {
+                lease_id,
+                window: Window::SevenDay,
+                unit: LeaseUnit::Fraction(0.50),
+                granted_at_ms: now,
+                expires_at_ms: now + 300_000,
+                spent: 0.0,
+                max_inflight: 1,
+                until: None,
+            },
+            grantee,
+            tcr_peer_wire::LendScope::All,
+        );
+        ledger.note_owner_headroom(Window::SevenDay, 0.30);
+    }
+
+    /// **The in-flight slot comes back on every way out, including the two that
+    /// used to leak it.**
+    ///
+    /// `enter_relay` takes a slot and it used to be given back by three
+    /// hand-placed calls, with the `?` on the ack write sitting between two of
+    /// them: a borrower that hung up while the ack was being written, or a
+    /// poisoned ledger lock on either later release, left the slot held and the
+    /// lease answered `InFlightFull` for the rest of its TTL.
+    ///
+    /// Both legs, because the poisoned one is the half a guard could easily get
+    /// wrong: a `lock()` that returns `Err` and is quietly ignored leaks
+    /// exactly what this replaces.
+    ///
+    /// Watched red: delete the `impl Drop for RelaySlot` body and the first
+    /// assertion reads 1; make the poisoned arm return instead of calling
+    /// `into_inner` and the second reads 1.
+    #[test]
+    fn a_relay_slot_is_given_back_when_its_guard_goes_out_of_scope() {
+        let grantee = PeerId([11_u8; 32]);
+        let lease_id = 0x5107_u128;
+        let ledger = std::sync::Mutex::new(Ledger::new());
+        {
+            let mut held = ledger.lock().expect("ledger lock");
+            lent(&mut held, lease_id, grantee);
+            held.enter_relay(lease_id, &grantee, 1, crate::now_ms())
+                .expect("the first relay is admitted");
+            assert_eq!(held.inflight(lease_id), 1, "the slot is taken");
+        }
+        {
+            let _slot = RelaySlot {
+                ledger: &ledger,
+                lease_id,
+                returned: false,
+            };
+        }
+        assert_eq!(
+            ledger.lock().expect("ledger lock").inflight(lease_id),
+            0,
+            "a guard that goes out of scope gives the slot back, whatever path took it there"
+        );
+
+        // AND THROUGH A POISONED LOCK. The ledger is the only thing that can
+        // put the slot back, so a guard that gives up on a poisoned lock leaks
+        // exactly what it exists to stop.
+        let ledger = std::sync::Arc::new(std::sync::Mutex::new(Ledger::new()));
+        {
+            let mut held = ledger.lock().expect("ledger lock");
+            lent(&mut held, lease_id, grantee);
+            held.enter_relay(lease_id, &grantee, 1, crate::now_ms())
+                .expect("the first relay is admitted");
+        }
+        let poisoner = std::sync::Arc::clone(&ledger);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.lock().expect("ledger lock");
+            panic!("a thread that dies holding the ledger");
+        })
+        .join();
+        assert!(panicked.is_err(), "the fixture really did poison the lock");
+        assert!(
+            ledger.lock().is_err(),
+            "positive control: the lock reads poisoned, or the leg below measures nothing"
+        );
+        {
+            let _slot = RelaySlot {
+                ledger: &ledger,
+                lease_id,
+                returned: false,
+            };
+        }
+        let held = match ledger.lock() {
+            Ok(held) => held,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            held.inflight(lease_id),
+            0,
+            "a poisoned ledger lock may not strand the lease's in-flight count for its whole \
+             life"
+        );
+    }
+
+    /// A slot the caller already gave back is not given back twice.
+    ///
+    /// The debit path releases under the same lock it debits on, so nothing
+    /// between the two can move the lease. `leave_relay` saturates at zero, so
+    /// a double release would be silent rather than loud, which is why this is
+    /// asserted with a SECOND relay in flight: the second slot is what a double
+    /// release would take away.
+    ///
+    /// Watched red: delete the `returned` early return from `Drop`.
+    #[test]
+    fn a_slot_the_caller_returned_is_not_returned_again() {
+        let grantee = PeerId([12_u8; 32]);
+        let lease_id = 0x5108_u128;
+        let ledger = std::sync::Mutex::new(Ledger::new());
+        {
+            let mut held = ledger.lock().expect("ledger lock");
+            let now = crate::now_ms();
+            held.record_scoped(
+                Lease {
+                    lease_id,
+                    window: Window::SevenDay,
+                    unit: LeaseUnit::Fraction(0.50),
+                    granted_at_ms: now,
+                    expires_at_ms: now + 300_000,
+                    spent: 0.0,
+                    max_inflight: 4,
+                    until: None,
+                },
+                grantee,
+                tcr_peer_wire::LendScope::All,
+            );
+            held.note_owner_headroom(Window::SevenDay, 0.30);
+            held.enter_relay(lease_id, &grantee, 1, now)
+                .expect("the first relay is admitted");
+            held.enter_relay(lease_id, &grantee, 2, now)
+                .expect("the second relay is admitted");
+            // The first request's own release, where the debit path writes it.
+            held.leave_relay(lease_id);
+        }
+        {
+            let _slot = RelaySlot {
+                ledger: &ledger,
+                lease_id,
+                returned: true,
+            };
+        }
+        assert_eq!(
+            ledger.lock().expect("ledger lock").inflight(lease_id),
+            1,
+            "the second relay is still in flight: a guard must not give back a slot its \
+             caller already returned"
+        );
+    }
 }

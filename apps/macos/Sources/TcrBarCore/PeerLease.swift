@@ -247,6 +247,41 @@ public enum LeaseEnd: Equatable, Hashable, Sendable {
         case .until(let clock): return "Until \(clock)"
         }
     }
+
+    /// The END an EDITING draft round-trips through, given the grant's own
+    /// stored absolute `until`. Shared by ``LeaseDraft/init(editing:peer:calendar:)``
+    /// and `PeersSettingsPane.endFor(_:)`, which is the point: those two used
+    /// to carry the same reduction written twice, and a fix landing in one
+    /// and not the other is exactly how a sheet and a row come to disagree
+    /// about the same lease.
+    ///
+    /// `--until 18:00` can only ever name a time TODAY (decision row 13, and
+    /// the fix to `parse_lend_end` REFUSES a clock already behind now rather
+    /// than rolling it to tomorrow). So a stored end that is on some OTHER
+    /// calendar day collapsed, the moment it round-tripped through here, to
+    /// today's clock, silently moving a lease that ended tomorrow at 18:00 to
+    /// end within the next few minutes, or, since the refusal landed, to a
+    /// Save that fails on a field the operator never touched.
+    ///
+    /// The fix keeps the date without inventing a second `--until` spelling
+    /// (rejected once already, see ``LeaseDraft/init(editing:peer:calendar:)``):
+    /// an end on a different day round-trips as `--for <remaining seconds>`
+    /// instead, an EXISTING spelling, resolved from the SAVE instant rather
+    /// than the instant this draft was opened. The few hundred milliseconds
+    /// between opening the sheet and pressing Save is not a figure any lease
+    /// here is precise to. Only an end still due today keeps the clock
+    /// spelling, which is what the sheet already showed the operator, and
+    /// changing that display for no reason would read like the field itself
+    /// had moved.
+    public static func editing(until: Int64?, now: Date, calendar: Calendar = .current) -> LeaseEnd {
+        guard let until else { return .none }
+        let untilDate = Date(timeIntervalSince1970: TimeInterval(until))
+        guard calendar.isDate(untilDate, inSameDayAs: now) else {
+            let remainingSeconds = max(1, Int(untilDate.timeIntervalSince(now).rounded(.up)))
+            return .after("\(remainingSeconds)s")
+        }
+        return .until(PeerLease.clock(unixSeconds: until, calendar: calendar))
+    }
 }
 
 /// The four numbers a lease carries, in one value.
@@ -568,19 +603,21 @@ public struct LeaseDraft: Equatable, Identifiable, Sendable {
 
     /// An existing lease, as the lender recorded it.
     ///
-    /// The end round-trips through the clock time the row shows, which is the
-    /// spelling `--until` takes. That loses the DATE of a lease ending
-    /// tomorrow; it is the same
-    /// limitation `PeersSettingsPane.endFor(_:)` already has, and inventing a
-    /// second spelling here would make the sheet and the row disagree.
-    public init(editing grant: PeerLendGrant, peer: String, calendar: Calendar = .current) {
+    /// The end round-trips through ``LeaseEnd/editing(until:now:calendar:)``,
+    /// which keeps the DATE of a lease ending some other day rather than
+    /// collapsing it to today's clock; see that function's own doc for why.
+    /// Shared with `PeersSettingsPane.endFor(_:)` for the reason a second
+    /// hand-written reduction here would risk again: the sheet and the row
+    /// disagreeing about the same lease.
+    public init(
+        editing grant: PeerLendGrant, peer: String, now: Date = Date(),
+        calendar: Calendar = .current
+    ) {
         self.peer = peer
         self.leaseId = grant.leaseId
         self.scope = grant.scope
         self.terms = grant.terms
-        self.end =
-            grant.until.map { .until(PeerLease.clock(unixSeconds: $0, calendar: calendar)) }
-            ?? .none
+        self.end = LeaseEnd.editing(until: grant.until, now: now, calendar: calendar)
         self.mode = grant.mode
     }
 
@@ -858,12 +895,26 @@ extension LeaseEnded {
                     + "being served on it. That Mac is the one that can lend it again.",
                 relendArguments: nil)
         }
+        // `PeerId::parse` refuses a name and the `tcr-…` display form; only
+        // the wire id is a peer argv `tcr` accepts. A row this build has not
+        // yet learned the wire id for (an untrusted or freshly-trusted row,
+        // see ``PeerEntry/id``'s own doc) gets a line saying why, never a
+        // Re-lend button built on `title`, which used to send a value the
+        // CLI refuses and read to the operator as a press that did nothing.
+        guard let peerId = entry.id else {
+            return LeaseEnded(
+                when: when,
+                sentence: "What you lent \(title) has ended, and it is kept here so you can "
+                    + "see what was lent. This build has not learned that Mac's wire id yet, "
+                    + "so it cannot Re-lend until it is seen again.",
+                relendArguments: nil)
+        }
         return LeaseEnded(
             when: when,
             sentence: "What you lent \(title) has ended, and it is kept here so you can see "
                 + "what was lent. Re-lend puts it back.",
             relendArguments: lent.first.map {
-                PeerCommand.lendRelend(peer: entry.id ?? title, leaseId: $0.leaseId)
+                PeerCommand.lendRelend(peer: peerId, leaseId: $0.leaseId)
             })
     }
 }

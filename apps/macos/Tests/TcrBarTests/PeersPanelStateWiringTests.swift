@@ -471,6 +471,30 @@ final class PeersPanelStateWiringTests: XCTestCase {
         XCTAssertNotNil(lent?.when, "an ended lease with a clock reports none")
     }
 
+    /// A row with no wire id yet (an untrusted or freshly-trusted Mac, see
+    /// `PeerEntry.id`'s own doc) must never build Re-lend argv from `title`:
+    /// `PeerId::parse` refuses a name, so that argv used to fail silently.
+    func testAnEndedLendWithNoWireIdRefusesRatherThanFallingBackToTheTitle() {
+        let now = Date(timeIntervalSince1970: 1_786_000_000)
+        let calendar = Calendar(identifier: .gregorian)
+        let noWireId = PeerListDocument.PeerEntry(
+            id: nil, name: "attic-nuc", trusted: true,
+            lend: [
+                PeerLendGrant(
+                    leaseId: "ls-4b1f", scope: .all, window: .week, fraction: 0.2,
+                    until: 1_785_998_200, ended: true)
+            ])
+        let lent = LeaseEnded.forEntry(
+            noWireId, title: "attic-nuc", now: now, calendar: calendar)
+        XCTAssertNil(
+            lent?.relendArguments,
+            "no wire id means no Re-lend argv, never one built on the title")
+        XCTAssertTrue(
+            lent?.sentence.contains("wire id") == true,
+            "the row says why Re-lend is unavailable rather than staying silent: "
+                + "\(lent?.sentence ?? "nil")")
+    }
+
     /// The tab has an ended arm at all and greys the row.
     func testTheTabDrawsAnEndedLease() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")

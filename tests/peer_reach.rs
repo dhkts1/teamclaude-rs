@@ -1336,10 +1336,11 @@ fn lan_scope_is_the_allow_list_row_14_names() {
 /// anywhere is answered" is exactly `listen: 0.0.0.0:7755` becoming a
 /// world-reachable socket on the loosest policy).
 ///
-/// What decides row 14 now is the BIND, not the switch: a listener bound to a
-/// LAN or loopback address answers everything, whatever the source, because
-/// nothing off the LAN can reach it without a mapping this node did not make.
-/// A listener bound to a globally routable address (`0.0.0.0` included) is
+/// What decides row 14 now is the BIND, not the switch: a listener bound to
+/// loopback answers everything, whatever the source, because nothing off this
+/// machine can dial it at all. A listener bound to anything else (`0.0.0.0`
+/// and a private address such as `10.0.0.5` included, since this node's own
+/// mapping keeper asks the router for a mapping on exactly such a bind) is
 /// answerable from off the LAN by construction, so from there on only a
 /// return visit or an enrolment is answered, independent of `peer.internet`,
 /// which [`internet_admission`] reads for one narrowing case only, measured
@@ -1353,7 +1354,7 @@ fn only_ik_is_answered_from_off_the_lan_when_the_bind_is_globally_routable() {
     let off_lan: IpAddr = "2001:db8::1".parse().expect("a documentation address");
     let on_lan: IpAddr = "10.0.0.7".parse().expect("an RFC 1918 address");
     let loopback: IpAddr = "127.0.0.1".parse().expect("loopback");
-    let lan_bind: IpAddr = "10.0.0.5".parse().expect("a private bind address");
+    let loopback_bind: IpAddr = "127.0.0.1".parse().expect("a loopback bind address");
     let global_bind: IpAddr = "0.0.0.0".parse().expect("an unspecified bind address");
 
     for pattern in [
@@ -1364,10 +1365,10 @@ fn only_ik_is_answered_from_off_the_lan_when_the_bind_is_globally_routable() {
         Handshake::Enrol,
     ] {
         assert_eq!(
-            listener::internet_admission(lan_bind, off_lan, pattern, false, &[]),
+            listener::internet_admission(loopback_bind, off_lan, pattern, false, &[]),
             InternetAdmission::Answer,
-            "bound to a LAN address, {pattern:?} from anywhere is answered: off the LAN \
-             cannot reach this socket without a mapping this node did not make"
+            "bound to loopback, {pattern:?} from anywhere is answered: nothing off this \
+             machine can dial this socket"
         );
         for lan in [on_lan, loopback] {
             assert_eq!(
@@ -1393,6 +1394,49 @@ fn only_ik_is_answered_from_off_the_lan_when_the_bind_is_globally_routable() {
             InternetAdmission::Answer,
             "{answered:?} carries something this node issued, so it reaches the pin check"
         );
+    }
+}
+
+/// **The gate for the private bind**: a Mac that binds its own LAN address is
+/// reachable from the internet as soon as the mapping keeper gets a mapping,
+/// and the keeper asks for one on any bind that is not loopback. The
+/// short-circuit that read the bind as "RFC 1918, therefore unreachable"
+/// therefore answered a knock and a first pairing from a stranger on exactly
+/// the configuration `listen: 10.0.0.5:7755` plus `internet on` produces.
+///
+/// Watch it fail by putting `is_lan_scope(bind)` back in place of
+/// `is_loopback_bind(bind)`: every assertion below flips to `Answer`.
+#[test]
+fn a_private_bind_refuses_a_knock_from_off_the_lan() {
+    let off_lan: IpAddr = "2001:db8::1".parse().expect("a documentation address");
+    let on_lan: IpAddr = "10.0.0.7".parse().expect("an RFC 1918 address");
+
+    for private_bind in ["10.0.0.5", "192.168.1.4", "172.16.9.9"] {
+        let bind: IpAddr = private_bind.parse().expect("a private bind address");
+        for pattern in [Handshake::Knock, Handshake::KnockPsk, Handshake::Pair] {
+            for internet in [false, true] {
+                assert_eq!(
+                    listener::internet_admission(bind, off_lan, pattern, internet, &[]),
+                    InternetAdmission::Refuse,
+                    "bound to {private_bind}, {pattern:?} from {off_lan} proves nothing this \
+                     node issued and a router mapping can carry it here"
+                );
+            }
+        }
+        for answered in [Handshake::Return, Handshake::Enrol] {
+            assert_eq!(
+                listener::internet_admission(bind, off_lan, answered, false, &[]),
+                InternetAdmission::Answer,
+                "bound to {private_bind}, {answered:?} still reaches the pin check"
+            );
+        }
+        for pattern in [Handshake::Knock, Handshake::Pair] {
+            assert_eq!(
+                listener::internet_admission(bind, on_lan, pattern, true, &[]),
+                InternetAdmission::Answer,
+                "and the LAN itself is untouched: {pattern:?} from {on_lan} is answered"
+            );
+        }
     }
 }
 

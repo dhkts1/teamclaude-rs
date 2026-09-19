@@ -2344,3 +2344,572 @@ async fn a_hello_arriving_while_the_peers_file_is_locked_leaves_the_runtime_free
     }
     holder.join().expect("the lock holder finishes");
 }
+
+/// **The gate for the punch bound**: a `PunchAt` frame spawns a task that
+/// sleeps to a slot boundary, up to thirty seconds, and then binds sockets.
+/// Nothing counted those tasks, so a pinned peer could hold as many sleeping
+/// tasks and as many pending binds as it managed to send frames. One punch per
+/// peer is the bound, because a peer cannot be punching two slots at once.
+///
+/// Driven through the guard rather than through a real punch: binding sockets
+/// and waiting out a slot boundary would measure the network. Watch it fail by
+/// making `PunchInFlight::acquire` ignore what the set insert returned, which
+/// is the unbounded behaviour this replaced.
+#[test]
+fn a_peer_gets_one_in_flight_punch_and_no_more() {
+    let admission = Arc::new(std::sync::Mutex::new(Admission::new()));
+    let peer = PeerId([7_u8; 32]);
+    let other = PeerId([9_u8; 32]);
+
+    let first =
+        listener::PunchInFlight::acquire(&admission, peer).expect("the first punch takes the slot");
+    assert!(
+        listener::PunchInFlight::acquire(&admission, peer).is_none(),
+        "a second PunchAt from the same peer, while the first is still sleeping to its slot \
+         boundary, takes no slot and spawns nothing"
+    );
+    let elsewhere = listener::PunchInFlight::acquire(&admission, other)
+        .expect("another peer's punch is not blocked by this one");
+    assert_eq!(
+        with_admission_arc(&admission, |guard| guard.punches_in_flight()),
+        2,
+        "the bound is per peer, so two peers punching at once is two slots"
+    );
+
+    drop(first);
+    assert_eq!(
+        with_admission_arc(&admission, |guard| guard.punches_in_flight()),
+        1,
+        "a punch that ended releases its slot, whether it connected or gave up"
+    );
+    let again = listener::PunchInFlight::acquire(&admission, peer)
+        .expect("and the peer can punch again once its last punch is done");
+
+    drop(again);
+    drop(elsewhere);
+    assert_eq!(
+        with_admission_arc(&admission, |guard| guard.punches_in_flight()),
+        0,
+        "nothing leaks: a peer that punched is not locked out for the life of the process"
+    );
+}
+
+// ===========================================================================
+// Cap: the stream header after an authenticated handshake
+// (`listener::STREAM_HEADER_TIMEOUT`, `listener::MAX_HEADERLESS_PER_PEER`)
+// ===========================================================================
+
+/// **A pinned peer that finishes its handshake and then says nothing is closed
+/// on a deadline, and the sessions it has waiting are counted.**
+///
+/// The pre-authentication socket slot is given back the instant a handshake
+/// completes, and until this deadline existed nothing counted what happened
+/// after: the task parked on the header read forever. The far side does not
+/// even have to stay: a replayed message 1 reaches the same state.
+///
+/// A real handshake over a real socket against the shipped accept loop,
+/// because what is under test is the state the loop is left in, not a verdict.
+/// Watch it fail by taking the `tokio::time::timeout` off the header read in
+/// `serve_stream`: the read below never returns and the outer timeout fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_authenticated_peer_that_never_sends_a_header_is_closed_on_a_deadline() {
+    let node = Node::new("headerless");
+    let client_dir = scratch("headerless-dialler");
+    let client = NodeKey::load_or_mint(&client_dir).expect("mint the dialler's key");
+
+    let mut file = node.file();
+    file.peers.push(PeerRow {
+        node: client.id(),
+        label: "dialler".to_string(),
+        endpoints: vec![Endpoint::direct(
+            "192.0.2.11:9600"
+                .parse()
+                .expect("a fixture address is a socket address"),
+            0,
+            EndpointSource::Paired,
+        )],
+        added_at: 1_700_000_000_000,
+        rendezvous_secret: None,
+        sees_us_at: None,
+        allow: Allow::default(),
+        lend: Vec::new(),
+    });
+    node.write_file(&file);
+
+    let context = node.context();
+    let addr = serve(context.clone()).await;
+    let mut stream = TcpStream::connect(addr).await.expect("dial the listener");
+
+    // The pinned dialler's own `IK`, finished, and then nothing.
+    let server_static = node.key.id().0;
+    let mut handshake = noise::initiator(&client, noise::PATTERN_RETURN, &server_static, None)
+        .expect("an IK initiator");
+    let mut scratch_bytes = vec![0_u8; noise::HANDSHAKE_SCRATCH_BYTES];
+    let len = handshake
+        .write_message(&[], &mut scratch_bytes)
+        .expect("IK message 1");
+    noise::write_frame(&mut stream, &scratch_bytes[..len])
+        .await
+        .expect("send message 1");
+    let message_2 = noise::read_frame(&mut stream)
+        .await
+        .expect("the responder answers a pinned IK");
+    let mut payload = vec![0_u8; noise::HANDSHAKE_SCRATCH_BYTES];
+    handshake
+        .read_message(&message_2, &mut payload)
+        .expect("read message 2");
+
+    // The session is authenticated and has sent no header: it is counted.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let waiting = with_admission(&context, |guard| guard.headerless_sessions(&client.id()));
+    assert_eq!(
+        waiting, 1,
+        "an authenticated session with no header yet must be counted, or the per-peer \
+         allowance counts nothing"
+    );
+
+    let started = std::time::Instant::now();
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(
+        listener::STREAM_HEADER_TIMEOUT * 3,
+        stream.read(&mut byte[..]),
+    )
+    .await
+    .expect("the listener closes a headerless session rather than parking on it forever");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the socket must be closed, not written to: {read:?}"
+    );
+    assert!(
+        started.elapsed() < listener::STREAM_HEADER_TIMEOUT * 2,
+        "the close took {:?} and the deadline is {:?}",
+        started.elapsed(),
+        listener::STREAM_HEADER_TIMEOUT
+    );
+
+    let after = with_admission(&context, |guard| guard.headerless_sessions(&client.id()));
+    assert_eq!(
+        after, 0,
+        "and the slot comes back on the deadline path, or the cap becomes a lockout"
+    );
+}
+
+/// **The allowance itself**: four sessions waiting for a header is all one peer
+/// gets, and each one gives its slot back.
+///
+/// Driven through the guard rather than four real handshakes, for the reason
+/// the punch bound is: what is under test is the counter.
+#[test]
+fn a_fifth_headerless_session_from_one_peer_is_refused() {
+    let admission = Arc::new(std::sync::Mutex::new(Admission::new()));
+    let peer = PeerId([11_u8; 32]);
+    let other = PeerId([12_u8; 32]);
+
+    let mut held = Vec::new();
+    for _ in 0..listener::MAX_HEADERLESS_PER_PEER {
+        held.push(
+            listener::HeaderlessSession::acquire(&admission, peer)
+                .expect("every session inside the allowance is taken"),
+        );
+    }
+    assert_eq!(
+        listener::HeaderlessSession::acquire(&admission, peer)
+            .err()
+            .expect("the session past the allowance is refused"),
+        listener::MAX_HEADERLESS_PER_PEER,
+        "the refusal reports what this peer already holds"
+    );
+    let elsewhere = listener::HeaderlessSession::acquire(&admission, other)
+        .expect("another peer is not shut out by this one");
+
+    held.pop();
+    let again = listener::HeaderlessSession::acquire(&admission, peer)
+        .expect("a session that ended gave its slot back");
+    drop(again);
+    drop(held);
+    drop(elsewhere);
+    assert_eq!(
+        with_admission_arc(&admission, |guard| guard.headerless_sessions(&peer)),
+        0,
+        "nothing leaks: a peer that waited is not locked out for the life of the process"
+    );
+}
+
+// ===========================================================================
+// Cap: the gateway's origin allow-list is a name AND a port
+// (`tunnel::allowed_origin`, `egress::PEER_EGRESS_PORT`)
+// ===========================================================================
+
+/// **A granted peer gets one port on an allow-listed name, not every service
+/// behind it.**
+///
+/// A blind hop can enforce host-and-port and nothing else, and the gateway used
+/// to read only the name: the port half lived on the asking node, which is the
+/// side a peer that wants to reach something else is not running. So a pinned
+/// peer could ask an allow-listed gateway for any port on `api.anthropic.com`,
+/// and the gateway dialled it.
+///
+/// Watch it fail by dropping the port comparison from `allowed_origin`: every
+/// refusal below becomes the allowed tuple.
+#[test]
+fn a_gateway_carries_an_allow_listed_name_on_one_port_only() {
+    use teamclaude_rs::peer::egress::{PEER_EGRESS_HOSTS, PEER_EGRESS_PORT};
+    use teamclaude_rs::peer::tunnel;
+
+    let peer = PeerId([13_u8; 32]);
+    let carried = tcr_peer_wire::TunnelTarget::Origin {
+        host: "api.anthropic.com".to_string(),
+        port: PEER_EGRESS_PORT,
+    };
+    assert_eq!(
+        tunnel::allowed_origin(&carried, PEER_EGRESS_HOSTS, peer).expect("the carried origin"),
+        ("api.anthropic.com", PEER_EGRESS_PORT),
+        "positive control: the one host-and-port this gateway exists to carry"
+    );
+
+    for port in [22_u16, 80, 8443, 9200] {
+        let elsewhere = tcr_peer_wire::TunnelTarget::Origin {
+            host: "api.anthropic.com".to_string(),
+            port,
+        };
+        let refusal = tunnel::allowed_origin(&elsewhere, PEER_EGRESS_HOSTS, peer)
+            .expect_err("a port this gateway does not carry is refused");
+        let said = format!("{refusal:#}");
+        assert!(
+            said.contains(&format!("port {PEER_EGRESS_PORT}")),
+            "the refusal must name the port that IS carried, so an operator reading the log \
+             knows what was asked and what is allowed: {said}"
+        );
+    }
+
+    let unknown = tcr_peer_wire::TunnelTarget::Origin {
+        host: "example.com".to_string(),
+        port: PEER_EGRESS_PORT,
+    };
+    assert!(
+        tunnel::allowed_origin(&unknown, PEER_EGRESS_HOSTS, peer).is_err(),
+        "and the name half is unchanged: a host off the list is still refused"
+    );
+}
+
+// ===========================================================================
+// Cap: a banned key stays banned on every arm, enrolment included
+// ===========================================================================
+
+/// **A blocked key holding a live invite still gets nothing.**
+///
+/// The Pair arm and the Return arm both refuse a banned static key inside the
+/// pin callback, before message 2 is written. The enrolment arm did not, and
+/// its authorization is a PSK anybody with the invite holds, so a key the
+/// operator blocked could dial from an address the ban does not name and
+/// enrol. A ban an invite silently lifts is not a ban.
+///
+/// Both halves are here on one listener: the blocked key gets zero bytes back,
+/// and a second key with the same invite is answered, which is what makes the
+/// first assertion about the BAN rather than about a broken invite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_banned_key_is_refused_on_the_enrolment_arm_too() {
+    let node = Node::new("enrol-ban");
+    let blocked = NodeKey::load_or_mint(&scratch("enrol-ban-blocked")).expect("the blocked key");
+    let welcome = NodeKey::load_or_mint(&scratch("enrol-ban-welcome")).expect("a second joiner");
+    let invite_secret = [3_u8; 32];
+
+    let mut file = node.file();
+    file.pending_invites.push(config::PendingInvite {
+        id: 1,
+        label: "joiner".to_string(),
+        secret: invite_secret,
+        expires_at_ms: pair::now_ms() + 600_000,
+        uses_left: 5,
+    });
+    node.write_file(&file);
+
+    // Banned by KEY at an address this test never dials from, so the address
+    // half of the ban cannot be what refuses the connection below.
+    let mut peer_state = node.state();
+    peer_state.ban(
+        "192.0.2.77",
+        Some(blocked.id()),
+        state::BanReason::Blocked,
+        pair::now_ms(),
+    );
+    node.write_state(&peer_state);
+
+    let addr = serve(node.context()).await;
+    let server_static = node.key.id().0;
+
+    let offered = |joiner: &NodeKey| {
+        let secret = *joiner.secret_bytes();
+        async move {
+            let mut stream = TcpStream::connect(addr).await.expect("dial the listener");
+            let mut handshake = noise::initiator_with_secret(
+                &secret,
+                noise::PATTERN_ENROL,
+                Some(&server_static),
+                Some(&invite_secret),
+            )
+            .expect("an IKpsk1 initiator");
+            let mut scratch_bytes = vec![0_u8; noise::HANDSHAKE_SCRATCH_BYTES];
+            let len = handshake
+                .write_message(&[], &mut scratch_bytes)
+                .expect("enrolment message 1");
+            noise::write_frame(&mut stream, &scratch_bytes[..len])
+                .await
+                .expect("send message 1");
+            tokio::time::timeout(Duration::from_secs(15), noise::read_frame(&mut stream))
+                .await
+                .expect("the listener answers or closes within the handshake deadline")
+        }
+    };
+
+    let refused = offered(&blocked).await;
+    assert!(
+        refused.is_err(),
+        "a blocked key must get nothing back, invite or no invite: {refused:?}"
+    );
+
+    let answered = offered(&welcome).await;
+    assert!(
+        answered.is_ok(),
+        "positive control: the same invite from a key nobody blocked is answered, so the \
+         refusal above is the ban and not a broken invite: {answered:?}"
+    );
+}
+
+// ===========================================================================
+// Cap: the hop budget on a forwarded frame is this Mac's, not the sender's
+// ===========================================================================
+
+/// **A frame that arrives carrying more hops than this Mac grants is refused,
+/// not clamped into a log line.**
+///
+/// `hops_remaining` is a number the requester wrote. The clamp was applied to
+/// the onward count, which rides on nothing (a blind forward writes no header
+/// of its own), so a requester that asked for 255 hops was authorized on the
+/// budget it had chosen for itself and only a log field disagreed.
+///
+/// Watch it fail by taking the arrival refusal out of `authorize_forward`: the
+/// over-ask below comes back as a plan.
+#[test]
+fn a_forward_asking_for_more_hops_than_this_mac_grants_is_refused() {
+    use teamclaude_rs::peer::config::PeerStore;
+    use teamclaude_rs::peer::tunnel::{self, Carry, Forward, OriginRoute, TunnelBudget};
+
+    let requester = PeerId([21_u8; 32]);
+    let target = PeerId([22_u8; 32]);
+    let me = PeerId([23_u8; 32]);
+    let max_hops = 1_u8;
+
+    let relay_row = |node: PeerId, label: &str, relay: bool| PeerRow {
+        node,
+        label: label.to_string(),
+        endpoints: vec![Endpoint::direct(
+            "192.0.2.30:9600"
+                .parse()
+                .expect("a fixture address is a socket address"),
+            0,
+            EndpointSource::Paired,
+        )],
+        added_at: 1_700_000_000_000,
+        rendezvous_secret: None,
+        sees_us_at: None,
+        allow: Allow {
+            relay,
+            ..Allow::default()
+        },
+        lend: Vec::new(),
+    };
+    let path = scratch("forward-hops").join("tcr-peers.json");
+    config::save(
+        &path,
+        &PeerFile {
+            max_hops,
+            peers: vec![
+                relay_row(requester, "asker", true),
+                relay_row(target, "onward", false),
+            ],
+            ..PeerFile::default()
+        },
+    )
+    .expect("write the peers file");
+    let store = PeerStore::open(&path).expect("open the peers file");
+
+    let asked = tcr_peer_wire::TunnelTarget::Peer { node: target };
+    let decide = |hops_remaining: u8| {
+        let budget = std::sync::Mutex::new(TunnelBudget::new());
+        tunnel::authorize_forward(
+            &Carry {
+                route: OriginRoute::Peer(target),
+                peer: requester,
+                target: &asked,
+                hosts: teamclaude_rs::peer::egress::PEER_EGRESS_HOSTS,
+                cap_bytes: 1024 * 1024,
+                budget: &budget,
+                now_ms: 1_767_225_600_000,
+            },
+            &Forward {
+                store: &store,
+                node: me,
+                hops_remaining,
+                via: &[],
+            },
+        )
+    };
+
+    let plan = decide(max_hops).expect("positive control: a frame inside the budget is forwarded");
+    assert_eq!(
+        plan.onward_hops, 0,
+        "one hop is spent here, and this Mac's budget was one"
+    );
+
+    for over_ask in [max_hops + 1, 8, u8::MAX] {
+        let refusal = decide(over_ask).expect_err("a frame over this Mac's budget is refused");
+        let said = format!("{refusal:#}");
+        assert!(
+            said.contains("maxHops"),
+            "the refusal must name the setting that refused it: {said}"
+        );
+    }
+}
+
+// ===========================================================================
+// A carry that died inside the pump is not a carry that finished
+// ===========================================================================
+
+/// **A frame that does not decrypt ends the pump, and the splice cannot see
+/// it.**
+///
+/// The pump copies PLAINTEXT, so a frame that failed to decrypt under the
+/// session key reaches a reader as an ordinary end of stream:
+/// `NoiseStream::finish` is the only thing that reports what really happened,
+/// and until now nothing in `src/` called it, so a carry that died was logged
+/// as "carried". Both splice callers in `tunnel` await it now.
+///
+/// Watch it fail by making `finish` return `Ok(())` without awaiting the pump.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_carried_stream_that_died_reports_it_through_finish() {
+    use tokio::io::AsyncReadExt as _;
+
+    let responder = NodeKey::load_or_mint(&scratch("pump-responder")).expect("a responder key");
+    let dialler = NodeKey::load_or_mint(&scratch("pump-dialler")).expect("a dialler key");
+    let responder_static = responder.id().0;
+    let pinned = dialler.id();
+
+    let (mut theirs, mut ours) = tokio::io::duplex(8192);
+    let responder_secret = *responder.secret_bytes();
+    let accepting = tokio::spawn(async move {
+        let session = noise::accept_handshake(
+            &mut ours,
+            &responder_secret,
+            noise::Handshake::Return,
+            &[],
+            move |_remote| Ok(pinned),
+        )
+        .await
+        .expect("the responder's handshake");
+        (ours, session)
+    });
+    let _dialled = noise::dial_handshake(
+        &mut theirs,
+        dialler.secret_bytes(),
+        noise::Handshake::Return,
+        Some(&responder_static),
+        None,
+    )
+    .await
+    .expect("the dialler's handshake");
+    let (ours, session) = accepting.await.expect("the responder task");
+
+    let mut carried = teamclaude_rs::peer::tunnel::NoiseStream::start(ours, session);
+    // Not a frame this session can open: the pump breaks on it.
+    noise::write_frame(&mut theirs, &[0_u8; 64])
+        .await
+        .expect("write a frame the session key cannot open");
+
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), carried.read(&mut byte[..]))
+        .await
+        .expect("the carried stream ends rather than hanging");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the reader sees an ordinary end of stream, which is exactly why finish exists: \
+         {read:?}"
+    );
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), carried.finish())
+        .await
+        .expect("the pump joins");
+    let said = format!(
+        "{:#}",
+        ended.expect_err("the pump ended on a decrypt failure")
+    );
+    assert!(
+        said.contains("did not decrypt"),
+        "finish must say what ended the carry, so a gateway does not log a dead carry as \
+         carried: {said}"
+    );
+}
+
+/// **The local end hanging up does not throw away the reply already in
+/// flight.**
+///
+/// `Ok(0)` on the local read ended the whole pump, so on a gateway carry the
+/// origin's reply was dropped the moment the client closed its own half. A
+/// half-close ends one direction; the other runs until the peer closes it or
+/// the drain deadline passes.
+///
+/// Watch it fail by breaking the pump on `Ok(0)` again: the read below returns
+/// zero bytes instead of the reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_end_that_closes_still_gets_what_the_peer_already_sent() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let responder = NodeKey::load_or_mint(&scratch("half-close-responder")).expect("a key");
+    let dialler = NodeKey::load_or_mint(&scratch("half-close-dialler")).expect("a key");
+    let responder_static = responder.id().0;
+    let pinned = dialler.id();
+
+    let (mut theirs, mut ours) = tokio::io::duplex(8192);
+    let responder_secret = *responder.secret_bytes();
+    let accepting = tokio::spawn(async move {
+        let session = noise::accept_handshake(
+            &mut ours,
+            &responder_secret,
+            noise::Handshake::Return,
+            &[],
+            move |_remote| Ok(pinned),
+        )
+        .await
+        .expect("the responder's handshake");
+        (ours, session)
+    });
+    let mut dialled = noise::dial_handshake(
+        &mut theirs,
+        dialler.secret_bytes(),
+        noise::Handshake::Return,
+        Some(&responder_static),
+        None,
+    )
+    .await
+    .expect("the dialler's handshake");
+    let (ours, session) = accepting.await.expect("the responder task");
+
+    let mut carried = teamclaude_rs::peer::tunnel::NoiseStream::start(ours, session);
+    // The local end is done talking, and is still there to be answered.
+    carried.shutdown().await.expect("half-close the local end");
+
+    let reply = b"a reply the far end was already sending";
+    noise::send_encrypted(&mut theirs, &mut dialled.transport, reply)
+        .await
+        .expect("the peer writes its reply after the local end closed");
+
+    let mut back = vec![0_u8; reply.len()];
+    tokio::time::timeout(Duration::from_secs(5), carried.read_exact(&mut back))
+        .await
+        .expect("the reply arrives rather than the pump having ended")
+        .expect("every byte of the reply");
+    assert_eq!(
+        back, reply,
+        "a half-closed local end must still be handed what the peer sent"
+    );
+}

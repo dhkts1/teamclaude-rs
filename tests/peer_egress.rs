@@ -38,7 +38,7 @@ use teamclaude_rs::config::{Account, Config, PacingConfig, ProxyConfig, Throttle
 use teamclaude_rs::manager::Manager;
 use teamclaude_rs::oauth::{OAuthError, RefreshFuture, TokenRefresher};
 use teamclaude_rs::peer::config::{Allow, Endpoint, EndpointSource, PeerFile, PeerRow};
-use teamclaude_rs::peer::egress::{self, EgressState, GatewayCandidate, ViaSetting};
+use teamclaude_rs::peer::egress::{self, GatewayCandidate, ViaSetting};
 use teamclaude_rs::peer::listener;
 use teamclaude_rs::peer::noise::{self, Handshake};
 use teamclaude_rs::peer::tunnel::{self, Admission, Carry, OriginRoute, TunnelBudget};
@@ -225,6 +225,150 @@ async fn serve_one_carry(
     .await
 }
 
+/// A gateway that takes the carry and then writes RUBBISH into the peer
+/// stream, so the requester's own pump fails to decrypt.
+///
+/// This is the shape the requester-side splice could not see: the splice
+/// copies the PLAINTEXT half, so a frame that never decrypted reaches it as a
+/// clean end of stream and is indistinguishable there from a carry that
+/// finished. The failure exists only inside the pump, which is what
+/// `NoiseStream::finish` reports.
+fn gateway_that_corrupts(
+    listener: TcpListener,
+    secret: [u8; 32],
+    rows: Vec<PeerRow>,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await?;
+        let pin_rows = rows.clone();
+        let mut session = noise::accept_handshake(
+            &mut stream,
+            &secret,
+            noise::Handshake::Return,
+            &[],
+            move |remote| noise::pin_check_rows(remote, &pin_rows),
+        )
+        .await?;
+        // The header the requester sends, read so the carry is genuinely
+        // under way before anything goes wrong.
+        let _ = noise::recv_encrypted(&mut stream, &mut session.transport).await?;
+        // A frame with a valid LENGTH and a body that is not a Noise frame:
+        // the framer hands it over and the decrypt is what fails, which is a
+        // pump error rather than a closed socket.
+        let rubbish = [0x5a_u8; 64];
+        stream
+            .write_all(&u32::try_from(rubbish.len())?.to_be_bytes())
+            .await?;
+        stream.write_all(&rubbish).await?;
+        stream.flush().await?;
+        // Held open: a close here would be an ordinary end of stream and the
+        // pump would report nothing at all.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        Ok(())
+    })
+}
+
+/// **A requester-side carry that died inside the peer stream says WHY, from the
+/// pump that knows.**
+///
+/// The gateway's own two splices awaited `NoiseStream::finish` and this one
+/// dropped its stream, so whatever ended the pump went on the floor. The log
+/// line is the whole record of a stream nobody may read, and it said only that
+/// the splice failed: not that the frames had stopped decrypting.
+///
+/// Measured rather than assumed, and the first version of this test was wrong
+/// about it: a pump that dies takes the duplex with it, so the splice ends in
+/// an error too and the line is still "failed mid-stream". What the awaited
+/// `finish()` adds is the `pump_error` field beside it, which is the half no
+/// other reader has. Asserting only on the message would have passed without
+/// the fix.
+///
+/// Watch it fail by dropping the `finish()` await in
+/// `egress::accept_once_splice`: the line stays, and `pump_error` is empty.
+#[tokio::test]
+async fn a_carry_that_died_inside_the_peer_stream_is_not_logged_as_carried() {
+    let (collector, _guard) = capture();
+    let requester = node();
+    let gateway = node();
+
+    let gateway_listener = loopback().await;
+    let gateway_addr = gateway_listener.local_addr().expect("the gateway address");
+    let gateway_task = gateway_that_corrupts(
+        gateway_listener,
+        gateway.secret,
+        vec![row(&requester.id, "requester", Vec::new(), true)],
+    );
+
+    let splice = egress::accept_once_splice(
+        &row(
+            &gateway.id,
+            "gateway",
+            vec![gateway_addr.to_string()],
+            false,
+        ),
+        &requester.secret,
+        ORIGIN,
+        443,
+    )
+    .await
+    .expect("the gateway takes the carry");
+
+    // One local connection, a byte so the pump has something to fail on, and
+    // then CLOSED. The close is load-bearing: it ends the local-to-peer
+    // direction cleanly, so the splice itself returns Ok and the only thing
+    // that knows the carry died is the pump. Hold the socket open instead and
+    // the splice errors on its own, which is an ending the old code reported
+    // too, and the gate below would pass without the fix.
+    {
+        let mut local = TcpStream::connect(("127.0.0.1", splice.port))
+            .await
+            .expect("dial the loopback splice");
+        local.write_all(b"GET / HTTP/1.1\r\n").await.ok();
+        let _ = local.flush().await;
+        let _ = local.shutdown().await;
+    }
+
+    // Waited for by its own log line rather than by joining the task: the
+    // handle is private on purpose (`PeerSplice::task`, so a streamed response
+    // can outlive the function that started it), and widening a production
+    // type for a test's convenience is the wrong trade.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let ending = loop {
+        let events = collector.events();
+        if let Some(event) = events.iter().find(|event| {
+            event
+                .message
+                .contains("the carry ended inside the peer stream")
+                || event.message.contains("the carry failed mid-stream")
+                || event.message == "peer egress: carried"
+        }) {
+            break event.clone();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the splice logged no ending at all within 5s: {:?}",
+            collector.messages()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
+    let _ = gateway_task.await;
+
+    assert_ne!(
+        ending.message, "peer egress: carried",
+        "a carry whose frames stopped decrypting is not a carry: {ending:?}"
+    );
+    let pump = ending
+        .fields
+        .get("pump_error")
+        .map(|value| value.trim_matches('"').to_string())
+        .unwrap_or_default();
+    assert!(
+        !pump.is_empty(),
+        "the line carries the pump's own ending, which is the only place a frame that \
+         failed to decrypt is visible at all: {ending:?}"
+    );
+}
+
 /// [`gateway_on`], serving `times` carries one after another.
 ///
 /// A pinned account is supposed to leave through the same Mac on EVERY
@@ -408,6 +552,10 @@ async fn loopback() -> TcpListener {
 const CARRIED_RESPONSE_HEAD: &str = concat!(
     "HTTP/1.1 200 OK\r\n",
     "content-type: application/json\r\n",
+    // REPEATED deliberately: a header build that replaces rather than appends
+    // hands the client the last value only. See the cookie assertion below.
+    "set-cookie: first=1\r\n",
+    "set-cookie: second=2\r\n",
     "content-length: 2\r\n",
     "request-id: req_carried\r\n",
     "anthropic-organization: not-the-id\r\n",
@@ -499,6 +647,25 @@ async fn a_carried_response_never_hands_the_client_the_serving_accounts_headers(
             .map(|value| value.to_str().expect("ascii")),
         Some("not-the-id"),
         "the family is a prefix match, not a substring one"
+    );
+    // **A REPEATED HEADER KEEPS EVERY VALUE.** The header build used `insert`,
+    // which REPLACES, while the direct path uses `append`: a response that
+    // legitimately repeats a name (`set-cookie` every day, `warning` and
+    // `link` besides) reached the client with its last value only, so a
+    // carried answer quietly carried less than a directly-served one.
+    //
+    // Watched red: put `insert` back and only `second=2` arrives.
+    let cookies: Vec<&str> = carried
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().expect("ascii"))
+        .collect();
+    assert_eq!(
+        cookies,
+        ["first=1", "second=2"],
+        "a carried response keeps every value of a repeated header, the way the direct \
+         path does"
     );
     assert_eq!(
         carried
@@ -1216,23 +1383,6 @@ fn resolve_via_never_substitutes_a_mac_the_operator_did_not_choose() {
         egress::resolve_via(&ViaSetting::pinned(addressless), &candidates).is_empty(),
         "a pinned Mac with no address is not reachable and is not substituted"
     );
-}
-
-/// The cached belief about the direct path, and what it is allowed to decide.
-#[test]
-fn the_direct_path_goes_cold_and_comes_back() {
-    let now = 1_767_225_600_000_i64;
-    assert!(EgressState::Healthy.direct_is_worth_trying(now));
-    let cold = EgressState::Cold {
-        until_ms: now + egress::COLD_MS,
-    };
-    assert!(!cold.direct_is_worth_trying(now));
-    assert!(cold.direct_is_worth_trying(now + egress::COLD_MS));
-    // The skeleton's `pick_egress` has no candidate set, so the only honest
-    // answer it can give is "no peer", and it must not invent one. This
-    // report carries the signature note.
-    assert_eq!(egress::pick_egress(EgressState::Healthy, now), None);
-    assert_eq!(egress::pick_egress(cold, now), None);
 }
 
 /// Deny by default, on the requester's side too: a host the mesh does not carry
@@ -3769,4 +3919,67 @@ fn an_unpinned_account_writes_no_egress_keys() {
         teamclaude_rs::config::EgressPin::default(),
         "and absent reads as the default it stood for, which is the whole of the round trip"
     );
+}
+
+/// **The dry-fleet terminal's doc may not say the fallback provider is absent
+/// on this branch.** It is installed at boot and the arm is live.
+///
+/// The comment read "inert until a phase returns a provider from
+/// `fallback::configured_provider`, which is `None` today, so this is
+/// byte-for-byte `exhausted_response` on this branch", while
+/// `server.rs` installs one from the peers file and then `expect`s it back.
+/// A reader who believes that sentence concludes that nothing downstream of the
+/// terminal can run, which is how a live borrow loop gets reasoned about as
+/// dead code.
+///
+/// A doc gate rather than a behaviour one because the behaviour is already
+/// covered (`tests/peer_lease.rs` drives a real borrow through this arm); what
+/// was wrong was only the sentence, and the failure worth catching is that
+/// sentence coming back.
+///
+/// Watched red: restore the "which is `None` today" clause to the doc block
+/// above `exhausted_or_fallback` in `src/proxy.rs`.
+#[test]
+fn the_dry_fleet_terminals_doc_does_not_call_the_fallback_arm_dead() {
+    let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/proxy.rs"))
+        .expect("the proxy's source is readable from the workspace root");
+    let lines: Vec<&str> = source.lines().collect();
+
+    // The doc block is the run of `///` lines immediately above the function,
+    // walked upwards from the signature. Anchored on the signature rather than
+    // on a line number, and the `expect` below is the positive control: a
+    // renamed or moved function fails this test loudly instead of scanning an
+    // empty span and passing.
+    let signature = lines
+        .iter()
+        .position(|line| line.starts_with("async fn exhausted_or_fallback("))
+        .expect(
+            "positive control failed: no `exhausted_or_fallback` in src/proxy.rs, so the doc \
+             block below is measuring nothing. If the dry-fleet terminal was renamed, rename \
+             it here too.",
+        );
+    let mut first = signature;
+    while first > 0 && lines[first - 1].trim_start().starts_with("///") {
+        first -= 1;
+    }
+    let doc = lines[first..signature].join("\n").to_lowercase();
+    assert!(
+        doc.contains("configured_provider"),
+        "positive control failed: the terminal's doc block no longer names the call it is \
+         about, so this gate is reading the wrong span: {doc}"
+    );
+
+    for claim in [
+        "which is `none` today",
+        "is `none` today",
+        "inert until",
+        "byte-for-byte",
+    ] {
+        assert!(
+            !doc.contains(claim),
+            "the dry-fleet terminal's doc claims the fallback arm cannot run ({claim}), but \
+             the boot sequence installs a provider from the peers file and `server.rs` then \
+             expects it back: {doc}"
+        );
+    }
 }
