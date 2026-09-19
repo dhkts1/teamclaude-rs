@@ -33,11 +33,19 @@
 //!
 //! # Nothing calls this yet
 //!
-//! This file is the crypto and the naming. There is no store client, no
-//! publisher task and no endpoint source here: those are separate changes and
-//! none of this runs at boot.
+//! This file is the crypto, the naming and the surface client. There is no
+//! publisher task and no endpoint source here, nothing reads a config key and
+//! nothing is spawned at boot: those are separate changes, and until one of
+//! them lands no code outside this file calls anything in it.
+//!
+//! # The surface is a seam, and only a seam
+//!
+//! [`DeadDropStore`] is an opaque name in and opaque bytes out, the rule
+//! [`crate::peer::reach::PunchNet`] is written to. Naming, sealing, freshness
+//! and every refusal above the wire are the shipped code in every test, so a
+//! backend swaps what a remote surface would have been and nothing else.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -460,4 +468,306 @@ pub fn open(
     }
 
     Ok(record)
+}
+
+// ---------------------------------------------------------------------------
+// The surface
+// ---------------------------------------------------------------------------
+
+/// The most of one answer this client will hold.
+///
+/// A sealed record is a few hundred bytes: four addresses, a peer id and three
+/// integers, sealed. 64 KiB is far above anything this writes and far below
+/// anything worth calling memory pressure. The figure is a choice and not a
+/// measurement, the shape [`crate::peer::reach_upnp::MAX_BODY_BYTES`] states:
+/// big enough that no honest surface trips it, small enough that a surface
+/// which answers forever cannot stream this node out of memory.
+pub const MAX_STORED_RECORD_BYTES: usize = 64 * 1024;
+
+/// How long one call may take before it is abandoned.
+///
+/// A drop call is one round trip to a host on the internet and it is never on
+/// anybody's critical path: a dial falls through to the order it would have
+/// used anyway. Ten seconds is generous for the call and short enough that a
+/// surface which accepts a connection and then says nothing cannot hold a task
+/// open.
+pub const STORE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The hole a template must carry, and the only substitution made in one.
+const NAME_PLACEHOLDER: &str = "{name}";
+
+/// Why a call to the surface did not succeed.
+///
+/// Absence is NOT in here: nothing at a name is `Ok(None)`, an ordinary
+/// outcome, the shape `reach_upnp` gives a router that declines.
+///
+/// Four variants and not one, for the reason [`RecordRefusal`] has seven: "the
+/// host never answered", "the host answered 403", "the host answered with a
+/// gigabyte" and "the host accepted the connection and then went quiet" are
+/// four different things for an operator to go and fix, and a refusal that
+/// answers one word for all four is one nobody can act on.
+///
+/// No variant carries the URL. A template may hold a credential in its path or
+/// its query, and `reqwest` puts the URL it was given into its own `Display`,
+/// so the source error is stripped of it with
+/// [`reqwest::Error::without_url`] before it is ever held here. The drop name
+/// is what a refusal names instead: it is the one identifier that is already
+/// opaque to everybody but the pair.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreRefusal {
+    /// The call never reached a server: DNS, the connection, or TLS.
+    #[error("dead drop: the surface could not be reached for {name}: {source}")]
+    Unreachable {
+        name: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    /// A server answered, with a status that is not a success and not the 404
+    /// that means "nothing here".
+    #[error("dead drop: the surface answered {status} for {name}")]
+    Status { status: u16, name: String },
+    /// The answer passed [`MAX_STORED_RECORD_BYTES`] while it was being read.
+    #[error("dead drop: the answer for {name} passed the {ceiling}-byte ceiling")]
+    TooLarge { name: String, ceiling: usize },
+    /// The call ran past [`STORE_TIMEOUT`], connecting or reading.
+    #[error("dead drop: the surface did not answer for {name} within {within_ms}ms")]
+    TimedOut { name: String, within_ms: u128 },
+}
+
+/// A dumb public key-value surface: an opaque name in, opaque bytes out.
+///
+/// The seam is the transport and nothing above it. Naming, sealing, freshness
+/// and admissibility are the shipped code in every test; a backend swaps only
+/// what a remote surface would have been. The rule
+/// [`crate::peer::reach::PunchNet`] is written to, for the same reason and in
+/// the same shape.
+pub trait DeadDropStore {
+    /// Place `record` at `name`, replacing whatever was there.
+    fn put(
+        &self,
+        name: &DropName,
+        record: &[u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), StoreRefusal>> + Send;
+
+    /// Read what is at `name`.
+    ///
+    /// `Ok(None)` is "nothing there": an ordinary outcome and not an error,
+    /// the shape `reach_upnp` gives a router that declines.
+    fn get(
+        &self,
+        name: &DropName,
+    ) -> impl std::future::Future<Output = std::result::Result<Option<Vec<u8>>, StoreRefusal>> + Send;
+}
+
+/// The backend that ships first: one URL template with a `{name}` hole, `PUT`
+/// and `GET`, and an optional bearer token.
+///
+/// Redirects are OFF, the shape `reach_upnp::fetch` already uses: a surface
+/// that redirects a `PUT` somewhere else is a surface doing something this
+/// node did not ask for, and the name is the one thing that must not move.
+/// Proxies are off for the reason `peer::serve` and `peer::lease` give, an
+/// ambient `HTTP_PROXY` very commonly points AT this program.
+///
+/// The token is held here and nowhere else: it is not in `Debug`, not in a
+/// refusal and not in any line this module writes.
+pub struct HttpsTemplateStore {
+    template: String,
+    /// The host the template names, kept for `Debug` alone: it is the part of
+    /// a template that can carry no credential.
+    host: String,
+    token: Option<String>,
+    client: reqwest::Client,
+    timeout: Duration,
+}
+
+impl std::fmt::Debug for HttpsTemplateStore {
+    /// The template and the token are deliberately not printed. A template can
+    /// carry a credential in its userinfo, its path or its query, and the
+    /// token is a credential outright; the host is what identifies this store
+    /// to somebody reading a line, and it can hold neither.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpsTemplateStore")
+            .field("host", &self.host)
+            .field("token", &if self.token.is_some() { "set" } else { "unset" })
+            .finish()
+    }
+}
+
+impl HttpsTemplateStore {
+    /// Build one from the configured template, at [`STORE_TIMEOUT`].
+    pub fn new(template: &str, token: Option<&str>) -> Result<Self> {
+        Self::with_timeout(template, token, STORE_TIMEOUT)
+    }
+
+    /// The same, with the call timeout chosen.
+    ///
+    /// Every refusal below is answered HERE and not at the first `PUT`: a
+    /// template that can never work is an operator's typo, and the moment to
+    /// say so is the moment it is read, not an hour later inside a background
+    /// task whose output nobody is watching.
+    pub fn with_timeout(template: &str, token: Option<&str>, timeout: Duration) -> Result<Self> {
+        if !template.contains(NAME_PLACEHOLDER) {
+            bail!(
+                "dead drop: the store template has no {NAME_PLACEHOLDER} hole, so every \
+                 slot and every friend would write over one location"
+            );
+        }
+
+        // Parsed with the hole filled, because the hole's braces are not valid
+        // in a URL and a template is never fetched with them still in it.
+        let sample = template.replace(NAME_PLACEHOLDER, &"0".repeat(32));
+        let url = reqwest::Url::parse(&sample)
+            .with_context(|| "dead drop: the store template is not a URL".to_string())?;
+
+        let host = url
+            .host_str()
+            .ok_or_else(|| anyhow!("dead drop: the store template names no host"))?
+            .to_string();
+
+        match url.scheme() {
+            "https" => {}
+            "http" if is_loopback_host(&host) => {}
+            "http" => bail!(
+                "dead drop: the store template is plain http to {host}; a record crosses \
+                 the internet and https is required for any host but loopback"
+            ),
+            other => bail!("dead drop: the store template's {other} scheme is not one this speaks"),
+        }
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(timeout)
+            .build()
+            .context("dead drop: the HTTP client would not build")?;
+
+        Ok(Self {
+            template: template.to_string(),
+            host,
+            token: token.map(str::to_string),
+            client,
+            timeout,
+        })
+    }
+
+    /// The URL for one name.
+    fn url_for(&self, name: &DropName) -> String {
+        self.template.replace(NAME_PLACEHOLDER, &name.to_wire())
+    }
+
+    /// Attach the bearer token, when there is one.
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    }
+
+    /// Which refusal one `reqwest` failure is, with the URL stripped out of it.
+    fn refuse(&self, source: reqwest::Error, name: &str) -> StoreRefusal {
+        if source.is_timeout() {
+            return StoreRefusal::TimedOut {
+                name: name.to_string(),
+                within_ms: self.timeout.as_millis(),
+            };
+        }
+        StoreRefusal::Unreachable {
+            name: name.to_string(),
+            source: source.without_url(),
+        }
+    }
+}
+
+/// Whether a host string is this machine talking to itself.
+///
+/// Loopback is the one host plain `http` is accepted for: the bytes never
+/// leave the machine, which is what the scheme rule is protecting. A bracketed
+/// IPv6 literal arrives with its brackets, which are the URL's punctuation and
+/// not part of the address.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    bare.parse::<IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
+}
+
+impl DeadDropStore for HttpsTemplateStore {
+    fn put(
+        &self,
+        name: &DropName,
+        record: &[u8],
+    ) -> impl std::future::Future<Output = std::result::Result<(), StoreRefusal>> + Send {
+        let url = self.url_for(name);
+        let wire = name.to_wire();
+        let body = record.to_vec();
+        async move {
+            let request = self.authorized(self.client.put(&url).body(body));
+            let response = request
+                .send()
+                .await
+                .map_err(|err| self.refuse(err, &wire))?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(StoreRefusal::Status {
+                    status: status.as_u16(),
+                    name: wire,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn get(
+        &self,
+        name: &DropName,
+    ) -> impl std::future::Future<Output = std::result::Result<Option<Vec<u8>>, StoreRefusal>> + Send
+    {
+        let url = self.url_for(name);
+        let wire = name.to_wire();
+        async move {
+            let request = self.authorized(self.client.get(&url));
+            let mut response = request
+                .send()
+                .await
+                .map_err(|err| self.refuse(err, &wire))?;
+
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                // Nothing at that name. Either this pair has not published in
+                // this slot or the surface dropped it; both are ordinary and
+                // neither is an error.
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(StoreRefusal::Status {
+                    status: status.as_u16(),
+                    name: wire,
+                });
+            }
+
+            // The ceiling is enforced while the body is read and never after
+            // it: a surface that keeps sending is stopped at the ceiling
+            // rather than held in memory and measured once it finishes. A
+            // promised `Content-Length` is the sender's claim about itself and
+            // a chunked answer makes no claim at all, so the read is the only
+            // place the limit can actually hold.
+            let mut collected: Vec<u8> = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|err| self.refuse(err, &wire))?
+            {
+                if collected.len() + chunk.len() > MAX_STORED_RECORD_BYTES {
+                    return Err(StoreRefusal::TooLarge {
+                        name: wire,
+                        ceiling: MAX_STORED_RECORD_BYTES,
+                    });
+                }
+                collected.extend_from_slice(&chunk);
+            }
+            Ok(Some(collected))
+        }
+    }
 }
