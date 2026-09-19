@@ -254,7 +254,13 @@ struct PeersSnapshot: Equatable {
         rows.filter { $0.trust == .trusted }.map { row in
             PeerMeshPeer(
                 name: row.title, rttMs: row.pathRttMs, lossPct: row.pathLossPct,
-                viaName: row.pathViaName, asleep: !row.awake)
+                viaName: row.pathViaName, asleep: !row.awake,
+                // The bare fact, not `row.pathRttMs != nil`. A path can be
+                // known and never measured, which is a tile with a line and no
+                // number; a Mac with no path at all is a dotted edge and a
+                // plate. Deriving the second from the first draws the plate on
+                // the first Mac an unprobed endpoint belongs to.
+                hasPath: row.hasPath)
         }
     }
 

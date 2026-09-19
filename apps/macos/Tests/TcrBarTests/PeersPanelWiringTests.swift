@@ -378,6 +378,33 @@ final class PeersPanelWiringTests: XCTestCase {
             "the decision is made and then not handed to the lines it decides")
     }
 
+    /// The mini mesh is told whether a Mac has a path, rather than guessing it
+    /// from the figures.
+    ///
+    /// `PeerMeshPeer.hasPath` defaults to `true`, so a tile built without it
+    /// claims every trusted Mac is reachable. The row already knows the answer
+    /// and the card already draws two different pictures for it, a dotted edge
+    /// with a plate against a solid one, and nothing carried the fact across
+    /// the one line between them.
+    ///
+    /// Not derived from `rttMs` at the far end either: a path that is known and
+    /// has never been probed has no number, and reading that as no path would
+    /// put the plate on a Mac this one can reach.
+    func testTheMeshIsHandedTheRowsOwnPathFact() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let mesh = try slice(
+            tab, from: "var meshPeers: [PeerMeshPeer] {", to: "var trustedCount: Int")
+        XCTAssertTrue(
+            mesh.contains("hasPath: row.hasPath"),
+            "the mesh is built without the row's path fact, so a Mac with no path reaches the "
+                + "card as hasPath: true and is drawn with a solid edge to a Mac nothing can "
+                + "reach")
+        XCTAssertFalse(
+            mesh.contains("hasPath: row.pathRttMs != nil"),
+            "the fact is re-derived from a measurement, which draws the no-path plate on a "
+                + "Mac whose one endpoint has simply never been probed")
+    }
+
     /// The unsupported card offers the update it asks for, and offers it only
     /// when it can really run one.
     ///
