@@ -2915,13 +2915,11 @@ async fn a_forwarded_borrow_reaches_the_lender_through_a_third_mac() {
          {credentials:?}"
     );
 
-    let carried = carrier.log();
-    assert!(
-        carried.contains("peer forward: carried"),
-        "the carrier must have carried the stream; without this line the borrow found \
-         some other route and this test is not measuring a forward. Carrier tail:\n{}",
-        tail(&carried, 20)
-    );
+    // The carrier writes this line when the carried stream CLOSES, which is
+    // after the borrower already holds its 200, so the line is waited for and
+    // never read once. Without it the borrow found some other route and this
+    // test is not measuring a forward; the wait panics with the carrier's tail.
+    carrier.wait_for_log("peer forward: carried");
     // And the row is STILL addressless, so nothing along the way quietly wrote
     // an endpoint back and turned the next run into a direct dial.
     let after = endpoints_for(&borrower, &lender_at_borrower);
@@ -3169,12 +3167,11 @@ async fn no_ipv6_endpoint_falls_through_to_a_forwarder() {
         "the answer must be on the LENDER's token, proving it reached the lender and was not \
          answered by the carrier: {credentials:?}"
     );
-    let carried = carrier.log();
-    assert!(
-        carried.contains("peer forward: carried"),
-        "the carrier must have carried the stream. Carrier tail:\n{}",
-        tail(&carried, 20)
-    );
+    // The carrier writes this line when the carried stream CLOSES, which is
+    // after the borrower already holds its 200, so the line is waited for and
+    // never read once. Without it the borrow found some other route and this
+    // test is not measuring a forward; the wait panics with the carrier's tail.
+    carrier.wait_for_log("peer forward: carried");
     println!(
         "{}",
         matrix::matrix_line(
