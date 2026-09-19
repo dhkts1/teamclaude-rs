@@ -434,6 +434,32 @@ final class PeersPanelWiringTests: XCTestCase {
             "the control is not the one the card's own sentence asks for")
     }
 
+    /// And something reaches the tab with an update check to hand it.
+    ///
+    /// The injection above is only half the wiring: with no caller passing one,
+    /// `onCheckForUpdates` is `nil` on every panel the app ever draws, the card
+    /// draws no button, and the whole arm is a branch nothing takes. The act
+    /// comes off the `Updater` `FleetView` already holds, the same one the
+    /// header's own update button presses, because two update paths is how the
+    /// two start disagreeing about whether a check is already running.
+    func testTheRunningPanelHandsThePeersTabTheAppsOwnUpdateCheck() throws {
+        let fleet = try source("apps/macos/Sources/TcrBar/FleetView.swift")
+        let view = try slice(fleet, from: "struct PeersView: View {", to: "struct Sparkline")
+        XCTAssertTrue(
+            view.contains("private let onCheckForUpdates: (() -> Void)?"),
+            "the peers view does not carry an update check, so nothing between the shell's "
+                + "updater and the card can pass one down")
+        XCTAssertTrue(
+            view.contains("onCheckForUpdates: onCheckForUpdates"),
+            "the peers view takes an update check and does not hand it to the tab")
+        XCTAssertEqual(
+            fleet.components(separatedBy: "onCheckForUpdates: { updater.checkForUpdates() }")
+                .count - 1,
+            2,
+            "both panels that draw the peers tab must hand it the act; one of them offers a "
+                + "card that tells an operator to update and gives them nothing to press")
+    }
+
     /// A Mac with no network at all says so, in both cards, and only when the
     /// running tcr reported it.
     ///
