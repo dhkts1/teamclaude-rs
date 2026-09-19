@@ -100,7 +100,15 @@ enum RenderStates {
             // `Menu` contents (the gear's "Use as control account" item, its
             // checkmark) never rasterise regardless of state; see this file's
             // own header and `AccountRow.accountActionsMenu`'s doc-comment.
-            ("13-control-account", .loaded(fleet(healthyJSON)), false, "alice@example.com"),
+            //
+            // `controlAccountJSON`, not `healthyJSON`: this is the one scene
+            // rendered at both `.auto` and `.comfortable` (`densityVariantScenes`
+            // below), and `.auto` only resolves `.compact` above four accounts
+            // (`PanelDensityPreference.comfortableCeiling`). `healthyJSON`'s two
+            // rows sit under that line, so `.auto` and a forced `.comfortable`
+            // drew the identical picture and the density variant proved
+            // nothing.
+            ("13-control-account", .loaded(fleet(controlAccountJSON)), false, "alice@example.com"),
             // Every spend branch at once — see `usageStatsJSON`.
             ("14-usage-stats", .loaded(fleet(usageStatsJSON)), false, nil),
             // A parked group beside a live one — see `parkedGroupJSON`.
@@ -2059,6 +2067,25 @@ enum RenderStates {
     private static var healthyJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498, plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")),"
             + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"], plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
+    }
+
+    /// Five plain accounts, `alice@example.com` first: scene 13's own fleet.
+    ///
+    /// Five, not `healthyJSON`'s two: `.auto` only resolves `.compact` above
+    /// ``PanelDensityPreference/comfortableCeiling`` (four) accounts, and
+    /// scene 13 is the one scene rendered at both `.auto` and a forced
+    /// `.comfortable`. A fleet at or under the ceiling draws the identical
+    /// picture either way, which is why the two density variants used to be
+    /// indistinguishable.
+    private static var controlAccountJSON: String {
+        "["
+            + (1...5).map { i in
+                i == 1
+                    ? account(
+                        "alice@example.com", quota: "0.12", state: "ok", plan: "Max 20x",
+                        orgUuid: "11111111-1111-1111-1111-111111111111")
+                    : account("member\(i)@example.com", quota: "0.\(i)0", state: "ok")
+            }.joined(separator: ",") + "]"
     }
 
     /// Scene 22: a single account, a LIVE read (so
