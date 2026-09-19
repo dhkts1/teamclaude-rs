@@ -38,16 +38,19 @@ final class AccountCardExitPillWiringTests: XCTestCase {
                 + "weight OK carries")
     }
 
-    /// The pill must NOT be crammed into the header's trailing `HStack`
-    /// alongside the name. That is the exact layout this test exists to
-    /// catch regressing back to: three badges plus the account's own name
-    /// do not fit in 372 pt, and the name is what gives way.
+    /// The pill itself must NOT be crammed into the header's trailing
+    /// `HStack` alongside the name. That is the exact layout this test
+    /// exists to catch regressing back to: three badges plus the account's
+    /// own name do not fit in 372 pt, and the name is what gives way. The
+    /// header IS allowed to read `exitWaitingPillText` to decide whether to
+    /// draw the state pill at all: that gate has no `role: .warn` pill of
+    /// its own, so it does not add the badge this test guards against.
     func testTheWaitingPillIsNotInsideTheNamesTrailingRow() throws {
         let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
         let header = try slice(
             card, from: "} trailing: {", to: ".accessibilityElement(children: .combine)")
         XCTAssertFalse(
-            header.contains("exitWaitingPillText") || header.contains("role: .warn"),
+            header.contains("role: .warn"),
             "the waiting pill is back inside the header's trailing HStack, which crowds "
                 + "the account name (\"alice @example.com\") off the row at the real 372 pt "
                 + "panel width, confirmed by rendering the exits-must-waiting card")
@@ -64,6 +67,21 @@ final class AccountCardExitPillWiringTests: XCTestCase {
             afterHeader.contains("exitWaitingPillText") && afterHeader.contains("role: .warn"),
             "the waiting pill is not between the header and the quota rows, so it is either "
                 + "gone or buried below the meters where OK already read as the whole story")
+    }
+
+    /// While the waiting pill is showing, the state pill must not also
+    /// draw: a card refusing requests must not still read green `OK` at a
+    /// glance. The state pill's draw is gated on the same
+    /// `exitWaitingPillText` the waiting row already reads.
+    func testStatePillIsHiddenWhileTheWaitingPillShows() throws {
+        let card = try source("apps/macos/Sources/TcrBar/PanelV4/AccountCard.swift")
+        let header = try slice(
+            card, from: "} trailing: {", to: ".accessibilityElement(children: .combine)")
+        XCTAssertTrue(
+            header.contains("if exitWaitingPillText == nil {")
+                && header.contains("V4Pill(text: statePillText, role: statePillRole"),
+            "the state pill is not gated on exitWaitingPillText being nil, so a card that is "
+                + "refusing requests can still show a lone green OK pill")
     }
 
     // MARK: - Source helpers (same technique as PeersPanelViewWiringTests)
