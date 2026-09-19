@@ -1544,9 +1544,15 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     // binds, because the seam it fills is on the answer path of a request and
     // must be decided before the first one can arrive.
     // `crate::fallback::PROVIDER` is a `OnceLock` for that reason: it is
-    // consulted only when the whole local fleet came up dry, and re-deciding
-    // "is there a provider?" per request would put a file read in front of an
-    // answer a client is waiting for.
+    // consulted only when the whole local fleet came up dry, and once it holds
+    // a provider nothing re-decides "is there a provider?" per request.
+    //
+    // This read is the first one and not the only one. A `NothingToBorrowFrom`
+    // here arms the peers file to be read again on a later dry fleet
+    // (`fallback::install_late_if_the_file_now_allows_it`), so a node paired
+    // and granted `disclose` after this line runs borrows without a restart,
+    // which is what `tcr peer allow` promises. That arm is why the outcome
+    // below is worth logging even when it is "nothing".
     //
     // A stand-down returns above this line, so a process that did not bind
     // installs nothing, the install is process-wide and a second `tcr` that
