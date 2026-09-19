@@ -122,8 +122,12 @@ public struct GatewayBytes: Equatable {
 ///
 /// Three strings and an argv, all decided by the builder: the view renders.
 public struct LeaseEnded: Equatable {
-    /// `17:30`, or `nil` when the producer said a lease ended without saying
-    /// when. Never a guessed clock.
+    /// `22m ago`, or `nil` when the producer said a lease ended without saying
+    /// when. Never a guessed time.
+    ///
+    /// A span and not a wall clock: `ended 09:36` was the only wall clock on
+    /// this tab, and with no date on it a lease that ended yesterday read as
+    /// one that ended this morning.
     public let when: String?
     public let sentence: String
     /// `tcr peer lend <peer> --relend <id>`, when this Mac is the LENDER and
@@ -139,7 +143,7 @@ public struct LeaseEnded: Equatable {
         self.relendArguments = relendArguments
     }
 
-    /// `ended 17:30`, or `ended` when no clock was reported.
+    /// `ended 22m ago`, or `ended` when no time was reported.
     public var label: String { when.map { "ended \($0)" } ?? "ended" }
 }
 

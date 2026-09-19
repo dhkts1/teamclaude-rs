@@ -357,6 +357,7 @@ final class PeersPanelStateWiringTests: XCTestCase {
     /// sent are refused, with the reason on screen.
     func testADraftRefusesAZeroShareAndAnEndAlreadyPassed() {
         let noon = Date(timeIntervalSince1970: 1_786_000_000)
+        let calendar = Calendar(identifier: .gregorian)
         var draft = LeaseDraft.new(peer: "studio-mac")
         XCTAssertNil(draft.refusal(now: noon), "the shipped default is refused")
 
@@ -364,7 +365,6 @@ final class PeersPanelStateWiringTests: XCTestCase {
         XCTAssertNotNil(draft.refusal(now: noon), "a share of zero is written as a lease")
 
         draft = LeaseDraft.new(peer: "studio-mac")
-        let calendar = Calendar(identifier: .gregorian)
         let hour = calendar.component(.hour, from: noon)
         draft.end = .until(String(format: "%02d:00", max(0, hour - 1)))
         XCTAssertNotNil(
@@ -598,16 +598,15 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 + "right now rather than nothing will happen again")
         XCTAssertEqual(ended.rowShape.subLines, 2)
         XCTAssertEqual(
-            LeaseEnded(when: "17:30", sentence: "It ended.").label, "ended 17:30")
+            LeaseEnded(when: "22m ago", sentence: "It ended.").label, "ended 22m ago")
         XCTAssertEqual(
             LeaseEnded(when: nil, sentence: "It ended.").label, "ended",
-            "a lease that ended at an hour nobody reported gets a guessed clock")
+            "a lease that ended at a time nobody reported gets a guessed one")
     }
 
     /// Which direction ended, and who may re-lend it.
     func testAnEndedLeaseKnowsWhichDirectionItWas() {
         let now = Date(timeIntervalSince1970: 1_786_000_000)
-        let calendar = Calendar(identifier: .gregorian)
         let running = PeerListDocument.PeerEntry(
             id: "tcr-4b8we1r0zp", name: "studio-mac", trusted: true, serves: true,
             until: 1_786_003_600)
@@ -619,7 +618,7 @@ final class PeersPanelStateWiringTests: XCTestCase {
             id: "tcr-4b8we1r0zp", name: "studio-mac", trusted: true, serves: true,
             until: 1_785_998_200, ended: true)
         let borrowedEnded = LeaseEnded.forEntry(
-            borrowed, title: "studio-mac", now: now, calendar: calendar)
+            borrowed, title: "studio-mac", now: now)
         XCTAssertNotNil(borrowedEnded, "a borrowed lease that ended is drawn as running")
         XCTAssertNil(
             borrowedEnded?.relendArguments,
@@ -648,12 +647,19 @@ final class PeersPanelStateWiringTests: XCTestCase {
                     until: 1_785_998_200, ended: true)
             ])
         let lent = LeaseEnded.forEntry(
-            allEnded, title: "attic-nuc", now: now, calendar: calendar)
+            allEnded, title: "attic-nuc", now: now)
         XCTAssertEqual(
             lent?.relendArguments,
             ["peer", "lend", "tcr-92hbq5t7yv", "--relend", "ls-4b1f"],
             "the lender's ended row lost the one control that puts the lease back")
-        XCTAssertNotNil(lent?.when, "an ended lease with a clock reports none")
+        // Relative, never a wall clock. `ended 09:36` was the only clock on
+        // a tab where everything else is counted, and with no date on it a
+        // lease that ended yesterday read as one that ended this morning.
+        XCTAssertEqual(
+            lent?.when, "30m ago",
+            "the ended lease is back to a wall clock, which with no date makes yesterday look "
+                + "like this morning")
+        XCTAssertEqual(lent?.label, "ended 30m ago")
     }
 
     /// A row with no wire id yet (an untrusted or freshly-trusted Mac, see
@@ -661,7 +667,6 @@ final class PeersPanelStateWiringTests: XCTestCase {
     /// `PeerId::parse` refuses a name, so that argv used to fail silently.
     func testAnEndedLendWithNoWireIdRefusesRatherThanFallingBackToTheTitle() {
         let now = Date(timeIntervalSince1970: 1_786_000_000)
-        let calendar = Calendar(identifier: .gregorian)
         let noWireId = PeerListDocument.PeerEntry(
             id: nil, name: "attic-nuc", trusted: true,
             lend: [
@@ -670,7 +675,7 @@ final class PeersPanelStateWiringTests: XCTestCase {
                     until: 1_785_998_200, ended: true)
             ])
         let lent = LeaseEnded.forEntry(
-            noWireId, title: "attic-nuc", now: now, calendar: calendar)
+            noWireId, title: "attic-nuc", now: now)
         XCTAssertNil(
             lent?.relendArguments,
             "no wire id means no Re-lend argv, never one built on the title")

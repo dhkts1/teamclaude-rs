@@ -898,8 +898,7 @@ extension LeaseEnded {
     /// formatter re-wrapping one line would have been indistinguishable from
     /// the rule changing.
     public static func forEntry(
-        _ entry: PeerListDocument.PeerEntry, title: String, now: Date,
-        calendar: Calendar = .current
+        _ entry: PeerListDocument.PeerEntry, title: String, now: Date
     ) -> LeaseEnded? {
         let borrowedEnded =
             (entry.until != nil || entry.ended != nil) && entry.leaseHasEnded(now: now)
@@ -908,10 +907,17 @@ extension LeaseEnded {
         guard borrowedEnded || lentEnded else { return nil }
 
         // The lender's record is the one that can be re-lent, and it is also
-        // the one that carries a clock this Mac may state.
+        // the one that carries a time this Mac may state.
+        //
+        // Said as a SPAN, `22m ago`, never a wall clock. `ended 09:36` was the
+        // only wall clock on a tab where every other time is counted, and with
+        // no date beside it a lease that ended yesterday reads as one that
+        // ended this morning.
         let lastEnded = lent.filter { $0.until != nil }.max { ($0.until ?? 0) < ($1.until ?? 0) }
-        let clockSeconds = lastEnded?.until ?? (lentEnded ? nil : entry.until)
-        let when = clockSeconds.map { PeerLease.clock(unixSeconds: $0, calendar: calendar) }
+        let endedSeconds = lastEnded?.until ?? (lentEnded ? nil : entry.until)
+        let when = endedSeconds.map {
+            PeerFormat.duration(now.timeIntervalSince1970 - Double($0))
+        }
 
         guard lentEnded else {
             // A lease this Mac BORROWED. There is no lease id it may use and
