@@ -1288,6 +1288,7 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
         },
         lent_to,
         internet: false,
+        network: true,
         exits: [(
             "alice".to_string(),
             teamclaude_rs::status::PeerExitJson {

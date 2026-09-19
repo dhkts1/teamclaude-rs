@@ -157,6 +157,15 @@ snow = { version = "0.10", default-features = false, features = ["use-curve25519
 # Measured in-tree cost: FIVE new lock entries: flume, if-addrs, mdns-sd,
 # socket-pktinfo and spin. The design predicted four and did not name `spin`.
 mdns-sd = "0.21"
+# Walks the real interface list for the Peers tab's "is there a LAN to look
+# on" fact (src/status/network_fact.rs). A route lookup on a documentation
+# address stood in first, but that needs a default gateway: a Mac with an
+# interface up and addressed and NO gateway (a hotspot with no uplink, an
+# isolated office LAN, two Macs on a link with no router) still finds peers
+# over mDNS on it, and the route trick read that Mac as having no network.
+# `if-addrs` is already resolved in `Cargo.lock` through `mdns-sd` above, so
+# this adds one dependency EDGE and no new package.
+if-addrs = "0.15"
 # The peer-mesh wire types, shared by both ends of a peer stream: the same
 # split, and for the same reason, as `tcr-status-wire` above.
 tcr-peer-wire = { path = "crates/tcr-peer-wire" }

@@ -173,6 +173,7 @@
     ]
   },
   "internet": false,
+  "network": true,
   "exits": {
     "alice": {
       "egress": "via 0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
