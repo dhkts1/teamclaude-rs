@@ -52,6 +52,13 @@
 //! [`peer_lease_provider`] is the decision "does this peers file describe a node
 //! that may borrow?", kept as a pure function of the file so it can be tested
 //! without a socket.
+//!
+//! The install is not boot-only, though, and this section used to imply it was.
+//! A node that boots with nobody to borrow from and is then paired and granted
+//! `disclose` gets its provider on the next dry fleet, because
+//! [`configured_provider`] re-asks that pure function when the peers file's
+//! mtime has moved. See [`install_late_if_the_file_now_allows_it`] for why that
+//! is a stat and not a thread.
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -182,17 +189,36 @@ pub trait FallbackProvider: Send + Sync {
     fn try_serve<'a>(&'a self, ask: &'a Ask<'a>) -> BoxFuture<'a, Option<Response>>;
 }
 
-/// The one provider this process consults, installed once at boot.
+/// The one provider this process consults, installed at most once.
 ///
 /// A `OnceLock` rather than a config read per call: this is on the answer path
-/// of a request that has already failed the whole local fleet, and re-deciding
-/// "is there a provider?" per request would put a file read (and a second
-/// spelling of the decision) in front of an answer the client is waiting for.
+/// of a request that has already failed the whole local fleet, and re-reading
+/// the whole peers file per request, with a second spelling of the decision
+/// beside it, would put that work in front of an answer a client is waiting
+/// for.
 /// Policy INSIDE the provider is still hot, [`PeerLeaseProvider`] re-reads the
 /// peers file through `PeerStore::reload_if_changed`, so a grant or a revoke
-/// lands without a restart; what needs a restart is turning the whole seam on,
-/// which is the same rule the peer listener's socket already has.
+/// lands without a restart.
+///
+/// Once it holds a provider it never changes, which is why the
+/// once-and-for-all read costs nothing after the first install. Getting there
+/// is the part that is hot: see [`LATE`].
 static PROVIDER: OnceLock<Box<dyn FallbackProvider>> = OnceLock::new();
+
+/// The peers file to look at again when [`PROVIDER`] is still empty, held as
+/// the same [`PeerStore`] the boot read produced.
+///
+/// Armed only by the boot path, and only when it found nothing to borrow from.
+/// So a process that never resolved a peers file, or that already has a
+/// provider, gets one `OnceLock` read on the dry-fleet path and no syscall at
+/// all.
+///
+/// A `PeerStore` rather than a path plus an mtime of our own, because the store
+/// IS this tree's one spelling of "has this file changed?"
+/// (`PeerStore::reload_if_changed`, the same call the peer listener makes
+/// between frames). A second spelling would be a second thing to keep in step,
+/// and the copy added later is the one that drifts.
+static LATE: OnceLock<PeerStore> = OnceLock::new();
 
 /// Install the provider for this process. Answers `false` when one was already
 /// installed, in which case NOTHING changed, the caller is the boot path and a
@@ -201,10 +227,70 @@ pub fn install_provider(provider: Box<dyn FallbackProvider>) -> bool {
     PROVIDER.set(provider).is_ok()
 }
 
-/// The provider this build consults, if any. `None` until [`install_provider`]
-/// runs, and then the dry-fleet arm is byte-for-byte what it is on `main`.
+/// The provider this build consults, if any. `None` until something installs
+/// one, and then the dry-fleet arm is byte-for-byte what it is on `main`.
+///
+/// **Asking this can install one.** When the boot read found nothing to borrow
+/// from it left the peers file armed ([`LATE`]), and this call is where the
+/// armed file is looked at again. It is the right place for it because it is
+/// the exact moment the answer is needed and the only moment it is: the caller
+/// is the dry-fleet terminal, so the question "may this node borrow?" is being
+/// asked for real, and a stale `None` here is the whole defect this guards
+/// against. An operator who paired a Mac and granted it `disclose` was told
+/// by the command that the grant was live, and got the exhausted 429 on every
+/// request until the process was restarted.
+///
+/// The hot path stays cheap. Once a provider exists the arm is never consulted
+/// again, and while it is consulted the cost is one `stat` of a file the
+/// listener already stats far more often than this.
 pub fn configured_provider() -> Option<&'static dyn FallbackProvider> {
+    if PROVIDER.get().is_none() {
+        install_late_if_the_file_now_allows_it();
+    }
     PROVIDER.get().map(std::convert::AsRef::as_ref)
+}
+
+/// Look at the armed peers file again and install the provider if the file now
+/// describes a node that may borrow. Answers what it did, or `None` when no
+/// file is armed.
+///
+/// # Why a stat on the answer path and not a watcher
+///
+/// The condition this waits for is a change to one file, and this tree already
+/// has the mechanism for that: `PeerStore::reload_if_changed` stats, returns on
+/// an unmoved mtime, and re-reads otherwise. A thread or a poller would be a
+/// second mechanism for one fact, would run on every node whether or not it
+/// ever borrows, and would still have to decide how often to look. Here the
+/// question is asked exactly when somebody needs the answer, which for a dry
+/// fleet is rare, and never when a provider is already installed.
+///
+/// # Nothing is ever uninstalled
+///
+/// A provider stays once installed, even after the last disclosing row is
+/// revoked, and that is not a leak: `PeerLeaseProvider::try_serve` re-reads the
+/// peers file per request and asks the same predicate again, so a revoked node
+/// declines and the request falls to the honest 429 it would have got anyway.
+/// Removing the provider would buy a second spelling of that refusal and no
+/// change in what a client sees.
+pub fn install_late_if_the_file_now_allows_it() -> Option<Installed> {
+    let store = LATE.get()?;
+    // Stats, and re-reads only when the mtime moved.
+    store.reload_if_changed();
+    let provider = peer_lease_provider(store)?;
+    let installed = if install_provider(Box::new(provider)) {
+        Installed::Yes
+    } else {
+        Installed::AlreadyInstalled
+    };
+    if installed == Installed::Yes {
+        tracing::info!(
+            path = %store.path().display(),
+            "peer-lease fallback: installed after boot, the peers file now names a peer this \
+             node may disclose to and can reach, so a request no local account can serve has \
+             somewhere to go without a restart"
+        );
+    }
+    Some(installed)
 }
 
 /// The peer-lease provider this peers file describes, or `None` for a file that
@@ -246,10 +332,21 @@ pub fn peer_lease_provider(store: &PeerStore) -> Option<PeerLeaseProvider> {
 ///
 /// A malformed peers file is an error, never a silent "no provider": that is the
 /// same rule `PeerStore::open` already applies, and the two must not disagree.
+///
+/// `NothingToBorrowFrom` is not the end of the story any more. It arms the
+/// store it just read as [`LATE`], so the same question is asked again the next
+/// time a request finds the fleet dry, and a pairing plus a `disclose` grant
+/// that happen while this process runs take effect without a restart.
 pub fn install_peer_lease_provider(path: &Path) -> Result<Installed> {
     let store =
         PeerStore::open(path).with_context(|| format!("peer lease: reading {}", path.display()))?;
     let Some(provider) = peer_lease_provider(&store) else {
+        if LATE.set(store).is_err() {
+            tracing::debug!(
+                path = %path.display(),
+                "peer-lease fallback: a peers file is already armed for a late install; keeping it"
+            );
+        }
         return Ok(Installed::NothingToBorrowFrom);
     };
     if install_provider(Box::new(provider)) {
@@ -266,7 +363,9 @@ pub enum Installed {
     /// This process now consults a peer-lease provider.
     Yes,
     /// The peers file names no peer this node may disclose to, so there is
-    /// nothing to borrow from and the arm stays exactly as it is on `main`.
+    /// nothing to borrow from and the dry-fleet answer stays exactly what it is
+    /// with no provider at all. Said by the boot read, this also arms that file
+    /// to be looked at again: see [`install_late_if_the_file_now_allows_it`].
     NothingToBorrowFrom,
     /// A provider was already installed and this call changed nothing.
     AlreadyInstalled,
