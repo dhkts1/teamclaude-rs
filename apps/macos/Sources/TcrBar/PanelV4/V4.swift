@@ -581,7 +581,7 @@ enum V4 {
     // MARK: - Peers tab literals
 
     /// The small circle in an account row's parked-tally breakdown
-    /// (`AccountsTabV4.parkedHeader`) — one dot per kind of parked exit,
+    /// (`AccountsTabV4.parkedHeader`): one dot per kind of parked exit,
     /// beside its count. Not ``dotSize`` (8): that is the freshness dot's own
     /// size, a different circle in a different card.
     static let tallyDotSize: CGFloat = 7
@@ -594,7 +594,7 @@ enum V4 {
     /// shown" footer under a capped list.
     static let limitedLineTopMargin: CGFloat = 2
 
-    /// `PeersTabV4.yesBlock` — the card explaining what pressing yes does —
+    /// `PeersTabV4.yesBlock`, the card explaining what pressing yes does:
     /// its own vertical and horizontal padding, and the margin that sits it
     /// under the sentence above.
     static let yesBlockPaddingV: CGFloat = 5
