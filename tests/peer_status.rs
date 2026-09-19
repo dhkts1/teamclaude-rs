@@ -1256,11 +1256,17 @@ fn peer_ls_fixture_document() -> teamclaude_rs::status::PeerLsJson {
     teamclaude_rs::status::PeerLsJson {
         supported: true,
         peers,
+        // `addr` carries the port, because that is what the command renders:
+        // the row in the state file is keyed on the bare IP and `peer ls`
+        // hands out `Knock::dial_address`, which is the string the panel
+        // dials to answer. A sample with the bare key in it would pin a shape
+        // no invocation emits.
         pending: vec![Knock {
-            addr: "192.0.2.14".to_string(),
+            addr: "192.0.2.14:7766".to_string(),
             instance_id: tcr_peer_wire::InstanceId([0x11; 8]),
             proposed_name: Some("kitchen-mac".to_string()),
             wire_version: 1,
+            listen_port: Some(7766),
             first_seen_ms: now_ms - 30_000,
             last_seen_ms: now_ms - 2_000,
         }],

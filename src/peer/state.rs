@@ -325,6 +325,12 @@ pub struct Knock {
     /// Where it knocked from, `ip:port`'s IP with the port dropped. See
     /// [`knock_address`]: a source PORT is ephemeral per connection, so keeping
     /// it would defeat the coalescing this row exists for.
+    ///
+    /// **This is the key, never the dial address.** The mutes, the bans and the
+    /// accepted windows are all keyed on this same bare IP, and the listener
+    /// compares it against the address a connection arrives on. What an
+    /// operator dials to answer is [`Self::dial_address`], which is this plus
+    /// [`Self::listen_port`] and is a rendering, not a second key.
     pub addr: String,
     /// The ephemeral id it knocked under. Updated in place when the same
     /// address knocks again with a different one.
@@ -334,6 +340,17 @@ pub struct Knock {
     pub proposed_name: Option<String>,
     /// The wire version it claimed.
     pub wire_version: u16,
+    /// The port the knocker said its own listener is bound to, when it said
+    /// one. See [`tcr_peer_wire::Knock::listen_port`]: the source port this
+    /// row's [`Self::addr`] drops is ephemeral, so this is the only number
+    /// that can be dialled back.
+    ///
+    /// `None` on a knock from a build that predates the field, and on the
+    /// placeholder row [`PeerState::reserve_knock_slot`] pushes, and then
+    /// [`Self::dial_address`] is the bare address, which is what every answer
+    /// had before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
     /// When this address first knocked, Unix milliseconds.
     pub first_seen_ms: i64,
     /// When it last knocked. A row expires [`KNOCK_TTL_MS`] after this.
@@ -359,6 +376,33 @@ impl Knock {
         self.instance_id == InstanceId([0_u8; tcr_peer_wire::INSTANCE_ID_BYTES])
             && self.proposed_name.is_none()
             && self.wire_version == 0
+    }
+
+    /// What to dial to answer this knock: `host:port` when the knocker said
+    /// which port it listens on, the bare host when it did not.
+    ///
+    /// **The one place the answer's address is built**, read by every surface
+    /// that shows a pending row, because an operator, and the panel, hand this
+    /// string straight to `tcr peer pair`. Before it existed each surface
+    /// printed [`Self::addr`] alone, every answer went to whatever was
+    /// listening on the default port, and a Mac that listens anywhere else
+    /// could not be answered at all: on one machine the dial came back to that
+    /// machine's own listener and the pairing digits never appeared.
+    ///
+    /// An IPv6 host is bracketed, because `fe80::1:7766` is not an address any
+    /// parser can split and `[fe80::1]:7766` is. An [`Self::addr`] that is not
+    /// an IP address at all, which nothing in this process writes, gets no
+    /// port appended rather than a string built around a value this cannot
+    /// read.
+    pub fn dial_address(&self) -> String {
+        let Some(port) = self.listen_port else {
+            return self.addr.clone();
+        };
+        match self.addr.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(host)) => format!("[{host}]:{port}"),
+            Ok(std::net::IpAddr::V4(host)) => format!("{host}:{port}"),
+            Err(_) => self.addr.clone(),
+        }
     }
 }
 
@@ -658,6 +702,7 @@ impl PeerState {
         instance_id: InstanceId,
         proposed_name: Option<String>,
         wire_version: u16,
+        listen_port: Option<u16>,
         now_ms: i64,
     ) -> Result<bool, KnockRefusal> {
         if let Some(refusal) = self.refusal_for_knock_source(addr, now_ms) {
@@ -670,6 +715,10 @@ impl PeerState {
             existing.instance_id = instance_id;
             existing.proposed_name = proposed_name;
             existing.wire_version = wire_version;
+            // The newest knock's port, including back to `None`: a Mac that
+            // moved its listener, or that downgraded to a build which says no
+            // port at all, must not be answered at the port it used to be on.
+            existing.listen_port = listen_port;
             existing.last_seen_ms = now_ms;
             return Ok(false);
         }
@@ -686,6 +735,7 @@ impl PeerState {
             instance_id,
             proposed_name,
             wire_version,
+            listen_port,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
         });
@@ -738,6 +788,9 @@ impl PeerState {
             instance_id: InstanceId([0_u8; tcr_peer_wire::INSTANCE_ID_BYTES]),
             proposed_name: None,
             wire_version: 0,
+            // Nothing has been decrypted yet, so there is no port to hold
+            // either. `record_knock` fills it with the real one.
+            listen_port: None,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
         });
@@ -816,9 +869,15 @@ impl PeerState {
                 return Some(row);
             }
         }
-        self.pending
-            .iter()
-            .find(|knock| knock.addr == selector && !knock.is_reservation_placeholder())
+        // The bare key, OR the `host:port` form the same row is printed under
+        // ([`Knock::dial_address`]). Every string a surface shows for a row
+        // has to select that row: `tcr peer pending` prints the dial address,
+        // and an operator who pastes back what they just read must not be told
+        // it matches no request.
+        self.pending.iter().find(|knock| {
+            (knock.addr == selector || knock.dial_address() == selector)
+                && !knock.is_reservation_placeholder()
+        })
     }
 
     /// Whether `text` is the address form every row in this file is keyed on:

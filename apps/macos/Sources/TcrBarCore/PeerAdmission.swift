@@ -16,9 +16,21 @@ import Foundation
 /// yet: the row exists so an operator can say yes, and Accept is what opens the
 /// 120-second window in which the six digits appear.
 public struct PeerKnock: Decodable, Equatable, Identifiable, Sendable {
-    /// Where it knocked from, the source IP with the port dropped. This is the
-    /// field the pending queue coalesces on, so two knocks from one Mac are
-    /// one row.
+    /// Where to ANSWER it: `host:port` when the knock said which port its
+    /// listener is bound to, the host alone when it did not.
+    ///
+    /// **This is the string to dial, and the whole reason it is not the bare
+    /// host.** A knock arrives on a connection whose source port is ephemeral,
+    /// so the Rust side coalesces its queue on the bare IP and hands this
+    /// surface the port the knocker named beside it. Pass it to
+    /// ``PeerCommand/pair(address:)`` unchanged: `tcr peer pair` fills the
+    /// default port in for a bare host, and a Mac listening anywhere else can
+    /// be reached only through the port in this string.
+    ///
+    /// There is no separate port property here on purpose. The port arrives on
+    /// its own key too, and a second field would be a second way to build the
+    /// same dial string; this panel shows what it was given and hands the same
+    /// string back as argv.
     public var addr: String
     /// The ephemeral, per-boot id it knocked under, 16 lower-case hex
     /// characters. **This is not identity**, it is what `accept`, `ignore`

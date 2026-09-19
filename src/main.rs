@@ -1718,7 +1718,8 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 let pending: Vec<peer::state::Knock> = state
                     .visible_pending()
                     .into_iter()
-                    .map(|mut knock| {
+                    .map(|knock| {
+                        let mut knock = dialable_pending_row(knock);
                         knock.proposed_name = knock.proposed_name.as_deref().map(masked_label);
                         knock
                     })
@@ -2068,10 +2069,10 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                 .clone()
                 .unwrap_or_else(teamclaude_rs::peer::config::default_path);
             let store = teamclaude_rs::peer::config::PeerStore::open(&path)?;
-            let addr: std::net::SocketAddr = a
-                .addr
-                .parse()
-                .with_context(|| format!("peer pair: {} is not a host:port to dial", a.addr))?;
+            // A bare host is taken too, and defaulted: see `peer_dial_addr`.
+            // `tcr peer pending` prints a bare address for a knock that named
+            // no port, and this command has to accept what that row printed.
+            let addr: std::net::SocketAddr = peer_dial_addr(&a.addr)?;
             // **Phase one: knock.** This replaced the direct-`XX` dial.
             // The older `tcr peer pair` opened a
             // two-minute window on THIS Mac and dialled, so any host that
@@ -2772,7 +2773,14 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
             // reason `PeerState::visible_pending` gives: a reservation
             // placeholder is a slot held against the cap, not a Mac the
             // operator saw ask.
-            let pending = state.visible_pending();
+            // `dialable_pending_row` for the reason it gives: what a reader of
+            // a pending row does with the address is dial it, so both surfaces
+            // here print the port the knocker said to answer on.
+            let pending: Vec<peer::state::Knock> = state
+                .visible_pending()
+                .into_iter()
+                .map(dialable_pending_row)
+                .collect();
 
             if a.json {
                 #[derive(serde::Serialize)]
@@ -4121,6 +4129,93 @@ fn peer_window_name(window: tcr_peer_wire::Window) -> &'static str {
 /// itself a disclosure of the shape it is trying to hide.
 fn masked_label(label: &str) -> String {
     tcr_peer_wire::sanitize_label(label).unwrap_or_else(|_| "[masked]".to_string())
+}
+
+/// One pending row as a READER of it wants it: `addr` carrying the port the
+/// knocker said to answer on, when it said one.
+///
+/// The row in the file keeps the bare IP, which is the key the mutes, the bans
+/// and the accepted windows are all matched on
+/// (`peer::state::Knock::addr`). What comes out of `tcr peer ls --json` and
+/// `tcr peer pending` is the address to DIAL, because that string is handed
+/// straight to `tcr peer pair`, by an operator reading a terminal and by the
+/// panel's own Accept. Printing the key there sent every answer to the default
+/// port.
+///
+/// One function for both surfaces rather than the same map twice: the panel
+/// and the terminal have to be told the same address, and the copy that drifts
+/// is the one nobody runs.
+fn dialable_pending_row(mut knock: peer::state::Knock) -> peer::state::Knock {
+    knock.addr = knock.dial_address();
+    knock
+}
+
+/// What `tcr peer pair` dials, from what an operator typed.
+///
+/// A `host:port` is taken as it is. A BARE address gets the port this Mac's
+/// own default listener uses, because that is the only port a knock with no
+/// port in it could have come from, and it is what every answer dialled before
+/// a knock carried a port at all. `tcr peer pending` prints a bare address on
+/// exactly that row, and a command that refused what the row beside it prints
+/// sends the operator to look up a number the file already knows.
+fn peer_dial_addr(text: &str) -> anyhow::Result<std::net::SocketAddr> {
+    let text = text.trim();
+    if let Ok(addr) = text.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    if let Ok(host) = text.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(
+            host,
+            peer::config::default_listen().port(),
+        ));
+    }
+    anyhow::bail!("peer pair: {text} is not a host:port, or a bare host, to dial")
+}
+
+#[cfg(test)]
+mod peer_dial_addr_tests {
+    use super::peer_dial_addr;
+
+    #[test]
+    fn a_host_and_port_is_dialled_exactly_as_typed() {
+        let addr = peer_dial_addr("192.0.2.10:7766").expect("a host:port parses");
+        assert_eq!(addr.port(), 7766);
+        assert_eq!(addr.ip().to_string(), "192.0.2.10");
+    }
+
+    #[test]
+    fn a_bare_host_takes_the_default_listen_port() {
+        let addr = peer_dial_addr("192.0.2.10").expect("a bare host parses");
+        assert_eq!(
+            addr.port(),
+            teamclaude_rs::peer::config::default_listen().port(),
+            "a knock that named no port is answered where the default listener is"
+        );
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_host_and_port_is_dialled_as_typed() {
+        let addr = peer_dial_addr("[2001:db8::1]:7766").expect("a bracketed v6 host:port parses");
+        assert_eq!(addr.port(), 7766);
+    }
+
+    #[test]
+    fn a_bare_ipv6_host_takes_the_default_listen_port() {
+        let addr = peer_dial_addr("2001:db8::1").expect("a bare v6 host parses");
+        assert_eq!(
+            addr.port(),
+            teamclaude_rs::peer::config::default_listen().port()
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_no_address_at_all_is_refused_rather_than_guessed() {
+        let err = peer_dial_addr("not-an-address").expect_err("a hostname is not dialled");
+        assert!(
+            format!("{err:#}").contains("is not a host:port"),
+            "the refusal names what was wrong with it: {err:#}"
+        );
+    }
 }
 
 #[cfg(test)]

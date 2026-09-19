@@ -103,10 +103,11 @@
   ],
   "pending": [
     {
-      "addr": "192.0.2.14",
+      "addr": "192.0.2.14:7766",
       "instanceId": "1111111111111111",
       "proposedName": "kitchen-mac",
       "wireVersion": 1,
+      "listenPort": 7766,
       "firstSeenMs": 1699999970000,
       "lastSeenMs": 1699999998000
     }
