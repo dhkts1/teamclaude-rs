@@ -67,25 +67,10 @@ struct AccountExitRow: View {
                         )
                 }
             }
-            // The lead ruled this readout onto the Accounts card, naming the
-            // Mac verbatim, and it is drawn on its own line rather than as a
-            // pill in the card header. Measured twice, not chosen: in the
-            // header at the panel's 372 pt the account's own name clipped to
-            // `...` (the defect `V4Row` and `PeersTabV4.rowMenu` both record
-            // for a trailing column that gains one more item), and inline
-            // beside the picker the words themselves clipped to "waiting for
-            // studio-m…". The lead's words are kept whole; only the position
-            // moved.
-            if let waiting = exit.waitingPill(peers: peerRows) {
-                Text(waiting)
-                    .font(V4.font(V4.muteSize, .semibold))
-                    .foregroundStyle(Tok.near)
-                    .lineLimit(1)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .help(
-                        "This account is pinned to that Mac and may not use another "
-                            + "address, so its requests wait until it is back.")
-            }
+            // The waiting readout is the header pill's job now
+            // (`AccountCard.exitWaitingPillText`). Printing it again here put
+            // the same amber words on the card twice, so this row draws only
+            // the picker and the note below.
             if let note = exit.note(peers: peerRows) {
                 Text(note)
                     .font(V4.font(V4.muteSize))
