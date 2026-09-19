@@ -13,31 +13,31 @@
 //! DHCP answers, and a Mac holding only one of those is not usefully on a
 //! network yet.
 //!
-//! # Why a route lookup, not an interface list
+//! # Why a real interface list, not a route lookup
 //!
-//! The real answer is "walk every interface", which needs `getifaddrs`. That
-//! is C and this crate forbids `unsafe` (`#![forbid(unsafe_code)]`,
-//! `src/lib.rs:8`). The crate that wraps it, `if-addrs`, is already resolved
-//! in `Cargo.lock` through `mdns-sd`, but pulling it into this crate directly
-//! would still add a dependency EDGE this unit's brief asks to record rather
-//! than take (see [`crate::peer::reach::global_v6_addresses`], which faced
-//! the identical choice for the v6 address this Mac would send from).
+//! An earlier version of this module asked the kernel's route lookup instead:
+//! `connect` a UDP socket to an off-link documentation address and read back
+//! the source address it picked, the same trick
+//! [`crate::peer::reach::global_v6_addresses`] and
+//! [`crate::peer::reach::Client::internal_address`] use. That answers "is
+//! there a route to the internet", not "is there a LAN to look on": a Mac
+//! with an interface up and addressed but no default gateway (a hotspot with
+//! no uplink, an isolated office LAN, two Macs on a link with no router) has
+//! no route to an off-link address at all, and `connect` fails with
+//! `ENETUNREACH` (confirmed on this machine with `SO_DONTROUTE`, which
+//! restricts a socket to directly-connected networks the same way a missing
+//! gateway does: the documentation-range probe failed with "Network is
+//! unreachable" while a plain probe on the same machine succeeded). That Mac
+//! still finds peers over mDNS on the LAN it has, so the route trick read a
+//! real "yes" as "no".
 //!
-//! What stands in is the same trick that function and
-//! [`crate::peer::reach::Client::internal_address`] already use: `connect` on
-//! a UDP socket touches no network, it only runs the kernel's route lookup
-//! and records a destination, and the source address the kernel picks back is
-//! the address a real interface would send from. No route at all (no
-//! interface up) leaves the socket at its unspecified bind address, and that
-//! is exactly the case this rule exists to catch.
+//! Walking every interface directly needs `getifaddrs`, which is C and this
+//! crate forbids `unsafe` (`#![forbid(unsafe_code)]`, `src/lib.rs:8`).
+//! `if-addrs` wraps it and is already resolved in `Cargo.lock` through
+//! `mdns-sd`, so taking it as a direct dependency here adds one dependency
+//! EDGE and no new package (`Cargo.toml`, next to `mdns-sd`).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-
-/// Destinations used only for their route lookup, one per family. Both are
-/// off-link documentation addresses (RFC 5737 for v4, RFC 3849 for v6) on
-/// purpose: nothing is ever sent to them, and a reserved prefix can never be
-/// the answer this rule is trying to detect.
-const PROBES: [&str; 2] = ["192.0.2.1:9", "[2001:db8::1]:9"];
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Is `addr` the kind of address a real, up, non-loopback interface holds?
 /// The one rule [`network_present`] runs, named so it can be driven directly
@@ -81,34 +81,30 @@ pub fn any_usable(addrs: &[IpAddr]) -> bool {
     addrs.iter().copied().any(is_usable)
 }
 
-/// The address the kernel would send `destination` from, or `None` when
-/// there is no route to try (no interface up at all, or the bind itself
-/// failed).
-fn route_source(destination: SocketAddr) -> Option<IpAddr> {
-    let bind = match destination {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => "[::]:0",
+/// Every address a real, operationally-up interface holds right now, as
+/// `if-addrs` reports it. Loopback is excluded here rather than left to
+/// [`is_usable`], because [`if_addrs::Interface::is_oper_up`] is a fact about
+/// the INTERFACE and [`is_usable`] is a rule about the ADDRESS; keeping them
+/// apart is what lets a test hand [`any_usable`] addresses directly without
+/// building a fake interface. An interface whose operational status this
+/// platform cannot report reads as down rather than up, so an unreadable
+/// state can only ever make this Mac look OFFLINE, never falsely online.
+fn interface_addresses() -> Vec<IpAddr> {
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
     };
-    let socket = UdpSocket::bind(bind).ok()?;
-    socket.connect(destination).ok()?;
-    Some(socket.local_addr().ok()?.ip())
-}
-
-/// Every address the kernel's route lookup reveals right now, one probe per
-/// family. A machine with no interface up returns an empty list.
-fn route_addresses() -> Vec<IpAddr> {
-    PROBES
-        .iter()
-        .filter_map(|probe| probe.parse::<SocketAddr>().ok())
-        .filter_map(route_source)
+    interfaces
+        .into_iter()
+        .filter(|interface| interface.is_oper_up() && !interface.is_loopback())
+        .map(|interface| interface.ip())
         .collect()
 }
 
 /// Is this Mac on a network at all: does it have at least one non-loopback
 /// interface up with a usable address? See the module doc comment for the
-/// rule and why a route lookup stands in for an interface list.
+/// rule and why a real interface list is what answers it.
 pub fn network_present() -> bool {
-    any_usable(&route_addresses())
+    any_usable(&interface_addresses())
 }
 
 #[cfg(test)]

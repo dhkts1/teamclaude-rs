@@ -2863,6 +2863,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hyper",
  "hyper-util",
+ "if-addrs",
  "listeners",
  "mdns-sd",
  "oauth2",
