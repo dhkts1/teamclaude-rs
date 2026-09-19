@@ -186,6 +186,19 @@ public struct AccountExit: Decodable, Equatable, Sendable {
         return note(name: route.label(peers: peers))
     }
 
+    /// The "must" switch's own label: `must use <peer>`, drawn only when
+    /// ``showsMust`` is true, so `route.peer` is never nil where this is read.
+    ///
+    /// **The WIRE id, not the name:** same caveat as ``AccountExit/Route/label``.
+    /// ``mustLabel(peers:)`` is what the picker draws.
+    public var mustLabel: String { "must use \(route.label)" }
+
+    /// What the picker draws: the same label, with the peer's name in place of
+    /// the wire id, resolved the way ``AccountExit/Route/label(peers:)`` is.
+    public func mustLabel(peers: [PeerListDocument.PeerEntry]) -> String {
+        "must use \(route.label(peers: peers))"
+    }
+
     /// The note's own three sentences, parameterized on what to call the
     /// peer, the one thing ``note`` and ``note(peers:)`` disagree about.
     private func note(name peer: String?) -> String? {
