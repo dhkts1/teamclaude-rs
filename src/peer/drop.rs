@@ -79,13 +79,19 @@ const DROP_MAGIC: [u8; 4] = *b"TCRD";
 const DROP_VERSION: u8 = 1;
 
 /// ChaCha20-Poly1305's nonce width.
-const NONCE_BYTES: usize = 12;
+///
+/// Visible to the rest of the peer module because [`seal_payload`] and
+/// [`open_payload`] are, and a second module framing a sealed payload has to
+/// size its own header off the same number rather than writing 12 again.
+pub(crate) const NONCE_BYTES: usize = 12;
 
-/// Poly1305's tag width, appended to the ciphertext by the AEAD.
-const TAG_BYTES: usize = 16;
+/// Poly1305's tag width, appended to the ciphertext by the AEAD. See
+/// [`NONCE_BYTES`] for why it is not private.
+pub(crate) const TAG_BYTES: usize = 16;
 
-/// Magic, version and nonce: everything before the sealed bytes.
-const HEADER_BYTES: usize = DROP_MAGIC.len() + 1 + NONCE_BYTES;
+/// Magic and version: everything this module puts in front of the sealed
+/// payload, which carries its own nonce ([`seal_payload`]).
+const FRAME_BYTES: usize = DROP_MAGIC.len() + 1;
 
 /// How old a record may be and still be applied.
 pub const MAX_RECORD_AGE: Duration = Duration::from_secs(2 * DROP_SLOT_SECONDS);
@@ -144,7 +150,13 @@ impl DropKeys {
 /// One round and not a loop, because 32 bytes is one SHA-256 block and the
 /// counter never reaches two: a loop here would be dead code that the next
 /// reader has to prove is dead.
-fn expand(pseudorandom_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
+///
+/// Visible to the rest of the peer module rather than private, so a sibling
+/// deriving a key off the same [`crate::peer::config::PeerRow::rendezvous_secret`]
+/// under its OWN versioned domain string calls this ladder instead of writing a
+/// second one. Two spellings of RFC 5869 § 2.3 in one crate is the drift
+/// `config::hmac_sha256`'s own doc warns about.
+pub(crate) fn expand(pseudorandom_key: &[u8; 32], info: &[u8]) -> [u8; 32] {
     let mut block = Vec::with_capacity(info.len() + 1);
     block.extend_from_slice(info);
     block.push(0x01);
@@ -303,6 +315,109 @@ fn associated_data(name: &DropName, publisher: &PeerId) -> Vec<u8> {
     aad
 }
 
+// ---------------------------------------------------------------------------
+// The AEAD body, shared with this module's siblings
+// ---------------------------------------------------------------------------
+
+/// Why a payload would not seal.
+///
+/// Two arms and not a string, because the two are a different kind of event: a
+/// CSPRNG that refuses is the platform failing, and an AEAD that refuses at
+/// this width cannot happen on inputs this code can build. Each caller writes
+/// the sentence in its own vocabulary, which is why this type carries no
+/// sentence of its own.
+pub(crate) enum SealFailure {
+    /// The platform CSPRNG would not fill the nonce.
+    Csprng(getrandom::Error),
+    /// The AEAD refused the inputs.
+    Aead,
+}
+
+/// A fresh random nonce and the AEAD's output over `plaintext`, as one run of
+/// bytes, authenticating `aad` without encrypting it.
+///
+/// The nonce is twelve RANDOM bytes from the platform CSPRNG and is never
+/// derived: a derived nonce repeats the moment one key seals twice over
+/// changed content, and a repeated ChaCha20-Poly1305 nonce under a fixed key is
+/// a total break. Twelve random bytes against a handful of seals is nowhere
+/// near a birthday problem.
+///
+/// What is NOT here: the magic, the version, and the meaning of `aad`. Framing
+/// is each caller's own, so that "these are not our bytes at all" stays a
+/// refusal a caller can make before any key is used.
+pub(crate) fn seal_payload(
+    seal_key: &[u8; 32],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> std::result::Result<Vec<u8>, SealFailure> {
+    use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    let mut nonce = [0_u8; NONCE_BYTES];
+    getrandom::fill(&mut nonce).map_err(SealFailure::Csprng)?;
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(seal_key));
+    let sealed = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        // The AEAD's own error carries nothing beyond "it failed", and at this
+        // width it cannot: the key and nonce are fixed-size arrays.
+        .map_err(|_| SealFailure::Aead)?;
+
+    let mut payload = Vec::with_capacity(NONCE_BYTES + sealed.len());
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&sealed);
+    Ok(payload)
+}
+
+/// Why a payload did not open.
+///
+/// The two arms exist so a caller that wants to tell a cut-off paste apart from
+/// a forgery can, and a caller that does not want to tell them apart says so by
+/// mapping both to one refusal. Collapsing them here would take the choice away
+/// from both.
+pub(crate) enum OpenFailure {
+    /// Fewer bytes than a nonce and a tag: there is nothing that could
+    /// authenticate, whatever the key.
+    TooShort,
+    /// The bytes did not authenticate: a wrong key, wrong associated data, or
+    /// bytes somebody edited.
+    DidNotAuthenticate,
+}
+
+/// The inverse of [`seal_payload`]: the plaintext, or which of the two ways it
+/// failed.
+pub(crate) fn open_payload(
+    seal_key: &[u8; 32],
+    aad: &[u8],
+    payload: &[u8],
+) -> std::result::Result<Vec<u8>, OpenFailure> {
+    use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
+    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+
+    let Some(nonce) = payload.get(..NONCE_BYTES) else {
+        return Err(OpenFailure::TooShort);
+    };
+    let Some(body) = payload.get(NONCE_BYTES..) else {
+        return Err(OpenFailure::TooShort);
+    };
+    if body.len() <= TAG_BYTES {
+        // Tag and nothing to authenticate. The AEAD would refuse this too;
+        // refusing it here keeps the length arithmetic in one place.
+        return Err(OpenFailure::TooShort);
+    }
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(seal_key));
+    cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: body, aad })
+        .map_err(|_| OpenFailure::DidNotAuthenticate)
+}
+
 /// Seal `record` for `name`.
 ///
 /// The nonce is twelve RANDOM bytes from the platform CSPRNG and is never
@@ -314,9 +429,6 @@ fn associated_data(name: &DropName, publisher: &PeerId) -> Vec<u8> {
 /// The associated data is the name and the publisher, which is what stops the
 /// surface moving one pair's record to another name and having it believed.
 pub fn seal(keys: &DropKeys, name: &DropName, record: &DropRecord) -> Result<Vec<u8>> {
-    use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-
     if record.v != DROP_VERSION {
         bail!(
             "dead drop: refusing to seal a version {} record, this build writes {DROP_VERSION}",
@@ -333,28 +445,19 @@ pub fn seal(keys: &DropKeys, name: &DropName, record: &DropRecord) -> Result<Vec
     let plaintext =
         serde_json::to_vec(record).context("dead drop: the record would not serialize")?;
 
-    let mut nonce = [0_u8; NONCE_BYTES];
-    getrandom::fill(&mut nonce).context("dead drop: the platform CSPRNG refused")?;
-
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&keys.seal_key));
     let aad = associated_data(name, &record.publisher);
-    let sealed = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: &aad,
-            },
-        )
-        // The AEAD's own error carries nothing beyond "it failed", and at this
-        // width it cannot: the key and nonce are fixed-size arrays.
-        .map_err(|_| anyhow!("dead drop: the record would not seal"))?;
+    let payload =
+        seal_payload(&keys.seal_key, &aad, &plaintext).map_err(|failure| match failure {
+            SealFailure::Csprng(err) => {
+                anyhow::Error::new(err).context("dead drop: the platform CSPRNG refused")
+            }
+            SealFailure::Aead => anyhow!("dead drop: the record would not seal"),
+        })?;
 
-    let mut out = Vec::with_capacity(HEADER_BYTES + sealed.len());
+    let mut out = Vec::with_capacity(FRAME_BYTES + payload.len());
     out.extend_from_slice(&DROP_MAGIC);
     out.push(DROP_VERSION);
-    out.extend_from_slice(&nonce);
-    out.extend_from_slice(&sealed);
+    out.extend_from_slice(&payload);
     Ok(out)
 }
 
@@ -370,9 +473,6 @@ pub fn open(
     sealed: &[u8],
     now_s: u64,
 ) -> std::result::Result<DropRecord, RecordRefusal> {
-    use chacha20poly1305::aead::{Aead as _, KeyInit as _, Payload};
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-
     // The magic and the version are read before anything else and outside the
     // AEAD, so a surface answering with a login page or an error document is
     // told apart from a surface answering with bytes somebody forged.
@@ -396,29 +496,20 @@ pub fn open(
         });
     }
 
-    let Some(nonce) = sealed.get(DROP_MAGIC.len() + 1..HEADER_BYTES) else {
+    let Some(payload) = sealed.get(FRAME_BYTES..) else {
         return Err(RecordRefusal::DidNotOpen);
     };
-    let Some(body) = sealed.get(HEADER_BYTES..) else {
-        return Err(RecordRefusal::DidNotOpen);
-    };
-    if body.len() <= TAG_BYTES {
-        // Tag and nothing to authenticate. The AEAD would refuse this too;
-        // refusing it here keeps the length arithmetic in one place.
-        return Err(RecordRefusal::DidNotOpen);
-    }
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(&keys.seal_key));
     let aad = associated_data(name, expected_publisher);
-    let plaintext = cipher
-        .decrypt(
-            Nonce::from_slice(nonce),
-            Payload {
-                msg: body,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| RecordRefusal::DidNotOpen)?;
+    let plaintext =
+        open_payload(&keys.seal_key, &aad, payload).map_err(|failure| match failure {
+            // One refusal for both, on purpose: a drop record comes off
+            // somebody else's surface, where a short answer is as likely to be
+            // a forgery as a truncation, so an operator could do nothing
+            // differently with the two told apart. A caller whose bytes came
+            // from a person's clipboard should decide otherwise.
+            OpenFailure::TooShort | OpenFailure::DidNotAuthenticate => RecordRefusal::DidNotOpen,
+        })?;
 
     // Past this line the bytes authenticated, so what follows can only have
     // been written by a holder of this pair's seal key. A plaintext that is
