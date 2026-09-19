@@ -1094,6 +1094,15 @@ struct PeersTabV4: View {
     /// ``LoginSheet`` already thread for the same `ImageRenderer` reason.
     var snapshotMode: Bool = false
     var onOpenSettings: () -> Void = {}
+    /// Run the app's own update check, the one the menu bar item runs.
+    ///
+    /// Injected, and `nil` means the control is NOT DRAWN. The panel has no
+    /// reach to the shell's `Updater` of its own (`MenuBarShell` owns it and
+    /// hands it to `FleetView`), and the two wrong answers are a global,
+    /// which would let any view start an update, and a button wired to a
+    /// closure that does nothing, which is a control that lies. So the card
+    /// offers it exactly when a caller has handed it a way to perform it.
+    var onCheckForUpdates: (() -> Void)?
 
     /// The Trust sheet's peer, when one is open. Held here rather than on the
     /// row so two rows cannot open two sheets.
@@ -1131,8 +1140,12 @@ struct PeersTabV4: View {
                 // (`FleetView.swift:1008`). That banner is for a status read
                 // this build could not decode; an older `tcr` with no peer
                 // subcommand decoded perfectly and answered honestly.
+                // The one card on this tab that tells an operator to go and do
+                // something the app itself can do. It said "update it" and
+                // offered nothing.
                 collapsed(
-                    "This tcr does not support peers yet. Update it and the tab fills in.")
+                    "This tcr does not support peers yet. Update it and the tab fills in.",
+                    checkForUpdates: onCheckForUpdates)
             } else {
                 if let answering = snapshot.answeringOn {
                     egressLine(answering)
@@ -1292,7 +1305,9 @@ struct PeersTabV4: View {
     /// One honest line, and nothing else on the tab. The collapse
     /// `FleetView.swift:1008` does for an undecodable status, in the shape a
     /// missing subcommand deserves.
-    private func collapsed(_ sentence: String) -> some View {
+    private func collapsed(
+        _ sentence: String, checkForUpdates: (() -> Void)? = nil
+    ) -> some View {
         V4Card {
             V4Row {
                 VStack(alignment: .leading, spacing: 2) {
@@ -1302,6 +1317,15 @@ struct PeersTabV4: View {
                         .foregroundStyle(Tok.mute)
                         .fixedSize(horizontal: false, vertical: true)
                         .lineSpacing(V4.lineSpacing(V4.muteSize))
+                }
+            } trailing: {
+                if let checkForUpdates {
+                    PeerActionButton(
+                        title: "Check for updates…",
+                        systemImage: nil,
+                        help: "Runs the same check as Check for Updates in the menu bar.",
+                        enabled: true,
+                        action: checkForUpdates)
                 }
             }
         }

@@ -374,6 +374,35 @@ final class PeersPanelWiringTests: XCTestCase {
             "the decision is made and then not handed to the lines it decides")
     }
 
+    /// The unsupported card offers the update it asks for, and offers it only
+    /// when it can really run one.
+    ///
+    /// It told an operator to update `tcr` and gave them nothing to press,
+    /// while the app ships an update flow the menu bar item runs. The panel
+    /// cannot reach the shell's updater by itself, so the act is injected: a
+    /// caller that has one hands it over, and with none the control is not
+    /// drawn at all rather than wired to a closure that does nothing.
+    func testTheUnsupportedCardOffersTheUpdateItAsksFor() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("var onCheckForUpdates: (() -> Void)?"),
+            "the update act is not injected any more, so the panel either reaches a global "
+                + "or the card is back to naming an act it cannot perform")
+        XCTAssertTrue(
+            tab.contains("checkForUpdates: onCheckForUpdates"),
+            "the unsupported card does not hand its control the act, so pressing it does "
+                + "nothing")
+        let card = try slice(
+            tab, from: "private func collapsed(", to: "/// The refused verb, in `tcr`'s own")
+        XCTAssertTrue(
+            card.contains("if let checkForUpdates {"),
+            "the button is drawn whether or not there is an update check behind it, which is "
+                + "a control that lies")
+        XCTAssertTrue(
+            card.contains("title: \"Check for updates…\""),
+            "the control is not the one the card's own sentence asks for")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
