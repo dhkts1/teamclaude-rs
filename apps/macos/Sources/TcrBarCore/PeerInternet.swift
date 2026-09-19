@@ -188,6 +188,9 @@ public struct PeerReachReading: Equatable, Sendable {
 ///  - ``routerSilent`` is the ordinary outcome on most home and office
 ///    routers, and it is amber rather than red: nothing failed, a request just
 ///    has nowhere to land yet.
+///  - ``retrying`` is ``asking``'s twin, reached from the row's own button
+///    instead of the switch, so a caller can tell the two presses apart
+///    without a second field.
 public enum PeerInternetReach: Equatable, Sendable {
     case off
     case asking
@@ -198,18 +201,27 @@ public enum PeerInternetReach: Equatable, Sendable {
     /// said no, and collapsing the two would hide a broken `tcr` behind a
     /// sentence about somebody's router.
     case unreadable(String)
+    /// The row's own "Ask the router again" button was pressed, and the
+    /// answer has not arrived. A typed case rather than a bool sitting beside
+    /// the state, so the button's "Asking…" and its disabled state read off
+    /// this one value, the same way every other line on the row does.
+    case retrying
 
     /// Which state the switch and the last reading put this Mac in.
     ///
     /// `nil` reading with the switch ON is ``asking``: the press has happened
     /// and the answer has not arrived. It is never ``routerSilent``, because
     /// "we have not heard yet" and "the router said no" are different facts
-    /// and only one of them is a finding.
-    public static func state(on: Bool, reading: PeerReachReading?, now: Date)
+    /// and only one of them is a finding. `retrying` is the same absence, but
+    /// reached from the row's own retry button rather than from turning the
+    /// switch on, so the caller says which by passing `retrying: true`.
+    public static func state(
+        on: Bool, reading: PeerReachReading?, retrying: Bool = false, now: Date
+    )
         -> PeerInternetReach
     {
         guard on else { return .off }
-        guard let reading else { return .asking }
+        guard let reading else { return retrying ? .retrying : .asking }
         // `heldMapping`, not `mapping`: `mapping` is this one call's own
         // probe outcome, but `heldMapping.expiresAtMs` is the absolute
         // instant the SERVING process's keeper recorded, so it needs no
@@ -239,7 +251,7 @@ public enum PeerInternetReach: Equatable, Sendable {
         switch self {
         case .off:
             return nil
-        case .asking:
+        case .asking, .retrying:
             return "Asking your router for a way in. This takes a few seconds."
         case .reachable(let address, let port, _):
             return "Reachable at \(address):\(port). Your router agreed to hold this port "
@@ -260,7 +272,16 @@ public enum PeerInternetReach: Equatable, Sendable {
     public var isWarning: Bool {
         switch self {
         case .routerSilent, .unreadable: return true
-        case .off, .asking, .reachable: return false
+        case .off, .asking, .retrying, .reachable: return false
+        }
+    }
+
+    /// Whether this is one of the two states that ended without a path, the
+    /// only ones the row's "Ask the router again" button appears on.
+    public var canRetry: Bool {
+        switch self {
+        case .routerSilent, .unreadable: return true
+        case .off, .asking, .retrying, .reachable: return false
         }
     }
 

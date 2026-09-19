@@ -22,6 +22,9 @@ struct PeerInternetRow: View {
     let state: PeerInternetReach
     /// The press, with the state it moves TO, the same rule the argv keeps.
     var onPress: (Bool) -> Void = { _ in }
+    /// Ask the router again, without touching the switch itself. Shown only
+    /// on the two states that ended without a path (``PeerInternetReach/canRetry``).
+    var onRetry: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -44,6 +47,11 @@ struct PeerInternetRow: View {
                     .foregroundStyle(state.isWarning ? Tok.near : Tok.inkFaint)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if state.canRetry || state == .retrying {
+                Button(state == .retrying ? "Asking…" : "Ask the router again", action: onRetry)
+                    .font(.caption)
+                    .disabled(state == .retrying)
             }
         }
     }
