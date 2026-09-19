@@ -20,10 +20,21 @@ final class PanelV4ControlsTests: XCTestCase {
         XCTAssertTrue(
             source.contains("@ViewBuilder var actions: (Account) -> Actions"),
             "AccountsTabV4 no longer takes a visible-actions slot")
+        // Two anchors rather than one call-site literal: the card's `lentTo`
+        // line made the call multi-line, so the old single-line spelling can
+        // never match again. What the test is FOR is
+        // that the actions closure still reaches the card, and that is the
+        // trailing-closure argument below.
+        XCTAssertTrue(
+            source.contains("lentTo: PeerLease.leases(forAccountLabel: row.account.name"),
+            "the card is no longer handed the leases drawn against its account")
         XCTAssertTrue(
             source.contains(
-                "AccountCard(account: row.account, shape: shape, now: now, "
-                    + "isControl: row.isControl) {"),
+                """
+                        ) {
+                            actions(row.account)
+                        }
+                """.trimmingCharacters(in: .whitespacesAndNewlines)),
             "the card is no longer handed its actions")
         XCTAssertTrue(
             source.contains(".contextMenu { menu(row.account) }"),

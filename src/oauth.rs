@@ -1002,6 +1002,8 @@ pub fn upsert_account(
                 organization_type: profile.organization_type.clone(),
                 rate_limit_tier: profile.rate_limit_tier.clone(),
                 seat_tier: profile.seat_tier.clone(),
+                egress: crate::config::Egress::Local,
+                egress_strict: false,
                 extra: serde_json::Map::new(),
             });
             Ok(())
@@ -1184,6 +1186,8 @@ async fn probe_add_capability(config: &Config) -> AddCapability {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
+        egress: crate::config::Egress::Local,
+        egress_strict: false,
         extra: serde_json::Map::new(),
     };
     match crate::cli::post_add_account(config, &probe).await {
@@ -2047,6 +2051,8 @@ fn persist_via_file(
         organization_type: profile.organization_type,
         rate_limit_tier: profile.rate_limit_tier,
         seat_tier: profile.seat_tier,
+        egress: crate::config::Egress::Local,
+        egress_strict: false,
         extra: serde_json::Map::new(),
     };
     match config::save_account(config_path, &account) {
@@ -2204,6 +2210,8 @@ async fn finish_login(
                 organization_type: profile.organization_type.clone(),
                 rate_limit_tier: profile.rate_limit_tier.clone(),
                 seat_tier: profile.seat_tier.clone(),
+                egress: crate::config::Egress::Local,
+                egress_strict: false,
                 extra: serde_json::Map::new(),
             };
             match crate::cli::post_add_account(config, &account).await {
@@ -4235,6 +4243,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         let rotate_config = load_or_default(&path).unwrap();
@@ -4440,6 +4450,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -4541,6 +4553,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -4727,6 +4741,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         config::save_account(&path, &rotated_alice).expect("the rotation must land on disk");
@@ -5163,6 +5179,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }

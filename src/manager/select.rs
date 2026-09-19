@@ -386,15 +386,70 @@ impl Manager {
         self.select_with_group(tried, now, model, affinity, path, conn_key, None)
     }
 
+    /// Whether `group` has opted in to `spillToPool`, a PREFERENCE, whose own
+    /// traffic may be served by a non-member when no member has capacity.
+    ///
+    /// A membership test rather than [`Self::spill_groups`] + `contains`, for
+    /// the reason [`Self::is_group_reserved`] gives: the request path asks it
+    /// per request and only ever needs the one answer. Reads the same
+    /// hot-reloaded cache, so a `groupSettings` edit takes effect on the next
+    /// request.
+    pub fn is_group_spill(&self, group: &str) -> bool {
+        self.spill_groups().contains(group)
+    }
+
+    /// **Whether a request asking for `group` is held STRICTLY inside it**,
+    /// the one answer, for every reader.
+    ///
+    /// `reserved || !spill`, which is verbatim the expression
+    /// [`Self::select_with_group`] computes for its own `strict_group`. A
+    /// measurement found two readers outside the picker asking
+    /// [`Self::is_group_reserved`] ALONE, `src/proxy.rs`'s refusal arm and its
+    /// mirror on the exhausted path, so for a group that is neither reserved
+    /// nor a spill group the picker held the request strictly while those two
+    /// scoped their answer to the whole fleet: the wait they sized, the
+    /// revalidation they attempted and the 429 they finally returned were all
+    /// about accounts the request was never allowed to touch. A lease's scope is
+    /// exactly such a group, so a borrowed request's refusal named the lender's
+    /// entire fleet.
+    ///
+    /// One function rather than the expression in three places: a strictness
+    /// rule the picker and the refusal disagree about is a request held in a
+    /// group and refused about a pool.
+    pub fn is_group_strict(&self, group: &str) -> bool {
+        self.is_group_reserved(group) || !self.is_group_spill(group)
+    }
+
     /// [`Self::select`], with an optional PREFER-semantics group (`tcr run
     /// --group <name>`, Phase 1 — see `docs/plans/account-groups-bridge-phase1.md`).
     /// `group` narrows only the pacing-respecting first pass of the normal pick
     /// (mirroring how that pass already narrows on `respect_pacing`); the soft
     /// fallback pass always passes `None`, so a group with no current capacity
-    /// degrades to the whole pool rather than a 429. Every OTHER eligibility check
-    /// in this function — honouring an existing pin, a connection's noise
-    /// affinity, a sticky divert destination — passes `None` unconditionally: an
-    /// already-warm session is never re-keyed by a per-request preference.
+    /// degrades to the whole pool rather than a 429.
+    ///
+    /// # Which checks see the group, and which see `None`
+    ///
+    /// This paragraph was stale and said the opposite of the code: "every
+    /// OTHER eligibility check … passes `None` unconditionally". Two of them
+    /// were moved, because a PREFERENCE and a STRICT ask are not the same
+    /// thing and only the first may be bypassed to keep a session warm.
+    ///
+    /// - the **affinity fast-path** and the **sticky divert destination** are
+    ///   judged against `strict_group`, not the raw `group`. A warm pin is
+    ///   still never re-litigated against a mere preference (a spill group
+    ///   passes as `None` there, exactly as before), but an operator's
+    ///   `--group` on a non-spill group, and a lease's scope, hold: an
+    ///   out-of-group pin is DIVERTED, never served, and the session keeps the
+    ///   pin its other traffic is warm on.
+    /// - the **hard account lock** is refused outright when it falls outside
+    ///   `strict_group`, which is why this function now computes the ask before
+    ///   it reads the lock.
+    /// - the **reservation** argument (`Self::reserved_blocks`) still takes the
+    ///   raw `group` everywhere: a reservation is not a preference, it is a real
+    ///   ask about who owns an account.
+    ///
+    /// An already-warm session is never re-KEYED by any of it: every arm above
+    /// diverts and keeps the pin.
     #[allow(clippy::too_many_arguments)]
     pub fn select_with_group(
         &self,
@@ -411,13 +466,6 @@ impl Manager {
         // file's mtime has not moved since the last check.
         self.reload_groups_if_changed();
 
-        // Hard account lock: pin ALL traffic to the configured account, bypassing
-        // rotation/affinity/migration. `tried` still ends the rotation loop — once the
-        // locked account has failed this request, return None (no failover to the pool).
-        if let Some(li) = self.locked_idx {
-            return if tried.contains(&li) { None } else { Some(li) };
-        }
-
         // A single point-in-time snapshot for the whole call — see
         // `Self::reserved_groups`'s doc for why this clones rather than holding
         // the lock across the accounts/affinity locks taken below.
@@ -429,6 +477,52 @@ impl Manager {
         // Same point-in-time-snapshot reasoning as `reserved_groups` above —
         // see `Self::spill_groups`'s doc.
         let spill_groups = self.spill_groups();
+        // THE GROUP ASK THIS CALL WILL HOLD STRICTLY, computed once here rather
+        // than at the pool pick alone, because the affinity fast-path below has
+        // to ask the same question and used to have no way to. See the pool
+        // pick's own comment for what strictness means and for the two
+        // carve-outs; this is the identical expression, hoisted.
+        let strict_group =
+            group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
+
+        // Hard account lock: pin ALL traffic to the configured account, bypassing
+        // rotation/affinity/migration. `tried` still ends the rotation loop, once the
+        // locked account has failed this request, return None (no failover to the pool).
+        //
+        // # A STRICT GROUP OUTRANKS THE LOCK, and once it did not
+        //
+        // This arm used to sit ABOVE `strict_group`, returning before the ask
+        // had even been computed, a measurement proved it, and it is the
+        // third door out of a strict group after the affinity fast-path and
+        // stickiness. For `tcr run --group` a lock is arguably the operator's
+        // own louder instruction; for a LEASE it is not the same operator at
+        // all. The lender expresses the scope as exactly this ask
+        // (`crate::peer::serve::ScopeRestriction::Group`), so a lender with
+        // `lockAccount` set served every borrowed request on the locked account
+        // whatever the lease was scoped to, a scoped lease drawing on an
+        // account outside its scope, on somebody else's Mac, which is the one
+        // outcome scoping exists to prevent.
+        //
+        // The refusal is `None` and not a widening to the group: a lock means
+        // "this account and no other" and a strict ask means "inside this group
+        // and nowhere else", so when they disagree there is no account that
+        // satisfies both, and the honest answer is the one a strict ask is
+        // always owed. The caller's next rung is the 429 it already has.
+        if let Some(li) = self.locked_idx {
+            if let Some(g) = strict_group {
+                let in_group = {
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    accounts
+                        .get(li)
+                        .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
+                };
+                if !in_group {
+                    return None;
+                }
+            }
+            return if tried.contains(&li) { None } else { Some(li) };
+        }
+
         let now_ms = odt_to_ms(now);
         // Compute the Fable classification ONCE, not per-account.
         let is_fable = model.is_some_and(crate::model::is_fable_model);
@@ -485,7 +579,47 @@ impl Manager {
                 (pinned, counts)
             };
             if let Some((idx, pin_touched_ms)) = pinned {
-                if tried.contains(&idx) {
+                // A STRICT GROUP ASK OUTRANKS AN EXISTING PIN, and once it
+                // did not.
+                //
+                // Every eligibility call in this fast-path passes `group: None`
+                // on purpose, a warm pin is not re-litigated against a per-request
+                // PREFERENCE, and `Self::reserved_blocks` answers `false` for
+                // any `Some(g)`, so no gate below looks at group MEMBERSHIP at
+                // all. A session that had pinned account `X` therefore kept
+                // being served on `X` even when the request asked strictly for
+                // a group `X` is not in. For `tcr run --group` that is a leak
+                // out of the group an operator typed; for a LEASE it is worse,
+                // because the lender's serving leg expresses a lease's
+                // scope as exactly this header
+                // ([`crate::peer::serve::ScopeRestriction::Group`]), so a
+                // borrowed request whose session key collided with a local
+                // session's pin was served on an account OUTSIDE the scope,
+                // on somebody else's Mac, which is the one outcome the scope
+                // exists to prevent.
+                //
+                // A DIVERT and not a re-key: the group ask is a fact about
+                // THIS request, so it joins the paced / model-class /
+                // short-hold family, the request is served inside the group
+                // and the session keeps the pin its other traffic is warm on.
+                // When the group has no free member the strict arm below
+                // returns `None`, which is the honest refusal a strict ask is
+                // owed, never a serve on the out-of-group pin.
+                let out_of_strict_group = strict_group.is_some_and(|g| {
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    !accounts
+                        .get(idx)
+                        .is_some_and(|a| a.groups.iter().any(|carried| carried == g))
+                });
+                if out_of_strict_group {
+                    let accounts = self.accounts.read().expect("accounts lock poisoned");
+                    keep_pin = Some(idx);
+                    divert_reason = Some("group-strict");
+                    divert_until_ms = accounts
+                        .get(idx)
+                        .and_then(|a| a.rate_limited_until_ms)
+                        .unwrap_or(0);
+                } else if tried.contains(&idx) {
                     // The pin already failed THIS request upstream. That is NOT proof
                     // the account is gone — a transient blip (a dropped connection, a
                     // 5xx) leaves every ACCOUNT-level gate clear. So divert this
@@ -754,7 +888,7 @@ impl Manager {
                                 let mut best: Option<usize> = None;
                                 let mut best_key: Option<(usize, u32, u64)> = None;
                                 for (cand, account) in accounts.iter().enumerate() {
-                                    if cand == idx {
+                                    if cand == idx || tried.contains(&cand) {
                                         continue;
                                     }
                                     let count_y = counts.get(&cand).copied().unwrap_or(0);
@@ -773,8 +907,14 @@ impl Manager {
                                         now,
                                         now_ms,
                                         is_fable,
-                                        None,  // no group PREFERENCE — honouring an existing pin
-                                        group, // but reservation is not a preference — real ask
+                                        // `strict_group`, not `None`: the fourth door out of a
+                                        // strict group, and the one that returns from inside the
+                                        // affinity fast path. A migration target is a NEW pin, not
+                                        // a re-litigation of the existing one, so it is held to the
+                                        // same strict ask every other candidate loop in this
+                                        // function already is.
+                                        strict_group,
+                                        group, // reservation is not a preference, real ask
                                         &reserved_groups,
                                         &parked_groups,
                                     ) {
@@ -907,8 +1047,13 @@ impl Manager {
                                             now,
                                             now_ms,
                                             is_fable,
-                                            None, // no group PREFERENCE — honouring an existing connection
-                                            group, // but reservation is not a preference — real ask
+                                            // `strict_group`, not `None`: a GROUP-scoped lease
+                                            // carries no `tried` seeding the way an account-set
+                                            // scope does, so for it `strict_group` is the whole
+                                            // enforcement, a connection-affinity account outside
+                                            // it must never be followed onto.
+                                            strict_group,
+                                            group, // reservation is not a preference, real ask
                                             &reserved_groups,
                                             &parked_groups,
                                         )
@@ -943,9 +1088,20 @@ impl Manager {
                             let usable = {
                                 let accounts =
                                     self.accounts.read().expect("accounts lock poisoned");
-                                accounts
-                                    .get(control_idx)
-                                    .is_some_and(|a| Self::control_eligible(a, now_ms))
+                                accounts.get(control_idx).is_some_and(|a| {
+                                    // `control_eligible` deliberately bypasses `disabled` and
+                                    // every other narrowing gate (see its own doc), it is NOT
+                                    // a substitute for the group scope. A STRICT ask (an
+                                    // operator's `--group`, or a lease's scope) is not a
+                                    // preference this designated-identity route may ignore: a
+                                    // GROUP-scoped lease carries no `tried` seeding, so this is
+                                    // the whole enforcement for it, same reasoning as the
+                                    // connection-affinity overlay just above.
+                                    Self::control_eligible(a, now_ms)
+                                        && strict_group.is_none_or(|g| {
+                                            a.groups.iter().any(|carried| carried == g)
+                                        })
+                                })
                             };
                             if usable {
                                 let mut accounts =
@@ -1005,8 +1161,19 @@ impl Manager {
                             now,
                             now_ms,
                             is_fable,
-                            None,  // no group PREFERENCE — honouring a sticky destination
-                            group, // but reservation is not a preference — real ask
+                            // `strict_group`, not `None`: the second door out
+                            // of a strict group, and the one the fast-path fix
+                            // above would otherwise leave open. Stickiness
+                            // exists so a diverted session keeps landing on ONE
+                            // warm alternative, and for a PREFER-only (spill)
+                            // group it still bypasses the narrowing exactly as
+                            // before. But a STRICT ask, an operator's
+                            // `--group`, or a lease's scope, is not a
+                            // preference to bypass: a sticky destination
+                            // outside it is the same out-of-scope serve, one
+                            // divert later.
+                            strict_group,
+                            group, // reservation is not a preference, real ask
                             &reserved_groups,
                             &parked_groups,
                         )
@@ -1136,8 +1303,9 @@ impl Manager {
             // exhaustion ladder (`proxy.rs`) the same `None` a truly exhausted fleet
             // produces, which soft-waits once for a transient park (the 17s hold
             // above) and answers an honest 429 only for real exhaustion.
-            let strict_group =
-                group.filter(|g| reserved_groups.contains(*g) || !spill_groups.contains(*g));
+            // `strict_group` is computed once at the top of this function, the
+            // affinity fast-path needs the same value, and one expression
+            // evaluated twice is one expression that drifts.
 
             // Soft fallback (CRITICAL — pacing must never DROP a servable request,
             // and a group with no current capacity must never either): if the first
@@ -2858,6 +3026,8 @@ mod revalidation_sticky_tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -3011,6 +3181,8 @@ mod sticky_divert_replay_tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -3145,6 +3317,501 @@ mod sticky_divert_replay_tests {
     }
 }
 
+/// Two gates on `select_with_group`'s strict-group arms, both of
+/// which had ZERO coverage: reverting either hunk left the whole suite green.
+///
+/// A lease's scope is expressed as exactly this ask
+/// ([`crate::peer::serve::ScopeRestriction::Group`]), so every door out of a
+/// strict group is an account outside the scope serving a borrowed request on
+/// somebody else's Mac.
+#[cfg(test)]
+mod strict_group_door_tests {
+    use super::*;
+    use crate::config::{Account, ProxyConfig};
+    use crate::oauth::NoRefresh;
+    use crate::probe::LiveUsageProber;
+    use crate::warmer::LiveWarmer;
+    use std::collections::HashSet;
+
+    fn account(name: &str, groups: &[&str]) -> Account {
+        Account {
+            name: name.to_string(),
+            account_type: "oauth".to_string(),
+            account_uuid: None,
+            org_uuid: None,
+            org_name: None,
+            access_token: format!("at-{name}"),
+            refresh_token: Some(format!("rt-{name}")),
+            expires_at: Some(crate::now_ms() + 3_600_000),
+            priority: Some(0),
+            switch_threshold: None,
+            disabled: None,
+            groups: Some(groups.iter().map(|g| (*g).to_string()).collect()),
+            organization_type: None,
+            rate_limit_tier: None,
+            seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn config_with(accounts: Vec<Account>, lock_account: Option<String>) -> Config {
+        Config {
+            quarantined_accounts: Vec::new(),
+            migrated_legacy_throttle: false,
+            renamed_accounts: Vec::new(),
+            rename_write_error: None,
+            proxy: ProxyConfig::default(),
+            upstream: "https://api.anthropic.com".to_string(),
+            switch_threshold: 0.90,
+            fable_weekly_threshold: None,
+            pacing: PacingConfig::default(),
+            account_throttle: ThrottleConfig::default(),
+            fleet_throttle: ThrottleConfig::default(),
+            lock_account,
+            control_account: None,
+            control_reserve: 0.05,
+            control_pooled: false,
+            reset_urgency_tier_hours: 24,
+            http1_only: false,
+            accounts,
+            group_settings: HashMap::new(),
+            pricing: Default::default(),
+            usage_retention_days: 90,
+            extra: serde_json::Map::new(),
+        }
+    }
+
+    fn build(config: Config) -> Arc<Manager> {
+        Manager::new(
+            config,
+            Arc::new(NoRefresh),
+            Arc::new(LiveUsageProber::new()),
+            Arc::new(LiveWarmer::new()),
+            None,
+        )
+    }
+
+    /// `config_with` plus a named control account, the door §H the
+    /// control-preferred overlay below needs to reach.
+    fn config_with_control(accounts: Vec<Account>, control_name: &str) -> Config {
+        let mut config = config_with(accounts, None);
+        config.control_account = Some(crate::config::ControlAccountRef::Name(
+            control_name.to_string(),
+        ));
+        config
+    }
+
+    /// **A HARD ACCOUNT LOCK DOES NOT BEAT A STRICT GROUP**, and this is the
+    /// door that opened before the ask was even computed.
+    ///
+    /// `lockAccount` used to return above `strict_group`, so a lender with one
+    /// set served every borrowed request on the locked account whatever the
+    /// lease was scoped to. `None` and not a widening: a lock means "this
+    /// account and no other", a strict ask means "inside this group and nowhere
+    /// else", and when they disagree no account satisfies both.
+    ///
+    /// Watched red: move the `locked_idx` arm back above `strict_group` (or
+    /// delete its `in_group` check) and the first assertion answers
+    /// `Some(bob)`.
+    #[test]
+    fn a_hard_account_lock_is_refused_outside_a_strict_group() {
+        let manager = build(config_with(
+            vec![account("alice", &["work"]), account("bob", &["home"])],
+            Some("bob".to_string()),
+        ));
+        let now = OffsetDateTime::now_utc();
+        let locked = manager
+            .select(&HashSet::new(), now, None, None, "/v1/messages", None)
+            .expect("the lock always answers when nothing asks for a group");
+
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("work"),
+            ),
+            None,
+            "the locked account is in `home`, so a STRICT ask for `work` has no \
+             answer, and must not be served on the lock"
+        );
+
+        // The controls, without which the refusal above could be a lock that
+        // simply stopped working.
+        assert_eq!(
+            manager.select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/v1/messages",
+                None,
+                Some("home"),
+            ),
+            Some(locked),
+            "a strict ask the lock SATISFIES is still served on the lock"
+        );
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/messages", None),
+            Some(locked),
+            "and a request that asks for no group is unaffected"
+        );
+    }
+
+    /// **A STICKY DIVERT DESTINATION DOES NOT BEAT A STRICT GROUP**, the hunk
+    /// added later and nobody covered: reverting it left the suite green.
+    ///
+    /// Stickiness exists so a diverted session keeps landing on ONE warm
+    /// alternative, and for a spill (PREFER-only) group it still bypasses the
+    /// narrowing exactly as before. A strict ask is not a preference to bypass.
+    ///
+    /// Watched red: pass `None` instead of `strict_group` to `Self::eligible`
+    /// in `select_with_group`'s `sticky_pick` block and the strict ask below is
+    /// answered `Some(sticky)`, an account outside the group, one divert
+    /// later.
+    #[test]
+    fn a_sticky_divert_destination_is_refused_outside_a_strict_group() {
+        let manager = build(config_with(
+            vec![account("alice", &["a-team"]), account("bob", &["b-team"])],
+            None,
+        ));
+        let now = OffsetDateTime::now_utc();
+        let key = 7_u64;
+
+        // One pinned session, its pin then rate-limited, so the next request
+        // for that session DIVERTS and keeps the pin.
+        let pin = manager
+            .select(&HashSet::new(), now, None, Some(key), "/v1/messages", None)
+            .expect("an account is eligible for the initial pin");
+        manager.mark_rate_limited(pin, 120);
+        let mut tried = HashSet::new();
+        tried.insert(pin);
+
+        // The first divert records the episode, and its destination becomes
+        // the sticky one. This is the live sticky path, not a seeded ledger.
+        let sticky = manager
+            .select(&tried, now, None, Some(key), "/v1/messages", None)
+            .expect("the other account serves the first divert");
+        assert_ne!(sticky, pin, "a divert lands on an alternate");
+        assert_eq!(
+            manager
+                .divert_ledger
+                .lock()
+                .expect("divert ledger lock poisoned")
+                .get(&key)
+                .copied()
+                .expect("the episode is recorded")
+                .sticky,
+            sticky,
+            "the sticky destination is the one the strict ask below must refuse"
+        );
+
+        // THE SUBJECT. The pin's OWN group is the strict ask: its only member
+        // is the pin, which this request has already tried, so the honest
+        // answer is `None`. The sticky destination is in the other group, and
+        // serving it would be the out-of-scope serve.
+        let pin_group = {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            accounts[pin].groups[0].clone()
+        };
+        let answer = manager.select_with_group(
+            &tried,
+            now,
+            None,
+            Some(key),
+            "/v1/messages",
+            None,
+            Some(&pin_group),
+        );
+        assert_ne!(
+            answer,
+            Some(sticky),
+            "the sticky destination is outside the strictly-asked group {pin_group} \
+             and must never be the answer"
+        );
+        assert_eq!(
+            answer, None,
+            "and the honest answer is the refusal a strict ask is owed"
+        );
+
+        // The control: the SAME session, the same episode, the same sticky
+        // destination, with no group asked for. Without this the assertion
+        // above could be passing because stickiness stopped working.
+        assert_eq!(
+            manager.select(&tried, now, None, Some(key), "/v1/messages", None),
+            Some(sticky),
+            "with no group asked for, the sticky destination is still reused"
+        );
+    }
+
+    /// **`is_group_strict` is `reserved || !spill`**, the one rule, so
+    /// `src/proxy.rs`'s refusal terminals scope their answer to the same set
+    /// the picker held the request inside.
+    ///
+    /// Watched red: make `is_group_strict` call `is_group_reserved` alone and
+    /// the first assertion fails, which is exactly the state the two
+    /// `proxy.rs` call sites were in.
+    #[test]
+    fn a_group_that_is_neither_reserved_nor_spill_is_strict() {
+        let manager = build(config_with(vec![account("alice", &["work"])], None));
+        assert!(
+            manager.is_group_strict("work"),
+            "a plain group is strict: it is not a spill group, so the picker \
+             holds its traffic inside it"
+        );
+        assert!(
+            !manager.is_group_spill("work"),
+            "and it is not a spill group, which is what makes it strict"
+        );
+        assert!(
+            manager.is_group_strict("never-configured"),
+            "a group nobody configured is strict too, for the same reason"
+        );
+    }
+
+    /// `config_with` plus `loadBalanceMigration: true`, the only mode the
+    /// migration scan below runs under (`Self::load_balance_migration_enabled`).
+    fn config_with_migration(accounts: Vec<Account>) -> Config {
+        let mut config = config_with(accounts, None);
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "loadBalanceMigration".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        config.extra = extra;
+        config
+    }
+
+    /// Seed a LIVE pin directly, bypassing `select`, the same shape as
+    /// `stale_pin_load_tests::pin` below in this file. Used here so two
+    /// sessions can be stacked on one account deterministically: a fresh,
+    /// unpinned `select` alternates its LRU pick across every eligible
+    /// account (`Self::pick_eligible`'s `last_selected_seq` tie-break), so
+    /// two back-to-back calls do NOT reliably land on the same index the way
+    /// the migration scan's precondition (`count_x >= 2`) needs.
+    fn pin(manager: &Manager, key: u64, idx: usize, touched_ms: i64) {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .insert(key, (idx, touched_ms));
+    }
+
+    fn pin_of(manager: &Manager, key: u64) -> Option<usize> {
+        manager
+            .affinity
+            .lock()
+            .expect("affinity lock poisoned")
+            .get(&key)
+            .map(|&(idx, _)| idx)
+    }
+
+    /// **THE FOURTH DOOR OUT OF A STRICT GROUP**, and the one that returns
+    /// from inside the affinity fast path, so neither the hard-lock test above
+    /// nor the sticky-destination test above ever reaches it.
+    ///
+    /// Watched red: the migration scan's `Self::eligible` call at this file's
+    /// `:901` passes `None` for the group PREFERENCE instead of `strict_group`,
+    /// so `at-outside` (no groups at all) is "eligible" for a strict `shared`
+    /// ask and, being the only unpinned account, is the least-loaded migration
+    /// target, `served` comes back `1`, the `assert_ne!` below fails, and the
+    /// session is committed and re-pinned there (`:999-1004`). Green once that
+    /// argument is `strict_group`.
+    #[test]
+    fn a_migration_target_is_refused_outside_a_strict_group() {
+        let manager = build(config_with_migration(vec![
+            account("at-inside", &["shared"]),
+            account("at-outside", &[]),
+        ]));
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        // Two sessions already stacked on the in-group account: `count_x == 2`,
+        // so the migration scan runs on the very next select for either one.
+        pin(&manager, 10, 0, now_ms);
+        pin(&manager, 11, 0, now_ms);
+
+        let served = manager
+            .select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                Some(10),
+                "/v1/messages",
+                None,
+                Some("shared"),
+            )
+            .expect("the strict group still has a servable member");
+        assert_ne!(
+            served, 1,
+            "`at-outside` carries no `shared` group; a migration target \
+             outside the strict group is the out-of-scope serve the scope \
+             exists to prevent"
+        );
+        assert_eq!(
+            pin_of(&manager, 10),
+            Some(served),
+            "and whatever it chose is what the session is pinned to"
+        );
+    }
+
+    /// The migration scan is the one candidate loop in this file with no
+    /// `tried` guard.
+    ///
+    /// Watched red: `:891`'s `continue` fires only for `cand == idx`, so
+    /// `at-b`, already in `tried`, either the account a borrowed request's
+    /// scope benched (`src/proxy.rs:2249-2256`) or the account a local retry
+    /// just failed on, is still the least-loaded candidate and the scan
+    /// returns it, migrating the session onto the very account `tried`
+    /// exists to rule out. Green once `:891` also `continue`s on
+    /// `tried.contains(&cand)`.
+    #[test]
+    fn a_migration_target_is_never_an_account_the_request_already_benched() {
+        let manager = build(config_with_migration(vec![
+            account("at-a", &[]),
+            account("at-b", &[]),
+        ]));
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+        // Two sessions already stacked on `at-a`: `count_x == 2`, so the scan
+        // runs and `at-b` (empty, and therefore the least-loaded candidate)
+        // is the only place it could migrate to.
+        pin(&manager, 10, 0, now_ms);
+        pin(&manager, 11, 0, now_ms);
+
+        // What a borrowed request under `x-tcr-accounts: at-a` looks like by
+        // the time it reaches the picker (`src/proxy.rs:2249-2256`), and
+        // equally what a local retry looks like after `at-b` failed it.
+        let mut tried = HashSet::new();
+        tried.insert(1);
+        assert_ne!(
+            manager.select(&tried, now, None, Some(10), "/v1/messages", None),
+            Some(1),
+            "`tried` is the set the picker may not return, and the migration \
+             scan is inside the picker"
+        );
+    }
+
+    /// **THE CONTROL-PREFERRED OVERLAY NEEDS NO CONFIG FLAG** to leave a
+    /// strict group, only an unpinned session, a non-inference path, and a
+    /// configured `controlAccount`.
+    ///
+    /// Watched red: `Self::control_eligible` deliberately bypasses every
+    /// narrowing gate including group membership (see its own doc), and the
+    /// overlay at this file's `:1080-1102` called it alone, so an unpinned
+    /// `/v1/organizations`-class request asking strictly for `shared` was
+    /// routed onto `at-control`, which carries no `shared` group. Green once
+    /// the overlay also requires `strict_group` membership.
+    #[test]
+    fn control_preferred_overlay_is_refused_outside_a_strict_group() {
+        let manager = build(config_with_control(
+            vec![
+                account("at-inside", &["shared"]),
+                account("at-control", &[]),
+            ],
+            "at-control",
+        ));
+        let now = OffsetDateTime::now_utc();
+
+        let served = manager
+            .select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None, // unpinned, the overlay only ever runs on a fresh session
+                "/v1/organizations",
+                None,
+                Some("shared"),
+            )
+            .expect("the strict group still has a servable member");
+        assert_ne!(
+            served, 1,
+            "`at-control` carries no `shared` group; the control-preferred \
+             overlay is a designated-identity route, not a licence to leave \
+             a strict group with no config flag at all"
+        );
+
+        // The control: with no group asked for, the same request still
+        // prefers the control account, the overlay itself is unaffected.
+        assert_eq!(
+            manager.select(&HashSet::new(), now, None, None, "/v1/organizations", None),
+            Some(1),
+            "with no group asked for, control-preferred routing is unchanged"
+        );
+    }
+
+    /// **THE CONNECTION-AFFINITY (NOISE) OVERLAY NEEDS NO CONFIG FLAG
+    /// EITHER**, the reachability turns only on the lender's HTTP client
+    /// reusing one loopback connection across leases (unmeasured by the
+    /// review), never on `loadBalanceMigration`.
+    ///
+    /// Watched red: the overlay at this file's `:1034-1075` called
+    /// `Self::eligible` with `group: None`, so a `/mcp-registry`-class
+    /// request whose connection was already following `at-outside` (no
+    /// `shared` group) kept following it even under a strict `shared` ask.
+    /// Green once that argument is `strict_group`.
+    #[test]
+    fn noise_connection_affinity_overlay_is_refused_outside_a_strict_group() {
+        let manager = build(config_with(
+            vec![
+                account("at-inside", &["shared"]),
+                account("at-outside", &[]),
+            ],
+            None,
+        ));
+        let now = OffsetDateTime::now_utc();
+        let now_ms = odt_to_ms(now);
+
+        // The control FIRST, on its own connection key: with no group asked
+        // for, a request follows its connection's already-affined account.
+        // Checked before the strict ask below on a SEPARATE key, because a
+        // strict ask that falls through to the normal pick re-records
+        // `conn_affinity` for whichever key it used, sharing one key would
+        // make the control assertion read the strict call's own side effect
+        // instead of the overlay's un-narrowed behaviour.
+        let control_conn_key = 100_u64;
+        manager.conn_affinity_record(control_conn_key, 1, now_ms);
+        assert_eq!(
+            manager.select(
+                &HashSet::new(),
+                now,
+                None,
+                None,
+                "/mcp-registry/v1/list",
+                Some(control_conn_key),
+            ),
+            Some(1),
+            "with no group asked for, connection affinity follows the account \
+             an earlier request on this connection left it on"
+        );
+
+        // THE SUBJECT: the same connection-affinity fact, but the request now
+        // asks strictly for `shared`, which `at-outside` does not carry.
+        let strict_conn_key = 99_u64;
+        manager.conn_affinity_record(strict_conn_key, 1, now_ms);
+        let served = manager
+            .select_with_group(
+                &HashSet::new(),
+                now,
+                None,
+                None, // unpinned, this overlay is also gated on `keep_pin.is_none()`
+                "/mcp-registry/v1/list",
+                Some(strict_conn_key),
+                Some("shared"),
+            )
+            .expect("the strict group still has a servable member");
+        assert_ne!(
+            served, 1,
+            "`at-outside` carries no `shared` group; a strict ask must not \
+             keep following a connection's account out of the group"
+        );
+    }
+}
+
 /// Reserved-group semantics test #5:
 /// `eligible` and `account_gate` must AGREE on the RESERVED gate over many
 /// account/reserved-set/ask combinations — a property test over the two
@@ -3176,6 +3843,8 @@ mod reserved_gate_agreement_tests {
                 organization_type: None,
                 rate_limit_tier: None,
                 seat_tier: None,
+                egress: crate::config::Egress::Local,
+                egress_strict: false,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -3336,6 +4005,8 @@ mod group_miss_tests {
                 organization_type: None,
                 rate_limit_tier: None,
                 seat_tier: None,
+                egress: crate::config::Egress::Local,
+                egress_strict: false,
                 extra: serde_json::Map::new(),
             },
             false,
@@ -3481,6 +4152,8 @@ mod reset_urgency_tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -3733,6 +4406,8 @@ mod fable_last_resort_tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -4109,6 +4784,8 @@ mod stale_pin_load_tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }

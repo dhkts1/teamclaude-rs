@@ -1,0 +1,29 @@
+[package]
+name = "tcr-peer-wire"
+version = "0.1.0"
+edition = "2021"
+license = "PolyForm-Noncommercial-1.0.0"
+publish = false
+description = "Serde types for the tcr peer-mesh wire contract, shared by both ends of a peer stream"
+
+# Serde only, and deliberately no crypto: the handshake lives in the main crate
+# (`src/peer/noise.rs`), so this crate stays a pure description of what two peers
+# say to each other. Built by `cargo test --all` / `cargo clippy --all-targets`
+# on the ubuntu CI runner (`.github/workflows/ci.yml`, `--all` = `--workspace`),
+# so it must stay Linux-clean forever: no macOS-only dependency, no `unsafe`.
+#
+# `data-encoding`: already in Cargo.lock as a transitive
+# dependency, so this line adds zero new packages. It replaces the hand-rolled
+# Crockford base32 below, and `JoinToken::to_token`/`parse`
+# (`src/peer/pair.rs`) use the same codec so there is one base32 implementation
+# on this wire, not two that can drift.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+data-encoding = "2"
+
+# Property tests over this crate's own encode/decode and parse
+# pairs (`tests/props.rs`). Gil approved this as a dev-dependency on
+# 2026-09-18, no other new dependency.
+[dev-dependencies]
+proptest = "1"

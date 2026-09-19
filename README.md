@@ -222,12 +222,33 @@ computed against the clock at read time, so neither the display nor the schedule
 stale bar. The request-flow diagram, the selection ordering and the probe schedule are in
 [`docs/architecture.md`](docs/architecture.md).
 
+## Peers
+
+`tcr` can find other Macs on your network running `tcr`, trust them, and lend a trusted Mac a
+share of an account: 20 % of a group's weekly window, one account until 18:00, and so on. Off
+by default, one switch each for finding and sharing, nothing sent before you turn one on.
+
+Three rules hold the whole thing up. The beacon carries a random per-boot id and a port, never
+a key or a name unless you allow the name. Nobody is trusted until a person on each Mac has
+compared the same six digits on both screens and pressed Trust. A borrowed request is served
+on the lender's own account: the borrower's credential never leaves the borrower's machine,
+and the lender never learns it.
+
+Pairing and every peer stream run over the
+[Noise Protocol Framework](https://noiseprotocol.org/noise.html): `XX` for a first pairing
+(both sides learn each other's key, the six digits come from the handshake hash), `IK` for a
+return visit to a Mac you already trust, `IKpsk1` when a join key is passed around. It is the
+handshake family WireGuard is built on, and if you want to understand how any
+Diffie-Hellman based authentication works, that one spec is the best hour you can spend.
+Finding, trusting, lending and what each act sends: [`docs/peers.md`](docs/peers.md).
+
 ## Documentation
 
 | Document | What is in it |
 |---|---|
 | [`docs/configuration.md`](docs/configuration.md) | Every config key, its type, default and source citation. |
 | [`docs/cli.md`](docs/cli.md) | Every command and flag, exit codes, account resolution. |
+| [`docs/peers.md`](docs/peers.md) | Finding, trusting and sharing accounts with other Macs on your network. |
 | [`docs/architecture.md`](docs/architecture.md) | Request flow, entry modes, account selection, quota probes. |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | Symptoms and what they mean. |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Development setup, test and lint gates, what `main` requires. |
@@ -254,6 +275,14 @@ the pooled Bearer is injected, so a client credential is never forwarded alongsi
 `git config core.hooksPath .githooks` enables a pre-commit secret scan and the other gates
 listed in [CONTRIBUTING.md](CONTRIBUTING.md#git-hooks). Treat it as a backstop: it only sees
 what you stage, and `--no-verify` exists.
+
+**Peers are opt-in twice and rate-limited.** Nothing is announced until `find` is on and
+nothing is served until `share` is on. A Mac that wants to pair knocks with ephemeral keys only
+and waits in a list until you accept it; knocks are capped per address (one every 10 s, burst
+3, two unauthenticated sockets) and the list holds eight. An address you ignore is muted, one
+you block is banned by address and, once its key is known, by key. A lender sees the plaintext
+of the requests it serves, by design, and lends at most half of any window. The full table of
+what each act sends is in [`docs/peers.md`](docs/peers.md#what-leaves-this-mac).
 
 Found a security issue? Please open a private report through GitHub's security advisories
 rather than a public issue.

@@ -1,0 +1,64 @@
+[
+  {
+    "id": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+    "display": "tcr-0W3GE1R70W",
+    "name": "studio-mac",
+    "address": "127.0.0.1:7749",
+    "trusted": true,
+    "lastSeenMs": 1699999700000,
+    "carries": true,
+    "serves": true,
+    "leaseSpent": 0.5,
+    "leaseTtlSeconds": 3600,
+    "byteCapPerHour": 2147483648,
+    "tokensPerHour": 250000,
+    "ended": false,
+    "paths": [
+      {
+        "endpoint": "127.0.0.1:7749",
+        "kind": "direct"
+      },
+      {
+        "endpoint": "127.0.0.1:7750",
+        "kind": "direct"
+      }
+    ]
+  },
+  {
+    "id": "144GJ289144GJ289144GJ289144GJ289144GJ289144GJ289144G",
+    "display": "tcr-144GJ28914",
+    "name": "attic-nuc",
+    "address": "127.0.0.1:7751",
+    "trusted": true,
+    "lastSeenMs": 1699999998000,
+    "carries": true,
+    "serves": false,
+    "inFlight": 2,
+    "leaseSpent": 0.34,
+    "leaseTtlSeconds": 240,
+    "bytesPerHour": 41943040,
+    "byteCapPerHour": 2147483648,
+    "tokensPerHour": 90000,
+    "noHeadroom": false,
+    "until": 1700003600,
+    "ended": false,
+    "paths": [
+      {
+        "endpoint": "127.0.0.1:7751",
+        "kind": "direct",
+        "rttMs": 18.5,
+        "lossPct": 0.0,
+        "bytesPerHour": 41943040,
+        "tokensPerHour": 90000,
+        "lastOkMs": 1699999998000
+      },
+      {
+        "endpoint": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+        "kind": "via",
+        "rttMs": 96.0,
+        "lossPct": 0.02,
+        "lastOkMs": 1699999970000
+      }
+    ]
+  }
+]

@@ -180,6 +180,25 @@ impl Manager {
             .map(|a| a.name.clone())
     }
 
+    /// Account `idx`'s exit lock, parsed once out of the config row that
+    /// carries it. See [`crate::config::Account::egress_pin`].
+    ///
+    /// Read from `self.config` and not from the runtime row beside
+    /// [`Self::access_token`], because the runtime row holds what this process
+    /// mutates per request and a pin is operator intent that only the config
+    /// file states. `None` for a stale `idx`, for the same reason
+    /// [`Self::access_token`] returns one, and nothing else: a pin that could
+    /// not be read never reaches this call, because serde refuses it at config
+    /// load rather than handing the request path a value to interpret.
+    pub fn account_egress(&self, idx: usize) -> Option<crate::config::EgressPin> {
+        self.config
+            .lock()
+            .expect("config lock poisoned")
+            .accounts
+            .get(idx)
+            .map(crate::config::Account::egress_pin)
+    }
+
     /// The pooled `account_uuid` to inject for account `idx` (a clone — the
     /// request outlives the lock). `None` when the account has no configured
     /// UUID, in which case the proxy leaves the body unchanged.

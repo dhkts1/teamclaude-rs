@@ -175,8 +175,22 @@ enum RenderStates {
             // Same row, the failure branch — the reason in place of the
             // button, and no button at all.
             ("21b-update-failed", .loaded(fleet(healthyJSON)), false, nil),
+            // The Accounts tab's no-requests banner
+            // (`FleetView.noRequestsBanner`, `NoRequestsBanner`). A live
+            // fleet, every account at zero requests, five minutes in. See
+            // ``noRequestsBannerZeroSince`` and ``noRequestsBannerRoute`` for
+            // the seeded clock and route.
+            ("22-no-requests-banner", .loaded(fleet(zeroRequestsJSON)), false, nil),
         ]
     }
+
+    /// Seeds for scene 22, the one scene that needs
+    /// ``FleetView``'s `initialZeroRequestsSince`/`initialClaudeCount`/
+    /// `initialClaudeRoute`. Every other scene leaves all three `nil`, which
+    /// draws no banner at all, exactly the panel's own default.
+    private static let noRequestsBannerZeroSince = Date().addingTimeInterval(-600)
+    private static let noRequestsBannerRoute = ClaudeRouteRead.Route(
+        url: "http://127.0.0.1:9443", source: "settings.json")
 
     /// The ``UpdateState`` a scene's `Updater` should report, or `nil` for
     /// every scene not about the update row — the same by-name lookup
@@ -359,6 +373,18 @@ enum RenderStates {
                 if renderSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        for scene in peerScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeer(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        for scene in controlScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderControl(scene, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
 
         print("\nrendered \(written)/\(attempted) images into \(directory.path)")
         exit(written == attempted ? 0 : 1)
@@ -502,7 +528,12 @@ enum RenderStates {
                 initialMachineStats: machineFixture,
                 initialRunningProcesses: runningProcessesFixture(
                     for: scene.name, state: scene.state),
-                initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name)
+                initialExpandedTimeoutClasses: expandedTimeoutClassesFixture(for: scene.name),
+                initialZeroRequestsSince: scene.name == "22-no-requests-banner"
+                    ? noRequestsBannerZeroSince : nil,
+                initialClaudeCount: scene.name == "22-no-requests-banner" ? 1 : nil,
+                initialClaudeRoute: scene.name == "22-no-requests-banner"
+                    ? noRequestsBannerRoute : nil
             )
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
             // A FIXED height, not the measured one.
@@ -602,6 +633,823 @@ enum RenderStates {
     /// These exist so the fixture reads like the thing it is picturing.
     private static let sheetScrimAlpha: Double = 0.45
     private static let sheetShadowRadius: CGFloat = 12
+
+    // MARK: - The Peers tab
+
+    /// The Peers tab's states, scenes 45 to 51 plus the unsupported collapse
+    ///, the Peers tab mockup (kept outside the tree), one scene per state, in
+    /// its order.
+    ///
+    /// A THIRD scene array, because peers are a sibling document
+    /// (`tcr peer ls --json`), not a field of
+    /// ``PollState``, so a peer state cannot be expressed as one of `scenes`'s
+    /// tuples at all. Same shape as ``sheetScenes`` and for the same class of
+    /// reason.
+    ///
+    /// Every fixture below is a ``PeersSnapshot`` built through
+    /// ``PeersSnapshotBuilder`` from a ``PeerListDocument``, the real decode
+    /// path, with a pinned `now`, so a scene cannot show a sentence the
+    /// running panel would not produce from the same JSON. And the controller
+    /// is ``PeerController/pinned(_:)``: no subprocess, no listener, no proxy,
+    /// nothing that could reach `127.0.0.1:3456`.
+    private static var peerScenes: [(name: String, snapshot: PeersSnapshot, dry: Bool)] {
+        [
+            // 1. A fresh install: finding off, and the only state a one-Mac
+            //    network ever has.
+            ("45-peers-off", peersSnapshot(PeerListDocument()), false),
+            // 2. Looking, and nothing found. A named state rather than a
+            //    spinner over an empty list, because "there may be nothing to
+            //    find" is the honest answer and `finding` is its own field.
+            ("46-peers-finding", peersSnapshot(PeerListDocument(finding: true)), false),
+            // 3. Two found, neither trusted, the second with its name NOT
+            //    announced (decision row 9), so this side has an address and
+            //    no name and the row is drawn rather than hidden.
+            (
+                "47-peers-found-untrusted",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2)),
+                            .init(address: "10.0.1.24:7749", lastSeenMs: peerMsAgo(6)),
+                        ])),
+                false
+            ),
+            // 4. The safe steady state, and the one most operators stay in:
+            //    one Mac trusted and carrying, sharing still off.
+            (
+                "48-peers-trusted-share-off",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(3), carries: true),
+                            .init(
+                                name: "attic-nuc", address: "attic-nuc.local:7749",
+                                lastSeenMs: peerMsAgo(40)),
+                        ])),
+                false
+            ),
+            // 5. The one screen where plaintext crosses a machine boundary, so
+            //    the one screen that uses the reserved hue: sharing on, with
+            //    the meter that says how much. The second row reads `nothing
+            //    yet` rather than a blank, zero spent is a measurement.
+            (
+                "49-peers-share-on",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
+                                leaseSpent: 0.34, leaseTtlSeconds: 240),
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "attic-nuc.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(5), carries: true, serves: true,
+                                leaseSpent: 0, leaseTtlSeconds: 300),
+                        ])),
+                false
+            ),
+            // 6. The other direction, and the reason the mesh exists: this
+            //    Mac's own accounts are dry (`dry: true` puts the header's
+            //    summary line in its own honest state) and studio-mac is
+            //    answering. The egress line is the first thing an operator
+            //    reads, because it explains why work is still moving.
+            (
+                "50-peers-borrowing",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(1), carries: true, serves: true,
+                                inFlight: 2, leaseSpent: 0.62, leaseTtlSeconds: 180),
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "attic-nuc.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(4), carries: true, serves: true,
+                                noHeadroom: true),
+                        ],
+                        answeringOn: .init(peer: "studio-mac", inFlight: 2))),
+                true
+            ),
+            // 7. Sharing on and the peer asleep. The meter reads zero rather
+            //    than the 34% it read six minutes ago (the mockup's rule 5),
+            //    and the row still says the offer stands, two fields, because
+            //    one could not do both.
+            (
+                "51-peers-asleep",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(360), carries: true, serves: true,
+                                leaseSpent: 0.34, leaseTtlSeconds: 0)
+                        ])),
+                false
+            ),
+            // 8. A Mac asking to pair, which is decision row 10's own first
+            //    screen and had no fixture at all: the knock card is drawn by
+            //    `PeersTabV4`, the pane fixture carries a `pending` row, and
+            //    the TAB never rendered one. A card nobody renders is a card
+            //    nobody reviews, and this one carries three controls and the
+            //    only sentence on the tab about what Accept does.
+            //
+            //    The address is private-range and the instance id is
+            //    obviously fake: this repository is public and these PNGs are
+            //    review artifacts.
+            (
+                "52-peers-knock",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ],
+                        pending: [
+                            .init(
+                                addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471",
+                                proposedName: "loft-mini", wireVersion: 1,
+                                firstSeenMs: peerMsAgo(30), lastSeenMs: peerMsAgo(4))
+                        ])),
+                false
+            ),
+            // 9. Trust pressed, and the other operator has not answered. The
+            //    row state, built through the same overlay the
+            //    live controller applies, so the fixture cannot show a row
+            //    the panel would not draw.
+            (
+                "53-peers-waiting",
+                PeersSnapshotBuilder.waiting(
+                    peersSnapshot(
+                        PeerListDocument(
+                            finding: true,
+                            peers: [
+                                .init(
+                                    name: "studio-mac", address: "studio-mac.local:7749",
+                                    lastSeenMs: peerMsAgo(2)),
+                                .init(
+                                    name: "attic-nuc", address: "attic-nuc.local:7749",
+                                    lastSeenMs: peerMsAgo(9)),
+                            ])),
+                    knocked: ["studio-mac.local:7749"]),
+                false
+            ),
+            // 10. A lease that ENDED, on both sides of it: the Mac this one
+            //     lends to (Re-lend, and the row greys) and the Mac that was
+            //     serving this one (no button, because re-lending is its
+            //     operator's act). Decision row 13 keeps both rows rather
+            //     than deleting them.
+            (
+                "54-peers-lease-ended",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "attic-nuc.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(6),
+                                lend: [
+                                    .init(
+                                        leaseId: "ls-2e77", scope: .group("work"),
+                                        window: .week, fraction: 0.20,
+                                        until: Int64(peerNow.timeIntervalSince1970) - 1800,
+                                        ended: true)
+                                ]),
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(3), carries: true, serves: true,
+                                leaseSpent: 0.34, leaseTtlSeconds: 240,
+                                until: Int64(peerNow.timeIntervalSince1970) - 600,
+                                ended: true),
+                        ])),
+                false
+            ),
+            // 11. The same lease still RUNNING, which is the row decision
+            //     row 13's "ends in 1 h" is about: without a fixture the
+            //     clause could ship saying nothing and every gate would pass.
+            (
+                "55-peers-lease-ends-soon",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(1), carries: true, serves: true,
+                                inFlight: 2, leaseSpent: 0.62, leaseTtlSeconds: 180,
+                                until: Int64(peerNow.timeIntervalSince1970) + 3600)
+                        ],
+                        answeringOn: .init(peer: "studio-mac", inFlight: 2))),
+                true
+            ),
+            // 9. The live half, which is what the paths block is for: two
+            //    Macs, two ways to reach each, and the three states of a
+            //    measurement side by side. studio-mac has a measured direct
+            //    path and a second endpoint nothing has probed; attic-nuc is
+            //    reachable only THROUGH studio-mac, which is the row an
+            //    operator has to be able to read at a glance, and its direct
+            //    path has measured loss. Rendered so the sub-line stack can be
+            //    looked at: the arithmetic that reserves room for it
+            //    (`PeerRowModel.rowShape`) is a number, and a number is not a
+            //    picture of a row.
+            (
+                "56-peers-paths",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "192.168.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
+                                leaseSpent: 0.34, leaseTtlSeconds: 240,
+                                tokensPerHour: 90_000,
+                                paths: [
+                                    .init(
+                                        endpoint: "192.168.1.24:7749", kind: .direct,
+                                        rttMs: 18.5, lossPct: 0,
+                                        lastOkMs: peerMsAgo(2)),
+                                    .init(endpoint: "10.0.1.24:7749", kind: .direct),
+                                ]),
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(9), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 96, lossPct: 0.02),
+                                    .init(
+                                        endpoint: "tcr-4b8we1r0zp", kind: .via,
+                                        rttMs: 128, lossPct: 0,
+                                        lastOkMs: peerMsAgo(30)),
+                                ]),
+                        ])),
+                false
+            ),
+            // One scene per path state. Two states already had a shape on
+            // screen; the third had none at all until now, because a
+            // trusted Mac with no paths drew no line and the `asleep` pill
+            // carried two facts.
+            (
+                "w12-path-direct",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "192.168.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
+                                leaseSpent: 0.34, leaseTtlSeconds: 240,
+                                paths: [
+                                    .init(
+                                        endpoint: "192.168.1.24:7749", kind: .direct,
+                                        rttMs: 14, lossPct: 0, lastOkMs: peerMsAgo(2))
+                                ])
+                        ])),
+                false
+            ),
+            // Forwarded and lossy: amber, and the forwarder is named rather
+            // than shown as the peer id the wire carries. 6 per cent, which is
+            // over the 3 per cent line this scene sets, so the scene checks the
+            // rule instead of restating it.
+            (
+                "w12-path-via",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "192.168.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(4), carries: true, serves: true,
+                                leaseSpent: 0.34, leaseTtlSeconds: 240,
+                                paths: [
+                                    .init(
+                                        endpoint: "tcr-92hbq5t7yv", kind: .via,
+                                        rttMs: 96, lossPct: 0.06, lastOkMs: peerMsAgo(4))
+                                ]),
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "loft-mini",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(3), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 18, lossPct: 0)
+                                ]),
+                        ])),
+                false
+            ),
+            // No path at all, beside the asleep pill that used to carry this
+            // fact alone. No RTT anywhere: a stale reading renders as absent.
+            (
+                "w12-path-none",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(360), carries: true, serves: true,
+                                leaseSpent: 0, leaseTtlSeconds: 0)
+                        ])),
+                false
+            ),
+            // Every scene of the mini mesh card is the REAL tab with the
+            // real card in it, so the mesh cannot show a shape the panel
+            // would not draw from the same document.
+            //
+            // 5a: one Mac direct and healthy, one carried and lossy.
+            (
+                "w12-mesh-two-macs",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 16, lossPct: 0.01)
+                                ]),
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "loft-mini",
+                                address: "10.0.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(3), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "tcr-92hbq5t7yv", kind: .via,
+                                        rttMs: 58, lossPct: 0.05)
+                                ]),
+                        ],
+                        name: "desk-mac")),
+                false
+            ),
+            // 5b: the direct line to loft-mini is gone and the only way left
+            // is through attic-nuc, which is still reached directly itself.
+            (
+                "w12-mesh-via-only",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 18, lossPct: 0)
+                                ]),
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "loft-mini",
+                                address: "10.0.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(8), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "tcr-92hbq5t7yv", kind: .via,
+                                        rttMs: 140, lossPct: 0.04)
+                                ]),
+                        ],
+                        name: "desk-mac")),
+                false
+            ),
+            // 5c: no trusted Macs at all. One sentence, no ring, and no link
+            // to a page with nothing on it.
+            (
+                "w12-mesh-empty",
+                peersSnapshot(PeerListDocument(finding: true, name: "desk-mac")),
+                false
+            ),
+            // 5d: seven trusted, five drawn, two collapsed. Chosen because it
+            // needs all four loss colours and both line styles at once, and
+            // because it is the fixture `PeerMeshLayoutTests` runs its
+            // no-collision gate over.
+            (
+                "w12-mesh-collapse",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 16, lossPct: 0.01)
+                                ]),
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "loft-mini",
+                                address: "10.0.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(4), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "tcr-92hbq5t7yv", kind: .via,
+                                        rttMs: 72, lossPct: 0.06)
+                                ]),
+                            .init(
+                                id: "tcr-7a1c5m9x2k", name: "office-mini",
+                                address: "10.0.1.41:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(6), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.41:7749", kind: .direct,
+                                        rttMs: 210, lossPct: 0.14)
+                                ]),
+                            .init(
+                                id: "tcr-3f8d2v6b1n", name: "lab-mac",
+                                address: "10.0.1.52:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(600), carries: true),
+                            .init(
+                                id: "tcr-5k2p8w4r7t", name: "gil-laptop",
+                                address: "10.0.1.63:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(5), carries: true,
+                                paths: [
+                                    .init(endpoint: "tcr-92hbq5t7yv", kind: .via, rttMs: 88)
+                                ]),
+                            .init(
+                                id: "tcr-6m3q9z1h5j", name: "shed-mac",
+                                address: "10.0.1.74:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(7), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.74:7749", kind: .direct,
+                                        rttMs: 24, lossPct: 0)
+                                ]),
+                            .init(
+                                id: "tcr-8n4t2y6u0i", name: "van-mac",
+                                address: "10.0.1.85:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(9), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.85:7749", kind: .direct,
+                                        rttMs: 31, lossPct: 0)
+                                ]),
+                        ],
+                        name: "desk-mac")),
+                false
+            ),
+            // The forward-compat state: an older `tcr` answering
+            // `{"supported": false}` collapses the tab to ONE honest line and
+            // must never draw
+            // `Unreadable status output` (`FleetView.swift:1008`). A scene
+            // nobody renders is a claim nobody can check.
+            (
+                "44-peers-unsupported",
+                peersSnapshot(PeerListDocument(supported: false)),
+                false
+            ),
+        ]
+    }
+
+    /// The fixture Settings > Peers renders under `--render-settings`, which
+    /// is the Settings > Peers mockup (kept outside the tree)'s own scene 58:
+    /// sharing on, two Macs trusted, one asleep, and the five This Mac
+    /// readouts present so the pane draws its real values rather than six
+    /// "not read yet" rows.
+    ///
+    /// Lives here, with the other fixtures, rather than in the pane: a
+    /// fixture inside a production view is a value that can be shipped by
+    /// accident, and every other pinned state this app draws is authored in a
+    /// `Render*` file. `PeersSettingsPane`'s own initialiser reaches for it
+    /// only when `RenderSettings.requestedDirectory()` says this process was
+    /// launched to write PNGs.
+    ///
+    /// The id and the address are obviously fake, per `CLAUDE.md`: this
+    /// repository is public and no real account, host or key goes into a
+    /// fixture.
+    static var settingsPaneFixture: PeersSnapshot {
+        peersSnapshot(
+            PeerListDocument(
+                finding: true, sharing: true,
+                peers: [
+                    .init(
+                        id: "tcr-4b8we1r0zp", name: "studio-mac",
+                        address: "studio-mac.local:7749", trusted: true,
+                        lastSeenMs: peerMsAgo(3), carries: true, serves: true,
+                        leaseSpent: 0.34, leaseTtlSeconds: 240),
+                    .init(
+                        id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                        address: "attic-nuc.local:7749", trusted: true,
+                        lastSeenMs: peerMsAgo(420), carries: true,
+                        lend: [
+                            .init(
+                                leaseId: "ls-4b1f", scope: .group("work"),
+                                window: .week, fraction: 0.20, ttlSeconds: 300,
+                                maxInFlight: 2,
+                                until: Int64(peerNow.timeIntervalSince1970) + 3600),
+                            .init(
+                                leaseId: "ls-2e77", scope: .accounts(["alice"]),
+                                window: .fiveHour, fraction: 0.20, ttlSeconds: 300,
+                                maxInFlight: 2,
+                                until: Int64(peerNow.timeIntervalSince1970) - 1800,
+                                ended: true),
+                        ]),
+                ],
+                name: "studio-mac",
+                // Decision row 10 turned this default OFF, and the fixture is
+                // the state a fresh config is in: the render then pictures the
+                // switch an operator actually meets.
+                announceName: false,
+                nodeId: "tcr-7f3k9m2q4x",
+                listenAddress: "0.0.0.0:7749",
+                via: "auto",
+                maxHops: 1,
+                // The panel-state rows: one Mac knocking, one blocked, one
+                // muted, and the caps as `src/main.rs:1202-1208` reports
+                // them. Every address is private-range and the labels are
+                // sanitized, this repository is public and these PNGs are
+                // review artifacts.
+                pending: [
+                    .init(
+                        addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471",
+                        proposedName: "loft-mini", wireVersion: 1,
+                        firstSeenMs: peerMsAgo(30), lastSeenMs: peerMsAgo(4))
+                ],
+                blocked: [
+                    .init(
+                        addr: "10.0.1.99", sinceMs: peerMsAgo(10800),
+                        reason: .forgottenAndBlocked)
+                ],
+                muted: [.init(addr: "10.0.1.55", untilMs: peerMsAgo(-2820))],
+                limited: 3,
+                caps: .init(
+                    foundRows: 12, foundPerAddress: 2, pending: 8, knockIntervalMs: 10000,
+                    knockBurst: 3, unauthenticatedSockets: 16),
+                lentTo: [
+                    "alice": [
+                        .init(
+                            peer: "attic-nuc", scope: .group("work"), window: .week,
+                            fraction: 0.20),
+                        .init(
+                            peer: "studio-mac", scope: .accounts(["alice"]), window: .fableWeek,
+                            fraction: 1.0),
+                    ]
+                ]))
+    }
+
+    /// Seconds ago, as Unix milliseconds against ``peerNow``, so a rendered
+    /// age is the same on every run, unlike the running panel's live clock.
+    private static func peerMsAgo(_ seconds: TimeInterval) -> Int64 {
+        Int64(peerNow.addingTimeInterval(-seconds).timeIntervalSince1970 * 1000)
+    }
+
+    /// The instant every peer scene is rendered AT. Pinned for the reason the
+    /// whole harness is pinned: an age that read "2s ago" on one run and
+    /// "3s ago" on the next would make every peer PNG differ from the last
+    /// one for no design reason.
+    ///
+    /// Not private: the Settings pane reads it too, under `--render-settings`
+    /// and only there. Its lease rows ask the clock what has ended, so a pane
+    /// drawn against the REAL clock read every fixture lease as expired the
+    /// day this instant fell behind today, and scene 63's "2 running, 1 ended"
+    /// rendered as three ended rows.
+    static let peerNow = Date(timeIntervalSince1970: 1_786_000_000)
+
+    private static func peersSnapshot(_ document: PeerListDocument) -> PeersSnapshot {
+        PeersSnapshotBuilder.snapshot(from: document, now: peerNow)
+    }
+
+    /// One Peers-tab state, drawn inside the REAL panel shell.
+    ///
+    /// ``PanelV4`` takes its content as a closure precisely so a tab can be
+    /// composed into it, which is what lets these scenes carry the header, the
+    /// summary line and the four-tab strip with Peers selected, the mockup's
+    /// own frame, without `FleetView` needing a way to inject fixture peers.
+    @MainActor
+    private static func renderPeer(
+        _ scene: (name: String, snapshot: PeersSnapshot, dry: Bool),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            // Density: absent, which is `PanelDensityPreference`'s own
+            // definition of the shipped default, the same write-then-remove
+            // every other scene in this file does.
+            UserDefaults.standard.removeObject(forKey: PanelDensityPreference.key)
+
+            let view =
+                PanelV4(
+                    freshness: "updated 2s ago",
+                    tabs: PanelTab.allCases,
+                    selected: .peers,
+                    badges: [:],
+                    onSelect: { _ in },
+                    onSettings: {},
+                    // Thirteen, the fleet every other scene in this file
+                    // draws, so `PanelDensity.auto` resolves the same way it
+                    // does on the Accounts tab and these PNGs are comparable
+                    // with those.
+                    accountCount: 13,
+                    summary: {
+                        SummaryLine(
+                            lines: [
+                                scene.dry
+                                    ? [
+                                        .init(text: "13 accounts", tint: Tok.dim),
+                                        .init(text: "none with headroom", tint: Tok.near),
+                                    ]
+                                    : [
+                                        .init(text: "13 accounts", tint: Tok.dim),
+                                        .init(
+                                            text: "6 with headroom", tint: Tok.ok,
+                                            emphasised: true),
+                                    ]
+                            ])
+                    },
+                    content: {
+                        PeersTabV4(
+                            controller: PeerController.pinned(scene.snapshot),
+                            snapshotMode: true)
+                    },
+                    footer: { EmptyView() }
+                )
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+                // A FIXED size, for the reason the fleet scenes give: the
+                // panel sizes itself from a GeometryReader preference and
+                // `ImageRenderer` performs no second layout pass.
+                .fixedSize()
+
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
+
+    // MARK: - Settings > Peers controls
+
+    /// One control, one state, one PNG.
+    ///
+    /// A FOURTH scene array, and the reason is the same class as
+    /// ``peerScenes``'s: these controls live on the Settings pane, whose own
+    /// harness (`RenderSettings`) hosts a real window and can draw exactly ONE
+    /// fixture per pane. A control with four states needs four pictures, so
+    /// each one is rasterised here on its own, in the panel harness that needs
+    /// no window at all.
+    ///
+    /// What that costs, said rather than hidden: this pictures the CONTROL,
+    /// not the pane around it. The pane's own render stays `--render-settings`.
+    private struct ControlScene {
+        let name: String
+        let view: AnyView
+    }
+
+    @MainActor
+    private static var controlScenes: [ControlScene] {
+        [
+            // Item 1, the mockup's scenes 1a to 1c plus the transient state
+            // the lead ruled in (`wave12-ui-findings.md`, "Lead answers").
+            ControlScene(
+                name: "w12-internet-off",
+                view: AnyView(PeerInternetRow(on: false, state: .off))),
+            ControlScene(
+                name: "w12-internet-asking",
+                view: AnyView(PeerInternetRow(on: true, state: .asking))),
+            ControlScene(
+                name: "w12-internet-mapped",
+                view: AnyView(
+                    PeerInternetRow(
+                        on: true,
+                        state: .reachable(
+                            // Documentation range (RFC 5737), like every other
+                            // address in this file: the repository is public.
+                            address: "203.0.113.44", port: 51413,
+                            expires: peerNow.addingTimeInterval(120))))),
+            ControlScene(
+                name: "w12-internet-silent",
+                view: AnyView(PeerInternetRow(on: true, state: .routerSilent))),
+            // Item 2, the mockup's scenes 2a to 2c. The third is the one a
+            // plain two-option toggle would hide: switched back to serve, and
+            // the borrower's old key still winding down on its own clock.
+            ControlScene(
+                name: "w12-mode-serve",
+                view: AnyView(
+                    LendModeControl(peer: "studio-mac", mode: .serve, status: nil))),
+            ControlScene(
+                name: "w12-mode-hand-active",
+                view: AnyView(
+                    LendModeControl(
+                        peer: "studio-mac", mode: .hand,
+                        status: PeerLease.handedKeyLine(
+                            mode: .hand,
+                            handedKeyUntil: Int64(peerNow.timeIntervalSince1970) + 262,
+                            peer: "studio-mac", now: peerNow)))),
+            // Item 3, the mockup's scenes 3a to 3d, on the real account card
+            // rather than the row alone: 3d's "waiting for studio-mac" is a
+            // PILL in the card header, so a picture of the row on its own
+            // could not show the state the lead ruled in.
+            ControlScene(
+                name: "w12-exits-local",
+                view: (exitsCard(.init(route: .local)))),
+            ControlScene(
+                name: "w12-exits-peer-soft",
+                view: (exitsCard(.init(route: .via(exitPeerId))))),
+            ControlScene(
+                name: "w12-exits-peer-must",
+                view: (exitsCard(.init(route: .via(exitPeerId), strict: true)))),
+            ControlScene(
+                name: "w12-exits-peer-must-waiting",
+                view: exitsCard(
+                    .init(
+                        route: .via(exitPeerId), strict: true, peerDown: true,
+                        waitingSeconds: 40))),
+            ControlScene(
+                name: "w12-mode-hand-winding",
+                view: AnyView(
+                    LendModeControl(
+                        peer: "studio-mac", mode: .serve,
+                        status: PeerLease.handedKeyLine(
+                            mode: .serve,
+                            handedKeyUntil: Int64(peerNow.timeIntervalSince1970) + 166,
+                            peer: "studio-mac", now: peerNow)))),
+        ]
+    }
+
+    /// One account card in one exit state, at the panel's own width.
+    ///
+    /// The card is the real ``AccountCard`` over the real `alice` fixture, so
+    /// a scene cannot show a card the panel would not draw; only the exit
+    /// value differs between the four.
+    /// The wire id an exit lock actually stores, and the row that turns it
+    /// back into a name.
+    ///
+    /// The scenes used to pin to the string `studio-mac`, which no peers file
+    /// ever holds: `egress` is `via <52-character id>`. Drawing the name
+    /// without the join made a picture of a case that cannot happen and hid
+    /// the one that does, a picker showing an id nobody can read.
+    private static let exitPeerId = String(repeating: "0", count: 52)
+
+    private static var exitPeerRows: [PeerListDocument.PeerEntry] {
+        [PeerListDocument.PeerEntry(id: exitPeerId, name: "studio-mac", trusted: true)]
+    }
+
+    @MainActor
+    private static func exitsCard(_ exit: AccountExit) -> AnyView {
+        // The first row of the healthy fleet, which is `alice`. An empty fleet
+        // would mean this file's own fixture stopped decoding, so the scene
+        // draws nothing rather than a card invented here.
+        guard let account = fleet(healthyJSON).accounts.first else {
+            return AnyView(EmptyView())
+        }
+        return AnyView(
+            AccountCard(
+                account: account, shape: .full, now: peerNow,
+                exit: exit, exitPeers: ["studio-mac", "attic-nuc"],
+                exitPeerRows: exitPeerRows, snapshotMode: true,
+                actions: { EmptyView() }
+            )
+            .frame(width: V4.panelWidth))
+    }
+
+    /// One control scene, drawn on the pane's own card fill at the pane's own
+    /// width.
+    @MainActor
+    private static func renderControl(
+        _ scene: ControlScene, appearance: Appearance, into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            let view =
+                scene.view
+                .padding(14)
+                // 460 pt: the detail column of the Settings window, which is
+                // the width these controls really get (`settings-peers-short`
+                // and `PeerPaneLayout`).
+                .frame(width: 460, alignment: .leading)
+                .background(Tok.cardFill)
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+                .fixedSize(horizontal: false, vertical: true)
+
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
 
     /// Rasterise one view to a PNG under `directory`. The single writer for
     /// every scene in this file, so a panel render and a sheet render cannot
@@ -821,7 +1669,12 @@ enum RenderStates {
         // collapsed to one before that fix. `nil` omits the key, which is the
         // older-server shape.
         orgUuid: String? = nil,
-        gate: String? = nil
+        gate: String? = nil,
+        // Requests served since this proxy started, wire field `"requests"`.
+        // Every existing call site keeps the measured 102 it always had;
+        // only the no-requests banner scene passes 0, which is the whole
+        // fact ``NoRequestsBanner`` reads off this field.
+        requests: Int = 102
     ) -> String {
         func resetAtMs(_ minutes: Int?) -> String {
             guard let minutes else { return "null" }
@@ -873,7 +1726,7 @@ enum RenderStates {
              "fiveHourResetAtMs":\(resetAtMs(fiveHourResetInMinutes)),
              "sevenDayResetAtMs":\(resetAtMs(sevenDayResetInMinutes)),
              "sevenDayOiResetAtMs":\(resetAtMs(sevenDayOiResetInMinutes)),
-             "requests":102,"inputTokens":8781926,"outputTokens":31860,
+             "requests":\(requests),"inputTokens":8781926,"outputTokens":31860,
              "cacheReadTokens":7407414,"cacheCreationTokens":\(usage == "null" ? "null" : "1200000"),
              "cacheHitRatio":0.84,"probeStatus":"\(probe)",
              "probeError":null,"lastStreamError":null,"streamErrorCount":0,
@@ -1070,6 +1923,14 @@ enum RenderStates {
     private static var healthyJSON: String {
         "[\(account("alice@example.com", quota: "0.12", state: "ok", fiveHourResetInMinutes: 130, sevenDayResetInMinutes: 4_320, sevenDayOi: "0.21", sevenDayOiState: "ok", sevenDayOiResetInMinutes: 6_498, plan: "Max 20x", orgUuid: "11111111-1111-1111-1111-111111111111")),"
             + "\(account("bob@example.com", quota: "0.31", state: "ok", sevenDayOi: "0.44", sevenDayOiState: "ok", groups: ["research"], reservedGroups: ["research"], plan: "Team 5x", orgUuid: "22222222-2222-2222-2222-222222222222"))]"
+    }
+
+    /// Scene 22: a single account, a LIVE read (so
+    /// ``NoRequestsBanner/totalRequests(_:)`` sees a measured zero rather than
+    /// an offline `nil`), and zero requests served: the colleague's fleet
+    /// this feature exists for.
+    private static var zeroRequestsJSON: String {
+        "[\(account("colleague@example.com", quota: "0.0", state: "ok", source: "live", plan: "Team Standard", orgUuid: "33333333-3333-3333-3333-333333333333", requests: 0))]"
     }
 
     /// F1's wire shape, attached to

@@ -1,0 +1,181 @@
+{
+  "supported": true,
+  "peers": [
+    {
+      "node": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+      "label": "studio-mac",
+      "endpoints": [
+        {
+          "kind": "direct",
+          "addr": "127.0.0.1:7749",
+          "observedAtMs": 1,
+          "source": "paired"
+        },
+        {
+          "kind": "direct",
+          "addr": "127.0.0.1:7750",
+          "observedAtMs": 1,
+          "source": "paired"
+        }
+      ],
+      "addedAt": 1,
+      "allow": {
+        "relay": false,
+        "gateway": true,
+        "carry": true,
+        "inspect": false,
+        "allowDisclose": true,
+        "acceptMove": false,
+        "control": {
+          "briefs": false,
+          "lendable": false,
+          "diag": false
+        }
+      },
+      "lend": [
+        {
+          "id": "0000000000000000000000000000002a",
+          "mode": "serve",
+          "scope": "all",
+          "window": "7d",
+          "fraction": 0.2,
+          "ttlS": 900,
+          "maxInflight": 2,
+          "until": 4102444800,
+          "ended": false
+        },
+        {
+          "id": "0000000000000000000000000000002b",
+          "mode": "hand",
+          "scope": {
+            "group": "work"
+          },
+          "window": "5h",
+          "fraction": 0.5,
+          "ttlS": 600,
+          "maxInflight": 1,
+          "ended": false
+        }
+      ],
+      "seesUsAt": [
+        "203.0.113.9:7749",
+        1700000000000
+      ],
+      "until": 4102444800,
+      "ended": false
+    },
+    {
+      "node": "144GJ289144GJ289144GJ289144GJ289144GJ289144GJ289144G",
+      "label": "attic-nuc",
+      "endpoints": [],
+      "addedAt": 1,
+      "allow": {
+        "relay": false,
+        "gateway": false,
+        "carry": false,
+        "inspect": false,
+        "allowDisclose": false,
+        "acceptMove": false,
+        "control": {
+          "briefs": false,
+          "lendable": false,
+          "diag": false
+        }
+      },
+      "lend": [
+        {
+          "id": "0000000000000000000000000000002c",
+          "mode": "serve",
+          "scope": "all",
+          "window": "5h",
+          "fraction": 0.1,
+          "ttlS": 300,
+          "maxInflight": 1,
+          "until": 1600000000,
+          "ended": true
+        }
+      ],
+      "until": 1600000000,
+      "ended": true
+    }
+  ],
+  "pending": [
+    {
+      "addr": "192.0.2.14",
+      "instanceId": "1111111111111111",
+      "proposedName": "kitchen-mac",
+      "wireVersion": 1,
+      "firstSeenMs": 1699999970000,
+      "lastSeenMs": 1699999998000
+    }
+  ],
+  "pendingCount": 1,
+  "blocked": [
+    {
+      "addr": "192.0.2.77",
+      "key": "0C1G60R30C1G60R30C1G60R30C1G60R30C1G60R30C1G60R30C1G",
+      "sinceMs": 1699913600000,
+      "reason": "blocked"
+    }
+  ],
+  "blockedCount": 1,
+  "muted": [
+    {
+      "addr": "192.0.2.90",
+      "untilMs": 1700000600000
+    }
+  ],
+  "mutedCount": 1,
+  "limited": 0,
+  "caps": {
+    "foundRows": 12,
+    "foundPerAddress": 2,
+    "pending": 8,
+    "knockIntervalMs": 10000,
+    "knockBurst": 3,
+    "unauthenticatedSockets": 16
+  },
+  "lentTo": {
+    "alice@example.com": [
+      {
+        "peer": "studio-mac",
+        "peerId": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+        "id": "0000000000000000000000000000002a",
+        "scope": "all",
+        "window": "7d",
+        "fraction": 0.2,
+        "until": 4102444800,
+        "ended": false
+      },
+      {
+        "peer": "studio-mac",
+        "peerId": "0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+        "id": "0000000000000000000000000000002b",
+        "scope": {
+          "group": "work"
+        },
+        "window": "5h",
+        "fraction": 0.5,
+        "ended": false
+      },
+      {
+        "peer": "attic-nuc",
+        "peerId": "144GJ289144GJ289144GJ289144GJ289144GJ289144GJ289144G",
+        "id": "0000000000000000000000000000002c",
+        "scope": "all",
+        "window": "5h",
+        "fraction": 0.1,
+        "until": 1600000000,
+        "ended": true
+      }
+    ]
+  },
+  "internet": false,
+  "exits": {
+    "alice": {
+      "egress": "via 0W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3GE1R70W3G",
+      "egressStrict": true,
+      "peerDown": false
+    }
+  }
+}

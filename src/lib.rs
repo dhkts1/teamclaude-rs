@@ -22,6 +22,8 @@ pub mod claude_code_login;
 pub mod cli;
 pub mod config;
 pub mod demo;
+pub mod doctor;
+pub mod fallback;
 #[cfg(unix)]
 pub mod handoff;
 pub mod identity;
@@ -30,6 +32,7 @@ pub mod mint;
 pub mod mitm;
 pub mod model;
 pub mod oauth;
+pub mod peer;
 pub mod pricing;
 pub mod probe;
 pub mod proxy;

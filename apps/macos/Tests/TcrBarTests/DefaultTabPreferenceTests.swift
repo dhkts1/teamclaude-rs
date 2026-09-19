@@ -25,12 +25,21 @@ final class DefaultTabPreferenceTests: XCTestCase {
         XCTAssertEqual(DefaultTabPreference.key, "defaultPanelTab")
     }
 
-    /// The three names must match `PanelTab`'s own cases
-    /// (`FleetView.swift:1727`) — this is the boundary the type's own
+    /// The four names must match `PanelTab`'s own cases
+    /// (`FleetView.swift:3247`), this is the boundary the type's own
     /// doc-comment explains, so a rename on either side that is not mirrored
     /// on the other is exactly what this test exists to catch.
     func testValidTabsMatchPanelTabsCases() {
-        XCTAssertEqual(DefaultTabPreference.validTabs, ["accounts", "sessions", "tools"])
+        XCTAssertEqual(
+            DefaultTabPreference.validTabs, ["accounts", "sessions", "tools", "peers"])
+    }
+
+    /// `peers` is a real tab now, so the preference must accept it rather than
+    /// treat it as a stale value and fall back, which is what it did while
+    /// the tab drew a placeholder.
+    func testPeersIsAcceptedAsAStoredValue() {
+        defaults.set("peers", forKey: DefaultTabPreference.key)
+        XCTAssertEqual(DefaultTabPreference(defaults: defaults).tab, "peers")
     }
 
     func testAnAbsentKeyFallsBackToAccounts() {

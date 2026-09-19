@@ -4,7 +4,7 @@
 # --all-targets --locked` on ubuntu, and `--all` means `--workspace`: anything
 # listed here compiles on Linux.
 [workspace]
-members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass"]
+members = [".", "crates/tcr-status-wire", "crates/tcr-fdpass", "crates/tcr-peer-wire"]
 resolver = "2"
 
 [package]
@@ -125,6 +125,63 @@ tempfile = "3.27"
 # `objc2-io-kit` there, which is expected, not a regression to chase.
 listeners = "0.6"
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Noise for the peer mesh (`tcr peer`, src/peer/noise.rs): `XX` plus a six-digit
+# compare for a first pairing (a discovered machine announces no key, so there is
+# nothing else to run), `IK` for a return visit to a pinned key (so no identity
+# appears on the wire to a passive LAN observer), `IKpsk1` for the one path that
+# starts with a key (a pasted join token), which is what lets a machine with no
+# display enrol. The reference Rust implementation.
+#
+# `default-features = false` because the default pulls aes-gcm and blake2 we never
+# call. Do NOT reach for the ring resolver: `RingResolver::resolve_dh` returns
+# `None` (snow-0.10.0/src/resolvers/ring.rs), so `ring-resolver` compiles and then
+# fails at RUNTIME with no X25519 provider, and `ring-accelerated` alongside
+# `default-features = false` trips snow's own `compile_error!` gate, which demands
+# a DH, a cipher and a hash feature. SHA256 rather than BLAKE2s keeps the suite
+# inside `use-sha2`, which this lock already resolved.
+#
+# Measured in-tree cost, both numbers because a reader needs both: 12 new crate
+# NAMES, 13 new lock ENTRIES. The thirteenth is a second VERSION of a name already
+# present (chacha20 0.9.1 beside the repo's 0.10.1), not a hidden crate.
+snow = { version = "0.10", default-features = false, features = ["use-curve25519", "use-chacha20poly1305", "use-sha2", "use-getrandom", "std"] }
+# DNS-SD discovery for `tcr peer find` (src/peer/discovery.rs), behind two
+# functions and `find` off by default, so the implementation can be swapped
+# without touching trust: under Noise a forged beacon buys nothing, because all
+# trust comes from the handshake against a pinned static key.
+#
+# DNS-SD is 60 pages of RFC and hand-rolling per-platform multicast socket
+# handling is the classic own-goal; it is also the discovery mechanism the rest of
+# macOS uses, so a peer is visible to standard tooling. The recorded alternative
+# is a 48-byte UDP beacon behind the same two functions at zero new packages.
+#
+# Measured in-tree cost: FIVE new lock entries: flume, if-addrs, mdns-sd,
+# socket-pktinfo and spin. The design predicted four and did not name `spin`.
+mdns-sd = "0.21"
+# The peer-mesh wire types, shared by both ends of a peer stream: the same
+# split, and for the same reason, as `tcr-status-wire` above.
+tcr-peer-wire = { path = "crates/tcr-peer-wire" }
+# The 128 opaque bits of a lease id (`Ledger::grant`, src/peer/lease.rs). Granted
+# as a DIRECT dependency rather than reached for through `snow`: 0.3.4 is already
+# in `Cargo.lock` (snow's `use-getrandom` resolves it), so this adds one
+# dependency EDGE and no package. A lease id is not Noise material and minting it
+# through `noise::random_secret` would make the one file that may name `snow::`
+# the source of a number that has nothing to do with a handshake.
+getrandom = "0.3"
+# HMAC-SHA256 for the opt-in network key's announcement tag
+# (`NetworkKey::announcement_tag`, src/peer/config.rs). Granted as a DIRECT
+# dependency for the same reason `getrandom` above is: 0.10.9 is already in
+# `Cargo.lock` because `snow`'s `use-sha2` feature resolves it, so this adds one
+# dependency EDGE and no package (`cargo tree -i sha2`). The HMAC construction
+# itself is twenty lines of RFC 2104 beside the key, because `hmac` is NOT in
+# the lock (`cargo tree -i hmac` prints nothing) and would be a genuinely new
+# package; it is verified against RFC 4231's test case 2, not against itself.
+sha2 = "0.10"
+
+[dev-dependencies]
+# Property tests over the peer-mesh wire's parse/decode boundary
+# (`tests/peer_props.rs`). Gil approved this as a dev-dependency on
+# 2026-09-18, and no other new dependency.
+proptest = "1"
 
 [profile.release]
 opt-level = 3

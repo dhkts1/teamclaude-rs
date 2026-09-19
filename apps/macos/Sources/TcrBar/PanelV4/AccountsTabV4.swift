@@ -24,6 +24,27 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     let expandedGroups: Set<String>
     let onToggleGroup: (String) -> Void
     let now: Date
+    /// Who is drawing on each account label, from `tcr peer ls --json`'s
+    /// `lentTo` map. Empty when no account is inside a lease, and empty
+    /// against a `tcr` that does not send the map yet, which draws no line on
+    /// any card.
+    var lentTo: [String: [PeerLentToEntry]] = [:]
+    /// Where each account exits from, keyed by account label. Empty draws no
+    /// row on any card.
+    var exits: [String: AccountExit] = [:]
+    /// The trusted Macs the exit picker may name.
+    var exitPeers: [String] = []
+    /// The rows behind those names, so a pinned Mac is drawn as the operator
+    /// knows it rather than as its wire id. See ``AccountExitRow/peerRows``.
+    var exitPeerRows: [PeerListDocument.PeerEntry] = []
+    /// Still controls instead of menus and switches, for `--render-states`.
+    var snapshotMode: Bool = false
+    /// The write: which account, where it exits from, and whether that is a
+    /// promise. One closure rather than two, because both halves are one
+    /// `tcr peer account` call and a half-written pin is a state nobody chose.
+    var onSetExit: (String, AccountExit.Route, Bool) -> Void = { _, _, _ in }
+    /// Opens a lender's sheet in Settings > Peers.
+    var onOpenLender: (String) -> Void = { _ in }
     /// The row's own actions, as a context menu — the SECOND route to them,
     /// from the one definition in ``AccountRow``.
     @ViewBuilder var menu: (Account) -> Menu
@@ -76,7 +97,34 @@ struct AccountsTabV4<Menu: View, Actions: View>: View {
     }
 
     private func card(_ row: FleetSectionRow, shape: AccountCard<Actions>.Shape) -> some View {
-        AccountCard(account: row.account, shape: shape, now: now, isControl: row.isControl) {
+        AccountCard(
+            account: row.account, shape: shape, now: now, isControl: row.isControl,
+            // Looked up through ``PeerLease/leases(forAccountLabel:in:)``, not
+            // with a subscript: the CLI masks any label its sanitizer refuses,
+            // so an email-labelled account arrives under one shared `[masked]`
+            // key that names several accounts and identifies none. That helper
+            // refuses to hand it to anybody, rather than drawing one account's
+            // lease on another's card.
+            lentTo: PeerLease.leases(forAccountLabel: row.account.name, in: lentTo),
+            onOpenLender: onOpenLender,
+            exit: PeerLease.exit(forAccountLabel: row.account.name, in: exits),
+            exitPeers: exitPeers,
+            exitPeerRows: exitPeerRows,
+            snapshotMode: snapshotMode,
+            onChooseExit: { route in
+                onSetExit(
+                    row.account.name, route,
+                    PeerLease.exit(forAccountLabel: row.account.name, in: exits)?.strict
+                        ?? false)
+            },
+            onToggleExitMust: { must in
+                guard
+                    let current = PeerLease.exit(
+                        forAccountLabel: row.account.name, in: exits)
+                else { return }
+                onSetExit(row.account.name, current.route, must)
+            }
+        ) {
             actions(row.account)
         }
         .contextMenu { menu(row.account) }

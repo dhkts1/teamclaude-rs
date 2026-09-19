@@ -173,6 +173,28 @@ pub struct StatusPayload {
     /// Neither skew direction is MISREAD, so this must NOT bump [`STATUS_KIND`].
     #[serde(default)]
     pub sessions_summary: tcr_status_wire::SessionsSummary,
+    /// One row per pinned Mac, in the vocabulary the panel already decodes,
+    /// see [`PeerStatusRow`], and [`peer_status_rows`] for the derivation.
+    ///
+    /// # Why the peers ride the STATUS payload at all
+    ///
+    /// The Peers tab used to answer its live half from `tcr peer ls --json`,
+    /// which is a projection of two FILES. Thirteen of the sixteen fields the
+    /// panel decodes had no Rust writer at all, so the tab drew placeholders
+    /// while both suites stayed green. A file cannot answer "how fast is this
+    /// path right now"; the serving process can, and this is the seam that
+    /// lets it.
+    ///
+    /// `#[serde(default, skip_serializing_if)]` for the same forward/back-compat
+    /// reason as [`Self::sessions`], and, per this struct's `build`
+    /// doc-comment on when a bump is and is not warranted, this must NOT bump
+    /// [`STATUS_KIND`]: an OLD client skips the unknown key, and a NEW client
+    /// reading an OLD server reads an empty list, which is the truth ("that
+    /// server never reported any peers") rather than a fabricated mesh. A bump
+    /// would make every not-yet-rebuilt client reject the payload and render
+    /// the structural zeros this endpoint exists to end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub peers: Vec<PeerStatusRow>,
 }
 
 /// One account's live row. Field-for-field the serializable half of
@@ -405,6 +427,15 @@ impl StatusPayload {
             group_colors,
             sessions: snapshot.wire_sessions.clone(),
             sessions_summary: snapshot.wire_sessions_summary.clone(),
+            // EMPTY here, and filled by the caller that holds the peers file,
+            // the peer state file and the lease ledger, none of which is in a
+            // [`StatsSnapshot`], which is the accounts view and nothing else.
+            // Deriving them here would mean this function reading two files off
+            // disk on every status request, and it takes no paths. The serving
+            // process assigns [`Self::peers`] from [`peer_status_rows`] after
+            // this call; an empty list is the honest answer for every other
+            // caller (the CLI's own round-trip tests, `into_snapshot`).
+            peers: Vec::new(),
         }
     }
 
@@ -476,6 +507,1067 @@ impl StatusPayload {
             thresholds,
         )
     }
+}
+
+/// Which kind of route a [`PathStatus`] describes.
+///
+/// A typed discriminant rather than a bool or a string, because the panel
+/// renders the two differently and a third kind (a relay, phase 6) is already
+/// on the roadmap. `direct` and `via` on the wire, which is what the panel's
+/// path sub-line decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathKind {
+    /// A socket address this Mac dials itself.
+    Direct,
+    /// Reached through another pinned Mac that forwards for us.
+    Via,
+    /// Reached over a socket this Mac opened to another and parked there.
+    ///
+    /// Its own word rather than `via`, because the two differ in the fact a
+    /// reader needs: a `via` path is one this Mac dials when it wants it, and
+    /// a `reverse` one exists only while the far Mac keeps a socket parked, so
+    /// "it stopped working" means different things and has different remedies.
+    Reverse,
+}
+
+/// One way to reach one pinned Mac, and what is known about it.
+///
+/// # What is measured and what is honestly absent
+///
+/// [`Self::endpoint`] and [`Self::kind`] come off the peers file. Every other
+/// field is a MEASUREMENT, and each one is `None` until something measures it
+/// rather than `0`. The distinction is the whole reason this block exists, a
+/// `0 ms` round trip beside a `0 %` loss reads as a perfect path, and that
+/// sentence is exactly what a structurally-unwritten field used to print.
+///
+/// The two traffic fields have their writer now, the per-path meter, summed
+/// into the state file's `pathTraffic` section, so for them the distinction is
+/// live in both directions: an unmeasured path is `None` and a path that
+/// carried nothing this hour is `Some(0)`. The per-endpoint round trip and the
+/// loss fraction are the prober's and are still written by nobody into this
+/// shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathStatus {
+    /// The socket address for a [`PathKind::Direct`] path, or the forwarding
+    /// Mac's peer id for a [`PathKind::Via`] one.
+    pub endpoint: String,
+    pub kind: PathKind,
+    /// Round trip over this path, milliseconds. `None` until the prober writes
+    /// it; never `0`, which would read as instantaneous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<f64>,
+    /// Fraction of probes lost over this path, 0 to 1. `None` until the prober
+    /// writes it; a measured zero is a real `0.0` and means something
+    /// different.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss_pct: Option<f64>,
+    /// Bytes carried over THIS path in the last rolling hour, out of the state
+    /// file's `pathTraffic` section
+    /// ([`crate::peer::state::PathTraffic`]).
+    ///
+    /// The byte budget ([`crate::peer::tunnel::TunnelBudget`]) still charges a
+    /// PEER and still cannot answer this: a cap keyed on anything but the peer
+    /// whose handshake was checked is not a cap. The second meter beside it
+    /// ([`crate::peer::tunnel::PathMeter`]) is keyed on the locator the traffic
+    /// went over, and this is its figure.
+    ///
+    /// `None` and `Some(0)` are different answers and the distinction is the
+    /// point: `None` is "nothing here measures this peer's paths", `Some(0)` is
+    /// "measured, and this path carried nothing this hour". A path with no row
+    /// of its own on a peer that HAS rows is a measured zero, which is what
+    /// makes "it all went the other way" a readable fact rather than an
+    /// absence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_hour: Option<u64>,
+    /// Tokens drawn over THIS path in the last hour, from the same section and
+    /// on the same `None`/`Some(0)` rule.
+    ///
+    /// It is a WINDOW and not a rate, which is what separates it from
+    /// [`PeerStatusRow::tokens_per_hour`]: that one divides a lease's `spent`
+    /// by the hours since it was granted and answers "how fast is this Mac
+    /// drawing", this one sums what was actually debited inside the hour and
+    /// answers "how much went this way". Two questions, and a reader that added
+    /// the paths up expecting the row's figure would be adding a rate to a
+    /// count.
+    ///
+    /// Zero on every path whose leases are measured in fractions of a window,
+    /// for the reason [`crate::peer::lease::Ledger::note_lease_path`]'s
+    /// neighbour gives: a fraction carries no token count, and this build
+    /// refuses to relay a tokens-unit lease at all
+    /// ([`tcr_peer_wire::LeaseRefusal::Unsupported`]), so a non-zero
+    /// figure here needs that refusal lifted first.
+    ///
+    /// Which is to say: **this field is structurally zero in this build, on
+    /// every path, and reading it as a measurement is reading a gap.** A
+    /// tokens-unit lease cannot even be minted, because
+    /// [`crate::peer::lease::clamp_to_grant`] takes its budget from
+    /// `fraction_budget`, which is `None` for
+    /// [`tcr_peer_wire::LeaseUnit::Tokens`] and answers `Unsupported` before a
+    /// lease id is issued; and if one somehow existed,
+    /// [`crate::peer::lease::Ledger::may_relay`] refuses it at the same
+    /// predicate on every borrow. `Ledger::tokens_of`, the only caller that
+    /// ever feeds [`crate::peer::tunnel::PathMeter::charge_tokens`], returns
+    /// `None` for any other unit, so nothing reaches the meter.
+    ///
+    /// The hand-mode path does not fill the gap either, and it is the one that
+    /// looks like it should: a borrower's `UsageHint` is applied by
+    /// `Ledger::apply_usage_hint`, which raises the lease's `spent` and never
+    /// touches the per-path meter, because that figure is a share of the
+    /// owner's window and not a token count. So the live numbers today are
+    /// [`Self::bytes_per_hour`] for both modes and `spent` on the lease row;
+    /// a per-path token figure is a tokens lease unit away, which is a change
+    /// to the mint, the relay check and the wire, not a display fix here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_hour: Option<u64>,
+    /// Last time this Mac is known to have reached the peer over this path,
+    /// Unix milliseconds.
+    ///
+    /// Derived, and deliberately narrow: `peer-state.json` records one
+    /// `last_seen` PER PEER, so it can only be attributed to a path when the
+    /// row has exactly one. With two endpoints and one timestamp, which path
+    /// answered is unknown, and this stays `None` on both rather than claiming
+    /// the same success twice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_ms: Option<i64>,
+}
+
+/// One pinned Mac as the SERVING process sees it: the sixteen fields the panel
+/// already decodes (`TcrBarCore/PeerListDocument.swift`'s `PeerEntry`), plus
+/// the per-path block and the one rate the ledger can answer.
+///
+/// # One vocabulary, and which side moved
+///
+/// The panel's field names win here, key for key (`lastSeenMs`, `leaseSpent`,
+/// `byteCapPerHour`), and the Rust side does the renaming. The other direction
+/// was tried by accident for three waves: the CLI emitted `node`, `label` and
+/// `addrs` while the panel decoded `id`, `name` and `address`, every Swift
+/// field is `decodeIfPresent`, and so the mismatch rendered an EMPTY row
+/// instead of failing a test.
+///
+/// # Every field is either derived from a file or honestly absent
+///
+/// Nothing here probes, dials, or asks a peer anything: [`peer_status_rows`]
+/// takes the two files' already-parsed contents and a clock. The fields that
+/// need a live measurement ([`Self::in_flight`], [`Self::no_headroom`],
+/// [`Self::bytes_per_hour`]) are `Option` and stay `None` on this path, so a
+/// reader can tell "not measured" from "measured zero".
+///
+/// No `PartialEq`: [`crate::peer::config::LendGrant`] has none, and adding one
+/// there is a change to another file. Tests compare the serialized JSON,
+/// which is the contract that actually matters here anyway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerStatusRow {
+    /// The pinned key in its WIRE form, 52 Crockford characters, which is the
+    /// same form `tcr peer ls --json` writes as a row's `node`.
+    ///
+    /// It used to be the `tcr-…` display form, and that made the two reads
+    /// unjoinable: the panel merges the file's rows with the serving process's
+    /// rows on this key ([`PeerListDocument.mergingLive`]), the halves carried
+    /// two different spellings of the same Mac, and every live row was appended
+    /// as a second row rather than merged. It is also the only form
+    /// [`tcr_peer_wire::PeerId::parse`] accepts, so a command built from a row
+    /// the panel is drawing (`--revoke`, `--relend`) now names something the
+    /// CLI can read back.
+    ///
+    /// [`Self::display`] carries the short form for the screen.
+    pub id: String,
+    /// The same key in the `tcr-…` display form: about 50 bits, for a person to
+    /// read one row aloud. Nothing parses it back.
+    pub display: String,
+    /// The operator's label, through the same sanitizer `tcr peer ls` uses,
+    /// see [`masked_label`]. This repository is public and this payload is read
+    /// by a GUI: a label that is an email or a uuid comes out `[masked]`.
+    pub name: String,
+    /// The newest endpoint, for the panel's single-address line. The full set
+    /// is [`Self::paths`]; this is the one a row draws when it has no room for
+    /// a sub-line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    /// Always true on this list: it is built from the peers FILE, and every row
+    /// in that file is pinned. A found-not-trusted Mac is a discovery row and
+    /// does not appear here at all.
+    pub trusted: bool,
+    /// Last time this peer answered, Unix milliseconds. Freshness, not
+    /// liveness: a sleeping laptop is the normal state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<i64>,
+    /// We may ask this Mac to carry us out ([`crate::peer::config::Allow::carry`]).
+    pub carries: bool,
+    /// This Mac may open a serve to us, which means it reads our requests in
+    /// full ([`crate::peer::config::Allow::allow_disclose`]).
+    pub serves: bool,
+    /// Requests this Mac is serving right now. `None` here: in-flight lives in
+    /// the running [`crate::peer::lease::Ledger`] and not in either file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_flight: Option<u32>,
+    /// Fraction of the newest live lease's window already spent, 0 to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_spent: Option<f64>,
+    /// Seconds left on the newest live lease before the borrower must ask
+    /// again. Clamped at zero, never negative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_seconds: Option<i64>,
+    /// Bytes carried for this Mac in the last rolling hour. `None` here for the
+    /// same reason as [`PathStatus::bytes_per_hour`]: the budget lives in the
+    /// serving process's [`crate::peer::tunnel::TunnelBudget`], not in a file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_per_hour: Option<u64>,
+    /// The ceiling those bytes are measured against, the operator's own
+    /// `maxTunnelBytesPerHour`, or
+    /// [`crate::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR`], and only on
+    /// a row this Mac actually carries for
+    /// ([`crate::peer::config::Allow::gateway`]). A cap on a row that carries
+    /// nothing is a meter with no meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_cap_per_hour: Option<u64>,
+    /// Tokens this Mac's leases have actually drawn per hour, from the lease
+    /// ledger in `peer-state.json`.
+    ///
+    /// Derived, and only where the ledger can answer it: a lease measured in
+    /// [`tcr_peer_wire::LeaseUnit::Tokens`] knows both its granted amount and
+    /// the fraction spent, so `amount * spent` over the hours since it was
+    /// granted is an OBSERVED rate. A lease measured as a utilization fraction
+    /// carries no token count anywhere in this tree, so those rows are `None`
+    /// rather than a fraction dressed up as tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_per_hour: Option<u64>,
+    /// The lender says it has nothing spare. `None` on this path: it is a
+    /// refusal that arrives on the wire, and neither file records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_headroom: Option<bool>,
+    /// The row-level end, Unix SECONDS: the soonest end among the
+    /// live leases this row is party to while any is running, and the latest
+    /// end once they have all ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+    /// True only when this row has at least one lease and every one of them is
+    /// past its end. A row with one live lease and one ended lease is not an
+    /// ended row.
+    pub ended: bool,
+    /// The lender's own grants for this row, one per lease, each with its
+    /// scope: the per-Mac sheet's "Lend from" list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lend: Vec<crate::peer::config::LendGrant>,
+    /// Every way this Mac knows to reach that one, newest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<PathStatus>,
+}
+
+/// A peer label, through the shared sanitizer, or `[masked]`.
+///
+/// The same rule `tcr peer ls` applies on the way out, and for the same reason:
+/// this repository is public, the peers file is hand-editable JSON, and a label
+/// that is an email, an org name or a uuid must not reach a screenshot, a log
+/// or a bug report. A plain label is returned untouched.
+pub fn masked_label(label: &str) -> String {
+    tcr_peer_wire::sanitize_label(label).unwrap_or_else(|_| "[masked]".to_string())
+}
+
+/// Derive the status payload's peers block from the two files, read-only.
+///
+/// `rows` is the peers file's own list ([`crate::peer::config::PeerStore::peers`]),
+/// `state` the peer state file ([`crate::peer::state::load`]), and `now_ms` the
+/// clock every derived field is answered against, taken ONCE by the caller, so
+/// two rows cannot disagree about whether the same 18:00 has arrived.
+///
+/// Nothing here opens a socket, and nothing here writes: a status request must
+/// not be able to change the mesh, and the prober that WILL measure paths is a
+/// separate writer feeding the same shape.
+pub fn peer_status_rows(
+    rows: &[crate::peer::config::PeerRow],
+    state: &crate::peer::state::PeerState,
+    now_ms: i64,
+) -> Vec<PeerStatusRow> {
+    let now_s = u64::try_from(now_ms.max(0) / 1_000).unwrap_or(0);
+    rows.iter()
+        .map(|row| {
+            let last_seen_ms = state
+                .last_seen
+                .iter()
+                .find(|(peer, _)| *peer == row.node)
+                .map(|(_, at)| *at);
+            let paths = peer_paths(row, last_seen_ms, state, now_ms);
+            let (until, ended) = row_ends(row, state, now_s);
+            let live = newest_live_lease(row, state, now_ms);
+            PeerStatusRow {
+                id: row.node.to_wire(),
+                display: row.node.display(),
+                name: masked_label(&row.label),
+                // NEWEST first, which is the order `paths` is built in, so the
+                // one-line address and the sub-line's first entry cannot
+                // disagree about which endpoint is current.
+                address: paths.first().map(|path| path.endpoint.clone()),
+                trusted: true,
+                last_seen_ms,
+                carries: row.allow.carry,
+                serves: row.allow.allow_disclose,
+                in_flight: None,
+                lease_spent: live.map(|lease| lease.spent),
+                lease_ttl_seconds: live
+                    .map(|lease| ((lease.expires_at_ms - now_ms).max(0)) / 1_000),
+                bytes_per_hour: None,
+                byte_cap_per_hour: row
+                    .allow
+                    .gateway
+                    .then_some(crate::peer::tunnel::DEFAULT_MAX_TUNNEL_BYTES_PER_HOUR),
+                tokens_per_hour: tokens_per_hour(row, state, now_ms),
+                no_headroom: None,
+                until,
+                ended,
+                lend: row.lend.clone(),
+                paths,
+            }
+        })
+        .collect()
+}
+
+/// The peers block for the SERVING process, read off the two files the mesh
+/// keeps, at `now_ms`.
+///
+/// [`peer_status_rows`] is the derivation and takes already-parsed contents;
+/// this is the one place that opens the files, so the proxy's status handler
+/// has a single call and the derivation stays testable without a filesystem.
+///
+/// # Why an unreadable file is an empty block and not a 500
+///
+/// `tcr status` is how an operator finds out what this process thinks, very
+/// much including when something is wrong with it. Refusing the whole payload
+/// because the peers file is missing would take the accounts view away too,
+/// and a missing peers file is the ORDINARY state of a Mac that has never
+/// paired with anything. So a read that fails is logged at warn with the path
+/// and the error, which is a surfaced error and not a swallowed one, and the
+/// block is empty: no peers file, no peers.
+pub fn peers_block(peers_path: &std::path::Path, now_ms: i64) -> Vec<PeerStatusRow> {
+    // `PeerStore` and not a bare `read_or_default`: it is the reader every
+    // other surface goes through, and it is what derives each grant's `ended`
+    // against the clock. A second reader here would be a second answer to
+    // "has this lease ended".
+    let store = match crate::peer::config::PeerStore::open(peers_path) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                path = %peers_path.display(),
+                error = %err,
+                "status: the peers file could not be read, so the status payload's peers \
+                 block is empty; the accounts it reports are unaffected"
+            );
+            return Vec::new();
+        }
+    };
+    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let state = match crate::peer::state::load(&state_path, now_ms) {
+        Ok(state) => state,
+        Err(err) => {
+            // A cold start rather than a refusal, the contract this file
+            // already documents: it costs the rows their `lastSeen` and their
+            // lease figures, and nothing else.
+            tracing::warn!(
+                path = %state_path.display(),
+                error = %err,
+                "status: no peer runtime state, so the peers block reports what the peers \
+                 file alone can say"
+            );
+            crate::peer::state::PeerState::default()
+        }
+    };
+    peer_status_rows(&store.peers(), &state, now_ms)
+}
+
+/// [`peer_graph`], derived off the two files on disk rather than values a
+/// caller already holds: the same split [`peers_block`] draws from
+/// [`peer_status_rows`], for the same reason. `tcr peer graph` and the CLI's
+/// own tests both need the derivation, and only one of them should know where
+/// the state file lives.
+///
+/// Nothing here opens a socket: an unreadable peers file reports a graph with
+/// only `this` as a node, never a refusal, so asking for a picture of a mesh
+/// this Mac has not yet joined is not an error.
+pub fn peer_graph_block(
+    peers_path: &std::path::Path,
+    this: &tcr_peer_wire::PeerId,
+    this_label: &str,
+    now_ms: i64,
+) -> PeerGraph {
+    let rows = match crate::peer::config::PeerStore::open(peers_path) {
+        Ok(store) => store.peers(),
+        Err(err) => {
+            tracing::warn!(
+                path = %peers_path.display(),
+                error = %err,
+                "status: the peers file could not be read, so the graph carries only this Mac"
+            );
+            Vec::new()
+        }
+    };
+    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    let state = match crate::peer::state::load(&state_path, now_ms) {
+        Ok(state) => state,
+        Err(err) => {
+            tracing::warn!(
+                path = %state_path.display(),
+                error = %err,
+                "status: no peer runtime state, so the graph carries no lease or freshness edges"
+            );
+            crate::peer::state::PeerState::default()
+        }
+    };
+    peer_graph(this, this_label, &rows, &state, now_ms)
+}
+
+/// The whole mesh as THIS Mac sees it: one node per Mac, one edge per way to
+/// reach one, one edge per live lease.
+///
+/// # What a graph is for, and why it is not the peers block
+///
+/// [`PeerStatusRow`] answers "what is my link to that Mac", one row at a time,
+/// in the panel's vocabulary. A graph answers a question no row can: which Macs
+/// are reachable only THROUGH another one, and which way the borrowing flows.
+/// Both are derived from the same two files by the same clock, so they cannot
+/// disagree: the graph is a second projection, never a second source.
+///
+/// # Its own kind, and why it is not [`STATUS_KIND`]
+///
+/// A graph is a different document with a different shape, so it carries its
+/// own discriminator: a reader handed this where a status payload was expected
+/// must refuse it, and the version this shape moves at has nothing to do with
+/// the status payload's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerGraph {
+    /// Always [`PEER_GRAPH_KIND`]. Checked by the reader before it trusts a
+    /// body, for the reason [`STATUS_KIND`] gives at length.
+    pub kind: String,
+    /// The clock every edge was derived against, Unix milliseconds. Taken ONCE
+    /// so two edges cannot disagree about whether the same lease has ended.
+    pub generated_at_ms: i64,
+    pub nodes: Vec<GraphNode>,
+    pub edges: Vec<GraphEdge>,
+}
+
+/// The discriminator on every [`PeerGraph`].
+pub const PEER_GRAPH_KIND: &str = "tcr.peer.graph.v1";
+
+/// Whether a node is the Mac that answered, or one it has pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GraphRole {
+    /// The Mac this graph was asked of. Exactly one node carries it.
+    #[serde(rename = "self")]
+    ThisMac,
+    /// A pinned Mac. One per row in the peers file, and nothing else: a found
+    /// but untrusted Mac has no identity yet (it is learned in the handshake),
+    /// so it cannot be a node in an identity-addressed graph.
+    #[serde(rename = "peer")]
+    Peer,
+}
+
+/// One Mac.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    /// The pinned key in its `tcr-…` display form, which is the only name a
+    /// Mac has here: an address is a locator and belongs on an edge.
+    pub id: String,
+    /// The operator's label through [`masked_label`], this graph can be served
+    /// as a page, so a label that is an email or a uuid comes out `[masked]`.
+    pub name: String,
+    pub role: GraphRole,
+    /// Last time that Mac answered, Unix milliseconds. Absent on the node that
+    /// answered (it does not see itself) and on a Mac never yet reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_ms: Option<i64>,
+}
+
+/// One directed fact between two Macs.
+///
+/// The common half is `from` and `to`; what KIND of fact it is, and the fields
+/// that only that kind has, are [`GraphEdgeDetail`], one tagged value rather
+/// than an edge carrying every field of both kinds with half of them null. A
+/// reader that matches on `kind` gets exactly the fields that kind defines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphEdge {
+    /// The node the fact points FROM, as a [`GraphNode::id`].
+    pub from: String,
+    pub to: String,
+    #[serde(flatten)]
+    pub detail: GraphEdgeDetail,
+}
+
+/// Which kind of fact an edge is, and the fields only that kind has.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+// `rename_all` on an enum renames the VARIANTS, never the fields inside
+// them, so it alone let `path_kind` and `expires_at_ms` onto the wire while
+// the variant tags looked perfectly right. `rename_all_fields` is the half
+// that reaches the fields, and the schema test is what caught the absence.
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum GraphEdgeDetail {
+    /// A way to reach the Mac at `to`. Every figure is the prober's and absent
+    /// until it lands, never a zero, which would read as a perfect path.
+    Path {
+        /// The socket address dialled, or the forwarding Mac's id on a
+        /// [`PathKind::Via`] edge.
+        endpoint: String,
+        path_kind: PathKind,
+        /// The Mac the bytes pass THROUGH, on a via edge only. It is what makes
+        /// the graph a graph: the reader can see that reaching `to` costs a
+        /// third Mac's willingness to forward.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        through: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rtt_ms: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loss_pct: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_ok_ms: Option<i64>,
+    },
+    /// A live lease. `from` is the LENDER and `to` is the borrower, always, so
+    /// the arrow points the way the quota flows and a reader never has to
+    /// consult a direction field to know which Mac is paying.
+    Lease {
+        /// The ledger's own id, in the 32-character hex form every CLI surface
+        /// prints and `--revoke` reads back
+        /// ([`crate::peer::config::lease_id_string`]). Zero-padded, because
+        /// unpadded is a DIFFERENT string for any id with a leading zero
+        /// nibble, and a reader lining this edge up against a lease list or
+        /// building a command from it would match nothing.
+        lease_id: String,
+        /// Fraction of the window drawn so far, 0 to 1.
+        spent: f64,
+        /// The renewal deadline, Unix milliseconds: the lease dies here unless
+        /// it is renewed.
+        expires_at_ms: i64,
+        /// The operator's own "lend until", Unix SECONDS, when one was set. A
+        /// different clock from `expires_at_ms` and deliberately kept apart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<u64>,
+    },
+}
+
+/// Derive [`PeerGraph`] from the two files, read-only.
+///
+/// `this` and `this_label` are the answering Mac's own identity: it is not in
+/// the peers file, which holds every Mac EXCEPT this one, so a graph that
+/// derived its nodes from the file alone would have no centre and no edges.
+///
+/// Nothing here opens a socket or writes anything, the same contract
+/// [`peer_status_rows`] carries: asking for a picture of the mesh must not be
+/// able to change it.
+pub fn peer_graph(
+    this: &tcr_peer_wire::PeerId,
+    this_label: &str,
+    rows: &[crate::peer::config::PeerRow],
+    state: &crate::peer::state::PeerState,
+    now_ms: i64,
+) -> PeerGraph {
+    let me = this.display();
+    let mut nodes = vec![GraphNode {
+        id: me.clone(),
+        name: masked_label(this_label),
+        role: GraphRole::ThisMac,
+        last_seen_ms: None,
+    }];
+    let mut edges: Vec<GraphEdge> = Vec::new();
+
+    for row in rows {
+        let peer = row.node.display();
+        let last_seen_ms = state
+            .last_seen
+            .iter()
+            .find(|(node, _)| *node == row.node)
+            .map(|(_, at)| *at);
+        nodes.push(GraphNode {
+            id: peer.clone(),
+            name: masked_label(&row.label),
+            role: GraphRole::Peer,
+            last_seen_ms,
+        });
+
+        // The paths, from the one derivation the peers block uses too, so a
+        // path drawn on the graph and the same path drawn on the tab cannot
+        // report different figures.
+        for path in peer_paths(row, last_seen_ms, state, now_ms) {
+            // `path.endpoint` is now the WIRE id on a Via/Reverse path (the
+            // fix `PeerStatusRow`'s own endpoint needed, so the panel can
+            // resolve it against `id`). This graph's node ids are all the
+            // DISPLAY form instead (`me`, `peer`, above), and nothing here
+            // re-resolves `through` against `nodes`, so carrying the wire id
+            // through unchanged would put one id space in `to` and a
+            // different one in `through` for the same Mac. Parsed back to
+            // display for this edge alone; a parse failure (an id this build
+            // cannot read) falls back to the wire form rather than losing
+            // the field.
+            let endpoint = if matches!(path.kind, PathKind::Via | PathKind::Reverse) {
+                tcr_peer_wire::PeerId::parse(&path.endpoint)
+                    .map_or_else(|_| path.endpoint.clone(), |id| id.display())
+            } else {
+                path.endpoint.clone()
+            };
+            let through = matches!(path.kind, PathKind::Via).then(|| endpoint.clone());
+            edges.push(GraphEdge {
+                from: me.clone(),
+                to: peer.clone(),
+                detail: GraphEdgeDetail::Path {
+                    endpoint,
+                    path_kind: path.kind,
+                    through,
+                    rtt_ms: path.rtt_ms,
+                    loss_pct: path.loss_pct,
+                    last_ok_ms: path.last_ok_ms,
+                },
+            });
+        }
+
+        // Leases this Mac has LENT that peer: this Mac's quota, drawn there.
+        for held in state.leases.iter().filter(|held| held.peer == row.node) {
+            if held.lease.expires_at_ms <= now_ms {
+                continue;
+            }
+            edges.push(lease_edge(&me, &peer, &held.lease));
+        }
+        // And the ones it has BORROWED from that peer: the arrow turns around,
+        // because the lender is always `from`.
+        for borrowed in state
+            .borrowed
+            .iter()
+            .filter(|borrowed| borrowed.lender == row.node)
+        {
+            if borrowed.lease.expires_at_ms <= now_ms {
+                continue;
+            }
+            edges.push(lease_edge(&peer, &me, &borrowed.lease));
+        }
+    }
+
+    PeerGraph {
+        kind: PEER_GRAPH_KIND.to_string(),
+        generated_at_ms: now_ms,
+        nodes,
+        edges,
+    }
+}
+
+/// One lease edge, lender to borrower.
+fn lease_edge(from: &str, to: &str, lease: &tcr_peer_wire::Lease) -> GraphEdge {
+    GraphEdge {
+        from: from.to_string(),
+        to: to.to_string(),
+        detail: GraphEdgeDetail::Lease {
+            lease_id: crate::peer::config::lease_id_string(lease.lease_id),
+            spent: lease.spent,
+            expires_at_ms: lease.expires_at_ms,
+            until: lease.until,
+        },
+    }
+}
+
+/// The endpoints of one row as [`PathStatus`] values, newest first.
+///
+/// Both kinds are derived now. The row's own list carries the locator
+/// ([`crate::peer::config::Locator`]), so a `Via` endpoint, a Mac that
+/// forwards for us, comes through as [`PathKind::Via`] with the forwarding
+/// Mac's peer id where a direct path carries a socket address. An earlier
+/// version of this comment said every path was direct because the peers file
+/// "holds socket addresses and nothing else"; that stopped being true when the
+/// row started holding endpoints.
+///
+/// `observed_at_ms` is deliberately NOT copied onto the path. It says when this
+/// Mac last LEARNED the endpoint, which is a different fact from when it last
+/// reached the peer over it, and [`PathStatus::last_ok_ms`] is the second one.
+fn peer_paths(
+    row: &crate::peer::config::PeerRow,
+    last_seen_ms: Option<i64>,
+    state: &crate::peer::state::PeerState,
+    now_ms: i64,
+) -> Vec<PathStatus> {
+    use crate::peer::config::Locator;
+
+    // Whether this peer's paths are measured AT ALL, decided once for the row:
+    // a peer with no traffic row has never been metered and every one of its
+    // paths answers `None`, a peer with any row has, and a path of its own with
+    // no row carried nothing. Deciding it per path instead would make the two
+    // answers depend on which endpoint happened to be looked at first.
+    let metered = state
+        .path_traffic
+        .iter()
+        .any(|traffic| traffic.peer == row.node);
+
+    // One endpoint means one candidate for the peer-level `last_seen`; two mean
+    // the timestamp cannot be attributed and both paths say so. See
+    // `PathStatus::last_ok_ms`.
+    let attributable = row.endpoints.len() == 1;
+    row.endpoints
+        .iter()
+        .map(|endpoint| {
+            // The wire id, not `display()`: `PeerStatusRow::id` (the key the
+            // panel resolves names by, `mergingLive` and `peerNames` both key
+            // on it) is the wire form, and a `Via`/`Reverse` endpoint that
+            // carried the display form instead could never be looked up in
+            // that map, so the tab drew the raw id where a name belonged.
+            let (address, kind) = match endpoint.locator {
+                Locator::Direct { addr } => (addr.to_string(), PathKind::Direct),
+                Locator::Via { node } => (node.to_wire(), PathKind::Via),
+                Locator::Reverse { node } => (node.to_wire(), PathKind::Reverse),
+            };
+            let traffic = state
+                .path_traffic
+                .iter()
+                .find(|traffic| traffic.peer == row.node && traffic.locator == endpoint.locator);
+            PathStatus {
+                endpoint: address,
+                kind,
+                rtt_ms: None,
+                loss_pct: None,
+                bytes_per_hour: metered.then(|| {
+                    traffic.map_or(0, |row| {
+                        rolled(row.bytes_last_hour, row.updated_at_ms, now_ms)
+                    })
+                }),
+                tokens_per_hour: metered.then(|| {
+                    traffic.map_or(0, |row| {
+                        rolled(row.tokens_last_hour, row.updated_at_ms, now_ms)
+                    })
+                }),
+                last_ok_ms: attributable.then_some(last_seen_ms).flatten(),
+            }
+        })
+        .collect()
+}
+
+/// One written total, read back against the clock: the figure it stood at, or
+/// `0` once the hour it described has entirely rolled off.
+///
+/// A [`crate::peer::state::PathTraffic`] row is a SUM taken at an instant, not
+/// the window itself, so the only two honest readings of it are "this is what
+/// the hour held then" and "then is longer ago than the window, so it holds
+/// nothing now". A partial roll-off is not derivable from a total and is not
+/// attempted: the meter's next write is what moves the figure, and a status
+/// reader that scaled it by elapsed time would be inventing a decay the traffic
+/// never had.
+///
+/// The boundary is [`crate::peer::tunnel::TunnelBudget::trim`]'s, to the
+/// millisecond: a row exactly one window old is still inside its window on both
+/// sides, so "may carry this hour" and "carried this hour" cannot be read
+/// against two different hours.
+fn rolled(total: u64, updated_at_ms: i64, now_ms: i64) -> u64 {
+    if now_ms.saturating_sub(updated_at_ms) > crate::peer::tunnel::BUDGET_WINDOW_MS {
+        0
+    } else {
+        total
+    }
+}
+
+/// The newest lease this row is party to that has NOT expired, in either
+/// direction: one the ledger minted for it, or one it granted this Mac.
+///
+/// Newest by `granted_at_ms`, because a row can hold several at once (decision
+/// 12) and the panel draws one meter.
+fn newest_live_lease<'a>(
+    row: &crate::peer::config::PeerRow,
+    state: &'a crate::peer::state::PeerState,
+    now_ms: i64,
+) -> Option<&'a tcr_peer_wire::Lease> {
+    state
+        .leases
+        .iter()
+        .filter(|held| held.peer == row.node)
+        .map(|held| &held.lease)
+        .chain(
+            state
+                .borrowed
+                .iter()
+                .filter(|borrowed| borrowed.lender == row.node)
+                .map(|borrowed| &borrowed.lease),
+        )
+        .filter(|lease| lease.expires_at_ms > now_ms)
+        .max_by_key(|lease| lease.granted_at_ms)
+}
+
+/// Observed tokens per hour for one row, from the lease ledger.
+///
+/// Summed over every live lease of that peer measured in
+/// [`tcr_peer_wire::LeaseUnit::Tokens`]: `amount * spent` is what has actually
+/// been drawn, and the hours since `granted_at_ms` is how long it took. A lease
+/// granted less than a second ago is not a rate yet and contributes nothing,
+/// dividing by that window would report a number in the billions.
+///
+/// `None`, not `Some(0)`, in BOTH cases where there is no rate to report: when
+/// no lease of this row is measured in tokens at all (nothing in this tree
+/// converts a utilization fraction to a token count), and when the only token
+/// leases are younger than that first window. A zero would read as "this Mac
+/// drew nothing", which is a claim and not an absence.
+fn tokens_per_hour(
+    row: &crate::peer::config::PeerRow,
+    state: &crate::peer::state::PeerState,
+    now_ms: i64,
+) -> Option<u64> {
+    /// A rate over a shorter window than this is noise, not a measurement.
+    const MIN_ELAPSED_MS: i64 = 1_000;
+
+    let mut total = 0.0_f64;
+    let mut measured = false;
+    for held in state.leases.iter().filter(|held| held.peer == row.node) {
+        let tcr_peer_wire::LeaseUnit::Tokens(amount) = held.lease.unit else {
+            continue;
+        };
+        let elapsed_ms = now_ms - held.lease.granted_at_ms;
+        if elapsed_ms < MIN_ELAPSED_MS {
+            // NOT measured. This sat above the check and marked the row
+            // measured first, so a lease minted in the last second reported
+            // `Some(0)`, "this Mac drew nothing", for a lease that had simply
+            // not run long enough to divide by. The two answers this function
+            // must keep apart are "no token lease here" and "not a rate yet",
+            // and both of them are `None`; only a lease that has actually run
+            // can contribute a number.
+            continue;
+        }
+        measured = true;
+        let hours = elapsed_ms as f64 / 3_600_000.0;
+        // `spent` is a fraction of the granted amount, clamped: a ledger row
+        // written by a newer build could carry a value outside 0..=1, and a
+        // rate above what was granted is not a thing this can report. Dropping
+        // the factor entirely reports the GRANT as if it had all been drawn,
+        // which is the defect `a_lent_lease_in_tokens_reports_a_rate_from_the_ledger`
+        // watched fail: 1 000 000 granted and half spent read as 500 000/h.
+        total += (amount as f64) * held.lease.spent.clamp(0.0, 1.0) / hours;
+    }
+    measured.then(|| total.round().max(0.0) as u64)
+}
+
+/// The row-level `until` and `ended`, over every lease this row is
+/// party to: the operator's grants, the leases the ledger minted against them,
+/// and the leases that Mac has granted THIS one.
+///
+/// The same rule `tcr peer ls --json` answers with (`peer_ls_ends` in
+/// `src/main.rs`), and the two must not drift: one row drawn by the panel from
+/// this payload and the same row drawn from `peer ls` disagreeing about whether
+/// a lease has ended is the exact confusion the two keys settled. Collapsing
+/// them onto this one writer needs an edit in `src/main.rs`, which has not
+/// happened yet.
+fn row_ends(
+    row: &crate::peer::config::PeerRow,
+    state: &crate::peer::state::PeerState,
+    now_s: u64,
+) -> (Option<u64>, bool) {
+    let mut ends: Vec<(Option<u64>, bool)> = row
+        .lend
+        .iter()
+        .map(|grant| (grant.until, grant.has_ended(now_s)))
+        .collect();
+    ends.extend(
+        state
+            .leases
+            .iter()
+            .filter(|held| held.peer == row.node)
+            .map(|held| (held.lease.until, lease_has_ended(&held.lease, now_s))),
+    );
+    ends.extend(
+        state
+            .borrowed
+            .iter()
+            .filter(|borrowed| borrowed.lender == row.node)
+            .map(|borrowed| {
+                (
+                    borrowed.lease.until,
+                    lease_has_ended(&borrowed.lease, now_s),
+                )
+            }),
+    );
+
+    if ends.is_empty() {
+        return (None, false);
+    }
+    let all_ended = ends.iter().all(|(_, past)| *past);
+    let named: Vec<u64> = ends.iter().filter_map(|(end, _)| *end).collect();
+    let until = if all_ended {
+        named.iter().copied().max()
+    } else {
+        // The SOONEST end among the live ones: that is the instant the row's
+        // "ends in 1 h" counts down to. A lease with no end contributes no
+        // candidate rather than an infinite one.
+        ends.iter()
+            .filter(|(_, past)| !*past)
+            .filter_map(|(end, _)| *end)
+            .min()
+    };
+    (until, all_ended)
+}
+
+/// Whether one wire lease's own end has passed, on the same clock.
+///
+/// A lease with no `until` has not ended by the clock: only its expiry ends it,
+/// and that is a different field with a different meaning.
+fn lease_has_ended(lease: &tcr_peer_wire::Lease, now_s: u64) -> bool {
+    lease.until.is_some_and(|end| now_s >= end)
+}
+
+// ---------------------------------------------------------------------------
+// The `tcr peer ls --json` document
+// ---------------------------------------------------------------------------
+
+/// One pinned Mac as `tcr peer ls --json` reports it.
+///
+/// # Why this names every field instead of flattening the row
+///
+/// It used to be `#[serde(flatten)] row: PeerRow`, which put EVERY key the
+/// peers file holds on the wire, `rendezvousSecret` included: 64 hex characters
+/// of the pair's derived port secret, on a payload TcrBar polls every three
+/// seconds and an operator pastes into a bug report. `docs/peers.md` says that
+/// value is never sent to anybody. A flattened struct makes "what crosses" a
+/// property of another file's struct definition, so the next field added to
+/// [`crate::peer::config::PeerRow`] crosses too, silently.
+///
+/// Naming the fields moves that decision here and makes it a compile-time one:
+/// a new field on `PeerRow` reaches this payload only when somebody writes it
+/// down. The secret stays in the peers FILE, which is where the reach code
+/// reads it from; nothing on this surface needs it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerLsRow {
+    /// The pinned static key, wire form (52 Crockford characters). The same
+    /// form [`PeerStatusRow::id`] carries, so the panel can join the two reads.
+    pub node: tcr_peer_wire::PeerId,
+    /// The operator's label, through [`masked_label`].
+    pub label: String,
+    /// Every way this Mac knows to reach that one, newest first.
+    #[serde(default)]
+    pub endpoints: Vec<crate::peer::config::Endpoint>,
+    /// When the pin was taken, Unix milliseconds.
+    pub added_at: i64,
+    /// What that Mac may do here, and what this Mac may ask of it.
+    pub allow: crate::peer::config::Allow,
+    /// The operator's own grants for this row, one per lease.
+    #[serde(default)]
+    pub lend: Vec<crate::peer::config::LendGrant>,
+    /// The address that peer last said it sees THIS Mac at, and when it said
+    /// so. An address is not a secret, and the panel draws it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sees_us_at: Option<(String, u64)>,
+    /// The row-level end over every lease this row is party to, Unix SECONDS,
+    /// `null` when nothing this row is party to has an end. While any lease is
+    /// running it is the SOONEST end among the live ones, the instant a row's
+    /// "ends in 1 h" counts down to; once they have all ended it is the LATEST
+    /// end, the "ended <when>" a greyed row prints.
+    ///
+    /// Derived against the clock at print time and never read off the file, for
+    /// the reason [`crate::peer::config::LendGrant::ended`] gives: a lease ends
+    /// on a wall clock and the file's mtime does not move when 18:00 arrives.
+    /// The per-lease `until` is still on each grant inside [`Self::lend`]; this
+    /// is the ROW-level answer, so a row can be drawn without walking its
+    /// leases and picking a different one than the next reader would.
+    ///
+    /// Derived from every lease this row is party to, whichever way it points:
+    /// the operator's own grants and the leases the ledger minted against them,
+    /// and the leases this Mac has been GRANTED by that row's Mac
+    /// (`peer-state.json`'s `borrowed` section). A borrower's row used to read
+    /// `until: null` for a Mac that was actively serving it, because the
+    /// borrower's copy lived only in a running proxy's memory.
+    pub until: Option<u64>,
+    /// True only when this row has at least one lease and every one of them is
+    /// past its `until`. A row with one live lease and one ended lease is not
+    /// an ended row, and saying otherwise would grey a Mac still being served.
+    pub ended: bool,
+}
+
+impl PeerLsRow {
+    /// Project one peers-file row, with the two ends the caller derived against
+    /// its own single clock.
+    ///
+    /// The label is masked here rather than at the call site, so no caller can
+    /// forget: this repository is public and this payload is read by a GUI.
+    pub fn from_row(row: crate::peer::config::PeerRow, until: Option<u64>, ended: bool) -> Self {
+        Self {
+            node: row.node,
+            label: masked_label(&row.label),
+            endpoints: row.endpoints,
+            added_at: row.added_at,
+            allow: row.allow,
+            lend: row.lend,
+            sees_us_at: row.sees_us_at,
+            until,
+            ended,
+        }
+    }
+}
+
+/// One account's exit lock as `tcr peer ls --json` reports it.
+///
+/// Four keys because they are one answer: where this account leaves from,
+/// whether an unavailable route refuses or falls back, whether the route is
+/// available right now, and how long it has been unavailable. A panel that read
+/// the pin without the liveness would draw "exits via <Mac>" over an account
+/// whose requests are all failing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerExitJson {
+    /// The file's own word: `local`, or `via <peer id>`.
+    pub egress: String,
+    /// Whether a pin that cannot be honoured refuses rather than falling back.
+    pub egress_strict: bool,
+    /// Whether the pinned Mac is unreachable from here right now.
+    pub peer_down: bool,
+    /// How long the pinned Mac has been unreachable, in seconds. Absent when
+    /// this Mac has never recorded contact with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_seconds: Option<u64>,
+}
+
+/// The caps the panel's Advanced pane draws, so it and this binary cannot
+/// disagree about what they are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerCapsJson {
+    pub found_rows: usize,
+    pub found_per_address: usize,
+    pub pending: usize,
+    pub knock_interval_ms: i64,
+    pub knock_burst: u32,
+    pub unauthenticated_sockets: usize,
+}
+
+/// The whole `tcr peer ls --json` document.
+///
+/// The panel reads this. The count-and-rows pairs are both present on purpose:
+/// a count alone makes the panel ask a second question to render the row, and
+/// the two calls would see two different instants.
+///
+/// Serialize only: `LentTo` has no `Deserialize`, and a reader of this document
+/// is the Swift panel, which has its own model. A test asserting the shape does
+/// it against the JSON, which is the contract that crosses.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerLsJson {
+    pub supported: bool,
+    /// One row per pinned Mac. See [`PeerLsRow`], which is an explicit
+    /// projection and carries no secret.
+    pub peers: Vec<PeerLsRow>,
+    /// Macs asking to pair.
+    pub pending: Vec<crate::peer::state::Knock>,
+    pub pending_count: usize,
+    /// Blocked addresses, with the key where one was learned.
+    pub blocked: Vec<crate::peer::state::Ban>,
+    pub blocked_count: usize,
+    /// Muted addresses, quiet until the deadline lifts on its own.
+    pub muted: Vec<crate::peer::state::Mute>,
+    pub muted_count: usize,
+    /// How many found rows this Mac is holding back. Zero from a CLI
+    /// invocation, which reads no live scan and so limited nothing.
+    pub limited: usize,
+    pub caps: PeerCapsJson,
+    /// The "Lent to …" line, per account label.
+    pub lent_to: std::collections::BTreeMap<String, Vec<crate::peer::lease::LentTo>>,
+    /// Whether this Mac may be reached from off its own LAN: the peers file's
+    /// own setting, not a reachability test.
+    pub internet: bool,
+    /// Every account that has an exit lock, keyed by the label a `--scope`
+    /// names it by.
+    pub exits: std::collections::BTreeMap<String, PeerExitJson>,
 }
 
 #[cfg(test)]

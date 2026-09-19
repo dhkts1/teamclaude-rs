@@ -38,11 +38,24 @@ app_dir="$build_dir/$app_name.app"
 macos_dir="$app_dir/Contents/MacOS"
 frameworks_dir="$app_dir/Contents/Frameworks"
 
-# The one URL the app answers, and the CLI's half of the contract. `tcr` opens
-# this to ask a running TcrBar to check for updates; `AppDelegate.application(_:open:)`
-# handles it. Changing either string without the other silently breaks the hand-off,
-# so both live here beside the CFBundleURLTypes entry that registers the scheme.
+# The TWO URL schemes the app answers, both handled by
+# `AppDelegate.application(_:open:)`. Changing either string without the other
+# side silently breaks the hand-off, so they live here beside the
+# CFBundleURLTypes entries that register them.
+#
+#   tcrbar://check-for-updates   the CLI asking a running TcrBar to act.
+#   tcr://peer/join?v=1&nk=…     decision row 11's share link: a person pastes
+#                                one in Slack or iMessage and opening it brings
+#                                this Mac onto that mesh. The app hands the
+#                                WHOLE link to `tcr peer join --stdin`.
+#
+# Two schemes and not one path under `tcrbar://`, because they are two
+# different things: one is a command, the other is a credential, and the CLI
+# accepts the `tcr://` form itself (`src/main.rs`'s PeerJoinArgs), so the link
+# a person receives is the same string whether they paste it into a terminal or
+# click it.
 url_scheme="tcrbar"
+peer_url_scheme="tcr"
 
 # Where the appcast lives. Sparkle reads this out of Info.plist at runtime, so it
 # is written once here rather than compiled into the app.
@@ -299,6 +312,14 @@ $sparkle_public_key_entry
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>$url_scheme</string>
+			</array>
+		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>$bundle_id.peer-join</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>$peer_url_scheme</string>
 			</array>
 		</dict>
 	</array>

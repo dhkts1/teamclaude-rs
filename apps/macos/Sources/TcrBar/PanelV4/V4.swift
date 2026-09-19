@@ -176,6 +176,11 @@ enum V4 {
     static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4
     static let barTrackAlpha: Double = 0.08
+    /// A peer row whose lease has ENDED, drawn as past
+    /// (`settings-peers-short.html`'s own `.lz.ended`, decision row 13). The
+    /// same 0.55 the per-Mac sheet's ended lease row already uses, so the two
+    /// surfaces grey one state by one amount.
+    static let endedRowOpacity: Double = 0.55
     static let barMinWidth: CGFloat = 2
     /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
     static let barCappedWidth: CGFloat = 110
@@ -397,6 +402,22 @@ enum V4 {
     static let footerRuleWidth: CGFloat = 1
     static let footerGap: CGFloat = 10
     static let footerGlyph: CGFloat = 12
+
+    // MARK: - Mini mesh card (`MiniMeshCard`)
+
+    static let meshEmptyPaddingV: CGFloat = 18
+    static let meshCardPadding: CGFloat = 8
+    /// `pillLabel` draws inside `pill.frame`, narrowed by this on the leading
+    /// and trailing edges combined so the reading and via-line never touch
+    /// the pill's own rounded border.
+    static let meshPillLabelInset: CGFloat = 20
+
+    // MARK: - Must switch (`.sw2.small`)
+
+    static let switchWidth: CGFloat = 30
+    static let switchHeight: CGFloat = 18
+    static let switchKnobSize: CGFloat = 14
+    static let switchKnobInset: CGFloat = 2
 
     // MARK: - Type
 

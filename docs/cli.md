@@ -668,6 +668,72 @@ a panel's fleet-wide headline never disagrees with the per-session rows by re-su
 
 ---
 
+## `tcr doctor`
+
+Answers one question: **is Claude Code actually reaching this proxy, and if it is not, what decided
+otherwise.** Every other verb here reports the fleet this proxy holds; this one reports whether
+anything is pointed at it.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--config <path>` | path | the per-user config path | config to read |
+| `--json` | bool | `false` (text) | emit one JSON object instead of greppable `key: value` lines |
+
+```
+$ tcr doctor
+baseUrl: https://gateway.example.com
+baseUrlSource: /Users/example/.claude/settings.json
+proxyPort: 3456
+portHolder: pid 4242 tcr
+portHolderIsTcr: yes
+requests10m: 0
+verdict: this proxy is not on Claude's route: /Users/example/.claude/settings.json sets https://gateway.example.com
+```
+
+| exit | meaning |
+|---|---|
+| **0** | Claude Code is routed to this proxy and the proxy answered |
+| **2** | Claude Code is routed somewhere else; the verdict names the file or variable that set it |
+| **3** | the route points here and nothing answered on the port |
+
+"Routed here" means the base URL names a loopback address (`127.0.0.1`, `localhost`, `[::1]`) on the
+port this config uses. Another machine's proxy on the same port is not this one.
+
+### Why the base URL can come from a file rather than the variable
+
+`tcr run` exports `ANTHROPIC_BASE_URL` onto the `claude` it launches. Claude Code then applies its
+settings files' `env` block **on top of** the environment it inherited, so a base URL written in a
+settings file wins over the one the launcher exported, silently. `doctor` resolves the four sources
+in Claude Code's own order and reports the winner:
+
+1. `.claude/settings.local.json` in the working directory
+2. `.claude/settings.json` in the working directory
+3. `.claude/settings.json` in the home directory
+4. the process environment's `ANTHROPIC_BASE_URL`
+5. failing all of those, `https://api.anthropic.com`
+
+A settings file that exists and cannot be parsed is reported on its own `problem:` line rather than
+read as "sets nothing": it is the likeliest place for the answer to be hiding, and skipping it
+quietly would let `doctor` name the wrong source with confidence.
+
+`requests10m` is how many requests this proxy served in the last ten minutes, summed from the
+per-minute sparklines on `/_tcr/status` (`reqPerMinute`, documented under `tcr status`). It reads
+`none` when no proxy answered, which is a different fact from `0`: a proxy that is up and idle is
+healthy, and only the first of those is exit **3**.
+
+`portHolder` is whoever is listening on the port, by pid and process name, from the same listener
+enumeration `tcr server` uses to decide a takeover. It answers the case the verdict line cannot:
+the route is right, nothing answers, and the port is held by something that is not a `tcr`.
+
+`--json` emits the same decision as one object, with `verdict` and `exitCode` written out so a
+caller reads one document instead of re-deriving either.
+
+`tcr status` prints this verdict line **first**, and only when it is exit 2 or 3, so a glance at the
+fleet cannot show healthy accounts while Claude Code talks to something else. The `--json` form of
+`status` is untouched: it stays a bare array.
+
+---
+
 ## `tcr sessions`
 
 `tcr sessions [--json]` — the sessions the RUNNING proxy has seen in the last hour. This is the
@@ -803,3 +869,340 @@ your checkout is; when the bundle id is not registered it says TcrBar is not ins
 names the install script, rather than surfacing LaunchServices' exit code. On non-macOS
 builds the subcommand still exists so `--help` is identical everywhere, and fails with that
 reason.
+
+---
+
+## `tcr peer`
+
+Finds other Macs on the network, trusts them, and lets trusted Macs share Claude accounts
+with each other. A walkthrough of the whole flow, Find, Trust, Share, the network key, the
+share link, and exactly what each act sends over the network, is in
+[peers.md](peers.md); this section is the flag reference for every `tcr peer` subcommand.
+None of it is on by default: a fresh install discloses nothing, opens no port and answers
+nobody.
+
+Every subcommand takes `--peers <path>`, defaulting to the peers file in the operator's
+config directory, for the same reason `--config` is on every account verb: a test (or a
+second identity on one Mac) points the whole peer surface at a different file with one flag.
+
+### `tcr peer id`
+
+Prints this node's own peer id, minting the keypair on first use.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file (and its node-key directory) to use |
+| `--regenerate` | bool | `false` | mint a NEW keypair; every peer that pinned the old one is evicted and its next handshake fails the pin check. Requires `--yes` |
+| `--yes` | bool | `false` | confirms `--regenerate`; has no effect alone |
+
+### `tcr peer ls`
+
+Lists pinned peers, what each may do, and what is in flight.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to read |
+| `--json` | bool | `false` | machine-readable output. A sibling document to `tcr status --json`, never merged into it: that is a bare array of accounts, and clients depend on exactly that shape |
+| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read for the account labels the `lentTo` block is keyed by. Nothing else is taken from it; a config that is missing or unreadable leaves `lentTo` empty instead of failing the listing |
+
+### `tcr peer find <on\|off>`
+
+Turns discovery on or off: announcing this Mac's presence and looking for others.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<on\|off>` | positional | | turn discovery on or off |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--announce-name <on\|off>` | enum | `off` | whether the beacon includes this Mac's display name. Off either way, the beacon never carries a key, a peer id, or any other identity material |
+
+**This verb writes a flag; the running server does the announcing.** It re-reads the flag
+about every twenty seconds, so `on` starts the beacon within that and `off` stops it within a
+minute, neither one needing a restart. The beacon carries the announcing process's per-boot
+instance id, which is why the CLI cannot announce on the server's behalf: a neighbour's knock
+names the id it saw, and an id from a CLI that has already exited matches nothing.
+
+### `tcr peer name [name]`
+
+Sets, or with no argument prints, this Mac's display name, what another Mac shows for it.
+Refused if it carries an `@`, a UUID shape, or an organization name, because a name reaches
+other machines. With nothing set, the name shown is the host name.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `[name]` | positional | prints current | the name to show |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+### `tcr peer share <on\|off>`
+
+Turns account sharing on or off for every currently trusted peer, at a default lend amount.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<on\|off>` | positional | | turn sharing on or off |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--window <5h\|7d\|7d_oi>` | enum | `7d` | which rate-limit window is shared. `5h` and `7d` are untiered; `7d_oi` is the only window upstream reports per model |
+| `--fraction <f>` | float | `0.1` | ceiling on any one lease, as a fraction of the window. Clamped to `0.0..=0.5` |
+| `--ttl <secs>` | int | `600` | how long a granted lease lives before it needs renewing |
+| `--max-inflight <n>` | int | `2` | how many borrowed requests may be in flight at once against one lease. `0` mints leases that refuse every request, which is what writing `0` asks for |
+| `--scope <scope>` | string | `all` | what the DEFAULT lease draws from: `all`, `group:<name>`, or `account:<label>[,<label>]`. Written onto every pinned Mac and recorded as `defaultLend`, which the Sharing defaults sheet shows |
+
+`tcr peer share on` with no flags mints exactly one grant per trusted peer: 10% of the weekly
+window (`7d`), a 600-second lease, at most 2 requests in flight, drawn from every account.
+
+Run again over a grant that already exists for the same window and scope, it **keeps that
+grant's mode, its end date and its daily hours** and changes only what you passed. Those three
+are decisions taken per peer: turning a `hand` grant back into a `serve` grant is a different
+disclosure than the one that was taken, and it used to happen silently on every re-run.
+
+`--fraction 0` **removes** the grant for that window and scope rather than minting a zero one,
+and prints how many it removed. Every Mac that still holds `inspect` may still open a serve
+stream; each request on it is then refused for want of a grant, and `tcr peer share off`
+closes the streams too.
+
+### `tcr peer pair <addr> [code]`
+
+Trusts a Mac interactively: both screens show six digits, both operators compare them and
+confirm.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<addr>` | positional | | `host:port` of the Mac to pair with |
+| `[code]` | positional | starts pairing | the six digits the other screen is showing. Omitted, this starts the pairing and prints this side's digits instead |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+The six digits are built from a **nonce contributed by each side**, and the answering Mac
+commits to its nonce before it sees the other's, so neither end can steer the digits after it
+knows what the other picked. A Mac on a build that predates this sends a shorter message and
+is **refused by name**: the error says an older build reached here and to update it and pair
+again, rather than falling back to digits one side could have chosen.
+
+### `tcr peer invite`
+
+Mints a one-line join key for a Mac with no screen to compare digits on: the headless path.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--label <name>` | string | none | a name for the joining Mac. Refused if it carries an `@`, a UUID shape, or an organization name |
+| `--ttl <secs>` | int | `600` | how long the key stays usable. Short on purpose: anything that can read the peers file can use an outstanding key while it exists |
+| `--uses <n>` | int | `1` | how many Macs may join with this one key |
+| `--revoke <id>` | int | none | revoke an outstanding key by id instead of minting one |
+
+### `tcr peer join [key]`
+
+Joins another Mac using a key or link it printed.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `[key]` | positional | | the `tcr-join:v1:…` key or the `tcr://peer/join?…` link the other Mac printed. **Visible in `ps` and shell history**: use `--stdin` to avoid that |
+| `--stdin` | bool | `false` | read the key or link from standard input instead of argv. The only path the panel and the `tcr://` URL handler use, and the one that never leaks the secret to another process |
+| `--label <name>` | string | none | this Mac's name, as the other one will show it |
+| `--replace` | bool | `false` | accept a link's network key when this Mac already has one |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+A link that carries a network key is **refused when this Mac already has one**, and the
+refusal names what replacing it would cut this Mac off from. It is the same refusal
+`tcr peer network-key join` gives, for the same reason: a second office's key pasted over the
+first is the commonest way a Mac disappears from its own mesh. `--replace` means it.
+
+### `tcr peer forget <peer>`
+
+Stops trusting a Mac. One deleted line; the next handshake from it fails.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<peer>` | positional | | the peer id to forget, as `tcr peer ls` prints it |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+Does **not** revoke egress still reachable through a peer that holds the `forward` grant; the
+output says so whenever one does.
+
+### `tcr peer allow <peer> <grant> <on\|off>`
+
+Grants or revokes one thing for one peer.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<peer>` | positional | | the peer id, in its full wire form: the `node` field of `tcr peer ls --json`, never the short `tcr-…` form the text output prints |
+| `<grant>` | enum | | `gateway` (carry this peer's bytes out, blind), `forward` (relay to peers this Mac has pinned, transitive), `inspect` (accept this peer's requests and serve them here, reading them in full), `disclose` (send requests to this peer, letting it read them in full), `accept-move` (accept an account this peer moves here, the only grant under which a credential crosses a host boundary), `control-briefs` (tell this peer about this Mac's other peers, one hop out), `control-lendable` (tell this peer how much this Mac could lend), `control-diag` (tell this peer this Mac's build and boot id) |
+| `<on\|off>` | positional | | grant or revoke |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+### `tcr peer lend <peer>`
+
+Sets what one peer may borrow, on one window and scope, or takes it away. A Mac may hold
+several leases at once, one per scope: lending a new scope adds a lease rather than replacing
+the ones already granted. `--list`, `--revoke` and `--relend` manage that set; on the panel
+this is the per-Mac sheet's **Lend from** list.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<peer>` | positional | | the peer id in full wire form, same rule as `tcr peer allow` |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--window <5h\|7d\|7d_oi>` | enum | `7d` | which window this grant is against |
+| `--fraction <f>` | float | `0.1` | ceiling on any one lease, as a fraction of the SCOPE's headroom. Clamped to `0.0..=0.5`. `0` removes the grant |
+| `--ttl <secs>` | int | `600` | how long a granted lease lives before it needs renewing |
+| `--max-inflight <n>` | int | `2` | how many borrowed requests may be in flight against one lease |
+| `--scope <scope>` | string | `all` | what this lease draws from: `all`, `group:<name>` (one `tcr group` group, pooled), or `account:<label>[,<label>]` (one or more accounts, by the sanitized label `tcr status` prints, never an email or a uuid) |
+| `--for <duration>` | string | no end | lend for a duration (`2h`, `90m`, `3d`), after which this Mac stops renewing the lease. `none` clears an end |
+| `--until <time>` | string | no end | lend until a time of day (`18:00`), today or tomorrow, whichever comes next |
+| `--between <HH:MM-HH:MM>` | string | no restriction | only open the lease inside this daily window, in this Mac's local time. `22:00-08:00` crosses midnight and is charged to the day it starts, so a Friday-only schedule with that window is open Friday 22:00 through Saturday 08:00 |
+| `--days <mon,tue,...>` | string | every day | only open the lease on these days of the week, read against the day the window starts |
+| `--mode <serve\|hand>` | enum | keeps the replaced grant's mode, or `serve` for a new one | `serve` sends the borrower's requests over this Mac and out on this Mac's IP; this Mac reads them. `hand` gives the borrower a short-lived access token instead, over the paired session, so the borrower sends the request on its own IP and this Mac never reads it. Omitted on a replace keeps the mode already in force, so editing a hand grant's fraction cannot quietly turn it back into `serve` |
+| `--list` | bool | `false` | list this peer's leases instead of changing them, one greppable line each, with the lease id `--revoke` and `--relend` take |
+| `--revoke <lease-id>` | string | none | take one lease away, by the id `--list` printed. The other leases this Mac holds are untouched |
+| `--relend <lease-id>` | string | none | put an ended lease back to work, with a new `--for`/`--until` or with no end at all |
+
+A lease asked for outside its own `--between`/`--days` window is refused: the borrower gets
+`OutsideSchedule` back instead of a grant, and nothing is served. A lease with no schedule set
+behaves exactly as it does today, open at every hour.
+
+**What `--mode hand` changes.** A `serve` grant is a proxy: Mac B's request travels to Mac A,
+Mac A sends it to the account's real destination and hands the reply back, so Mac A's `tcr`
+sees every prompt. A `hand` grant is different in kind: Mac A mints the account's own
+short-lived access token and sends it to Mac B once, over the already-paired, already-encrypted
+session. From then on Mac B talks to the account directly, on Mac B's own IP, and Mac A reads
+nothing. Mac A still holds the refresh token and still decides when the lease ends; letting it
+expire, or `--revoke`, is the only way to take a hand grant back, since there is no request
+passing through Mac A to refuse.
+
+A `hand` grant is refused outright, before anything is written, when every account the scope
+covers has `egressStrict` on: that pin says the account's requests leave through one named Mac
+or not at all, and a borrower sending on its OWN IP can never be that Mac. Lend it as
+`--mode serve` instead, or clear the pin on an account the scope covers first.
+
+### `tcr peer status`
+
+Asks the RUNNING proxy what it holds for each pinned Mac: what is in flight, what each lease
+has spent, and which paths have been measured. Nothing here is read off the peers file, so a
+row appears only while a server is up.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--config <path>` | path | `~/.config/teamclaude.json` | main config to read the port and api-key from |
+| `--json` | bool | `false` | emit the peers block as JSON instead of greppable text |
+
+Each row carries the pinned key twice: **`id`** is the full wire form, the only spelling
+`tcr peer lend --revoke` and `--relend` read back, and **`display`** is the short `tcr-…` form
+for a person reading one row aloud. Nothing parses `display` back. A row's `name` is the
+operator's label through the same sanitizer `tcr peer ls` uses, so a label that is an email or
+a UUID comes out `[masked]`.
+
+### `tcr peer via <target>`
+
+Chooses how this Mac reaches the internet when its own connection is down.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<target>` | positional | | `auto` to fall back to a trusted, willing Mac automatically, `off` to never route out through a peer, or a peer id to pin one specific Mac |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+### `tcr peer internet <on\|off>`
+
+Opts this Mac into being reached from off its own network. Off by default: a fresh install
+answers nobody outside its LAN, the same as it answers nobody at all before `tcr peer listen`
+is set.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<on\|off>` | positional | | turn internet reachability on or off |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+Turning it on asks the router for a mapping on the peer listener's port and keeps it open,
+renewed every 30 minutes on a 2-hour lifetime; turning it off, or shutting down, deletes the
+mapping instead of leaving it on the router. See [peers.md](peers.md) § "Reaching a Mac off
+your network" for the fallback path when the mapping itself is unreachable.
+
+**A running server honours both settings without a restart.** It re-reads the flag about every
+five seconds, the way it re-reads `peer.find`: `off` ends the keeper and deletes through
+whichever protocol granted the mapping, and `on` starts a keeper and asks the router again. The
+flag used to be read once at boot, which meant `off` ran in the CLI, deleted over NAT-PMP, and
+the server's next renewal simply created the mapping again; `on` then reached nothing at all
+until the next restart.
+
+### `tcr peer pending`
+
+Shows the Macs asking to pair with this one, and nothing else about them: a request is a
+row, never a trust decision.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file (and the runtime-state file beside it) to use |
+| `--json` | bool | `false` | machine-readable output |
+
+### `tcr peer accept <target>`, `tcr peer ignore <target>`, `tcr peer block <target>`
+
+Answer one pairing request. `<target>` is the instance id or address, as `tcr peer pending`
+prints it, on all three.
+
+| verb | effect |
+|---|---|
+| `accept` | opens a two-minute window during which the six-digit compare can complete for that one Mac |
+| `ignore` | turns the request down and stays quiet to that address for an hour |
+| `block` | refuses permanently: bans the address, and the peer's static key too once the handshake has learned one, so a new address does not help it |
+
+Both take `--peers <path>` (default: the peers file in the operator's config directory).
+
+### `tcr peer unblock <addr>`
+
+Lifts a block.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<addr>` | positional | | the address to unblock, as `tcr peer ls --json` lists it under `blocked` |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+### `tcr peer network-key <set\|join\|clear\|show> [key]`
+
+The opt-in office network key (52 characters, 32 bytes, Crockford base32): mint one, paste one
+in, clear it, or check whether one is set.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `<action>` | enum | | `set` mints a key and prints it once; `join` pastes in a key another Mac printed; `clear` forgets it, making this Mac visible and reachable to every `tcr` on the network again; `show` says whether one is set, without printing it |
+| `[key]` | positional | | for `join`: the key string. Omit with `--stdin` |
+| `--stdin` | bool | `false` | for `join`: read the key from standard input, so it never enters argv or shell history |
+| `--replace` | bool | `false` | required by `set` and `join` when a key is already set, because replacing it cuts this Mac off from every Mac still holding the old one. Without it the verb refuses and prints what it would have cut off |
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+
+### `tcr peer link`
+
+Prints one link to share, which brings another Mac onto this mesh. Refuses if no network key
+is set yet (`tcr peer network-key set` first): a link with nothing to carry names `tcr peer
+invite` as the headless alternative instead.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--invite` | bool | `false` | also mint a one-use join key and carry it in the link, so opening it also completes pairing. **Turns the link into a live bearer secret with ten minutes on it**: without this flag it carries only the network key |
+| `--label <name>` | string | none | a name for the joining Mac, when `--invite` is given |
+
+### `tcr peer reach`
+
+Prints what this Mac can be reached on from off the local network. Read-only: nothing here
+dials a peer or touches the running proxy.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--map` | bool | `false` | also ask the router for a NAT-PMP mapping on the peer listener's port, held for two minutes |
+| `--json` | bool | `false` | machine-readable output |
+
+It prints, in order: this Mac's global IPv6 addresses (none, if it has none); the router's
+NAT-PMP answer, meaning the gateway found, the external address, and the mapping outcome when
+`--map` was passed (a refusal is an ordinary outcome, not an error); the local listen port;
+the current time-derived port slot; and, per pinned peer, that peer's derived port for this
+slot. A refusal from the router, or a peer row with no derived port yet, still exits 0.
+
+### `tcr peer graph <--json\|--serve>`
+
+Prints, or serves, the mesh as this Mac currently sees it: pinned peers, the paths to each,
+and each path's RTT and loss. Read-only, same as `tcr peer reach`.
+
+| flag | type | default | effect |
+|---|---|---|---|
+| `--peers <path>` | path | `~/.config/tcr-peers.json` | peers file to use |
+| `--json` | bool | `false` | print the graph once, machine-readable, and exit |
+| `--serve` | bool | `false` | bind loopback only and serve one page redrawing the graph from the same data every 5 seconds, nodes and edges coloured by RTT and loss. Refuses to bind anything but loopback: this is a page for the Mac it runs on, not the mesh. See [peers.md](peers.md) § "Seeing the mesh's paths (not in this release)" for why there is no mesh-wide version yet |
+
+`--json` and `--serve` are mutually exclusive; one of the two is required.

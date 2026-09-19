@@ -64,6 +64,38 @@ enum RenderSettings {
         }
     }
 
+    /// A sheet the Peers pane is asked to open before the capture.
+    ///
+    /// The mockup's scenes 62 and 63 are sheets, and a sheet is `@State`
+    /// behind a press: nothing in a render run can click. The pane already
+    /// reaches for this type to decide it must not poll
+    /// (`PeersSettingsPane.init`), so the request is read the same way rather
+    /// than through a new parameter threaded down `SettingsRootView`.
+    ///
+    /// The REAL presentation path, not the sheet's body drawn on its own: a
+    /// sheet body hosted in a window of its own would be a picture of a view,
+    /// not of the sheet an operator gets, and `Form(.grouped)` inside it is
+    /// exactly what the two rejected approaches in this file's header could
+    /// not draw.
+    enum SheetScene: String, CaseIterable {
+        /// Scene 62, behind `Customize…`.
+        case defaults = "peers-defaults-sheet"
+        /// Scene 63, behind a trusted Mac's row.
+        case mac = "peers-mac-sheet"
+        /// The lease sheet, which `Add a lease…` opens on top of
+        /// scene 63. A sheet over a sheet, so the capture walks to the
+        /// DEEPEST attached one.
+        case lease = "peers-lease-sheet"
+    }
+
+    /// Set for the duration of one capture, read by the pane's `onAppear`.
+    ///
+    /// A static because the pane is built by `SettingsRootView` through
+    /// `SettingsTab.allCases` and there is no seam to pass a value through.
+    /// Cleared by the same call that sets it, so one scene cannot leak into
+    /// the next.
+    @MainActor static var requestedSheet: SheetScene?
+
     @MainActor
     static func run(into directory: URL) -> Never {
         do {
@@ -81,6 +113,16 @@ enum RenderSettings {
             for appearance in Appearance.allCases {
                 attempted += 1
                 if render(tab, appearance: appearance, into: directory) { written += 1 }
+            }
+        }
+        // The two sheet scenes, after the panes: same window, same appearance
+        // loop, with the pane asked to present one before the capture.
+        for scene in SheetScene.allCases {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if render(.peers, appearance: appearance, sheet: scene, into: directory) {
+                    written += 1
+                }
             }
         }
 
@@ -102,25 +144,136 @@ enum RenderSettings {
         ]
     }
 
-    /// 660×581 — the window's own real minimum, per `SettingsWindowController`
-    /// and the design review's own "Applied" note
+    /// 660×581, the reviewed window as a FRAME
     /// (`docs/design/panel-tabs-review.md`: "window 660×581 with a 200px
-    /// sidebar").
+    /// sidebar"), which is `SettingsWindowController`'s 540 pt of content plus
+    /// its title bar. Used as a content size here, so these four panes are
+    /// captured a little roomier than they open. Peers is captured in the
+    /// shipped content size instead, because for that pane the window size IS
+    /// the claim (``windowSize(for:)``).
     private static let windowSize = NSSize(width: 660, height: 581)
+
+    /// The window this pane is captured in.
+    ///
+    /// # Peers is captured in the window an operator actually has
+    ///
+    /// It used to be GROWN for this one pane, to the pane's own estimate with
+    /// the disclosure open, clamped to the screen, so that every control was
+    /// in one frame. That made the capture unfalsifiable about the one thing
+    /// the pane is being judged on: in a window taller than the document,
+    /// "document ≤ viewport" is true by construction and says nothing about the
+    /// 540 pt window `SettingsWindowController` opens. The pane's height budget
+    /// makes the pane FIT, so the capture is taken in the shipped window and the
+    /// printed line becomes the claim: document against viewport, in the hole
+    /// the pane has to fit.
+    ///
+    /// The Advanced disclosure is closed in this scene (it is `@State` and no
+    /// render run opens it), so nothing below the fold is lost by not growing:
+    /// what the grown window used to reveal was the pane's own overflow.
+    private static func windowSize(for tab: SettingsTab, sheet: SheetScene?) -> NSSize {
+        // A SHEET capture is not the fit claim. The mockup measures scene 63's
+        // card at 844.61 pt and says the window grows to hold it, which is
+        // what a macOS sheet does; capturing it in the 540 pt pane window
+        // would clip the bottom of the sheet and the PNG would be a picture of
+        // this harness's window rather than of the sheet.
+        if sheet != nil { return NSSize(width: 660, height: 980) }
+        guard tab == .peers else { return windowSize }
+        return SettingsWindowController.shippedContentSize
+    }
+
+    /// The window's own title bar and the form's outer margins, everything
+    /// around the pane's own rows.
+    private static let chromeHeight: CGFloat = 81
+
+    /// The height of the row a pane has to have in frame, at its BOTTOM.
+    ///
+    /// # What this replaces, and why a constant could not stay
+    ///
+    /// This used to be `tab == .peers ? 470 : 0`, measured once against the
+    /// rendered PNG. The pane it was measured against is gone: the shortened
+    /// pane moved Paste a key, Regenerate and the id behind a
+    /// disclosure, so 470 pt now scrolls a pane that FITS into the bounce
+    /// region and the capture comes back white, while the harness still
+    /// prints a successful render. A number aimed at a moving target goes
+    /// wrong silently every time the target moves.
+    ///
+    /// # Why a height and not an accessibility identifier
+    ///
+    /// Aiming at a NAMED element was tried first and measured, not assumed.
+    /// Neither route to one exists in this process (probed 2026-09-18):
+    ///
+    ///  - `NSView.accessibilityIdentifier()` is empty on every view under the
+    ///    pane. SwiftUI's `.accessibilityIdentifier(_:)` does not reach the
+    ///    backing views, and a grouped `Form`'s rows are drawn into graphics
+    ///    layers, no view in the tree carried the identifier, and none
+    ///    carried the row's TEXT either.
+    ///  - the accessibility TREE is empty: `accessibilityChildren()` on the
+    ///    window's content view answered nil, because AX children are built
+    ///    lazily when an AX client attaches and this harness is not one.
+    ///
+    /// So the harness asks the PANE instead. For Peers the element is the
+    /// `Advanced…` disclosure, and the fact that makes it derivable is
+    /// structural: **it is the LAST row on the pane**. Its bottom is the
+    /// document's bottom, and its height is
+    /// ``PeersSettingsPane/lastRowHeight``, off the same metrics
+    /// `PeerPaneLayoutTests` gates. Nothing here is measured off a PNG and
+    /// nothing is a literal.
+    private static func scrollTargetHeight(for tab: SettingsTab) -> CGFloat? {
+        tab == .peers ? PeersSettingsPane.lastRowHeight : nil
+    }
+
+    /// What the pane's own arithmetic says it needs, for the scene being
+    /// captured: the fixture's two trusted Macs and one pairing request, with
+    /// the disclosure closed, which is the state `@State private var
+    /// advancedOpen = false` puts every render run in.
+    ///
+    /// Printed beside the drawn document height rather than used to size
+    /// anything. Two models of one pane, and either one alone is a claim: the
+    /// arithmetic is what the tests can gate, the drawn figure is what the
+    /// operator gets.
+    private static func paneEstimate(for tab: SettingsTab) -> CGFloat {
+        guard tab == .peers else { return 0 }
+        return PeersSettingsPane.estimatedHeight(
+            trustedMacs: 2, pendingKnocks: 1, advancedOpen: false)
+    }
+
+    /// The pane's own scroll view: the WIDEST one in the window, which is the
+    /// detail side's `Form`. The sidebar is a `List` and therefore a scroll
+    /// view too, and it is the one a plain depth-first walk finds first:
+    /// scrolling that instead would move the five row labels and leave the
+    /// pane exactly where it was, which looks identical to a scroll that did
+    /// not happen.
+    private static func paneScrollView(in view: NSView) -> NSScrollView? {
+        var found: [NSScrollView] = []
+        func walk(_ v: NSView) {
+            if let scroll = v as? NSScrollView { found.append(scroll) }
+            v.subviews.forEach(walk)
+        }
+        walk(view)
+        return found.max { $0.bounds.width < $1.bounds.width }
+    }
 
     @MainActor
     private static func render(
-        _ tab: SettingsTab, appearance: Appearance, into directory: URL
+        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene? = nil,
+        into directory: URL
     ) -> Bool {
         // Two appearances, two mechanisms: `NSApp.appearance` is what the window
         // and its title bar adopt, and the DRAWING appearance is what every
         // dynamic `NSColor` in the view tree resolves against.
         let previousAppAppearance = NSApp.appearance
         NSApp.appearance = appearance.nsAppearance
-        defer { NSApp.appearance = previousAppAppearance }
+        // Set and cleared around this ONE capture, so a scene cannot leak into
+        // the next one or into a pane that was asked for no sheet at all.
+        requestedSheet = sheet
+        defer {
+            NSApp.appearance = previousAppAppearance
+            requestedSheet = nil
+        }
 
         return withDrawingAppearance(appearance.nsAppearance) {
-            renderUnderCurrentAppearance(tab, appearance: appearance, into: directory)
+            renderUnderCurrentAppearance(
+                tab, appearance: appearance, sheet: sheet, into: directory)
         }
     }
 
@@ -133,7 +286,7 @@ enum RenderSettings {
     /// to change nothing.
     @MainActor
     private static func renderUnderCurrentAppearance(
-        _ tab: SettingsTab, appearance: Appearance, into directory: URL
+        _ tab: SettingsTab, appearance: Appearance, sheet: SheetScene?, into directory: URL
     ) -> Bool {
         let fleet = Fleet(accounts: fixtureAccounts())
         let dependencies = SettingsDependencies(
@@ -164,6 +317,7 @@ enum RenderSettings {
             .environment(\.colorScheme, appearance == .dark ? .dark : .light)
 
         let hostingController = NSHostingController(rootView: rootView)
+        let windowSize = windowSize(for: tab, sheet: sheet)
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: windowSize),
             styleMask: [.titled, .closable, .resizable, .miniaturizable, .fullSizeContentView],
@@ -193,7 +347,66 @@ enum RenderSettings {
             RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         }
 
-        let name = "\(tab.rawValue)-\(appearance.rawValue).png"
+        // Then scroll, for the one pane that does not fit in any window this
+        // display can hold, and give it its own turns to composite. After the
+        // first five: the `Form`'s table view has no document height to scroll
+        // within until it has laid out once, so a scroll issued before them
+        // clamps to zero and captures the top of the pane.
+        if let rowHeight = scrollTargetHeight(for: tab), let contentView = window.contentView,
+            let scroll = paneScrollView(in: contentView)
+        {
+            let documentHeight = scroll.documentView?.frame.height ?? 0
+            // Where the clip view RESTS before anything scrolls it. In a
+            // `.fullSizeContentView` window that is `-toolbarInset`, not zero,
+            // and scrolling to a literal zero is what hid the first section
+            // head behind the title bar, ``RenderScrollTarget/clipOrigin(restingY:offset:)``
+            // carries the measurement.
+            let restingY = scroll.contentView.bounds.origin.y
+            // How much of the DOCUMENT an operator sees without touching the
+            // wheel: the clip view's own frame, less the inset the toolbar
+            // takes off the top.
+            //
+            // Not `contentView.bounds.height`. That is the frame PLUS the
+            // inset (592 for a 540 pt clip with a 52 pt toolbar, measured
+            // 2026-09-18), so using it overstated the visible height by 104 pt
+            // and made this line's "document ≤ viewport" read as a fit when
+            // the pane in fact scrolled by 100. It also under-scrolled every
+            // capture by the same amount: the `Advanced…` row this scroll
+            // exists to show was still below the fold in the PNG while the log
+            // said the pane fit.
+            let viewportHeight = scroll.contentView.frame.height + restingY
+            // The last row's extent in DOCUMENT coordinates, top-down: its
+            // BOTTOM is the document's bottom, by the structural fact
+            // ``scrollTargetHeight(for:)`` states.
+            let offset = RenderScrollTarget.offset(
+                targetMinY: max(0, documentHeight - rowHeight), targetMaxY: documentHeight,
+                viewportHeight: viewportHeight, documentHeight: documentHeight)
+            scroll.contentView.scroll(
+                to: NSPoint(
+                    x: 0, y: RenderScrollTarget.clipOrigin(restingY: restingY, offset: offset)))
+            scroll.reflectScrolledClipView(scroll.contentView)
+            // Printed either way, including the zero: "scrolled to 0" says the
+            // pane FIT, which is scene 59's own claim and a fact worth having
+            // in the log. A silent skip reads exactly like a scroll that did
+            // not happen.
+            //
+            // The pane's own ESTIMATE is printed beside the drawn figure
+            // because they are two different models of one pane and the gap
+            // between them is the gap this pane's shrink closed: the arithmetic
+            // `PeerPaneLayoutTests` gates against a number only AppKit can
+            // produce.
+            print(
+                "  \(tab.rawValue): scrolled to \(Int(offset)) pt to show the last "
+                    + "\(Int(rowHeight)) pt of the pane (document \(Int(documentHeight)) pt, "
+                    + "viewport \(Int(viewportHeight)) pt, resting \(Int(restingY)) pt, "
+                    + "pane estimate \(Int(paneEstimate(for: tab))) pt)")
+            for _ in 0..<3 {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            }
+        }
+
+        // A sheet scene is named for the SHEET, not for the pane behind it.
+        let name = "\(sheet?.rawValue ?? tab.rawValue)-\(appearance.rawValue).png"
         // `NSView.cacheDisplay`/`ImageRenderer` both draw OFFSCREEN, bypassing
         // the window server entirely — measured across every attempt in this
         // file's own doc-comment, neither one reliably reproduces what
@@ -204,9 +417,24 @@ enum RenderSettings {
         // window this PROCESS OWNS needs no Screen Recording permission
         // (that gate is for capturing another process's windows); only this
         // process's own window is ever named here.
+        // A sheet is a WINDOW of its own, attached to this one, so capturing
+        // the parent's window number would picture the pane with a grey scrim
+        // over it and no sheet at all. `attachedSheet` is nil until AppKit has
+        // presented it, which the run-loop turns above are what pay for.
+        var target = window
+        while let attached = target.attachedSheet { target = attached }
+        if sheet != nil && target === window {
+            // Said out loud rather than captured anyway: a silent fall back to
+            // the parent window writes a PNG that looks like a successful
+            // render of the wrong thing.
+            FileHandle.standardError.write(
+                Data("no sheet presented for \(name); captured nothing\n".utf8))
+            window.close()
+            return false
+        }
         guard
             let cgImage = CGWindowListCreateImage(
-                .null, .optionIncludingWindow, CGWindowID(window.windowNumber),
+                .null, .optionIncludingWindow, CGWindowID(target.windowNumber),
                 [.boundsIgnoreFraming, .bestResolution])
         else {
             window.close()

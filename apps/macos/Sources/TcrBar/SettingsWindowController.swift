@@ -27,10 +27,23 @@ import TcrBarCore
 final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let dependencies: SettingsDependencies
 
+    /// The window's content size, and its floor, shape S7
+    /// (`docs/design/panel-tabs-review.md`): a fixed 200 pt sidebar plus a
+    /// 540 pt-tall detail.
+    ///
+    /// A `static` rather than two literals in `init` because the render
+    /// harness captures the Peers pane in THIS size and judges the pane by
+    /// whether its document fits this viewport. Two copies of the number would
+    /// have the harness photographing a window nobody opens.
+    /// `nonisolated` because this type is `@MainActor` and the size is a
+    /// constant: the render harness reads it while sizing a window off the
+    /// main actor's back, and an isolated constant is an error in Swift 6.
+    nonisolated static let shippedContentSize = NSSize(width: 660, height: 540)
+
     init(dependencies: SettingsDependencies) {
         self.dependencies = dependencies
         let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: CGSize(width: 660, height: 540)),
+            contentRect: NSRect(origin: .zero, size: Self.shippedContentSize),
             styleMask: [
                 .titled, .closable, .resizable, .miniaturizable,
                 .fullSizeContentView,
@@ -58,7 +71,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         // the shape S7 (`docs/design/panel-tabs-review.md`) exists to hold to:
         // a fixed 200pt sidebar plus a 540pt-tall detail is the floor, not a
         // starting point to shrink from.
-        window.minSize = NSSize(width: 660, height: 540)
+        window.minSize = Self.shippedContentSize
         window.center()
         window.delegate = self
         window.contentViewController = NSHostingController(

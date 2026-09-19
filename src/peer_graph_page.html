@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>tcr peer graph</title>
+<style>
+  :root {
+    --bg: #1c1d1f;
+    --card: #2c2f31;
+    --line: #3a3e41;
+    --text: #e8e8ea;
+    --dim: #9a9fa4;
+    --ok: #3fb97f;
+    --warn: #d9a441;
+    --bad: #d9544d;
+    --unmeasured: #5a5e62;
+    --lease: #6f8fd9;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px -apple-system, BlinkMacSystemFont, "SF Pro Text", Helvetica, Arial, sans-serif;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; }
+  header .meta { color: var(--dim); font-size: 12px; }
+  main { padding: 20px; display: flex; gap: 20px; align-items: flex-start; }
+  #graph { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  .legend {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px 16px;
+    min-width: 190px;
+  }
+  .legend h2 {
+    font-size: 12px; margin: 0 0 10px; color: var(--dim); font-weight: 600;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  .legend .row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+  .legend .swatch { width: 18px; height: 3px; border-radius: 2px; }
+  .legend .row.lease .swatch { height: 0; border-top: 2px dashed var(--lease); width: 18px; background: none; }
+  .node-label { fill: var(--text); font-size: 12px; }
+  .node-self circle { fill: #4a5a92; stroke: #7c94e0; stroke-width: 2; }
+  .node-peer circle { fill: var(--card); stroke: var(--dim); stroke-width: 1.5; }
+  .edge-label { fill: var(--dim); font-size: 10px; }
+  footer { padding: 8px 20px; color: var(--dim); font-size: 11px; border-top: 1px solid var(--line); }
+  #empty { padding: 40px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>tcr peer graph</h1>
+  <span class="meta" id="updated">loading…</span>
+</header>
+<main id="main">
+  <svg id="graph" width="640" height="440" viewBox="0 0 640 440"></svg>
+  <div class="legend">
+    <h2>Edges</h2>
+    <div class="row"><span class="swatch" style="background:var(--ok)"></span> path · under 3% loss</div>
+    <div class="row"><span class="swatch" style="background:var(--warn)"></span> path · 3&ndash;10% loss</div>
+    <div class="row"><span class="swatch" style="background:var(--bad)"></span> path · over 10% loss</div>
+    <div class="row"><span class="swatch" style="background:var(--unmeasured)"></span> path · not measured</div>
+    <div class="row lease"><span class="swatch"></span> lease · lender &rarr; borrower</div>
+  </div>
+</main>
+<footer id="footer">&mdash;</footer>
+<script>
+// No dependency, no framework: one poll loop and one SVG render. The wire
+// shapes below match `status::PeerGraph`, `GraphNode` and `GraphEdge` field
+// for field (`src/status.rs`), which is what `/graph.json` returns.
+
+const REFRESH_MS = 5000;
+const svg = document.getElementById("graph");
+const updated = document.getElementById("updated");
+const footer = document.getElementById("footer");
+const NS = "http://www.w3.org/2000/svg";
+
+function edgeColor(edge) {
+  if (edge.kind === "lease") return "var(--lease)";
+  const loss = edge.lossPct;
+  if (loss === undefined || loss === null) return "var(--unmeasured)";
+  if (loss < 0.03) return "var(--ok)";
+  if (loss <= 0.10) return "var(--warn)";
+  return "var(--bad)";
+}
+
+function edgeLabel(edge) {
+  if (edge.kind === "lease") {
+    return `lease ${(edge.spent * 100).toFixed(0)}% spent`;
+  }
+  const parts = [];
+  if (typeof edge.rttMs === "number") parts.push(`${Math.round(edge.rttMs)} ms`);
+  if (typeof edge.lossPct === "number") {
+    parts.push(edge.lossPct <= 0 ? "no loss" : `${Math.round(edge.lossPct * 100)}% lost`);
+  }
+  if (parts.length === 0) parts.push("not measured");
+  const via = edge.pathKind === "via" ? "via " : "";
+  return `${via}${edge.endpoint} · ${parts.join(" · ")}`;
+}
+
+function layout(nodes) {
+  // The answering Mac at the centre, every peer on a circle around it: the
+  // only layout a page with no physics engine needs for a handful of Macs.
+  const cx = 320, cy = 220, r = 150;
+  const peers = nodes.filter((n) => n.role !== "self");
+  const pos = {};
+  const self = nodes.find((n) => n.role === "self");
+  if (self) pos[self.id] = { x: cx, y: cy };
+  peers.forEach((n, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(1, peers.length) - Math.PI / 2;
+    pos[n.id] = { x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
+  });
+  return pos;
+}
+
+function el(tag, attrs, text) {
+  const node = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) node.setAttribute(k, v);
+  if (text !== undefined) node.textContent = text;
+  return node;
+}
+
+function render(graph) {
+  svg.innerHTML = "";
+  if (graph.nodes.length === 0) {
+    svg.appendChild(el("text", { x: 20, y: 40, fill: "var(--dim)" }, "no peers pinned"));
+    return;
+  }
+  const pos = layout(graph.nodes);
+
+  // Two Macs can carry several edges (two endpoints, a lease each way), and a
+  // straight line drawn twice on the same two points is one line an operator
+  // can read and a second nobody can find. Each edge between the same two
+  // ENDS (`from`/`to`, never `through`, which only bends the line and does
+  // not change what it connects) after the first bows further off the
+  // straight line, and its label rides the bow.
+  const pairSeen = {};
+  const pairEdges = {};
+  graph.edges.forEach((edge) => {
+    const key = [edge.from, edge.to].sort().join("|");
+    pairEdges[key] = (pairEdges[key] || 0) + 1;
+  });
+
+  // Edges first, so node circles paint over their own line ends.
+  graph.edges.forEach((edge) => {
+    const from = pos[edge.from];
+    const to = pos[edge.to];
+    if (!from || !to) return;
+    const key = [edge.from, edge.to].sort().join("|");
+    const total = pairEdges[key];
+    const index = pairSeen[key] || 0;
+    pairSeen[key] = index + 1;
+    // Offsets alternate sides and grow: 0, then ±1, ±2 … perpendicular to the
+    // line, so a pair with several edges fans out rather than stacking.
+    const rank = Math.ceil((index + 1) / 2) * (index % 2 === 0 ? 1 : -1);
+    const bow = total > 1 ? rank * 34 : 0;
+
+    const mx = (from.x + to.x) / 2, my = (from.y + to.y) / 2;
+    const dx = to.x - from.x, dy = to.y - from.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len; // unit normal
+    let cx = mx + nx * bow, cy = my + ny * bow;
+    // A `via` edge's own fact is WHICH Mac carries it: bend the curve toward
+    // the forwarding node's own position, past whatever fan-out offset the
+    // pair above it already claimed, so a via edge reads as routed through
+    // that node rather than as a second direct line to the same place.
+    if (edge.through && pos[edge.through]) {
+      const t = pos[edge.through];
+      cx = (cx + t.x) / 2;
+      cy = (cy + t.y) / 2;
+    }
+
+    const dashed = edge.kind === "lease" || edge.pathKind === "via";
+    const path = el("path", {
+      d: `M ${from.x} ${from.y} Q ${cx} ${cy} ${to.x} ${to.y}`,
+      fill: "none",
+      stroke: edgeColor(edge),
+      "stroke-width": edge.kind === "lease" ? 1.5 : 2,
+      "stroke-dasharray": dashed ? "5 4" : "",
+    });
+    svg.appendChild(path);
+    svg.appendChild(el(
+      "text",
+      { class: "edge-label", x: cx, y: cy - 4 + index * 13, "text-anchor": "middle" },
+      edgeLabel(edge)
+    ));
+  });
+
+  graph.nodes.forEach((node) => {
+    const p = pos[node.id];
+    if (!p) return;
+    const g = el("g", { class: node.role === "self" ? "node-self" : "node-peer", transform: `translate(${p.x},${p.y})` });
+    g.appendChild(el("circle", { r: node.role === "self" ? 26 : 22 }));
+    g.appendChild(el("text", { class: "node-label", "text-anchor": "middle", y: 4 }, node.name));
+    svg.appendChild(g);
+  });
+}
+
+async function poll() {
+  try {
+    const res = await fetch("/graph.json", { cache: "no-store" });
+    if (!res.ok) throw new Error(`graph.json: ${res.status}`);
+    const graph = await res.json();
+    render(graph);
+    const at = new Date(graph.generatedAtMs);
+    updated.textContent = `updated ${at.toLocaleTimeString()}`;
+    footer.textContent = `${graph.nodes.length} Macs · ${graph.edges.length} edges · refreshes every 5 s · loopback only`;
+  } catch (err) {
+    updated.textContent = `stalled: ${err.message}`;
+  }
+}
+
+poll();
+setInterval(poll, REFRESH_MS);
+</script>
+</body>
+</html>

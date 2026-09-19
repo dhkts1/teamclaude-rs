@@ -42,6 +42,33 @@ struct AccountCard<Actions: View>: View {
     /// the whole panel and required a reader to hold "which account" in their
     /// head while scanning the cards below it (review's card-pill ask).
     var isControl: Bool = false
+    /// The Macs drawing on this account, from `tcr peer ls --json`'s `lentTo`
+    ///, the LENDER's own file, so the line costs no wire call and says
+    /// nothing a peer told us.
+    ///
+    /// Empty on an account inside no lease, which draws no line at all: that
+    /// absence is how an operator tells the two states apart at a glance
+    /// (decision row 13, and the mockup's scene 64 ledger).
+    var lentTo: [PeerLentToEntry] = []
+    /// Opens that Mac's sheet in Settings > Peers. The card's job is to say
+    /// THAT the account is lent; how much is the sheet's.
+    var onOpenLender: (String) -> Void = { _ in }
+    /// Where this account's requests leave from, or `nil` when nothing
+    /// reported it, which draws no row at all.
+    ///
+    /// Absent is the state every `tcr` in this tree is in: no read carries the
+    /// account's `egress` keys yet. A picker defaulting to "This Mac" would be
+    /// this panel asserting where traffic leaves, which is the one claim this
+    /// control exists to make honestly.
+    var exit: AccountExit? = nil
+    /// The trusted Macs the picker may name.
+    var exitPeers: [String] = []
+    /// See ``AccountExitRow/peerRows``.
+    var exitPeerRows: [PeerListDocument.PeerEntry] = []
+    /// Still controls instead of a `Menu`, for `--render-states`.
+    var snapshotMode: Bool = false
+    var onChooseExit: (AccountExit.Route) -> Void = { _ in }
+    var onToggleExitMust: (Bool) -> Void = { _ in }
     /// The card's visible per-account controls — the actions menu, and the
     /// re-login button on a broken account. A closure so ``AccountCard`` stays
     /// free of the controllers those controls are wired to: they are built from
@@ -107,12 +134,59 @@ struct AccountCard<Actions: View>: View {
                     trailingHelp: index == 1 ? row1TrailingHelp : usageTailHelp,
                     trailingTint: index == 1 ? fableTailTint : nil)
             }
+            if let line = PeerLease.lentToLine(lentTo) {
+                lentLine(line)
+            }
+            if let exit {
+                AccountExitRow(
+                    account: account.name, exit: exit, peers: exitPeers,
+                    peerRows: exitPeerRows,
+                    snapshotMode: snapshotMode, onChoose: onChooseExit,
+                    onToggleMust: onToggleExitMust)
+            }
         }
         // `.contain` WITH a label. Without one the container has no accessible
         // name, so it cannot take focus and a user arriving at the card is told
         // nothing about which account they have arrived at.
         .accessibilityElement(children: .contain)
         .accessibilityLabel(account.cardSummaryLabel(now: now, isControl: isControl))
+    }
+
+    /// Decision row 13's line, under the meters: who is drawing on this
+    /// account.
+    ///
+    /// **A control as well as a readout.** Pressing it opens the first named
+    /// Mac's sheet, where the amounts and the Revoke live, which is the
+    /// mockup's own behaviour for scene 64 and the reason this is a `Button`
+    /// and not a `Text`. The chevron is what says so.
+    ///
+    /// It wears the reserved plaintext hue, because being inside a lease means
+    /// another Mac may spend this account's allowance and read what it sends.
+    /// The hue is a second channel: the sentence carries the meaning.
+    private func lentLine(_ line: String) -> some View {
+        Button {
+            guard let first = lentTo.first?.peer else { return }
+            onOpenLender(first)
+        } label: {
+            HStack(spacing: V4.pillGap) {
+                Text(line)
+                    .font(V4.font(V4.muteSize))
+                    .foregroundStyle(Tok.unknown)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: V4.muteSize - 1, weight: .semibold))
+                    .foregroundStyle(Tok.mute)
+            }
+            .padding(.top, V4.quotaMarginTop)
+        }
+        .buttonStyle(.plain)
+        .help(
+            "Another Mac may spend this account's allowance and reads what it sends. Opens "
+                + "that Mac's sheet in Settings > Peers, where the amount and Revoke are."
+        )
+        .accessibilityLabel("\(line). Opens that Mac's settings sheet.")
     }
 
     /// Three pieces, ONE line, in BOTH shapes (`.name.acct` in the mockup):

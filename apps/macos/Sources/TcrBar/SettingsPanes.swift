@@ -284,10 +284,19 @@ struct MenuBarSettingsPane: View {
             }
 
             Section {
+                // Every tab the panel has, from `PanelTab.allCases` rather
+                // than four hand-written tags. The hand-written list offered
+                // three of the four, `peers` was missing, so the one way to
+                // store it was a hand edit of `UserDefaults`, and a list
+                // that has to be kept in step with an enum is the same
+                // drift `PanelTab`'s own doc-comment now describes. The tag
+                // is the raw value, which is exactly what
+                // `DefaultTabPreference` stores and `MenuBarShell`
+                // reads back.
                 Picker("Open on", selection: $defaultTabPreference.tab) {
-                    Text("Accounts").tag("accounts")
-                    Text("Sessions").tag("sessions")
-                    Text("Tools").tag("tools")
+                    ForEach(PanelTab.allCases, id: \.self) { tab in
+                        Text(tab.title).tag(tab.rawValue)
+                    }
                 }
                 .pickerStyle(.menu)
                 Picker("Panel density", selection: $panelDensityPreference.density) {

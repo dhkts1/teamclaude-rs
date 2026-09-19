@@ -27,7 +27,9 @@ pub enum ConfigError {
 fn default_port() -> u16 {
     3456
 }
-fn default_upstream() -> String {
+/// `pub(crate)` so `peer::lease` can read the one spelling of this address
+/// rather than keeping a second copy of the literal.
+pub(crate) fn default_upstream() -> String {
     "https://api.anthropic.com".to_string()
 }
 fn default_switch_threshold() -> f64 {
@@ -235,6 +237,27 @@ pub struct Account {
     /// no multiplier, which outranks it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_tier: Option<String>,
+    /// Which node this account's requests leave from. See [`Egress`]; absent is
+    /// [`Egress::Local`], which is what every account did before this key
+    /// existed.
+    ///
+    /// Skipped when it is `Local`, which is why [`egress_is_local`] exists: a
+    /// save rewrites every account row, and without this the first save after
+    /// an upgrade writes `"egress": "local"` onto rows whose operator never
+    /// asked for a pin, on a file a human reads and edits.
+    #[serde(default, skip_serializing_if = "egress_is_local")]
+    pub egress: Egress,
+    /// Whether a pin that cannot be honoured refuses the request instead of
+    /// falling back to the local path. See [`EgressPin::strict`] for what each
+    /// answer is for.
+    ///
+    /// Skipped when false, for the reason above.
+    #[serde(
+        default,
+        rename = "egressStrict",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub egress_strict: bool,
     /// Any per-account keys we do not model (e.g. `models`, `upstream`, `sx`).
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -247,6 +270,159 @@ impl Account {
         self.groups
             .as_deref()
             .is_some_and(|groups| groups.iter().any(|g| g == group))
+    }
+
+    /// This account's exit lock: where it leaves from, and what an exit it
+    /// cannot reach costs.
+    ///
+    /// One call and one typed value, so no consumer re-derives the pin with a
+    /// filter of its own: the request path asks this question once per attempt
+    /// and reads [`EgressPin`] from then on. Both halves are already parsed by
+    /// the time this runs, at config load, which is what makes it infallible.
+    pub fn egress_pin(&self) -> EgressPin {
+        EgressPin {
+            egress: self.egress,
+            strict: self.egress_strict,
+        }
+    }
+}
+
+/// One account's exit lock, as the request path reads it.
+///
+/// Two values in one type because they are one decision: where this account
+/// leaves from, and what it costs when that route is unavailable. Reading them
+/// separately is how a caller ends up honouring the pin and forgetting the
+/// strictness, which is the case that silently sends an allow-listed account
+/// out of the wrong address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EgressPin {
+    /// Which node this account's requests leave from.
+    pub egress: Egress,
+    /// Whether a pin that cannot be honoured refuses the request rather than
+    /// falling back to the local path.
+    ///
+    /// `false`, the default, keeps the request working and says so in one log
+    /// line: the pin is a preference about which address the origin sees, and
+    /// an operator who has not said otherwise would rather be served from the
+    /// wrong address than not served. `true` is the operator who pinned the
+    /// account BECAUSE the address is load-bearing, an allow-listed office IP
+    /// or a session an origin ties to one address, for whom leaving by another
+    /// route is worse than a refusal.
+    pub strict: bool,
+}
+
+/// Where one account's requests leave the mesh from: the exit lock of
+/// decisions row 15, "we need to be able to lock where accounts go out from
+/// which server sometimes it might be important for saving the same ip".
+///
+/// # Why this is about an account and not about the machine
+///
+/// `tcr-peers.json` already carries [`crate::peer::egress::ViaSetting`], which
+/// answers a different question: how this Mac reaches the internet when its own
+/// path is dead. This one answers where ONE account leaves from on every
+/// request, working local path or not. The two never merge, and a reader who
+/// takes one for the other gets a pin that only applies during an outage.
+///
+/// # The file shape is two spellings and no third
+///
+/// `"egress": "local"`, or `"egress": "via <peer id>"`, which is what
+/// `docs/configuration.md`'s account table and `docs/peers.md` both state. The
+/// `via ` prefix is what stops a bare 52-character token in a config file being
+/// read as an identity by inspection: the key says what kind of thing follows
+/// it, so a value that is neither spelling is an error at LOAD rather than a
+/// pin nobody can account for. Parsed once, by serde, into this enum. Nothing
+/// downstream ever compares it against a string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum Egress {
+    /// Out of this Mac's own socket, which is what every account did before
+    /// this key existed.
+    #[default]
+    Local,
+    /// Always out of this pinned Mac, carried blind, and never another.
+    Via(tcr_peer_wire::PeerId),
+}
+
+/// `skip_serializing_if` for [`Account::egress`].
+///
+/// Separate from [`Egress::is_local`] because serde hands the predicate a
+/// reference and that method takes the value, which is `Copy`: one adapter
+/// here rather than a second spelling of the question.
+fn egress_is_local(egress: &Egress) -> bool {
+    egress.is_local()
+}
+
+impl Egress {
+    /// The word the file stores for "not pinned".
+    pub const LOCAL: &'static str = "local";
+
+    /// What a pinned value starts with, so the two spellings cannot be
+    /// confused for each other or for anything else. The trailing space is part
+    /// of it: `via <peer id>` is the form the documentation states, and a
+    /// colon or a bare id is refused rather than quietly accepted beside it.
+    pub const VIA_PREFIX: &'static str = "via ";
+
+    /// Whether this account is unpinned. Named rather than `== Local` so every
+    /// reader asks the question the same way.
+    pub fn is_local(self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    /// The peer this account is pinned to, when it is pinned at all.
+    pub fn peer(self) -> Option<tcr_peer_wire::PeerId> {
+        match self {
+            Self::Local => None,
+            Self::Via(peer) => Some(peer),
+        }
+    }
+}
+
+impl std::fmt::Display for Egress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local => f.write_str(Self::LOCAL),
+            Self::Via(peer) => write!(f, "{}{}", Self::VIA_PREFIX, peer.to_wire()),
+        }
+    }
+}
+
+impl From<Egress> for String {
+    fn from(egress: Egress) -> Self {
+        egress.to_string()
+    }
+}
+
+impl TryFrom<String> for Egress {
+    type Error = String;
+
+    /// Two spellings and no third, and a value that is neither fails the whole
+    /// config load.
+    ///
+    /// Refusing here is the point. A pin the operator typed wrong, read as
+    /// `local`, would send the account out of the very address it was written
+    /// down to avoid, and it would do it silently on every request; a load that
+    /// stops and names the value is the one outcome that cannot do that.
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        let raw = raw.trim();
+        if raw == Self::LOCAL {
+            return Ok(Self::Local);
+        }
+        let Some(id) = raw.strip_prefix(Self::VIA_PREFIX) else {
+            return Err(format!(
+                "account `egress` must be `{}` or `{}<peer id>`, and `{raw}` is neither \
+                 (`tcr peer ls` prints the ids this Mac has pinned)",
+                Self::LOCAL,
+                Self::VIA_PREFIX,
+            ));
+        };
+        tcr_peer_wire::PeerId::parse(id.trim())
+            .map(Self::Via)
+            .map_err(|err| {
+                format!(
+                    "account `egress` is pinned to `{id}`, which is not a peer id \
+                     (`tcr peer ls` prints the ids this Mac has pinned): {err}"
+                )
+            })
     }
 }
 
@@ -6227,6 +6403,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
