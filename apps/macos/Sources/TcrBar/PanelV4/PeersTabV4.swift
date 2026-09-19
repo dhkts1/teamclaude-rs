@@ -1062,17 +1062,23 @@ struct PeersTabV4: View {
                     egressLine(answering)
                 }
                 findCard
-                // Above "Other Macs": the shape of the mesh
-                // first, then the rows that carry the same two numbers per
-                // Mac. Drawn on every state including the empty one, which
-                // says so in a sentence rather than drawing a ring with
-                // nothing on it.
-                MiniMeshCard(
-                    root: snapshot.thisMac ?? "This Mac",
-                    peers: snapshot.meshPeers,
-                    onOpenGraph: { openGraph() }
-                )
-                .padding(.top, V4.cardGap)
+                // Above "Other Macs": the shape of the mesh first, then the
+                // rows that carry the same two numbers per Mac.
+                //
+                // NOT on the empty state. With nothing trusted this card was a
+                // paragraph saying there is nothing to draw, stacked directly
+                // above another card saying there is nothing found: two
+                // absences, one under the other, about two fifths of the
+                // panel. The found card below is the one that owns that
+                // sentence.
+                if snapshot.trustedCount > 0 {
+                    MiniMeshCard(
+                        root: snapshot.thisMac ?? "This Mac",
+                        peers: snapshot.meshPeers,
+                        onOpenGraph: { openGraph() }
+                    )
+                    .padding(.top, V4.cardGap)
+                }
                 // Decision row 10's own order: a request to connect sits ABOVE
                 // the list of Macs, because it is the one thing on this tab
                 // that is waiting on the operator. A found row is passive.

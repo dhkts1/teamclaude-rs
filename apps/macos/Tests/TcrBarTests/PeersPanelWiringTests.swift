@@ -299,6 +299,24 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "says not trusted and on a button that cannot be pressed yet")
     }
 
+    /// No drawing of the mesh until there is a mesh.
+    ///
+    /// With nothing trusted the card was a paragraph saying there is nothing
+    /// to draw, stacked directly above another card saying there is nothing
+    /// found: about two fifths of the panel spent on two absences, and the
+    /// found card below already says it.
+    func testTheMeshCardIsDrawnOnlyWhenAMacIsTrusted() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let body = try slice(tab, from: "                findCard", to: "ForEach(snapshot.pending)")
+        XCTAssertTrue(
+            body.contains("if snapshot.trustedCount > 0 {"),
+            "the mini mesh is drawn unconditionally again, so an empty drawing sits above "
+                + "an empty found card")
+        XCTAssertTrue(
+            body.contains("MiniMeshCard("),
+            "the mesh card is gone from the tab altogether, not just from the empty state")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
