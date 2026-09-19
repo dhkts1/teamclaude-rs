@@ -27,6 +27,41 @@ final class PeerAdmissionTests: XCTestCase {
             "an empty name is the same state as no name and must not draw empty brackets")
     }
 
+    /// The deadline is COUNTED, from the knock's own first seen time.
+    ///
+    /// The card stated it in prose, "a request nobody answers expires by
+    /// itself in ten minutes", and never counted it, while the knock carries
+    /// the timestamp the count needs.
+    func testTheKnockCountsItsOwnDeadline() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let knock = PeerKnock(
+            addr: "10.0.1.24", instanceId: "8f2c1ad63b0e4471", proposedName: "loft-mini",
+            firstSeenMs: Int64((now.timeIntervalSince1970 - 180) * 1000))
+        XCTAssertEqual(PeerAdmission.knockExpiry(firstSeenMs: knock.firstSeenMs, now: now), "7m")
+        XCTAssertEqual(
+            PeerAdmission.knockAddressLine(knock, now: now), "10.0.1.24 · expires in 7m",
+            "the address line no longer counts the deadline the knock's own timestamp buys")
+
+        // A knock older than the deadline, and one whose producer sent no
+        // timestamp at all, both count NOTHING rather than a negative span or
+        // an invented one.
+        let stale = PeerKnock(
+            addr: "10.0.1.24", instanceId: "8f", proposedName: "loft-mini",
+            firstSeenMs: Int64((now.timeIntervalSince1970 - 3600) * 1000))
+        XCTAssertNil(PeerAdmission.knockExpiry(firstSeenMs: stale.firstSeenMs, now: now))
+        XCTAssertEqual(PeerAdmission.knockAddressLine(stale, now: now), "10.0.1.24")
+        XCTAssertNil(
+            PeerAdmission.knockExpiry(firstSeenMs: 0, now: now),
+            "a knock with no timestamp got a deadline out of the epoch")
+
+        // With no name proposed the name line IS the address, so the second
+        // line is the count alone rather than the address twice.
+        let unnamed = PeerKnock(
+            addr: "10.0.1.24", instanceId: "8f",
+            firstSeenMs: Int64((now.timeIntervalSince1970 - 180) * 1000))
+        XCTAssertEqual(PeerAdmission.knockAddressLine(unnamed, now: now), "expires in 7m")
+    }
+
     /// Every verb on the row takes the INSTANCE ID, not the name: two knocks
     /// can propose one name, and `src/main.rs:201-207` takes the instance id
     /// or the address.

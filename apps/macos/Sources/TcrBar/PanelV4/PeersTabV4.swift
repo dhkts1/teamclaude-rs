@@ -167,6 +167,16 @@ struct PeersSnapshot: Equatable {
     /// mutates a snapshot after it is derived.
     var rows: [PeerRowModel]
     let answeringOn: PeerListDocument.AnsweringOn?
+    /// The instant this snapshot was read AT, carried so that anything the
+    /// tab counts counts from the same clock the rest of the snapshot was
+    /// worded against.
+    ///
+    /// The row ages (`found 2s ago`) are already phrases decided at read time;
+    /// a deadline is not, because it is a count DOWN and the view is what
+    /// draws it. Reading `Date()` inside the view instead would make a
+    /// fixture drawn by `--render-states` count against the real clock, so
+    /// one scene's PNG would differ from the last run's for no design reason.
+    var readAt: Date = Date()
     /// The five Settings-only readouts, straight off the document. `nil` is
     /// "not read yet", which is what the pane draws.
     var name: String? = nil
@@ -310,6 +320,7 @@ enum PeersSnapshotBuilder {
                 row($0, sharing: document.sharing, now: now, names: peerNames(document))
             },
             answeringOn: document.answeringOn,
+            readAt: now,
             name: document.name,
             announceName: document.announceName,
             nodeId: document.nodeId,
@@ -1756,7 +1767,8 @@ struct PeersTabV4: View {
             (
                 "Ignore", PeerCommand.ignore(instance: knock.instanceId),
                 "Turns this request down and stays quiet to that address for an hour. A "
-                    + "request nobody answers expires by itself in ten minutes.",
+                    + "request nobody answers expires by itself; the line above counts "
+                    + "what is left of it.",
                 false
             ),
             (
@@ -1797,7 +1809,11 @@ struct PeersTabV4: View {
                         accessibilityLabel: "More for \(PeerAdmission.knockNameLine(knock))",
                         help: "Block this address, whether or not it is asking to connect.")
                 }
-                if let address = PeerAdmission.knockAddressLine(knock) {
+                // The address AND the deadline, counted from the knock's own
+                // first-seen time against the clock this snapshot was read
+                // at, rather than a card stating ten minutes in prose and
+                // never counting them.
+                if let address = PeerAdmission.knockAddressLine(knock, now: snapshot.readAt) {
                     MuteText(text: address, lineLimit: 1)
                 }
                 MuteText(text: PeerAdmission.knockDetail, lineLimit: nil)

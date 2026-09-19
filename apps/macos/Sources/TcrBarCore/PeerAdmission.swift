@@ -269,12 +269,43 @@ public enum PeerAdmission {
         return "\(name) wants to connect"
     }
 
-    /// The address on its own line beside ``knockNameLine``, or `nil` when
-    /// ``knockNameLine`` already IS the address (no name was proposed, so
-    /// there is nothing left to show on a second line).
-    public static func knockAddressLine(_ knock: PeerKnock) -> String? {
-        guard let name = knock.proposedName, !name.isEmpty else { return nil }
-        return knock.addr
+    /// The address on its own line beside ``knockNameLine``, with the
+    /// deadline counted beside it: `10.0.1.24 · expires in 7m`.
+    ///
+    /// When no name was proposed, ``knockNameLine`` already IS the address and
+    /// this line is the count alone; with neither an expiry nor a name there
+    /// is nothing left to say and the line is `nil`.
+    public static func knockAddressLine(_ knock: PeerKnock, now: Date) -> String? {
+        let named = !(knock.proposedName ?? "").isEmpty
+        let expiry = knockExpiry(firstSeenMs: knock.firstSeenMs, now: now)
+            .map { "expires in \($0)" }
+        guard named else { return expiry }
+        guard let expiry else { return knock.addr }
+        return "\(knock.addr) · \(expiry)"
+    }
+
+    /// How long a knock stands before the Mac holding it drops the row.
+    ///
+    /// The Rust side owns this number: `KNOCK_TTL_MS` in `src/peer/state.rs`
+    /// is what drops an unanswered knock, and `PAIR_WAIT` in
+    /// `src/peer/pair.rs` is the matching wait on the Mac that sent it.
+    /// Nothing on the wire reports either, so this is a copy of a constant
+    /// rather than a reading, and it is the only copy: every surface counts
+    /// against this and none of them describes it in prose.
+    public static let knockExpirySeconds: TimeInterval = 600
+
+    /// `7m` left on a knock, from the timestamp the knock itself carries, or
+    /// `nil` when there is nothing honest to count.
+    ///
+    /// `nil` covers both a knock past its deadline and one whose producer
+    /// sent no timestamp at all, which arrives as `0` and would otherwise
+    /// count from 1970. Neither gets an invented figure.
+    public static func knockExpiry(firstSeenMs: Int64, now: Date) -> String? {
+        guard firstSeenMs > 0 else { return nil }
+        let age = now.timeIntervalSince1970 - Double(firstSeenMs) / 1000
+        let remaining = knockExpirySeconds - age
+        guard remaining > 0 else { return nil }
+        return PeerFormat.span(remaining)
     }
 
     /// What Accept buys, under the title. Decision row 10 in one line:
