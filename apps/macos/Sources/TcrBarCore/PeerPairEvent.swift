@@ -117,15 +117,32 @@ public enum PeerPairState: Equatable, Sendable {
 
     /// The instruction for the OTHER Mac, while this one waits. `nil` once
     /// there is nothing over there left to do, and `nil` before the command
-    /// has named the instance: a sentence with a blank where an argument
-    /// belongs is worse than no sentence.
+    /// has named the instance: until the knock is away there is nothing over
+    /// there to act on.
     ///
-    /// The instance id and not the name: `tcr peer accept` takes the id, and
-    /// two Macs can propose one name.
+    /// **The panel's own surface, not a terminal's.** It printed two commands
+    /// wrapped in backticks, which draw as the characters they are, plus a
+    /// sixteen-character instance id, to somebody who is looking at a panel
+    /// precisely because they are not in a terminal. The person at the other
+    /// Mac has this same tab, the request is already on it, and Accept is a
+    /// button. The commands and the id are still reachable, in
+    /// ``farSideCommands``, which the sheet's own control carries as help.
     public var farSideInstruction: String? {
         guard case .asking(let instance) = self, !instance.isEmpty else { return nil }
-        return "On that Mac, `tcr peer pending` lists this request and "
-            + "`tcr peer accept \(instance)` approves it. Nothing has been disclosed to it yet."
+        return "On that Mac, the Peers tab shows this request and anybody there can press "
+            + "Accept. Nothing has been disclosed to it yet."
+    }
+
+    /// The same fact for somebody at a terminal, with the argument each verb
+    /// takes. Help text and a bug report, never the sheet's own line.
+    ///
+    /// The instance id and not the name: `tcr peer accept` takes the id, and
+    /// two Macs can propose one name. No backticks: this is read as plain
+    /// text wherever it is drawn.
+    public var farSideCommands: String? {
+        guard case .asking(let instance) = self, !instance.isEmpty else { return nil }
+        return "On that Mac, tcr peer pending lists this request and tcr peer accept "
+            + "\(instance) approves it."
     }
 
     /// The sheet's headline for this state. The words live here rather than in

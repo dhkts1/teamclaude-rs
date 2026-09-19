@@ -2273,8 +2273,13 @@ struct PeerTrustSheet: View {
     private var cancelHelp: String {
         switch state {
         case .asking:
+            // The two commands and the instance id live HERE, not on the
+            // sheet: the sheet's own line is for the person at the other Mac,
+            // who has this same tab and a button; this is for the one at a
+            // terminal, and for a bug report.
+            let commands = state.farSideCommands.map { " " + $0 } ?? ""
             return "Stops waiting and ends this request here. The request stands on that Mac "
-                + "until somebody answers it or it expires."
+                + "until somebody answers it or it expires." + commands
         case .comparing:
             return "Ends this request. Nothing is written and \(peerName) stays untrusted."
         case .done, .refused, .cancelled:
