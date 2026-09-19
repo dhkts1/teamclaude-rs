@@ -197,26 +197,34 @@ async fn scripted(behaviour: FarEnd) -> Scripted {
 // Item 1: the measurement
 // ---------------------------------------------------------------------------
 
-/// **Five probes against a peer that answers 40 ms late read 40 ms.**
+/// An upper bound wide enough to be about units, not about speed.
 ///
-/// The gate for the EWMA and for the whole prober: every sample is 40, so an
-/// average with any weighting is 40, and what is actually under test is that
-/// the number recorded is a ROUND TRIP measured by the asker and not something
-/// off the wire. The tolerance is ten percent, OR an absolute 15 ms,
-/// whichever is wider, and the absolute floor is the one that matters: ten
-/// percent of 40 ms is 4 ms, and this suite runs beside every other test
-/// binary in the tree, where a scheduler that parks a task for one extra tick
-/// costs more than that. Measured once, under a full run, as a 10 % miss on a
-/// path whose only cost beside the sleep is two Noise frames on loopback. The
-/// number under test is 40 against 0, the mutation below, and a 15 ms window
-/// separates those two just as well as a 4 ms one.
+/// A round trip on loopback behind a 40 ms sleep is tens of milliseconds on an
+/// idle box and can be a few hundred on a loaded one. 2000 ms is two orders of
+/// magnitude above the sleep, so what it still catches is a number that is not
+/// milliseconds at all: microseconds read as milliseconds, or a nanosecond
+/// count cast down. It is deliberately not a precision gate, because a
+/// precision gate here measures the scheduler and not the prober.
+const RTT_CEILING_MS: f64 = 2000.0;
+
+/// How much of the 40 ms sleep must survive into the difference between the
+/// two runs below.
 ///
-/// Watched red: in `src/peer/probe.rs::probe_once`, replace
-/// `rtt_ms: u32::try_from(elapsed).unwrap_or(u32::MAX)` with `rtt_ms: 0` and
-/// this reads 0 instead of 40.
-#[tokio::test]
-async fn five_probes_against_a_forty_millisecond_peer_read_forty() {
-    let script = scripted(FarEnd::EchoAfter(Duration::from_millis(DELAY_MS))).await;
+/// Half the sleep. The two runs pay the same costs apart from the sleep, so
+/// whatever the scheduler adds falls out of the difference; what is left is
+/// non-common cost, one run being parked harder than the other, and 20 ms of
+/// room for it. A prober that reported a constant, or a number off the wire
+/// rather than its own clock, reads the same on both runs and the difference
+/// is zero.
+const DELAY_VISIBLE_MS: f64 = 20.0;
+
+/// One five-probe run against a peer that answers `delay` late, and the path
+/// the asker measured for it.
+///
+/// A helper rather than a body, because the measurement gate below needs two
+/// of these runs to compare against each other.
+async fn five_probes_against(delay: Duration) -> PathStat {
+    let script = scripted(FarEnd::EchoAfter(delay)).await;
     let (mut stream, mut session) =
         open_control(script.addr, &script.dialer_secret, &script.far_public)
             .await
@@ -245,27 +253,72 @@ async fn five_probes_against_a_forty_millisecond_peer_read_forty() {
 
     let stat = table
         .stat(&PeerId(script.far_public), &locator)
-        .expect("the path this probing measured");
-    let rtt = stat.rtt_ms.expect("five acks, so there is a round trip");
-    // Ten percent or 15 ms, whichever is wider. See this test's doc-comment
-    // for why the absolute floor is the load-bearing half.
-    const RTT_TOLERANCE_MS: f64 = 15.0;
-    let slack = (DELAY_MS as f64 * 0.1).max(RTT_TOLERANCE_MS);
-    let low = DELAY_MS as f64 - slack;
-    let high = DELAY_MS as f64 + slack;
-    assert!(
-        rtt >= low && rtt <= high,
-        "five 40 ms answers must read 40 ms within {slack} ms, not {rtt}"
-    );
-    assert_eq!(stat.samples, 5);
-    assert!(
-        stat.loss_pct.abs() < f64::EPSILON,
-        "nothing was lost, so loss is zero and not {}",
-        stat.loss_pct
-    );
+        .expect("the path this probing measured")
+        .clone();
 
     drop(stream);
     script.handle.await.expect("the far end").expect("no error");
+    stat
+}
+
+/// **Five probes against a peer that answers 40 ms late read at least 40 ms,
+/// and read higher than the same five against a peer that answers at once.**
+///
+/// The gate for the EWMA and for the whole prober: the number recorded is a
+/// ROUND TRIP measured by the asker's own clock, not something off the wire
+/// and not a constant. Two facts carry that, and neither of them is a window
+/// around 40:
+///
+/// 1. The scripted 40 ms sleep is a FLOOR the asker cannot undercut. Every
+///    sample is the sleep plus two Noise frames on loopback, so every sample
+///    is above 40, so an EWMA of them with any weighting is above 40. A box
+///    under load pushes this number UP, which is the direction the assertion
+///    already allows. The ceiling beside it is about units, see
+///    [`RTT_CEILING_MS`].
+/// 2. The same five probes against a peer that answers with no sleep read
+///    lower, by at least half the sleep. That is the half that says the number
+///    tracks THIS peer's answer and is not a constant: a prober that returned
+///    40 for everything, or 0 for everything, has a difference of zero.
+///
+/// The window this replaced was 40 plus or minus 15 ms, and it measured the
+/// scheduler: PR #349 read 68.57 ms for these same five answers on a loaded
+/// CI runner, which is the 40 ms sleep plus 28 ms of scheduling on a path
+/// whose only other cost is two frames on loopback. Nothing was wrong with the
+/// prober in that run.
+///
+/// Watched red: in `src/peer/probe.rs::probe_once`, replace
+/// `rtt_ms: u32::try_from(elapsed).unwrap_or(u32::MAX)` with `rtt_ms: 0` and
+/// both halves go red, the floor on 0 against 40 and the difference on 0
+/// against 0.
+#[tokio::test]
+async fn five_probes_against_a_forty_millisecond_peer_read_forty() {
+    let delayed = five_probes_against(Duration::from_millis(DELAY_MS)).await;
+    let rtt = delayed.rtt_ms.expect("five acks, so there is a round trip");
+    assert!(
+        rtt >= DELAY_MS as f64,
+        "a scripted {DELAY_MS} ms answer cannot be measured faster than {DELAY_MS} ms, \
+         and this read {rtt}"
+    );
+    assert!(
+        rtt <= RTT_CEILING_MS,
+        "a 40 ms answer on loopback cannot be {rtt} ms; see RTT_CEILING_MS"
+    );
+    assert_eq!(delayed.samples, 5);
+    assert!(
+        delayed.loss_pct.abs() < f64::EPSILON,
+        "nothing was lost, so loss is zero and not {}",
+        delayed.loss_pct
+    );
+
+    let prompt = five_probes_against(Duration::ZERO).await;
+    let prompt_rtt = prompt
+        .rtt_ms
+        .expect("five acks from the prompt peer too, so there is a round trip");
+    assert!(
+        rtt - prompt_rtt >= DELAY_VISIBLE_MS,
+        "the {DELAY_MS} ms peer must read at least {DELAY_VISIBLE_MS} ms above the peer \
+         that answers at once, and it read {rtt} against {prompt_rtt}"
+    );
 }
 
 /// **A peer whose build does not know what a probe is gets exactly one.**

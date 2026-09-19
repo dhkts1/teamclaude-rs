@@ -2433,47 +2433,6 @@ mod tests {
         }
     }
 
-    /// Wait for a line matching `predicate` to appear in `sink`, up to `timeout`.
-    ///
-    /// The single-read version of this flaked: the test called
-    /// `sink.contents()` once, at the instant `serve()` returned, and failed if
-    /// the line was not there yet.
-    ///
-    /// The mechanism was investigated on 2026-09-13 and NOT established. Three
-    /// hypotheses were tested and falsified: a 4-worker `multi_thread` runtime
-    /// passes 3/3 (so it is not the thread-local subscriber escaping to a
-    /// worker), the `server started` emit is inline in `serve()` rather than on
-    /// a spawned task, and the lib suite reproduced it 0/6 on an idle machine.
-    /// The one observed failure coincided with a wedged sccache and three
-    /// concurrent release builds on the same box.
-    ///
-    /// A bounded poll removes the dependence on that one instant WITHOUT
-    /// weakening the assertion: a line that is genuinely never emitted still
-    /// fails, `timeout` later, with the same captured contents in the message.
-    /// That is the property that makes this a deflake rather than a mute, and
-    /// `scripts/watch-boot-line-fail.sh` is what proves it.
-    ///
-    /// `tokio::time::sleep`, never `std::thread::sleep`: under the default
-    /// current_thread runtime a blocking sleep parks the whole reactor, so any
-    /// pending task that still owes the line could never run and the poll would
-    /// be guaranteed to time out.
-    async fn wait_for_logged_line(
-        sink: &SharedBuf,
-        timeout: std::time::Duration,
-        predicate: impl Fn(&str) -> bool,
-    ) -> Option<String> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if let Some(line) = sink.contents().lines().find(|l| predicate(l)) {
-                return Some(line.to_string());
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-
     impl std::io::Write for SharedBuf {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -2649,35 +2608,81 @@ mod tests {
     /// makes that invariant survive a future default change instead of
     /// resting on it silently (same reasoning as
     /// `a_panicking_background_task_is_logged_and_not_respawned` above).
+    ///
+    /// # Why this boots more than once, and waits on no clock
+    ///
+    /// The `server started` emit is one process-wide `tracing` callsite, and
+    /// `tracing` caches that callsite's `Interest` globally the FIRST time any
+    /// thread reaches it. When only one dispatcher is registered,
+    /// `callsite::register` computes that interest from the REGISTERING
+    /// thread's own default subscriber (`Rebuilder::JustOne` in
+    /// `tracing-core`'s `callsite.rs`). Two other tests in this binary boot a
+    /// server with no subscriber installed. Whichever of them reaches the
+    /// callsite first caches `Interest::never` for it, and from then on THIS
+    /// test's `serve()` emits nothing at all, however long anything waits: the
+    /// line is lost, not late.
+    ///
+    /// Measured on 2026-09-19 at this exact callsite: with a bare thread
+    /// booting first, a `serve()` on the capturing thread wrote no boot line to
+    /// the sink, and a `rebuild_interest_cache()` on the capturing thread made
+    /// the next boot write it. That is what the two calls below are: the
+    /// rebuild runs while this thread's capturing subscriber is the default, so
+    /// it recomputes the interest for every callsite already registered,
+    /// including this one. A callsite that is registered for the first time
+    /// DURING the first boot here is out of that rebuild's reach, so the
+    /// attempt after it repairs that case: registration has happened by then,
+    /// and the second attempt's rebuild covers it.
+    ///
+    /// This replaced a 5 s deadline that reddened three full `--lib` runs under
+    /// load and passed alone every time. The deadline could not have worked:
+    /// the line was never emitted in those runs, so no deadline is long enough.
+    /// Nothing here reads a clock.
     #[tokio::test(flavor = "current_thread")]
     async fn boot_line_carries_every_new_knob_with_its_configured_value() {
-        let sink = SharedBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        /// Two are enough for the mechanism above, three is margin.
+        const BOOTS: usize = 3;
 
-        let mut handle = serve(ServeOptions {
-            tls: TlsSetup::Disabled,
-            ..ServeOptions::new(boot_line_test_config())
-        })
-        .await
-        .expect("bind must succeed on an ephemeral port")
-        .expect_started();
+        let mut captured = String::new();
+        for _ in 0..BOOTS {
+            let sink = SharedBuf::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            let _guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
 
-        let boot_line = wait_for_logged_line(&sink, std::time::Duration::from_secs(5), |line| {
-            line.contains("server started")
-        })
-        .await
-        .unwrap_or_else(|| {
-            panic!(
-                "no \"server started\" line within 5s; captured log: {:?}",
-                sink.contents()
-            )
-        });
-        let boot_line = boot_line.as_str();
+            let mut handle = serve(ServeOptions {
+                tls: TlsSetup::Disabled,
+                ..ServeOptions::new(boot_line_test_config())
+            })
+            .await
+            .expect("bind must succeed on an ephemeral port")
+            .expect_started();
 
+            // Read once. The emit is inline in `serve()` (see the `tracing::info!`
+            // beside the bind), so by the time `serve()` has returned the line is
+            // either in this sink or it was never enabled for this boot.
+            let line = sink
+                .contents()
+                .lines()
+                .find(|line| line.contains("server started"))
+                .map(str::to_string);
+            handle.shutdown().await;
+            captured = sink.contents();
+
+            let Some(boot_line) = line else {
+                continue;
+            };
+            assert_boot_line_knobs(boot_line.as_str());
+            return;
+        }
+        panic!("no \"server started\" line in {BOOTS} boots; captured log: {captured:?}");
+    }
+
+    /// Every knob this unit added to the boot line, with the value
+    /// [`boot_line_test_config`] set.
+    fn assert_boot_line_knobs(boot_line: &str) {
         for expected in [
             "session_affinity=false",
             "revalidation_serve=false",
@@ -2706,9 +2711,8 @@ mod tests {
                 "boot line missing {expected:?}; full line: {boot_line:?}"
             );
         }
-
-        handle.shutdown().await;
     }
+
     /// **The peer-lease fallback is wired at boot**, a server booted beside a
     /// peers file with sharing on reaches the provider on a dry fleet.
     ///
