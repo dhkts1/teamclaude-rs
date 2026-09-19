@@ -5792,10 +5792,19 @@ fn open_log_appender(
 /// event after that silently stops reaching disk while every gate stays green.
 /// `RollingFileAppender` itself implements `Write`/`MakeWriter` synchronously,
 /// so it needs no guard and no lifetime plumbing.
+/// `stdout_ansi` is the caller's decision, made once, because the library's
+/// own default is wrong here: `tracing_subscriber::fmt::Layer::default` turns
+/// colour on whenever `NO_COLOR` is unset and never asks whether the sink is a
+/// terminal, so a redirected `tcr --headless > run.log` fills the file with
+/// escape codes. That is a bug by itself (a log nobody can grep), and it broke
+/// `tests/peer_e2e.rs` on CI, where `NO_COLOR` is unset and the children's
+/// boot logs are files: every field name arrived as
+/// `\e[3mpeer_listen\e[0m\e[2m=\e[0m`.
 fn headless_subscriber<W>(
     filter: tracing_subscriber::EnvFilter,
     file: Option<tracing_appender::rolling::RollingFileAppender>,
     stdout_sink: W,
+    stdout_ansi: bool,
 ) -> impl tracing::Subscriber + Send + Sync
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -5809,7 +5818,11 @@ where
     });
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().with_writer(stdout_sink))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(stdout_ansi)
+                .with_writer(stdout_sink),
+        )
         .with(file_layer)
 }
 
@@ -5832,7 +5845,12 @@ fn init_tracing(headless: bool) {
         }
     };
     if headless {
-        headless_subscriber(filter, file, std::io::stdout).init();
+        // Colour only for a human at a terminal. Piped or redirected stdout is
+        // something a program or a test will read back, and `NO_COLOR` is still
+        // honoured on top: see `headless_subscriber`.
+        let ansi = std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+        headless_subscriber(filter, file, std::io::stdout, ansi).init();
         return;
     }
     // No file? Already warned above. The TUI cannot fall back to stdout without
@@ -6381,6 +6399,7 @@ mod tests {
             tracing_subscriber::EnvFilter::new("info"),
             Some(appender),
             stdout.clone(),
+            false,
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("{marker}");
@@ -6403,6 +6422,57 @@ mod tests {
         );
     }
 
+    /// Redirected stdout carries no escape codes.
+    ///
+    /// The library default would: `Layer::default` enables colour whenever
+    /// `NO_COLOR` is unset, whatever the sink is, so a `tcr --headless >
+    /// run.log` on a machine without `NO_COLOR` wrote a log that no `rg` of a
+    /// field name could match. Asserted on both sinks, and against the same
+    /// sink with colour ON, so a `stdout_ansi` argument that is quietly
+    /// ignored fails here rather than on somebody's CI runner.
+    #[test]
+    fn headless_stdout_is_plain_when_it_is_not_a_terminal() {
+        let plain = SharedBuf::default();
+        let marker = format!("headless-ansi-probe-{}", std::process::id());
+
+        let subscriber = headless_subscriber(
+            tracing_subscriber::EnvFilter::new("info"),
+            None,
+            plain.clone(),
+            false,
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(peer_listen = %"127.0.0.1:34865", "{marker}");
+        });
+
+        let written = plain.contents();
+        assert!(
+            !written.contains('\u{1b}'),
+            "non-terminal stdout must hold no escape byte; held: {written:?}"
+        );
+        assert!(
+            written.contains("peer_listen=127.0.0.1:34865"),
+            "a reader must find the plain `key=value`; held: {written:?}"
+        );
+
+        // The control: the same call with colour on must differ, which is what
+        // proves the assertion above measures the argument.
+        let coloured = SharedBuf::default();
+        let subscriber = headless_subscriber(
+            tracing_subscriber::EnvFilter::new("info"),
+            None,
+            coloured.clone(),
+            true,
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(peer_listen = %"127.0.0.1:34865", "{marker}");
+        });
+        assert!(
+            coloured.contents().contains('\u{1b}'),
+            "with colour on the same event carries escapes, so the plain case above is a real result"
+        );
+    }
+
     /// A log file that will not open must degrade to stdout-only, never take the
     /// proxy down: logging is not worth the traffic it is observing.
     #[test]
@@ -6414,6 +6484,7 @@ mod tests {
             tracing_subscriber::EnvFilter::new("info"),
             None,
             stdout.clone(),
+            false,
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("{marker}");

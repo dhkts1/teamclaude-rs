@@ -311,6 +311,14 @@ impl Mac {
 
     fn env(&self, command: &mut Command) {
         command
+            // Colour off at the source. A child that inherits an unset
+            // `NO_COLOR` writes escape codes into its boot log even though the
+            // log is a file, because the subscriber never asks whether its sink
+            // is a terminal (`tracing_subscriber::fmt::Layer::default`). The
+            // searchers strip escapes too (`strip_ansi`), so neither half alone
+            // is load-bearing; this half also keeps the logs readable when a
+            // failing run prints one.
+            .env("NO_COLOR", "1")
             .env("HOME", self.home.path())
             .env("XDG_CACHE_HOME", self.home.path().join(".cache"))
             .env(
@@ -469,7 +477,7 @@ impl Mac {
 
     /// The whole of this boot's log.
     fn log(&self) -> String {
-        std::fs::read_to_string(&self.log).unwrap_or_default()
+        strip_ansi(&std::fs::read_to_string(&self.log).unwrap_or_default())
     }
 
     /// Block until this boot's log holds a line containing `needle`, and return
@@ -704,8 +712,49 @@ fn a_half_written_line_is_not_a_line() {
     );
 }
 
+/// Every ANSI escape sequence out of some child output.
+///
+/// # Why the tests need this
+///
+/// `tracing_subscriber`'s `Layer::default` turns colour ON whenever `NO_COLOR`
+/// is unset, and it never asks whether the sink is a terminal, so a child
+/// whose stdout is a plain file still gets escapes. Every spawn here now sets
+/// `NO_COLOR=1`, but a searcher that only works on plain text is one dropped
+/// `env` call away from the failure that cost this file a CI round: locally
+/// the tool shell exports `NO_COLOR=1`, the runner does not, and
+/// `field(line, "peer_listen")` looked for a literal `peer_listen=` that had
+/// become `\e[3mpeer_listen\e[0m\e[2m=\e[0m`. Stripping here makes the
+/// searchers hold either way.
+///
+/// Handles the two forms the formatter emits: CSI (`\e[` … final byte in
+/// `@`-`~`) and a two-byte escape such as `\e(B`.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\u{1b}' {
+            out.push(ch);
+            continue;
+        }
+        // A CSI sequence runs until its final byte, `@` through `~`. Anything
+        // else is the two-byte form: the escape and the one character after it,
+        // both already consumed.
+        if chars.next() == Some('[') {
+            for next in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `key=value` out of one tracing line, where the value runs to the next space.
+///
+/// Colour-blind by construction: see [`strip_ansi`].
 fn field(line: &str, key: &str) -> Option<String> {
+    let line = strip_ansi(line);
     let marker = format!("{key}=");
     let start = line.find(&marker)? + marker.len();
     Some(
@@ -715,6 +764,40 @@ fn field(line: &str, key: &str) -> Option<String> {
             .unwrap_or_default()
             .to_string(),
     )
+}
+
+/// The exact boot line a CI runner produced at 8668af1, where `NO_COLOR` is
+/// unset and every field name and `=` sits inside an escape sequence. Red
+/// before [`strip_ansi`]: `field` searched for a literal `peer_listen=` that
+/// is not in this line at all, and all twelve tests in this file timed out
+/// thirty seconds later saying the field never arrived.
+#[test]
+fn a_coloured_boot_line_still_yields_the_peer_address() {
+    let coloured = "\u{1b}[2m2026-09-19T16:08:55Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \u{1b}[2mteamclaude_rs::server\u{1b}[0m\u{1b}[2m:\u{1b}[0m peer listener up (a second socket; the local /_tcr/ gate is untouched) \u{1b}[3mpeer_listen\u{1b}[0m\u{1b}[2m=\u{1b}[0m127.0.0.1:34865 \u{1b}[3mnode\u{1b}[0m\u{1b}[2m=\u{1b}[0mtcr-EXAMPLENODE";
+    assert_eq!(
+        field(coloured, "peer_listen").as_deref(),
+        Some("127.0.0.1:34865"),
+        "the address reads out of a line whose field name and `=` are wrapped in escapes"
+    );
+    assert_eq!(
+        field(coloured, "node").as_deref(),
+        Some("tcr-EXAMPLENODE"),
+        "the last field on a coloured line ends at the line, not at an escape"
+    );
+    assert!(
+        !strip_ansi(coloured).contains('\u{1b}'),
+        "stripping leaves no escape byte behind"
+    );
+    assert!(
+        strip_ansi(coloured).contains("peer_listen=127.0.0.1:34865"),
+        "a stripped line carries the plain `key=value` the searchers look for"
+    );
+    let plain = "INFO server: peer listener up peer_listen=127.0.0.1:34865";
+    assert_eq!(
+        strip_ansi(plain),
+        plain,
+        "a line with no escapes in it comes back unchanged"
+    );
 }
 
 /// The six digits out of `code=NNNNNN` or `shows NNNNNN`.
@@ -854,7 +937,7 @@ async fn two_macs_find_each_other_pair_on_six_digits_and_pin() {
     );
     // The whole point: before Accept, the requester has been told
     // nothing: no static key, so no digits either.
-    let before = std::fs::read_to_string(&pair.out).unwrap_or_default();
+    let before = strip_ansi(&std::fs::read_to_string(&pair.out).unwrap_or_default());
     assert!(
         !before.contains("this Mac shows"),
         "digits appeared BEFORE anyone pressed Accept, which means an XX message 2 \
@@ -1217,7 +1300,7 @@ impl PairProcess {
             .child
             .wait()
             .expect("the pair process is waitable after its answer");
-        let printed = std::fs::read_to_string(&self.out).unwrap_or_default();
+        let printed = strip_ansi(&std::fs::read_to_string(&self.out).unwrap_or_default());
         assert!(
             status.success(),
             "{}: `tcr peer pair` exited {status:?}:\n{printed}",
@@ -1249,7 +1332,7 @@ fn spawn_pair(mac: &Mac, addr: &str) -> PairProcess {
 fn wait_for_file(path: &Path, needle: &str, mac: &Mac) -> String {
     let deadline = Instant::now() + LINE_TIMEOUT;
     loop {
-        let body = std::fs::read_to_string(path).unwrap_or_default();
+        let body = strip_ansi(&std::fs::read_to_string(path).unwrap_or_default());
         if let Some(line) = complete_lines(&body)
             .rev()
             .find(|line| line.contains(needle))
@@ -2241,6 +2324,9 @@ fn boot_cost_once(with_peers: bool) -> f64 {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tcr"));
     command
         .args(["--headless", "--port", "0", "--no-replace"])
+        // The same colour-off contract as `Mac::env`; this sample owns no
+        // `Mac` to borrow it from.
+        .env("NO_COLOR", "1")
         .env("HOME", home.path())
         .env("XDG_CACHE_HOME", home.path().join(".cache"))
         .env(
@@ -2257,7 +2343,7 @@ fn boot_cost_once(with_peers: bool) -> f64 {
 
     let deadline = Instant::now() + LINE_TIMEOUT;
     loop {
-        let body = std::fs::read_to_string(&log).unwrap_or_default();
+        let body = strip_ansi(&std::fs::read_to_string(&log).unwrap_or_default());
         if body.contains("listening on http://") {
             break;
         }
