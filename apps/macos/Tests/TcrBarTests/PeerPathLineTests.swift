@@ -132,4 +132,51 @@ final class PeerPathLineTests: XCTestCase {
     func testTheNoPathLineIsNotLabelledTriedFirst() {
         XCTAssertFalse(PeerFormat.pathLines([])[0].text.contains("tried first"))
     }
+
+    /// One of the three absences is a thing a person can answer, and the line
+    /// carries that as a FACT rather than leaving it to be read out of the
+    /// words.
+    ///
+    /// A Mac this one has pinned, that it looked for and could not find, is
+    /// the whole state the link exists for: both ends moved and neither can
+    /// dial the other. The other two absences are not that. `path not
+    /// reported` says nothing looked, so there is nothing yet to answer, and
+    /// the same measured absence on a Mac this one has not pinned has no key
+    /// to seal anything under.
+    func testOnlyAMeasuredAbsenceOnATrustedRowIsAControl() {
+        let trusted = PeerFormat.pathLines([], absence: .measured, answerable: true)
+        XCTAssertEqual(trusted.count, 1)
+        XCTAssertTrue(
+            trusted[0].actionable,
+            "a trusted Mac this one measured no way to reach draws a plain readout, which is "
+                + "the one line on the tab that has an answer behind it")
+        XCTAssertFalse(
+            PeerFormat.pathLines([], absence: .measured)[0].actionable,
+            "an untrusted row offers the act, and there is no shared secret to seal a link "
+                + "under on a Mac this one has never pinned")
+        XCTAssertFalse(
+            PeerFormat.pathLines([], absence: .notReported, answerable: true)[0].actionable,
+            "an unread live half offers a remedy for a reading this build never took")
+        XCTAssertTrue(
+            PeerFormat.pathLines([], absence: .silent, answerable: true).isEmpty,
+            "the silent absence draws a line at all, and it would be a pressable one")
+        XCTAssertFalse(
+            PeerFormat.pathLines([path(rttMs: 14, lossPct: 0)], answerable: true)[0].actionable,
+            "a row with a path draws its path line as a control")
+    }
+
+    /// And the actionable line says the act, in the row's own words, beside
+    /// the problem it answers. The words are the tab's, not the view's: a
+    /// control whose label is spelled at the call site is a second place the
+    /// wording lives.
+    func testTheActionableLineNamesTheActBesideTheProblem() {
+        let line = PeerFormat.pathLines([], absence: .measured, answerable: true)[0]
+        XCTAssertEqual(line.text, "no path right now · send it a link")
+        XCTAssertEqual(
+            line.tone, .absent,
+            "the line changed tone when it became a control, and it is still an absence")
+        XCTAssertEqual(
+            PeerFormat.pathLines([], absence: .measured)[0].text, "no path right now",
+            "a row with no act to offer says the act anyway")
+    }
 }

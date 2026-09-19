@@ -135,13 +135,26 @@ extension PeerFormat {
     /// nothing measured is a lie. A row with a single path still gets the
     /// prefix, because it is still the path dialled first. Do not "improve"
     /// this into `in use` without a wire field to back it.
+    ///
+    /// `answerable` is the second half of the one question the absent line
+    /// cannot settle alone: an absence a person can DO something about is a
+    /// measured one on a Mac this one has pinned AND can name to the verb that
+    /// answers it, and the caller is the only place either fact is in hand. It
+    /// decides ``PeerPathLine/actionable``, and the line then says the act out
+    /// loud rather than leaving a reader of the words to work out that this
+    /// one absence is different from the other two.
     public static func pathLines(
         _ paths: [PeerListDocument.PeerPath], names: [String: String] = [:],
-        absence: PeerPathAbsence = .measured
+        absence: PeerPathAbsence = .measured, answerable: Bool = false
     ) -> [PeerPathLine] {
         guard !paths.isEmpty else {
             guard let sentence = absence.sentence else { return [] }
-            return [PeerPathLine(text: sentence, tone: .absent)]
+            let actionable = answerable && absence.isActionable
+            return [
+                PeerPathLine(
+                    text: actionable ? "\(sentence) · \(PeerPathAbsence.remedy)" : sentence,
+                    tone: .absent, actionable: actionable)
+            ]
         }
         return paths.enumerated().map { index, path in
             let text = pathLine(path, names: names)
@@ -213,6 +226,26 @@ public enum PeerPathAbsence: Equatable, Sendable {
         case .silent: return nil
         }
     }
+
+    /// Whether this absence is one a person can answer from the row itself.
+    ///
+    /// Exactly one of the three is. A MEASURED absence is this Mac saying it
+    /// looked and found no way there, which is the state a person fixes by
+    /// telling the other Mac where this one is now. `path not reported` is the
+    /// opposite claim, nothing looked, so there is nothing yet to answer and a
+    /// control there would offer a remedy for a reading this build never took.
+    /// The silent case draws no line at all, so there is nothing to press.
+    ///
+    /// It is a fact on the value rather than a test on the WORDS, because the
+    /// view that draws the line would otherwise have to decide this by
+    /// comparing the sentence it was handed against a copy of the sentence
+    /// held somewhere else, which is two places one string has to stay
+    /// spelled the same.
+    public var isActionable: Bool { self == .measured }
+
+    /// What an actionable absence adds after its own sentence, so the line
+    /// states the act and not only the problem.
+    public static let remedy = "send it a link"
 }
 
 /// One path's line and how it reads: ordinary, worth a look, or the absence
@@ -233,9 +266,19 @@ public struct PeerPathLine: Equatable, Hashable, Sendable {
 
     public let text: String
     public let tone: Tone
+    /// Whether this line is a control and not only a readout.
+    ///
+    /// True on exactly one line: the measured absence on a trusted row, where
+    /// the sentence that states the problem is also the press that answers it
+    /// (the freshness readout beside it is the same shape, a reading and the
+    /// control that takes it again). Carried here, decided once by the caller
+    /// that knows both halves, so the view never asks whether a line reads
+    /// like the actionable one.
+    public let actionable: Bool
 
-    public init(text: String, tone: Tone) {
+    public init(text: String, tone: Tone, actionable: Bool = false) {
         self.text = text
         self.tone = tone
+        self.actionable = actionable
     }
 }
