@@ -2010,12 +2010,13 @@ pub async fn say_hello(store: &PeerStore, peer: &PeerId) -> Result<Option<Hello>
     }
 
     let now = crate::now_ms();
-    let mut learned = crate::peer::config::endpoints_from_hello(&theirs.addrs, now);
-    learned.push(Endpoint::direct(
-        reached,
-        now,
-        crate::peer::config::EndpointSource::Hello,
-    ));
+    // The peer's own claimed addresses, plus the socket this dial actually
+    // reached when that is not redundant with one of them: see
+    // [`crate::peer::config::endpoints_and_connection_from_hello`] for why an
+    // unconditional push of `reached` would leave a dead ephemeral entry on
+    // the row next to the address the peer already named.
+    let learned =
+        crate::peer::config::endpoints_and_connection_from_hello(&theirs.addrs, reached, now);
     crate::peer::config::observe_endpoints(store.path(), peer, &learned)
         .context("peer hello: could not record where this peer answers")?;
     Ok(Some(theirs))
