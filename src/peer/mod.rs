@@ -150,3 +150,8 @@ pub mod probe;
 /// Where two Macs that both moved leave each other an address: the per-pair
 /// name and the sealed record. Crypto and naming only, called by nothing yet.
 pub mod drop;
+
+/// What one Mac sends one friend after it changed networks: a sealed record
+/// saying where it is now. The seal and the refusals only, called by nothing
+/// yet.
+pub mod moved;
