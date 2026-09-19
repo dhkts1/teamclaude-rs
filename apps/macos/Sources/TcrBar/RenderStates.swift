@@ -1188,6 +1188,23 @@ enum RenderStates {
                 peersSnapshot(PeerListDocument(supported: false)),
                 false
             ),
+            // A Mac with no network interface at all. There was no fixture
+            // for this state, so a Find card arm written for it would have
+            // shipped with nobody able to look at it first.
+            //
+            // Built behind `PeerListDocument` as it stands today, a
+            // `finding: false` document with no rows, since a network field
+            // has not landed on it yet in this pass. That is the same
+            // document `45-peers-off` builds, so this scene draws the same
+            // picture as that one until the field exists, a known,
+            // deliberate duplicate, not a fixture bug. One line flips it once
+            // the field lands: replace `PeerListDocument()` below with
+            // `PeerListDocument(network: false)`.
+            (
+                "64-peers-no-network",
+                peersSnapshot(PeerListDocument()),
+                false
+            ),
         ]
     }
 
