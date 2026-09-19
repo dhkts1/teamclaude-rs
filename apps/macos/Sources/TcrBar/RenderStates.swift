@@ -393,6 +393,14 @@ enum RenderStates {
                 if renderPeerSheet(scene, appearance: appearance, into: directory) { written += 1 }
             }
         }
+        for scene in peerMovedSheetScenes {
+            for appearance in Appearance.allCases {
+                attempted += 1
+                if renderPeerMovedSheet(scene, appearance: appearance, into: directory) {
+                    written += 1
+                }
+            }
+        }
         for scene in controlScenes {
             for appearance in Appearance.allCases {
                 attempted += 1
@@ -1076,6 +1084,37 @@ enum RenderStates {
                         ])),
                 false
             ),
+            // The absent line as a CONTROL, beside a row that has a path, so
+            // the difference between the two sub-lines is in one picture: one
+            // states a route, the other states the absence AND offers the act
+            // that answers it. The scene above is the same line on a Mac with
+            // nothing else around it; this one is what the tab really looks
+            // like when one Mac of two cannot be reached, which is the state
+            // the act exists for.
+            (
+                "w13-path-none-control",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "loft-mini",
+                                address: "192.168.4.31:41234", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true, serves: true,
+                                leaseSpent: 0.22, leaseTtlSeconds: 240,
+                                paths: [
+                                    .init(
+                                        endpoint: "192.168.4.31:41234", kind: .direct,
+                                        rttMs: 11, lossPct: 0, lastOkMs: peerMsAgo(2))
+                                ]),
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(172_800), carries: true),
+                        ],
+                        name: "desk-mac")),
+                false
+            ),
             // Every scene of the mini mesh card is the REAL tab with the
             // real card in it, so the mesh cannot show a shape the panel
             // would not draw from the same document.
@@ -1555,6 +1594,89 @@ enum RenderStates {
             return rasterise(
                 view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
         }
+    }
+
+    /// The three states of the link sheet, over the row it opens from.
+    ///
+    /// Every one of them is a screen a person meets with no terminal open, and
+    /// two of the three say that nothing was made: a mint that cannot happen
+    /// yet and a run that did not happen at all have different fixes and had
+    /// to be looked at side by side rather than trusted to be distinguishable.
+    ///
+    /// The strings are the ones the verb prints, quoted as it prints them, and
+    /// the link is nonsense of the right shape: this repository is public and
+    /// a real sealed record is a real Mac's addresses.
+    private static var peerMovedSheetScenes: [(name: String, outcome: PeerMovedMint.Outcome?)] {
+        [
+            (
+                "w13-moved-link",
+                .minted(
+                    link: "tcr://peer/moved?v=1&r=6YFN2TQ8ZKW3H0JA5RC1XVB7MEPD9GNT4SZQ0W8KY2FH"
+                        + "6JR3BXM5VCTQ81NPZDGA7KW4YFS2JHR0BXVC93MTQ8ZNPD5G",
+                    sentences: "peer moved: sealed for studio-mac; only that Mac can read it, "
+                        + "and it goes stale in 24 hours\npeer moved: it carries 2 address(es) "
+                        + "and nothing else: it joins nothing, grants nothing and pairs nothing")
+            ),
+            // The one pair this feature cannot serve, said with the fix in it.
+            // The sentence is the CLI's, in place of the link box.
+            (
+                "w13-moved-no-secret",
+                .refused(
+                    "moved link: this pair has no shared secret yet, so there is nothing only "
+                        + "the two of you can read; let the two Macs complete one session "
+                        + "together and try again")
+            ),
+            // Not a refusal: nothing ran. The remedy is about this Mac's own
+            // installation, which is why it may not be drawn in tcr's voice.
+            (
+                "w13-moved-failed",
+                // The remedy is not written out here: it is the one the app
+                // really prints, so a picture of this screen cannot show a fix
+                // that does not work.
+                .couldNotRun("tcr not found (searched 4 locations). " + TcrTool.overrideRemedy)
+            ),
+        ]
+    }
+
+    /// One link-sheet state, over the trusted row whose line opened it.
+    @MainActor
+    private static func renderPeerMovedSheet(
+        _ scene: (name: String, outcome: PeerMovedMint.Outcome?),
+        appearance: Appearance,
+        into directory: URL
+    ) -> Bool {
+        withDrawingAppearance(appearance.nsAppearance) {
+            let view =
+                peersPanel(snapshot: movedSheetTab, dry: false, appearance: appearance)
+                .overlay {
+                    ZStack {
+                        Color.black.opacity(sheetScrimAlpha)
+                        PeerMovedSheet(peerName: "studio-mac", outcome: scene.outcome)
+                            .background(
+                                RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel)
+                            )
+                            .shadow(radius: sheetShadowRadius)
+                    }
+                }
+                .environment(\.colorScheme, appearance == .dark ? .dark : .light)
+            return rasterise(
+                view, named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
+        }
+    }
+
+    /// The tab underneath every link sheet: the trusted Mac this one cannot
+    /// reach, whose own path line is the press that opened the sheet.
+    private static var movedSheetTab: PeersSnapshot {
+        peersSnapshot(
+            PeerListDocument(
+                finding: true, sharing: true,
+                peers: [
+                    .init(
+                        id: "tcr-4b8we1r0zp", name: "studio-mac",
+                        address: "studio-mac.local:7749", trusted: true,
+                        lastSeenMs: peerMsAgo(172_800), carries: true)
+                ],
+                name: "desk-mac"))
     }
 
     /// The tab underneath every Trust sheet: the found row the sheet was
