@@ -663,7 +663,7 @@ never whether to trust it, so a wrong entry costs a connect timeout and nothing 
 | `addr` | string (`host:port`) | the socket to open. `direct` only |
 | `node` | string (52-char base32) | the forwarding peer's pinned key. `via` only |
 | `observedAtMs` | int (unix ms) | when this Mac observed the endpoint, on its own clock, never a time taken off the wire |
-| `source` | `"paired"` \| `"hello"` \| `"beacon"` \| `"mapping"` \| `"brief"` \| `"drop"` | what taught this Mac the endpoint: the pairing or enrolment itself, a `Hello` inside a session whose key checked out, a discovery beacon matching a pinned instance, this Mac's own port mapping, a trusted peer's word about a mutual friend, or a record left at a dead drop. The last two are the weakest and are dialled last, in that order |
+| `source` | `"paired"` \| `"hello"` \| `"beacon"` \| `"mapping"` \| `"brief"` \| `"drop"` \| `"moved"` | what taught this Mac the endpoint: the pairing or enrolment itself, a `Hello` inside a session whose key checked out, a discovery beacon matching a pinned instance, this Mac's own port mapping, a trusted peer's word about a mutual friend, a record left at a dead drop, or a sealed link a person pasted (`tcr peer moved open`). The last three are the weakest: a brief is dialled after everything this Mac worked out for itself, and the last two share the bottom band, since both are sealed under a key a Mac this one has since forgotten still holds |
 
 A file written before this key holds `addrs: ["host:port", ...]` instead. It is still read: each
 string becomes a `direct` endpoint sourced `paired` and dated `addedAt`, since the legacy key
