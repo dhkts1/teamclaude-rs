@@ -474,12 +474,12 @@ enum PeersSnapshotBuilder {
             return pills
         }
         if (entry.inFlight ?? 0) > 0 {
-            // The disclosure pill, in the reserved hue. "serving you" rather
-            // than "reading": the direction is what the operator needs and the
-            // sentence under the bar carries the verb.
-            pills.append(("serving you", .disclosure))
+            // The disclosure pill, in the reserved hue. The direction is what
+            // the operator needs, said with the same word the meter below
+            // uses (`PeerLendDirection`), so the two cannot disagree.
+            pills.append((PeerLendDirection.theyLend.pillText, .disclosure))
         } else if entry.serves {
-            pills.append(("serves", .disclosure))
+            pills.append((PeerLendDirection.youLend.pillText, .disclosure))
         } else if entry.carries {
             pills.append(("carries", .info))
         }
@@ -511,6 +511,10 @@ enum PeersSnapshotBuilder {
             // depends entirely on the lender, the work stopped at an hour the
             // screen never named.
             let ends = entry.endsInSentence(now: now).map { " " + $0 } ?? ""
+            let inFlight = entry.inFlight ?? 0
+            // The same direction the pill above picked, from the same fact
+            // (`inFlight`), so the meter label and the pill cannot disagree.
+            let direction: PeerLendDirection = inFlight > 0 ? .theyLend : .youLend
             guard awake else {
                 // Rule 5: a Mac that has stopped serving renders zero, never
                 // its last value, and the offer standing is a different field
@@ -520,9 +524,9 @@ enum PeersSnapshotBuilder {
                         spent: 0,
                         sentence: "Nothing is being served while it is away, so this reads "
                             + "zero. The offer stands and starts again by itself when "
-                            + "\(title) wakes." + ends))
+                            + "\(title) wakes." + ends,
+                        label: direction.meterLabel))
             }
-            let inFlight = entry.inFlight ?? 0
             if inFlight > 0 {
                 return .lease(
                     LeaseFraction(
@@ -530,21 +534,24 @@ enum PeersSnapshotBuilder {
                         sentence: "\(PeerFormat.requests(inFlight)) on \(title)'s accounts now, "
                             + "and it has spent \(PeerFormat.share(spent)) of what it offered "
                             + "you. It reads what it serves, and your sign-in stays here."
-                            + ends))
+                            + ends,
+                        label: direction.meterLabel))
             }
             if spent <= 0 {
                 return .lease(
                     LeaseFraction(
                         spent: 0,
                         sentence: "\(title) has not served a request yet. The same offer "
-                            + "stands as for every trusted Mac." + ends))
+                            + "stands as for every trusted Mac." + ends,
+                        label: direction.meterLabel))
             }
             return .lease(
                 LeaseFraction(
                     spent: spent,
                     sentence: "\(title) has used \(PeerFormat.share(spent)) of what you offered "
                         + "it this week"
-                        + PeerFormat.ttlClause(entry.leaseTtlSeconds) + "." + ends))
+                        + PeerFormat.ttlClause(entry.leaseTtlSeconds) + "." + ends,
+                    label: direction.meterLabel))
         }
         if entry.carries, let bytes = entry.bytesPerHour, let cap = entry.byteCapPerHour {
             return .gateway(
@@ -1880,9 +1887,9 @@ struct PeersTabV4: View {
         switch text {
         case "trusted": return "Pinned on both Macs. It can carry your traffic."
         case "carries": return "Holds your encrypted bytes and can open none of them."
-        case "serves":
+        case PeerLendDirection.youLend.pillText:
             return "May serve your requests on its own accounts, and read them."
-        case "serving you":
+        case PeerLendDirection.theyLend.pillText:
             return "Serving your requests on its own accounts right now, and reading them."
         case "asleep": return "Not answering. The offer stands and resumes when it wakes."
         case "no headroom": return "It has nothing spare, so nothing was asked of it."
@@ -1906,7 +1913,7 @@ struct LeaseMeter: View {
 
     var body: some View {
         MeterBody(
-            label: "shared",
+            label: fraction.label,
             fill: fraction.spent,
             value: fraction.value,
             sentence: fraction.sentence,

@@ -113,6 +113,32 @@ final class PeerMeterTests: XCTestCase {
         XCTAssertEqual(LeaseFraction(spent: -1, sentence: "").spent, 0)
     }
 
+    /// The two words a Mac lends and a Mac borrows: a direction is always
+    /// named, never the bare word `shared`, which reads the same whichever
+    /// way the lease runs. One place decides the words, so the pill and the
+    /// meter label cannot phrase the same fact two ways.
+    func testPeerLendDirectionNamesTheWordsOnce() {
+        XCTAssertEqual(PeerLendDirection.youLend.pillText, "you lend")
+        XCTAssertEqual(PeerLendDirection.theyLend.pillText, "they lend")
+        XCTAssertEqual(PeerLendDirection.youLend.meterLabel, "you lent")
+        XCTAssertEqual(PeerLendDirection.theyLend.meterLabel, "they lent")
+    }
+
+    /// A lease meter's label says which Mac is the lender; it is never the
+    /// direction-less `shared` the tab used to draw regardless of who was
+    /// lending to whom.
+    func testALeaseFractionCarriesItsDirectionsLabel() {
+        let theyLend = LeaseFraction(
+            spent: 0.62, sentence: "", label: PeerLendDirection.theyLend.meterLabel)
+        XCTAssertEqual(theyLend.label, "they lent")
+        let youLend = LeaseFraction(
+            spent: 0.34, sentence: "", label: PeerLendDirection.youLend.meterLabel)
+        XCTAssertEqual(youLend.label, "you lent")
+        XCTAssertNotEqual(
+            theyLend.label, youLend.label,
+            "the two directions must not collapse back onto one shared word")
+    }
+
     /// An unreported ceiling draws EMPTY, not full. A zero cap read as "at
     /// cap" would paint a full bar on a Mac nobody has measured.
     func testAnUnmeasuredCeilingDrawsEmpty() {

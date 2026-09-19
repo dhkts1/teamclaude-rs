@@ -507,8 +507,12 @@ final class PeersPanelStateWiringTests: XCTestCase {
             meter.components(separatedBy: "entry.endsInSentence(now: now)").count - 1, 1,
             "the end sentence is computed more than once in the meter builder, which is four "
                 + "chances to forget it")
+        // Every arm now closes with the direction's meter label rather than
+        // the bare `))`, added alongside the two direction words
+        // (`PeerLendDirection`), so the anchor moved from `+ ends))` to
+        // `+ ends,` (the label parameter follows on the next line).
         XCTAssertEqual(
-            meter.components(separatedBy: "+ ends))").count - 1, 4,
+            meter.components(separatedBy: "+ ends,").count - 1, 4,
             "one of the four lease sentences no longer carries the end clause, so the row it "
                 + "draws never names the hour the work stops")
     }
@@ -813,6 +817,73 @@ final class PeersPanelStateWiringTests: XCTestCase {
                 "RenderSettings.requestedDirectory() != nil ? RenderStates.peerNow : Date()"),
             "the pane judges ends against the real clock under a render run, so every fixture "
                 + "lease reads as expired and scene 63 pictures three ended rows")
+    }
+
+    // MARK: - Item 9: lending and borrowing say which Mac is the lender
+
+    /// The pill says `you lend` or `they lend`, never the bare literal
+    /// `serves`/`serving you` this tab drew before: a word with no direction
+    /// in it reads the same whether this Mac is lending or borrowing, so a
+    /// direction is always named.
+    func testThePillNamesADirectionNotTheBareVerb() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let builder = try slice(
+            tab, from: "private static func pills(", to: "private static func meter(")
+        XCTAssertTrue(
+            builder.contains("PeerLendDirection.theyLend.pillText"),
+            "the pill for a Mac serving you right now no longer says `they lend`")
+        XCTAssertTrue(
+            builder.contains("PeerLendDirection.youLend.pillText"),
+            "the pill for a Mac you are lending to no longer says `you lend`")
+        XCTAssertFalse(
+            builder.contains("\"serving you\""),
+            "the bare literal `serving you` is back, so the pill and the meter can drift "
+                + "apart the way `serves`/`serving you` and a meter fixed at `shared` once did")
+        XCTAssertFalse(
+            builder.contains("\"serves\", .disclosure"),
+            "the bare literal `serves` is back on the pill")
+    }
+
+    /// The meter label is built from the SAME `PeerLendDirection` the pill
+    /// reads, on the same `inFlight` fact, so the two cannot name two
+    /// different lenders for one row.
+    func testTheMeterLabelSharesThePillsDirection() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let meter = try slice(
+            tab, from: "private static func meter(", to: "// MARK: - Reading it")
+        XCTAssertTrue(
+            meter.contains("let direction: PeerLendDirection = inFlight > 0 ? .theyLend : .youLend"),
+            "the meter no longer derives its direction from the same `inFlight` fact the "
+                + "pill uses")
+        XCTAssertEqual(
+            meter.components(separatedBy: "label: direction.meterLabel").count - 1, 4,
+            "one of the four lease sentences no longer labels its meter with the direction, "
+                + "so that row's meter can read `shared` again or the wrong direction")
+        let leaseView = try slice(
+            tab, from: "struct LeaseMeter: View {", to: "struct GatewayMeter: View {")
+        XCTAssertFalse(
+            leaseView.contains("label: \"shared\""),
+            "the lease meter view is back to a direction-less literal, and would draw one "
+                + "word for both a Mac you lend to and a Mac lending to you")
+        XCTAssertTrue(
+            leaseView.contains("label: fraction.label"),
+            "the lease meter view no longer draws the label the builder computed")
+    }
+
+    /// The tooltip switch (`pillHelp`) and the pill builder are keyed off the
+    /// same `PeerLendDirection` words, so a rename of one cannot silently
+    /// leave the other's `case` unmatched and falling to its `default: return
+    /// text` arm.
+    func testThePillTooltipIsKeyedOffTheSameDirectionWords() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let help = try slice(
+            tab, from: "private func pillHelp(_ text: String) -> String {", to: "}\n}")
+        XCTAssertTrue(
+            help.contains("case PeerLendDirection.youLend.pillText:"),
+            "the tooltip no longer matches the pill builder's `you lend` word")
+        XCTAssertTrue(
+            help.contains("case PeerLendDirection.theyLend.pillText:"),
+            "the tooltip no longer matches the pill builder's `they lend` word")
     }
 
     // MARK: - Helpers
