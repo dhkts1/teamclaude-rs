@@ -669,9 +669,12 @@ enum RenderStates {
     /// Every scene, plus the refusal banner each one draws (almost always
     /// none).
     private static var peerSceneList:
-        [(name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal)]
+        [(
+            name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal,
+            detailsOpen: Bool
+        )]
     {
-        peerStates.map { ($0.name, $0.snapshot, $0.dry, PeerRefusal()) } + [
+        peerStates.map { ($0.name, $0.snapshot, $0.dry, PeerRefusal(), false) } + [
             // A verb this panel ran was refused, and the tab is STILL THERE.
             //
             // It had no fixture, which is how the opposite shipped: a refusal
@@ -692,8 +695,55 @@ enum RenderStates {
                 false,
                 PeerRefusal(
                     message: "tcr peer share on failed (exit 1): peer share: refused, no Mac "
-                        + "is trusted yet, so there is nobody to share with")
-            )
+                        + "is trusted yet, so there is nobody to share with"),
+                false
+            ),
+            // The same refusal with the VERB carried alongside it, which is
+            // what the banner needs to lead with the act: `Sharing was
+            // refused` rather than `That was refused`, which names none of the
+            // dozen controls on this tab.
+            //
+            // The scene above keeps the verb off deliberately: it is the older
+            // shape, a refusal this build has no word for, and the two
+            // headlines have to be comparable side by side.
+            (
+                "65-peers-refused-verb",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ])),
+                false,
+                PeerRefusal(
+                    message: "tcr peer share on failed (exit 1): peer share: refused, no Mac "
+                        + "is trusted yet, so there is nobody to share with",
+                    verb: ["peer", "share", "on"]),
+                false
+            ),
+            // And with Details pressed, which is the whole point of putting
+            // the raw line behind a button: the sentence leads, the command
+            // line and the exit code are one press away, and both halves need
+            // a picture or the press is a claim about a state nobody has seen.
+            (
+                "66-peers-refused-verb-details",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true,
+                        peers: [
+                            .init(
+                                name: "studio-mac", address: "studio-mac.local:7749",
+                                lastSeenMs: peerMsAgo(2))
+                        ])),
+                false,
+                PeerRefusal(
+                    message: "tcr peer share on failed (exit 1): peer share: refused, no Mac "
+                        + "is trusted yet, so there is nobody to share with",
+                    verb: ["peer", "share", "on"]),
+                true
+            ),
         ]
     }
 
@@ -1188,21 +1238,101 @@ enum RenderStates {
                 peersSnapshot(PeerListDocument(supported: false)),
                 false
             ),
-            // A Mac with no network interface at all. There was no fixture
-            // for this state, so a Find card arm written for it would have
-            // shipped with nobody able to look at it first.
+            // A Mac with no network interface at all: no Wi-Fi, no cable.
             //
-            // Built behind `PeerListDocument` as it stands today, a
-            // `finding: false` document with no rows, since a network field
-            // has not landed on it yet in this pass. That is the same
-            // document `45-peers-off` builds, so this scene draws the same
-            // picture as that one until the field exists, a known,
-            // deliberate duplicate, not a fixture bug. One line flips it once
-            // the field lands: replace `PeerListDocument()` below with
-            // `PeerListDocument(network: false)`.
+            // `network: false` and not an absent field. Absent is every `tcr`
+            // shipped before the field, which draws the tab exactly as it
+            // always drew it; only a REPORTED false turns the Find card and
+            // the card under it into their no-network arms, which is the pair
+            // of sentences this scene exists to let somebody read.
+            //
+            // `finding: true` with it, and that is the whole point of the
+            // arm: the Find card replaces its LOOKING line, because a Mac
+            // with no interface is not looking whatever the switch says.
+            // Switched off, the off state is the operator's own doing and
+            // keeps the headline, so a fixture with the switch off would
+            // picture the old card and prove nothing.
             (
                 "64-peers-no-network",
-                peersSnapshot(PeerListDocument()),
+                peersSnapshot(PeerListDocument(finding: true, network: false)),
+                false
+            ),
+            // A trusted Mac whose live half this build could not read at all.
+            //
+            // Built through `mergingLive(.unsupported)`, the real path an
+            // older `tcr` takes, rather than by setting the flag by hand: the
+            // row then says `path not reported`, which is an absence this
+            // panel did not measure, against `w12-path-none` above, where it
+            // looked and there is no way through right now. Two absences, two
+            // sentences, and the pair only reads as deliberate side by side.
+            (
+                "w12-path-not-reported",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "studio-mac",
+                                address: "studio-mac.local:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true)
+                        ]
+                    ).mergingLive(.unsupported)),
+                false
+            ),
+            // Two trusted Macs and one of them unreachable: a dotted grey edge
+            // and a `no path now` plate beside a solid measured one.
+            //
+            // The card takes that fact from the row rather than from the
+            // figures, and until it was handed over every tile claimed a path.
+            // A scene with both pictures in one frame is the only way to see
+            // that the two are drawn differently at all.
+            (
+                "w12-mesh-one-path-missing",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 16, lossPct: 0.01)
+                                ]),
+                            .init(
+                                id: "tcr-4b8we1r0zp", name: "loft-mini",
+                                address: "10.0.1.24:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(3), carries: true),
+                        ],
+                        name: "desk-mac")),
+                false
+            ),
+            // One trusted Mac, reached directly, with a round trip and no loss
+            // figure at all.
+            //
+            // The graph says that by DROPPING the dot, so the only way to
+            // check that it is dropped is a picture of a tile that should not
+            // have one. The reading beside it reads `direct · 22 ms` and stops
+            // there rather than printing a nought nothing counted.
+            (
+                "w12-mesh-loss-unread",
+                peersSnapshot(
+                    PeerListDocument(
+                        finding: true, sharing: true,
+                        peers: [
+                            .init(
+                                id: "tcr-92hbq5t7yv", name: "attic-nuc",
+                                address: "10.0.1.31:7749", trusted: true,
+                                lastSeenMs: peerMsAgo(2), carries: true,
+                                paths: [
+                                    .init(
+                                        endpoint: "10.0.1.31:7749", kind: .direct,
+                                        rttMs: 22)
+                                ])
+                        ],
+                        name: "desk-mac")),
                 false
             ),
         ]
@@ -1324,7 +1454,10 @@ enum RenderStates {
     /// own frame, without `FleetView` needing a way to inject fixture peers.
     @MainActor
     private static func renderPeer(
-        _ scene: (name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal),
+        _ scene: (
+            name: String, snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal,
+            detailsOpen: Bool
+        ),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
@@ -1332,7 +1465,7 @@ enum RenderStates {
             rasterise(
                 peersPanel(
                     snapshot: scene.snapshot, dry: scene.dry, refusal: scene.refusal,
-                    appearance: appearance),
+                    detailsOpen: scene.detailsOpen, appearance: appearance),
                 named: "\(scene.name)-\(appearance.rawValue).png", into: directory)
         }
     }
@@ -1348,24 +1481,36 @@ enum RenderStates {
     /// The runs are ``PeerPairRun/init(pinned:)``: no process, no pipe, no
     /// subprocess of any kind, the same door ``PeerController/pinned(_:)``
     /// gives the tab underneath.
-    private static var peerSheetScenes: [(name: String, state: PeerPairState, typed: String)] {
+    private static var peerSheetScenes:
+        [(name: String, state: PeerPairState, typed: String, expiresIn: TimeInterval?)]
+    {
         [
             // 1. The knock is away and nobody over there has answered. The
             //    instance id is the argument the OTHER operator types, so the
             //    sheet prints it; this one is obviously fake, as every id in
             //    this file is.
-            ("57-trust-waiting", .asking(instance: "8f2c1ad63b0e4471"), ""),
+            //
+            //    The one scene that counts a deadline, because it is the one
+            //    state that has one: the request this panel sent expires, the
+            //    sheet says how long is left, and the running panel counts
+            //    from the press that opened it. A pinned number rather than a
+            //    live count, the rule every other figure in this file keeps,
+            //    so the PNG is the same on every run.
+            (
+                "57-trust-waiting", .asking(instance: "8f2c1ad63b0e4471"), "",
+                PeerAdmission.knockExpirySeconds - 45
+            ),
             // 2. The pivotal screen: this Mac's six digits, and an empty field
             //    for the six the other screen is showing. Trust is drawn
             //    disabled here, which is the state an operator meets first.
-            ("58-trust-compare", .comparing(code: "418902"), ""),
+            ("58-trust-compare", .comparing(code: "418902"), "", nil),
             // 3. The same screen with the other Mac's digits typed in full, so
             //    the enabled control has a picture too. Without this one the
             //    only rendered Trust button is a dim one, and "the control is
             //    reachable" would again be a claim with no fixture behind it.
-            ("59-trust-compare-typed", .comparing(code: "418902"), "418902"),
+            ("59-trust-compare-typed", .comparing(code: "418902"), "418902", nil),
             // 4. Pinned.
-            ("60-trust-done", .done(peer: "tcr-4b8we1r0zp"), ""),
+            ("60-trust-done", .done(peer: "tcr-4b8we1r0zp"), "", nil),
             // 5. Refused, in the CLI's own words. A MISMATCH, which is the
             //    one refusal this path exists to produce.
             (
@@ -1373,17 +1518,17 @@ enum RenderStates {
                 .refused(
                     "peer pair: refused, 418902 here, 418903 there. A mismatch is the one "
                         + "signal this path exists to produce, so it is not a retry prompt"),
-                "418903"
+                "418903", nil
             ),
             // 6. The operator stopped it.
-            ("62-trust-cancelled", .cancelled, ""),
+            ("62-trust-cancelled", .cancelled, "", nil),
         ]
     }
 
     /// One Trust sheet state, over the found-rows tab it opens from.
     @MainActor
     private static func renderPeerSheet(
-        _ scene: (name: String, state: PeerPairState, typed: String),
+        _ scene: (name: String, state: PeerPairState, typed: String, expiresIn: TimeInterval?),
         appearance: Appearance,
         into directory: URL
     ) -> Bool {
@@ -1399,6 +1544,7 @@ enum RenderStates {
                             peerName: "studio-mac",
                             state: scene.state,
                             compare: .constant(run.compare),
+                            expiresIn: scene.expiresIn,
                             snapshotMode: true
                         )
                         .background(RoundedRectangle(cornerRadius: V4.cardRadius).fill(Tok.panel))
@@ -1430,6 +1576,7 @@ enum RenderStates {
     @MainActor
     private static func peersPanel(
         snapshot: PeersSnapshot, dry: Bool, refusal: PeerRefusal = PeerRefusal(),
+        detailsOpen: Bool = false,
         appearance: Appearance
     ) -> some View {
         // Density: absent, which is `PanelDensityPreference`'s own
@@ -1469,7 +1616,8 @@ enum RenderStates {
                     content: {
                         PeersTabV4(
                             controller: PeerController.pinned(scene.snapshot, refusal: refusal),
-                            snapshotMode: true)
+                            snapshotMode: true,
+                            refusalDetailsOpen: detailsOpen)
                     },
                     footer: { EmptyView() }
                 )
@@ -1501,8 +1649,13 @@ enum RenderStates {
     @MainActor
     private static var controlScenes: [ControlScene] {
         [
-            // Item 1, the mockup's scenes 1a to 1c plus the transient state
-            // the lead ruled in (`wave12-ui-findings.md`, "Lead answers").
+            // The "Reachable from the internet" row, one PNG per state it can
+            // be in: the switch off, the router being asked, a mapping held,
+            // a router that never answered, that question asked again from
+            // the row's own button, and `tcr` itself refusing. Six states,
+            // six pictures, because the row draws a different sentence and a
+            // different control for each and a sentence nobody can look at is
+            // a sentence nobody reviews.
             ControlScene(
                 name: "w12-internet-off",
                 view: AnyView(PeerInternetRow(on: false, state: .off))),
@@ -1522,6 +1675,24 @@ enum RenderStates {
             ControlScene(
                 name: "w12-internet-silent",
                 view: AnyView(PeerInternetRow(on: true, state: .routerSilent))),
+            // The row's own button pressed, which is a different state from
+            // the switch being turned on: same waiting line, and the button
+            // itself now reads `Asking…` and is dim. Both facts come off the
+            // one value, so a picture of the row is the only way to see that
+            // the button changed with it.
+            ControlScene(
+                name: "w12-internet-retrying",
+                view: AnyView(PeerInternetRow(on: true, state: .retrying))),
+            // And `tcr` itself refusing or answering something this build
+            // cannot read, in its own words. Amber, like the silent router,
+            // but a different sentence: a probe that failed is not a router
+            // that said no, and drawing one as the other hides a broken `tcr`
+            // behind a sentence about somebody's hardware.
+            ControlScene(
+                name: "w12-internet-unreadable",
+                view: AnyView(
+                    PeerInternetRow(
+                        on: true, state: .unreadable("peer reach: no reply from the router")))),
             // Item 2, the mockup's scenes 2a to 2c. The third is the one a
             // plain two-option toggle would hide: switched back to serve, and
             // the borrower's old key still winding down on its own clock.
