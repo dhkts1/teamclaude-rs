@@ -19,7 +19,7 @@ final class PeerPathLineTests: XCTestCase {
         let lines = PeerFormat.pathLines([path(rttMs: 14, lossPct: 0)])
         XCTAssertEqual(lines.count, 1)
         XCTAssertEqual(lines[0].tone, .plain)
-        XCTAssertEqual(lines[0].text, "192.168.1.24:7749 · 14 ms · no loss")
+        XCTAssertEqual(lines[0].text, "tried first · 192.168.1.24:7749 · 14 ms · no loss")
     }
 
     /// 4b: a forwarded path is amber, and it NAMES the forwarder rather than
@@ -29,7 +29,7 @@ final class PeerPathLineTests: XCTestCase {
             [path(endpoint: "tcr-92hbq5t7yv", kind: .via, rttMs: 96, lossPct: 0.06)],
             names: ["tcr-92hbq5t7yv": "loft-mini"])
         XCTAssertEqual(lines[0].tone, .warn)
-        XCTAssertEqual(lines[0].text, "via loft-mini · 96 ms · 6% lost")
+        XCTAssertEqual(lines[0].text, "tried first · via loft-mini · 96 ms · 6% lost")
     }
 
     /// A forwarder this Mac has no name for keeps its id. Inventing a name
@@ -37,7 +37,7 @@ final class PeerPathLineTests: XCTestCase {
     func testAnUnnamedForwarderKeepsItsId() {
         let lines = PeerFormat.pathLines(
             [path(endpoint: "tcr-92hbq5t7yv", kind: .via, rttMs: 96, lossPct: 0)])
-        XCTAssertEqual(lines[0].text, "via tcr-92hbq5t7yv · 96 ms · no loss")
+        XCTAssertEqual(lines[0].text, "tried first · via tcr-92hbq5t7yv · 96 ms · no loss")
     }
 
     /// The 3 per cent line below, checked on both sides of it rather
@@ -72,7 +72,7 @@ final class PeerPathLineTests: XCTestCase {
     /// figures are missing, which is not the same as having no path.
     func testAnUnmeasuredPathIsNotTheNoPathState() {
         let lines = PeerFormat.pathLines([path()])
-        XCTAssertEqual(lines[0].text, "192.168.1.24:7749 · not measured")
+        XCTAssertEqual(lines[0].text, "tried first · 192.168.1.24:7749 · not measured")
         XCTAssertEqual(lines[0].tone, .plain)
         XCTAssertNotEqual(lines[0].text, "no path right now")
     }
@@ -84,7 +84,27 @@ final class PeerPathLineTests: XCTestCase {
             path(endpoint: "10.0.1.24:7749"),
         ])
         XCTAssertEqual(lines.count, 2)
-        XCTAssertTrue(lines[0].text.hasPrefix("192.168.1.24:7749"))
+        XCTAssertTrue(lines[0].text.hasPrefix("tried first · 192.168.1.24:7749"))
         XCTAssertTrue(lines[1].text.hasPrefix("10.0.1.24:7749"))
+    }
+
+    /// Nothing on the wire says which path a connection is actually using, so
+    /// the first line says only that it is the one tried first, never `in
+    /// use`. A row with a single path still gets the prefix: it is still the
+    /// path dialled first, even though it is also the only one.
+    func testOnlyTheFirstLineSaysTriedFirst() {
+        let lines = PeerFormat.pathLines([
+            path(endpoint: "192.168.1.24:7749"),
+            path(endpoint: "10.0.1.24:7749"),
+        ])
+        XCTAssertTrue(lines[0].text.hasPrefix("tried first · "))
+        XCTAssertFalse(lines[1].text.hasPrefix("tried first · "))
+        XCTAssertFalse(lines[1].text.contains("tried first"))
+    }
+
+    /// The no-path line is an absence, not a path: it never claims to be
+    /// tried first.
+    func testTheNoPathLineIsNotLabelledTriedFirst() {
+        XCTAssertFalse(PeerFormat.pathLines([])[0].text.contains("tried first"))
     }
 }
