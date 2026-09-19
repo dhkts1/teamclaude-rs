@@ -478,7 +478,15 @@ enum PeersSnapshotBuilder {
             lend: entry.lend,
             // Newest first, as the serving process ordered them: the first
             // line is the path a dial would try first.
-            pathLines: PeerFormat.pathLines(entry.paths, names: names, absence: absence),
+            //
+            // A measured absence here is the one line on the tab with an act
+            // behind it, and the act names this Mac by the id the wire
+            // carries. A row read from a `tcr` that reports none is drawn as
+            // the plain readout it was: offering a press that can only come
+            // back refused is the menu-with-no-address case `rowMenu` already
+            // refuses to draw.
+            pathLines: PeerFormat.pathLines(
+                entry.paths, names: names, absence: absence, answerable: entry.id != nil),
             hasPath: !entry.paths.isEmpty,
             pathRttMs: entry.paths.first?.rttMs,
             pathLossPct: entry.paths.first?.lossPct,
@@ -882,6 +890,60 @@ final class PeerController: ObservableObject {
         }
     }
 
+    /// Mint one link for one trusted Mac, and hand back what the verb
+    /// answered, classified.
+    ///
+    /// Not ``capture(_:into:)``, and the difference is what the sheet has to
+    /// draw. That one reports two things, text or a failure, and it builds the
+    /// failure by wrapping the argv around whatever was said, so a refusal
+    /// `tcr` explained and a run this app could not make arrive as the same
+    /// case with the same shape. This screen has to tell those apart, because
+    /// one of them has a remedy in it and the other is about this Mac's own
+    /// installation. It also has to show the LINK alone, in a box a person
+    /// copies from, rather than the link with two sentences stuck to it.
+    ///
+    /// The peer id rides argv, the same as every other verb's subject: it is
+    /// what `tcr peer ls` prints and what this row already draws. Nothing
+    /// sealed goes near argv, and nothing sealed comes back except on stdout.
+    func mintMovedLink(peer: String, into sink: @escaping (PeerMovedMint.Outcome) -> Void) {
+        guard !isPinned else { return }
+        let arguments = PeerCommand.moved(mint: peer)
+        let key = arguments.joined(separator: " ")
+        guard !pending.contains(key) else { return }
+        pending.insert(key)
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Self.mint(arguments: arguments)
+            }.value
+            guard let self else { return }
+            self.pending.remove(key)
+            sink(outcome)
+        }
+    }
+
+    /// Blocking, always called off the main actor. `tcr`'s own exit code and
+    /// both its streams, classified by ``PeerMovedMint``: the sentence a
+    /// person reads on this screen is the one the same command prints in a
+    /// terminal.
+    private nonisolated static func mint(arguments: [String]) -> PeerMovedMint.Outcome {
+        switch TcrTool.resolve() {
+        case .failure(let notFound):
+            return .couldNotRun(
+                "tcr not found (searched \(notFound.searched.count) locations). "
+                    + TcrTool.overrideRemedy)
+        case .success(let executable):
+            do {
+                let output = try TcrTool.run(executable: executable, arguments: arguments)
+                return PeerMovedMint.outcome(
+                    exitCode: output.exitCode,
+                    stdout: String(data: output.stdout, encoding: .utf8) ?? "",
+                    stderr: output.stderr)
+            } catch {
+                return .couldNotRun(error.localizedDescription)
+            }
+        }
+    }
+
     /// Put a failure this panel produced OUTSIDE a verb onto the tab, in the
     /// same place `tcr`'s own refusals land. One writer, so a message cannot
     /// be drawn in two different ways.
@@ -1008,8 +1070,9 @@ final class PeerController: ObservableObject {
     /// the tab nothing; that is what makes this a second call rather than a
     /// wider first one.
     private nonisolated static func readLive(executable: URL) -> PeerListDocument.LivePeersRead {
-        guard let output = try? TcrTool.run(
-            executable: executable, arguments: PeerCommand.liveStatus)
+        guard
+            let output = try? TcrTool.run(
+                executable: executable, arguments: PeerCommand.liveStatus)
         else { return .unsupported }
         guard output.exitCode == 0 else { return .unsupported }
         return (try? PeerListDocument.decodeLivePeers(output.stdout)) ?? .unsupported
@@ -1138,6 +1201,17 @@ struct PeersTabV4: View {
     /// The Block that was chosen, while the confirm is up. One value, so two
     /// rows cannot arm two bans.
     @State private var blocking: PeerBlockTarget?
+    /// The row whose link sheet is up, and what the mint answered. Held here
+    /// beside the Trust sheet's own pair and for the same reason: two rows
+    /// cannot open two sheets, and a second press behind an open one would
+    /// start a second run with nowhere to draw it.
+    ///
+    /// `nil` on the outcome while the sheet is up means the run has not
+    /// answered yet, which is what the sheet draws: opening first and filling
+    /// in is what keeps a slow `tcr` from reading as a press that did nothing
+    /// (the join key sheet's own precedent).
+    @State private var minting: PeerRowModel?
+    @State private var minted: PeerMovedMint.Outcome?
     /// Whether the refusal banner is showing the raw line tcr printed. Closed
     /// on every new refusal, because the sentence is what the next one is
     /// about.
@@ -1257,6 +1331,15 @@ struct PeersTabV4: View {
             } else {
                 Color.clear.onAppear { trusting = nil }
             }
+        }
+        // The second sheet on this tab, and the two can never be up together:
+        // Trust opens from a found row's trailing button and this one from a
+        // trusted row's path line, and each holds the only row it is open for.
+        .sheet(item: $minting) { row in
+            PeerMovedSheet(
+                peerName: row.title,
+                outcome: minted,
+                onClose: { minting = nil })
         }
         // Block asks once, and the question names the address rather than the
         // name: the name is a string the other Mac chose, and the ban is on
@@ -1647,11 +1730,15 @@ struct PeersTabV4: View {
                 // whose live half this build could not read, which is why the
                 // row above it is unchanged rather than reworded.
                 ForEach(row.pathLines, id: \.self) { line in
-                    Text(line.text)
-                        .font(V4.font(V4.muteSize))
-                        .foregroundStyle(pathTint(line.tone))
-                        .lineLimit(1)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    if line.actionable {
+                        pathControl(row, line: line)
+                    } else {
+                        Text(line.text)
+                            .font(V4.font(V4.muteSize))
+                            .foregroundStyle(pathTint(line.tone))
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
         }
@@ -1670,6 +1757,53 @@ struct PeersTabV4: View {
         if let refusal = PeerGraphLauncher.open() {
             controller.report(failure: refusal)
         }
+    }
+
+    /// The line that states the problem, as the press that answers it.
+    ///
+    /// # Why this line and not a button beside the name
+    ///
+    /// The trailing column of a trusted row is full: two pills, the freshness
+    /// readout and the refresh dot, and `V4Row` clips the LEADING label to pay
+    /// for anything added there, which is the measurement `rowMenu` records in
+    /// full. So a fourth control there costs the peer's name. The readout that
+    /// already says what is wrong costs nothing and is where the person is
+    /// looking, and it is the shape `freshnessDot` above already has: a
+    /// reading, and the control that answers it.
+    ///
+    /// Drawn in the ordinary sub-line ink rather than the absence's dimmer
+    /// one. The absent tint says "nothing here", which is the truth about a
+    /// readout and a lie about a control: a pressable line in the disabled
+    /// colour reads as a line that cannot be pressed.
+    ///
+    /// A render run draws it and cannot press it: the press is what starts a
+    /// subprocess, and `--render-states` writes PNGs without one.
+    private func pathControl(_ row: PeerRowModel, line: PeerPathLine) -> some View {
+        Button {
+            startMinting(row)
+        } label: {
+            Text(line.text)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(Tok.mute)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(minting != nil)
+        .accessibilityLabel("Send \(row.title) a link to this Mac")
+        .help(
+            "Makes one link for \(row.title), sealed so only that Mac can read it. Send it in "
+                + "whatever you already use to talk to whoever is at that Mac.")
+    }
+
+    /// Open the sheet first, then fill it in, so a slow mint reads as a screen
+    /// that is working rather than a press that did nothing.
+    private func startMinting(_ row: PeerRowModel) {
+        guard !snapshotMode else { return }
+        minted = nil
+        minting = row
+        controller.mintMovedLink(peer: row.id) { minted = $0 }
     }
 
     /// Ordinary, worth a look, or the absence itself. Colour is the second
@@ -2341,6 +2475,133 @@ struct PeerActionButton: View {
         .disabled(!enabled)
         .accessibilityLabel(title)
         .help(help)
+    }
+}
+
+// MARK: - The link sheet
+
+/// One link for one Mac, and the two things a person is entitled to know
+/// before they paste it into a chat window.
+///
+/// A pure function of a ``PeerMovedMint/Outcome``, the same shape
+/// ``PeerTrustSheet`` is of a pairing state, and for the same two reasons: a
+/// fixture can draw every state it has, and a test can build one without a
+/// subprocess. Everything that runs a process is in ``PeerController``.
+///
+/// # Copy is the whole interaction
+///
+/// There is no Send. This app does not know which chat the two people use, and
+/// a button that opened one would be picking for them. So the link is shown in
+/// full, selectable, and Copy puts it on the pasteboard: the same answer the
+/// join key sheet already gives for the other string a person has to carry to
+/// another Mac.
+///
+/// # What is said here and what is quoted
+///
+/// The sentence about what the message carries is this panel's, because it is
+/// about the chat window the person is about to use and `tcr` knows nothing
+/// about that. Everything else under the link is quoted from the run: how long
+/// it stays good, how many addresses it holds, and what it does not do are
+/// the CLI's own printed sentences, unedited. Saying any of them again in
+/// Swift would be a second copy free to drift from the one a person reads in a
+/// terminal.
+struct PeerMovedSheet: View {
+    let peerName: String
+    /// What the mint answered, or `nil` while it is still running.
+    let outcome: PeerMovedMint.Outcome?
+    var onClose: () -> Void = {}
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: V4.buttonGap) {
+            Text(title)
+                .font(V4.font(V4.summarySize, .semibold))
+                .foregroundStyle(Tok.ink)
+                .fixedSize(horizontal: false, vertical: true)
+
+            switch outcome {
+            case nil:
+                sentence("Sealing one for \(peerName).", tint: Tok.inkDim)
+            case .minted(let link, let sentences):
+                sentence(
+                    "Send it however you already talk to whoever is at \(peerName). Only "
+                        + "\(peerName) can read it.", tint: Tok.inkDim)
+                linkBox(link)
+                sentence(
+                    "The message carries no address and no name in the clear. Anyone else who "
+                        + "sees it, including the chat service, sees only those characters.",
+                    tint: Tok.mute)
+                if !sentences.isEmpty {
+                    sentence(sentences, tint: Tok.mute)
+                }
+            case .refused(let said):
+                // `tcr`'s own words, in place of the link box. The pair with
+                // no shared secret is the one refusal a person can act on and
+                // the remedy is inside the sentence, so it is not summarised.
+                sentence(said, tint: Tok.near)
+            case .couldNotRun(let said):
+                sentence(said, tint: Tok.near)
+            }
+
+            HStack(spacing: V4.buttonGap) {
+                Spacer(minLength: 0)
+                PeerActionButton(
+                    title: "Done", systemImage: nil,
+                    help: "Closes this. The link stays good whether this is open or not."
+                ) { onClose() }
+                if case .minted(let link, _) = outcome {
+                    PeerActionButton(
+                        title: "Copy link", systemImage: nil,
+                        help: "Puts the link on the pasteboard. Nothing else goes with it."
+                    ) {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(link, forType: .string)
+                    }
+                }
+            }
+        }
+        .padding(.vertical, V4.cardPaddingV)
+        .padding(.horizontal, V4.cardPaddingH)
+        .frame(width: V4.panelWidth, alignment: .leading)
+        .background(Tok.panel)
+    }
+
+    /// The headline says which of the three screens this is, so a refusal is
+    /// never read as a link that has not arrived yet.
+    private var title: String {
+        switch outcome {
+        case nil, .minted: return "A link for \(peerName)"
+        case .refused: return "No link for \(peerName)"
+        case .couldNotRun: return "That did not run"
+        }
+    }
+
+    /// The link itself: whole, wrapped rather than cut, and selectable, so it
+    /// can be taken by hand from a Mac whose pasteboard is being used for
+    /// something else. Never truncated: half a link pasted into a chat is the
+    /// cut-short refusal at the other end.
+    private func linkBox(_ link: String) -> some View {
+        Text(link)
+            .font(V4.mono(V4.monoSize))
+            .foregroundStyle(Tok.ink)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, V4.yesBlockPaddingV)
+            .padding(.horizontal, V4.yesBlockPaddingH)
+            .background(
+                RoundedRectangle(cornerRadius: V4.buttonRadius)
+                    .fill(Tok.ink.opacity(V4.buttonFillAlpha))
+            )
+            .accessibilityLabel("A link for \(peerName)")
+    }
+
+    private func sentence(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(V4.font(V4.dimSize))
+            .foregroundStyle(tint)
+            .fixedSize(horizontal: false, vertical: true)
+            .lineSpacing(V4.lineSpacing(V4.dimSize))
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 

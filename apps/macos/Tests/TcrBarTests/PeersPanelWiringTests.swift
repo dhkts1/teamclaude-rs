@@ -486,6 +486,94 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "somebody who is on no network")
     }
 
+    // MARK: - The line that answers itself
+
+    /// The absent line is a control where it can be answered, and a readout
+    /// everywhere else, and the row decides which from FACTS.
+    ///
+    /// The view may not work this out from the words. A sentence compared
+    /// against a copy of itself held in a view is the second place one string
+    /// has to stay spelled the same, and the one that goes stale is the one
+    /// nobody is reading.
+    func testTheAbsentPathLineIsAControlOnlyWhereItCanBeAnswered() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let builder = try slice(
+            tab, from: "private static func row(", to: "private static func pills(")
+        XCTAssertTrue(
+            builder.contains("answerable: entry.id != nil"),
+            "the row no longer says whether its absent line can be answered, so either every "
+                + "row offers the act or none does, and a row whose wire carried no id offers "
+                + "a press that can only come back refused")
+        let card = try slice(
+            tab, from: "private func peerCard(_ row: PeerRowModel) -> some View {",
+            to: "/// Serve the mesh as a page")
+        XCTAssertTrue(
+            card.contains("if line.actionable {") && card.contains("pathControl(row, line: line)"),
+            "the path lines are all drawn as plain text again, so the one line with an act "
+                + "behind it is a readout and the feature has no surface at all")
+        XCTAssertFalse(
+            card.contains("no path right now"),
+            "the row decides what this line is by reading its own words, which is a second "
+                + "copy of a sentence PeerFormat owns")
+    }
+
+    /// The press starts the mint for THAT row's Mac, and the id it hands over
+    /// is the row's own.
+    ///
+    /// A sheet opened from one row and minting for another is a link sealed
+    /// for the wrong Mac: it would open against nothing at the far end, and
+    /// the refusal there names nobody, so neither person could tell what went
+    /// wrong.
+    func testTheLinkSheetMintsForTheRowItWasOpenedFrom() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("controller.mintMovedLink(peer: row.id)"),
+            "the press no longer mints for the row it came from")
+        XCTAssertTrue(
+            tab.contains("PeerCommand.moved(mint: peer)"),
+            "the controller builds the mint argv by hand instead of through the one factory "
+                + "that writes it")
+        XCTAssertTrue(
+            tab.contains(".sheet(item: $minting) { row in"),
+            "nothing presents the link sheet, so the press sets a value and no sheet appears")
+        let start = try slice(
+            tab, from: "private func startMinting(_ row: PeerRowModel) {",
+            to: "/// Ordinary, worth a look")
+        XCTAssertTrue(
+            start.contains("guard !snapshotMode else { return }"),
+            "a render run starts a subprocess: --render-states writes PNGs and runs nothing")
+        XCTAssertTrue(
+            start.contains("minted = nil"),
+            "the sheet opens holding the LAST run's answer, so one row's link is drawn under "
+                + "another row's name until the new run lands")
+    }
+
+    /// Three screens, and the one with a Copy button is the one with a link.
+    ///
+    /// A refused mint drawn as an empty box with Copy under it is a press that
+    /// puts nothing on the pasteboard and says nothing about why, which is the
+    /// same defect the join key sheet was built to close.
+    func testTheLinkSheetDrawsARefusalRatherThanAnEmptyBox() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let sheet = try slice(
+            tab, from: "struct PeerMovedSheet: View {", to: "// MARK: - The Trust sheet")
+        XCTAssertTrue(
+            sheet.contains("case .refused(let said):") && sheet.contains("case .couldNotRun(let said):"),
+            "the sheet stopped drawing one of the two ways a mint does not produce a link, so "
+                + "one of them is a sheet with nothing in it")
+        XCTAssertTrue(
+            sheet.contains("if case .minted(let link, _) = outcome {"),
+            "Copy is offered whether or not there is a link to copy")
+        XCTAssertTrue(
+            sheet.contains("NSPasteboard.general.setString(link, forType: .string)"),
+            "the sheet has no Copy: a link is a string somebody has to paste into a chat "
+                + "window, and it is not selectable from a screenshot")
+        XCTAssertFalse(
+            sheet.contains("goes stale") || sheet.contains("24 hours"),
+            "the sheet spells out how long a link stays good, which tcr already prints: two "
+                + "spellings of one number is the one that drifts")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
