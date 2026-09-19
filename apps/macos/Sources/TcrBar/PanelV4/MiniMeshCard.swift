@@ -173,12 +173,15 @@ struct MiniMeshCard: View {
 
     private func pillLabel(_ pill: PeerMeshLayout.Pill) -> some View {
         VStack(alignment: .leading, spacing: 1) {
+            // The sizes the plate was MEASURED at. Written here as literals
+            // they were a second copy of the two numbers that decide whether
+            // the text fits the box it is drawn in.
             Text(pill.reading)
-                .font(.system(size: 10))
+                .font(.system(size: PeerMeshLayout.pillReadingSize))
                 .foregroundStyle(Tok.ink)
             if let via = pill.via {
                 Text(via)
-                    .font(.system(size: 9))
+                    .font(.system(size: PeerMeshLayout.pillViaSize))
                     .foregroundStyle(Tok.mute)
             }
         }

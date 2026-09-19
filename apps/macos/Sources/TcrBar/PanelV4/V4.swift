@@ -424,7 +424,13 @@ enum V4 {
     /// `pillLabel` draws inside `pill.frame`, narrowed by this on the leading
     /// and trailing edges combined so the reading and via-line never touch
     /// the pill's own rounded border.
-    static let meshPillLabelInset: CGFloat = 20
+    ///
+    /// Bound to the layout's own value rather than written twice: the plate is
+    /// now sized to fit its text PLUS this gap, so a second copy here could
+    /// make the box and the words inside it disagree about how much room there
+    /// is, which is the shape of the truncation that made every unmeasured
+    /// reading print `not m…`.
+    static let meshPillLabelInset: CGFloat = PeerMeshLayout.pillLabelInset
 
     /// The gap between the lines of a pairing request's card: the sentence,
     /// the address, what Accept does, and the row of controls under them.
