@@ -2701,7 +2701,7 @@ enum RenderStates {
     ///    applied to every tag, this row shows it.
     ///  - an ungrouped row, so the scene also carries a tag-less baseline.
     ///
-    /// The pass condition is that the parked tags read as held back — dim
+    /// The pass condition is that the parked tags read as held back: dim
     /// wash, pause glyph — while `DEV` beside them stays at full strength and
     /// still identifiable by colour. A tag that dims into illegibility fails
     /// this scene as surely as one that does not dim at all.
