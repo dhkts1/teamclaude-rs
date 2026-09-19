@@ -39,6 +39,8 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+pub mod network_fact;
+
 use crate::build_info::BuildInfo;
 use crate::probe::ProbeStatus;
 use crate::stats::{AccountSnapshot, GateReason, QuotaState, StatsSnapshot};
@@ -1565,6 +1567,12 @@ pub struct PeerLsJson {
     /// Whether this Mac may be reached from off its own LAN: the peers file's
     /// own setting, not a reachability test.
     pub internet: bool,
+    /// Whether this Mac is on a network at all right now: at least one
+    /// non-loopback interface up with a usable address. See
+    /// [`network_fact::network_present`] for the rule. `false` is the fact
+    /// that turns "Looking" into "No network" on the Peers tab; old readers
+    /// that do not know this key yet simply ignore it.
+    pub network: bool,
     /// Every account that has an exit lock, keyed by the label a `--scope`
     /// names it by.
     pub exits: std::collections::BTreeMap<String, PeerExitJson>,

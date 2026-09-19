@@ -1747,6 +1747,7 @@ async fn run_peer(args: peer_cli::PeerArgs) -> anyhow::Result<()> {
                     peers: masked,
                     lent_to,
                     internet: file.internet,
+                    network: status::network_fact::network_present(),
                     exits,
                     pending_count: pending.len(),
                     pending,
