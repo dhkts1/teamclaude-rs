@@ -941,9 +941,11 @@ fn a_brief_endpoint_is_dialled_after_a_paired_one() {
 /// peer still holds, so it is the weakest evidence on the list and it sorts
 /// after everything, the brief included.
 ///
-/// Asserted as the WHOLE expected order over all six sources rather than as one
-/// comparison between two: a single "drop is after brief" assertion passes just
-/// as happily if the new band swallowed one of the four above it.
+/// Asserted as the WHOLE expected order over the six sources this row is built
+/// from rather than as one comparison between two: a single "drop is after
+/// brief" assertion passes just as happily if the new band swallowed one of the
+/// four above it. The seventh source, a pasted link, shares the drop's band and
+/// is asserted where it is written, in `tests/peer_moved.rs`.
 ///
 /// The recency key is deliberately set against the source key here: the drop
 /// endpoint is the newest on the row and the paired one the oldest, so an order
@@ -963,6 +965,7 @@ fn a_drop_endpoint_sorts_below_a_brief() {
             EndpointSource::Beacon => 9_724,
             EndpointSource::Brief => 9_725,
             EndpointSource::Drop => 9_726,
+            EndpointSource::Moved => 9_727,
         }
     };
     let addr_of = |source: EndpointSource| -> SocketAddr {

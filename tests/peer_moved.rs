@@ -18,6 +18,10 @@
 use std::net::SocketAddr;
 
 use tcr_peer_wire::{decode_bytes, PeerId};
+use teamclaude_rs::peer::config::{
+    Allow, Endpoint, EndpointSource, PeerRow, MAX_ENDPOINTS_PER_PEER,
+};
+use teamclaude_rs::peer::discovery::{admissible_moved_endpoints, MAX_MOVED_ENDPOINTS_PER_PEER};
 use teamclaude_rs::peer::moved::{
     open_link, open_link_field, seal_link, seal_link_field, MintRefusal, MovedKeys, MovedRecord,
     MovedRefusal, MAX_MOVED_AGE, MOVED_VERSION,
@@ -389,6 +393,270 @@ fn a_link_cut_short_by_a_chat_app_is_refused_as_a_cut_paste() {
             "{len} bytes is shorter than any link, so it is a cut paste"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Where an address off a link lands on the row, and how hard it is believed
+// ---------------------------------------------------------------------------
+
+/// A row with no endpoints, for the two tests about what a link may write.
+fn pinned_row(node: PeerId) -> PeerRow {
+    PeerRow {
+        node,
+        label: "studio-mac".to_string(),
+        endpoints: Vec::new(),
+        added_at: ROW_MS,
+        rendezvous_secret: None,
+        sees_us_at: None,
+        allow: Allow::default(),
+        lend: Vec::new(),
+    }
+}
+
+/// A clock that is not the machine's, so these two tests read the same on every
+/// run. 2026-01-01T00:00:00Z.
+const ROW_MS: i64 = 1_767_225_600_000;
+
+/// An address in a documentation range, one per port.
+fn row_addr(port: u16) -> SocketAddr {
+    address(&format!("198.51.100.7:{port}"))
+}
+
+/// **An address off a pasted link never evicts one a handshake proved, never
+/// re-dates it, and never rewrites it as a link's.**
+///
+/// A link is the weakest thing that can reach the endpoint list, beside a
+/// dead-drop record: it is sealed under a key a Mac this one has since
+/// forgotten still holds, and the operator's confirmation authorizes the write
+/// rather than the address. So it gets the three rules the other weak bands
+/// get, with its own cap, and this says they hold for the new band rather than
+/// only for the two older ones.
+///
+/// Four claims, each a different way the rules could be wrong:
+///
+/// 1. a full row admits nothing at all, however many addresses the link
+///    carried;
+/// 2. a locator the row holds from a stronger source is refused, not re-dated
+///    and not rewritten as a link's, which is invisible in a count of
+///    endpoints;
+/// 3. a locator the row already holds from a link is refreshed, evicting
+///    nothing;
+/// 4. the third new address off a link is refused while the row still has free
+///    slots, which is the cap firing and not the row's own eight.
+///
+/// Watched red, one mutation at a time: pointing
+/// `discovery::admissible_moved_endpoints` at `MAX_ENDPOINTS_PER_PEER` instead
+/// of its own cap fails claim 4, and pointing it at `EndpointSource::Drop`
+/// fails claim 3, because a locator held as a link stops counting as this
+/// band's own and is refused instead of refreshed.
+#[test]
+fn a_moved_endpoint_never_evicts_one_a_handshake_proved() {
+    let peer = peer_id(0xA1);
+
+    // The four a record may carry, so the caps below are what bounds the write
+    // rather than the size of the list handed in.
+    let carried: Vec<Endpoint> = (9_800_u16..9_804)
+        .map(|port| Endpoint::direct(row_addr(port), ROW_MS + 1_000, EndpointSource::Moved))
+        .collect();
+
+    // 1. A full row: two endpoints the pairing proved and six a session did.
+    let mut full = pinned_row(peer);
+    full.observe_endpoint(Endpoint::direct(
+        row_addr(9_700),
+        ROW_MS,
+        EndpointSource::Paired,
+    ));
+    full.observe_endpoint(Endpoint::direct(
+        row_addr(9_701),
+        ROW_MS,
+        EndpointSource::Paired,
+    ));
+    for port in (9_702_u16..).take(MAX_ENDPOINTS_PER_PEER - 2) {
+        full.observe_endpoint(Endpoint::direct(
+            row_addr(port),
+            ROW_MS,
+            EndpointSource::Hello,
+        ));
+    }
+    assert_eq!(
+        full.endpoints.len(),
+        MAX_ENDPOINTS_PER_PEER,
+        "the row this claim needs is a full one: {:?}",
+        full.endpoints
+    );
+    assert!(
+        admissible_moved_endpoints(&full, &carried).is_empty(),
+        "a full row admits nothing off a link: every slot holds an address this Mac \
+         proved, and a link's endpoint carries this Mac's clock, so unbounded it would \
+         lead them all"
+    );
+    let proven_count = full
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.source == EndpointSource::Paired)
+        .count();
+    assert_eq!(
+        proven_count, 2,
+        "the two the pairing proved are still on the row, unchanged: {:?}",
+        full.endpoints
+    );
+
+    // 2. A locator the row already holds from a stronger source.
+    let mut held_stronger = pinned_row(peer);
+    held_stronger.observe_endpoint(Endpoint::direct(
+        row_addr(9_700),
+        ROW_MS,
+        EndpointSource::Paired,
+    ));
+    let same_locator = vec![Endpoint::direct(
+        row_addr(9_700),
+        ROW_MS + 1_000,
+        EndpointSource::Moved,
+    )];
+    assert!(
+        admissible_moved_endpoints(&held_stronger, &same_locator).is_empty(),
+        "a locator the pairing proved is left alone: refreshing it would re-date it and \
+         rewrite its source as the weakest band there is"
+    );
+
+    // 3. The same locator, already held from a link: refreshed, evicting
+    //    nothing.
+    let mut held_as_moved = pinned_row(peer);
+    held_as_moved.observe_endpoint(Endpoint::direct(
+        row_addr(9_900),
+        ROW_MS,
+        EndpointSource::Moved,
+    ));
+    let refresh = vec![Endpoint::direct(
+        row_addr(9_900),
+        ROW_MS + 1_000,
+        EndpointSource::Moved,
+    )];
+    let admissible = admissible_moved_endpoints(&held_as_moved, &refresh);
+    assert_eq!(
+        admissible, refresh,
+        "an address this row already holds from a link is refreshed rather than refused, \
+         which is what makes a second paste of the same link cost nothing: {admissible:?}"
+    );
+
+    // 4. The cap, with room to spare on the row itself.
+    let mut at_cap = pinned_row(peer);
+    for port in (9_910_u16..).take(MAX_MOVED_ENDPOINTS_PER_PEER) {
+        at_cap.observe_endpoint(Endpoint::direct(
+            row_addr(port),
+            ROW_MS,
+            EndpointSource::Moved,
+        ));
+    }
+    assert!(
+        at_cap.endpoints.len() < MAX_ENDPOINTS_PER_PEER,
+        "the row still has free slots, so this claim is the cap and not the row's own \
+         limit: {:?}",
+        at_cap.endpoints
+    );
+    let next = vec![Endpoint::direct(
+        row_addr(9_920),
+        ROW_MS + 1_000,
+        EndpointSource::Moved,
+    )];
+    assert!(
+        admissible_moved_endpoints(&at_cap, &next).is_empty(),
+        "at most {MAX_MOVED_ENDPOINTS_PER_PEER} of the eight slots are an address off a \
+         link, so the rest stay with what this Mac proved"
+    );
+
+    // And the cap really is what a whole record runs into: four addresses at
+    // once onto an empty row writes two.
+    let empty = pinned_row(peer);
+    assert_eq!(
+        admissible_moved_endpoints(&empty, &carried).len(),
+        MAX_MOVED_ENDPOINTS_PER_PEER,
+        "one link carrying four addresses writes at most the cap"
+    );
+}
+
+/// **An address off a link is dialled behind a friend's word and beside a
+/// record off a dead drop.**
+///
+/// The two sealed bands rank together because they are the same evidence: a key
+/// derived from the pair's rendezvous secret, which a Mac this one has since
+/// forgotten still holds. Below a brief, which came over a session that proved
+/// a static key, from a Mac this node pinned, about a Mac it also pinned.
+///
+/// Asserted as the whole order over all seven sources rather than as one
+/// comparison: "a link sorts after a brief" passes just as happily if the new
+/// band swallowed one of the four above it.
+///
+/// The link's endpoint is the NEWEST on the row, which is what gives this test
+/// teeth in both directions. Recency is the last key, so a link that wrongly
+/// tied the brief's band would be dialled BEFORE the brief, and one given a
+/// band of its own below the drop would be dialled after it. Either way the
+/// order asserted below is the one that breaks.
+///
+/// Watched red: giving [`EndpointSource::Moved`] the brief's rank (`2`) in
+/// `probe::source_rank` moves the link's address from index 5 to index 4, and
+/// giving it a band of its own (`4`) swaps it with the drop's.
+#[test]
+fn a_moved_endpoint_sorts_behind_a_brief_and_beside_a_drop() {
+    use teamclaude_rs::peer::probe::{self, PathTable};
+
+    let port_of = |source: EndpointSource| -> u16 {
+        match source {
+            EndpointSource::Paired => 9_721,
+            EndpointSource::Hello => 9_722,
+            EndpointSource::Mapping => 9_723,
+            EndpointSource::Beacon => 9_724,
+            EndpointSource::Brief => 9_725,
+            EndpointSource::Drop => 9_726,
+            EndpointSource::Moved => 9_727,
+        }
+    };
+    let addr_of = |source: EndpointSource| -> SocketAddr { row_addr(port_of(source)) };
+
+    // Newest first, which is the order the source key has to overturn, and the
+    // link's address leads it.
+    let newest_first = [
+        EndpointSource::Moved,
+        EndpointSource::Drop,
+        EndpointSource::Brief,
+        EndpointSource::Beacon,
+        EndpointSource::Mapping,
+        EndpointSource::Hello,
+        EndpointSource::Paired,
+    ];
+    let mut row = pinned_row(peer_id(0x16));
+    row.endpoints = newest_first
+        .iter()
+        .enumerate()
+        .map(|(nth, source)| {
+            let age_ms = i64::try_from(nth).expect("seven endpoints fit") * 60_000;
+            Endpoint::direct(addr_of(*source), ROW_MS - age_ms, *source)
+        })
+        .collect();
+
+    let ordered: Vec<SocketAddr> = probe::order_endpoints(&row, &PathTable::default())
+        .into_iter()
+        .filter_map(|endpoint| endpoint.direct_addr())
+        .collect();
+
+    // Paired and Hello share a band, as do Mapping and Beacon, and so now do
+    // Drop and Moved: within each the newer one leads, which is the recency
+    // tiebreak and not a band of its own.
+    let expected = vec![
+        addr_of(EndpointSource::Hello),
+        addr_of(EndpointSource::Paired),
+        addr_of(EndpointSource::Beacon),
+        addr_of(EndpointSource::Mapping),
+        addr_of(EndpointSource::Brief),
+        addr_of(EndpointSource::Moved),
+        addr_of(EndpointSource::Drop),
+    ];
+    assert_eq!(
+        ordered, expected,
+        "the whole dial order, weakest evidence last: what a handshake proved, then this \
+         Mac's own hints, then a friend's word, then the two sealed under a key a \
+         forgotten peer still holds"
+    );
 }
 
 /// The frame minimum, derived the way the module derives it: four bytes of
