@@ -119,53 +119,58 @@ public enum PeerMovedLink {
         return "tcr://\(url.host ?? "?")\(url.path) with \(carried ? "a sealed record" : "nothing sealed")"
     }
 
-    /// What `tcr peer moved open` answered on the run that writes nothing.
+    /// What one run of `tcr peer moved open` answered.
     ///
     /// Two outcomes and one input, the EXIT CODE. The words are carried
     /// through untouched either way: `tcr` decides whether a link is good, for
     /// whom, and how old is too old, and an app that re-read its sentences to
     /// classify them would be making that call a second time and disagreeing
     /// the first time the CLI gained a case.
-    public enum Preview: Equatable, Sendable {
-        /// The link was read. The string is what `tcr` printed, and it is what
-        /// the person is shown before anything is kept.
-        case wouldAdd(String)
-        /// Nothing was kept and nothing will be. The string is what `tcr`
-        /// said, or this app's own words when it said nothing at all.
+    ///
+    /// One type for both runs, because both are the same verb and both fail in
+    /// the same two shapes: the run that writes nothing, and the run that keeps
+    /// what the first one showed.
+    public enum Answer: Equatable, Sendable {
+        /// The verb exited clean and printed something. The string is what
+        /// `tcr` printed: what it would add, on the first run, and what it did
+        /// add, on the second.
+        case clean(String)
+        /// Nothing was kept. The string is what `tcr` said, or this app's own
+        /// words when it said nothing at all.
         case refused(String)
 
-        /// Whether the operator gets a button that keeps anything.
+        /// Whether this run went through.
         ///
-        /// A refused link is a sentence and a stop. It never turns into an
-        /// offer to pair, to trust, or to add a Mac: a link forwarded into the
-        /// wrong chat would then be a trust prompt in front of someone the
-        /// sender never meant to ask.
-        public var offersApply: Bool {
-            if case .wouldAdd = self { return true }
+        /// On the first run it is also the gate on the ask: only a clean read
+        /// gets an alert with a button that keeps anything. A refused link is
+        /// a sentence and a stop, never an offer to pair, to trust or to add a
+        /// Mac, because a link forwarded into the wrong chat would then be a
+        /// trust prompt in front of someone the sender never meant to ask.
+        public var isClean: Bool {
+            if case .clean = self { return true }
             return false
         }
 
         /// The text to put on screen, whichever outcome this is.
         public var lines: String {
             switch self {
-            case .wouldAdd(let text): return text
+            case .clean(let text): return text
             case .refused(let text): return text
             }
         }
     }
 
-    /// Classify the preview run.
+    /// Classify one run.
     ///
     /// An exit of 0 with nothing printed is treated as a refusal in this app's
     /// own words rather than an empty alert, which would ask a person to agree
     /// to a blank page. That is the same answer ``PeerCommand`` callers already
     /// get from a capture that exits clean and prints nothing.
-    public static func preview(exitCode: Int32, stdout: String, stderr: String) -> Preview {
+    public static func answer(exitCode: Int32, stdout: String, stderr: String) -> Answer {
         let out = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        let err = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         guard exitCode == 0 else {
-            if !err.isEmpty { return .refused(err) }
-            if !out.isEmpty { return .refused(out) }
+            let said = refusalWords(stdout: stdout, stderr: stderr)
+            guard said.isEmpty else { return .refused(said) }
             return .refused(
                 "tcr peer moved open failed (exit \(exitCode)) and printed nothing, so nothing "
                     + "was kept.")
@@ -175,7 +180,22 @@ public enum PeerMovedLink {
                 "tcr peer moved open exited 0 and printed nothing, so there is nothing to show "
                     + "and nothing to keep.")
         }
-        return .wouldAdd(out)
+        return .clean(out)
+    }
+
+    /// What `tcr` said on a run that went wrong: its stderr, or its stdout
+    /// when it wrote nothing there.
+    ///
+    /// One extractor for both runs. The run that writes nothing and the run
+    /// that keeps fail in the same two shapes, and two call sites picking a
+    /// stream each would eventually show a person one run's words and not the
+    /// other's. Empty when the process said nothing at all, which the caller
+    /// answers in its own words, because "it failed and printed nothing" is a
+    /// different fact from anything `tcr` reported.
+    public static func refusalWords(stdout: String, stderr: String) -> String {
+        let err = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard err.isEmpty else { return err }
+        return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// The sentence a refusal puts on screen or in the log.

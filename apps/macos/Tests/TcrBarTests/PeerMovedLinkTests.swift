@@ -197,29 +197,29 @@ final class PeerMovedLinkTests: XCTestCase {
             "tcr://peer/moved with nothing sealed")
     }
 
-    // MARK: What the preview run answered
+    // MARK: What a run answered
 
     /// The exit code is the whole of what this app reads. `tcr` decides
     /// whether a link is good and for whom; its words are carried through
     /// untouched.
-    func testACleanPreviewOffersToKeepAndCarriesTheCliWordsUntouched() {
+    func testACleanReadOffersToKeepAndCarriesTheCliWordsUntouched() {
         let printed = "peer moved: would add 192.0.2.7:41234\npeer moved: nothing written"
-        let preview = PeerMovedLink.preview(exitCode: 0, stdout: printed, stderr: "")
-        XCTAssertEqual(preview, .wouldAdd(printed))
-        XCTAssertTrue(preview.offersApply)
-        XCTAssertEqual(preview.lines, printed)
+        let answer = PeerMovedLink.answer(exitCode: 0, stdout: printed, stderr: "")
+        XCTAssertEqual(answer, .clean(printed))
+        XCTAssertTrue(answer.isClean)
+        XCTAssertEqual(answer.lines, printed)
     }
 
     /// **A refusal never becomes an offer.** Whatever `tcr` refused, the alert
     /// has a sentence and a stop in it, and no button that keeps, pairs or
     /// trusts anything: a link forwarded into the wrong chat would otherwise
     /// put a trust prompt in front of someone the sender never meant to ask.
-    func testARefusedPreviewOffersNothing() {
+    func testARefusedReadOffersNothing() {
         let said = "peer moved: this link was not meant for this Mac"
-        let preview = PeerMovedLink.preview(exitCode: 1, stdout: "", stderr: said)
-        XCTAssertEqual(preview, .refused(said))
-        XCTAssertFalse(preview.offersApply)
-        XCTAssertEqual(preview.lines, said)
+        let answer = PeerMovedLink.answer(exitCode: 1, stdout: "", stderr: said)
+        XCTAssertEqual(answer, .refused(said))
+        XCTAssertFalse(answer.isClean)
+        XCTAssertEqual(answer.lines, said)
     }
 
     /// A failure that printed only on stdout still shows `tcr`'s own words,
@@ -227,18 +227,18 @@ final class PeerMovedLinkTests: XCTestCase {
     /// than opening an empty alert.
     func testAFailureWithNothingOnStderrStillSaysSomething() {
         XCTAssertEqual(
-            PeerMovedLink.preview(exitCode: 2, stdout: "peer moved: cut short", stderr: ""),
+            PeerMovedLink.answer(exitCode: 2, stdout: "peer moved: cut short", stderr: ""),
             .refused("peer moved: cut short"))
-        let silent = PeerMovedLink.preview(exitCode: 2, stdout: "", stderr: "")
-        XCTAssertFalse(silent.offersApply)
+        let silent = PeerMovedLink.answer(exitCode: 2, stdout: "", stderr: "")
+        XCTAssertFalse(silent.isClean)
         XCTAssertTrue(silent.lines.contains("exit 2"))
     }
 
     /// An exit of 0 with nothing printed is a refusal too: an alert with a
     /// blank body asks a person to agree to nothing.
     func testACleanRunThatPrintedNothingIsNotAnOffer() {
-        let preview = PeerMovedLink.preview(exitCode: 0, stdout: "  \n", stderr: "")
-        XCTAssertFalse(preview.offersApply)
-        XCTAssertTrue(preview.lines.contains("nothing to keep"))
+        let answer = PeerMovedLink.answer(exitCode: 0, stdout: "  \n", stderr: "")
+        XCTAssertFalse(answer.isClean)
+        XCTAssertTrue(answer.lines.contains("nothing to keep"))
     }
 }
