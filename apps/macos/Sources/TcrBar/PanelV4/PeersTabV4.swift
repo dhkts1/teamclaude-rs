@@ -270,6 +270,17 @@ struct PeersSnapshot: Equatable {
 /// plaintext names both parties, a direction and a verb, and the word `read`
 /// never appears alone.
 enum PeersSnapshotBuilder {
+    /// The carry pill's word, and it names a CAPABILITY.
+    ///
+    /// It said `carries`, which reads as "is relaying right now", on a row
+    /// whose own path line said that Mac's traffic goes through a third one.
+    /// The grant is permission to relay; whether anything is being relayed at
+    /// this instant is what the path line under the pill answers. Written once
+    /// because the pill and the sentence behind it (``PeersTabV4/pillHelp(_:)``)
+    /// are the same string in two places, and the copy that drifts is the one
+    /// nobody reads.
+    static let carryPillText = "can carry"
+
     static func snapshot(from document: PeerListDocument, now: Date) -> PeersSnapshot {
         guard document.supported else {
             return PeersSnapshot(
@@ -481,7 +492,7 @@ enum PeersSnapshotBuilder {
         } else if entry.serves {
             pills.append((PeerLendDirection.youLend.pillText, .disclosure))
         } else if entry.carries {
-            pills.append(("carries", .info))
+            pills.append((carryPillText, .info))
         }
         return pills
     }
@@ -1890,7 +1901,9 @@ struct PeersTabV4: View {
     private func pillHelp(_ text: String) -> String {
         switch text {
         case "trusted": return "Pinned on both Macs. It can carry your traffic."
-        case "carries": return "Holds your encrypted bytes and can open none of them."
+        case PeersSnapshotBuilder.carryPillText:
+            return "May hold your encrypted bytes and can open none of them. The path line "
+                + "under the row says whether it is doing so now."
         case PeerLendDirection.youLend.pillText:
             return "May serve your requests on its own accounts, and read them."
         case PeerLendDirection.theyLend.pillText:

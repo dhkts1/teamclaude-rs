@@ -262,6 +262,29 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "line is for")
     }
 
+    /// A capability and an act get different words.
+    ///
+    /// The pill means "is willing to relay" and it read as "is relaying now",
+    /// on a row whose own path line said its traffic went through somebody
+    /// else. The pill states the capability; the path line under it states the
+    /// act. And the word is written ONCE, because the pill and the sentence
+    /// behind it are the same string in two places.
+    func testTheCarryPillNamesTheCapabilityAndIsWrittenOnce() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("static let carryPillText = \"can carry\""),
+            "the carry pill's word is not the capability, or is no longer written in one "
+                + "place for the pill and its help to share")
+        XCTAssertFalse(
+            tab.contains("(\"carries\", .info)"),
+            "the pill says carries again, which reads as an act on a row whose path line "
+                + "says the bytes go through a third Mac")
+        XCTAssertFalse(
+            tab.contains("case \"carries\": return"),
+            "the pill help is keyed on the old word, so the pill an operator hovers has no "
+                + "sentence behind it at all")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
