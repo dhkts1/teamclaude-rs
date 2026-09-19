@@ -176,14 +176,6 @@ public enum PeerMeter: Equatable {
         return false
     }
 
-    /// Whether a lease is RUNNING on this row, which is the other half of the
-    /// same question: a running lease is traffic, and traffic is the proof
-    /// that a path exists whether or not the wire named one.
-    public var isLiveLease: Bool {
-        if case .lease = self { return true }
-        return false
-    }
-
     /// The row SHAPE this meter implies, for ``PeerPanelHeight``.
     public var rowShape: PeerPanelHeight.Row {
         switch self {

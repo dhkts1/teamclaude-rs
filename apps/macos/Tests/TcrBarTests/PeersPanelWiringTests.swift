@@ -359,9 +359,13 @@ final class PeersPanelWiringTests: XCTestCase {
         let builder = try slice(
             tab, from: "private static func row(", to: "private static func pills(")
         XCTAssertTrue(
-            builder.contains("(entry.inFlight ?? 0) > 0 || meter.isLiveLease"),
+            builder.contains("let working = (entry.inFlight ?? 0) > 0"),
             "traffic no longer silences the absent path line, so a row can contradict "
                 + "itself two lines apart")
+        XCTAssertFalse(
+            builder.contains("meter.isLiveLease"),
+            "a standing lease with nothing on it silences the line again, and that is not "
+                + "traffic: it cost a sleeping Mac's row the one true line it had")
         XCTAssertTrue(
             builder.contains("working ? .silent"),
             "a row with work in flight prints an absence again")

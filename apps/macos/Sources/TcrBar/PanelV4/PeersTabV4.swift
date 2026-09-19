@@ -445,12 +445,17 @@ enum PeersSnapshotBuilder {
         // time is how the row ends up with a live pill over a dead meter.
         let meter = meter(entry, title: title, sharing: sharing, awake: seen.awake, now: now)
         // Which of the three absences this row's empty path list means, and
-        // only this caller can answer it. Work in flight or a running lease
-        // is traffic, and traffic is the proof a path exists: the row printed
-        // `2 requests are on studio-mac's accounts now` two lines above `no
-        // path right now`, which is the card contradicting itself. Otherwise
-        // the live half either answered and found nothing, or never answered.
-        let working = (entry.inFlight ?? 0) > 0 || meter.isLiveLease
+        // only this caller can answer it.
+        //
+        // WORK IN FLIGHT, and nothing weaker. Traffic is the proof a path
+        // exists: the row printed `2 requests are on studio-mac's accounts
+        // now` two lines above `no path right now`, which is one card
+        // contradicting itself. A live lease with nothing on it is not that
+        // proof, and reading it as such cost the asleep row the one true line
+        // it had: a standing offer on a Mac that is not answering is exactly
+        // where "no path right now" is worth saying. Measured on the rendered
+        // scene, where the line vanished from a sleeping Mac's row.
+        let working = (entry.inFlight ?? 0) > 0
         let absence: PeerPathAbsence =
             working ? .silent : (liveAnswered == false ? .notReported : .measured)
         return PeerRowModel(
