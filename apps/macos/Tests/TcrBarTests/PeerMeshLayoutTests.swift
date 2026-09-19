@@ -1,0 +1,186 @@
+import XCTest
+
+@testable import TcrBarCore
+
+/// The mini mesh card's geometry, and the gate it ships with.
+final class PeerMeshLayoutTests: XCTestCase {
+    /// The card's real drawing area inside the 372 pt panel.
+    private let small = CGSize(width: 340, height: 206)
+    private let tall = CGSize(width: 340, height: 300)
+
+    private var twoMacs: [PeerMeshPeer] {
+        [
+            PeerMeshPeer(name: "attic-nuc", rttMs: 16, lossPct: 0.01),
+            PeerMeshPeer(name: "loft-mini", rttMs: 58, lossPct: 0.05, viaName: "attic-nuc"),
+        ]
+    }
+
+    /// The scene the brief names as the gate: seven trusted Macs, five drawn,
+    /// two collapsed, every loss band and both line styles at once.
+    private var sevenMacs: [PeerMeshPeer] {
+        [
+            PeerMeshPeer(name: "attic-nuc", rttMs: 16, lossPct: 0.01),
+            PeerMeshPeer(name: "loft-mini", rttMs: 72, lossPct: 0.06, viaName: "attic-nuc"),
+            PeerMeshPeer(name: "office-mini", rttMs: 210, lossPct: 0.14),
+            PeerMeshPeer(name: "lab-mac", asleep: true),
+            PeerMeshPeer(name: "gil-laptop", rttMs: 88, viaName: "attic-nuc"),
+            PeerMeshPeer(name: "shed-mac", rttMs: 24, lossPct: 0),
+            PeerMeshPeer(name: "van-mac", rttMs: 31, lossPct: 0),
+        ]
+    }
+
+    // MARK: THE gate
+
+    /// No pill may sit on another pill, on a tile, or on a tile's name. Both
+    /// of the mockup's own rendering passes shipped exactly this defect
+    /// ("attic-nuc" over "16 ms"), and it is a claim about rectangles, so it
+    /// is checked as one rather than looked at.
+    func testNoPillIntersectsAnotherPillATileOrAName() {
+        let layout = PeerMeshLayout.layout(size: tall, root: "desk-mac", peers: sevenMacs)
+        XCTAssertFalse(layout.pills.isEmpty, "a fixture with no pills would pass vacuously")
+        let tiles = layout.nodes.map(\.frame) + layout.nodes.map(\.labelFrame)
+        for (index, pill) in layout.pills.enumerated() {
+            for tile in tiles {
+                XCTAssertFalse(
+                    pill.frame.intersects(tile),
+                    "pill \(pill.reading) lands on a tile or a name at \(pill.frame)")
+            }
+            for other in layout.pills.dropFirst(index + 1) {
+                XCTAssertFalse(
+                    pill.frame.intersects(other.frame),
+                    "pill \(pill.reading) lands on pill \(other.reading)")
+            }
+        }
+    }
+
+    /// And the same for the two-Mac card, which is the one an operator with a
+    /// small mesh actually looks at every day.
+    func testTheTwoMacCardIsAlsoFreeOfCollisions() {
+        let layout = PeerMeshLayout.layout(size: small, root: "desk-mac", peers: twoMacs)
+        let tiles = layout.nodes.map(\.frame) + layout.nodes.map(\.labelFrame)
+        XCTAssertEqual(layout.pills.count, 2)
+        for (index, pill) in layout.pills.enumerated() {
+            for tile in tiles { XCTAssertFalse(pill.frame.intersects(tile)) }
+            for other in layout.pills.dropFirst(index + 1) {
+                XCTAssertFalse(pill.frame.intersects(other.frame))
+            }
+        }
+    }
+
+    /// Every pill is inside the card. A reading half off the edge is the same
+    /// failure as one under a tile: the operator cannot read it.
+    func testEveryPillIsInsideTheCard() {
+        let layout = PeerMeshLayout.layout(size: tall, root: "desk-mac", peers: sevenMacs)
+        let bounds = CGRect(origin: .zero, size: tall)
+        for pill in layout.pills {
+            XCTAssertTrue(bounds.contains(pill.frame), "\(pill.reading) at \(pill.frame)")
+        }
+    }
+
+    // MARK: The states
+
+    func testTheEmptyMeshDrawsNothingAtAll() {
+        let layout = PeerMeshLayout.layout(size: small, root: "desk-mac", peers: [])
+        XCTAssertTrue(layout.nodes.isEmpty, "no ring, and no lone root floating in it")
+        XCTAssertTrue(layout.edges.isEmpty)
+        XCTAssertTrue(layout.pills.isEmpty)
+    }
+
+    func testTheRootCarriesItsOwnTileAndEveryPeerGetsOne() {
+        let layout = PeerMeshLayout.layout(size: small, root: "desk-mac", peers: twoMacs)
+        XCTAssertEqual(layout.nodes.count, 3)
+        XCTAssertEqual(layout.nodes.first?.isRoot, true)
+        XCTAssertEqual(layout.nodes.first?.label, "desk-mac")
+        XCTAssertEqual(layout.edges.count, 2)
+    }
+
+    /// A carried path is dashed and names its forwarder on the pill's second
+    /// line; a direct one does neither.
+    func testACarriedPathIsDashedAndNamesItsForwarder() {
+        let layout = PeerMeshLayout.layout(size: small, root: "desk-mac", peers: twoMacs)
+        XCTAssertEqual(layout.edges.map(\.carried), [false, true])
+        XCTAssertEqual(layout.pills.map(\.via), [nil, "via attic-nuc"])
+        XCTAssertEqual(layout.pills.map(\.reading), ["16 ms", "58 ms"])
+    }
+
+    /// A sleeping Mac keeps its tile, dimmed, and gets NO pill: its last
+    /// numbers are a stale reading and this card does not draw those.
+    func testASleepingMacHasATileAndNoPill() {
+        let layout = PeerMeshLayout.layout(size: tall, root: "desk-mac", peers: sevenMacs)
+        let sleeping = layout.nodes.first { $0.label == "lab-mac" }
+        XCTAssertEqual(sleeping?.asleep, true)
+        XCTAssertFalse(layout.pills.contains { $0.reading.contains("lab-mac") })
+        // Five drawn Macs, one of them asleep, so four readings.
+        XCTAssertEqual(layout.pills.count, 4)
+        XCTAssertEqual(layout.unplacedReadings, 0)
+    }
+
+    /// Seven trusted, five drawn, and one tile standing in for the rest. It
+    /// carries no name and no reading, because it is not one peer.
+    func testPastTheCapTheRestCollapseIntoOneTile() {
+        let layout = PeerMeshLayout.layout(size: tall, root: "desk-mac", peers: sevenMacs)
+        let stack = layout.nodes.first { $0.collapsed != nil }
+        XCTAssertEqual(stack?.collapsed, 2)
+        XCTAssertEqual(stack?.label, "and 2 more")
+        // Root, five Macs, one stand-in.
+        XCTAssertEqual(layout.nodes.count, 7)
+        // No edge to the stand-in: it is a count, not a path.
+        XCTAssertEqual(layout.edges.count, 5)
+    }
+
+    func testExactlySixTrustedMacsAreAllDrawnWithNoStandIn() {
+        let six = Array(sevenMacs.prefix(6))
+        let layout = PeerMeshLayout.layout(size: tall, root: "desk-mac", peers: six)
+        XCTAssertNil(layout.nodes.first { $0.collapsed != nil })
+        XCTAssertEqual(layout.nodes.count, 7)
+        XCTAssertEqual(layout.edges.count, 6)
+    }
+
+    /// Up to three Macs sit in one row; above that the card takes two, which
+    /// is what keeps a tile from having to shrink.
+    func testThreeMacsShareOneRowAndFourTakeTwo() {
+        let three = Array(sevenMacs.prefix(3))
+        let flat = PeerMeshLayout.layout(size: small, root: "desk-mac", peers: three)
+        let rowsInFlat = Set(flat.nodes.dropFirst().map(\.frame.minY))
+        XCTAssertEqual(rowsInFlat.count, 1)
+
+        let four = Array(sevenMacs.prefix(4))
+        let tree = PeerMeshLayout.layout(size: tall, root: "desk-mac", peers: four)
+        let rowsInTree = Set(tree.nodes.dropFirst().map(\.frame.minY))
+        XCTAssertEqual(rowsInTree.count, 2)
+    }
+
+    // MARK: Argv
+
+    /// The card's one control. `--serve` is what makes the verb a page rather
+    /// than a print, and it binds loopback only.
+    func testOpenFullGraphRunsTheServingVerb() {
+        XCTAssertEqual(PeerCommand.graphServe, ["peer", "graph", "--serve"])
+    }
+
+    // MARK: The colour rule
+
+    /// Green under 3 per cent, amber to 10, red above it, and grey for a path
+    /// nothing has measured, which is a different fact from a healthy one.
+    func testTheLossBandsAreTheOnesThisWaveSets() {
+        XCTAssertEqual(PeerMeshTone.forLoss(0), .ok)
+        XCTAssertEqual(PeerMeshTone.forLoss(0.029), .ok)
+        XCTAssertEqual(PeerMeshTone.forLoss(0.03), .near)
+        XCTAssertEqual(PeerMeshTone.forLoss(0.10), .near)
+        XCTAssertEqual(PeerMeshTone.forLoss(0.11), .bad)
+        XCTAssertEqual(PeerMeshTone.forLoss(nil), .unmeasured)
+    }
+
+    /// An unmeasured path says so on its pill rather than printing a zero, and
+    /// a carried unmeasured path still names its forwarder: "not measured" and
+    /// "carried" are two independent facts.
+    func testAnUnmeasuredCarriedPathSaysBoth() {
+        let layout = PeerMeshLayout.layout(
+            size: small, root: "desk-mac",
+            peers: [PeerMeshPeer(name: "gil-laptop", viaName: "attic-nuc")])
+        XCTAssertEqual(layout.pills.first?.reading, "not measured")
+        XCTAssertEqual(layout.pills.first?.via, "via attic-nuc")
+        XCTAssertEqual(layout.pills.first?.tone, .unmeasured)
+        XCTAssertEqual(layout.edges.first?.carried, true)
+    }
+}

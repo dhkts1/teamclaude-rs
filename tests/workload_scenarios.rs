@@ -117,6 +117,8 @@ fn account(name: &str, priority: i64) -> Account {
         organization_type: None,
         rate_limit_tier: None,
         seat_tier: None,
+        egress: teamclaude_rs::config::Egress::Local,
+        egress_strict: false,
         extra: serde_json::Map::new(),
     }
 }

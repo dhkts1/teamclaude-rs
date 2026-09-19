@@ -440,6 +440,14 @@ pub struct ServerHandle {
     /// The affinity flusher / quota prober / keep-warm loops, whichever this
     /// config enabled.
     background: Vec<JoinHandle<()>>,
+    /// The LAN peer mesh's second socket, when this boot started one. See
+    /// [`boot_peer_listener`]. `None` is the default and the whole of the
+    /// feature flag: a peers file with no `listen` opens no port.
+    ///
+    /// Held so a caller (and a test) can learn the port the kernel assigned for
+    /// a `listen` of `:0` without reading the peers file back, the same way
+    /// [`Self::addr`] answers it for the proxy's own socket.
+    peer_addr: Option<SocketAddr>,
 }
 
 impl ServerHandle {
@@ -451,6 +459,15 @@ impl ServerHandle {
     /// The live [`Manager`], for a caller that wants the same state the TUI reads.
     pub fn manager(&self) -> &Arc<Manager> {
         &self.manager
+    }
+
+    /// The LAN peer mesh's socket, if this boot opened one.
+    ///
+    /// `None` is a fresh install, and every install that has not written a
+    /// `listen` into its peers file: the port is opt-in and there is no second
+    /// switch.
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
     }
 
     /// How many background loops this config spawned (the accept loop excluded).
@@ -784,6 +801,559 @@ async fn supervise(task: &'static str, fut: impl std::future::Future<Output = ()
 ///
 /// Returns [`ServeOutcome::StoodDown`] rather than exiting when a recognized
 /// proxy incumbent holds the port. Errors only when the bind itself fails.
+/// The LAN peer mesh's policy file for this process, or `None` for a process
+/// that must not read one.
+///
+/// # Why this is derived and not its own `ServeOptions` field
+///
+/// Every sibling side effect in [`ServeOptions`], the pin cache, the
+/// Sessions/Tools cache, the usage ledger, the port claim, is a field that
+/// defaults to `None` so the *dangerous* configuration is the one a caller has
+/// to spell out. A `peers_path` field would read exactly the same way and is
+/// the shape to reach for when the option struct is next touched; it is not
+/// taken here because [`ServeOptions`] is built by struct literal in
+/// `src/main.rs` and in `tests/serve_library_path.rs` with no
+/// `..Default::default()`, so adding one field is a compile error in two other
+/// files.
+///
+/// What is derived instead is not a guess. `persist_path` is the config file
+/// this process may WRITE, the binary passes it, [`ServeOptions::new`] leaves
+/// it `None`, and its own doc says a library caller serving a real config must
+/// pass it. The peers file lives in that config's directory by the same
+/// convention the rest of the peer surface already uses: `tcr peer id` resolves
+/// the node key from the peers file's own directory
+/// (`crate::peer::serve::node_key_dir`), which is why one `--peers` argument
+/// points the whole peer surface at a temp dir. So "the peers file beside the
+/// config this process owns" makes `--config` select a whole profile, its
+/// accounts, its peers, its node key, instead of pairing one profile's
+/// accounts with the operator's real trust relationships.
+///
+/// Both halves of the inertness follow: a caller with no config path reads no
+/// peers file at all, and a caller with a temp config path reads a peers file
+/// that does not exist, which [`crate::peer::config::read_or_default`] answers
+/// as a node with no peers.
+/// The file NAME is taken off [`crate::peer::config::default_path`] rather than
+/// spelled again here: that function owns what the peers file is called, and a
+/// second literal is the classic way a resolver comes to look for a file
+/// nothing writes.
+fn peers_file_beside_config(persist_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    let dir = persist_path?.parent()?;
+    let default = crate::peer::config::default_path();
+    Some(dir.join(default.file_name()?))
+}
+
+/// Start the LAN peer mesh's listener, if this node's peers file asks for one.
+///
+/// # This is `listener::serve`'s production caller
+///
+/// Everything under `src/peer/` was reachable only from `tcr peer` subcommands
+/// and from tests: the accept loop, the two-phase pairing, the stream gate and
+/// the lender's half of a SERVE all existed and nothing in a serving process
+/// ever called them. So a Mac running `tcr` answered no peer on any port, and
+/// every gate that proved the mesh worked proved it about a test binary. This
+/// function is the line that joins them.
+///
+/// # The switch is `listen`, and `find` alone is refused with its remedy
+///
+/// The ask is to boot "when the peers file has `find` on (or a listen
+/// address)". `find` alone cannot get there and the refusal is deliberate: there
+/// is no default peer port anywhere in this tree (the `9600` in
+/// `src/peer/discovery.rs` lives only in that file's own tests), so booting on
+/// `find` alone would mean inventing one here, a second place for the port to
+/// live, and one the peers file does not name. That collides with the rule
+/// this function exists to satisfy: **the peers file must hold
+/// `listen` before the first connection**, because the beacon's port, a share
+/// link and `tcr peer` all read the address off that file, and a port only this
+/// process knew would make every one of them name a different socket. So a file
+/// with `find` on and no `listen` gets a warning that names the remedy, and no
+/// port.
+///
+/// # What is wired, and the one thing that is not
+///
+/// The accept loop gets a [`crate::peer::listener::LeaseServing`]: a fresh
+/// ledger, THIS process's own proxy base (the whole of "own picker, own Bearer,
+/// own bucket", see `crate::peer::serve::handle_serve_on`) and the manager as
+/// the quota reader. It also gets the owner's headroom noted per window, on a
+/// ticker, because `Ledger::may_relay` refuses on an ABSENT measurement: a
+/// listener wired without it would answer `owner-guard` to every relayed
+/// request and look, from the outside, exactly like a listener that was never
+/// wired at all.
+///
+/// The headroom is noted for `LendScope::All` only. Per-scope headroom needs
+/// the scope, which lives on `LendGrant` in `src/peer/config.rs`,
+/// and nothing reads it here yet.
+async fn boot_peer_listener(
+    peers_path: &std::path::Path,
+    manager: &Arc<Manager>,
+    own_proxy_base: &str,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) -> Option<SocketAddr> {
+    use crate::peer::listener::{self, LeaseServing, SessionContext};
+
+    let file = match crate::peer::config::read_or_default(peers_path) {
+        Ok(file) => file,
+        // Never fatal, and never silent: a peers file that cannot be read is
+        // not the same fact as a node with no peers, and local traffic is
+        // unaffected either way. The same rule the fallback install above
+        // follows, for the same reason.
+        Err(err) => {
+            tracing::warn!(
+                path = %peers_path.display(),
+                error = %err,
+                "peer listener: the peers file could not be read, so no peer port is opened \
+                 (local traffic is unaffected)"
+            );
+            return None;
+        }
+    };
+
+    let Some(listen) = file.listen else {
+        if file.discovery {
+            tracing::warn!(
+                path = %peers_path.display(),
+                "peer listener: `find` is on but this peers file names no `listen` address, \
+                 so there is no port to announce and none is opened; write a `listen` into \
+                 the peers file (for example \"listen\": \"0.0.0.0:9600\") and restart"
+            );
+        }
+        return None;
+    };
+
+    let listening = match listener::bind(listen).await {
+        Ok(listening) => listening,
+        // A peer port that will not bind must not stop this process serving
+        // local traffic: the mesh is an addition to a working proxy, never a
+        // precondition for one.
+        Err(err) => {
+            tracing::warn!(
+                listen = %listen,
+                error = %err,
+                "peer listener: could not bind the peer socket, so no peer is answered \
+                 (local traffic is unaffected)"
+            );
+            return None;
+        }
+    };
+    let local = match listening.local_addr() {
+        Ok(local) => local,
+        Err(err) => {
+            tracing::warn!(
+                listen = %listen,
+                error = %err,
+                "peer listener: the bound peer socket has no address; not serving it"
+            );
+            return None;
+        }
+    };
+
+    let node_dir = peers_path.parent().map_or_else(
+        crate::peer::id::default_config_dir,
+        std::path::Path::to_path_buf,
+    );
+    let key = match crate::peer::id::NodeKey::load_or_mint(&node_dir) {
+        Ok(key) => key,
+        Err(err) => {
+            tracing::warn!(
+                dir = %node_dir.display(),
+                error = %err,
+                "peer listener: this node has no keypair to answer a handshake with, so the \
+                 peer socket is not served"
+            );
+            return None;
+        }
+    };
+
+    // The rendezvous secrets this fleet already earned, back into the process
+    // register before the listener answers anything. Without this a restart
+    // loses every derived-port fallback until each pair speaks again, which is
+    // precisely the case a peer that moved needs it for.
+    match crate::peer::config::read_or_default(peers_path) {
+        Ok(file) => {
+            let restored = crate::peer::reach::restore_from_peers(&file);
+            tracing::info!(restored, "peer listener: restored rendezvous secrets");
+        }
+        Err(err) => tracing::warn!(
+            error = %err,
+            "peer listener: the peers file did not read, so no rendezvous secret was restored"
+        ),
+    }
+
+    // The state file that belongs with THIS peers file, not the one in the
+    // operator's own cache directory: a `--config` pointing at a temp profile
+    // must not write the real machine's pairing window, knock queue, mutes or
+    // bans. See `serve::peer_state_path`.
+    let state_path = crate::peer::serve::peer_state_path(peers_path);
+    // RESTORED, not empty, the review's M2. `Ledger::new()` here was the whole
+    // of why two doc-comments promised "restored=N expired=M" and no reader ever
+    // saw the line: a restart voided every lease the operator had granted, and a
+    // borrower mid-lease was stranded until it re-asked.
+    let ledger = Arc::new(std::sync::Mutex::new(
+        crate::peer::lease::Ledger::restored_from(&state_path),
+    ));
+    let context =
+        SessionContext::new(&key, peers_path, &state_path).with_lease_serving(Some(LeaseServing {
+            ledger: ledger.clone(),
+            upstream: own_proxy_base.to_string(),
+            utilization: manager.clone(),
+            manager: manager.clone(),
+        }));
+
+    // The owner's headroom, noted BEFORE the accept loop starts, so the first
+    // relayed request to arrive is decided against a measurement rather than
+    // against an absence. Then on a ticker, because the fleet's utilization
+    // moves and `may_relay` reads the last figure written.
+    note_owner_headroom(manager, &ledger);
+    {
+        let manager = manager.clone();
+        let ledger = ledger.clone();
+        let mut stop = shutdown.subscribe();
+        background.push(tokio::spawn(supervise("peer-headroom", async move {
+            let notes = async {
+                let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    note_owner_headroom(&manager, &ledger);
+                }
+            };
+            tokio::select! {
+                _ = notes => {}
+                _ = stop.changed() => {}
+            }
+        })));
+    }
+
+    tracing::info!(
+        peer_listen = %local,
+        peers_file = %peers_path.display(),
+        state_file = %state_path.display(),
+        // The SAME per-boot instance id the beacon announces and every knock
+        // this node sends names: one `OnceLock` in `crate::peer::id`
+        // (`boot_instance_id`), read by `SessionContext::new` here and by
+        // `discovery::build_beacon_info` there. Logged so the two can be
+        // compared in a log rather than taken on trust.
+        instance = %context.instance_id(),
+        node = %key.id().display(),
+        "peer listener up (a second socket; the local /_tcr/ gate is untouched)"
+    );
+
+    // `peer.internet`, through the one function every serving process calls
+    // for it. This used to run only inside `listener::serve`, which this
+    // function does not call (it binds and serves itself, so the pairing-window
+    // file is this profile's rather than the machine's): so the shipped proxy
+    // asked its router for nothing, `reach::external_socket()` was `None` on
+    // every Mac, and `spawn_reverse_carriers` below therefore parked a carrier
+    // at every friend on every Mac, whether or not it needed one.
+    //
+    // The guard is moved into the listener task so the mapping is deleted when
+    // that task is dropped at shutdown, which is what actually happens here:
+    // see `reach::MappingGuard`.
+    let mapping = crate::peer::reach::start_peer_mapping(peers_path, file.internet, local);
+
+    // The beacon, announced by the process that is actually listening.
+    spawn_beacon(peers_path, local.port(), shutdown, background);
+
+    // The reverse carriers, for a Mac nothing can dial.
+    //
+    // Asked ONCE, at boot, against the two facts `reach` measures: a router
+    // mapping this process holds, and a global IPv6 address. A Mac with either
+    // one can be dialled and asking a friend to hold a socket for it anyway
+    // would spend a third machine's bytes on a path it does not need
+    // (`tunnel::reverse_carry_is_wanted` is that decision, and it is a pure
+    // function so both answers are testable without a router).
+    //
+    // One keeper task per pinned friend that may carry for this node. They are
+    // supervised and stopped with everything else here; each one opens a
+    // carrier, waits until a forward spends it, and opens the next.
+    spawn_reverse_carriers(peers_path, &key, &context, shutdown, background);
+
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-listener", async move {
+        // Held here and nowhere else: dropping this future at shutdown takes
+        // the router mapping away with it.
+        let _mapping = mapping;
+        tokio::select! {
+            result = listener::serve_on_with(listening, context) => {
+                if let Err(err) = result {
+                    tracing::warn!(error = %err, "peer listener: the accept loop stopped");
+                }
+            }
+            _ = stop.changed() => {}
+        }
+    })));
+
+    Some(local)
+}
+
+/// Announce this node on the LAN, from the process that is actually
+/// listening, for as long as `peer.find` is on.
+///
+/// # Why the announcer belongs here and not in the CLI
+///
+/// `tcr peer find on` used to register the beacon in the CLI process and
+/// exit. mdns-sd runs its daemon on a background thread of that process, so
+/// the beacon died with the command: a `find off` in a new process found the
+/// shared daemon empty, and no serving process ever announced anything. The
+/// payload made it worse than a missing row. A beacon carries the announcing
+/// process's per-boot instance id
+/// ([`crate::peer::id::boot_instance_id`]), and the knock a neighbour sends
+/// after seeing it names the id it saw: announced from the CLI, that id
+/// belonged to a process that had already exited, so it could never match the
+/// server's own.
+///
+/// # What the loop does
+///
+/// It wakes every [`crate::peer::discovery::BEACON_RESTAMP_INTERVAL`] and asks
+/// [`crate::peer::discovery::announce_step`] what to do, off two facts: the
+/// `find` flag as the peers file states it NOW, and the minute the beacon it
+/// is holding was stamped in.
+///
+/// The flag is re-read from the file rather than taken from the boot snapshot,
+/// which is how `tcr peer find on|off` reaches a running server at all: the
+/// same shape as `Manager::reload_groups_if_changed`, reading the file each
+/// wake because this one is small and twenty seconds apart.
+///
+/// The re-stamp is the second half. The beacon's keyed tag is computed over
+/// the current minute and a receiver holding the network key accepts this
+/// minute and the one before, so a beacon stamped once at registration stops
+/// verifying about two minutes later: the node kept announcing and became
+/// undiscoverable to exactly the neighbours that share its key.
+fn spawn_beacon(
+    peers_path: &std::path::Path,
+    port: u16,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) {
+    use crate::peer::discovery::{self, AnnounceStep};
+
+    let peers_path = peers_path.to_path_buf();
+    let mut stop = shutdown.subscribe();
+    background.push(tokio::spawn(supervise("peer-beacon", async move {
+        let announcing = async move {
+            let mut stamped: Option<i64> = None;
+            let mut ticker = tokio::time::interval(discovery::BEACON_RESTAMP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let file = match crate::peer::config::read_or_default(&peers_path) {
+                    Ok(file) => file,
+                    // Never fatal: a peers file that does not read for a
+                    // moment is not the same fact as `find` being off, and
+                    // unregistering on it would take a working beacon away.
+                    Err(err) => {
+                        tracing::warn!(
+                            path = %peers_path.display(),
+                            error = %err,
+                            "peer find: the peers file did not read, so the beacon is left as \
+                             it is until the next wake"
+                        );
+                        continue;
+                    }
+                };
+                match discovery::announce_step(
+                    file.discovery,
+                    stamped,
+                    crate::now_ms().div_euclid(1_000),
+                ) {
+                    AnnounceStep::Idle => {}
+                    step @ (AnnounceStep::Start | AnnounceStep::Restamp) => {
+                        let store = match crate::peer::config::PeerStore::open(&peers_path) {
+                            Ok(store) => store,
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    "peer find: the peers file did not open, so nothing is \
+                                     announced this wake"
+                                );
+                                continue;
+                            }
+                        };
+                        let name = file.announce_name.then(|| file.display_name());
+                        match discovery::advertise(&store, name.as_deref(), port).await {
+                            Ok(()) => {
+                                stamped = Some(discovery::current_stamp_minute());
+                                if step == AnnounceStep::Start {
+                                    tracing::info!(
+                                        peer_port = port,
+                                        named = file.announce_name,
+                                        "peer find: announcing this node on the LAN"
+                                    );
+                                }
+                            }
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "peer find: this node could not announce itself on the LAN; \
+                                 it is still reachable by address"
+                            ),
+                        }
+                    }
+                    AnnounceStep::Stop => {
+                        stamped = None;
+                        if let Err(err) = discovery::stop_all() {
+                            tracing::warn!(
+                                error = %err,
+                                "peer find: off, and the beacon could not be withdrawn; it \
+                                 ages out on its own"
+                            );
+                        } else {
+                            tracing::info!("peer find: off, so this node stopped announcing");
+                        }
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            _ = announcing => {}
+            _ = stop.changed() => {
+                if let Err(err) = crate::peer::discovery::stop_all() {
+                    tracing::warn!(
+                        error = %err,
+                        "peer find: the beacon could not be withdrawn at shutdown; it ages \
+                         out on its own"
+                    );
+                }
+            }
+        }
+    })));
+}
+
+/// Start one carrier keeper per friend, when this Mac cannot be dialled at all.
+///
+/// Split out of [`boot_peer_listener`] because it is a decision and a fan-out
+/// rather than another line of wiring: the decision is
+/// [`crate::peer::tunnel::reverse_carry_is_wanted`], and the fan-out is one
+/// task per friend that `forwarders_for` says may carry for this node.
+///
+/// # A boot-time answer, and why that is the honest scope
+///
+/// The mapping and the IPv6 address are read once here. A Mac that gains a
+/// mapping later keeps its keepers running, which costs a socket per friend
+/// and nothing else, and a Mac that LOSES one does not start them until it
+/// restarts. Re-asking per round would put a router probe on a loop this
+/// process runs forever, and the probe replaces the lifetime of the mapping it
+/// is asking about (`tcr peer reach`'s own `--map` is opt-in for exactly that
+/// reason). The tighter answer is the keeper reading the record
+/// `reach::record_mappings_at` already writes, which is a change to the
+/// keeper's own loop rather than to this fan-out.
+fn spawn_reverse_carriers(
+    peers_path: &std::path::Path,
+    key: &crate::peer::id::NodeKey,
+    context: &crate::peer::listener::SessionContext,
+    shutdown: &watch::Sender<bool>,
+    background: &mut Vec<JoinHandle<()>>,
+) {
+    let held = crate::peer::reach::external_socket();
+    let global_v6 = crate::peer::reach::global_v6_addresses();
+    // `external_socket` answers with the mapped socket rather than the
+    // `Mapping` the decision takes, so the presence of one is converted here
+    // and the absence of one stays an absence: a node with no mapping and no
+    // IPv6 is the whole of what `Wanted` means.
+    let mapping = held.map(|socket| crate::peer::reach::Mapping {
+        protocol: crate::peer::reach::MapProtocol::Tcp,
+        internal_port: socket.port(),
+        external_port: socket.port(),
+        lifetime_secs: 0,
+        epoch_secs: 0,
+    });
+    match crate::peer::tunnel::reverse_carry_is_wanted(mapping.as_ref(), &global_v6) {
+        crate::peer::tunnel::ReverseNeed::NotWanted(why) => {
+            tracing::debug!(
+                reason = ?why,
+                "peer reverse: this Mac can be dialled, so no friend is asked to hold a carrier"
+            );
+            return;
+        }
+        crate::peer::tunnel::ReverseNeed::Wanted => {}
+    }
+
+    let store = match crate::peer::config::PeerStore::open(peers_path) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "peer reverse: the peers file did not read, so no friend is asked to carry"
+            );
+            return;
+        }
+    };
+    let friends = crate::peer::tunnel::reverse_carriers(&store, &key.id());
+    if friends.is_empty() {
+        tracing::info!(
+            "peer reverse: nothing can dial this Mac and no pinned Mac may carry for it, so a \
+             borrow from here is all it can do (`tcr peer allow <peer> carry` on a friend)"
+        );
+        return;
+    }
+    tracing::info!(
+        friends = friends.len(),
+        "peer reverse: nothing can dial this Mac, so it is asking friends to hold a carrier"
+    );
+    // `MAX_PARKED_PER_PEER` keepers per friend, not one, because that constant
+    // IS the concurrency an undialable Mac gets on a friend's desk and its own
+    // doc says so: one parked carrier serves exactly one forward and is then
+    // gone, so a single keeper gives this Mac a pool of one and the second of
+    // two streams a borrow needs (the lease ask, then the SERVE) arrives to an
+    // empty desk. The desk refuses anything past the cap, which is what keeps
+    // this number a ceiling rather than a race: a keeper whose park is refused
+    // waits `retry` and tries again.
+    for friend in friends {
+        for _ in 0..crate::peer::tunnel::MAX_PARKED_PER_PEER {
+            let friend = friend.clone();
+            let context = context.clone();
+            let mut stop = shutdown.subscribe();
+            background.push(tokio::spawn(supervise("peer-reverse", async move {
+            let keeper = crate::peer::tunnel::keep_reverse_carrier(
+                friend,
+                crate::peer::probe::PROBE_INTERVAL,
+                None,
+                |friend: crate::peer::config::PeerRow| {
+                    let context = context.clone();
+                    async move {
+                        crate::peer::listener::park_one_carrier(&friend, &context).await
+                    }
+                },
+            );
+            tokio::select! {
+                _ = keeper => {}
+                _ = stop.changed() => {}
+            }
+        })));
+        }
+    }
+}
+
+/// Write this fleet's lendable headroom, per window, into the lender's ledger.
+///
+/// `Ledger::may_relay` refuses an ABSENT measurement (see `Ledger::headroom`),
+/// so this is what makes a booted lender able to serve anything at all. Every
+/// window this build knows, because a lease may be granted on any of them and
+/// the one that was never noted is the one that refuses.
+fn note_owner_headroom(
+    manager: &Arc<Manager>,
+    ledger: &Arc<std::sync::Mutex<crate::peer::lease::Ledger>>,
+) {
+    let now = time::OffsetDateTime::now_utc();
+    // A poisoned ledger lock is a panic somewhere in a relay, already logged
+    // where it happened. Reported rather than propagated: this is a background
+    // note, and refusing to serve local traffic over it would be the wrong
+    // trade.
+    let Ok(mut held) = ledger.lock() else {
+        tracing::warn!("peer listener: the lease ledger's lock is poisoned; headroom not noted");
+        return;
+    };
+    for window in [
+        tcr_peer_wire::Window::FiveHour,
+        tcr_peer_wire::Window::SevenDay,
+        tcr_peer_wire::Window::SevenDayOi,
+    ] {
+        // `All` only. See `boot_peer_listener`'s doc for why there is no
+        // per-scope figure yet.
+        let fraction = manager.lendable_fraction(&tcr_peer_wire::LendScope::All, window, now);
+        held.note_owner_headroom(window, fraction);
+    }
+}
+
 pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
     let ServeOptions {
         mut config,
@@ -880,6 +1450,55 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
             probe,
             report,
         }));
+    }
+
+    // The peer-lease fallback, installed here, after the port question is
+    // settled, before the manager probes anything and long before the listener
+    // binds, because the seam it fills is on the answer path of a request and
+    // must be decided before the first one can arrive.
+    // `crate::fallback::PROVIDER` is a `OnceLock` for that reason: it is
+    // consulted only when the whole local fleet came up dry, and re-deciding
+    // "is there a provider?" per request would put a file read in front of an
+    // answer a client is waiting for.
+    //
+    // A stand-down returns above this line, so a process that did not bind
+    // installs nothing, the install is process-wide and a second `tcr` that
+    // stood down must not leave one behind.
+    // Kept before `persist_path` is handed to the manager below, because the
+    // peer LISTENER is booted after the proxy's own bind and needs the same
+    // resolution. One expression, read twice, rather than two spellings of
+    // "the peers file beside the config".
+    let persist_path_for_peers = persist_path.clone();
+    if let Some(peers_path) = peers_file_beside_config(persist_path.as_deref()) {
+        // The egress seam reads the peers file per request and cannot be asked
+        // what path it was built from (`crate::peer::egress::peers_path`), so
+        // the boot path tells it once. Without this line an explicit
+        // `--config` elsewhere carried requests against the default peers
+        // file rather than against the file this server was actually started
+        // with.
+        if !crate::peer::egress::install_peers_path(peers_path.clone()) {
+            tracing::debug!(
+                path = %peers_path.display(),
+                "peer egress: a peers file was already installed for this process; keeping it"
+            );
+        }
+        match crate::fallback::install_peer_lease_provider(&peers_path) {
+            Ok(installed) => tracing::info!(
+                path = %peers_path.display(),
+                outcome = ?installed,
+                "peer-lease fallback: the dry-fleet arm now has somewhere to go"
+            ),
+            // Never fatal, and never silent either: an unreadable peers file
+            // means the operator's trust relationships cannot be read, which is
+            // worth a warning and is not worth refusing to serve local traffic
+            // over.
+            Err(err) => tracing::warn!(
+                path = %peers_path.display(),
+                error = %err,
+                "peer-lease fallback: the peers file could not be read, so nothing is borrowed \
+                 (local traffic is unaffected)"
+            ),
+        }
     }
 
     let manager = Manager::with_live_refresher(config, persist_path);
@@ -1279,6 +1898,30 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         }
     });
 
+    // The LAN peer mesh's second socket, opened here and nowhere else.
+    //
+    // AFTER the proxy's own bind, because the lender's half of a SERVE sends
+    // the relayed request through THIS process's own proxy, that is the whole
+    // of "own picker, own Bearer, own bucket", so the base it is given has to
+    // be the port this process actually bound, which for `port: 0` is a number
+    // only the kernel knew a moment ago.
+    //
+    // Before the accept loop is spawned below, so a peer that connects the
+    // instant the port opens finds a process whose own proxy is already bound.
+    let peer_addr = match peers_file_beside_config(persist_path_for_peers.as_deref()) {
+        Some(peers_path) => {
+            boot_peer_listener(
+                &peers_path,
+                &manager,
+                &format!("http://127.0.0.1:{}", bound.port()),
+                &shutdown_tx,
+                &mut background,
+            )
+            .await
+        }
+        None => None,
+    };
+
     let serve_manager = manager.clone();
     let mut stop = shutdown_tx.subscribe();
     let server = tokio::spawn(async move {
@@ -1300,6 +1943,7 @@ pub async fn serve(options: ServeOptions) -> anyhow::Result<ServeOutcome> {
         server: Some(server),
         server_finished: false,
         background,
+        peer_addr,
     }))
 }
 
@@ -1381,6 +2025,9 @@ mod tests {
             server: Some(server),
             server_finished: false,
             background,
+            // No peer socket: a hand-built handle in a unit test opens no port
+            // at all, least of all a second one on the LAN.
+            peer_addr: None,
         }
     }
 
@@ -1903,7 +2550,19 @@ mod tests {
     /// incident reads this ONE line (see the module doc-comment on why it is
     /// one line, not several); a knob resolved correctly but never logged is
     /// invisible to exactly that read.
-    #[tokio::test]
+    ///
+    /// `flavor = "current_thread"` is pinned explicitly, not left to the
+    /// macro's default: `_guard` below is a thread-local `DefaultGuard`
+    /// (`tracing::subscriber::set_default`), so it only covers whichever OS
+    /// thread runs the test body. `serve()`'s boot line is emitted inline,
+    /// on the calling task, and `background.push(tokio::spawn(...))`'s
+    /// loops spawned earlier in `serve()` are themselves polled on that same
+    /// task's thread under `current_thread` (there is only one), so nothing
+    /// here can land on a thread the guard never reached. Pinning the flavor
+    /// makes that invariant survive a future default change instead of
+    /// resting on it silently (same reasoning as
+    /// `a_panicking_background_task_is_logged_and_not_respawned` above).
+    #[tokio::test(flavor = "current_thread")]
     async fn boot_line_carries_every_new_knob_with_its_configured_value() {
         let sink = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
@@ -1962,5 +2621,155 @@ mod tests {
         }
 
         handle.shutdown().await;
+    }
+    /// **The peer-lease fallback is wired at boot**, a server booted beside a
+    /// peers file with sharing on reaches the provider on a dry fleet.
+    ///
+    /// `install_peer_lease_provider` had no production caller at all: the whole
+    /// feature was a library function and a test, so a `tcr` that had paired a
+    /// Mac and granted it `disclose` still answered the honest 429 without ever
+    /// asking that Mac for a lease.
+    ///
+    /// The instrument is a socket, not a log line and not the `OnceLock`. The
+    /// provider's first act on a dry-fleet ask is to dial the lender's address
+    /// (`lease::request_lease` -> `serve::dial_peer`), so a listener at that
+    /// address that accepts and hangs up is proof the arm reached the provider
+    /// and the provider read the peers file. It hangs up rather than answering,
+    /// which fails the borrower's handshake and returns it to the last rung of
+    /// the ladder, the 429 this handler always had.
+    ///
+    /// Watch it fail by deleting the `install_peer_lease_provider` block from
+    /// `serve`: no connection arrives, `configured_provider()` is `None`, and
+    /// both assertions below go red. Measured that way before this test was
+    /// kept.
+    ///
+    /// It is the only test in this binary that may install a provider, the
+    /// install is process-wide by design (`crate::fallback::PROVIDER`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn booting_beside_a_sharing_peers_file_wires_the_peer_lease_fallback() {
+        let home = tempfile::tempdir().expect("a temp home");
+        let config_path = home.path().join("teamclaude.json");
+        std::fs::write(&config_path, br#"{"accounts": []}"#).expect("the temp config writes");
+
+        // The lender: a socket that accepts one connection, records it, and
+        // closes. Obviously fake node id, and an address on a kernel port.
+        let lender = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the fake lender");
+        let lender_addr = lender.local_addr().expect("the fake lender's addr");
+        let dialled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = dialled.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = lender.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        // The peers file BESIDE the config, which is how `serve` resolves it.
+        // See `peers_file_beside_config`. `disclose` on plus an address is what
+        // "sharing on" means on the borrowing side.
+        let peers_path = home.path().join("tcr-peers.json");
+        let file = crate::peer::config::PeerFile {
+            peers: vec![crate::peer::config::PeerRow {
+                node: tcr_peer_wire::PeerId([5_u8; 32]),
+                label: "lending-mac".to_string(),
+                endpoints: vec![crate::peer::config::Endpoint::direct(
+                    lender_addr,
+                    0,
+                    crate::peer::config::EndpointSource::Paired,
+                )],
+                added_at: 0,
+                rendezvous_secret: None,
+                sees_us_at: None,
+                allow: crate::peer::config::Allow {
+                    relay: false,
+                    gateway: false,
+                    carry: false,
+                    inspect: false,
+                    allow_disclose: true,
+                    accept_move: false,
+                    control: crate::peer::config::ControlGrants::default(),
+                },
+                lend: Vec::new(),
+            }],
+            ..crate::peer::config::PeerFile::default()
+        };
+        crate::peer::config::save(&peers_path, &file).expect("the peers file writes");
+
+        let config: Config = serde_json::from_str(r#"{ "proxy": { "port": 0 }, "accounts": [] }"#)
+            .expect("the inline test config parses");
+        let mut handle = serve(ServeOptions {
+            persist_path: Some(config_path),
+            tls: TlsSetup::Disabled,
+            ..ServeOptions::new(config)
+        })
+        .await
+        .expect("bind must succeed on an ephemeral port")
+        .expect_started();
+
+        let provider = crate::fallback::configured_provider()
+            .expect("the boot sequence installed a peer-lease provider");
+        assert_eq!(
+            provider.name(),
+            "peer-lease",
+            "the installed provider is the peer-lease one"
+        );
+
+        // One POST at a fleet with no account that can serve it: the dry-fleet
+        // arm, which is the only condition under which a provider is consulted.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("a loopback client");
+        let answered = client
+            .post(format!("http://{}/v1/messages", handle.addr()))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"claude-sonnet-4-5","messages":[]}"#)
+            .send()
+            .await
+            .expect("the proxy answered");
+        assert_eq!(
+            answered.status().as_u16(),
+            429,
+            "the fake lender hung up, so the ladder's last rung answers, the honest 429"
+        );
+        assert_eq!(
+            dialled.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the dry-fleet arm reached the installed provider, which dialled the lender \
+             named in the peers file beside the config"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// The resolver's own three answers, without a server.
+    ///
+    /// A caller with no config path reads no peers file at all, which is the
+    /// inertness every sibling side effect in [`ServeOptions`] has; a caller
+    /// with one gets the peers file in that config's directory and nowhere
+    /// else, so `--config` selects a whole profile rather than pairing one
+    /// profile's accounts with the operator's real trust relationships.
+    #[test]
+    fn the_peers_file_is_the_one_beside_the_config_and_nothing_without_one() {
+        assert_eq!(peers_file_beside_config(None), None);
+
+        let resolved = peers_file_beside_config(Some(std::path::Path::new(
+            "/tmp/tcr-unit-profile/teamclaude.json",
+        )))
+        .expect("a config path resolves a peers path");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/tmp/tcr-unit-profile/tcr-peers.json"),
+            "the peers file is the one beside the config"
+        );
+
+        // And it is the same NAME the rest of the peer surface uses, read off
+        // that function rather than spelled twice.
+        assert_eq!(
+            resolved.file_name(),
+            crate::peer::config::default_path().file_name()
+        );
     }
 }

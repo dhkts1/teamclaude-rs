@@ -176,6 +176,11 @@ enum V4 {
     static var barHeight: CGFloat { compact ? 6 : 7 }
     static let barRadius: CGFloat = 4
     static let barTrackAlpha: Double = 0.08
+    /// A peer row whose lease has ENDED, drawn as past
+    /// (`settings-peers-short.html`'s own `.lz.ended`, decision row 13). The
+    /// same 0.55 the per-Mac sheet's ended lease row already uses, so the two
+    /// surfaces grey one state by one amount.
+    static let endedRowOpacity: Double = 0.55
     static let barMinWidth: CGFloat = 2
     /// `.bar.capped{max-width:110px}` — the BY TOOL bars only.
     static let barCappedWidth: CGFloat = 110

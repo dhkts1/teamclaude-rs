@@ -53,6 +53,22 @@ struct FleetView: View {
     /// ``onWhatsNew``, and for the same reason: the render harness passes `{}`.
     var onSettings: () -> Void = {}
 
+    /// The panel's ONE peer reader, shared by the Peers tab and by the
+    /// accounts tab's "Lent to …" lines.
+    ///
+    /// **It polls only while the Peers tab is on screen.** `PeersTabV4`
+    /// starts and stops it on appear and disappear, exactly as before; the
+    /// accounts tab asks for a SINGLE read when it appears
+    /// (``refreshLentTo()``), because a lease is the lender's own record and
+    /// changes when the operator lends, not on a cadence. A panel sitting on
+    /// Accounts therefore runs one `tcr peer ls --json` per visit rather than
+    /// one per poll interval.
+    ///
+    /// Hoisted out of `PeersView` so the two surfaces read ONE document. Two
+    /// controllers would be two reads of one file at two instants, which is
+    /// the disagreement `PeersSnapshot`'s own header exists to prevent.
+    @StateObject private var peers = PeerController()
+
     /// Surfaced in place rather than swallowed: a button that silently does
     /// nothing is worse than one that says why.
     @State private var loginError: String?
@@ -166,6 +182,22 @@ struct FleetView: View {
     /// alone rather than a 0% nobody measured.
     @State private var runningProcesses: [String: RunningCallStats] = [:]
 
+    /// When this app first saw the fleet read live with every account at
+    /// zero requests, in a row. `nil` once any account has served a request,
+    /// or the read stops being live, so a proxy that starts answering resets
+    /// the clock rather than keeping the old start time. See
+    /// ``NoRequestsBanner``.
+    @State private var zeroRequestsSince: Date?
+
+    /// The running `claude` process count, refreshed alongside
+    /// ``runningProcesses`` off the same ``ProcessTable/read()`` walk this
+    /// panel already does for the Tools tab. `nil` before the first read.
+    @State private var claudeCount: Int?
+
+    /// Where Claude is routed, read once per poll rather than once per render
+    /// so `body` never touches disk. See ``ClaudeRouteRead``.
+    @State private var claudeRoute: ClaudeRouteRead.Route?
+
     /// The kill a confirm is currently open for, `nil` when none is.
     ///
     /// The request holds what the DIALOG needs to name — the command and the
@@ -224,7 +256,14 @@ struct FleetView: View {
         // that opens to the commands behind it — and a harness that can only
         // ever draw it closed leaves the half that answers the question
         // unreviewed.
-        initialExpandedTimeoutClasses: Set<String> = []
+        initialExpandedTimeoutClasses: Set<String> = [],
+        // Seeded for the same reason the three above are: the render harness
+        // never runs the real clock or the real process table, so without
+        // this the no-requests banner scene has no way to be five minutes
+        // into a zero-request read.
+        initialZeroRequestsSince: Date? = nil,
+        initialClaudeCount: Int? = nil,
+        initialClaudeRoute: ClaudeRouteRead.Route? = nil
     ) {
         self.poller = poller
         self.server = server
@@ -244,6 +283,9 @@ struct FleetView: View {
         self._machine = State(initialValue: initialMachineStats)
         self._runningProcesses = State(initialValue: initialRunningProcesses)
         self._expandedTimeoutClasses = State(initialValue: initialExpandedTimeoutClasses)
+        self._zeroRequestsSince = State(initialValue: initialZeroRequestsSince)
+        self._claudeCount = State(initialValue: initialClaudeCount)
+        self._claudeRoute = State(initialValue: initialClaudeRoute)
     }
 
     /// `TCRBAR_LEGACY_PANEL=1` draws the pre-v4 panel instead, for one release,
@@ -271,6 +313,8 @@ struct FleetView: View {
                 sessionFiles = SessionFiles.read()
                 machine = MachineStats.read()
                 refreshRunningProcesses()
+                refreshClaudeCount()
+                claudeRoute = ClaudeRouteRead.current()
             }
         }
         .onChange(of: poller.lastPollAt) { _ in
@@ -278,6 +322,9 @@ struct FleetView: View {
                 sessionFiles = SessionFiles.read()
                 machine = MachineStats.read()
                 refreshRunningProcesses()
+                refreshClaudeCount()
+                refreshZeroRequestsSince()
+                claudeRoute = ClaudeRouteRead.current()
             }
         }
         // The kill confirm. `docs/design/tools-tab.md`: "a destructive control
@@ -385,6 +432,22 @@ struct FleetView: View {
         }
     }
 
+    /// The line a colleague's panel never had: the proxy is up, an account
+    /// was added, and nothing has reached it. `Tok.near`, the same amber
+    /// `verdictLine` already uses for "nothing failed, but nothing happened
+    /// either." See ``NoRequestsBanner``.
+    @ViewBuilder
+    private func noRequestsBanner(_ fleet: Fleet) -> some View {
+        if let text = noRequestsBannerText(fleet) {
+            Text(text)
+                .font(V4.font(V4.muteSize))
+                .foregroundStyle(Tok.near)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, V4.summaryPaddingSide)
+                .padding(.bottom, V4.summaryPaddingBottom)
+        }
+    }
+
     /// Is there a fleet to draw tabs over? `.loaded` with at least one account
     /// — the exact case ``v4Content`` gives a tab body to. Every other state
     /// (pending, tool missing, command failed, undecodable, empty fleet) falls
@@ -422,8 +485,23 @@ struct FleetView: View {
     /// Accounts itself carries no count of its own; the summary line directly
     /// above it already counts the fleet.
     private var v4Badges: [PanelTab: Int] {
-        guard case .loaded(let fleet) = poller.state else { return [:] }
         var out: [PanelTab: Int] = [:]
+        // A pairing request is the one thing on this panel that is WAITING on
+        // the operator (decision row 10), and it expires in ten minutes. It
+        // had no badge at all, so a knock could arrive and expire while
+        // somebody sat on the Accounts tab and was never told.
+        //
+        // `pendingCount` is the producer's own count, not `pending.count`:
+        // when the binary holds rows back the two disagree on purpose, and
+        // the number a badge shows is the number of requests, not the number
+        // of rows this build happened to be sent.
+        //
+        // Read off the SAME controller the Peers tab and the account cards
+        // read, so the badge and the rows cannot show two instants. Its
+        // cadence is that controller's: a poll while the Peers tab is open,
+        // and one read per visit to the Accounts tab.
+        if peers.snapshot.pendingCount > 0 { out[.peers] = peers.snapshot.pendingCount }
+        guard case .loaded(let fleet) = poller.state else { return out }
         if !fleet.sessions.isEmpty { out[.sessions] = fleet.sessions.count }
         if !fleet.toolsRunning.isEmpty { out[.tools] = fleet.toolsRunning.count }
         return out
@@ -436,6 +514,7 @@ struct FleetView: View {
             case .accounts:
                 SummaryLine.accounts(fleet)
                 accountsProvenanceLine(fleet)
+                noRequestsBanner(fleet)
             // Both gated on `sessionsSupported`, which is the guard the pre-v4
             // header at ``header`` has always carried and the v4 summary block
             // dropped: a server that predates the sessions wire reports no
@@ -459,6 +538,11 @@ struct FleetView: View {
                         .padding(.horizontal, V4.summaryPaddingSide)
                         .padding(.bottom, V4.summaryPaddingBottom)
                 }
+            // No summary line: a summary of nothing is a fabricated
+            // measurement, which is the same refusal the two tabs above make
+            // when the server predates the sessions wire.
+            case .peers:
+                EmptyView()
             }
         }
         v4UpdateRow
@@ -540,6 +624,14 @@ struct FleetView: View {
                 sessionsTab(fleet)
             case .tools:
                 toolsTab(fleet)
+            case .peers:
+                // The SAME controller the accounts tab reads `lentTo` from.
+                // One per panel: two would poll `tcr peer ls` twice and could
+                // show two instants of one file, which is the disagreement
+                // `PeersSnapshot`'s own header exists to prevent.
+                PeersView(
+                    controller: peers, snapshotMode: snapshotMode,
+                    onOpenSettings: onSettings)
             }
         default:
             // Every not-a-fleet state keeps the banner it already had: those
@@ -549,13 +641,44 @@ struct FleetView: View {
         }
     }
 
+    /// One `tcr peer ls --json`, for the lent-to lines. Never on a cadence:
+    /// see ``peers``. Skipped in `snapshotMode`, where the whole harness
+    /// contract is that nothing shells out.
+    private func refreshLentTo() {
+        guard !snapshotMode else { return }
+        Task { await peers.refresh() }
+    }
+
     private func accountsTabV4(_ fleet: Fleet) -> some View {
+        accountsTabBody(fleet)
+            // One read per visit to this tab, for the lent-to lines. The read
+            // itself is a detached task inside ``refreshLentTo()``, so a slow
+            // `tcr` cannot hold up this draw.
+            .onAppear { refreshLentTo() }
+    }
+
+    private func accountsTabBody(_ fleet: Fleet) -> some View {
         AccountsTabV4(
             fleet: fleet,
             controlName: control.current,
             expandedGroups: expandedGroups,
             onToggleGroup: { toggleGroupExpansion($0) },
-            now: Date()
+            now: Date(),
+            lentTo: peers.snapshot.lentTo,
+            exits: peers.snapshot.exits,
+            exitPeers: peers.snapshot.rows.filter { $0.trust == .trusted }.map(\.title),
+            exitPeerRows: peers.snapshot.entries,
+            onSetExit: { account, route, must in
+                peers.run(
+                    PeerCommand.accountExit(account: account, route: route, must: must))
+            },
+            onOpenLender: { lender in
+                // Two windows, one request: the pane opens that Mac's sheet
+                // when it appears, and clears the route so it does not
+                // re-open on the next visit.
+                SettingsNavigation.shared.peerSheet = lender
+                onSettings()
+            }
         ) { account in
             // The row's own actions, from the ONE definition of them —
             // `AccountRow`'s menu, rendered with no row around it. A second
@@ -661,6 +784,7 @@ struct FleetView: View {
         case .accounts: return AppBuild.label ?? "TcrBar"
         case .sessions: return "proxy + Claude Code session files"
         case .tools: return "from request bodies only · nothing logged"
+        case .peers: return "peer mesh · nothing built yet"
         }
     }
 
@@ -1049,6 +1173,8 @@ struct FleetView: View {
                 sessionsTab(fleet)
             case .tools:
                 toolsTab(fleet)
+            case .peers:
+                PeersView(snapshotMode: snapshotMode, onOpenSettings: onSettings)
             }
         }
     }
@@ -1067,7 +1193,8 @@ struct FleetView: View {
     // content-dependent height on a tab switch would risk reopening.
 
     /// The segmented control at the top of the panel — SF Symbols
-    /// `gauge`/`person.2`/`terminal`, a count badge on the two new tabs,
+    /// `gauge`/`person.2`/`terminal`/`network`, a count badge on the two
+    /// session-derived tabs,
     /// mirroring `docs/design/panel-tabs-mockup.html`.
     private func panelTabBar(_ fleet: Fleet) -> some View {
         HStack(spacing: 3) {
@@ -1089,6 +1216,10 @@ struct FleetView: View {
         case .accounts: return nil
         case .sessions: return fleet.sessions.isEmpty ? nil : fleet.sessions.count
         case .tools: return fleet.toolsRunning.isEmpty ? nil : fleet.toolsRunning.count
+        // No badge until there is something countable to badge, and a peer
+        // count is not it: a pinned peer that is asleep is the normal state,
+        // so a "2" here would read as activity when it means membership.
+        case .peers: return nil
         }
     }
 
@@ -1942,6 +2073,40 @@ struct FleetView: View {
         }
         runningProcesses = ProcessStats.poll(
             calls: calls, table: ProcessTable.read(), previous: runningProcesses, now: Date())
+    }
+
+    /// A second, cheap walk of the same process table ``refreshRunningProcesses()``
+    /// reads, since that function returns early whenever nothing is running and
+    /// this count needs an answer either way. See ``NoRequestsBanner``.
+    private func refreshClaudeCount() {
+        claudeCount = ProcessTable.read().filter { $0.name == "claude" }.count
+    }
+
+    /// Advances or clears ``zeroRequestsSince`` off the poll that just landed.
+    /// The pure zero/live check is ``NoRequestsBanner/totalRequests(_:)``; this
+    /// function only starts and stops its own clock.
+    private func refreshZeroRequestsSince() {
+        guard case .loaded(let fleet) = poller.state,
+            let total = NoRequestsBanner.totalRequests(fleet)
+        else {
+            zeroRequestsSince = nil
+            return
+        }
+        if total > 0 {
+            zeroRequestsSince = nil
+        } else if zeroRequestsSince == nil {
+            zeroRequestsSince = Date()
+        }
+    }
+
+    /// The Accounts tab's no-requests banner text, or `nil` when it must not
+    /// show. See ``NoRequestsBanner``.
+    private func noRequestsBannerText(_ fleet: Fleet) -> String? {
+        guard let since = zeroRequestsSince, let route = claudeRoute else { return nil }
+        return NoRequestsBanner.text(
+            liveFor: Date().timeIntervalSince(since),
+            claudeCount: claudeCount,
+            route: route)
     }
 
     /// One of today's slowest calls — the same item, with a pill where the
@@ -3328,11 +3493,33 @@ struct FleetView: View {
 /// A dictionary rather than one summed scalar because rows are not uniform
 /// height — `visibleRowsHeight(for:)` needs the first N individually, in
 /// display order, not just their total.
-/// The panel's three tabs (F2 + F3).
+
+/// The panel's four tabs (F2 + F3, plus Peers).
 /// `CaseIterable` so `panelTabBar` draws them in one declared order rather
 /// than a second list a reviewer has to keep in sync with this one.
-enum PanelTab: Equatable, CaseIterable {
-    case accounts, sessions, tools
+///
+/// `peers` draws the real tab now, two switches, a card per Mac and a count
+/// line, so it is a tab the panel may open on like any other. The sentence
+/// here used to say the opposite, on the grounds that the case rendered a
+/// placeholder.
+///
+/// # Why there is a raw value
+///
+/// ``DefaultTabPreference`` stores the chosen tab as a STRING, because it
+/// lives in `TcrBarCore` and cannot import this target (that type's own
+/// doc-comment says why). Two sites then have to turn a string back into a
+/// tab: the "Open on" picker's tags (`SettingsPanes.swift`) and
+/// `MenuBarShell.initialTab(from:)`. Spelled as literals, those were two
+/// copies of one decision, and they drifted exactly as copies do, the picker
+/// offered three of the four names and the shell mapped anything it did not
+/// recognise to `.accounts`, so `peers` could be neither selected nor opened
+/// on. The raw value is the one place that pairing lives: the picker tags
+/// `allCases` and the shell reads `PanelTab(rawValue:)`, and neither can name
+/// a tab this enum does not have. The four strings must stay equal to
+/// ``DefaultTabPreference/validTabs``, which `DefaultTabPreferenceTests` and
+/// `PeersPanelWiringTests` both pin.
+enum PanelTab: String, Equatable, CaseIterable {
+    case accounts, sessions, tools, peers
 
     var title: String {
         switch self {
@@ -3344,6 +3531,7 @@ enum PanelTab: Equatable, CaseIterable {
         case .accounts: return "Accts"
         case .sessions: return "Sessions"
         case .tools: return "Tools"
+        case .peers: return "Peers"
         }
     }
 
@@ -3352,7 +3540,42 @@ enum PanelTab: Equatable, CaseIterable {
         case .accounts: return "gauge"
         case .sessions: return "person.2"
         case .tools: return "terminal"
+        case .peers: return "network"
         }
+    }
+}
+
+/// The Peers tab's body: two switches, the Macs between them, and one count
+/// line (`PanelV4/PeersTabV4.swift`, built from
+/// the Peers tab mockup (kept outside the tree) scenes 45 to 51).
+///
+/// A wrapper, and thin on purpose. It owns the ``PeerController``, one per
+/// panel, started when the tab appears and stopped when it goes away, so a
+/// panel sitting on the Accounts tab runs no peer subprocess at all, and
+/// nothing else. Everything the tab knows is in `PeersTabV4`, which takes a
+/// controller and can therefore be drawn from a pinned snapshot by
+/// `--render-states` without a proxy, a listener or a subprocess.
+struct PeersView: View {
+    /// Injected by the render harness; the panel makes its own.
+    @StateObject private var controller: PeerController
+    private let snapshotMode: Bool
+    private let onOpenSettings: () -> Void
+
+    init(
+        controller: PeerController? = nil,
+        snapshotMode: Bool = false,
+        onOpenSettings: @escaping () -> Void = {}
+    ) {
+        _controller = StateObject(wrappedValue: controller ?? PeerController())
+        self.snapshotMode = snapshotMode
+        self.onOpenSettings = onOpenSettings
+    }
+
+    var body: some View {
+        PeersTabV4(
+            controller: controller,
+            snapshotMode: snapshotMode,
+            onOpenSettings: onOpenSettings)
     }
 }
 

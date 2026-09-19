@@ -1120,8 +1120,12 @@ mod tests {
         );
     }
 
-    /// UDP canary. **This test cannot currently fail, and that is deliberate —
-    /// but it was previously documented as if a filter were holding it up.**
+    /// UDP canary, with a positive control of its own.
+    ///
+    /// **The exclusion half cannot currently fail, and that is deliberate.**
+    /// It was once documented as if a filter were holding it up; the control
+    /// beside it is what stops "nothing was reported" reading as "UDP was
+    /// correctly excluded".
     ///
     /// Measured 2026-08-08 on macOS by removing each filter in turn and re-running:
     /// it stays green with `SocketState::Listen` removed AND with `Protocol::TCP`
@@ -1130,28 +1134,50 @@ mod tests {
     /// comment here claimed "`Protocol::TCP` (not the state filter) is what keeps
     /// this green", which the mutations refute.
     ///
-    /// It is kept as a pure upstream canary: if `listeners` ever starts reporting
+    /// It is kept as an upstream canary: if `listeners` ever starts reporting
     /// UDP sockets, this goes red and tells us the protocol filter has become
-    /// load-bearing. Do not count it as evidence that either filter works — the
-    /// two tests above are, and both were watched failing under mutation.
+    /// load-bearing. Do not count the exclusion as evidence that either filter
+    /// works: the two tests above are, and both were watched failing under
+    /// mutation. What the control below DOES prove is that the enumeration ran
+    /// at all on the very port being asked about, which an empty answer from a
+    /// broken `get_all()` would otherwise have satisfied.
     #[test]
     fn port_listeners_excludes_a_udp_socket_on_the_same_port() {
-        let udp = std::net::UdpSocket::bind("127.0.0.1:0").expect("binding an ephemeral UDP port");
-        let port = udp
-            .local_addr()
-            .expect("a bound socket has a local address")
-            .port();
-
-        // Assert on OUR pid, not on global emptiness. A UDP bind reserves a port
-        // in the UDP space only — the TCP space is independent, so an unrelated
-        // process may legitimately be TCP-LISTENing on this same number. Asserting
-        // `is_empty()` made this test depend on the whole machine's TCP usage, a
-        // precondition it never established, and it went red on a CI runner where
-        // pid 9460 held TCP on the port the kernel handed us for UDP.
+        // **The TCP socket is bound FIRST and the UDP one takes its number.**
         //
-        // This cannot pass vacuously through a broken `port_listeners` that always
-        // returns empty: `port_listeners_finds_this_process_on_an_ephemeral_port`
-        // is the positive control for that, and would fail first.
+        // Letting the kernel pick the UDP port and then asking about it left
+        // the whole TCP space of that number to chance, including this
+        // process's own: the lib suite runs many tests at once, several of
+        // them bind ephemeral TCP listeners, and one of them landing on the
+        // number handed to this UDP socket reddens this test with OUR pid,
+        // which is exactly what its assertion is about. Measured once in a
+        // full workspace run. Binding TCP first makes the number this test's
+        // own in both spaces, so no sibling in this process can take it while
+        // the listener is up.
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("binding an ephemeral TCP port");
+        let port = listener
+            .local_addr()
+            .expect("a bound listener has a local address")
+            .port();
+        // The same number in the UDP space, which is independent: this is the
+        // socket the assertion below is about.
+        let udp = std::net::UdpSocket::bind(("127.0.0.1", port))
+            .expect("the UDP space of a TCP port this process holds is free");
+
+        // The positive control, and it is new: with both sockets bound, this
+        // process IS a holder, through the TCP listener. Without it the
+        // assertion that follows would pass just as well against a
+        // `port_listeners` that had stopped enumerating anything at all.
+        let with_tcp = port_listeners(port);
+        assert!(
+            with_tcp.contains(&std::process::id()),
+            "this process holds a TCP LISTEN on port {port}, so it must be reported; \
+             got {with_tcp:?}"
+        );
+
+        // Now only the UDP socket is left on that number.
+        drop(listener);
         let holders = port_listeners(port);
         assert!(
             !holders.contains(&std::process::id()),

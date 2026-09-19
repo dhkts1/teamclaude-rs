@@ -1510,6 +1510,47 @@ fn write_control_account(
     Ok(name)
 }
 
+/// Write one account's exit lock: where its requests leave from, and what an
+/// exit it cannot reach costs.
+///
+/// Through [`edit_account`], the same load/resolve/save chain every other
+/// account edit uses, so this verb cannot resolve a query differently from
+/// `tcr disable`, cannot skip the ambiguous-query message, and cannot leave a
+/// partial write behind when the query matches nothing.
+///
+/// # File only, and that is not the half-write `set_enabled` shouts about
+///
+/// `egress` is a boot-time field: the request path reads the pin off the
+/// config the proxy loaded at start, so a running proxy keeps its old exit
+/// until it restarts, and there is no live route to ask instead. That is a
+/// different situation from a disable, where the file and a running rotation
+/// can disagree about an account that is being used RIGHT NOW. The caller
+/// prints the restart line rather than this returning a warning, because the
+/// panel shells out to the CLI and the operator reads what it prints.
+///
+/// `None` leaves that half alone: an operator who says `--must` and nothing
+/// else is changing the strictness of a pin they already chose, and re-sending
+/// a pin they did not name would be this function inventing one.
+pub fn set_account_egress(
+    config_path: &Path,
+    query: &str,
+    egress: Option<config::Egress>,
+    strict: Option<bool>,
+) -> anyhow::Result<(String, config::EgressPin)> {
+    edit_account(config_path, query, |config, idx| {
+        if let Some(egress) = egress {
+            config.accounts[idx].egress = egress;
+        }
+        if let Some(strict) = strict {
+            config.accounts[idx].egress_strict = strict;
+        }
+        (
+            config.accounts[idx].name.clone(),
+            config.accounts[idx].egress_pin(),
+        )
+    })
+}
+
 /// Set or clear the identity-bound control account, **in the running proxy
 /// first** — same posture as [`set_enabled`], and for the same reason: a
 /// file-only write would leave the running process still resolving identity
@@ -2483,6 +2524,38 @@ async fn fetch_live_status(config: &Config) -> Result<StatusPayload, LiveStatusE
     parse_live_status(&fetch_live_status_body(config).await?)
 }
 
+/// The peers block as the RUNNING proxy reports it, `tcr peer status --json`.
+///
+/// # Why this is a separate verb from `tcr peer ls`
+///
+/// `peer ls` projects two FILES and answers the same thing with no server at
+/// all. This asks the process that is serving what it currently holds: the
+/// leases in its ledger, when each Mac was last heard from, the paths it knows.
+/// Folding them into one verb would make a proxy that is DOWN look like a peers
+/// file that is EMPTY, which is the one confusion the Peers tab forbids by name
+/// (`TcrBarCore/PeerListDocument.swift`, `LivePeersRead`).
+///
+/// So the error is returned rather than turned into an empty list: the caller
+/// exits non-zero, and the panel keeps the file half it already drew.
+pub async fn live_peers(config: &Config) -> Result<Vec<crate::status::PeerStatusRow>, String> {
+    match fetch_live_status(config).await {
+        Ok(payload) => Ok(payload.peers),
+        Err(LiveStatusError::NoServer) => Err(format!(
+            "no tcr is listening on 127.0.0.1:{}, so there is no live view to read \
+             (`tcr peer ls` reads the file)",
+            config.proxy.port
+        )),
+        Err(LiveStatusError::NoAnswer(why)) => Err(format!(
+            "the tcr on 127.0.0.1:{} accepted the connection and never answered: {why}",
+            config.proxy.port
+        )),
+        Err(LiveStatusError::Unusable(why)) => Err(format!(
+            "the tcr on 127.0.0.1:{} answered with something this build cannot read: {why}",
+            config.proxy.port
+        )),
+    }
+}
+
 /// The typed half of [`fetch_live_status`], split out so a caller that needs
 /// the RAW body as well (`sessions()`, which must tell an absent `sessions`
 /// key from an empty array — `#[serde(default)]` erases the difference) can
@@ -2722,9 +2795,22 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
     let config = import_claude_code_login_if_empty(config_path, config).await;
     warn_if_no_accounts(&config);
 
+    // Read before the match: the offline arm CONSUMES `config`, and the route
+    // check below needs the port whichever arm ran.
+    let proxy_port = config.proxy.port;
+    // How many requests this proxy served recently, or `None` when nothing
+    // answered. The two are different facts, and `crate::doctor` keeps them
+    // apart (a proxy that is up and idle is healthy; one that never answered is
+    // not on the route at all).
+    let mut served_recently: Option<u64> = None;
+
     let (source, server_build, snapshot, thresholds, http1_only, control, group_colors) =
         match fetch_live_status(&config).await {
             Ok(payload) => {
+                served_recently = Some(crate::doctor::requests_in_window(
+                    &payload,
+                    crate::doctor::REQUEST_WINDOW_MINUTES,
+                ));
                 let build = payload.build.clone();
                 let http1_only = payload.http1_only;
                 let control = payload.control.clone();
@@ -2811,6 +2897,17 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         // `Manager::http1_only`'s doc-comment for why this must NOT be
         // re-derived from the config file when `source=live`. `groupColors`
         // rides the same way, one `name:hex` token per group.
+        // The route problem goes ABOVE the fleet, because it outranks it: a
+        // glance at `tcr status` that shows healthy accounts while Claude Code
+        // is pointed at another base URL is the exact reading that cost a
+        // colleague an afternoon. Only when there IS a problem (exit 2, routed
+        // elsewhere; exit 3, routed here with nothing answering), and only in
+        // the text form. `--json` is a bare array a script pipes into jq, and
+        // a line above it would corrupt that contract.
+        let route = crate::doctor::inspect(proxy_port, served_recently);
+        if route.exit_code() != 0 {
+            println!("{}", route.verdict());
+        }
         let group_colors_field = if group_colors.is_empty() {
             String::new()
         } else {
@@ -2838,6 +2935,49 @@ pub async fn status(config_path: &Path, json: bool) -> anyhow::Result<()> {
         print!("{}", render_accounts(&snapshot, source));
     }
     Ok(())
+}
+
+/// `tcr doctor [--json]`: is Claude Code reaching this proxy, and if not, what
+/// decided otherwise. Returns the exit code the caller hands to the process:
+/// 0 routed here and serving, 2 routed somewhere else, 3 routed here with
+/// nothing answering ([`crate::doctor::Report::exit_code`]).
+///
+/// The live read happens here rather than in `crate::doctor` so there stays
+/// exactly ONE client speaking to the status endpoint, with one set of
+/// timeouts and one api-key rule. Everything this prints is decided by
+/// [`crate::doctor::inspect`], which is pure and tested against a temp HOME.
+///
+/// `LiveStatusError::NoServer` is the only failure that reads as "no proxy
+/// answered" without a word on stderr: it is the ordinary state of a machine
+/// whose proxy is down, and it is already the headline of the verdict line.
+/// The other two mean something IS on the port and could not be read, which the
+/// operator has to be told, since the request count then reads `none` for a
+/// reason that is not "the proxy is down".
+pub async fn doctor(config_path: &Path, json: bool) -> anyhow::Result<i32> {
+    let config = load_config(config_path)?;
+    let served_recently = match fetch_live_status(&config).await {
+        Ok(payload) => Some(crate::doctor::requests_in_window(
+            &payload,
+            crate::doctor::REQUEST_WINDOW_MINUTES,
+        )),
+        Err(LiveStatusError::NoServer) => None,
+        Err(reason) => {
+            eprintln!(
+                "[tcr] warning: something is listening on 127.0.0.1:{} and this build could not read its status ({}). The request count below reads as none for that reason, not because the proxy is down.",
+                config.proxy.port,
+                reason.why()
+            );
+            None
+        }
+    };
+
+    let report = crate::doctor::inspect(config.proxy.port, served_recently);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report.to_json())?);
+    } else {
+        println!("{}", report.render_text());
+    }
+    Ok(report.exit_code())
 }
 
 /// The build `key=value` tail of the `status source=` line.
@@ -4411,6 +4551,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -4504,6 +4646,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         let applied = post_add_account(&config, &account)
@@ -4558,6 +4702,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         let err = post_add_account(&config, &account)
@@ -5264,23 +5410,51 @@ mod tests {
     /// The fallback half of the same contract: with nothing listening, the live
     /// read reports `NoServer` (the ordinary case, which warns about nothing) and
     /// `tcr status` keeps working exactly as before — just labelled `offline`.
+    ///
+    /// # Why it retries
+    ///
+    /// The port is reserved by binding and dropping, so between that drop and
+    /// the request it belongs to nobody, and under a full `cargo test`, where
+    /// other binaries are opening sockets at the same time, another process
+    /// takes it. This test then reaches something that ANSWERS, which is a
+    /// different error and a correct one, and the assertion fails for a reason
+    /// that has nothing to do with the classification it guards. Measured: it
+    /// went red exactly this way in one of three full-suite runs, with
+    /// `error sending request for url (http://127.0.0.1:64013/_tcr/status)`.
+    ///
+    /// So a lost port is retried on a fresh one, five times at most. The ceiling
+    /// keeps the race visible: losing five in a row is a runner with no free
+    /// ports, which is a defect to see rather than to retry past. The same
+    /// shape, and the same reason, as `Mac::boot` in `tests/peer_e2e.rs`.
     #[tokio::test]
     async fn live_status_falls_back_when_no_server_answers() {
-        // Bind and immediately drop, so the port is free and reliably refuses.
-        let port = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let mut config = load_from(TWO_ACCOUNTS);
-        config.proxy.port = port;
+        /// How many times this may lose the port before it is a failure.
+        const ATTEMPTS: usize = 5;
 
-        match fetch_live_status(&config).await {
-            Err(LiveStatusError::NoServer) => {}
-            Err(err) => panic!(
-                "a dead port is the ordinary no-server case, not a warning: {}",
-                err.why()
-            ),
-            Ok(_) => panic!("nothing is listening on {port}"),
+        let mut lost = 0;
+        loop {
+            // Bind and immediately drop, so the port is free and refuses.
+            let port = {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let mut config = load_from(TWO_ACCOUNTS);
+            config.proxy.port = port;
+
+            match fetch_live_status(&config).await {
+                Err(LiveStatusError::NoServer) => return,
+                Err(err) => {
+                    lost += 1;
+                    assert!(
+                        lost < ATTEMPTS,
+                        "five loopback ports in a row were taken by something else between \
+                         the reserve and the request, so this box has no free ports rather \
+                         than a race: {}",
+                        err.why()
+                    );
+                }
+                Ok(_) => panic!("something is listening on {port} and answered a status payload"),
+            }
         }
     }
 

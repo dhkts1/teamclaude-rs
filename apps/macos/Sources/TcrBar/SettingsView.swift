@@ -1,12 +1,18 @@
 import SwiftUI
 import TcrBarCore
 
-/// The four panes.
+/// The five panes.
+///
+/// `peers` is last deliberately. The two controls an operator needs live on
+/// the panel's own Peers tab and everything else
+/// here, so this pane is the detail behind a tab rather than a place anyone has
+/// to visit, and the sidebar reads in the order a person meets the app.
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general
     case menuBar
     case groupsRotation
     case updates
+    case peers
 
     var id: Self { self }
 
@@ -16,6 +22,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .menuBar: return "Menu Bar"
         case .groupsRotation: return "Groups & Rotation"
         case .updates: return "Updates"
+        case .peers: return "Peers"
         }
     }
 
@@ -25,6 +32,9 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .menuBar: return "menubar.rectangle"
         case .groupsRotation: return "square.grid.2x2"
         case .updates: return "arrow.triangle.2.circlepath"
+        // The same SF Symbol `PanelTab.peers` uses, so the sidebar row and
+        // the panel tab it explains read as one thing.
+        case .peers: return "network"
         }
     }
 }
@@ -43,6 +53,21 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 final class SettingsNavigation: ObservableObject {
     static let shared = SettingsNavigation()
     @Published var selectedTab: SettingsTab? = .general
+
+    /// The trusted Mac whose sheet to open once the Peers pane appears, and
+    /// `nil` the rest of the time.
+    ///
+    /// Decision row 13's account card is a control as well as a readout:
+    /// clicking "Lent to attic-nuc 20 %" opens THAT Mac's sheet, which lives
+    /// in Settings > Peers and not on the panel. Two windows, so the request
+    /// has to travel, and it travels on the object that already carries
+    /// "which pane", rather than on a second singleton that would then be a
+    /// second answer to "where is Settings right now".
+    ///
+    /// The pane CLEARS it when it opens the sheet. A request left set would
+    /// re-open the sheet every time the pane appeared, which is the shape of
+    /// bug a stale route always has.
+    @Published var peerSheet: String?
 }
 
 /// `NavigationSplitView` sidebar + detail, back/forward toolbar navigation —
@@ -89,10 +114,18 @@ struct SettingsRootView: View {
         .frame(minWidth: 660, minHeight: 540)
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
-                Button { goBack() } label: { Image(systemName: "chevron.left") }
-                    .disabled(!canGoBack)
-                Button { goForward() } label: { Image(systemName: "chevron.right") }
-                    .disabled(!canGoForward)
+                Button {
+                    goBack()
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .disabled(!canGoBack)
+                Button {
+                    goForward()
+                } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .disabled(!canGoForward)
             }
         }
         .onChange(of: navigation.selectedTab) { _ in recordNavigation() }
@@ -179,6 +212,8 @@ private struct SettingsDetailView: View {
                 GroupsRotationSettingsPane(dependencies: dependencies)
             case .updates:
                 UpdatesSettingsPane(dependencies: dependencies)
+            case .peers:
+                PeersSettingsPane(dependencies: dependencies)
             }
         }
         .navigationTitle(tab.title)

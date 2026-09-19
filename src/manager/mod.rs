@@ -45,6 +45,11 @@ use crate::stats::{
 };
 use crate::warmer::{AccountWarmer, LiveWarmer};
 
+// The ONE line `src/manager/select.rs`'s zero-change tripwire explicitly
+// permits: `Manager::lendable_fraction` has to live on a SIBLING of `select.rs`
+// to reach its `pub(super) fn effective_threshold`, and a sibling module that
+// is not declared does not exist. See `peer_lend.rs`'s own doc-comment.
+mod peer_lend;
 mod pins;
 mod probing;
 mod refresh;
@@ -2162,7 +2167,20 @@ impl Manager {
             // The identity match is the same probe the loop above uses, just
             // run in the opposite direction: does any LOADED account already
             // own this fresh entry?
-            let http1_only = self.config.lock().expect("config lock poisoned").http1_only;
+            //
+            // Pushed onto `self.config.accounts` in the SAME iteration as
+            // `self.accounts` (never one without the other): `Self::account_egress`
+            // and every other by-index reader of `self.config` assume the two
+            // vectors are index-aligned, because accounts are appended, never
+            // removed, from either. Before this fix only the runtime vector grew
+            // here, so after one admission `self.accounts[idx]` and
+            // `self.config.accounts.get(idx)` named two different accounts (or
+            // `idx` was simply out of bounds on the config side) for every index
+            // from the admitted account onward: a strict pin on any of them
+            // silently failed open (`account_egress` returns `None` on an
+            // out-of-range `idx`, and callers read `None` as "no pin").
+            let mut config = self.config.lock().expect("config lock poisoned");
+            let http1_only = config.http1_only;
             for candidate in &fresh.accounts {
                 let already_known = accounts.iter().any(|existing| {
                     let probe = crate::identity::probe(
@@ -2178,6 +2196,7 @@ impl Manager {
                 }
                 changed.push(format!("{}: admitted by reload", candidate.name));
                 accounts.push(AccountRuntime::from_config(candidate, http1_only));
+                config.accounts.push(candidate.clone());
             }
         }
 
@@ -2853,6 +2872,33 @@ impl Manager {
                         // `identity::probe`'s None placeholders — see
                         // `persist_replaced`'s doc-comment for the restart-un-bench
                         // this replaces.
+                        //
+                        // `egress`/`egress_strict` are NOT on `AccountRuntime` (see
+                        // `Self::account_egress`'s doc-comment: a pin is operator
+                        // intent that only the config file states), so the only
+                        // place to read the row's current pin from is
+                        // `self.config`, resolved by identity, the same way
+                        // `persist_replaced` resolves its own write target, never
+                        // by `idx`, because `idx` here is a `self.accounts`
+                        // (runtime) index and is not guaranteed to line up with
+                        // `self.config.accounts`.
+                        let existing_pin = {
+                            let config = self.config.lock().expect("config lock poisoned");
+                            match crate::identity::resolve(
+                                config.accounts.iter().enumerate(),
+                                &target,
+                            ) {
+                                crate::identity::Resolved::One(position) => config
+                                    .accounts
+                                    .get(position)
+                                    .map(config::Account::egress_pin)
+                                    .unwrap_or_default(),
+                                crate::identity::Resolved::Many
+                                | crate::identity::Resolved::None => {
+                                    crate::config::EgressPin::default()
+                                }
+                            }
+                        };
                         let target = config::Account {
                             name: row.name.clone(),
                             account_type: row.account_type.clone(),
@@ -2878,6 +2924,13 @@ impl Manager {
                             organization_type: row.organization_type.clone(),
                             rate_limit_tier: row.rate_limit_tier.clone(),
                             seat_tier: row.seat_tier.clone(),
+                            // Carried from the config row this account already
+                            // resolves to, never hardcoded to `Local`/unpinned;
+                            // see the `existing_pin` note above. A re-add that
+                            // supplied no egress preference of its own must not
+                            // silently drop an operator's exit-node pin.
+                            egress: existing_pin.egress,
+                            egress_strict: existing_pin.strict,
                             extra: serde_json::Map::new(),
                         };
                         Resolution::Updated {
@@ -3225,6 +3278,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         }
     }
@@ -5034,6 +5089,72 @@ mod tests {
             "the newly admitted account must be selectable, not just counted: got {idx:?}"
         );
         drop(accounts);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// C-4 regression: `Self::account_egress` indexes `self.config.accounts`
+    /// with a RUNTIME index (`self.accounts`). Before this fix, the APP-35
+    /// admission arm above (`reload_admits_an_account_added_to_the_file_after_boot`)
+    /// pushed a newly discovered account onto the runtime vector ONLY, never
+    /// onto `self.config.accounts`, so after one hot-add, `self.accounts` has
+    /// N+1 rows and `self.config.accounts` still has N. `account_egress(N)` then
+    /// reads `config.accounts.get(N)`, which is out of bounds and `None`, so a
+    /// STRICT pin on the newly admitted account is silently read as no pin at
+    /// all.
+    #[test]
+    fn reload_keeps_account_egress_index_aligned_with_a_hot_added_strict_pin() {
+        let path = tmp_config_path("reload-egress-index");
+        let pinned_peer = tcr_peer_wire::PeerId([9u8; 32]);
+        let boot = config_with(vec![account("acct-a", 0)]);
+        config::save(&path, &boot).expect("write initial reload config");
+        let manager = build_manager_with_path(boot, path.clone());
+        assert_eq!(
+            manager
+                .accounts
+                .read()
+                .expect("accounts lock poisoned")
+                .len(),
+            1,
+            "control: boots with exactly the one account on disk"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let appended = config_with(vec![
+            account("acct-a", 0),
+            Account {
+                egress: crate::config::Egress::Via(pinned_peer),
+                egress_strict: true,
+                ..account("acct-b", 5)
+            },
+        ]);
+        config::save(&path, &appended).expect("write appended reload config");
+        manager.reload_groups_if_changed();
+
+        let idx = {
+            let accounts = manager.accounts.read().expect("accounts lock poisoned");
+            assert_eq!(
+                accounts.len(),
+                2,
+                "the newly admitted account must appear in the runtime rotation"
+            );
+            accounts
+                .iter()
+                .position(|a| a.name == "acct-b")
+                .expect("acct-b was admitted by reload")
+        };
+
+        let pin = manager.account_egress(idx);
+        assert_eq!(
+            pin,
+            Some(crate::config::EgressPin {
+                egress: crate::config::Egress::Via(pinned_peer),
+                strict: true,
+            }),
+            "a strict pin on a hot-admitted account must be readable by its runtime \
+             index, not silently None (fail open) because self.config.accounts \
+             lagged self.accounts: got {pin:?}"
+        );
+
         std::fs::remove_file(&path).ok();
     }
 
@@ -10510,6 +10631,79 @@ mod tests {
         assert_eq!(
             reloaded.accounts[1].refresh_token.as_deref(),
             Some("rt-PERSONAL")
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// F5 follow-up: the re-add target `add_or_update_account`'s `Updated`
+    /// arm hands to `persist_replaced` must carry the account's EXISTING
+    /// exit-node pin, never hardcode the unpinned default. The bug is
+    /// unobservable on the common path (`persist_replaced`'s `Resolved::One`
+    /// arm reads only `access_token`/`refresh_token`/`expires_at` off the
+    /// target, never touching `egress` when a matching config/disk row is
+    /// found, so egress survives untouched either way there). It bites in
+    /// `persist_replaced`'s APPEND arm, reached when the in-memory
+    /// `self.accounts` runtime row still exists but the on-disk document has
+    /// lost its counterpart entry (an operator hand-editing `tcr-peers`-style
+    /// config, or a partial write): `merge_account`'s `EntryMatch::None` arm
+    /// then serializes the WHOLE target object as a fresh disk row, `egress`
+    /// included, so with the hardcoded default, the pin the in-memory config
+    /// still remembers never reaches the newly recreated disk row.
+    #[test]
+    fn add_or_update_account_carries_an_existing_strict_egress_pin_into_a_recreated_disk_row() {
+        let pinned_peer = tcr_peer_wire::PeerId([7u8; 32]);
+        let pinned = Account {
+            account_uuid: Some("uuid-pinned".to_string()),
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            egress: crate::config::Egress::Via(pinned_peer),
+            egress_strict: true,
+            ..account("pinned@example.com", 0)
+        };
+        let (manager, path) =
+            build_manager_with_disk(config_with(vec![pinned]), "f5-egress-pin-carried");
+
+        // Simulate the disk document losing its entry for this account while
+        // `self.config` in memory (the manager never re-reads accounts from
+        // disk, only groups reload) still carries the full row, pin
+        // included: a raw JSON edit, never through `config::save`, which
+        // would go through `self.config` and defeat the scenario.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["accounts"].as_array_mut().unwrap().clear();
+        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        // Same identity, fresh credentials, and, like a real re-add through
+        // `POST /_tcr/accounts`, no opinion of its own about egress: the
+        // submission carries only what `account(..)` builds, i.e. Local/false.
+        let submission = Account {
+            account_uuid: Some("uuid-pinned".to_string()),
+            access_token: "at-new".to_string(),
+            refresh_token: Some("rt-new".to_string()),
+            ..account("pinned@example.com", 0)
+        };
+        let outcome = manager.add_or_update_account(submission);
+        match outcome {
+            AddAccountOutcome::Updated { persist, .. } => {
+                assert_eq!(persist, AddPersist::Persisted);
+            }
+            other => panic!("same identity, fresh credentials must UPDATE in place: {other:?}"),
+        }
+
+        // DISK: the row `persist_replaced` recreates must carry the pin
+        // forward, not reset it to Local.
+        let reloaded = config::load(&path).expect("reload persisted config");
+        assert_eq!(reloaded.accounts.len(), 1);
+        assert_eq!(
+            reloaded.accounts[0].egress,
+            crate::config::Egress::Via(pinned_peer),
+            "the recreated disk row must carry the account's existing egress pin forward, \
+             not reset it to Local"
+        );
+        assert!(
+            reloaded.accounts[0].egress_strict,
+            "the recreated disk row must carry the account's existing strict flag forward"
         );
 
         std::fs::remove_file(&path).ok();

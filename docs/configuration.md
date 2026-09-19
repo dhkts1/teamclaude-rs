@@ -155,6 +155,8 @@ gate above; it is not a credential anything downstream of the proxy needs.
 | `priority` | i64 | absent → `0` | no | rotation order, **lower value = preferred** |
 | `switchThreshold` | float | absent → the global value | no | per-account override of the top-level threshold |
 | `disabled` | bool | absent → `false` | no | held out of rotation; this is the key `tcr disable` writes |
+| `egress` | `"local"` \| `"via <peer>"` | `"local"` | no | (arriving) pins where this account's requests leave from. `local` is today's behaviour: they leave from whichever Mac is currently serving them. `via <peer>` always sends them out through one named peer instead, so the account keeps a single IP no matter which Mac in the mesh runs it; that peer carries the bytes blind and never sees what is inside them. Local to this file, never sent over the wire |
+| `egressStrict` | bool | `false` | no | (arriving) what to do when `egress` names a peer and that peer cannot be reached: `true` refuses the request by name instead of falling back; `false` (default) sends it from this Mac instead, with a log line saying so |
 
 `type` is not decorative. Only `"oauth"` accounts get token refresh, quota probing and
 keep-warm; any other value is treated as a static key.
@@ -599,3 +601,111 @@ pin file and the singleton owner file get the same treatment.
 Never commit this file, never paste its contents into an issue, a PR or a chat, and never
 copy it into a repository checkout, including this one, which is public. Tests in this
 repo write their own temporary configs with obviously fake values; do the same.
+
+## `tcr-peers.json`
+
+A second file, `tcr-peers.json` in the operator's config directory, mode `0600`, holds everything about the LAN peer
+mesh: who this Mac trusts, what each trusted Mac may do, and the office network key. It is
+never merged into `teamclaude.json` above; a walkthrough of what the mesh does is in
+[peers.md](peers.md), and this section is the file's key reference, read from
+`src/peer/config.rs`.
+
+A missing file is the default: nothing pinned, the listener off. A file that exists but
+cannot be parsed is a named refusal, same rule as the main config.
+
+**Two tiers, one reload rule.** [`listen`](#top-level-keys), `discovery` and `maxHops` are
+read once at boot: turning the listener on is a restart-worthy act. Everything under a
+peer's `allow` and `lend` is re-read whenever this file's mtime moves, the same
+`reload_groups_if_changed` mechanism the main config already uses for group membership, so
+`tcr peer allow` and `tcr peer lend` take effect with no restart and no cost to the prompt
+cache.
+
+### Top level keys
+
+| json key | type | default | boot-time or hot | what it does |
+|---|---|---|---|---|
+| `listen` | string (`host:port`) | absent | boot-time | where the peer listener binds. **Absent means the feature is off**: a fresh install discloses nothing, opens no port, answers nobody |
+| `discovery` | bool | `false` | boot-time | whether this Mac announces itself and looks for others (`tcr peer find`) |
+| `name` | string | absent | hot | this Mac's display name (`tcr peer name`). Absent means "use the host name", resolved at use and never written as a fallback value, so a name the operator never chose still reads as unset |
+| `announceName` | bool | `false` | hot | whether the discovery beacon includes `name`. Off leaves the beacon as presence and a port only; it never carries a key or a peer id either way |
+| `networkKey` | string (52-char base32) | absent | boot-time for the beacon, hot for a pairing request | the opt-in office password (`tcr peer network-key`); an admission ticket to the beacon layer, not an identity |
+| `maxHops` | int | `1` | boot-time | how many times a frame of this Mac's may be forwarded; `0` disables forwarding entirely, which is also what makes `tcr peer forget` mesh-wide again |
+| `internet` | bool | `false` | boot-time | (arriving) whether this Mac tries to be reached from off its own network at all (`tcr peer internet on\|off`). On: at boot and every 30 minutes, asks the router for a mapping on the listener's port and renews it before its 2-hour lifetime is up; the mapping is deleted both when this is turned off and at shutdown. Off leaves this Mac reachable on its LAN only |
+| `paths` | object | absent | hot | (arriving) policy for choosing which endpoint to dial: `paths.prefer` (`"direct"` or `"via"`), `paths.maxLossPct` (default `5`), `paths.viaAllow` (which peers may carry when `via` is preferred). Absent means the built-in order, direct first, newest endpoint first |
+| `peers` | array of peer rows | `[]` | hot | one row per pinned peer, see below |
+| `pendingInvites` | array of invites | `[]` | hot | one-use join keys minted by `tcr peer invite` that have not been spent yet |
+
+### One entry in `peers[]`
+
+| json key | type | required | what it does |
+|---|---|---|---|
+| `node` | string (52-char base32) | **yes** | the pinned static key. **This is the authorization.** A changed key on a pinned peer is a refusal naming both fingerprints, never a silent re-pin |
+| `label` | string | **yes** | the operator's name for the peer |
+| `endpoints` | array of endpoint objects | no, default `[]` | where this peer was reached, newest first, at most 8. Routing advice only; identity is re-proven by the handshake every time, never trusted from this list. Replaces `addrs`, which a file written before this key still uses and which is still read |
+| `addedAt` | int (unix ms) | **yes** | when this peer was pinned |
+| `allow` | object | no, default all false | what this peer may do, see below. A bare pin can do nothing but say hello |
+| `lend` | array of lend grants | no, default `[]` | what this peer may borrow, per window; an empty list is "nothing" |
+
+One entry in `endpoints[]`. A peer is its key, not its address: this list is how to reach it,
+never whether to trust it, so a wrong entry costs a connect timeout and nothing else.
+
+| json key | type | what it does |
+|---|---|---|
+| `kind` | `"direct"` \| `"via"` | whether this Mac opens the socket itself, or reaches the peer through another pinned Mac that forwards. `via` is tried last: a hop spends a second machine's bytes and its consent |
+| `addr` | string (`host:port`) | the socket to open. `direct` only |
+| `node` | string (52-char base32) | the forwarding peer's pinned key. `via` only |
+| `observedAtMs` | int (unix ms) | when this Mac observed the endpoint, on its own clock, never a time taken off the wire |
+| `source` | `"paired"` \| `"hello"` \| `"beacon"` \| `"mapping"` | what taught this Mac the endpoint: the pairing or enrolment itself, a `Hello` inside a session whose key checked out, a discovery beacon matching a pinned instance, or this Mac's own port mapping |
+
+A file written before this key holds `addrs: ["host:port", ...]` instead. It is still read: each
+string becomes a `direct` endpoint sourced `paired` and dated `addedAt`, since the legacy key
+carried no time of its own and the pin that wrote the address is when it was observed. The next
+save writes `endpoints`. An entry there that is not a socket address is dropped with a warning
+naming it, rather than refusing the file.
+
+`allow` fields, every one off by default:
+
+| json key | what it grants |
+|---|---|
+| `gateway` | this peer may ask us to carry bytes out to an allow-listed origin, blind. We hold no key for what we carry |
+| `relay` | this peer may ask us to forward to a peer WE have pinned. **Transitive**: a node two hops out reaches our gateway with this peer's authority, so `tcr peer forget` does not revoke egress still reachable through a still-trusted relay |
+| `inspect` | this peer may open a lease to us. We read its requests in full and serve them on our own account |
+| `allowDisclose` | we may open a lease to this peer. It reads our requests in full, prompts included |
+| `acceptMove` | this peer may hand us an account. The only grant under which a credential crosses a host boundary at all |
+| `control.briefs` | this peer is told about our other peers, one hop out |
+| `control.lendable` | this peer is told our per-window lendable amounts and account counts |
+| `control.diag` | this peer is told our build sha and boot id |
+
+One entry in `lend[]` (`tcr peer lend`, `tcr peer share`). A Mac may hold several of these at
+once, one per `(window, scope)` pair, because lending a new scope adds a lease rather than
+replacing the ones already granted:
+
+| json key | type | what it does |
+|---|---|---|
+| `id` | string (32 hex chars) | the wire lease id this grant mints leases under, the handle `--revoke`/`--relend` take. `0` is a grant written before ids existed; the next save mints one |
+| `scope` | `"all"` \| `{"group": "<name>"}` \| `{"accounts": ["<label>", ...]}` | what this grant lends FROM. Defaults to `"all"`, which is what every grant written before scopes existed already meant. Never crosses the wire |
+| `window` | `5h` \| `7d` \| `7d_oi` | which rate-limit window this grant draws from |
+| `fraction` | float | ceiling on any one lease, as a fraction of the SCOPE's headroom. Clamped to `0.0..=0.5`, mirroring the clamp the main config applies to its own reserve |
+| `ttlS` | int | how long a granted lease lives, in seconds, before it needs renewing |
+| `maxInflight` | int | how many borrowed requests may be in flight against one lease at once |
+| `until` | int (unix seconds), absent for no end | the absolute end of the LENDING (`--for`/`--until`), distinct from `ttlS`'s renewal deadline. Absent is the default: no end |
+| `between` | string (`"HH:MM-HH:MM"`), absent for every hour | the daily window this grant lends in, local time (`--between`). A window whose end is before its start crosses midnight. Unlike `until`, which ends the lending once, this closes and re-opens every day; a request outside it is refused `OutsideSchedule` |
+| `days` | string (`"mon,tue"`), absent for every day | the days the `between` window may START on (`--days`). An overnight window granted on `fri` therefore runs into Saturday morning, and not into Sunday |
+| `ended` | bool | whether `until` has passed. **Derived on read and never trusted from the file**: a hand-planted or stale `"ended": true` on a live grant reads as `false` |
+
+### An outstanding invite (`pendingInvites[]`)
+
+| json key | type | what it does |
+|---|---|---|
+| `id` | int | the id `tcr peer invite --revoke <id>` takes |
+| `label` | string | the name the joiner will be pinned under |
+| `secret` | 32 bytes | the join secret, used as the pairing PSK. Stored in the clear: a stored hash could not be both unusable by an attacker and usable to complete a handshake. What actually bounds it: single use, a short TTL, file mode `0600`, deletion on use, an explicit revoke, and a cap of 8 outstanding at once |
+| `expiresAtMs` | int (unix ms) | absolute deadline |
+| `usesLeft` | int | how many joins this invite may still admit; deleted at zero |
+
+### File permissions
+
+Same rule as `teamclaude.json`: mode `0600`, enforced before any bytes are written and
+re-checked afterward. `tcr` refuses to trust a peers file it finds in any other mode rather
+than silently loosening it. Never commit this file for the same reason as the main config:
+`node`, `networkKey` and an outstanding invite's `secret` are all live cryptographic material.

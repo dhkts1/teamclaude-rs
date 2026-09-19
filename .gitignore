@@ -69,3 +69,10 @@ apps/macos/build/
 # list of private names discloses the names it exists to protect. Each clone
 # keeps its own; the gate is inert without it and says so on install.
 .githooks/private-names
+/target-mutate/
+/target-check/
+
+# proptest writes a regression seed file beside the test that failed; those
+# seeds are per-machine scratch, not a contract this repo keeps.
+tests/.proptest-regressions
+**/.proptest-regressions

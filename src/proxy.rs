@@ -50,6 +50,7 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::config;
+use crate::fallback;
 use crate::manager::{
     AccountStatus, AddAccountOutcome, AddPersist, ControlPersist, DisablePersist, ExhaustionHint,
     InFlightGuard, Manager, SetControlOutcome, SetDisabledOutcome,
@@ -74,6 +75,24 @@ const ERROR_BODY_LOG_CAP: usize = 2 * 1024;
 /// rather than duplicating the header name as a second literal that could
 /// drift out of sync with what this file reads.
 pub const GROUP_HEADER_NAME: &str = "x-tcr-group";
+/// The account-set restriction a BORROWED request carries, and the only
+/// selection header that names accounts (a scope's
+/// `--scope account:<label>[,<label>]`).
+///
+/// Written by the lender's own serving leg
+/// ([`crate::peer::serve::serve_on_own_account`]) onto the loopback request it
+/// makes through this proxy, after its header allowlist has run, a borrower
+/// cannot set it, because `lender_forwards_header` does not carry this name.
+///
+/// The value is a comma-separated list of
+/// [`tcr_peer_wire::sanitize_label`] labels, the same spelling the CLI's
+/// `--scope` takes and `tcr peer ls --json` prints. It can only ever NARROW
+/// the pick: every account outside the set is benched before the rotation loop
+/// starts (see `handle`), so every gate that already holds, reserved, parked,
+/// disabled, the model class, pacing, still holds on top of it, and a set
+/// that names no live account ends in the same honest 429 an exhausted fleet
+/// produces.
+pub const ACCOUNTS_HEADER_NAME: &str = "x-tcr-accounts";
 /// Depth of the SSE tee side-channel. A fast upstream feeding a slow parser task
 /// can retain at most this many chunks; beyond it, `try_send` drops chunks for
 /// the parser (usage counting becomes best-effort) rather than letting the buffer
@@ -292,7 +311,7 @@ enum Transient429 {
 ///   `3600s` or more and got exactly 3600), so spreading within
 ///   `[3600 - N, 3600]` stays inside an envelope we had already chosen, and
 ///   strictly improves on arming every account at one instant.
-fn jittered_quota_hold(retry_after: i64, nanos: u32) -> i64 {
+pub(crate) fn jittered_quota_hold(retry_after: i64, nanos: u32) -> i64 {
     let clamped = retry_after.clamp(1, MAX_QUOTA_HOLD_SECS);
     if clamped < MAX_QUOTA_HOLD_SECS {
         return clamped;
@@ -761,7 +780,10 @@ const CONTROL_BODY_LIMIT: usize = 8 * 1024;
 /// catch-all, so a spelling that misses the prefix misses the routes too. Do not
 /// read this comment as "nothing unguarded gets past" — read it as "what gets past
 /// is a forwarded 404".
-const LOCAL_PREFIX: &str = "/_tcr";
+/// `pub(crate)` so `src/peer/serve.rs` refuses THIS prefix rather than a second
+/// spelling of it: a relayed request that reached these routes would arrive at
+/// `local_endpoint_gate` having satisfied it by construction.
+pub(crate) const LOCAL_PREFIX: &str = "/_tcr";
 
 /// Paths whose upstream call must carry the **client's own** credential and which
 /// therefore bypass account selection entirely. Matched as prefixes of the request
@@ -817,7 +839,10 @@ const LOCAL_PREFIX: &str = "/_tcr";
 /// Both edges of a raw `starts_with` were live defects: `"/api/oauth/file_upload"`
 /// (no terminator) also relayed `/api/oauth/file_upload_v2`, and `"/v1/code/"`
 /// (with one) missed the bare `/v1/code`.
-const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
+/// `pub(crate)` so `src/peer/serve.rs` reads THIS list rather than a copy of it.
+/// A borrower must refuse to open a SERVE for every path here, and a copy of a
+/// security list in two files is a fact in two places that will drift.
+pub(crate) const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
     "/v1/code",
     "/api/oauth/files",
     "/api/oauth/file_upload",
@@ -836,7 +861,10 @@ const CLIENT_CREDENTIAL_PREFIXES: [&str; 6] = [
 /// the POOLED path — putting our Bearer on a client's token exchange, precisely what
 /// the paragraph above says must never happen. Relaying a hypothetical sub-path with
 /// no auth is the safe direction to be wrong in; a pooled Bearer is not.
-const CLIENT_TOKEN_REFRESH_PATH: &str = "/v1/oauth/token";
+/// `pub(crate)` for the same reason as [`CLIENT_CREDENTIAL_PREFIXES`]: it is the
+/// SEVENTH path, it lives outside that array, and `src/peer/serve.rs` must
+/// refuse it too.
+pub(crate) const CLIENT_TOKEN_REFRESH_PATH: &str = "/v1/oauth/token";
 
 /// `user-agent` sent by [`RelayMode::Raw`] when the client sent none. The JS proxy
 /// defaults to `'node'` here; naming ourselves is more honest about who is calling.
@@ -860,7 +888,7 @@ enum RelayMode {
 /// is wrong in both directions: without a terminator `/api/oauth/file_upload` also
 /// swallows `/api/oauth/file_upload_v2`, and with one `/v1/code/` misses the bare
 /// `/v1/code`. Callers must pass a `base` with NO trailing slash. Pure — unit-tested.
-fn path_is_under(path: &str, base: &str) -> bool {
+pub(crate) fn path_is_under(path: &str, base: &str) -> bool {
     path.strip_prefix(base)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
@@ -920,7 +948,7 @@ fn is_dot_segment(segment: &str) -> bool {
 ///   `/v1/code\foo` classified as pooled here and landed on the upstream as the
 ///   Remote Control path `/v1/code/foo` wearing a pooled Bearer — the under-inclusive
 ///   half of the same defect. `%5c` is NOT decoded by the parser, so it is left alone.
-fn path_is_ambiguous(path: &str) -> bool {
+pub(crate) fn path_is_ambiguous(path: &str) -> bool {
     path.contains('\\') || path.split('/').any(is_dot_segment)
 }
 
@@ -949,7 +977,7 @@ fn target_host<'a>(uri: &'a axum::http::Uri, headers: &'a HeaderMap) -> Option<&
 /// colon in `[::1]` is INSIDE the address, so splitting on it yields `[:` — a host
 /// that matches nothing, which turned an IPv6 loopback client into a misroute. The
 /// port, when present, always follows the `]`.
-fn strip_port(authority: &str) -> &str {
+pub fn strip_port(authority: &str) -> &str {
     if authority.starts_with('[') {
         return authority.split_inclusive(']').next().unwrap_or(authority);
     }
@@ -965,7 +993,13 @@ fn strip_port(authority: &str) -> &str {
 /// a `Host` header, and the brackets are not part of the address, so they are
 /// stripped before parsing — without that, the v6 loopback fails a check the v4
 /// one passes. Pure — unit-tested.
-fn host_is_loopback(host: &str) -> bool {
+/// `pub` so `tcr peer graph --serve` (`src/main.rs`, a separate crate from this
+/// library) asks this question here rather than
+/// keeping its own answer to it: a second spelling of "is this loopback" is a
+/// second thing to get wrong, on a gate whose whole job is refusing a name that
+/// resolves to loopback in somebody else's browser. Callers hand it a host with
+/// no port, which is what [`strip_port`] is for.
+pub fn host_is_loopback(host: &str) -> bool {
     let bare = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -1228,12 +1262,28 @@ async fn status_handler(
     }
 
     let now = OffsetDateTime::now_utc();
-    let payload = crate::status::StatusPayload::from_snapshot(
+    let mut payload = crate::status::StatusPayload::from_snapshot(
         &manager.snapshot(now),
         &manager.thresholds(),
         manager.http1_only(),
         manager.control_name(),
         manager.group_colors(),
+    );
+    // The peers block, which `from_snapshot` leaves empty because a
+    // `StatsSnapshot` is the accounts view and carries no peers file, no peer
+    // state file and no ledger. Assigned HERE, in the serving process, which is
+    // the only caller that holds the path those files were installed under
+    // (`peer::egress::peers_path`), the CLI's own round-trip tests and
+    // `into_snapshot` keep the honest empty list.
+    //
+    // Two file reads on a status request, and that is the trade this endpoint
+    // already makes everywhere else: it is a snapshot of what this process
+    // believes right now, and a cached peers block would be the stale-panel bug
+    // the whole payload exists to end. Both reads are read-only and neither
+    // takes the file lock.
+    payload.peers = crate::status::peers_block(
+        &crate::peer::egress::peers_path(),
+        (now.unix_timestamp_nanos() / 1_000_000) as i64,
     );
     let Ok(body) = serde_json::to_string(&payload) else {
         // Serializing plain numbers and strings cannot realistically fail, but a
@@ -1864,6 +1914,8 @@ async fn add_account_handler(State(manager): State<Arc<Manager>>, req: Request) 
         organization_type: parsed.organization_type,
         rate_limit_tier: parsed.rate_limit_tier,
         seat_tier: parsed.seat_tier,
+        egress: crate::config::Egress::Local,
+        egress_strict: false,
         extra: serde_json::Map::new(),
     };
     // Captured before the move below: on an ambiguous match this is the ONLY
@@ -2181,6 +2233,58 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // 3. Selection + rotation loop.
     let account_count = manager.account_count();
     let mut tried: HashSet<usize> = HashSet::new();
+    // THE BORROWED-REQUEST PATH, and nothing else reaches it: a lease's
+    // account-set scope, as the header the lender's own serving leg wrote onto
+    // this loopback request (see [`ACCOUNTS_HEADER_NAME`]).
+    //
+    // Applied by BENCHING every account outside the set, seeding `tried`,
+    // which every selection call below already honours, rather than by a new
+    // argument on the picker. Three properties follow from that, and they are
+    // the reason it is written this way:
+    //
+    //  - it can only narrow. `tried` is the set the picker may not return, so
+    //    an out-of-scope account is unreachable by the normal pick, by the
+    //    soft fallback, by the 429 rotation and by the revalidation pass, and
+    //    no gate is weakened on the way.
+    //  - the affinity fast-path honours it too: a pin inside `tried` DIVERTS
+    //    (the session keeps its pin, this one request is served elsewhere),
+    //    which is exactly what a borrowed request whose session key collided
+    //    with a local one needs.
+    //  - a set that names no account this fleet carries leaves every account
+    //    benched, so the picker answers `None` and the client gets the same
+    //    honest 429 an exhausted fleet produces, never an out-of-scope serve.
+    //
+    // The lender refuses such a scope before a byte is sent
+    // (`ScopeRestriction::Unenforceable`), so this is the backstop and not the
+    // enforcement point.
+    if let Some(labels) = req_headers
+        .get(ACCOUNTS_HEADER_NAME)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        })
+        .filter(|labels| !labels.is_empty())
+    {
+        for idx in 0..account_count {
+            let inside = manager.account_name(idx).is_some_and(|name| {
+                tcr_peer_wire::sanitize_label(&name).is_ok_and(|label| labels.contains(&label))
+            });
+            if !inside {
+                tried.insert(idx);
+            }
+        }
+        tracing::debug!(
+            accounts = %labels.join(","),
+            benched = tried.len(),
+            of = account_count,
+            "account-set scope: this request may be served only by the accounts it names"
+        );
+    }
     // Accounts that already got their one force-refresh on a 401.
     let mut forced_401: HashSet<usize> = HashSet::new();
     // Per-account inline-429 retry counters.
@@ -2218,6 +2322,17 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
     // acted on it is unknown. One such attempt anywhere in the ladder taints the
     // terminal answer for the whole request — see [`bad_gateway`]'s two shapes.
     let mut unknown_outcome_transport_failure = false;
+    // Blind peer egress is offered ONCE per request, and this is the bound.
+    //
+    // It sits beside `unknown_outcome_transport_failure` because it is the same
+    // fact read the other way round: a carry is only ever offered while that
+    // flag is still false, nothing this request sent has left this box, so a
+    // resend down another path cannot double-send a POST. `src/peer/egress.rs`
+    // documents the seam; the offer itself is in the transport-failure arm
+    // below, above both the resolver arm's sleep and the exhausted-transport
+    // terminal, so both entry points the design names are one call site rather
+    // than two that can drift.
+    let mut peer_egress_tried = false;
     // Accounts upstream refused with a 403 on OUR pooled credential, in the order
     // seen. Every entry here is also an `upstream_responses` and a `tried` — a 403
     // is a real answer, not a transport gap, and there is nothing to retry on the
@@ -2319,9 +2434,66 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                     // at the top of the handler: `reserved` hot-reloads, so
                     // `tcr group unreserve <g>` releases an already-stalled request
                     // on its next pass through this arm instead of after a restart.
+                    // `is_group_strict`, not `is_group_reserved`: the THIRD
+                    // door out of a strict group, which a measurement found
+                    // open here and on the exhausted path below. The
+                    // picker holds a request strictly for `reserved || !spill`
+                    // and this arm asked only about `reserved`, so for a
+                    // group that is neither reserved nor a spill group, a
+                    // lease's scope is exactly one, every answer below was
+                    // sized against a fleet the request was never allowed to
+                    // touch. One rule, one function: see
+                    // `Manager::is_group_strict`.
                     let strict_group = request_group
                         .as_deref()
-                        .filter(|g| manager.is_group_reserved(g));
+                        .filter(|g| manager.is_group_strict(g));
+                    // What a fallback provider would be told, built once for the
+                    // three terminals below. It carries the client's own
+                    // headers, MINUS every credential, and `Ask::scrubbed` is what
+                    // removes them: `build_upstream_headers`, the only code in
+                    // this file that strips a client's `authorization` and
+                    // substitutes a pooled token, is 215 lines downstream of
+                    // here, so the scrub cannot be left to it.
+                    //
+                    // They are carried rather than dropped because a relayed
+                    // request with no `anthropic-version` and no
+                    // `content-type` is answered 400 by the API: an `Ask` that
+                    // carried nothing could only produce an answer the client
+                    // cannot use, and the borrower served that 400 as if a
+                    // lender had answered it.
+                    //
+                    // `None` for a path no provider may ever be offered, and
+                    // that refusal is HERE rather than only inside the
+                    // provider: the `Ask` clones the whole request body, so
+                    // asking first means a client-credential body is never
+                    // copied for a relay that cannot happen. The provider
+                    // keeps the identical check as its own first act, a
+                    // provider is written by whoever adds the next one, and
+                    // this seam cannot rely on that, so this is the cheap
+                    // half of a defence that exists twice on purpose.
+                    //
+                    // `None` for a non-POST for the same reason and one more of
+                    // its own: a relayed request is a POST or nothing
+                    // (`peer::serve::SERVE_METHOD`), and the borrower used to
+                    // write the literal `"POST"` into the frame whatever its
+                    // client had sent, so a `GET` was POSTed on somebody
+                    // else's account, out of a lease. The lender refuses that
+                    // frame now, but only after it has crossed a host
+                    // boundary; refusing here means a non-POST this fleet
+                    // cannot serve gets the SAME answer it got before any of
+                    // this existed, from `exhausted_or_fallback`'s terminal.
+                    let fallback_ask = (method == axum::http::Method::POST
+                        && crate::peer::serve::serve_is_allowed_for_path(&path))
+                    .then(|| fallback::Ask {
+                        path: &path,
+                        method: method.as_str(),
+                        model: request_model.as_deref(),
+                        group: request_group.as_deref(),
+                        affinity: session_key,
+                        tried_local: tried.len(),
+                        body: body_bytes.clone(),
+                        headers: fallback::Ask::scrubbed(&req_headers),
+                    });
                     if every_attempt_transport_failed(transport_failures, upstream_responses) {
                         // Nothing reached an upstream — but WHY decides the status.
                         // If any attempt died in the resolver, the honest answer is
@@ -2427,14 +2599,28 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                             // returned None because that one account already failed
                             // this request. Revalidation must not escape the lock and
                             // send the request through another pooled credential.
+                            //
+                            // **And neither may a lease.** This arm was changed to
+                            // `exhausted_or_fallback` when the fallback seam landed,
+                            // which consults a provider that never reads
+                            // `locked_account_name`: a request the operator pinned to
+                            // ONE account was then served on a PEER's credential the
+                            // moment that account 429'd, which is the same escape the
+                            // revalidation serve is refused for and a wider one, the
+                            // credential is not even this Mac's. The refusal is
+                            // written once, inside `exhausted_or_fallback`, so it
+                            // holds for this arm and for the two below it rather
+                            // than only for the arm somebody remembered.
                             if manager.locked_account_name().is_some() {
-                                return exhausted_response(
+                                return exhausted_or_fallback(
                                     &manager,
                                     now,
                                     account_count,
                                     request_is_fable,
                                     strict_group,
-                                );
+                                    fallback_ask.as_ref(),
+                                )
+                                .await;
                             }
                             // Not a transient park — the whole fleet reads over the
                             // SOFT switch threshold. Before synthesizing a 429, try a
@@ -2464,22 +2650,26 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                                 ) {
                                     idx
                                 } else {
-                                    return exhausted_response(
+                                    return exhausted_or_fallback(
                                         &manager,
                                         now,
                                         account_count,
                                         request_is_fable,
                                         strict_group,
-                                    );
+                                        fallback_ask.as_ref(),
+                                    )
+                                    .await;
                                 }
                             } else {
-                                return exhausted_response(
+                                return exhausted_or_fallback(
                                     &manager,
                                     now,
                                     account_count,
                                     request_is_fable,
                                     strict_group,
-                                );
+                                    fallback_ask.as_ref(),
+                                )
+                                .await;
                             }
                         }
                     }
@@ -2507,6 +2697,43 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             tried.insert(idx);
             continue;
         };
+        // **The exit lock, before the direct attempt and not inside its failure
+        // arm.** An account the operator locked to one Mac leaves from that Mac
+        // on EVERY request, working direct path or not: the whole point is that
+        // the origin sees one address for it. So this is consulted here rather
+        // than beside the blind-carry offer far below, it never touches
+        // `EgressState`, and it never reads a transport failure, because on
+        // this line nothing has been attempted yet.
+        //
+        // It sits just BELOW `access_token` and not above it because a carried
+        // request is the same request on the same credential, and this
+        // account's Bearer is built by `build_upstream_headers`, which is the
+        // one place that scrub lives.
+        //
+        // Inert for every account that is not pinned: one config read answers
+        // `TakeTheDirectPath` before a file, a key or a socket is touched. The
+        // decision, the refusal and the one fallback log line are all in
+        // `peer::egress`.
+        match crate::peer::egress::pinned_egress(crate::peer::egress::PinnedAttempt {
+            manager: &manager,
+            account_idx: idx,
+            method: &method,
+            path_and_query: &path_and_query,
+            headers: build_upstream_headers(&req_headers, &token),
+            body: body_bytes.clone(),
+            peers_path: &crate::peer::egress::peers_path(),
+            session_key,
+            session_kind,
+            wire_session_id: wire_session_id.as_deref(),
+            model: request_model.clone(),
+            tool_uses: &wire_tool_uses,
+            tool_results: &wire_tool_results,
+        })
+        .await
+        {
+            crate::peer::egress::PinnedEgress::TakeTheDirectPath => {}
+            crate::peer::egress::PinnedEgress::Answered(response) => return response,
+        }
         // This account's OWN client — fetched INSIDE the loop, keyed on the idx
         // this iteration is actually about to serve. Hoisting this above the
         // loop (as it used to be) reused whichever account was selected FIRST
@@ -2576,6 +2803,129 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
                 // attribute it to; `is_connect` / `is_timeout` separate "never
                 // reached the host" from "the host went quiet mid-request".
                 transport_failures += 1;
+                // **Blind peer egress, the one offer per request.**
+                //
+                // Four conjuncts, and the first two are what stop a carry
+                // RESENDING a request an upstream may already have acted on.
+                // `err.is_connect()` alone was not enough, and that was the
+                // CRITICAL a measurement found: it describes only THIS
+                // attempt, so a request whose earlier attempt died past the
+                // connect phase (`unknown_outcome_transport_failure`, set
+                // below) and whose next one failed to connect satisfied it and
+                // carried a POST that may have been received. So:
+                //
+                //  - `!unknown_outcome_transport_failure`: no attempt in this
+                //    request has ever been written onto a live connection.
+                //  - `every_attempt_transport_failed(..)`: no attempt ever
+                //    reached an upstream at all. An upstream answer, a 429, a
+                //    403, anything, is proof the request left this box, and it
+                //    is a fact about the REQUEST, not about this attempt.
+                //  - `err.is_connect() || is_offline_error(&err)`: this attempt
+                //    died before or at connect.
+                //  - `rotation_is_spent`: the ladder has no untried account
+                //    left to rotate to, OR the failure is machine-level
+                //    (the resolver), where rotating cannot help because every
+                //    account resolves the same name. Offering on the FIRST
+                //    connect failure of a multi-account fleet is what let a
+                //    carry run while an account that would have answered had
+                //    not been tried yet.
+                //
+                // Position follows from that last conjunct: after rotation,
+                // and still ABOVE the resolver arm's fixed six-second wait, so
+                // an offline machine is offered a carry before it sleeps
+                // rather than after. One call site, bounded once per request by
+                // `peer_egress_tried`.
+                //
+                // Inert by construction when the mesh is not set up: no peers
+                // file, `via off`, or no pinned Mac with an address all answer
+                // `None` before anything is dialled, and then this arm carries
+                // on to exactly the behaviour it had before. Nothing about
+                // `is_offline_error`, `every_attempt_transport_failed` or
+                // either terminal status is widened.
+                let machine_level = is_offline_error(&err);
+                let nothing_ever_left_this_box = !unknown_outcome_transport_failure
+                    && (err.is_connect() || machine_level)
+                    && every_attempt_transport_failed(transport_failures, upstream_responses);
+                // `tried` never contains `idx` yet (it is inserted on the way
+                // out of this arm), so this account plus the benched ones is
+                // the whole fleet exactly when the ladder is out of moves. A
+                // request narrowed by the account-set scope header counts its
+                // own benched accounts here too, which is right: they are not
+                // rotatable for this request either.
+                let rotation_is_spent = machine_level || tried.len() + 1 >= account_count;
+                if !peer_egress_tried && nothing_ever_left_this_box && rotation_is_spent {
+                    peer_egress_tried = true;
+                    crate::peer::egress::note_direct_failure(crate::peer::pair::now_ms());
+                    // The body is rebuilt here rather than shared with the
+                    // direct attempt's `out_body` above, because the two hunks
+                    // are built separately. The
+                    // two must agree: a carried request is the SAME request,
+                    // and the account-uuid patch is part of what the upstream
+                    // sees.
+                    let carried_body =
+                        (method != Method::GET && method != Method::HEAD).then(|| {
+                            match manager.account_uuid(idx) {
+                                Some(uuid) if uuid.len() == 36 => {
+                                    match crate::account_uuid::patch_account_uuid(
+                                        &body_bytes,
+                                        &uuid,
+                                    ) {
+                                        std::borrow::Cow::Owned(patched) => {
+                                            bytes::Bytes::from(patched)
+                                        }
+                                        std::borrow::Cow::Borrowed(_) => body_bytes.clone(),
+                                    }
+                                }
+                                _ => body_bytes.clone(),
+                            }
+                        });
+                    let peers_path = crate::peer::egress::peers_path();
+                    if let Some(carried) = crate::peer::egress::retry_through_peer(
+                        crate::peer::egress::CarriedRequest {
+                            url: &url,
+                            method: &method,
+                            headers: build_upstream_headers(&req_headers, &token),
+                            body: carried_body,
+                            peers_path: &peers_path,
+                        },
+                    )
+                    .await
+                    {
+                        // A carried request is a served request, and it is
+                        // recorded exactly like one, the counter, the
+                        // wire-session table and the ring buffer, in the order
+                        // the terminal outcome below uses. The account and the
+                        // credential were ours; only the route out belonged to
+                        // a peer, so a carry that did not count would make all
+                        // three under-report this fleet's own traffic.
+                        // `egress::record_carried` documents which figure it
+                        // cannot record and why.
+                        //
+                        // The headers it folds into the quota are the ORIGIN's
+                        // own, carried out of the peer path unfiltered
+                        // alongside the client's response, because the client's
+                        // copy no longer has them, `is_account_scoped` strips
+                        // them there exactly as `build_response` does here.
+                        crate::peer::egress::record_carried(
+                            &manager,
+                            crate::peer::egress::CarriedRecord {
+                                account_idx: idx,
+                                account: account_name.clone(),
+                                session_key,
+                                session_kind,
+                                wire_session_id: wire_session_id.as_deref(),
+                                model: request_model.clone(),
+                                method: method.to_string(),
+                                path: path_and_query.clone(),
+                                status: carried.response.status().as_u16(),
+                                tool_uses: &wire_tool_uses,
+                                tool_results: &wire_tool_results,
+                                upstream_headers: &carried.upstream_headers,
+                            },
+                        );
+                        return carried.response;
+                    }
+                }
                 // `?err`, NOT `%err`. reqwest's `Display` prints only its own top
                 // frame and never walks `source()`, so the h2 sub-kind
                 // (`SendRequest` / `Canceled` / `ChannelClosed`) and its reason code
@@ -3348,9 +3698,12 @@ async fn handle(State(manager): State<Arc<Manager>>, req: Request) -> Response {
             OffsetDateTime::now_utc(),
             account_count,
             request_is_fable,
+            // The MIRROR of the refusal arm above, and the same fix: a
+            // strict ask is `reserved || !spill`, so this terminal's own
+            // scoping has to ask the same question the picker did.
             request_group
                 .as_deref()
-                .filter(|g| manager.is_group_reserved(g)),
+                .filter(|g| manager.is_group_strict(g)),
         )
     }
 }
@@ -3470,6 +3823,38 @@ fn build_upstream_headers(req_headers: &HeaderMap, token: &str) -> HeaderMap {
         out.insert(AUTHORIZATION, value);
     }
     out
+}
+
+/// `hand` mode, and the ONLY bearer on this request path that is
+/// not this Mac's own: the owner of a leased account handed this node a
+/// short-lived access token over an `IK`-authenticated CONTROL session, and a
+/// request served under that lease leaves from HERE rather than from the
+/// owner's Mac.
+///
+/// # The third arm, beside the pooled bearer and the client's own
+///
+/// [`build_upstream_headers`] sets this Mac's pooled `Bearer` for the rotation
+/// loop; [`build_passthrough_headers`] keeps the CLIENT's own `authorization`
+/// for [`RelayMode::ClientCredential`]. This one sets a bearer that belongs to
+/// neither: a peer owner's. It reuses `build_upstream_headers` for the stripping
+/// rather than repeating the drop list, because a second copy of that list is
+/// how an inbound `authorization` survives on exactly one of the three paths.
+///
+/// # Where the token comes from, and where it can never go
+///
+/// [`crate::peer::lease::handed_tokens`], a process-local map with no `serde`
+/// and no path. `None` here means no live handed bearer for that lease, which
+/// the caller answers by NOT sending: a hand-mode request with no token is a
+/// request this node cannot pay for, and the ladder's next rung is a better
+/// answer than an unauthenticated call to upstream.
+pub(crate) fn build_handed_bearer_headers(
+    req_headers: &HeaderMap,
+    lease_id: u128,
+    now_ms: i64,
+) -> Option<HeaderMap> {
+    let store = crate::peer::lease::handed_tokens().lock().ok()?;
+    let token = store.bearer(lease_id, now_ms)?;
+    Some(build_upstream_headers(req_headers, token))
 }
 
 /// Clone the client's request headers for a [`RelayMode::ClientCredential`] call:
@@ -3664,7 +4049,13 @@ async fn relay_upstream(
 
 /// Hop-by-hop request headers that must not be forwarded. Header names from a
 /// [`HeaderMap`] are already lowercased.
-fn is_request_hop_by_hop(name: &str) -> bool {
+///
+/// `pub(crate)` so `src/peer/serve.rs` asks THIS predicate rather than holding a
+/// second eleven-name list. A SERVE frame is a request leaving this host for
+/// another one, so every name here is wrong on it for exactly the reasons it is
+/// wrong upstream, and `proxy-authorization` is a credential as well as a
+/// hop-by-hop header, which is the one this list must not be allowed to drift on.
+pub(crate) fn is_request_hop_by_hop(name: &str) -> bool {
     matches!(
         name,
         "host"
@@ -3683,7 +4074,12 @@ fn is_request_hop_by_hop(name: &str) -> bool {
 
 /// Response headers that are connection-specific / would mis-frame the relayed
 /// body and so are stripped from the response we return to the client.
-fn is_response_skip(name: &str) -> bool {
+///
+/// `pub(crate)` alongside [`is_request_hop_by_hop`], so a SERVE reply rebuilt in
+/// `src/peer/serve.rs` strips exactly what this handler strips. A relayed
+/// response that kept its `content-length` would mis-frame the body the same way
+/// here as it does there.
+pub(crate) fn is_response_skip(name: &str) -> bool {
     matches!(
         name,
         "connection"
@@ -3711,7 +4107,13 @@ fn is_response_skip(name: &str) -> bool {
 ///
 /// `request-id` is deliberately absent: it identifies a REQUEST, not an account,
 /// and it is the one id that makes a single failed call debuggable end-to-end.
-fn is_account_scoped(name: &str) -> bool {
+///
+/// `pub(crate)` for the same reason [`is_response_skip`] is: the peer-egress
+/// path serves a response to the SAME local client off the SAME pooled account,
+/// so a second copy of this rule over there would be a second answer to "what
+/// may the caller see", and it would drift the first time Anthropic adds a
+/// header. The other reader is `crate::peer::egress`'s `axum_response_from`.
+pub(crate) fn is_account_scoped(name: &str) -> bool {
     name.starts_with("anthropic-ratelimit-") || name == "anthropic-organization-id"
 }
 
@@ -4339,6 +4741,69 @@ fn error_response(
     response
 }
 
+/// The dry-fleet terminal: consult the fallback ladder once, then answer with
+/// exactly what this handler answered before it existed.
+///
+/// Placed here rather than earlier in the arm because everything local is
+/// cheaper than anything remote: the transient-park soft wait and the
+/// revalidation serve both run first, so a recovery this machine could have
+/// made on its own is never pre-empted by a remote one.
+///
+/// Inert until a phase returns a provider from
+/// [`fallback::configured_provider`], which is `None` today, so this is
+/// byte-for-byte [`exhausted_response`] on this branch.
+///
+/// A **reserved group** never reaches a provider. A reserved group means "one of
+/// these accounts or nothing", and a peer's account is not one of them; the
+/// third spill door the revalidation serve had to be gated against is the same
+/// door here.
+///
+/// A **hard account lock** never reaches one either, for the same sentence with
+/// a different subject: `lock_account` means this one account or nothing, and a
+/// peer's account is not it. See the check at the top of the body.
+///
+/// The other terminal in this handler, the attempt budget running out while
+/// still rotating, at the tail of the loop, is deliberately NOT routed through
+/// this function yet. It is a different question ("we walked the fleet and ran
+/// out of tries") and whether a lease should be spent there is the lease
+/// phase's call, with a re-send hazard to weigh rather than a line to copy.
+async fn exhausted_or_fallback(
+    manager: &Manager,
+    now: OffsetDateTime,
+    account_count: usize,
+    is_fable: bool,
+    strict_group: Option<&str>,
+    ask: Option<&fallback::Ask<'_>>,
+) -> Response {
+    // **A HARD ACCOUNT LOCK NEVER REACHES A PROVIDER.** `lock_account` is the
+    // operator saying this fleet is one account for as long as it is set, so a
+    // request it could not serve has no failover at all: not another local
+    // account (which is why `select_with_group` returned `None` in the first
+    // place), not the revalidation serve, and least of all a peer's credential
+    // on another Mac. This arm was reached by every caller when the seam landed
+    // and the provider read no lock, so a pinned request was served on a peer's
+    // account the moment its own account 429'd.
+    //
+    // Checked HERE rather than at the three call sites: a terminal somebody
+    // adds later gets the rule for free, and the rule has one spelling.
+    let locked = manager.locked_account_name().is_some();
+    // `None` is a path this seam refused to build an `Ask` for at all, a
+    // client-credential path, which no provider may be offered. See the arm at
+    // `:2352`.
+    if let (Some(ask), None, false) = (ask, strict_group, locked) {
+        if let Some(provider) = fallback::configured_provider() {
+            if let Some(response) = provider.try_serve(ask).await {
+                tracing::info!(
+                    provider = provider.name(),
+                    "no local account could serve this request, served through a fallback provider"
+                );
+                return response;
+            }
+        }
+    }
+    exhausted_response(manager, now, account_count, is_fable, strict_group)
+}
+
 /// 429 with a fleet-wide `retry-after` hint when no account is currently usable.
 /// `is_fable` scopes the hint to the request's model class so a Fable request is
 /// told the true Fable-weekly recovery instant (see [`Manager::exhaustion_hint`]).
@@ -4663,6 +5128,8 @@ mod tests {
             organization_type: Some("claude_team".to_string()),
             rate_limit_tier: Some("default_raven".to_string()),
             seat_tier: Some("team_standard".to_string()),
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         let body = serde_json::to_string(&account).expect("serialize the account login sends");
@@ -4724,6 +5191,8 @@ mod tests {
                 organization_type: None,
                 rate_limit_tier: None,
                 seat_tier: None,
+                egress: crate::config::Egress::Local,
+                egress_strict: false,
                 extra: serde_json::Map::new(),
             }],
             group_settings: std::collections::HashMap::new(),
@@ -6381,6 +6850,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         Config {
@@ -8174,6 +8645,8 @@ mod tests {
             organization_type: None,
             rate_limit_tier: None,
             seat_tier: None,
+            egress: crate::config::Egress::Local,
+            egress_strict: false,
             extra: serde_json::Map::new(),
         };
         let resp = client

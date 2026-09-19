@@ -231,11 +231,80 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// The SECOND scheme this app answers: `tcr://peer/join?v=1&nk=…[&jk=…]`,
+    /// decision row 11's share link.
+    ///
+    /// Two schemes and not one, because they are two different things.
+    /// `tcrbar://` is the CLI asking this app to act on the operator's behalf;
+    /// `tcr://` is a person pasting a CREDENTIAL that happens to open this
+    /// app. Sharing a namespace would put an update check and an office
+    /// network key in one switch.
+    ///
+    /// **The whole URL goes to `tcr peer join --stdin`, and never into argv.**
+    /// `nk` is the network key and `jk` a one-use join key; argv is readable
+    /// by every process on this Mac through `ps` and lands in this process's
+    /// crash reports. The CLI owns what a link MEANS, which key sets what,
+    /// that a spent `jk` still sets `nk`, so this hands the string over
+    /// rather than unpacking it.
+    ///
+    /// What reaches the log is ``PeerJoinLink/redacted(_:)``: the path, and
+    /// which kinds of key rode along. Never the URL, never a key. Silence is
+    /// not an option here, a link that did nothing quietly is
+    /// indistinguishable from a broken handler, and neither is the link
+    /// itself, because the system log is readable by other processes too.
+    ///
+    /// **A shape refusal (wrong scheme, wrong path, no key at all) never
+    /// raises the confirmation sheet.** ``PeerJoinLink/invocation(for:)``
+    /// already answers that for free before this does anything, and a sheet
+    /// asking "join this mesh?" over a link that was never going anywhere
+    /// would train an operator to stop reading it. Only a link that WOULD
+    /// actually set something asks first, via ``PeerJoinConfirmation``.
+    private func handleJoinLink(_ url: URL) {
+        let shape = PeerJoinLink.redacted(url)
+        NSLog("TcrBar: %@ received", shape)
+        guard case .success = PeerJoinLink.invocation(for: url) else {
+            let outcome = PeerController.join(link: url)
+            NSLog("TcrBar: %@: %@", shape, outcome)
+            return
+        }
+        Task.detached(priority: .userInitiated) {
+            let hasExistingKey = Self.networkKeyIsCurrentlySet()
+            let confirmed = await PeerJoinConfirmation.confirm(url: url, hasExistingKey: hasExistingKey)
+            guard confirmed else {
+                NSLog("TcrBar: %@: cancelled at the confirmation sheet", shape)
+                return
+            }
+            let outcome = PeerController.join(link: url)
+            NSLog("TcrBar: %@: %@", shape, outcome)
+        }
+    }
+
+    /// `tcr peer network-key show`, blocking, off the main thread: the one
+    /// fact ``PeerJoinConfirmation`` needs and this app never reads any other
+    /// way (the peers file's own `network_key` field never crosses `peer ls`
+    /// or `status --json`). `false` on any failure to resolve or run `tcr`:
+    /// the sheet then reads as "nothing to replace" rather than blocking a
+    /// legitimate join on a `tcr` this build cannot find; that failure
+    /// surfaces properly a moment later, when the join itself is attempted.
+    private nonisolated static func networkKeyIsCurrentlySet() -> Bool {
+        guard case .success(let executable) = TcrTool.resolve() else { return false }
+        guard
+            let output = try? TcrTool.run(
+                executable: executable, arguments: PeerCommand.networkKeyShow)
+        else { return false }
+        return PeerJoinLink.networkKeyIsSet(
+            output: String(data: output.stdout, encoding: .utf8) ?? "")
+    }
+
     /// Host-based, not path-based: `URL(string:)` parses `tcrbar://check-for-updates`
     /// with `host == "check-for-updates"` and an empty path. An unrecognised URL is
     /// logged rather than silently dropped, because a mistyped scheme call that
     /// does nothing is indistinguishable from a broken updater.
     private func handle(_ url: URL) {
+        if url.scheme?.lowercased() == PeerJoinLink.scheme {
+            handleJoinLink(url)
+            return
+        }
         guard url.scheme == "tcrbar" else {
             NSLog("TcrBar: ignoring URL with unexpected scheme: %@", url.absoluteString)
             return

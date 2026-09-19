@@ -470,15 +470,30 @@ final class MenuBarShell {
         let menu = NSMenu()
 
         let serverItem: NSMenuItem
+        // `startDisabledReason` is `nil` on every state but a NON-proxy
+        // process holding the port (`ServerController+StartServerReason`),
+        // read off the same check `server.start()` already ran on its last
+        // attempt, not a new port probe. A colleague's "Start server" was
+        // disabled with no reason at all; this is the reason.
         if server.state.isOurChild {
             serverItem = NSMenuItem(
                 title: "Stop server", action: #selector(quickStopServer), keyEquivalent: "")
+            serverItem.target = self
+            menu.addItem(serverItem)
+        } else if let reason = server.state.startDisabledReason {
+            serverItem = NSMenuItem(title: "Start server", action: nil, keyEquivalent: "")
+            serverItem.isEnabled = false
+            menu.addItem(serverItem)
+            let reasonItem = NSMenuItem(title: reason, action: nil, keyEquivalent: "")
+            reasonItem.isEnabled = false
+            reasonItem.indentationLevel = 1
+            menu.addItem(reasonItem)
         } else {
             serverItem = NSMenuItem(
                 title: "Start server", action: #selector(quickStartServer), keyEquivalent: "")
+            serverItem.target = self
+            menu.addItem(serverItem)
         }
-        serverItem.target = self
-        menu.addItem(serverItem)
 
         let refreshItem = NSMenuItem(
             title: "Refresh", action: #selector(quickRefresh), keyEquivalent: "")
@@ -545,12 +560,15 @@ final class MenuBarShell {
     /// doc-comment on why it cannot hold `PanelTab` directly); this is the
     /// one place that turns it back into the real enum, at the one call site
     /// that constructs the live panel.
-    private static func initialTab(from preference: DefaultTabPreference) -> PanelTab {
-        switch preference.tab {
-        case "sessions": return .sessions
-        case "tools": return .tools
-        default: return .accounts
-        }
+    ///
+    /// `PanelTab(rawValue:)` rather than a `switch` over the names. The switch
+    /// listed three of the four and sent everything else to `.accounts`, so a
+    /// stored `peers`, which ``DefaultTabPreference`` accepts and the picker
+    /// now offers, was read, validated, and then silently opened the Accounts
+    /// tab. A value this enum does not have still falls back, which is the
+    /// same treatment ``DefaultTabPreference`` gives a hand-edited key.
+    static func initialTab(from preference: DefaultTabPreference) -> PanelTab {
+        PanelTab(rawValue: preference.tab) ?? .accounts
     }
 
     func openPanel() {
