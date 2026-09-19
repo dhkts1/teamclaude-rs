@@ -794,7 +794,31 @@ impl PeerRow {
 /// the same locator with the same source is still re-dated, which does move
 /// the file's mtime, so the caller decides how often to call this; every
 /// caller today is once per session and not once per frame.
+///
+/// **Every entry is still refused by [`is_dialable_claim`] here**, in case a
+/// caller built an [`Endpoint`] by hand rather than through
+/// [`endpoints_from_hello`]: the one thing this function must never do is
+/// write a socket nothing can dial, no matter which caller handed it one.
+///
+/// What this function deliberately does NOT do is drop a same-host entry at
+/// a second port: [`crate::peer::discovery::neighbor_brief_endpoints`] hands
+/// it batches where several addresses legitimately share a host (a Mac
+/// behind one NAT, several router-mapped ports), capped by its own
+/// [`crate::peer::discovery::MAX_BRIEF_ADDRS`] and by
+/// [`MAX_ENDPOINTS_PER_PEER`], and a host-keyed dedup here would silently
+/// collapse that batch to one entry regardless of which caller sent it.
+/// Watch that batch shrink to one by adding a same-host dedup pass to this
+/// function: `five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_endpoint`
+/// (`tests/peer_discovery.rs`) reads two endpoints where it must read two
+/// kinds of evidence, not one address. The connection's-own-source-port rule
+/// a hello batch also needs is therefore scoped to the hello call sites, not
+/// here: see [`endpoints_and_connection_from_hello`].
 pub fn observe_endpoints(path: &Path, peer: &PeerId, endpoints: &[Endpoint]) -> Result<bool> {
+    let endpoints: Vec<Endpoint> = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.direct_addr().is_none_or(is_dialable_claim))
+        .copied()
+        .collect();
     if endpoints.is_empty() {
         return Ok(false);
     }
@@ -804,10 +828,55 @@ pub fn observe_endpoints(path: &Path, peer: &PeerId, endpoints: &[Endpoint]) -> 
         return Ok(false);
     };
     for endpoint in endpoints {
-        row.observe_endpoint(*endpoint);
+        row.observe_endpoint(endpoint);
     }
     save(path, &file)?;
     Ok(true)
+}
+
+/// A hello's own claimed addresses, plus the connection's observed address
+/// when it is not redundant with one of them.
+///
+/// **The third refusal the measured defect needs, scoped to where it is
+/// safe.** [`observe_endpoints`] cannot drop a same-host duplicate itself
+/// (its own doc comment says why: a brief batch legitimately holds several
+/// ports on one host), so this is the caller-side combine a hello exchange
+/// uses instead of pushing the connection's address unconditionally. When
+/// [`endpoints_from_hello`] already produced a dialable entry for
+/// `connection_source`'s host, that entry is the hello's own claim about its
+/// listen port and is kept; the connection's address is the ephemeral source
+/// port of the socket that carried this one hello, gone the moment it
+/// closes, and is dropped rather than sitting on the row as a second,
+/// unreachable way to the same Mac. When nothing in `addrs` named that host,
+/// `connection_source` is the only fact this node has and is kept, filtered
+/// by [`is_dialable_claim`] like every other endpoint.
+///
+/// Used by the dialing side of a hello exchange (`peer::serve`). The
+/// listener side builds its own batch by pushing the connection's address
+/// after [`endpoints_from_hello`] unconditionally; that push does not go
+/// through this function, so a peers file learned entirely from inbound
+/// hellos does not yet get this refusal. Reported to the lead as a gap for
+/// whoever owns that call site to close, rather than folded into
+/// [`observe_endpoints`] and risking the brief regression above.
+pub fn endpoints_and_connection_from_hello(
+    addrs: &[String],
+    connection_source: SocketAddr,
+    observed_at_ms: i64,
+) -> Vec<Endpoint> {
+    let mut learned = endpoints_from_hello(addrs, observed_at_ms);
+    let already_named = learned.iter().any(|endpoint| {
+        endpoint
+            .direct_addr()
+            .is_some_and(|addr| addr.ip() == connection_source.ip())
+    });
+    if !already_named && is_dialable_claim(connection_source) {
+        learned.push(Endpoint::direct(
+            connection_source,
+            observed_at_ms,
+            EndpointSource::Hello,
+        ));
+    }
+    learned
 }
 
 /// Record the pair's rendezvous secret on a pinned row.
@@ -843,12 +912,27 @@ pub fn observe_rendezvous_secret(path: &Path, peer: &PeerId, secret: [u8; 32]) -
 ///
 /// The TIME is the caller's clock. A peer telling this Mac when it was seen
 /// would be a peer deciding how fresh its own advice looks.
+///
+/// The address itself is refused by [`is_dialable_claim`] first, the same
+/// gate [`endpoints_from_hello`] applies: `observed_you_at` is a claim about
+/// a socket this node could punch back at, so `0.0.0.0`, `::` and port `0`
+/// are exactly as unusable here as they are in an endpoint. Both call sites,
+/// the listener's and the dialer's, funnel through this one writer, so the
+/// check belongs here rather than duplicated at each.
 pub fn observe_seen_address(
     path: &Path,
     peer: &PeerId,
     addr: SocketAddr,
     observed_at_ms: u64,
 ) -> Result<bool> {
+    if !is_dialable_claim(addr) {
+        tracing::debug!(
+            peer = %peer.display(),
+            addr = %addr,
+            "peers file: refusing to record an unreachable address a peer said it sees us at"
+        );
+        return Ok(false);
+    }
     let _lock = FileLock::acquire(path)?;
     let mut file = read_or_default(path)?;
     let Some(row) = file.peers.iter_mut().find(|row| &row.node == peer) else {
@@ -867,6 +951,25 @@ pub fn observe_seen_address(
     Ok(true)
 }
 
+/// Whether a peer can actually be dialed at `addr`, apart from who claims it.
+///
+/// `0.0.0.0` and `::` are the address a listener BINDS, never one a peer
+/// answers on: a socket configured to listen on every interface still has to
+/// be dialed at one of them, so trying the unspecified address itself just
+/// asks the kernel to pick an interface and never reaches the peer this claim
+/// was supposed to be for. Port `0` is the same kind of placeholder: it asks
+/// the kernel for a fresh ephemeral port at bind time and answers on none.
+/// Both cost a wasted dial in the order this node's source rank sets, ahead
+/// of the address that actually answers.
+///
+/// Measured after one hello between two live nodes: the far side's `Hello`
+/// literally named its own configured listen socket, `0.0.0.0:7766`, and that
+/// string sat on the row next to `198.51.100.7:7766`, the address that
+/// actually answered.
+fn is_dialable_claim(addr: SocketAddr) -> bool {
+    !addr.ip().is_unspecified() && addr.port() != 0
+}
+
 /// The endpoints in a `Hello`, as this node is willing to believe them.
 ///
 /// A `Hello` arrives inside a session whose static key checked out, so the
@@ -881,10 +984,16 @@ pub fn observe_seen_address(
 /// `Vec<String>` and this node cannot dial a string it cannot parse. Skipped
 /// and not refused: a peer running a build that announces something new must
 /// not be able to make its `Hello` unreadable.
+///
+/// An entry that parses but is not [`is_dialable_claim`] is skipped the same
+/// way, for the reason that function states: a `Hello` naming its own bind
+/// address is not lying, it is reporting the configuration honestly, and the
+/// honest report is still not something to dial.
 pub fn endpoints_from_hello(addrs: &[String], observed_at_ms: i64) -> Vec<Endpoint> {
     addrs
         .iter()
         .filter_map(|addr| addr.parse::<SocketAddr>().ok())
+        .filter(|addr| is_dialable_claim(*addr))
         .map(|addr| Endpoint::direct(addr, observed_at_ms, EndpointSource::Hello))
         .collect()
 }
@@ -2206,5 +2315,198 @@ mod tests {
             err.to_string().contains("ten to six"),
             "the refusal must name the value: {err}"
         );
+    }
+
+    /// **The two junk shapes a hello can name are dropped, and a real one is
+    /// kept.** `0.0.0.0:7766` is the far side's own bind address, never
+    /// something this node can dial; port `198.51.100.7:0` is the same kind
+    /// of placeholder at a real host. `198.51.100.7:7766` is the one address
+    /// in this batch a peer actually answers on and must survive.
+    ///
+    /// Watch it fail by removing the `.filter(|addr| is_dialable_claim(*addr))`
+    /// line from [`endpoints_from_hello`]: all three entries come back,
+    /// `0.0.0.0:7766` and `198.51.100.7:0` among them.
+    #[test]
+    fn endpoints_from_hello_drops_an_unspecified_address_and_a_zero_port() {
+        let addrs = vec![
+            "0.0.0.0:7766".to_string(),
+            "198.51.100.7:0".to_string(),
+            "198.51.100.7:7766".to_string(),
+        ];
+        let learned = endpoints_from_hello(&addrs, 1_000);
+        let kept: Vec<SocketAddr> = learned.iter().filter_map(Endpoint::direct_addr).collect();
+        assert_eq!(
+            kept,
+            vec!["198.51.100.7:7766".parse::<SocketAddr>().unwrap()],
+            "only the one dialable address should survive: {kept:?}"
+        );
+    }
+
+    /// An `::` (the unspecified IPv6 address) is refused the same way `0.0.0.0`
+    /// is, and a real IPv6 host is kept.
+    #[test]
+    fn endpoints_from_hello_drops_the_unspecified_ipv6_address() {
+        let addrs = vec!["[::]:7766".to_string(), "[2001:db8::7]:7766".to_string()];
+        let learned = endpoints_from_hello(&addrs, 1_000);
+        let kept: Vec<SocketAddr> = learned.iter().filter_map(Endpoint::direct_addr).collect();
+        assert_eq!(
+            kept,
+            vec!["[2001:db8::7]:7766".parse::<SocketAddr>().unwrap()],
+            "only the real host should survive: {kept:?}"
+        );
+    }
+
+    /// **An older-build hello that only ever announced the good form is
+    /// unchanged.** A build from before the unspecified address showed up in
+    /// the wild sent exactly one address, its real listen socket, and this
+    /// function must not touch that case at all.
+    #[test]
+    fn endpoints_from_hello_leaves_an_older_builds_good_address_alone() {
+        let addrs = vec!["198.51.100.7:7766".to_string()];
+        let learned = endpoints_from_hello(&addrs, 1_000);
+        assert_eq!(learned.len(), 1);
+        assert_eq!(
+            learned[0].direct_addr(),
+            Some("198.51.100.7:7766".parse().unwrap())
+        );
+        assert_eq!(learned[0].source, EndpointSource::Hello);
+        assert_eq!(learned[0].observed_at_ms, 1_000);
+    }
+
+    /// **The connection's own source port is refused once the hello already
+    /// names a listen port for the same host.** `198.51.100.7:7766` is what
+    /// the hello's own `addrs` claims; `198.51.100.7:50254` is the ephemeral
+    /// port the dial actually landed on, for the same host, and it must not
+    /// sit on the row next to the address the hello already named.
+    ///
+    /// Watch it fail by dropping the `!already_named` check in
+    /// [`endpoints_and_connection_from_hello`] and always pushing the
+    /// connection's address: both entries for `198.51.100.7` come back.
+    #[test]
+    fn endpoints_and_connection_from_hello_drops_the_connections_own_source_port_once_a_listen_port_is_named(
+    ) {
+        let learned = endpoints_and_connection_from_hello(
+            &["198.51.100.7:7766".to_string()],
+            "198.51.100.7:50254".parse().unwrap(),
+            1_000,
+        );
+        let addrs: Vec<SocketAddr> = learned.iter().filter_map(Endpoint::direct_addr).collect();
+        assert_eq!(
+            addrs,
+            vec!["198.51.100.7:7766".parse::<SocketAddr>().unwrap()],
+            "the ephemeral connection port must not survive next to the announced one: {addrs:?}"
+        );
+    }
+
+    /// **When the hello's own claim was junk, the connection's observed
+    /// address is the only way back to this host and must be kept**, not
+    /// refused as if it were the redundant one: the far side announced its
+    /// own bind address, `0.0.0.0:7766`, which [`endpoints_from_hello`]
+    /// already drops, and the socket the dial actually reached,
+    /// `198.51.100.7:7766`, is the one fact this node has left.
+    #[test]
+    fn endpoints_and_connection_from_hello_keeps_the_connection_address_when_the_hello_named_nothing(
+    ) {
+        let learned = endpoints_and_connection_from_hello(
+            &["0.0.0.0:7766".to_string()],
+            "198.51.100.7:7766".parse().unwrap(),
+            2_000,
+        );
+        let addrs: Vec<SocketAddr> = learned.iter().filter_map(Endpoint::direct_addr).collect();
+        assert_eq!(
+            addrs,
+            vec!["198.51.100.7:7766".parse::<SocketAddr>().unwrap()],
+            "the only address a peer with a junk bind claim can be dialed at must survive: {addrs:?}"
+        );
+    }
+
+    /// **`observe_endpoints` must NOT dedup a same-host batch by IP.** A
+    /// neighbour brief legitimately hands it several ports on one host, and
+    /// this row's own doc comment names the regression: collapsing that
+    /// batch to one entry here would break
+    /// `five_hundred_brief_addresses_write_once_and_never_outrank_the_paired_endpoint`
+    /// (`tests/peer_discovery.rs`), which is exactly what happened when a
+    /// same-host dedup was tried at this layer before it moved to
+    /// [`endpoints_and_connection_from_hello`].
+    #[test]
+    fn observe_endpoints_keeps_every_port_a_caller_hands_it_for_one_host() {
+        let peer = PeerId(*b"peer-endpoint-hygiene-test-aaaaa");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcr-peers.json");
+        let mut file = PeerFile::default();
+        file.peers.push(PeerRow {
+            node: peer,
+            label: "hygiene".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        });
+        save(&path, &file).unwrap();
+
+        let learned = vec![
+            Endpoint::direct(
+                "198.51.100.7:1".parse().unwrap(),
+                1_000,
+                EndpointSource::Brief,
+            ),
+            Endpoint::direct(
+                "198.51.100.7:2".parse().unwrap(),
+                1_000,
+                EndpointSource::Brief,
+            ),
+        ];
+        observe_endpoints(&path, &peer, &learned).unwrap();
+        let row = read_or_default(&path)
+            .unwrap()
+            .peers
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            row.endpoints.len(),
+            2,
+            "a caller that means to hand this row two ports on one host gets both: {:?}",
+            row.endpoints
+        );
+    }
+
+    /// `observed_you_at` is refused by the same gate an endpoint is: an
+    /// unspecified address or a zero port is never recorded onto
+    /// [`PeerRow::sees_us_at`].
+    #[test]
+    fn observe_seen_address_refuses_an_unspecified_address() {
+        let peer = PeerId(*b"peer-seen-address-hygiene-aaaaaa");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tcr-peers.json");
+        let mut file = PeerFile::default();
+        file.peers.push(PeerRow {
+            node: peer,
+            label: "hygiene".to_string(),
+            endpoints: Vec::new(),
+            added_at: 0,
+            allow: Allow::default(),
+            lend: Vec::new(),
+            rendezvous_secret: None,
+            sees_us_at: None,
+        });
+        save(&path, &file).unwrap();
+
+        let wrote =
+            observe_seen_address(&path, &peer, "0.0.0.0:7766".parse().unwrap(), 1_000).unwrap();
+        assert!(!wrote, "an unspecified address must not be recorded");
+        let row = read_or_default(&path)
+            .unwrap()
+            .peers
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(row.sees_us_at, None);
+
+        let wrote = observe_seen_address(&path, &peer, "198.51.100.7:7766".parse().unwrap(), 1_000)
+            .unwrap();
+        assert!(wrote, "a real address must still be recorded");
     }
 }
