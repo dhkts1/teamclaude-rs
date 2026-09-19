@@ -2431,6 +2431,10 @@ mod tests {
             let bytes = self.0.lock().expect("shared buffer poisoned").clone();
             String::from_utf8_lossy(&bytes).into_owned()
         }
+
+        fn clear(&self) {
+            self.0.lock().expect("shared buffer poisoned").clear();
+        }
     }
 
     impl std::io::Write for SharedBuf {
@@ -2500,6 +2504,19 @@ mod tests {
     /// only reacts to a panic, never to an ordinary return (which is exactly
     /// what every one of these loops does today on a clean shutdown: the
     /// `tokio::select!` around `stop.changed()` returns `()`, not a panic).
+    ///
+    /// Same process-wide callsite-caching problem as
+    /// `boot_line_carries_every_new_knob_with_its_configured_value` above: if
+    /// some other thread reached `supervise`'s `tracing::error!` first with no
+    /// subscriber installed, the interest for that callsite is cached as
+    /// `never` and this test's sink would stay empty regardless of what
+    /// `supervise` actually did: an empty sink would pass whether or not a
+    /// clean return gets logged as a panic. `rebuild_interest_cache()` fixes
+    /// that, but only proves the callsite is *reachable*; it says nothing
+    /// about whether THIS assertion could ever fail. So before trusting the
+    /// empty-sink assertion below, drive the actual panic path first and
+    /// require the sink to capture it: a positive control. Only then is an
+    /// empty sink from the clean-return path evidence of anything.
     #[tokio::test]
     async fn a_clean_return_is_not_logged_as_a_panic() {
         let sink = SharedBuf::default();
@@ -2508,6 +2525,24 @@ mod tests {
             .with_ansi(false)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        // Positive control: the sink must actually capture a panic logged by
+        // `supervise` under this subscriber, or the assertion below proves
+        // nothing.
+        let control_handle = tokio::spawn(supervise("test-positive-control", async {
+            panic!("positive control: this must reach the sink");
+        }));
+        control_handle
+            .await
+            .expect("supervise() catches the panic, so this JoinHandle completes normally");
+        assert!(
+            sink.contents().contains("background task panicked"),
+            "positive control failed: a real panic was not captured, so an \
+             empty sink below would prove nothing: {:?}",
+            sink.contents()
+        );
+        sink.clear();
 
         let handle = tokio::spawn(supervise("test-clean-task", async {}));
         handle
