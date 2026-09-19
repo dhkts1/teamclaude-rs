@@ -1291,10 +1291,14 @@ struct PeersTabV4: View {
         let argv = PeerCommand.find(on: !on)
         return switchCard(
             title: "Find Macs on this network",
+            // The subtitle DESCRIBES, in every state. It used to carry
+            // `Looking. 2 Macs found, 2 trusted.` while the footer a few
+            // points below carried the same count: one fact, printed twice in
+            // one scroll, and the cost was the only line on this tab that
+            // could say what finding actually does. The count now lives in the
+            // footer alone.
             state: on
-                ? (snapshot.rows.isEmpty
-                    ? "Looking. Other Macs running tcr appear below by themselves."
-                    : "Looking. \(snapshot.countLine).")
+                ? "Looking. Other Macs running tcr appear below by themselves."
                 : "Off. This Mac is not announcing itself and is not looking.",
             isOn: on,
             enabled: true,

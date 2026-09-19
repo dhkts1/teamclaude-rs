@@ -239,6 +239,29 @@ final class PeersPanelWiringTests: XCTestCase {
                 + "is stored, accepted, and then opens the Accounts tab")
     }
 
+    // MARK: - One fact, in the one place that owns it
+
+    /// The Mac count belongs to the footer, and the Find card's subtitle is
+    /// the only line on the tab that could say what finding DOES.
+    ///
+    /// The count was printed twice in one scroll, about fifteen points apart:
+    /// `Looking. 2 Macs found, 2 trusted.` in this subtitle and `2 Macs
+    /// found, 2 trusted` in the footer under the list. Spending the one
+    /// describing line on a number that is already below is what this closes.
+    func testTheFindCardSubtitleDescribesFindingRatherThanCountingMacs() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        let card = try slice(
+            tab, from: "private var findCard: some View {", to: "private var shareCard")
+        XCTAssertFalse(
+            card.contains("snapshot.countLine"),
+            "the Find card prints the Mac count again, a few points above the footer that "
+                + "owns it")
+        XCTAssertTrue(
+            card.contains("Looking. Other Macs running tcr appear below by themselves."),
+            "the Looking arm no longer says what finding does, which is the one thing this "
+                + "line is for")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
