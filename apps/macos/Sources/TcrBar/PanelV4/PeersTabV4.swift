@@ -281,6 +281,20 @@ enum PeersSnapshotBuilder {
     /// nobody reads.
     static let carryPillText = "can carry"
 
+    /// What carrying means, said ONCE under the section head.
+    ///
+    /// It was a per-row sentence, repeated word for word on every trusted row:
+    /// seven identical paragraphs in the seven-Mac state, for a fact that is
+    /// true of every trusted Mac and changes for none of them. A row keeps a
+    /// sentence of its own only where it DEVIATES, which is the carrying row
+    /// with its own byte figures.
+    ///
+    /// `path`, not `route`: one noun for a way to reach a Mac, on the whole
+    /// tab.
+    static let carrySentence =
+        "A trusted Mac carries your traffic when this Mac has no path of its own, and reads "
+        + "none of it."
+
     static func snapshot(from document: PeerListDocument, now: Date) -> PeersSnapshot {
         guard document.supported else {
             return PeersSnapshot(
@@ -573,9 +587,9 @@ enum PeersSnapshotBuilder {
                         + "them, out of \(PeerFormat.megabytes(cap)) MB an hour."))
         }
         if entry.carries {
-            return .none(
-                "Carries your traffic when this Mac has no route of its own, and reads none "
-                    + "of it.")
+            // No sentence: this row says exactly what ``carrySentence`` says
+            // above the list, so it says nothing and the reader reads it once.
+            return .none(nil)
         }
         return .none(nil)
     }
@@ -1803,19 +1817,26 @@ struct PeersTabV4: View {
     }
 
     private var sectionHead: some View {
-        HStack(spacing: V4.rowGap) {
-            SectionHead(title: "Other Macs")
-            Spacer(minLength: 0)
-            if snapshot.sharing {
-                PeerPill(
-                    text: "sharing", role: .disclosure,
-                    help: "Trusted Macs may serve your requests on their own accounts, and "
-                        + "read them.")
-            } else if snapshot.finding {
-                PeerPill(
-                    text: "finding", role: .ok,
-                    help: "Discovery is up. A readout, not a control.")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: V4.rowGap) {
+                SectionHead(title: "Other Macs")
+                Spacer(minLength: 0)
+                if snapshot.sharing {
+                    PeerPill(
+                        text: "sharing", role: .disclosure,
+                        help: "Trusted Macs may serve your requests on their own accounts, and "
+                            + "read them.")
+                } else if snapshot.finding {
+                    PeerPill(
+                        text: "finding", role: .ok,
+                        help: "Discovery is up. A readout, not a control.")
+                }
             }
+            // The fact every trusted row used to repeat, said once, where a
+            // reader meets it before the rows rather than seven times inside
+            // them. Drawn whenever the head is, so the height budget's
+            // `carrySentenceLines` is a constant and not a guess.
+            MuteText(text: PeersSnapshotBuilder.carrySentence, lineLimit: nil)
         }
         .padding(.top, V4.sectionHeadMarginTop)
         .padding(.horizontal, V4.sectionHeadMarginSide)
@@ -1888,6 +1909,15 @@ struct PeersTabV4: View {
     /// not have.
     static let hitTarget: CGFloat = 40
 
+    /// How many lines ``PeersSnapshotBuilder/carrySentence`` takes under the
+    /// section head at this panel's width, for the height budget below.
+    ///
+    /// Charged unconditionally, because the sentence is drawn whenever the
+    /// section head is: a conditional line is a line the budget can be wrong
+    /// about, and growth the budget cannot see comes out of the footer
+    /// (``PeerPanelHeight``'s own invariant).
+    static let carrySentenceLines: CGFloat = 2
+
     /// What ``PeerPanelHeight`` charges for this tab, at the density now
     /// resolved. Read off `V4` here (the one place that knows both), and
     /// passed in, so the arithmetic stays testable in `TcrBarCore`.
@@ -1900,11 +1930,12 @@ struct PeersTabV4: View {
             cardGap: V4.cardGap,
             // The two switch cards (each a name line, a state line and a
             // two-line yes block inside its own card chrome), the section
-            // head, and the count line.
+            // head AND the carry sentence under it, and the count line.
             fixedChrome: 2
                 * (V4.lineHeight(V4.nameSize) + V4.lineHeight(V4.muteSize)
                     + 2 * V4.lineHeight(V4.muteSize) + 2 * V4.cardInsetV)
                 + V4.sectionHeadMarginTop + V4.lineHeight(V4.sectionHeadSize)
+                + carrySentenceLines * V4.lineHeight(V4.muteSize)
                 + V4.footerMarginTop + V4.lineHeight(V4.byToolLineSize))
     }
 

@@ -317,6 +317,35 @@ final class PeersPanelWiringTests: XCTestCase {
             "the mesh card is gone from the tab altogether, not just from the empty state")
     }
 
+    /// The carry sentence is said once, above the list, and the rows that do
+    /// not deviate from it say nothing.
+    ///
+    /// It was repeated word for word on every trusted row, seven times in the
+    /// seven-Mac state, for a fact that is true of every trusted Mac. A row
+    /// keeps a sentence of its own only where it deviates, which is the
+    /// gateway row with its own byte figures.
+    func testTheCarrySentenceIsSaidOnceAboveTheList() throws {
+        let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
+        XCTAssertTrue(
+            tab.contains("static let carrySentence ="),
+            "the shared carry sentence is not one string any more")
+        let head = try slice(
+            tab, from: "private var sectionHead: some View {", to: "private var countLine")
+        XCTAssertTrue(
+            head.contains("PeersSnapshotBuilder.carrySentence"),
+            "the section head no longer carries the sentence, so the fact is said nowhere")
+        XCTAssertFalse(
+            tab.contains("\"Carries your traffic when this Mac has no route of its own"),
+            "the per-row copy of the carry sentence is back, once per trusted row, and it "
+                + "still says route where the tab says path")
+        let metrics = try slice(
+            tab, from: "static var heightMetrics: PeerPanelHeight.Metrics {", to: "private func pillHelp")
+        XCTAssertTrue(
+            metrics.contains("carrySentenceLines"),
+            "the height budget does not charge for the sentence under the section head, and "
+                + "growth the budget cannot see comes out of the footer")
+    }
+
     // MARK: - Reading the source
 
     private func repoRoot() -> URL {
