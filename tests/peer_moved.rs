@@ -1116,3 +1116,148 @@ fn the_mint_verb_reads_the_held_mapping_off_the_state_file() {
          router has already dropped it, so a link must not advertise it: {out}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The panel's argv, against this verb
+// ---------------------------------------------------------------------------
+
+/// The argv the macOS panel sends, read out of the panel's own source.
+///
+/// Read rather than restated, because a copy of it here would agree with
+/// nothing: the whole failure this guards is the two sides drifting apart, and
+/// a second literal drifts with neither. The panel builds one array and appends
+/// one flag for the keep run, so this returns the array and the caller adds the
+/// flag the same way.
+fn panel_open_argv() -> Vec<String> {
+    let swift = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("apps/macos/Sources/TcrBarCore/PeerMovedLink.swift"),
+    )
+    .expect("the panel's link type is in this tree");
+    let line = swift
+        .lines()
+        .find(|line| line.contains("var arguments = ["))
+        .expect("the panel still builds the open verb's argv from one array literal");
+    let inside = line
+        .split_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inside, _)| inside)
+        .expect("the array literal is on one line");
+    inside
+        .split(',')
+        .map(str::trim)
+        .filter(|part| part.starts_with('"'))
+        .map(|part| part.trim_matches('"').to_string())
+        .collect()
+}
+
+/// The same, for the verb that makes a link.
+fn panel_mint_argv() -> Vec<String> {
+    let swift = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("apps/macos/Sources/TcrBarCore/PeerCommand.swift"),
+    )
+    .expect("the panel's command factory is in this tree");
+    let line = swift
+        .lines()
+        .find(|line| line.contains("func moved(mint peer: String)"))
+        .expect("the panel still spells the mint verb in one factory");
+    // The LAST bracket on the line: the return type `[String]` is written
+    // before the array literal and a leading split reads that instead.
+    let inside = line
+        .rsplit_once('[')
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(inside, _)| inside)
+        .expect("the array literal is on one line");
+    // Quoted parts only: the last element is the peer id, a Swift parameter
+    // name rather than a word, and it is the caller's to supply. Filtering on
+    // the quotes rather than on the name keeps a rename from silently dropping
+    // a real word out of the argv this compares.
+    inside
+        .split(',')
+        .map(str::trim)
+        .filter(|part| part.starts_with('"'))
+        .map(|part| part.trim_matches('"').to_string())
+        .collect()
+}
+
+/// **The words the panel sends are the words this verb answers to.**
+///
+/// The two halves were written apart: the Swift side against a contract, the
+/// Rust side against its own tests, and nothing ran one against the other. A
+/// flag renamed on either side leaves both suites green and the button dead,
+/// which is the one failure neither suite can see.
+///
+/// `--peers` is the only argument added here, and it is what keeps the run off
+/// the operator's own file; every other word comes out of the panel's source.
+///
+/// Watched red: changing `--stdin` to `--stdin-link` in the Swift array leaves
+/// this failing at the first run with clap's own "unexpected argument".
+#[test]
+fn the_argv_the_panel_sends_is_the_argv_these_verbs_answer_to() {
+    let mint = panel_mint_argv();
+    assert_eq!(
+        mint,
+        vec!["peer", "moved", "mint"],
+        "the mint verb the panel spells is not the one this build has"
+    );
+
+    let sender_dir = scratch("panel-argv-sender");
+    let sender = sender_peers(&sender_dir, None);
+    // The panel's own words, with the peer id it puts last, and nothing else.
+    let mut mint_extra: Vec<&str> = mint[2..].iter().map(String::as_str).collect();
+    let friend = peer_id(0x22).to_wire();
+    mint_extra.push(&friend);
+    let (out, err, ok) = run_moved(&sender, &mint_extra, None);
+    assert!(ok, "the panel's mint argv exited non-zero: {err}\n{out}");
+    let link = link_from(&out);
+
+    let receiver_dir = scratch("panel-argv-receiver");
+    let receiver = receiver_peers(&receiver_dir, &sender_id(&sender_dir));
+
+    let open = panel_open_argv();
+    assert_eq!(
+        open,
+        vec!["peer", "moved", "open", "--stdin"],
+        "the read run's argv moved, so the panel is asking for a verb or a flag this build \
+         does not have"
+    );
+    let preview: Vec<&str> = open[2..].iter().map(String::as_str).collect();
+    let (out, err, ok) = run_moved(&receiver, &preview, Some(&link));
+    assert!(ok, "the panel's read argv exited non-zero: {err}\n{out}");
+    // The three facts the panel's own reader keys on: a clean exit, words on
+    // stdout, and nothing on stderr. It shows stdout on a clean run and stderr
+    // on a refused one, so a preview that wrote its sentence to the wrong
+    // stream would put an empty alert in front of a person.
+    assert!(
+        !out.trim().is_empty(),
+        "a clean read printed nothing, which the panel draws as a refusal in its own words"
+    );
+    assert!(
+        err.trim().is_empty(),
+        "the read run wrote to stderr on a clean exit: {err}"
+    );
+
+    // And the keep run, which is the same array with the one flag the panel
+    // appends when the person presses Keep.
+    let mut keep = preview.clone();
+    keep.push("--yes");
+    let (out, err, ok) = run_moved(&receiver, &keep, Some(&link));
+    assert!(ok, "the panel's keep argv exited non-zero: {err}\n{out}");
+    assert!(
+        out.contains("added 1 address"),
+        "the keep run did not keep what the read run offered: {out}"
+    );
+
+    // The refusal shape, on the stream the panel reads it from. A link cut
+    // short is the refusal a chat window produces, and the panel prefers
+    // stderr, so a refusal that spoke only on stdout would reach a person as
+    // this app's own "printed nothing" sentence instead of tcr's.
+    let cut = &link[..link.len() - 8];
+    let (out, err, ok) = run_moved(&receiver, &preview, Some(cut));
+    assert!(!ok, "a cut link exited clean: {out}");
+    assert!(
+        !err.trim().is_empty(),
+        "a refusal said nothing on stderr, so the panel falls back to its own words: {out}"
+    );
+}

@@ -1119,6 +1119,14 @@ struct PeersTabV4: View {
     /// closure that does nothing, which is a control that lies. So the card
     /// offers it exactly when a caller has handed it a way to perform it.
     var onCheckForUpdates: (() -> Void)?
+    /// Draw the refusal banner with its raw line already showing.
+    ///
+    /// `--render-states` only, and it exists because the toggle below it is
+    /// `@State`: a fixture cannot press a button, so the half of the banner
+    /// that lives behind Details had no picture at all and the press was a
+    /// claim about a state nobody could look at. It never disables the toggle;
+    /// nothing in the harness presses it.
+    var refusalDetailsOpen: Bool = false
 
     /// The Trust sheet's peer, when one is open. Held here rather than on the
     /// row so two rows cannot open two sheets.
@@ -1404,7 +1412,7 @@ struct PeersTabV4: View {
                     ) { controller.dismissRefusal() }
                 }
             }
-            if refusalDetails {
+            if refusalDetails || refusalDetailsOpen {
                 Text(raw)
                     .font(.system(size: V4.muteSize, design: .monospaced))
                     .foregroundStyle(Tok.mute)
