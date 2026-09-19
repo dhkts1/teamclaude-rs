@@ -807,6 +807,14 @@ pub const MAX_BRIEF_ADDRS: usize = 4;
 /// actually reached at.
 pub const MAX_BRIEF_ENDPOINTS_PER_PEER: usize = 2;
 
+/// How many of a row's [`crate::peer::config::MAX_ENDPOINTS_PER_PEER`] slots a
+/// dead-drop record may ever hold.
+///
+/// [`MAX_BRIEF_ENDPOINTS_PER_PEER`]'s value and its reason, for a source that
+/// is weaker still: a record off a surface nobody here owns must never be able
+/// to fill a row.
+pub const MAX_DROP_ENDPOINTS_PER_PEER: usize = 2;
+
 /// Record one incoming `Hello.briefs` against the peers file and return how
 /// many rows it moved.
 ///
@@ -911,10 +919,54 @@ pub fn observe_neighbor_briefs(
 /// Which of one node's brief endpoints may be written, read off the row as it
 /// stands: the three rules in [`observe_neighbor_briefs`]'s doc, in order.
 fn admissible_brief_endpoints(row: &PeerRow, learned: &[Endpoint]) -> Vec<Endpoint> {
-    let mut briefs_held = row
+    admissible_weak_endpoints(
+        row,
+        learned,
+        EndpointSource::Brief,
+        MAX_BRIEF_ENDPOINTS_PER_PEER,
+    )
+}
+
+/// Which of a dead-drop record's addresses may be written onto the row, read
+/// off the row as it stands.
+///
+/// [`admissible_brief_endpoints`]'s three rules with
+/// [`crate::peer::config::EndpointSource::Drop`] in place of
+/// [`crate::peer::config::EndpointSource::Brief`] and
+/// [`MAX_DROP_ENDPOINTS_PER_PEER`] in place of
+/// [`MAX_BRIEF_ENDPOINTS_PER_PEER`]. A locator the row holds from a stronger
+/// source is left alone, never re-dated and never downgraded.
+///
+/// It is a sibling and not a second implementation: both call
+/// [`admissible_weak_endpoints`], so a rule fixed for one band is fixed for
+/// both. `observed_at_ms` on what comes back is the caller's own clock and
+/// never the record's, the rule
+/// [`crate::peer::config::Endpoint::observed_at_ms`] states.
+pub fn admissible_drop_endpoints(row: &PeerRow, learned: &[Endpoint]) -> Vec<Endpoint> {
+    admissible_weak_endpoints(
+        row,
+        learned,
+        EndpointSource::Drop,
+        MAX_DROP_ENDPOINTS_PER_PEER,
+    )
+}
+
+/// The three rules themselves, over whichever weak source is being admitted
+/// and whatever that source's cap is.
+///
+/// One body rather than one per source: the rules are a property of how much a
+/// weak source is worth, not of which one it is, and two copies drift the
+/// moment one of them is corrected.
+fn admissible_weak_endpoints(
+    row: &PeerRow,
+    learned: &[Endpoint],
+    source: EndpointSource,
+    cap: usize,
+) -> Vec<Endpoint> {
+    let mut held_from_source = row
         .endpoints
         .iter()
-        .filter(|endpoint| endpoint.source == EndpointSource::Brief)
+        .filter(|endpoint| endpoint.source == source)
         .count();
     let mut free_slots = crate::peer::config::MAX_ENDPOINTS_PER_PEER.saturating_sub(
         row.endpoints
@@ -934,13 +986,13 @@ fn admissible_brief_endpoints(row: &PeerRow, learned: &[Endpoint]) -> Vec<Endpoi
             .iter()
             .find(|held| held.locator == endpoint.locator)
         {
-            Some(held) if held.source == EndpointSource::Brief => admissible.push(*endpoint),
+            Some(held) if held.source == source => admissible.push(*endpoint),
             Some(_) => continue,
             None => {
-                if briefs_held >= MAX_BRIEF_ENDPOINTS_PER_PEER || free_slots == 0 {
+                if held_from_source >= cap || free_slots == 0 {
                     continue;
                 }
-                briefs_held += 1;
+                held_from_source += 1;
                 free_slots -= 1;
                 admissible.push(*endpoint);
             }

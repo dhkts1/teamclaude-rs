@@ -1098,3 +1098,101 @@ fn a_flood_holds_two_rows_per_address_and_nothing_survives_the_ttl() {
         "a flooder that stops announcing holds nothing a minute later"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The weakest source of all: an address left at a dead drop
+// ---------------------------------------------------------------------------
+
+/// **An address off a dead drop never evicts one this Mac proved, and never
+/// downgrades one either.**
+///
+/// A dead-drop record is the weakest thing on the endpoint list: it comes off a
+/// surface nobody here owns, and a peer this Mac has forgotten still holds the
+/// key that seals it. So it gets the three rules a neighbour brief already
+/// gets, with its own cap, and this is the test that says the three hold for
+/// the new band rather than only for the old one.
+///
+/// Four claims, each one a different way the rules are wrong:
+///
+/// 1. a full row (eight endpoints a handshake proved) admits nothing at all;
+/// 2. a locator the row already holds from a stronger source is refused, not
+///    re-dated and not rewritten as a drop, which is what "never downgrades"
+///    means and is invisible in a count of endpoints;
+/// 3. a locator the row holds AS a drop is refreshed, which evicts nothing;
+/// 4. the third new drop on a row is refused while there is still room, which
+///    is the cap and not the row's own eight slots.
+///
+/// Watched red, one mutation at a time, each restored from a byte copy. In
+/// `admissible_weak_endpoints`: dropping `|| free_slots == 0` from the guard
+/// takes claim 1 down (on the free-slot subtraction, which is what a full row
+/// reaching that arm at all means); dropping `held_from_source >= cap ||` from
+/// it fails claim 4's assertion; and changing the `Some(held) if held.source ==
+/// source` arm to match any held endpoint fails claim 2's.
+#[test]
+fn a_drop_endpoint_never_evicts_a_proven_one() {
+    use teamclaude_rs::peer::config::{Endpoint, EndpointSource, MAX_ENDPOINTS_PER_PEER};
+
+    let peer = PeerId([0xA1; 32]);
+    let proven: std::net::SocketAddr = "192.0.2.50:9601".parse().expect("a literal address");
+    let addr = |port: u16| -> std::net::SocketAddr {
+        format!("198.51.100.7:{port}")
+            .parse()
+            .expect("a literal address")
+    };
+
+    // 1. A row already full of endpoints a completed handshake proved.
+    let mut full = pinned_row(peer, proven);
+    for port in (9_700_u16..).take(MAX_ENDPOINTS_PER_PEER) {
+        full.observe_endpoint(Endpoint::direct(addr(port), 2_000, EndpointSource::Hello));
+    }
+    assert_eq!(
+        full.endpoints.len(),
+        MAX_ENDPOINTS_PER_PEER,
+        "the row this claim needs is a full one: {:?}",
+        full.endpoints
+    );
+    let learned = vec![Endpoint::direct(addr(9_800), 3_000, EndpointSource::Drop)];
+    assert!(
+        discovery::admissible_drop_endpoints(&full, &learned).is_empty(),
+        "a full row admits nothing off a dead drop: the eight slots hold what this Mac \
+         proved, and a record carries this Mac's clock, so unbounded it would lead them all"
+    );
+
+    // 2. The same locator, already held from a stronger source.
+    let held_stronger = pinned_row(peer, proven);
+    let same_locator = vec![Endpoint::direct(proven, 3_000, EndpointSource::Drop)];
+    assert!(
+        discovery::admissible_drop_endpoints(&held_stronger, &same_locator).is_empty(),
+        "a locator the pairing proved is left alone: refreshing it would re-date it and \
+         rewrite its source as the weakest band on the list"
+    );
+
+    // 3. The same locator, already held AS a drop: refreshed, evicting nothing.
+    let mut held_as_drop = pinned_row(peer, proven);
+    held_as_drop.observe_endpoint(Endpoint::direct(addr(9_900), 2_000, EndpointSource::Drop));
+    let refresh = vec![Endpoint::direct(addr(9_900), 3_000, EndpointSource::Drop)];
+    let admissible = discovery::admissible_drop_endpoints(&held_as_drop, &refresh);
+    assert_eq!(
+        admissible, refresh,
+        "a drop this row already holds is refreshed rather than refused: {admissible:?}"
+    );
+
+    // 4. The cap, with room to spare on the row itself.
+    let mut two_drops = pinned_row(peer, proven);
+    for port in (9_910_u16..).take(discovery::MAX_DROP_ENDPOINTS_PER_PEER) {
+        two_drops.observe_endpoint(Endpoint::direct(addr(port), 2_000, EndpointSource::Drop));
+    }
+    assert!(
+        two_drops.endpoints.len() < MAX_ENDPOINTS_PER_PEER,
+        "the row still has free slots, so claim 4 is the cap and not the row's own limit: \
+         {:?}",
+        two_drops.endpoints
+    );
+    let third = vec![Endpoint::direct(addr(9_920), 3_000, EndpointSource::Drop)];
+    assert!(
+        discovery::admissible_drop_endpoints(&two_drops, &third).is_empty(),
+        "at most {} of the eight slots are an address off a dead drop, so the rest stay \
+         with the endpoints this Mac proved",
+        discovery::MAX_DROP_ENDPOINTS_PER_PEER
+    );
+}

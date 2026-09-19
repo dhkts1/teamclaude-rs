@@ -1003,6 +1003,7 @@ fn hello_for_a_bare_pin_is_minimal() {
             briefs: true,
             lendable: true,
             diag: true,
+            drop: true,
         },
     );
     assert_eq!(granted.hops_to_egress, Some(1));

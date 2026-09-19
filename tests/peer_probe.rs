@@ -932,3 +932,83 @@ fn a_brief_endpoint_is_dialled_after_a_paired_one() {
          {measured:?}"
     );
 }
+
+/// **An address off a dead drop is dialled last of all, below a brief.**
+///
+/// A brief came from a Mac this node pinned, over a session that proved a
+/// static key, about a Mac this node also pinned. A dead-drop record came off a
+/// surface that can withhold and is sealed under a symmetric key a forgotten
+/// peer still holds, so it is the weakest evidence on the list and it sorts
+/// after everything, the brief included.
+///
+/// Asserted as the WHOLE expected order over all six sources rather than as one
+/// comparison between two: a single "drop is after brief" assertion passes just
+/// as happily if the new band swallowed one of the four above it.
+///
+/// The recency key is deliberately set against the source key here: the drop
+/// endpoint is the newest on the row and the paired one the oldest, so an order
+/// that read recency first would be the exact reverse of the one asserted.
+///
+/// Watched red: give [`teamclaude_rs::peer::config::EndpointSource::Drop`] the
+/// brief's rank (`2`) in `probe::source_rank` and the drop endpoint ties with
+/// the brief, landing at index 4 instead of 5.
+#[test]
+fn a_drop_endpoint_sorts_below_a_brief() {
+    let peer = PeerId([22_u8; 32]);
+    let port_of = |source: EndpointSource| -> u16 {
+        match source {
+            EndpointSource::Paired => 9_721,
+            EndpointSource::Hello => 9_722,
+            EndpointSource::Mapping => 9_723,
+            EndpointSource::Beacon => 9_724,
+            EndpointSource::Brief => 9_725,
+            EndpointSource::Drop => 9_726,
+        }
+    };
+    let addr_of = |source: EndpointSource| -> SocketAddr {
+        format!("127.0.0.1:{}", port_of(source))
+            .parse()
+            .expect("an addr")
+    };
+
+    // Newest first in the list and in the clock, which is the order the source
+    // key has to overturn.
+    let weakest_first = [
+        EndpointSource::Drop,
+        EndpointSource::Brief,
+        EndpointSource::Beacon,
+        EndpointSource::Mapping,
+        EndpointSource::Hello,
+        EndpointSource::Paired,
+    ];
+    let mut row = pinned(peer.0, "attic-nuc");
+    row.endpoints = weakest_first
+        .iter()
+        .enumerate()
+        .map(|(nth, source)| {
+            let age_ms = i64::try_from(nth).expect("six endpoints fit") * 60_000;
+            Endpoint::direct(addr_of(*source), FIXED_MS - age_ms, *source)
+        })
+        .collect();
+
+    let ordered: Vec<SocketAddr> = probe::order_endpoints(&row, &PathTable::default())
+        .into_iter()
+        .filter_map(|endpoint| endpoint.direct_addr())
+        .collect();
+
+    // Paired and Hello share a band, as do Mapping and Beacon, so within each
+    // the newer one leads: that is the recency tiebreak, not a fourth band.
+    let expected = vec![
+        addr_of(EndpointSource::Hello),
+        addr_of(EndpointSource::Paired),
+        addr_of(EndpointSource::Beacon),
+        addr_of(EndpointSource::Mapping),
+        addr_of(EndpointSource::Brief),
+        addr_of(EndpointSource::Drop),
+    ];
+    assert_eq!(
+        ordered, expected,
+        "the whole dial order, weakest evidence last: what a handshake proved, then this \
+         Mac's own hints, then a friend's word, then a record off a surface nobody here owns"
+    );
+}
