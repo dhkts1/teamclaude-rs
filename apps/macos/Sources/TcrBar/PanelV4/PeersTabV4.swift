@@ -820,12 +820,15 @@ final class PeerController: ObservableObject {
             guard let self else { return }
             self.pending.remove(key)
             if case .failed(let message) = outcome {
+                // The argv goes with the message: the banner leads with the
+                // act that was refused, and this is the one place that knows
+                // which act it was.
                 // No silent fallback: `tcr`'s own words, on the tab, rather
                 // than a press that looks like it worked. In the refusal
                 // beside the snapshot and not in the snapshot itself, so the
                 // tab keeps every control it had and the next poll cannot wipe
                 // the sentence three seconds later (``PeerRefusal``).
-                self.refusal.refused(message)
+                self.refusal.refused(message, verb: arguments)
                 return
             }
             // The press did what it said. Whatever refusal was on screen is
@@ -1102,6 +1105,10 @@ struct PeersTabV4: View {
     /// The Block that was chosen, while the confirm is up. One value, so two
     /// rows cannot arm two bans.
     @State private var blocking: PeerBlockTarget?
+    /// Whether the refusal banner is showing the raw line tcr printed. Closed
+    /// on every new refusal, because the sentence is what the next one is
+    /// about.
+    @State private var refusalDetails = false
 
     private var snapshot: PeersSnapshot { controller.snapshot }
 
@@ -1111,8 +1118,8 @@ struct PeersTabV4: View {
             // tab keeps every control it had, and this stays until it is
             // dismissed or a verb succeeds: the poll behind it cannot touch
             // it, because it is not part of the read (``PeerRefusal``).
-            if let refused = controller.refusal.message {
-                refusalBanner(refused)
+            if controller.refusal.isShowing {
+                refusalBanner(controller.refusal)
             }
             if let failure = snapshot.failure {
                 // The READ failed, which is a different fact: this build has
@@ -1183,6 +1190,9 @@ struct PeersTabV4: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        // A new refusal is a new sentence: the raw line of the last one closes
+        // rather than standing under somebody else's headline.
+        .onChange(of: controller.refusal.message) { _ in refusalDetails = false }
         .onAppear { if !snapshotMode { controller.start() } }
         .onDisappear { controller.stop() }
         .sheet(item: $trusting) { row in
@@ -1305,16 +1315,19 @@ struct PeersTabV4: View {
     /// `w12-exits-*` rows are the surface this copies. Colour is the second
     /// channel as everywhere here, so the sentence leads and the glyph
     /// follows it.
-    private func refusalBanner(_ message: String) -> some View {
-        V4Card {
+    private func refusalBanner(_ refusal: PeerRefusal) -> some View {
+        let raw = refusal.message ?? ""
+        return V4Card {
             V4Row {
                 HStack(alignment: .top, spacing: V4.rowGap) {
                     Image(systemName: "exclamationmark.triangle")
                         .font(V4.font(V4.dimSize))
                         .foregroundStyle(Tok.near)
                     VStack(alignment: .leading, spacing: 2) {
-                        NameText(text: "That was refused", lineLimit: 2)
-                        Text(message)
+                        // The ACT, named. `That was refused` says nothing
+                        // about which of a dozen controls was pressed.
+                        NameText(text: refusal.headline, lineLimit: 2)
+                        Text(refusal.body ?? raw)
                             .font(V4.font(V4.muteSize))
                             .foregroundStyle(Tok.ink)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1324,18 +1337,39 @@ struct PeersTabV4: View {
                     }
                 }
             } trailing: {
-                PeerActionButton(
-                    title: "Dismiss",
-                    systemImage: nil,
-                    help: "Clears this. It also clears by itself the next time a press does "
-                        + "what it was asked.",
-                    enabled: true
-                ) { controller.dismissRefusal() }
+                HStack(spacing: V4.pillGap) {
+                    // The command line and the exit code, one press away:
+                    // what a bug report needs and a person does not. The
+                    // banner used to LEAD with them.
+                    PeerActionButton(
+                        title: "Details",
+                        systemImage: nil,
+                        help: "Shows the line tcr printed, word for word.",
+                        enabled: true
+                    ) { refusalDetails.toggle() }
+                    PeerActionButton(
+                        title: "Dismiss",
+                        systemImage: nil,
+                        help: "Clears this. It also clears by itself the next time a press does "
+                            + "what it was asked.",
+                        enabled: true
+                    ) { controller.dismissRefusal() }
+                }
+            }
+            if refusalDetails {
+                Text(raw)
+                    .font(.system(size: V4.muteSize, design: .monospaced))
+                    .foregroundStyle(Tok.mute)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .lineSpacing(V4.lineSpacing(V4.muteSize))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding(.top, V4.yesBlockMarginTop)
             }
         }
         .padding(.top, V4.marginAfterStrip(V4.cardGap))
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Refused. \(message)")
+        .accessibilityLabel("\(refusal.headline). \(refusal.body ?? raw)")
     }
 
     // MARK: The egress line

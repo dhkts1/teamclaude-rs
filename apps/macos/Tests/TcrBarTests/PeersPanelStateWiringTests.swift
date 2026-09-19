@@ -785,11 +785,14 @@ final class PeersPanelStateWiringTests: XCTestCase {
     func testARefusedVerbNoLongerReplacesTheTab() throws {
         let tab = try source("apps/macos/Sources/TcrBar/PanelV4/PeersTabV4.swift")
         let body = try slice(tab, from: "var body: some View {", to: "/// Close the Trust sheet")
+        // The banner takes the whole refusal now, not its raw string: it
+        // leads with the act that was refused and holds the command line and
+        // the exit code behind Details.
         XCTAssertTrue(
-            body.contains("if let refused = controller.refusal.message {")
-                && body.contains("refusalBanner(refused)"),
+            body.contains("if controller.refusal.isShowing {")
+                && body.contains("refusalBanner(controller.refusal)"),
             "a refused verb is no longer drawn as a banner above the tab")
-        let banner = try XCTUnwrap(body.range(of: "refusalBanner(refused)")).lowerBound
+        let banner = try XCTUnwrap(body.range(of: "refusalBanner(controller.refusal)")).lowerBound
         let find = try XCTUnwrap(body.range(of: "findCard")).lowerBound
         XCTAssertTrue(banner < find, "the banner is below the controls it is an answer to")
         XCTAssertTrue(
@@ -806,8 +809,9 @@ final class PeersPanelStateWiringTests: XCTestCase {
             tab, from: "private func run(arguments: [String], stdin: String?) {",
             to: "/// Runs one verb and hands back what it PRINTED")
         XCTAssertTrue(
-            run.contains("self.refusal.refused(message)"),
-            "a refused verb no longer lands in the refusal beside the snapshot")
+            run.contains("self.refusal.refused(message, verb: arguments)"),
+            "a refused verb no longer lands in the refusal beside the snapshot, or lands "
+                + "without the argv the banner names the act from")
         XCTAssertFalse(
             run.contains("PeersSnapshotBuilder.failed(message)"),
             "a refused verb is written into the snapshot again, so the tab is replaced by one "
