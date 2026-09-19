@@ -2854,6 +2854,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "chacha20poly1305",
  "clap",
  "crossterm",
  "eventsource-stream",
