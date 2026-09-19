@@ -1550,6 +1550,12 @@ pub struct PeerLsJson {
     /// projection and carries no secret.
     pub peers: Vec<PeerLsRow>,
     /// Macs asking to pair.
+    ///
+    /// Each row's `addr` is the address to ANSWER on, `host:port` when the
+    /// knock said which port its listener is bound to and the bare host when
+    /// it did not. The panel hands that string to `tcr peer pair`, so it is
+    /// built by `crate::peer::state::Knock::dial_address` rather than being
+    /// the bare key the file coalesces knocks under.
     pub pending: Vec<crate::peer::state::Knock>,
     pub pending_count: usize,
     /// Blocked addresses, with the key where one was learned.

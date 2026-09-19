@@ -757,7 +757,7 @@ final class PeerController: ObservableObject {
 
     func refresh() async {
         guard !isPinned else { return }
-        let read = await Task.detached(priority: .userInitiated) { Self.read() }.value
+        let read = await Task.detached(priority: .userInitiated) { await Self.read() }.value
         readSnapshot = read
         publish()
     }
@@ -1086,17 +1086,29 @@ final class PeerController: ObservableObject {
     /// their CLI is old is the wrong sentence. Classified on the exit code
     /// and on `tcr`'s own "unrecognized subcommand" wording rather than on
     /// one of them alone.
-    private nonisolated static func read() -> PeersSnapshot {
+    private nonisolated static func read() async -> PeersSnapshot {
         switch TcrTool.resolve() {
         case .failure(let notFound):
             return PeersSnapshotBuilder.failed(
                 "tcr not found (searched \(notFound.searched.count) locations). "
                     + TcrTool.overrideRemedy)
         case .success(let executable):
+            // Both reads at once. The two are independent, the live half takes
+            // no input from the file half, so running them one after another
+            // charged this tab two subprocesses in a row for work that fits in
+            // the longer of them. Started here, before the file read, so the
+            // two waits overlap; awaited in every branch below, so nothing
+            // returns while a child it started is still running. A run whose
+            // file half fails pays one extra cheap read and drops its answer,
+            // which is the same containment the merge below has always had.
+            async let live = Task.detached(priority: .userInitiated) {
+                readLive(executable: executable)
+            }.value
             do {
                 let output = try TcrTool.run(
                     executable: executable, arguments: PeerCommand.list)
                 if output.exitCode != 0 {
+                    _ = await live
                     let text = output.stderr.lowercased()
                     if text.contains("unrecognized subcommand")
                         || text.contains("unexpected argument")
@@ -1112,11 +1124,12 @@ final class PeerController: ObservableObject {
                 let document = try JSONDecoder().decode(
                     PeerListDocument.self, from: output.stdout)
                 // The live half is a SECOND call, and it may only ever add:
-                // every failure below lands as `.unsupported` and the tab
+                // every failure inside it lands as `.unsupported` and the tab
                 // draws exactly the file half it always did.
                 return PeersSnapshotBuilder.snapshot(
-                    from: document.mergingLive(readLive(executable: executable)), now: Date())
+                    from: document.mergingLive(await live), now: Date())
             } catch {
+                _ = await live
                 return PeersSnapshotBuilder.failed(
                     "tcr peer ls answered something this build cannot read: "
                         + error.localizedDescription)

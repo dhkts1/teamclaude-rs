@@ -20,6 +20,7 @@
 //! field arrives with a serde default and the version untouched.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -324,6 +325,12 @@ pub struct Knock {
     /// Where it knocked from, `ip:port`'s IP with the port dropped. See
     /// [`knock_address`]: a source PORT is ephemeral per connection, so keeping
     /// it would defeat the coalescing this row exists for.
+    ///
+    /// **This is the key, never the dial address.** The mutes, the bans and the
+    /// accepted windows are all keyed on this same bare IP, and the listener
+    /// compares it against the address a connection arrives on. What an
+    /// operator dials to answer is [`Self::dial_address`], which is this plus
+    /// [`Self::listen_port`] and is a rendering, not a second key.
     pub addr: String,
     /// The ephemeral id it knocked under. Updated in place when the same
     /// address knocks again with a different one.
@@ -333,6 +340,17 @@ pub struct Knock {
     pub proposed_name: Option<String>,
     /// The wire version it claimed.
     pub wire_version: u16,
+    /// The port the knocker said its own listener is bound to, when it said
+    /// one. See [`tcr_peer_wire::Knock::listen_port`]: the source port this
+    /// row's [`Self::addr`] drops is ephemeral, so this is the only number
+    /// that can be dialled back.
+    ///
+    /// `None` on a knock from a build that predates the field, and on the
+    /// placeholder row [`PeerState::reserve_knock_slot`] pushes, and then
+    /// [`Self::dial_address`] is the bare address, which is what every answer
+    /// had before this existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
     /// When this address first knocked, Unix milliseconds.
     pub first_seen_ms: i64,
     /// When it last knocked. A row expires [`KNOCK_TTL_MS`] after this.
@@ -358,6 +376,33 @@ impl Knock {
         self.instance_id == InstanceId([0_u8; tcr_peer_wire::INSTANCE_ID_BYTES])
             && self.proposed_name.is_none()
             && self.wire_version == 0
+    }
+
+    /// What to dial to answer this knock: `host:port` when the knocker said
+    /// which port it listens on, the bare host when it did not.
+    ///
+    /// **The one place the answer's address is built**, read by every surface
+    /// that shows a pending row, because an operator, and the panel, hand this
+    /// string straight to `tcr peer pair`. Before it existed each surface
+    /// printed [`Self::addr`] alone, every answer went to whatever was
+    /// listening on the default port, and a Mac that listens anywhere else
+    /// could not be answered at all: on one machine the dial came back to that
+    /// machine's own listener and the pairing digits never appeared.
+    ///
+    /// An IPv6 host is bracketed, because `fe80::1:7766` is not an address any
+    /// parser can split and `[fe80::1]:7766` is. An [`Self::addr`] that is not
+    /// an IP address at all, which nothing in this process writes, gets no
+    /// port appended rather than a string built around a value this cannot
+    /// read.
+    pub fn dial_address(&self) -> String {
+        let Some(port) = self.listen_port else {
+            return self.addr.clone();
+        };
+        match self.addr.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(host)) => format!("[{host}]:{port}"),
+            Ok(std::net::IpAddr::V4(host)) => format!("{host}:{port}"),
+            Err(_) => self.addr.clone(),
+        }
     }
 }
 
@@ -657,6 +702,7 @@ impl PeerState {
         instance_id: InstanceId,
         proposed_name: Option<String>,
         wire_version: u16,
+        listen_port: Option<u16>,
         now_ms: i64,
     ) -> Result<bool, KnockRefusal> {
         if let Some(refusal) = self.refusal_for_knock_source(addr, now_ms) {
@@ -669,6 +715,10 @@ impl PeerState {
             existing.instance_id = instance_id;
             existing.proposed_name = proposed_name;
             existing.wire_version = wire_version;
+            // The newest knock's port, including back to `None`: a Mac that
+            // moved its listener, or that downgraded to a build which says no
+            // port at all, must not be answered at the port it used to be on.
+            existing.listen_port = listen_port;
             existing.last_seen_ms = now_ms;
             return Ok(false);
         }
@@ -685,6 +735,7 @@ impl PeerState {
             instance_id,
             proposed_name,
             wire_version,
+            listen_port,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
         });
@@ -737,6 +788,9 @@ impl PeerState {
             instance_id: InstanceId([0_u8; tcr_peer_wire::INSTANCE_ID_BYTES]),
             proposed_name: None,
             wire_version: 0,
+            // Nothing has been decrypted yet, so there is no port to hold
+            // either. `record_knock` fills it with the real one.
+            listen_port: None,
             first_seen_ms: now_ms,
             last_seen_ms: now_ms,
         });
@@ -815,9 +869,15 @@ impl PeerState {
                 return Some(row);
             }
         }
-        self.pending
-            .iter()
-            .find(|knock| knock.addr == selector && !knock.is_reservation_placeholder())
+        // The bare key, OR the `host:port` form the same row is printed under
+        // ([`Knock::dial_address`]). Every string a surface shows for a row
+        // has to select that row: `tcr peer pending` prints the dial address,
+        // and an operator who pastes back what they just read must not be told
+        // it matches no request.
+        self.pending.iter().find(|knock| {
+            (knock.addr == selector || knock.dial_address() == selector)
+                && !knock.is_reservation_placeholder()
+        })
     }
 
     /// Whether `text` is the address form every row in this file is keyed on:
@@ -1029,6 +1089,49 @@ pub enum StateOrigin {
     },
 }
 
+/// The six numbers the "peer state restored" line below reports, held so the
+/// next tick can be compared against this one.
+///
+/// `PartialEq` is the whole point: two ticks with the same six numbers are,
+/// as far as an operator reading the log cares, the same event, and the
+/// second one saying so again is the spam this type exists to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RestoreCounts {
+    restored: usize,
+    borrowed: usize,
+    expired: usize,
+    pending: usize,
+    muted: usize,
+    banned: usize,
+}
+
+/// The last tick's [`RestoreCounts`] this process logged at INFO, per PATH.
+///
+/// [`load_with_origin`] runs on every poll of `tcr status` (once a second
+/// from the panel), not only at boot, so logging its numbers unconditionally
+/// turns one boot line into one line a second. Keyed by path for the same
+/// reason [`crate::peer::config::PEERS_FILE_OPENS`] is: a test binary runs
+/// its tests concurrently in one process, and a single global slot would
+/// compare one test's first tick against whatever another test's temp file
+/// last wrote.
+static LAST_RESTORE_LOG: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<PathBuf, RestoreCounts>>,
+> = std::sync::OnceLock::new();
+
+/// Whether `counts` differs from the last tick this process logged for
+/// `path`, or there was no last tick at all (first call for this path, the
+/// boot case). Updates the cache to `counts` either way, so the comparison on
+/// the NEXT call is always against the tick that just ran, not against
+/// whatever was last logged.
+fn restore_counts_changed(path: &Path, counts: RestoreCounts) -> bool {
+    let mut cache = LAST_RESTORE_LOG
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .expect("restore-log cache lock poisoned");
+    let previous = cache.insert(path.to_path_buf(), counts);
+    previous != Some(counts)
+}
+
 /// [`load`], and where the state came from. See [`StateOrigin`].
 pub fn load_with_origin(path: &Path, now_ms: i64) -> Result<(PeerState, StateOrigin)> {
     // **The review's L1: the mode tripwire the peers file has, on the file that
@@ -1136,15 +1239,41 @@ pub fn load_with_origin(path: &Path, now_ms: i64) -> Result<(PeerState, StateOri
     // sees and another does not.
     let aged_out = state.expire(now_ms);
     let expired = total - restored + aged_out + (borrowed_total - borrowed);
-    tracing::info!(
+    let counts = RestoreCounts {
         restored,
         borrowed,
         expired,
-        pending = state.pending.len(),
-        muted = state.muted.len(),
-        banned = state.banned.len(),
-        "peer state restored"
-    );
+        pending: state.pending.len(),
+        muted: state.muted.len(),
+        banned: state.banned.len(),
+    };
+    // `tcr status` polls this function once a second, so an unconditional
+    // `info!` here is not a boot line, it is a busy loop's worth of identical
+    // lines burying whatever else the log holds. Only a first read for this
+    // path (the actual boot event) or a tick whose numbers moved earns INFO;
+    // an unchanged tick still logs, but at `debug!`, so the fact is still
+    // there for anyone who raised the filter to look for it.
+    if restore_counts_changed(path, counts) {
+        tracing::info!(
+            restored = counts.restored,
+            borrowed = counts.borrowed,
+            expired = counts.expired,
+            pending = counts.pending,
+            muted = counts.muted,
+            banned = counts.banned,
+            "peer state restored"
+        );
+    } else {
+        tracing::debug!(
+            restored = counts.restored,
+            borrowed = counts.borrowed,
+            expired = counts.expired,
+            pending = counts.pending,
+            muted = counts.muted,
+            banned = counts.banned,
+            "peer state restored"
+        );
+    }
     Ok((state, StateOrigin::Trusted))
 }
 
@@ -1324,4 +1453,135 @@ pub fn save(path: &Path, state: &PeerState) -> Result<()> {
     let json = serde_json::to_string_pretty(&file)?;
     crate::config::write_atomic(path, &json)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// One captured tracing event: its level and its message, which is all
+    /// this test needs to tell an INFO "peer state restored" apart from a
+    /// DEBUG one.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct Message(Option<String>);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut message = Message(None);
+            event.record(&mut message);
+            if let Some(message) = message.0 {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .push((*event.metadata().level(), message));
+            }
+        }
+    }
+
+    impl Capture {
+        fn count(&self, level: tracing::Level, needle: &str) -> usize {
+            self.0
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .filter(|(event_level, message)| *event_level == level && message.contains(needle))
+                .count()
+        }
+    }
+
+    /// A scratch state-file path unique to this thread, so two tests run
+    /// concurrently in this binary never share a [`LAST_RESTORE_LOG`] cache
+    /// entry (that cache is keyed by path for exactly this reason).
+    fn scratch_state_path() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tcr-peer-state-restored-log-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        dir.join("peer-state.json")
+    }
+
+    /// **A tick that restores the same nothing twice logs the fact ONCE at
+    /// INFO, not twice.**
+    ///
+    /// `tcr status` polls [`load_with_origin`] once a second, so the boot
+    /// line this function documents becomes a line-a-second poll unless a
+    /// tick whose six numbers match the last one it logged stays at
+    /// `debug!`. Watched red by reverting the `if restore_counts_changed`
+    /// branch back to an unconditional `tracing::info!`: the second call
+    /// then adds a second INFO line and this test's `count(INFO, ..) == 1`
+    /// fails with 2.
+    #[test]
+    fn a_tick_that_restored_nothing_new_stays_quiet_the_second_time() {
+        let path = scratch_state_path();
+        save(&path, &PeerState::default()).expect("write scratch state file");
+        let now = crate::now_ms();
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            load_with_origin(&path, now).expect("first tick reads the file just written");
+            load_with_origin(&path, now).expect("second tick reads the same, unchanged file");
+        });
+
+        assert_eq!(
+            capture.count(tracing::Level::INFO, "peer state restored"),
+            1,
+            "two identical ticks must log the restore ONCE at INFO, not once per tick"
+        );
+        assert_eq!(
+            capture.count(tracing::Level::DEBUG, "peer state restored"),
+            1,
+            "the second, unchanged tick must still say what it found, at debug"
+        );
+    }
+
+    /// A tick whose counts differ from the last one this process logged for
+    /// the same path earns INFO again, because that IS new information: an
+    /// operator restarted, or a knock landed between the two reads.
+    #[test]
+    fn a_tick_whose_counts_moved_logs_at_info_again() {
+        let path = scratch_state_path();
+        save(&path, &PeerState::default()).expect("write scratch state file");
+        let now = crate::now_ms();
+
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            load_with_origin(&path, now).expect("first tick reads the file just written");
+
+            // Something changed on disk between the two ticks: a knock landed
+            // and the pending queue is no longer empty.
+            let mut state = PeerState::default();
+            state
+                .reserve_knock_slot("198.51.100.1:4242", now)
+                .expect("reserve a knock slot for the fixture");
+            save(&path, &state).expect("write the changed scratch state file");
+
+            load_with_origin(&path, now).expect("second tick reads the changed file");
+        });
+
+        assert_eq!(
+            capture.count(tracing::Level::INFO, "peer state restored"),
+            2,
+            "a tick whose numbers moved must log again at INFO, not stay quiet"
+        );
+    }
 }

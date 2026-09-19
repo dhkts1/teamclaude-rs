@@ -166,6 +166,7 @@ async fn a_booted_server_answers_a_knock_and_refuses_the_local_route_on_its_peer
         instance_id: tcr_peer_wire::InstanceId([7_u8; tcr_peer_wire::INSTANCE_ID_BYTES]),
         proposed_name: Some("studio-mac".to_string()),
         wire_version: tcr_peer_wire::PROTO_VERSION,
+        listen_port: Some(7766),
     };
     teamclaude_rs::peer::noise::send_knock(&mut stream, &knock, None)
         .await

@@ -1102,21 +1102,23 @@ pub struct Enroll {
 /// key anywhere in the handshake**, so a knock discloses neither end's
 /// identity. The rule is: "the requester opens a Noise `NN` session (ephemeral
 /// keys only, no static on either side) and sends `{instance_id,
-/// proposed_name, wire_version}`; the responder queues it and shows it in the
-/// Peers tab as '<name or address> wants to pair' with Accept / Ignore;
-/// nothing else happens, no static key is revealed."
+/// proposed_name, wire_version, listen_port}`; the responder queues it and
+/// shows it in the Peers tab as '<name or address> wants to pair' with
+/// Accept / Ignore; nothing else happens, no static key is revealed."
 ///
 /// The responder answers one byte ([`KNOCK_ACK`]) and closes. That one byte is
 /// the whole of what a stranger learns: something is listening and it took the
 /// knock. It is not an approval and it is not a capability.
 ///
-/// # Every field here is a CLAIM, and two of the three prove nothing
+/// # Every field here is a CLAIM, and not one of them proves anything
 ///
 /// [`Self::instance_id`] is ephemeral by construction and rotatable at will;
-/// [`Self::proposed_name`] is attacker-chosen text. Only the source address,
+/// [`Self::proposed_name`] is attacker-chosen text; [`Self::listen_port`] is a
+/// number the knocker picked and nothing checks. Only the source address,
 /// which is not in this message, because a TCP handshake already made it real,
 /// is worth coalescing on. So the queue keys on the address and this message
-/// is what the operator READS beside it.
+/// is what the operator READS beside it, plus the one number the answer is
+/// dialled to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Knock {
@@ -1131,6 +1133,32 @@ pub struct Knock {
     /// The wire version it speaks, so a responder on a different one can say so
     /// in the pending row instead of the operator discovering it at `XX`.
     pub wire_version: u16,
+    /// The port the knocker's OWN listener is bound to, so the answer can be
+    /// dialled back to it.
+    ///
+    /// # This is the one field here that is not merely a label
+    ///
+    /// The three fields above are read by a person. This one is dialled by a
+    /// program, and without it there is nothing to dial: the source port of
+    /// the connection a knock arrives on is ephemeral, a fresh number per TCP
+    /// connection and never a listening port, so a responder that wanted to
+    /// answer had only the source IP and had to guess the port. A Mac whose
+    /// listener is not on the default port could not be answered at all, and
+    /// the guess landed on whatever happened to be listening at the default,
+    /// which on one machine is that machine's own listener.
+    ///
+    /// It is still a CLAIM, in the same sense the rest of the message is: a
+    /// knocker may name any port, and naming one buys nothing, the responder
+    /// dials it only if an operator presses Accept, and the `XX` handshake at
+    /// the far end of that dial is what decides identity. What a wrong port
+    /// costs is a dial that reaches nothing.
+    ///
+    /// `None` when the knocker did not say (an older build, or one with no
+    /// listener of its own), and then the responder has the source IP alone
+    /// and the port it defaults to, which is exactly where it was before this
+    /// field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_port: Option<u16>,
 }
 
 /// The single byte a responder writes back on a knock, and the only byte a
